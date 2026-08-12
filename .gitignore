@@ -4,7 +4,6 @@ zig-pkg/
 zig-out-linux/
 testdata/*.pem
 tools/h2spec/h2spec
-vendor/tls-zig/.git/
 *.o
 *.a
 .DS_Store

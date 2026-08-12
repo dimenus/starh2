@@ -38,8 +38,10 @@ do not weaken other failures into exclusions. The pinned Darwin h2spec needs
 
 ## TLS and allocation traps
 
-TLS is vendored at `vendor/tls-zig` with `starh2-nonblock-v1` (see `tools/lock.json`).
-If vendored code changes, update the recorded patch and SHA-256 together.
+TLS is pinned in `build.zig.zon` to the `starh2-nonblock-v1` archive of
+`dimenus/tls.zig` (URL + content hash; see `tools/lock.json`). The source-visible
+patch remains at `vendor/tls-zig-nonblock-v1.patch`. If the fork or patch
+changes, update the zon URL/hash, fork commit, and patch SHA-256 together.
 
 - TLS 1.3 plaintext scratch is 16 KiB plus the inner content-type byte.
 - `tls_edge.firstRecord` deliberately feeds one record per decrypt call. Without
