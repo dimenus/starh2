@@ -503,3 +503,117 @@ test "hpack insert OOM is OutOfMemory not CompressionError" {
     const result = dec.decode(&block, 10, 1000, 100, 100);
     try std.testing.expectError(error.OutOfMemory, result);
 }
+
+
+test "raised request_body_bytes: 413 on content-length and on cap+1" {
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const hpack = starh2.core.hpack;
+    const raised: usize = 2 * 1024 * 1024;
+    var limits = starh2.Limits.defaults;
+    limits.request_body_bytes = raised;
+
+    // Trigger A: content-length proves overflow before any DATA.
+    {
+        var session = try session_mod.Session.init(std.testing.allocator, limits);
+        defer session.deinit();
+        freeIntents(session.drainIntents());
+        var cl_buf: [32]u8 = undefined;
+        const cl = try std.fmt.bufPrint(&cl_buf, "{d}", .{raised + 1});
+        const fields = [_]hpack.HeaderField{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "http" },
+            .{ .name = ":path", .value = "/x" },
+            .{ .name = ":authority", .value = "localhost" },
+            .{ .name = "content-length", .value = cl },
+        };
+        const block = try hpack.Encoder.encode(std.testing.allocator, &fields);
+        defer std.testing.allocator.free(block);
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(std.testing.allocator);
+        try prefaceSettings(&wire);
+        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        const fh = frame.FrameHeader{
+            .length = @intCast(block.len),
+            .type = .headers,
+            .flags = .{ .end_headers = true },
+            .stream_id = 1,
+        };
+        fh.encode(&hdr_buf);
+        try wire.appendSlice(std.testing.allocator, &hdr_buf);
+        try wire.appendSlice(std.testing.allocator, block);
+        try session.ingest(wire.items);
+        const intents = session.drainIntents();
+        defer freeIntents(intents);
+        var saw_413 = false;
+        var saw_dispatch = false;
+        for (intents) |it| switch (it) {
+            .early_reject => |e| {
+                if (e.status == 413) saw_413 = true;
+            },
+            .dispatch_request => saw_dispatch = true,
+            else => {},
+        };
+        try std.testing.expect(saw_413);
+        try std.testing.expect(!saw_dispatch);
+    }
+
+    // Trigger B: no content-length; byte cap+1 on DATA emits 413 immediately.
+    {
+        var session = try session_mod.Session.init(std.testing.allocator, limits);
+        defer session.deinit();
+        freeIntents(session.drainIntents());
+        const fields = [_]hpack.HeaderField{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "http" },
+            .{ .name = ":path", .value = "/x" },
+            .{ .name = ":authority", .value = "localhost" },
+        };
+        const block = try hpack.Encoder.encode(std.testing.allocator, &fields);
+        defer std.testing.allocator.free(block);
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(std.testing.allocator);
+        try prefaceSettings(&wire);
+        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        const fh = frame.FrameHeader{
+            .length = @intCast(block.len),
+            .type = .headers,
+            .flags = .{ .end_headers = true },
+            .stream_id = 1,
+        };
+        fh.encode(&hdr_buf);
+        try wire.appendSlice(std.testing.allocator, &hdr_buf);
+        try wire.appendSlice(std.testing.allocator, block);
+
+        var remaining: usize = raised + 1;
+        while (remaining > 0) {
+            const take = @min(remaining, 16 * 1024);
+            remaining -= take;
+            var data = try std.testing.allocator.alloc(u8, frame.FRAME_HEADER_LEN + take);
+            defer std.testing.allocator.free(data);
+            const dh = frame.FrameHeader{
+                .length = @intCast(take),
+                .type = .data,
+                .flags = .{ .end_stream = remaining == 0 },
+                .stream_id = 1,
+            };
+            dh.encode(data[0..frame.FRAME_HEADER_LEN]);
+            @memset(data[frame.FRAME_HEADER_LEN..], 'b');
+            try wire.appendSlice(std.testing.allocator, data);
+        }
+        try session.ingest(wire.items);
+        const intents = session.drainIntents();
+        defer freeIntents(intents);
+        var saw_413 = false;
+        var saw_dispatch = false;
+        for (intents) |it| switch (it) {
+            .early_reject => |e| {
+                if (e.status == 413) saw_413 = true;
+            },
+            .dispatch_request => saw_dispatch = true,
+            else => {},
+        };
+        try std.testing.expect(saw_413);
+        try std.testing.expect(!saw_dispatch);
+    }
+}

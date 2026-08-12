@@ -350,3 +350,37 @@ test "Intent and ControlEntry sizes feed resourceUpperBound" {
     try std.testing.expect(starh2.core.bound_shapes.CONTROL_ENTRY_SIZE >= 16);
     try std.testing.expectEqual(@sizeOf(starh2.edge.fair_scheduler.ControlEntry), starh2.core.bound_shapes.CONTROL_ENTRY_SIZE);
 }
+
+// Raised body-cap cost card (t-480).
+//
+// Which caps a consumer may raise, and what each costs in resourceUpperBound:
+// - `request_body_bytes` — per-stream 413 threshold only. Raising it alone does
+//   NOT change `resourceUpperBound().allocator_bytes`.
+// - `request_bytes_per_connection` / `request_bytes_per_server` — the real
+//   concurrent body residency budget. To admit S streams each holding a full
+//   body of size B: set `request_bytes_per_connection >= B*S` and keep
+//   `request_bytes_per_server` ≥ that connection ceiling (else InvalidConfig).
+// - `max_streams_per_connection` — multiplies handler/ticket/map terms AND the
+//   B*S product above when bodies are saturated.
+test "raised request_body_bytes: publish concurrent body memory cost" {
+    const B: usize = 2 * 1024 * 1024; // 2 MiB — qmdsync-class body
+    var lim = starh2.Limits.defaults;
+    const base = try lim.resourceUpperBound();
+
+    lim.request_body_bytes = B;
+    const body_only = try lim.resourceUpperBound();
+    try std.testing.expectEqual(base.allocator_bytes, body_only.allocator_bytes);
+
+    const S = lim.max_streams_per_connection;
+    const need_conn = B * S; // 2 MiB * 256 = 512 MiB
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), need_conn);
+
+    lim.request_bytes_per_connection = need_conn;
+    lim.request_bytes_per_server = @max(lim.request_bytes_per_server, need_conn);
+    const full = try lim.resourceUpperBound();
+    try std.testing.expect(full.allocator_bytes > base.allocator_bytes);
+    // Connection count multiplies the per-conn request_bytes term once, plus the
+    // global request_bytes_per_server ceiling counted once.
+    const delta = full.allocator_bytes - base.allocator_bytes;
+    try std.testing.expect(delta >= need_conn); // at least the server-level bump
+}

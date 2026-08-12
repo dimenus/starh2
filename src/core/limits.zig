@@ -75,6 +75,11 @@ pub const Limits = struct {
     path_wire_bytes: usize = 24 * 1024,
     path_component_bytes: usize = 16 * 1024,
     query_component_bytes: usize = 16 * 1024,
+    /// Per-stream decoded body cap (413 threshold). Does not by itself grow
+    /// `resourceUpperBound`: concurrent body residency is gated by
+    /// `request_bytes_per_connection` / `request_bytes_per_server`. Raising this
+    /// to B with S streams requires `request_bytes_per_connection >= B*S` (and a
+    /// matching server ceiling) if every stream may hold a full body at once.
     request_body_bytes: usize = 256 * 1024,
     /// Intent backlog entries per connection (session).
     intent_entries_per_connection: usize = 512,
