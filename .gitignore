@@ -9,3 +9,4 @@ tools/h2spec/h2spec
 *.o
 *.a
 .DS_Store
+zig-out-musl-debug/
