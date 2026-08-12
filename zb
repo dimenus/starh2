@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$HOME/.zvm/bin/zig" "$@"

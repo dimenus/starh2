@@ -1,0 +1,18 @@
+{
+  "zig": "0.16.0",
+  "zio": {
+    "tag": "v0.16.0",
+    "commit": "fd16258e8fadec5aa74f13302efecd070593cb06"
+  },
+  "datastar-sdk.zig": {
+    "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"
+  },
+  "tls.zig": {
+    "base_commit": "5452bafc98d23e304209cb24d81fd2d19434e52d",
+    "fork_commit": "66f53e13d1007a550326f3fa45fee0d253d64c3f",
+    "patch": "vendor/tls-zig-nonblock-v1.patch",
+    "patch_sha256": "d908349c4cc5d37f86a3c13481007c89fb965b024f8a635298555457d6299dd9",
+    "abi": "starh2-nonblock-v1",
+    "abi_version": 1
+  }
+}
