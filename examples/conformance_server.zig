@@ -1,4 +1,5 @@
-//! Fixed conformance-server CLI (DESIGN.md §11).
+//! Fixed conformance-server CLI: --mode tls|h2c, --bind host:port,
+//! optional --cert/--key; one JSON ready line on stdout; routes /hello /sse /morph /signals.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");

@@ -1,6 +1,7 @@
 # starh2
 
-Server-side HTTP/2 stack shaped around Datastar. Design of record: `DESIGN.md`.
+Server-side HTTP/2 stack shaped around Datastar. Rationale lives in the git log
+(initial commit and the design-retirement commit).
 
 Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib lookups. Do not guess 0.16 APIs.
 

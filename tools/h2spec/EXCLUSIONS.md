@@ -1,7 +1,8 @@
 # h2spec exclusions (RFC 9113)
 
 starh2 intentionally parses and ignores RFC 7540 priority dependency fields
-(DESIGN §7.2 / §10). The following h2spec http2 cases exercise only those
+(priority fields are parsed and ignored; priority-tree scheduling is a v1 non-goal).
+The following h2spec http2 cases exercise only those
 removed semantics and are published exclusions — not expected-failure baselines
 for other failures.
 

@@ -1,4 +1,4 @@
-// Multiplex grader (DESIGN §12.3).
+// Multiplex grader: one dial, 100 SSE, stall one stream, 200 morph, probe.
 // Stateful HTTP/2 frame shim: client-preface pass-through + incremental framing
 // on both directions. Drops client→server WINDOW_UPDATE for one stream while
 // recording the peer's advertised stream window and DATA received during morphs.

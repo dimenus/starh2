@@ -160,7 +160,7 @@ pub const Response = struct {
 
     fn writeBody(self: *Response, body: *Body, bytes: []const u8) ResponseError!void {
         try self.checkBody(body);
-        // SSE write has exactly one implicit flush (DESIGN §7.6) — no second flushCb.
+        // SSE write has exactly one implicit flush — no second flushCb.
         try self.writeFn(self.ctx, self.stream_id, bytes, false, self.sse);
     }
 

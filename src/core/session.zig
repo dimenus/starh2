@@ -110,7 +110,7 @@ pub const Session = struct {
     control_frames_since_data: usize = 0,
     /// Optional server-wide stream admission (global max_streams_per_server).
     stream_hooks: ?StreamHooks = null,
-    /// Edge-owned rate limiter + clock snapshot (DESIGN §7.7). Null → rates disabled.
+    /// Edge-owned rate limiter + clock snapshot. Null → rates disabled.
     rate_limiter: ?*rates_mod.RateLimiter = null,
     edge_now_ns: u64 = 0,
     /// Wall-clock start of unfinished field block (0 = idle).
@@ -415,7 +415,7 @@ pub const Session = struct {
 
     fn beginGracefulPhase1(self: *Session) !void {
         if (self.grace_phase != .none or self.terminal != .none) return;
-        // DESIGN §9: GOAWAY NO_ERROR with last-stream-ID 2^31-1, then PING.
+        // Graceful shutdown: GOAWAY NO_ERROR with last-stream-ID 2^31-1, then PING.
         try self.emitGoawayNoTerminal(std.math.maxInt(u31), .no_error);
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.ping(&buf, false, &self.grace_ping);
@@ -561,7 +561,7 @@ pub const Session = struct {
     }
 
     fn chargeRate(self: *Session, typ: frame.FrameType, already_terminal: bool) !void {
-        // Protocol errors win over simultaneous rate errors (DESIGN §7.7).
+        // Protocol errors win over simultaneous rate errors.
         if (already_terminal) return;
         if (self.terminal != .none) return;
         if (self.rate_limiter) |rl| {
@@ -571,7 +571,7 @@ pub const Session = struct {
         }
     }
 
-    /// Edge clock: field-block / request-body idle deadlines (DESIGN §7.7).
+    /// Edge clock: field-block / request-body idle deadlines.
     pub fn checkIdleDeadlines(self: *Session, now_ns: u64) !void {
         if (self.terminal != .none) return;
         if (self.expect_continuation != null and self.field_block_started_ns != 0) {

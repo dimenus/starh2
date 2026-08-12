@@ -1,4 +1,4 @@
-//! Edge-clock token buckets for non-DATA / RST / SETTINGS / PING rate budgets (DESIGN §7.7).
+//! Edge-clock token buckets for non-DATA / RST / SETTINGS / PING rate budgets.
 const std = @import("std");
 const frame = @import("frame.zig");
 
@@ -30,7 +30,7 @@ pub const TokenBucket = struct {
     }
 };
 
-/// Defaults from DESIGN §7.7 (per 10-second windows).
+/// Defaults: per 10-second windows for control-frame rate budgets.
 pub const RateLimiter = struct {
     non_data: TokenBucket = .init(10_000, 1_000), // 10000 / 10s
     rst: TokenBucket = .init(1_000, 100),
