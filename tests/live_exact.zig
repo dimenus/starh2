@@ -3,6 +3,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
+const h2c = @import("starh2_h2_client");
 
 const dummy: u8 = 0;
 const BODY_70K = 70 * 1024;
@@ -75,63 +76,6 @@ fn readAvailable(stream: zio.net.Stream, bytes: []u8) !usize {
         error.Timeout => 0,
         else => return err,
     };
-}
-
-fn appendHeaders(gpa: std.mem.Allocator, wire: *std.ArrayList(u8), stream_id: u31, path: []const u8, end_stream: bool) !void {
-    const frame = starh2.core.frame;
-    const hpack = starh2.core.hpack;
-    const fields = [_]hpack.HeaderField{
-        .{ .name = ":method", .value = "GET" },
-        .{ .name = ":scheme", .value = "http" },
-        .{ .name = ":path", .value = path },
-        .{ .name = ":authority", .value = "localhost" },
-    };
-    const block = try hpack.Encoder.encode(gpa, &fields);
-    defer gpa.free(block);
-    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
-    const fh = frame.FrameHeader{
-        .length = @intCast(block.len),
-        .type = .headers,
-        .flags = .{ .end_headers = true, .end_stream = end_stream },
-        .stream_id = stream_id,
-    };
-    fh.encode(&hdr_buf);
-    try wire.appendSlice(gpa, &hdr_buf);
-    try wire.appendSlice(gpa, block);
-}
-
-fn buildClientHelloWindow(gpa: std.mem.Allocator, path: []const u8, stream_id: u31, win: u32) ![]u8 {
-    const frame = starh2.core.frame;
-    var wire: std.ArrayList(u8) = .empty;
-    errdefer wire.deinit(gpa);
-    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
-    {
-        var sbuf: [64]u8 = undefined;
-        const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
-        try wire.appendSlice(gpa, sbuf[0..sn]);
-    }
-    {
-        var sbuf: [64]u8 = undefined;
-        const settings = [_]frame.Setting{.{ .id = .initial_window_size, .value = win }};
-        const sn = try frame.Serializer.settingsFrame(&sbuf, false, &settings);
-        try wire.appendSlice(gpa, sbuf[0..sn]);
-    }
-    try appendHeaders(gpa, &wire, stream_id, path, true);
-    return try wire.toOwnedSlice(gpa);
-}
-
-fn appendWindowUpdate(gpa: std.mem.Allocator, wire: *std.ArrayList(u8), stream_id: u31, incr: u31) !void {
-    const frame = starh2.core.frame;
-    var buf: [13]u8 = undefined;
-    const n = try frame.Serializer.windowUpdate(&buf, stream_id, incr);
-    try wire.appendSlice(gpa, buf[0..n]);
-}
-
-fn appendRst(gpa: std.mem.Allocator, wire: *std.ArrayList(u8), stream_id: u31) !void {
-    const frame = starh2.core.frame;
-    var buf: [13]u8 = undefined;
-    const n = try frame.Serializer.rstStream(&buf, stream_id, .cancel);
-    try wire.appendSlice(gpa, buf[0..n]);
 }
 
 /// Incremental client-side H2 frame accumulator for live gates.
@@ -361,7 +305,7 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     starh2.edge.connection.test_write_delay_ms = 15;
     defer starh2.edge.connection.test_write_delay_ms = 0;
 
-    const open = try buildClientHelloWindow(gpa, "/big", stream_id, initial_win);
+    const open = try h2c.buildClientHelloWindow(gpa, "/big", stream_id, initial_win, .empty);
     defer gpa.free(open);
     try writeAllStream(stream, open);
 
@@ -401,8 +345,8 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
         const incr: u31 = @intCast(@min(step, need - sent));
         var boost: std.ArrayList(u8) = .empty;
         defer boost.deinit(gpa);
-        try appendWindowUpdate(gpa, &boost, stream_id, incr);
-        try appendWindowUpdate(gpa, &boost, 0, incr);
+        try h2c.appendWindowUpdate(gpa, &boost, stream_id, incr);
+        try h2c.appendWindowUpdate(gpa, &boost, 0, incr);
         client.noteWindowUpdate(stream_id, incr);
         client.noteWindowUpdate(0, incr);
         try writeAllStream(stream, boost.items);
@@ -499,14 +443,14 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     defer stream.close();
     starh2.edge.connection.test_write_delay_ms = 5;
     defer starh2.edge.connection.test_write_delay_ms = 0;
-    const open = try buildClientHelloWindow(gpa, "/cap", stream_id, initial_win);
+    const open = try h2c.buildClientHelloWindow(gpa, "/cap", stream_id, initial_win, .empty);
     defer gpa.free(open);
     try writeAllStream(stream, open);
     // SETTINGS enlarges only the per-stream send window. Raise the connection
     // window as well so the 192KiB response can drain after its first 65,535B.
     var conn_boost: std.ArrayList(u8) = .empty;
     defer conn_boost.deinit(gpa);
-    try appendWindowUpdate(gpa, &conn_boost, 0, BODY_192K);
+    try h2c.appendWindowUpdate(gpa, &conn_boost, 0, BODY_192K);
     try writeAllStream(stream, conn_boost.items);
 
     // Wait until sparse capacity waiter is observed for this stream.
@@ -586,7 +530,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     defer stream.close();
     starh2.edge.connection.test_write_delay_ms = 50;
     defer starh2.edge.connection.test_write_delay_ms = 0;
-    const open = try buildClientHelloWindow(gpa, "/cap", stream_id, initial_win);
+    const open = try h2c.buildClientHelloWindow(gpa, "/cap", stream_id, initial_win, .empty);
     defer gpa.free(open);
     try writeAllStream(stream, open);
 
@@ -599,7 +543,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
 
     var rst: std.ArrayList(u8) = .empty;
     defer rst.deinit(gpa);
-    try appendRst(gpa, &rst, stream_id);
+    try h2c.appendRst(gpa, &rst, stream_id);
     try writeAllStream(stream, rst.items);
 
     const evt = try result_ch.waitOne(3000);
@@ -645,7 +589,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
     var stream = try peer.connect(.{});
     // Keep socket open until result received (defer close after wait).
-    const open = try buildClientHelloWindow(gpa, "/rstblock", stream_id, 256);
+    const open = try h2c.buildClientHelloWindow(gpa, "/rstblock", stream_id, 256, .empty);
     defer gpa.free(open);
     try writeAllStream(stream, open);
 
@@ -658,7 +602,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
 
     var rst: std.ArrayList(u8) = .empty;
     defer rst.deinit(gpa);
-    try appendRst(gpa, &rst, stream_id);
+    try h2c.appendRst(gpa, &rst, stream_id);
     try writeAllStream(stream, rst.items);
 
     const evt = try result_ch.waitOne(3000);
@@ -712,7 +656,7 @@ fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         var stream = try peer.connect(.{});
         defer stream.close();
         // Tiny stream window so handler blocks inside send after HEADERS/DATA start.
-        const open = try buildClientHelloWindow(gpa, "/wf", 1, 256);
+        const open = try h2c.buildClientHelloWindow(gpa, "/wf", 1, 256, .empty);
         defer gpa.free(open);
         try writeAllStream(stream, open);
 
@@ -726,8 +670,8 @@ fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         starh2.edge.wire_pump.test_fail_next_write.store(true, .release);
         var boost: std.ArrayList(u8) = .empty;
         defer boost.deinit(gpa);
-        try appendWindowUpdate(gpa, &boost, 1, 64 * 1024);
-        try appendWindowUpdate(gpa, &boost, 0, 64 * 1024);
+        try h2c.appendWindowUpdate(gpa, &boost, 1, 64 * 1024);
+        try h2c.appendWindowUpdate(gpa, &boost, 0, 64 * 1024);
         writeAllStream(stream, boost.items) catch {};
 
         const evt = result_ch.waitOne(2000) catch |err| {
@@ -779,7 +723,7 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
         var stream = try peer.connect(.{});
         defer stream.close();
-        const open = try buildClientHelloWindow(gpa, "/slow", 1, 256);
+        const open = try h2c.buildClientHelloWindow(gpa, "/slow", 1, 256, .empty);
         defer gpa.free(open);
         try writeAllStream(stream, open);
         const evt = try result_ch.waitOne(3000);
@@ -794,7 +738,7 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
         var stream = try peer.connect(.{});
         defer stream.close();
-        const open = try buildClientHelloWindow(gpa, "/ok", 1, 64 * 1024);
+        const open = try h2c.buildClientHelloWindow(gpa, "/ok", 1, 64 * 1024, .empty);
         defer gpa.free(open);
         try writeAllStream(stream, open);
         var buf: [4096]u8 = undefined;
@@ -845,7 +789,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
     var stream = try peer.connect(.{});
     defer stream.close();
-    const open = try buildClientHelloWindow(gpa, "/big", 1, 256);
+    const open = try h2c.buildClientHelloWindow(gpa, "/big", 1, 256, .empty);
     defer gpa.free(open);
     try writeAllStream(stream, open);
 

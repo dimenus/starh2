@@ -36,6 +36,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Exported for dependents that need h2 client wire bytes (std.http.Client is h1-only).
+    const h2_client_mod = b.addModule("starh2_h2_client", .{
+        .root_source_file = b.path("src/h2_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "starh2", .module = starh2_mod },
+        },
+    });
+
     const lib_tests = b.addTest(.{
         .root_module = starh2_mod,
     });
@@ -122,6 +132,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
                 .{ .name = "zio", .module = zio_dep.module("zio") },
             },
         }),
@@ -135,6 +146,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
                 .{ .name = "zio", .module = zio_dep.module("zio") },
             },
         }),
