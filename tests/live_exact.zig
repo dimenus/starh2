@@ -246,15 +246,25 @@ fn okProgressHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Re
 fn waitAccountingZero(server: *starh2.Server, timeout_ms: u64) !void {
     var waited: u64 = 0;
     while (waited < timeout_ms) : (waited += 10) {
+        // Slots release strictly after handlers exit, so both must reach zero:
+        // live_handlers alone would pass while the slot is still held.
         if (server.accounting.active_streams.load(.acquire) == 0 and
             server.accounting.outbound_bytes.load(.acquire) == 0 and
             server.accounting.request_bytes.load(.acquire) == 0 and
-            starh2.edge.connection.test_observed_live_handlers.load(.acquire) == 0)
+            starh2.edge.connection.test_observed_live_handlers.load(.acquire) == 0 and
+            starh2.edge.connection.test_observed_slots_in_use.load(.acquire) == 0)
         {
             return;
         }
         zio.sleep(.fromMilliseconds(10)) catch {};
     }
+    std.debug.print("accounting stuck: active_streams={d} outbound_bytes={d} request_bytes={d} live_handlers={d} slots_in_use={d}\n", .{
+        server.accounting.active_streams.load(.acquire),
+        server.accounting.outbound_bytes.load(.acquire),
+        server.accounting.request_bytes.load(.acquire),
+        starh2.edge.connection.test_observed_live_handlers.load(.acquire),
+        starh2.edge.connection.test_observed_slots_in_use.load(.acquire),
+    });
     return error.AccountingTimeout;
 }
 

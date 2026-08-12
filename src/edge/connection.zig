@@ -25,9 +25,14 @@ pub var test_hold_completion_drain: std.atomic.Value(bool) = .init(false);
 pub var test_write_delay_ms: u64 = 0;
 /// Test-only: fail write pump after N successful writes (0 = never).
 pub var test_write_fail_after: u64 = 0;
-/// Test-only: last observed live_handlers (updated by actor loop).
+/// Test-only: handlers running across all connections. Published by the mutation
+/// itself, not by the actor loop: an idle actor parks until the next wakeup, so a
+/// value refreshed only per iteration stays stale for as long as the connection is
+/// quiet and reports handlers that have already exited.
 pub var test_observed_live_handlers: std.atomic.Value(usize) = .init(0);
-/// Test-only: slots currently in_use (updated on alloc/release).
+/// Test-only: handler slots held across all connections. Released strictly later
+/// than `test_observed_live_handlers` (the actor releases the slot after joining
+/// the handler), so a drain gate must require both to reach zero.
 pub var test_observed_slots_in_use: std.atomic.Value(usize) = .init(0);
 /// Test-only: FairScheduler emits observed by actor (mutation canary).
 pub var test_observed_sched_emits: std.atomic.Value(usize) = .init(0);
@@ -273,6 +278,13 @@ const Connection = struct {
     ciphertext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
     shutting_down: bool = false,
+    /// Set by a handler after it refills scheduler slab space; cleared by the
+    /// actor at the top of each iteration. Emission happens only in the
+    /// actor's drainEmit, so a refill that lands between the actor's drain and
+    /// its actor_wake.reset() would otherwise be a lost wakeup: the handler
+    /// then waits on space that only emission can free, and the actor sleeps
+    /// until an unrelated read or a protocol deadline.
+    sched_refilled: std.atomic.Value(bool) = .init(false),
     grace_deadline: ?std.Io.Timestamp = null,
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
@@ -933,14 +945,8 @@ const Connection = struct {
         }
 
         while (true) {
+            _ = self.sched_refilled.swap(false, .acq_rel);
             self.drainCompletions();
-
-            test_observed_live_handlers.store(self.live_handlers.load(.acquire), .release);
-            var slots_used: usize = 0;
-            for (self.handlers) |s| {
-                if (s.in_use) slots_used += 1;
-            }
-            test_observed_slots_in_use.store(slots_used, .release);
 
             {
                 self.session_mu.lockUncancelable(io);
@@ -977,6 +983,7 @@ const Connection = struct {
                 self.drainCompletions();
                 maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
                 if (maybe_chunk == null and
+                    !self.sched_refilled.load(.acquire) and
                     !self.writer_failed.load(.acquire) and
                     !(self.config.shutdown_flag != null and self.config.shutdown_flag.?.load(.acquire)))
                 {
@@ -1012,9 +1019,10 @@ const Connection = struct {
             if (self.session.terminal != .none) break;
         }
 
+        // shutdownHandlers returns only once every slot went through releaseSlot, so
+        // both counters have already been decremented for this connection. Storing 0
+        // here would clobber connections still serving on the same process.
         try self.shutdownHandlers();
-        test_observed_live_handlers.store(0, .release);
-        test_observed_slots_in_use.store(0, .release);
 
         if (self.tls_conn) |*tc| {
             const res = tls_edge.connectionClose(tc, self.ciphertext_scratch);
@@ -1159,6 +1167,7 @@ const Connection = struct {
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) {
                 slot.in_use = true;
+                _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
                 slot.stream_id = stream_id;
                 slot.terminal.clear();
                 _ = slot.terminal.generation.fetchAdd(1, .acq_rel);
@@ -1189,6 +1198,7 @@ const Connection = struct {
                 slot.reaper_reserved = false;
             }
             slot.in_use = false;
+            _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
             slot.terminal.clear();
             slot.completion_owner.store(reported, .release);
             // Event state is reset only when this slot is admitted again; every
@@ -1434,12 +1444,16 @@ const Connection = struct {
                 return error.OutOfMemory;
             };
             off += take;
+            self.sched_refilled.store(true, .release);
+            self.actor_wake.set(self.config.io);
         }
         if (bytes.len == 0 or end or flush_ticket != 0) {
             self.sched.enqueueDataBytes(stream_id, &.{}, end, flush_ticket, flush_slot, cap) catch {
                 if (flush_ticket != 0) return error.WriteFailed;
                 return error.OutOfMemory;
             };
+            self.sched_refilled.store(true, .release);
+            self.actor_wake.set(self.config.io);
         }
     }
 
@@ -1788,6 +1802,7 @@ const Connection = struct {
         job.resp.ctx = &job.hctx;
 
         _ = self.live_handlers.fetchAdd(1, .acq_rel);
+        _ = test_observed_live_handlers.fetchAdd(1, .acq_rel);
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
@@ -1830,6 +1845,7 @@ const Connection = struct {
                 self.actor_wake.set(self.config.io);
             }
             _ = self.live_handlers.fetchSub(1, .acq_rel);
+            _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
             job.arena.deinit();
             self.config.gpa.destroy(job);
         }
