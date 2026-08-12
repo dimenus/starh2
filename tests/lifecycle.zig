@@ -255,10 +255,7 @@ test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
-            .max_unused_stacks = 64,
-            .max_age = .fromSeconds(5),
-        },
+            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 64 },
         .executors = .exact(2),
         .enable_task_migration = true,
     });
@@ -406,10 +403,7 @@ test "waitForStreamSpace: cancel while blocked is lock-balanced under DebugAlloc
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
-            .max_unused_stacks = 8,
-            .max_age = .fromSeconds(5),
-        },
+            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 8, .prewarm = 8 },
         .executors = .exact(2),
         .enable_task_migration = true,
     });
@@ -452,10 +446,7 @@ test "lifecycle: 100x write-fail ticket wake (no hang)" {
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
-            .max_unused_stacks = 32,
-            .max_age = .fromSeconds(5),
-        },
+            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
         .enable_task_migration = true,
     });
@@ -595,10 +586,7 @@ test "lifecycle: global stream cap and cancellation storm" {
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
-            .max_unused_stacks = 64,
-            .max_age = .fromSeconds(5),
-        },
+            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 64 },
         .executors = .exact(2),
         .enable_task_migration = true,
     });
@@ -719,10 +707,7 @@ test "lifecycle: every public Server allocation failure unwinds cleanly" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
-            .max_unused_stacks = 16,
-            .max_age = .fromSeconds(5),
-        },
+            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         // FailingAllocator is deliberately not thread-safe. One executor makes
         // fail-index ordering deterministic while still exercising task unwind.
         .executors = .exact(1),
@@ -985,7 +970,7 @@ test "lifecycle: >64KiB body under small window + RST (stream 1)" {
     }
     const gpa = dbg.allocator();
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .max_unused_stacks = 32, .max_age = .fromSeconds(5) },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024 , .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
         .enable_task_migration = true,
     });
@@ -1001,7 +986,7 @@ test "lifecycle: >64KiB body under small window + RST (sparse stream id)" {
     }
     const gpa = dbg.allocator();
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .max_unused_stacks = 32, .max_age = .fromSeconds(5) },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024 , .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
         .enable_task_migration = true,
     });

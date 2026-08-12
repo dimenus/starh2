@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#fd16258e8fadec5aa74f13302efecd070593cb06",
-            .hash = "zio-0.16.0-xHbVVJQxIgAMdBlOCF65siVKJRVww9Z_ayfJanpk7VEK",
+            .url = "git+https://github.com/lalinsky/zio#a2b134a7abe35d9b29e8578fad30adc7a026fb4e",
+            .hash = "zio-0.17.0-xHbVVKr9JQBFsFjx4hcL4z3BkqyBkonICNTz5DdJxhE2",
         },
         .datastar = .{
             .url = "git+https://github.com/zigster64/datastar-sdk.zig#0c1f91f3d82ecd1dad3c53b9450db12623fc3408",

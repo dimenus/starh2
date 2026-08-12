@@ -107,10 +107,7 @@ test "counting allocator: Server.init under published ceiling" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
-            .max_unused_stacks = 16,
-            .max_age = .fromSeconds(5),
-        },
+            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         .executors = .exact(1),
     });
     defer rt.deinit();
@@ -168,10 +165,7 @@ test "fail-index iteration: Server.init fails closed" {
         const rt = zio.Runtime.init(gpa, .{
             .stack_pool = .{
                 .maximum_size = 1024 * 1024,
-                .committed_size = 64 * 1024,
-                .max_unused_stacks = 8,
-                .max_age = .fromSeconds(5),
-            },
+                .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 8, .prewarm = 8 },
             .executors = .exact(1),
         }) catch {
             saw_fail = true;
@@ -239,10 +233,7 @@ test "counting allocator peak under live hello stays under ceiling" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
-            .max_unused_stacks = 16,
-            .max_age = .fromSeconds(5),
-        },
+            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         // FailingAllocator is not thread-safe; serialize the counting path.
         .executors = .exact(1),
         .enable_task_migration = false,

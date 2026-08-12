@@ -180,7 +180,7 @@ pub const Limits = struct {
         const max_stack: usize = 1024 * 1024;
         const committed_stack: usize = 64 * 1024;
         // Exact topology: accept loops + per-conn (actor+read+write+ack) + handlers + reapers.
-        // Cached unused stacks: zio max_unused_stacks default documented as 256 in DESIGN §5.
+        // Cached unused stacks: zio stack_pool.prewarm/slab_slots floor; production uses prewarm=256.
         const per_conn_tasks: usize = 4;
         terms.tasks = try checkedAdd(
             try checkedAdd(self.max_endpoints, try checkedMul(self.max_connections, per_conn_tasks)),

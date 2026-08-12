@@ -814,7 +814,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
 fn spawnRt(gpa: std.mem.Allocator) !*zio.Runtime {
     return try zio.Runtime.init(gpa, .{
-        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .max_unused_stacks = 32, .max_age = .fromSeconds(5) },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024 , .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
         .enable_task_migration = true,
     });
