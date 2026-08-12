@@ -2,6 +2,8 @@
 zig-out/
 zig-pkg/
 zig-out-linux/
+zig-out-musl/
+zig-out-musl-arm/
 testdata/*.pem
 tools/h2spec/h2spec
 *.o
