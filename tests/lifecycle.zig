@@ -995,3 +995,74 @@ test "lifecycle: >64KiB body under small window + RST (sparse stream id)" {
     var h = try rt.spawn(runLargeBodyWindowGate, .{ rt, gpa, @as(u31, 1_000_001) });
     try h.join();
 }
+
+fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } },
+    };
+
+    // --- Success: .listening must mean connectable, with no sleep to cover a race. ---
+    const any_port = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try starh2.Server.init(gpa, rt, .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = any_port }},
+        .routes = &routes,
+        .tls = null,
+    });
+    defer server.deinit(gpa);
+    try std.testing.expectEqual(starh2.BindState.pending, server.bind_state.load(.acquire));
+
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const port = server.localAddress(0).getPort();
+    try std.testing.expect(port != 0);
+    {
+        // Connect immediately: if readiness were published before accept was live
+        // this is what would fail.
+        const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+        var stream = try peer.connect(.{});
+        defer stream.close();
+        const wire = try h2c.buildClientHello(gpa, "/hello");
+        defer gpa.free(wire);
+        try writeAllStream(stream, wire);
+        try waitAccountingZero(&server, 5_000);
+    }
+
+    // A second wait on an already-listening server returns immediately.
+    try server.waitUntilListening(0);
+
+    server.requestShutdown();
+    try serve_handle.join();
+
+    // --- Failure: an occupied port must report .failed, not time out. ---
+    const taken = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var squatter = try taken.listen(.{ .reuse_address = false });
+    defer squatter.close();
+    const squatted = squatter.socket.address.ip;
+
+    var doomed = try starh2.Server.init(gpa, rt, .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = squatted }},
+        .routes = &routes,
+        .tls = null,
+    });
+    defer doomed.deinit(gpa);
+    var doomed_handle = try rt.spawn(starh2.Server.serve, .{ &doomed, gpa });
+    try std.testing.expectError(error.BindFailed, doomed.waitUntilListening(5 * std.time.ns_per_s));
+    try std.testing.expectError(error.ListenFailed, doomed_handle.join());
+}
+
+test "lifecycle: waitUntilListening is authoritative for bind success and failure" {
+    var dbg = std.heap.DebugAllocator(.{}).init;
+    defer {
+        if (dbg.deinit() != .ok) @panic("DebugAllocator leak after readiness gate");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
+        .executors = .exact(2),
+        .enable_task_migration = true,
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(runListeningReadiness, .{ rt, gpa });
+    try h.join();
+}

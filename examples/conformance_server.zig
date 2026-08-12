@@ -203,15 +203,26 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     defer server.deinit(gpa);
 
     // Start serve in background-ish: we need localAddress after bind.
-    // serve() binds then loops — spawn it and poll for address.
+    // serve() binds then loops — spawn it and wait for it to publish .listening.
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
-    errdefer {
+    // Cleared once serve() has already returned on its own; cancelling a handle
+    // we have joined would consume it twice.
+    var serve_running = true;
+    errdefer if (serve_running) {
         server.requestShutdown();
         serve_handle.cancel();
-    }
+    };
 
-    // Wait briefly for bind
-    zio.sleep(.fromMilliseconds(50)) catch {};
+    // The ready line is a contract: harnesses connect the moment they read it,
+    // so it must not be printed on a timer. On a bind failure, surface serve()'s
+    // real error rather than the wait's generic BindFailed.
+    server.waitUntilListening(5 * std.time.ns_per_s) catch |err| {
+        if (err == error.BindFailed) {
+            serve_running = false;
+            try serve_handle.join();
+        }
+        return err;
+    };
     const local = server.localAddress(0);
     const port = local.getPort();
 

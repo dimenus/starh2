@@ -48,6 +48,20 @@ const ConnSlot = struct {
     occupied: bool = false,
 };
 
+/// Observable progress of `serve`'s startup. `serve` binds inside the spawned
+/// task, so a caller that only holds the JoinHandle cannot tell "listening" from
+/// "about to fail BindFailed" without racing on a sleep. Embedders gate their
+/// own cutover on this (qmdsync disables its HTTP/1.1 UI only once the h2
+/// listener is up), so the answer has to be authoritative, not timed.
+pub const BindState = enum(u8) {
+    /// serve() has not finished binding and spawning accept loops yet.
+    pending,
+    /// Every endpoint is bound and its accept loop is running.
+    listening,
+    /// serve() gave up during startup and is returning an error.
+    failed,
+};
+
 pub const Server = struct {
     gpa: std.mem.Allocator,
     runtime: *zio.Runtime,
@@ -67,6 +81,7 @@ pub const Server = struct {
     conn_slots: []ConnSlot = &.{},
     conn_slots_mu: zio.Mutex = .init,
     listeners_bound: usize = 0,
+    bind_state: std.atomic.Value(BindState) = .init(.pending),
 
     pub fn init(gpa: std.mem.Allocator, runtime: *zio.Runtime, config: ServerConfig) InitError!Server {
         _ = try config.limits.resourceUpperBound();
@@ -169,11 +184,16 @@ pub const Server = struct {
     pub fn serve(self: *Server, gpa: std.mem.Allocator) ServeError!void {
         std.debug.assert(gpa.vtable == self.gpa.vtable);
         self.listeners_bound = 0;
+        self.bind_state.store(.pending, .release);
         errdefer {
             var i: usize = 0;
             while (i < self.listeners_bound) : (i += 1) self.listeners[i].close();
             self.listeners_bound = 0;
         }
+        // Fires on every error return below (bind, reaper spawn, accept spawn),
+        // so a waiter is released with .failed instead of waiting out its timeout.
+        // Nothing after the .listening store can return an error.
+        errdefer self.bind_state.store(.failed, .release);
         for (self.endpoints, 0..) |ep, i| {
             const addr = switch (ep) {
                 .tls_h2 => |a| a,
@@ -223,6 +243,10 @@ pub const Server = struct {
             };
             accepts_started += 1;
         }
+
+        // Published only once every endpoint is bound AND its accept loop is
+        // live, so a released waiter can immediately connect.
+        self.bind_state.store(.listening, .release);
 
         while (!self.shutdown_flag.load(.acquire)) {
             zio.sleep(.fromMilliseconds(50)) catch break;
@@ -370,6 +394,40 @@ pub const Server = struct {
 
     pub fn requestShutdown(self: *Server) void {
         self.shutdown_flag.store(true, .release);
+    }
+
+    pub const WaitListeningError = error{
+        /// serve() failed during startup; join its handle for the specific error.
+        BindFailed,
+        /// Still pending when the budget ran out — serve() may not have been spawned.
+        Timeout,
+        Canceled,
+    };
+
+    /// Block the calling task until `serve` is accepting on every endpoint.
+    ///
+    /// Callers spawn `serve` and then need to know whether the socket is actually
+    /// up before they act on it — `localAddress` reads uninitialized storage until
+    /// this returns, and an embedder that tears down its fallback path on the
+    /// strength of a spawn alone loses the listener silently when the bind fails.
+    pub fn waitUntilListening(self: *Server, timeout_ns: u64) WaitListeningError!void {
+        const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% timeout_ns;
+        while (true) {
+            switch (self.bind_state.load(.acquire)) {
+                .listening => return,
+                .failed => return error.BindFailed,
+                .pending => {},
+            }
+            if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
+                // Re-check: a transition can land between the load and the deadline.
+                return switch (self.bind_state.load(.acquire)) {
+                    .listening => {},
+                    .failed => error.BindFailed,
+                    .pending => error.Timeout,
+                };
+            }
+            zio.sleep(.fromMilliseconds(1)) catch return error.Canceled;
+        }
     }
 
     pub fn localAddress(self: *const Server, endpoint_index: usize) EndpointAddress {

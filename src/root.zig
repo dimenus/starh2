@@ -42,6 +42,7 @@ pub const EndpointAddress = edge.server.EndpointAddress;
 pub const TlsConfig = edge.server.TlsConfig;
 pub const InitError = edge.server.InitError;
 pub const ServeError = edge.server.ServeError;
+pub const BindState = edge.server.BindState;
 pub const Handler = http.router.Handler;
 pub const Route = http.router.Route;
 pub const Request = http.request.Request;
