@@ -697,12 +697,11 @@ const Connection = struct {
             else => {},
         };
 
-        // Release any wire chunks still queued (AckDrainer may not see them if pump died).
-        while (self.write_ch.tryReceive()) |chunk| {
-            if (chunk.bytes.len != 0) self.config.gpa.free(chunk.bytes);
-            self.applyOutboundRelease(chunk.outbound_release, .wire);
-            if (chunk.control_entry) self.applyControlRelease(chunk.control_release, true);
-        } else |_| {}
+        // Do NOT drain write_ch here. WritePump is the sole consumer while the
+        // connection is live; stealing chunks races AckDrainer wire releases
+        // (and can double-free payload bytes). Queued wire is released via
+        // WritePump failDrain/ack or Connection.deinit after pumps join.
+        self.write_ch.send(.{ .bytes = &.{}, .len = 0 }) catch {};
 
         self.wakeAllSpace();
         self.session.terminal = .transport;
@@ -1030,7 +1029,14 @@ const Connection = struct {
                 slot.completion_owner.store(live, .release);
                 slot.reaper_reserved = false;
                 self.handler_joins[i] = null;
-                if (i < self.space_sems.len) self.space_sems[i] = .{ .permits = 0 };
+                // Reset permits only — never rebuild the Semaphore (mutex/cond must
+                // stay valid while AckDrainer may be in wakeAllSpace → post).
+                if (i < self.space_sems.len) {
+                    const sem = &self.space_sems[i];
+                    sem.mutex.lockUncancelable();
+                    sem.permits = 0;
+                    sem.mutex.unlock();
+                }
                 return slot;
             }
         }
@@ -1055,7 +1061,10 @@ const Connection = struct {
             slot.terminal.clear();
             slot.completion_owner.store(reported, .release);
             self.handler_joins[i] = null;
-            if (i < self.space_sems.len) self.space_sems[i] = .{ .permits = 0 };
+            // Never reassign space_sems[i] = .{ .permits = 0 }: that rebuilds the
+            // embedded Mutex/Condition while AckDrainer may be inside wakeAllSpace
+            // → post() (ReleaseSafe unreachable under the live mutex). Extra
+            // permits on slot reuse are harmless — waitForStreamSpace rechecks cap.
         }
     }
 
