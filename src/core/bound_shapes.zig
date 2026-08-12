@@ -1,7 +1,6 @@
 //! Concrete allocation shapes for Limits.resourceUpperBound — no magic estimates.
 //! HashMap bytes use Zig 0.16 `std.hash_map` allocate layout (Header + Metadata + keys + values).
 const std = @import("std");
-const zio = @import("zio");
 const ticket_table = @import("../edge/ticket_table.zig");
 const wire_pump = @import("../edge/wire_pump.zig");
 const stream_mod = @import("stream.zig");
@@ -9,6 +8,7 @@ const frame = @import("frame.zig");
 const hpack = @import("hpack.zig");
 const session_mod = @import("session.zig");
 const fair_scheduler = @import("../edge/fair_scheduler.zig");
+const router_mod = @import("../http/router.zig");
 
 /// Zig `default_max_load_percentage` — must match std.hash_map.
 pub const HASH_MAP_MAX_LOAD_PERCENTAGE: u32 = 80;
@@ -62,8 +62,7 @@ pub fn hashMapBytes(comptime K: type, comptime V: type, n: usize) error{Overflow
     return hashMapBytesForCapacity(K, V, cap);
 }
 
-pub const JOIN_HANDLE_SIZE: usize = @sizeOf(zio.JoinHandle(void));
-pub const CONN_SLOT_SIZE: usize = @sizeOf(struct { handle: ?zio.JoinHandle(void) = null, occupied: bool = false });
+pub const JOIN_HANDLE_SIZE: usize = @sizeOf(std.Io.Future(void));
 pub const WIRE_CHUNK_DESC_SIZE: usize = @sizeOf(wire_pump.WireChunk);
 pub const WRITE_COMPLETION_SIZE: usize = @sizeOf(wire_pump.WriteCompletion);
 pub const TICKET_WAIT_SIZE: usize = @sizeOf(ticket_table.TicketWait);
@@ -73,7 +72,14 @@ pub const INTENT_SIZE: usize = @sizeOf(session_mod.Intent);
 pub const DATA_PENDING_SIZE: usize = @sizeOf(fair_scheduler.DataPending);
 pub const CONTROL_ENTRY_SIZE: usize = @sizeOf(fair_scheduler.ControlEntry);
 pub const FramedDataEntryShape = fair_scheduler.FramedDataEntry;
-pub const SEMAPHORE_SIZE: usize = @sizeOf(zio.Semaphore);
+pub const EVENT_SIZE: usize = @sizeOf(std.Io.Event);
+pub const ROUTE_SIZE: usize = @sizeOf(router_mod.Route);
+pub const ENDPOINT_CONFIG_SIZE: usize = @sizeOf(union(enum) {
+    tls_h2: std.Io.net.IpAddress,
+    h2c_prior_knowledge: std.Io.net.IpAddress,
+});
+pub const LISTENER_SIZE: usize = @sizeOf(std.Io.net.Server);
+pub const ENDPOINT_ADDRESS_SIZE: usize = @sizeOf(std.Io.net.IpAddress);
 
 /// Per-stream map entry bound (key u31 + Stream value) under HashMap policy.
 pub fn streamMapBytes(max_streams: usize) error{Overflow}!usize {

@@ -30,7 +30,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zio", .module = zio_dep.module("zio") },
             .{ .name = "datastar", .module = datastar_dep.module("datastar") },
             .{ .name = "tls", .module = tls_dep.module("tls") },
         },
@@ -139,6 +138,22 @@ pub fn build(b: *std.Build) void {
     });
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
 
+    const backend_parity_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/backend_parity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_backend_parity_tests = b.addRunArtifact(backend_parity_tests);
+    const backend_parity_step = b.step("test-backend-parity", "Run std.Io backend parity and wakeup gates");
+    backend_parity_step.dependOn(&run_backend_parity_tests.step);
+
     const live_exact_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/live_exact.zig"),
@@ -187,6 +202,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_interop_tests.step);
     test_step.dependOn(&run_regression_tests.step);
     test_step.dependOn(&run_lifecycle_tests.step);
+    test_step.dependOn(&run_backend_parity_tests.step);
     test_step.dependOn(&run_live_exact_tests.step);
     test_step.dependOn(&run_writer_tests.step);
     test_step.dependOn(&run_scheduler_tests.step);
@@ -258,7 +274,6 @@ pub fn build(b: *std.Build) void {
             .target = rt,
             .optimize = .ReleaseSafe,
             .imports = &.{
-                .{ .name = "zio", .module = zio_rt.module("zio") },
                 .{ .name = "datastar", .module = datastar_rt.module("datastar") },
                 .{ .name = "tls", .module = tls_rt.module("tls") },
             },

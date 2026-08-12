@@ -170,7 +170,7 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !struct {
 
 fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process.Args, io: std.Io) !void {
     const args = try parseArgs(gpa, process_args);
-    const addr = try zio.net.IpAddress.parseIp4(args.host, args.port);
+    const addr = try starh2.EndpointAddress.parseIp4(args.host, args.port);
 
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } },
@@ -195,7 +195,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         break :blk .{ .tls_h2 = addr };
     } else .{ .h2c_prior_knowledge = addr };
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{ep},
         .routes = &routes,
         .tls = tls_cfg,

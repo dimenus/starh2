@@ -265,7 +265,7 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     starh2.edge.connection.test_boot_ready.store(false, .release);
     starh2.edge.connection.test_queue_wire_bypass.store(0, .release);
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = bigBodyHandler } },
     };
@@ -280,7 +280,7 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -405,7 +405,7 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     starh2.edge.connection.test_waiting_for_space.store(0, .release);
     starh2.edge.connection.test_queue_wire_bypass.store(0, .release);
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/cap", .handler = .{ .ptr = @constCast(&dummy), .runFn = capWaitBodyHandler } },
     };
@@ -421,7 +421,7 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -494,7 +494,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     handler_entered.store(false, .release);
     starh2.edge.connection.test_waiting_for_space.store(0, .release);
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/cap", .handler = .{ .ptr = @constCast(&dummy), .runFn = rstBlockHandler } },
     };
@@ -509,7 +509,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -557,7 +557,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     result_ch.reset();
     handler_entered.store(false, .release);
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/rstblock", .handler = .{ .ptr = @constCast(&dummy), .runFn = rstBlockHandler } },
     };
@@ -571,7 +571,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -614,7 +614,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
 }
 
 fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/wf", .handler = .{ .ptr = @constCast(&dummy), .runFn = writeFailHandler } },
     };
@@ -627,7 +627,7 @@ fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -687,7 +687,7 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     result_ch.reset();
     handler_entered.store(false, .release);
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/slow", .handler = .{ .ptr = @constCast(&dummy), .runFn = slowBlockHandler } },
         .{ .method = .GET, .path = "/ok", .handler = .{ .ptr = @constCast(&dummy), .runFn = okProgressHandler } },
@@ -703,7 +703,7 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -761,7 +761,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     result_ch.reset();
     handler_entered.store(false, .release);
 
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = bigBodyHandler } },
     };
@@ -775,7 +775,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.graceful_drain_timeout_ns = 100 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,

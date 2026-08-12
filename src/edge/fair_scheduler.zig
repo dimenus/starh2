@@ -3,7 +3,6 @@
 //! Pending DATA uses boot-reserved per-stream slabs (no post-boot GPA growth).
 //! Nonterminal controls counted only when emitted.
 const std = @import("std");
-const zio = @import("zio");
 const control_pool = @import("control_pool.zig");
 const frame = @import("../core/frame.zig");
 
@@ -72,6 +71,7 @@ pub const BuildDataFrame = *const fn (*anyopaque, u31, []const u8, bool) anyerro
 
 pub const FairScheduler = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     ctrl: control_pool.ControlPool,
     terminal_q: []ControlEntry,
     terminal_head: usize = 0,
@@ -103,6 +103,7 @@ pub const FairScheduler = struct {
 
     pub fn init(
         gpa: std.mem.Allocator,
+        io: std.Io,
         ctrl_bytes: usize,
         ctrl_entries: usize,
         terminal_cap: usize,
@@ -131,6 +132,7 @@ pub const FairScheduler = struct {
         }
         return .{
             .gpa = gpa,
+            .io = io,
             .ctrl = control_pool.ControlPool.init(ctrl_bytes, ctrl_entries),
             .terminal_q = tq,
             .ordinary_q = oq,
@@ -207,6 +209,17 @@ pub const FairScheduler = struct {
 
     pub fn pendingCount(self: *const FairScheduler) usize {
         return self.active_pending;
+    }
+
+    pub fn nextSlowDeadlineNs(self: *const FairScheduler, timeout_ns: u64) ?u64 {
+        if (timeout_ns == 0) return null;
+        var next: ?u64 = null;
+        for (self.pending_slots) |slot| {
+            if (slot.stream_id == 0 or slot.len == 0 or slot.last_progress_ns == 0) continue;
+            const deadline = slot.last_progress_ns +% timeout_ns;
+            if (next == null or deadline < next.?) next = deadline;
+        }
+        return next;
     }
 
     pub fn contains(self: *FairScheduler, stream_id: u31) bool {
@@ -306,7 +319,7 @@ pub const FairScheduler = struct {
         @memcpy(pw.slab[pw.len..][0..bytes.len], bytes);
         pw.len += bytes.len;
         if (end) pw.end_stream = true;
-        pw.last_progress_ns = zio.Timestamp.now(.monotonic).toNanoseconds();
+        pw.last_progress_ns = nowNs(self.io);
         if (flush_ticket != 0) {
             pw.flush_ticket = flush_ticket;
             pw.flush_slot = flush_slot;
@@ -482,7 +495,7 @@ pub const FairScheduler = struct {
                 const rest = pw.len - take;
                 if (rest > 0) @memmove(pw.slab[0..rest], pw.slab[take..][0..rest]);
                 pw.len = rest;
-                pw.last_progress_ns = zio.Timestamp.now(.monotonic).toNanoseconds();
+                pw.last_progress_ns = nowNs(self.io);
                 if (end or (pw.len == 0 and pw.end_stream)) {
                     self.freePending(pw);
                 }
@@ -548,9 +561,13 @@ pub const FairScheduler = struct {
     }
 };
 
+fn nowNs(io: std.Io) u64 {
+    return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
+
 test "scheduler queues own payloads and hold control until complete" {
     const gpa = std.testing.allocator;
-    var sched = try FairScheduler.init(gpa, 64 * 1024, 256, 16, 256, 8, 64 * 1024);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, 64 * 1024);
     defer sched.deinit();
     const p = try gpa.dupe(u8, "helloctl");
     try sched.enqueueControl(p, .ordinary, 0, 0);
@@ -561,7 +578,7 @@ test "scheduler queues own payloads and hold control until complete" {
 
 test "pending DATA uses boot slab without GPA growth" {
     const gpa = std.testing.allocator;
-    var sched = try FairScheduler.init(gpa, 1024, 32, 4, 32, 2, 1024);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, 1024);
     defer sched.deinit();
     try sched.enqueueDataBytes(1, "hello", false, 0, 0, 1024);
     try std.testing.expectEqual(@as(usize, 5), sched.pendingByteLen(1));

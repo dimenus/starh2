@@ -459,6 +459,7 @@ pub const Session = struct {
         if (self.stream_hooks) |h| h.onRelease(h.ctx);
         // Drop map entry; late frames classify via bounded tombstones.
         if (!self.isTombstoned(stream_id)) {
+            // Tombstone exhaustion still permits removal; late frames use generic closed-stream rules.
             self.addTombstone(stream_id, .no_error) catch {};
         }
         _ = self.streams.remove(stream_id);
@@ -593,6 +594,23 @@ pub const Session = struct {
             _ = self.body_idle_ns.remove(sid);
             try self.emitRst(sid, .cancel);
         }
+    }
+
+    /// Earliest edge-owned idle deadline, or null when no protocol timer is armed.
+    /// This only derives protocol state; the edge chooses how to wait for it.
+    pub fn nextIdleDeadlineNs(self: *Session) ?u64 {
+        var next: ?u64 = null;
+        if (self.expect_continuation != null and self.field_block_started_ns != 0) {
+            next = self.field_block_started_ns +% self.limits.field_block_timeout_ns;
+        }
+        var it = self.body_idle_ns.iterator();
+        while (it.next()) |entry| {
+            const started = entry.value_ptr.*;
+            if (started == 0) continue;
+            const deadline = started +% self.limits.request_body_idle_timeout_ns;
+            if (next == null or deadline < next.?) next = deadline;
+        }
+        return next;
     }
 
     fn onSettings(self: *Session, hdr: frame.FrameHeader, payload: []const u8) !void {
@@ -974,6 +992,7 @@ pub const Session = struct {
             // Early-rejected streams: trailers close remote; ensure the one HTTP response exists.
             if (s.early_status) |st| {
                 self.decoder.freeResult(decoded);
+                // The early-reject state is already terminal and owns the response.
                 s.onHeaders(true) catch {};
                 try self.emitEarlyReject(stream_id, st);
                 self.releaseConcurrency(stream_id);
@@ -995,6 +1014,7 @@ pub const Session = struct {
             if (err == error.PathTooLong) {
                 s.refused_before_dispatch = true;
                 s.early_status = 414;
+                // The early-reject state is already terminal and owns the response.
                 s.onHeaders(self.header_end_stream) catch {};
                 try self.emitEarlyReject(stream_id, 414);
                 self.releaseConcurrency(stream_id);
@@ -1055,6 +1075,7 @@ pub const Session = struct {
                 }
                 break :blk list.toOwnedSlice(self.allocator) catch |err| {
                     list.deinit(self.allocator);
+                    // Preserve the original allocation error if fail-closed signaling also allocates.
                     self.failClosedInternal() catch {};
                     return err;
                 };

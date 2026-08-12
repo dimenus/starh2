@@ -1,6 +1,5 @@
 //! Connection actor: owns Session, TLS (optional), HPACK, fair write scheduling.
 const std = @import("std");
-const zio = @import("zio");
 const tls = @import("tls");
 const session_mod = @import("../core/session.zig");
 const hpack = @import("../core/hpack.zig");
@@ -16,6 +15,7 @@ const rates_mod = @import("../core/rates.zig");
 const ticket_table = @import("ticket_table.zig");
 const control_pool = @import("control_pool.zig");
 const fair_scheduler = @import("fair_scheduler.zig");
+const io_queue = @import("io_queue.zig");
 
 /// Test-only: when true, handler spawn fails closed into synchronous runHandlerJob.
 pub var test_force_spawn_fail: bool = false;
@@ -48,16 +48,28 @@ pub var test_last_peer_reset_code: std.atomic.Value(u32) = .init(0);
 pub var test_waiting_for_space: std.atomic.Value(u32) = .init(0);
 /// Test-only: Connection finished boot allocations (pools, sched slabs, session maps).
 pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
+/// Test-only gate that parks the actor immediately before its event-driven wait.
+pub var test_hold_before_actor_wait: std.atomic.Value(bool) = .init(false);
+pub var test_actor_waiting: std.Io.Event = .unset;
+pub var test_release_actor_wait: std.Io.Event = .unset;
+/// Test-only fallback timer raced against actor events by the wakeup canary.
+pub var test_polling_canary_tick_ns: std.atomic.Value(u64) = .init(0);
+
+fn nowNs(io: std.Io) u64 {
+    return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
 
 pub const Mode = enum { h2c, tls_h2 };
 
 pub const ConnConfig = struct {
+    io: std.Io,
     mode: Mode,
     limits: limits_mod.Limits,
     router: router_mod.Router,
     tls_auth: ?*tls.config.CertKeyPair = null,
     gpa: std.mem.Allocator,
     shutdown_flag: ?*std.atomic.Value(bool) = null,
+    shutdown_event: ?*std.Io.Event = null,
     reaper: ?*ReaperPool = null,
     /// Server-wide stream + reaper reservation (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
@@ -162,9 +174,10 @@ const reaper_owned: u8 = 1;
 const reported: u8 = 2;
 
 pub const ReaperJob = struct {
-    handle: zio.JoinHandle(void),
+    handle: std.Io.Future(void),
     owner: *std.atomic.Value(u8),
-    completion: *zio.Channel(u31),
+    completion: *std.Io.Queue(u31),
+    actor_wake: *std.Io.Event,
     stream_id: u31,
 };
 
@@ -178,14 +191,14 @@ comptime {
 }
 
 pub const ReaperPool = struct {
-    jobs: zio.Channel(ReaperJob),
+    io: std.Io,
+    jobs: std.Io.Queue(ReaperJob),
     job_buf: []ReaperJob,
     gpa: std.mem.Allocator,
-    shut: std.atomic.Value(bool) = .init(false),
 
-    pub fn init(gpa: std.mem.Allocator, capacity: usize) !ReaperPool {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, capacity: usize) !ReaperPool {
         const buf = try gpa.alloc(ReaperJob, capacity);
-        return .{ .jobs = .init(buf), .job_buf = buf, .gpa = gpa };
+        return .{ .io = io, .jobs = .init(buf), .job_buf = buf, .gpa = gpa };
     }
 
     pub fn deinit(self: *ReaperPool) void {
@@ -194,41 +207,30 @@ pub const ReaperPool = struct {
         self.* = undefined;
     }
 
-    pub fn worker(self: *ReaperPool) void {
-        while (!self.shut.load(.acquire)) {
-            var job = self.jobs.receive() catch break;
-            job.handle.cancel();
+    pub fn worker(self: *ReaperPool) std.Io.Cancelable!void {
+        while (true) {
+            var job = self.jobs.getOne(self.io) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => return error.Canceled,
+            };
+            job.handle.cancel(self.io);
             const prev = job.owner.swap(reported, .acq_rel);
             if (prev == reaper_owned) {
-                job.completion.send(job.stream_id) catch {};
+                job.completion.putOneUncancelable(self.io, job.stream_id) catch {
+                    // Connection teardown has already closed completion delivery.
+                };
+                job.actor_wake.set(self.io);
             }
         }
-        // Drain any remaining jobs after close(.graceful).
-        while (self.jobs.tryReceive()) |job_val| {
-            var job = job_val;
-            job.handle.cancel();
-            const prev = job.owner.swap(reported, .acq_rel);
-            if (prev == reaper_owned) {
-                job.completion.send(job.stream_id) catch {};
-            }
-        } else |_| {}
     }
 };
 
-pub fn serveAccepted(stream: zio.net.Stream, config: ConnConfig) void {
-    // TCP_NODELAY before first read — failure closes socket.
-    stream.socket.setNoDelay(true) catch {
-        if (config.handshake_held) {
-            if (config.accounting) |a| a.releaseHandshake();
-        }
-        stream.close();
-        return;
-    };
+pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cancelable!void {
     var conn = Connection.init(stream, config) catch {
         if (config.handshake_held) {
             if (config.accounting) |a| a.releaseHandshake();
         }
-        stream.close();
+        stream.close(config.io);
         return;
     };
     defer conn.deinit();
@@ -241,19 +243,28 @@ pub fn serveAccepted(stream: zio.net.Stream, config: ConnConfig) void {
     // Seed read-chunk free list after channels are live.
     var i: u32 = 0;
     while (i < conn.read_pool_n) : (i += 1) {
-        conn.read_free_ch.send(i) catch {};
+        conn.read_free_ch.putOneUncancelable(config.io, i) catch {
+            // Fresh queue capacity exactly matches the number of pool indices.
+            unreachable;
+        };
     }
-    conn.run() catch {};
+    conn.run() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            // Transport/protocol failure is connection-local and closes below.
+        },
+    };
 }
 
 const Connection = struct {
-    stream: zio.net.Stream,
+    stream: std.Io.net.Stream,
     config: ConnConfig,
     session: session_mod.Session,
     read_ch_buf: []wire_pump.WireChunk,
     write_ch_buf: []wire_pump.WireChunk,
-    read_ch: zio.Channel(wire_pump.WireChunk) = undefined,
-    write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
+    read_ch: std.Io.Queue(wire_pump.WireChunk) = undefined,
+    write_ch: std.Io.Queue(wire_pump.WireChunk) = undefined,
+    actor_wake: std.Io.Event = .unset,
     tls_server: ?tls.nonblock.Server = null,
     tls_conn: ?tls.nonblock.Connection = null,
     tls_prng: std.Random.DefaultPrng = undefined,
@@ -262,21 +273,21 @@ const Connection = struct {
     ciphertext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
     shutting_down: bool = false,
-    grace_deadline: ?zio.Timestamp = null,
+    grace_deadline: ?std.Io.Timestamp = null,
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
-    session_mu: zio.Mutex = .init,
+    session_mu: std.Io.Mutex = .init,
     live_handlers: std.atomic.Value(usize) = .init(0),
     reaper: ?*ReaperPool = null,
     completion_ch_buf: []u31 = &.{},
-    completion_ch: zio.Channel(u31) = undefined,
+    completion_ch: std.Io.Queue(u31) = undefined,
     write_ack_buf: []wire_pump.WriteCompletion = &.{},
-    write_ack_ch: zio.Channel(wire_pump.WriteCompletion) = undefined,
+    write_ack_ch: std.Io.Queue(wire_pump.WriteCompletion) = undefined,
     ticket_slots: []ticket_table.TicketWait = &.{},
     tickets: ticket_table.TicketTable = undefined,
     /// Indexed parallel to handlers; only valid while slot.in_use.
-    handler_joins: []?zio.JoinHandle(void) = &.{},
-    handshake_deadline: ?zio.Timestamp = null,
+    handler_joins: []?std.Io.Future(void) = &.{},
+    handshake_deadline: ?std.Io.Timestamp = null,
     /// Connection-local outbound/request reservations — AckDrainer + actor under atomics.
     outbound_held: std.atomic.Value(usize) = .init(0),
     pending_outbound_held: std.atomic.Value(usize) = .init(0),
@@ -287,18 +298,15 @@ const Connection = struct {
     /// Set by AckDrainer on write failure; actor owns handler terminal transition.
     writer_failed: std.atomic.Value(bool) = .init(false),
     writer_fail_handled: bool = false,
-    /// Bounded writer-failure event (AckDrainer → actor). Capacity 1.
-    writer_fail_buf: [1]u8 = .{0},
-    writer_fail_ch: zio.Channel(u8) = undefined,
-    /// Capacity waiters: one zio.Semaphore per HandlerSlot (slotIndex(stream_id); sparse IDs safe).
-    space_sems: []zio.Semaphore = &.{},
+    /// Capacity waiters: one std.Io.Event per HandlerSlot (sparse IDs safe).
+    space_events: []std.Io.Event = &.{},
     /// Actor-owned intent batch — filled by drainIntentsInto (no nested Session drain).
     intent_batch: []session_mod.Intent = &.{},
     rates: rates_mod.RateLimiter = .{},
     /// Fixed inbound wire chunk pool.
     read_chunk_storage: []u8 = &.{},
     read_free_buf: []u32 = &.{},
-    read_free_ch: zio.Channel(u32) = undefined,
+    read_free_ch: std.Io.Queue(u32) = undefined,
     read_pool_n: u32 = 0,
     /// Preallocated scratch for stream-id sweeps (no hot-path ArrayList).
     sid_scratch: []u31 = &.{},
@@ -319,7 +327,7 @@ const Connection = struct {
         end_stream: bool,
     };
 
-    fn init(stream: zio.net.Stream, config: ConnConfig) !Connection {
+    fn init(stream: std.Io.net.Stream, config: ConnConfig) !Connection {
         const gpa = config.gpa;
         var session = try session_mod.Session.init(gpa, config.limits);
         errdefer session.deinit();
@@ -360,7 +368,7 @@ const Connection = struct {
         errdefer gpa.free(write_ch_buf);
         const handlers = try gpa.alloc(HandlerSlot, config.limits.max_streams_per_connection);
         errdefer gpa.free(handlers);
-        const handler_joins = try gpa.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
+        const handler_joins = try gpa.alloc(?std.Io.Future(void), config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_joins);
         const completion_ch_buf = try gpa.alloc(u31, config.limits.max_streams_per_connection);
         errdefer gpa.free(completion_ch_buf);
@@ -379,9 +387,9 @@ const Connection = struct {
         errdefer gpa.free(read_free_buf);
         const sid_scratch = try gpa.alloc(u31, config.limits.max_streams_per_connection);
         errdefer gpa.free(sid_scratch);
-        const space_sems = try gpa.alloc(zio.Semaphore, config.limits.max_streams_per_connection);
-        errdefer gpa.free(space_sems);
-        @memset(space_sems, .{ .permits = 0 });
+        const space_events = try gpa.alloc(std.Io.Event, config.limits.max_streams_per_connection);
+        errdefer gpa.free(space_events);
+        @memset(space_events, .unset);
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
         errdefer gpa.free(intent_batch);
         var tls_recv_acc: std.ArrayList(u8) = .empty;
@@ -397,6 +405,7 @@ const Connection = struct {
         const term_cap = @max(config.limits.control_entries_per_connection / 8, 16);
         var sched = try fair_scheduler.FairScheduler.init(
             gpa,
+            config.io,
             config.limits.control_bytes_per_connection,
             config.limits.control_entries_per_connection,
             term_cap,
@@ -425,23 +434,23 @@ const Connection = struct {
             .read_free_buf = read_free_buf,
             .read_pool_n = n_chunks,
             .sid_scratch = sid_scratch,
-            .space_sems = space_sems,
+            .space_events = space_events,
             .intent_batch = intent_batch,
             .tls_recv_acc = tls_recv_acc,
         };
         @memset(self.handlers, .{});
         @memset(self.handler_joins, null);
-        self.tickets = ticket_table.TicketTable.init(self.ticket_slots);
+        self.tickets = ticket_table.TicketTable.init(config.io, self.ticket_slots);
         self.read_ch = .init(self.read_ch_buf);
         self.write_ch = .init(self.write_ch_buf);
         self.completion_ch = .init(self.completion_ch_buf);
         self.write_ack_ch = .init(self.write_ack_buf);
         self.read_free_ch = .init(self.read_free_buf);
-        self.writer_fail_ch = .init(&self.writer_fail_buf);
         return self;
     }
 
     fn deinit(self: *Connection) void {
+        const io = self.config.io;
         // Must not free while handlers still live.
         std.debug.assert(self.live_handlers.load(.acquire) == 0);
         if (self.handshake_held) {
@@ -449,28 +458,31 @@ const Connection = struct {
             self.handshake_held = false;
         }
         // Drain channels before freeing their backing buffers.
-        while (self.write_ch.tryReceive()) |chunk| {
+        while (io_queue.tryGet(wire_pump.WireChunk, &self.write_ch, io)) |chunk| {
             if (chunk.bytes.len != 0) self.config.gpa.free(chunk.bytes);
             // Release amounts without AckDrainer (teardown path).
             self.applyOutboundRelease(chunk.outbound_release, .wire);
             if (chunk.control_entry) self.applyControlRelease(chunk.control_release, true);
-        } else |_| {}
-        while (self.read_ch.tryReceive()) |chunk| {
+        }
+        while (io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io)) |chunk| {
             if (chunk.pool_index) |idx| {
-                self.read_free_ch.send(idx) catch {};
+                self.read_free_ch.putOneUncancelable(io, idx) catch {
+                    // Every queued read chunk owns one removed pool index.
+                    unreachable;
+                };
             } else if (chunk.bytes.len != 0) {
                 self.config.gpa.free(chunk.bytes);
             }
-        } else |_| {}
+        }
         // Late reaper posts can arrive after shutdownHandlers; never discard without releaseSlot.
-        while (self.completion_ch.tryReceive()) |sid| {
+        while (io_queue.tryGet(u31, &self.completion_ch, io)) |sid| {
             self.releaseSlot(sid);
-        } else |_| {}
+        }
         for (self.handlers) |s| std.debug.assert(!s.in_use);
-        while (self.write_ack_ch.tryReceive()) |ack| {
+        while (io_queue.tryGet(wire_pump.WriteCompletion, &self.write_ack_ch, io)) |ack| {
             self.applyOutboundRelease(ack.outbound_release, .wire);
             if (ack.control_entry) self.applyControlRelease(ack.control_release, true);
-        } else |_| {}
+        }
 
         self.session.deinit();
         const RelCtx = struct {
@@ -497,7 +509,7 @@ const Connection = struct {
         if (self.read_chunk_storage.len != 0) self.config.gpa.free(self.read_chunk_storage);
         if (self.read_free_buf.len != 0) self.config.gpa.free(self.read_free_buf);
         if (self.sid_scratch.len != 0) self.config.gpa.free(self.sid_scratch);
-        if (self.space_sems.len != 0) self.config.gpa.free(self.space_sems);
+        if (self.space_events.len != 0) self.config.gpa.free(self.space_events);
         if (self.intent_batch.len != 0) self.config.gpa.free(self.intent_batch);
         const held = self.outbound_held.load(.acquire);
         const pending_held = self.pending_outbound_held.load(.acquire);
@@ -505,7 +517,7 @@ const Connection = struct {
         std.debug.assert(held == pending_held + wire_held);
         std.debug.assert(held == 0);
         if (!self.socket_closed.load(.acquire)) {
-            self.stream.close();
+            self.stream.close(io);
             self.socket_closed.store(true, .release);
         }
     }
@@ -577,7 +589,7 @@ const Connection = struct {
 
     fn ackDrainer(self: *Connection) void {
         while (true) {
-            const ack = self.write_ack_ch.receive() catch break;
+            const ack = self.write_ack_ch.getOne(self.config.io) catch break;
             self.applyOutboundRelease(ack.outbound_release, .wire);
             if (ack.control_entry) self.applyControlRelease(ack.control_release, true);
             if (ack.fail_all) {
@@ -585,11 +597,11 @@ const Connection = struct {
                 self.tickets.failAll();
                 // Do NOT touch handlers[] — actor applies connection_closed terminals.
                 self.wakeAllSpace();
-                self.writer_fail_ch.trySend(1) catch {};
             } else if (ack.ticket != 0) {
                 self.tickets.complete(ack.ticket_slot, ack.ticket, ack.ok);
             }
             if (ack.outbound_release != 0) self.wakeAllSpace();
+            self.actor_wake.set(self.config.io);
             if (ack.shutdown) break;
         }
     }
@@ -601,12 +613,12 @@ const Connection = struct {
 
     fn wakeStreamSpace(self: *Connection, stream_id: u31) void {
         if (self.spaceIndex(stream_id)) |i| {
-            if (i < self.space_sems.len) self.space_sems[i].post();
+            if (i < self.space_events.len) self.space_events[i].set(self.config.io);
         }
     }
 
     fn wakeAllSpace(self: *Connection) void {
-        for (self.space_sems) |*s| s.post();
+        for (self.space_events) |*event| event.set(self.config.io);
     }
 
     /// AckDrainer-signaled writer failure: terminate connection, reset every stream,
@@ -672,8 +684,10 @@ const Connection = struct {
         }
         var si: usize = 0;
         while (si < sids) : (si += 1) {
+            // Teardown continues when a stream was concurrently made terminal.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = self.sid_scratch[si], .code = .cancel } }) catch {};
         }
+        // Session teardown below is authoritative if GOAWAY cannot be enqueued.
         self.session.applyCommand(.{ .goaway = .{ .last_stream_id = self.session.last_processed_stream, .code = .internal_error } }) catch {};
         // Consume resulting intents into free (no further writes).
         const n = self.session.drainIntentsInto(self.intent_batch);
@@ -701,7 +715,11 @@ const Connection = struct {
         // connection is live; stealing chunks races AckDrainer wire releases
         // (and can double-free payload bytes). Queued wire is released via
         // WritePump failDrain/ack or Connection.deinit after pumps join.
-        self.write_ch.send(.{ .bytes = &.{}, .len = 0 }) catch {};
+        // Writer queue closure already terminates the failed transport.
+        _ = io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, .{
+            .bytes = &.{},
+            .len = 0,
+        });
 
         self.wakeAllSpace();
         self.session.terminal = .transport;
@@ -721,7 +739,7 @@ const Connection = struct {
     fn checkSlowConsumers(self: *Connection) !void {
         const limit_ns = self.config.limits.slow_consumer_timeout_ns;
         if (limit_ns == 0) return;
-        const now = zio.Timestamp.now(.monotonic).toNanoseconds();
+        const now = nowNs(self.config.io);
         var n_stale: usize = 0;
         const StaleCtx = struct {
             c: *Connection,
@@ -751,6 +769,7 @@ const Connection = struct {
             if (self.slotIndex(sid)) |si| {
                 self.handlers[si].terminal.setCause(.slow_consumer);
             }
+            // Local terminal/accounting cleanup remains required if the stream already closed.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .cancel } }) catch {};
             if (self.sched.findPending(sid)) |pw| {
                 // Exact terminal: wake flush waiter so wait maps SlowConsumer via SlotTerminal.
@@ -765,50 +784,128 @@ const Connection = struct {
         }
     }
 
+    fn drainCompletions(self: *Connection) void {
+        if (test_hold_completion_drain.load(.acquire)) return;
+        while (io_queue.tryGet(u31, &self.completion_ch, self.config.io)) |sid| {
+            self.releaseSlot(sid);
+        }
+    }
+
+    fn nextDeadlineNs(self: *Connection) ?u64 {
+        var next = self.session.nextIdleDeadlineNs();
+        if (self.sched.nextSlowDeadlineNs(self.config.limits.slow_consumer_timeout_ns)) |deadline| {
+            if (next == null or deadline < next.?) next = deadline;
+        }
+        if (self.grace_deadline) |deadline| {
+            const ns: u64 = @intCast(deadline.nanoseconds);
+            if (next == null or ns < next.?) next = ns;
+        }
+        const canary_tick = test_polling_canary_tick_ns.load(.acquire);
+        if (canary_tick != 0) {
+            const deadline = nowNs(self.config.io) +% canary_tick;
+            if (next == null or deadline < next.?) next = deadline;
+        }
+        return next;
+    }
+
+    const Activity = union(enum) {
+        actor: std.Io.Cancelable!void,
+        shutdown: std.Io.Cancelable!void,
+        timer: std.Io.Cancelable!void,
+    };
+
+    fn waitEvent(event: *std.Io.Event, io: std.Io) std.Io.Cancelable!void {
+        return event.wait(io);
+    }
+
+    fn waitTimer(timeout: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
+        return timeout.sleep(io);
+    }
+
+    fn waitForActivity(self: *Connection) !void {
+        const io = self.config.io;
+        if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
+            test_actor_waiting.set(io);
+            try test_release_actor_wait.wait(io);
+        }
+        var result_buf: [3]Activity = undefined;
+        var select = std.Io.Select(Activity).init(io, &result_buf);
+        errdefer select.cancelDiscard();
+        try select.concurrent(.actor, waitEvent, .{ &self.actor_wake, io });
+        if (self.config.shutdown_event) |event| {
+            try select.concurrent(.shutdown, waitEvent, .{ event, io });
+        }
+        if (self.nextDeadlineNs()) |deadline_ns| {
+            const now = nowNs(io);
+            if (deadline_ns <= now) {
+                select.cancelDiscard();
+                return;
+            }
+            const timeout: std.Io.Timeout = .{ .deadline = .{
+                .raw = .fromNanoseconds(@intCast(deadline_ns)),
+                .clock = .awake,
+            } };
+            try select.concurrent(.timer, waitTimer, .{ timeout, io });
+        }
+        const selected = try select.await();
+        defer select.cancelDiscard();
+        switch (selected) {
+            inline else => |result| try result,
+        }
+    }
+
     fn run(self: *Connection) !void {
         const gpa = self.config.gpa;
+        const io = self.config.io;
 
         var read_pump: wire_pump.ReadPump = .{
+            .io = io,
             .stream = self.stream,
             .to_actor = &self.read_ch,
+            .actor_wake = &self.actor_wake,
             .chunk_storage = self.read_chunk_storage,
             .n_chunks = self.read_pool_n,
             .free_indices = &self.read_free_ch,
         };
         var write_pump: wire_pump.WritePump = .{
+            .io = io,
             .stream = self.stream,
             .from_actor = &self.write_ch,
             .completions = &self.write_ack_ch,
+            .actor_wake = &self.actor_wake,
             .gpa = gpa,
             .test_delay_ms = test_write_delay_ms,
             .test_fail_after = test_write_fail_after,
         };
-        var read_handle = try zio.spawn(wire_pump.ReadPump.run, .{&read_pump});
-        errdefer read_handle.cancel();
-        var write_handle = try zio.spawn(wire_pump.WritePump.run, .{&write_pump});
-        errdefer write_handle.cancel();
-        var ack_handle = try zio.spawn(ackDrainerEntry, .{self});
-        errdefer ack_handle.cancel();
+        var read_handle = try io.concurrent(wire_pump.ReadPump.run, .{&read_pump});
+        errdefer read_handle.cancel(io);
+        var write_handle = try io.concurrent(wire_pump.WritePump.run, .{&write_pump});
+        errdefer write_handle.cancel(io);
+        var ack_handle = try io.concurrent(ackDrainerEntry, .{self});
+        errdefer ack_handle.cancel(io);
 
         defer {
             read_pump.stop();
             write_pump.stop();
-            self.write_ch.send(.{ .bytes = &.{}, .len = 0 }) catch {};
-            write_handle.cancel();
-            read_handle.cancel();
-            write_handle.join() catch {};
-            read_handle.join() catch {};
+            _ = self.write_ch.putUncancelable(io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
+                // A closed writer queue already terminates the pump.
+            };
+            self.stream.shutdown(io, .both) catch {
+                // Shutdown is best-effort; task cancellation is the authoritative unblock.
+            };
+            write_handle.cancel(io);
+            read_handle.cancel(io);
             // AckDrainer exits on shutdown completion from write pump.
-            ack_handle.join();
+            ack_handle.await(io);
             if (!self.socket_closed.swap(true, .acq_rel)) {
-                self.stream.close();
+                self.stream.close(io);
             }
         }
 
         if (self.config.mode == .tls_h2) {
             const auth = self.config.tls_auth orelse return error.InvalidConfig;
             var seed: [8]u8 = undefined;
-            zio.random(&seed);
+            io.random(&seed);
             self.tls_prng = std.Random.DefaultPrng.init(@as(u64, @bitCast(seed)));
             self.tls_server = tls.nonblock.Server.init(.{
                 .auth = auth,
@@ -816,8 +913,8 @@ const Connection = struct {
                 .rng = self.tls_prng.random(),
                 .now = .zero,
             });
-            self.handshake_deadline = zio.Timestamp.fromNanoseconds(
-                zio.Timestamp.now(.monotonic).toNanoseconds() +% 5 * std.time.ns_per_s,
+            self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
+                @as(i96, nowNs(io) +% 5 * std.time.ns_per_s),
             );
             try self.tlsHandshakeViaPumps();
             if (self.handshake_held) {
@@ -829,13 +926,15 @@ const Connection = struct {
         try self.flushSessionIntents();
 
         if (self.config.mode == .h2c) {
-            self.handshake_deadline = zio.Timestamp.fromNanoseconds(
-                zio.Timestamp.now(.monotonic).toNanoseconds() +% self.config.limits.preface_timeout_ns,
+            self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
+                @as(i96, nowNs(io) +% self.config.limits.preface_timeout_ns),
             );
             try self.waitH2cPreface();
         }
 
         while (true) {
+            self.drainCompletions();
+
             test_observed_live_handlers.store(self.live_handlers.load(.acquire), .release);
             var slots_used: usize = 0;
             for (self.handlers) |s| {
@@ -843,25 +942,16 @@ const Connection = struct {
             }
             test_observed_slots_in_use.store(slots_used, .release);
 
-            if (!test_hold_completion_drain.load(.acquire)) {
-                while (self.completion_ch.tryReceive()) |sid| {
-                    self.releaseSlot(sid);
-                } else |_| {}
-            }
-
             {
-                self.session_mu.lockUncancelable();
-                defer self.session_mu.unlock();
-                while (self.writer_fail_ch.tryReceive()) |_| {
-                    self.handleWriterFailed();
-                } else |_| {}
+                self.session_mu.lockUncancelable(io);
+                defer self.session_mu.unlock(io);
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
                 if (self.session.terminal != .none) break;
-                const now = zio.Timestamp.now(.monotonic).toNanoseconds();
+                const now = nowNs(io);
                 self.session.edge_now_ns = now;
-                self.session.checkIdleDeadlines(now) catch {};
-                self.maybeBeginGraceful() catch {};
-                self.checkSlowConsumers() catch {};
+                try self.session.checkIdleDeadlines(now);
+                try self.maybeBeginGraceful();
+                try self.checkSlowConsumers();
                 self.drainEmit() catch {
                     // Fail-closed: Session may already be debited — terminate connection.
                     self.writer_failed.store(true, .release);
@@ -869,34 +959,47 @@ const Connection = struct {
                 };
             }
 
-            const chunk = self.read_ch.tryReceive() catch |err| switch (err) {
-                error.ChannelEmpty => {
-                    if (self.session.terminal != .none) break;
-                    if (self.shutting_down and self.session.grace_phase == .phase2 and
-                        self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0)
-                    {
-                        self.session_mu.lockUncancelable();
-                        defer self.session_mu.unlock();
-                        self.finishGraceful() catch {};
-                        break;
-                    }
-                    zio.sleep(.fromMilliseconds(5)) catch break;
-                    continue;
-                },
-                else => break,
-            };
+            if (self.session.terminal != .none) break;
+            if (self.shutting_down and self.session.grace_phase == .phase2 and
+                self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0)
+            {
+                self.session_mu.lockUncancelable(io);
+                defer self.session_mu.unlock(io);
+                try self.finishGraceful();
+                break;
+            }
+
+            var maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
+            if (maybe_chunk == null) {
+                // Reset before rechecking every producer-owned source; this closes
+                // the set-before-reset lost-wakeup race.
+                self.actor_wake.reset();
+                self.drainCompletions();
+                maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
+                if (maybe_chunk == null and
+                    !self.writer_failed.load(.acquire) and
+                    !(self.config.shutdown_flag != null and self.config.shutdown_flag.?.load(.acquire)))
+                {
+                    try self.waitForActivity();
+                }
+                if (maybe_chunk == null) continue;
+            }
+            const chunk = maybe_chunk.?;
             if (chunk.len == 0 and chunk.bytes.len == 0) break;
             defer {
                 if (chunk.pool_index) |idx| {
-                    self.read_free_ch.send(idx) catch {};
+                    self.read_free_ch.putOneUncancelable(io, idx) catch {
+                        // Each consumed pooled chunk returns exactly one index.
+                        unreachable;
+                    };
                 } else if (chunk.bytes.len != 0) {
                     gpa.free(chunk.bytes);
                 }
             }
 
-            self.session_mu.lockUncancelable();
-            defer self.session_mu.unlock();
-            self.session.edge_now_ns = zio.Timestamp.now(.monotonic).toNanoseconds();
+            self.session_mu.lockUncancelable(io);
+            defer self.session_mu.unlock(io);
+            self.session.edge_now_ns = nowNs(io);
             if (self.config.mode == .tls_h2 and self.tls_conn == null) {
                 try self.appendTlsInput(chunk.bytes[0..chunk.len]);
             } else if (self.tls_conn != null) {
@@ -917,7 +1020,9 @@ const Connection = struct {
             const res = tls_edge.connectionClose(tc, self.ciphertext_scratch);
             if (res.ciphertext_len > 0) {
                 const out = try gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
-                self.sendAccountedWire(out, true, 0, 0, 0, false) catch {};
+                self.sendAccountedWire(out, true, 0, 0, 0, false) catch {
+                    // The connection is already terminal; close-notify is best-effort.
+                };
             }
         }
     }
@@ -926,26 +1031,57 @@ const Connection = struct {
         self.ackDrainer();
     }
 
+    const ReceiveResult = union(enum) {
+        read: (std.Io.QueueClosedError || std.Io.Cancelable)!wire_pump.WireChunk,
+        shutdown: std.Io.Cancelable!void,
+        timer: std.Io.Cancelable!void,
+    };
+
+    fn receiveRead(queue: *std.Io.Queue(wire_pump.WireChunk), io: std.Io) (std.Io.QueueClosedError || std.Io.Cancelable)!wire_pump.WireChunk {
+        return queue.getOne(io);
+    }
+
     fn receiveUntilDeadline(self: *Connection) !wire_pump.WireChunk {
-        const dl = self.handshake_deadline orelse {
-            return self.read_ch.receive() catch return error.ConnectionClosed;
+        const io = self.config.io;
+        var result_buf: [3]ReceiveResult = undefined;
+        var select = std.Io.Select(ReceiveResult).init(io, &result_buf);
+        errdefer select.cancelDiscard();
+        try select.concurrent(.read, receiveRead, .{ &self.read_ch, io });
+        if (self.config.shutdown_event) |event| {
+            try select.concurrent(.shutdown, waitEvent, .{ event, io });
+        }
+        if (self.handshake_deadline) |deadline| {
+            if (nowNs(io) >= @as(u64, @intCast(deadline.nanoseconds))) {
+                select.cancelDiscard();
+                return error.TlsHandshakeTimeout;
+            }
+            const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = deadline, .clock = .awake } };
+            try select.concurrent(.timer, waitTimer, .{ timeout, io });
+        }
+        const selected = try select.await();
+        defer select.cancelDiscard();
+        return switch (selected) {
+            .read => |result| result catch |err| switch (err) {
+                error.Closed => error.ConnectionClosed,
+                error.Canceled => error.Canceled,
+            },
+            .shutdown => |result| blk: {
+                try result;
+                break :blk error.ConnectionClosed;
+            },
+            .timer => |result| blk: {
+                try result;
+                break :blk error.TlsHandshakeTimeout;
+            },
         };
-        const now = zio.Timestamp.now(.monotonic).toNanoseconds();
-        const dl_ns = dl.toNanoseconds();
-        if (now >= dl_ns) return error.TlsHandshakeTimeout;
-        var ac = zio.AutoCancel.init;
-        defer ac.clear();
-        ac.set(zio.Timeout.fromNanoseconds(dl_ns -% now));
-        const chunk = self.read_ch.receive() catch |err| {
-            if (err == error.Canceled and ac.check(error.Canceled)) return error.TlsHandshakeTimeout;
-            return error.ConnectionClosed;
-        };
-        return chunk;
     }
 
     fn recycleReadChunk(self: *Connection, chunk: wire_pump.WireChunk) void {
         if (chunk.pool_index) |idx| {
-            self.read_free_ch.send(idx) catch {};
+            self.read_free_ch.putOneUncancelable(self.config.io, idx) catch {
+                // A received pooled chunk always owns one free-list vacancy.
+                unreachable;
+            };
         } else if (chunk.bytes.len != 0) {
             self.config.gpa.free(chunk.bytes);
         }
@@ -966,9 +1102,9 @@ const Connection = struct {
             };
             defer self.recycleReadChunk(chunk);
             if (chunk.len == 0) return error.ConnectionClosed;
-            self.session_mu.lockUncancelable();
+            self.session_mu.lockUncancelable(self.config.io);
             {
-                defer self.session_mu.unlock();
+                defer self.session_mu.unlock(self.config.io);
                 try self.session.ingest(chunk.bytes[0..chunk.len]);
                 try self.processIntents();
                 if (self.session.terminal != .none) return error.ConnectionClosed;
@@ -982,7 +1118,7 @@ const Connection = struct {
         const srv = &(self.tls_server orelse return error.InvalidConfig);
         while (true) {
             if (self.handshake_deadline) |dl| {
-                if (zio.Timestamp.now(.monotonic).toNanoseconds() >= dl.toNanoseconds()) {
+                if (nowNs(self.config.io) >= @as(u64, @intCast(dl.nanoseconds))) {
                     return error.TlsHandshakeTimeout;
                 }
             }
@@ -1029,14 +1165,7 @@ const Connection = struct {
                 slot.completion_owner.store(live, .release);
                 slot.reaper_reserved = false;
                 self.handler_joins[i] = null;
-                // Reset permits only — never rebuild the Semaphore (mutex/cond must
-                // stay valid while AckDrainer may be in wakeAllSpace → post).
-                if (i < self.space_sems.len) {
-                    const sem = &self.space_sems[i];
-                    sem.mutex.lockUncancelable();
-                    sem.permits = 0;
-                    sem.mutex.unlock();
-                }
+                if (i < self.space_events.len) self.space_events[i].reset();
                 return slot;
             }
         }
@@ -1053,6 +1182,8 @@ const Connection = struct {
     fn releaseSlot(self: *Connection, stream_id: u31) void {
         if (self.slotIndex(stream_id)) |i| {
             const slot = &self.handlers[i];
+            if (self.handler_joins[i]) |*handle| handle.await(self.config.io);
+            self.handler_joins[i] = null;
             if (slot.reaper_reserved) {
                 if (self.config.accounting) |a| a.releaseReaper();
                 slot.reaper_reserved = false;
@@ -1060,32 +1191,35 @@ const Connection = struct {
             slot.in_use = false;
             slot.terminal.clear();
             slot.completion_owner.store(reported, .release);
-            self.handler_joins[i] = null;
-            // Never reassign space_sems[i] = .{ .permits = 0 }: that rebuilds the
-            // embedded Mutex/Condition while AckDrainer may be inside wakeAllSpace
-            // → post() (ReleaseSafe unreachable under the live mutex). Extra
-            // permits on slot reuse are harmless — waitForStreamSpace rechecks cap.
+            // Event state is reset only when this slot is admitted again; every
+            // waiter rechecks capacity and terminal state under session_mu.
         }
     }
 
-    fn enqueueReaperOrFail(self: *Connection, slot: *HandlerSlot, handle: zio.JoinHandle(void), stream_id: u31) void {
+    fn enqueueReaperOrFail(self: *Connection, slot: *HandlerSlot, handle: std.Io.Future(void), stream_id: u31) void {
         if (self.reaper) |pool| {
-            pool.jobs.trySend(.{
-                .handle = handle,
+            var owned_handle = handle;
+            const queued = io_queue.tryPut(ReaperJob, &pool.jobs, self.config.io, .{
+                .handle = owned_handle,
                 .owner = &slot.completion_owner,
                 .completion = &self.completion_ch,
+                .actor_wake = &self.actor_wake,
                 .stream_id = stream_id,
-            }) catch {
+            });
+            if (!queued) {
                 // Invariant: reserved capacity must make this impossible.
                 std.debug.assert(false);
+                owned_handle.cancel(self.config.io);
                 slot.completion_owner.store(reported, .release);
+                // This invariant-failure path already owns connection and slot teardown.
                 self.session.applyCommand(.{ .goaway = .{ .code = .internal_error, .last_stream_id = self.session.last_processed_stream } }) catch {};
+                // No wire recovery is possible after the reserved reaper queue rejected the job.
                 self.processIntents() catch {};
                 self.releaseSlot(stream_id);
-            };
+            }
         } else {
             var h = handle;
-            h.cancel();
+            h.cancel(self.config.io);
             slot.completion_owner.store(reported, .release);
             self.releaseSlot(stream_id);
         }
@@ -1151,9 +1285,7 @@ const Connection = struct {
         // therefore finish before the completion is posted; draining once then leaving
         // discards the release. Wait until every slot is released via releaseSlot.
         while (true) {
-            while (self.completion_ch.tryReceive()) |sid| {
-                self.releaseSlot(sid);
-            } else |_| {}
+            self.drainCompletions();
             var any_in_use = false;
             for (self.handlers) |s| {
                 if (s.in_use) {
@@ -1162,7 +1294,8 @@ const Connection = struct {
                 }
             }
             if (!any_in_use) break;
-            zio.sleep(.fromMilliseconds(5)) catch {};
+            const sid = self.completion_ch.getOne(self.config.io) catch return error.Canceled;
+            self.releaseSlot(sid);
         }
     }
 
@@ -1177,6 +1310,7 @@ const Connection = struct {
             );
             if (res.ciphertext_len > 0) {
                 const out = try self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
+                // TLS close-notify is best-effort; sendAccountedWire releases `out` on failure.
                 self.sendAccountedWire(out, true, 0, 0, 0, false) catch {};
             }
             if (res.consumed > 0) {
@@ -1212,24 +1346,24 @@ const Connection = struct {
             self.shutting_down = true;
             try self.session.applyCommand(.graceful_phase1);
             try self.processIntents();
-            const now_ns = zio.Timestamp.now(.monotonic).toNanoseconds();
-            self.grace_deadline = zio.Timestamp.fromNanoseconds(now_ns +% std.time.ns_per_s);
+            const now_ns = nowNs(self.config.io);
+            self.grace_deadline = std.Io.Timestamp.fromNanoseconds(@as(i96, now_ns +% std.time.ns_per_s));
             return;
         }
         if (self.session.grace_phase == .phase1) {
-            const now = zio.Timestamp.now(.monotonic);
+            const now = nowNs(self.config.io);
             const due = self.session.gracePingAcked() or
-                (self.grace_deadline != null and now.toNanoseconds() >= self.grace_deadline.?.toNanoseconds());
+                (self.grace_deadline != null and now >= @as(u64, @intCast(self.grace_deadline.?.nanoseconds)));
             if (due) {
                 try self.session.applyCommand(.graceful_phase2);
                 try self.processIntents();
-                self.grace_deadline = zio.Timestamp.fromNanoseconds(
-                    now.toNanoseconds() +% self.config.limits.graceful_drain_timeout_ns,
+                self.grace_deadline = std.Io.Timestamp.fromNanoseconds(
+                    @as(i96, now +% self.config.limits.graceful_drain_timeout_ns),
                 );
             }
         } else if (self.session.grace_phase == .phase2) {
             if (self.grace_deadline) |dl| {
-                if (zio.Timestamp.now(.monotonic).toNanoseconds() >= dl.toNanoseconds()) {
+                if (nowNs(self.config.io) >= @as(u64, @intCast(dl.nanoseconds))) {
                     try self.finishGraceful();
                 }
             }
@@ -1241,6 +1375,7 @@ const Connection = struct {
         var it = self.session.streams.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.state != .closed and e.value_ptr.state != .idle) {
+                // A stream may become terminal while the graceful sweep advances.
                 self.session.applyCommand(.{ .reset_stream = .{ .stream_id = e.key_ptr.*, .code = .cancel } }) catch {};
             }
         }
@@ -1258,10 +1393,11 @@ const Connection = struct {
             test_waiting_for_space.store(@as(u32, stream_id), .release);
             // Explicit lock ownership: unlock for wait, always reacquire uncancelable
             // before any return so caller defer unlock stays balanced.
-            const sem = if (self.spaceIndex(stream_id)) |i| &self.space_sems[i] else null;
-            self.session_mu.unlock();
-            const wait_res: anyerror!void = if (sem) |s| s.wait() else error.Canceled;
-            self.session_mu.lockUncancelable();
+            const event = if (self.spaceIndex(stream_id)) |i| &self.space_events[i] else null;
+            if (event) |e| e.reset();
+            self.session_mu.unlock(self.config.io);
+            const wait_res: anyerror!void = if (event) |e| e.wait(self.config.io) else error.Canceled;
+            self.session_mu.lockUncancelable(self.config.io);
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             wait_res catch {
@@ -1448,7 +1584,7 @@ const Connection = struct {
     }
 
     fn sendFlushTicket(self: *Connection, ticket: u64, slot: u32) anyerror!void {
-        self.write_ch.send(.{
+        self.write_ch.putOne(self.config.io, .{
             .bytes = &.{},
             .len = 0,
             .flush_barrier = true,
@@ -1471,7 +1607,7 @@ const Connection = struct {
             if (control_entry) self.applyControlRelease(control_n, true);
             return error.OutOfMemory;
         }
-        self.write_ch.send(.{
+        self.write_ch.putOne(self.config.io, .{
             .bytes = out,
             .len = out.len,
             .flush_barrier = flush,
@@ -1628,6 +1764,7 @@ const Connection = struct {
             if (!acct.tryReserveReaper()) {
                 job.arena.deinit();
                 gpa.destroy(job);
+                // A terminal connection needs no additional refusal frame.
                 self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
                 try self.processIntents();
                 return;
@@ -1638,6 +1775,7 @@ const Connection = struct {
             if (self.config.accounting) |acct| acct.releaseReaper();
             job.arena.deinit();
             gpa.destroy(job);
+            // A terminal connection needs no additional refusal frame.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
             try self.processIntents();
             return;
@@ -1653,12 +1791,10 @@ const Connection = struct {
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
-            zio.spawn(runHandlerJob, .{job});
+            self.config.io.concurrent(runHandlerJob, .{job});
         const h = handle catch {
             runHandlerJob(job);
-            while (self.completion_ch.tryReceive()) |sid| {
-                self.releaseSlot(sid);
-            } else |_| {}
+            self.drainCompletions();
             return;
         };
         if (self.slotIndex(d.stream_id)) |i| {
@@ -1688,7 +1824,10 @@ const Connection = struct {
         defer {
             const prev = job.slot.completion_owner.cmpxchgStrong(live, reported, .acq_rel, .acquire);
             if (prev == null) {
-                self.completion_ch.send(job.stream_id) catch {};
+                self.completion_ch.putOneUncancelable(self.config.io, job.stream_id) catch {
+                    // Connection teardown has already assumed completion ownership.
+                };
+                self.actor_wake.set(self.config.io);
             }
             _ = self.live_handlers.fetchSub(1, .acq_rel);
             job.arena.deinit();
@@ -1701,28 +1840,34 @@ const Connection = struct {
                 f.handler.runFn(f.handler.ptr, &job.req, &job.resp) catch {
                     if (job.slot.terminal.getCause() != null) return;
                     if (!job.resp.committed) {
+                        // The original handler error remains terminal if the fallback cannot write.
                         job.resp.send(500, &.{}, "internal error") catch {};
                     } else if (!job.resp.finished) {
                         self.withSession(struct {
                             fn go(c: *Connection, sid: u31) void {
+                                // A concurrently terminal stream needs no second reset.
                                 c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
+                                // Connection teardown is authoritative when reset output cannot be queued.
                                 c.processIntents() catch {};
                             }
                         }.go, job.stream_id);
                     }
                 };
                 if (job.slot.terminal.getCause() == null and !job.resp.committed) {
+                    // Terminal transport state supersedes the synthetic fallback.
                     job.resp.send(500, &.{}, "no response") catch {};
                 }
             },
             .not_found => {
                 if (job.slot.terminal.getCause() == null) {
+                    // Terminal transport state supersedes the synthetic response.
                     job.resp.send(404, &.{}, "not found") catch {};
                 }
             },
             .method_not_allowed => {
                 if (job.slot.terminal.getCause() == null) {
                     const allow = [_]request.Header{.{ .name = "allow", .value = "GET, POST" }};
+                    // Terminal transport state supersedes the synthetic response.
                     job.resp.send(405, &allow, "method not allowed") catch {};
                 }
             },
@@ -1730,13 +1875,13 @@ const Connection = struct {
     }
 
     fn withSession(self: *Connection, comptime f: anytype, arg: anytype) void {
-        self.session_mu.lock() catch return;
-        defer self.session_mu.unlock();
+        self.session_mu.lock(self.config.io) catch return;
+        defer self.session_mu.unlock(self.config.io);
         f(self, arg);
     }
 
     fn lockSession(self: *Connection) response.ResponseError!void {
-        self.session_mu.lock() catch return error.Canceled;
+        self.session_mu.lock(self.config.io) catch return error.Canceled;
     }
 
     fn sendCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {
@@ -1751,7 +1896,7 @@ const Connection = struct {
         defer if (armed) self.tickets.releaseReserved(slot_i);
         {
             try self.lockSession();
-            defer self.session_mu.unlock();
+            defer self.session_mu.unlock(self.config.io);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
             for (headers) |h| {
@@ -1787,7 +1932,7 @@ const Connection = struct {
         {
             errdefer self.tickets.releaseReserved(slot_i);
             try self.lockSession();
-            defer self.session_mu.unlock();
+            defer self.session_mu.unlock(self.config.io);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
             if (sse) {
@@ -1828,7 +1973,7 @@ const Connection = struct {
         {
             errdefer if (need_wait) self.tickets.releaseReserved(slot_i);
             try self.lockSession();
-            defer self.session_mu.unlock();
+            defer self.session_mu.unlock(self.config.io);
             self.enqueuePending(stream_id, bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
             self.processIntents() catch return error.WriteFailed;
         }
@@ -1845,7 +1990,7 @@ const Connection = struct {
         {
             errdefer self.tickets.releaseReserved(slot_i);
             try self.lockSession();
-            defer self.session_mu.unlock();
+            defer self.session_mu.unlock(self.config.io);
             if (self.sched.findPending(stream_id)) |pw| {
                 if (pw.len > 0 or pw.end_stream) {
                     pw.flush_ticket = ticket;
@@ -1866,7 +2011,7 @@ const Connection = struct {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         try self.lockSession();
-        defer self.session_mu.unlock();
+        defer self.session_mu.unlock(self.config.io);
         self.session.applyCommand(.{ .reset_stream = .{ .stream_id = stream_id, .code = .cancel } }) catch return error.WriteFailed;
         self.processIntents() catch return error.WriteFailed;
     }

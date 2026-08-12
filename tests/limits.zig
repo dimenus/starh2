@@ -44,7 +44,7 @@ test "bound terms use concrete sizes and capacities" {
     try std.testing.expect(b.terms.on_demand_conn > 0);
     try std.testing.expect(b.terms.on_demand_server > 0);
     try std.testing.expect(b.terms.reaper_jobs > 0);
-    try std.testing.expect(b.terms.conn_slots > 0);
+    try std.testing.expectEqual(@as(usize, 0), b.terms.conn_slots);
     try std.testing.expect(b.terms.routes > 0);
     try std.testing.expect(b.terms.certs > 0);
     try std.testing.expect(b.terms.tls_scratch > 0);
@@ -122,8 +122,8 @@ test "counting allocator: Server.init under published ceiling" {
             }
         }.f },
     }};
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try starh2.Server.init(gpa, rt, .{
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -182,11 +182,11 @@ test "fail-index iteration: Server.init fails closed" {
                 }
             }.f },
         }};
-        const addr = zio.net.IpAddress.parseIp4("127.0.0.1", 0) catch {
+        const addr = starh2.EndpointAddress.parseIp4("127.0.0.1", 0) catch {
             saw_fail = true;
             continue;
         };
-        var server = starh2.Server.init(gpa, rt, .{
+        var server = starh2.Server.init(gpa, rt.io(), .{
             .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
             .routes = &routes,
             .tls = null,
@@ -250,8 +250,8 @@ test "counting allocator peak under live hello stays under ceiling" {
             }
         }.f },
     }};
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try starh2.Server.init(gpa, rt, .{
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,

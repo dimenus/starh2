@@ -13,8 +13,8 @@ fn sse(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerr
 const dummy: u8 = 0;
 
 fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 8080);
-    var server = try starh2.Server.init(gpa, rt, .{
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 8080);
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &.{.{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sse } }},
         .tls = null,

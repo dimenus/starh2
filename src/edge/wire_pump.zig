@@ -1,9 +1,9 @@
-//! Sole owners of the raw zio stream Reader and Writer directions.
+//! Sole owners of the raw std.Io stream Reader and Writer directions.
 //! Pumps never mutate Connection state — they only exchange WireChunk / WriteCompletion
 //! messages carrying integer tickets and release amounts.
 const std = @import("std");
-const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
+const io_queue = @import("io_queue.zig");
 
 pub const WriteCompletion = struct {
     /// Nonzero: complete this ticket wait slot.
@@ -36,40 +36,57 @@ pub const WireChunk = struct {
 };
 
 pub const ReadPump = struct {
-    stream: zio.net.Stream,
-    to_actor: *zio.Channel(WireChunk),
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    to_actor: *std.Io.Queue(WireChunk),
+    actor_wake: *std.Io.Event,
     /// Contiguous storage: n_chunks * WIRE_CHUNK_SIZE.
     chunk_storage: []u8,
     n_chunks: u32,
     /// Free pool indices (actor returns after consume).
-    free_indices: *zio.Channel(u32),
+    free_indices: *std.Io.Queue(u32),
     stopped: std.atomic.Value(bool) = .init(false),
 
-    pub fn run(self: *ReadPump) !void {
+    fn returnIndex(self: *ReadPump, idx: u32) void {
+        self.free_indices.putOneUncancelable(self.io, idx) catch {
+            // Queue closure means connection teardown owns the backing pool.
+        };
+    }
+
+    fn postEof(self: *ReadPump) void {
+        self.to_actor.putOneUncancelable(self.io, .{ .bytes = &.{}, .len = 0 }) catch {
+            // A closed actor queue means the connection is already tearing down.
+        };
+        self.actor_wake.set(self.io);
+    }
+
+    pub fn run(self: *ReadPump) void {
         const chunk_size = limits_mod.WIRE_CHUNK_SIZE;
+        var reader = self.stream.reader(self.io, &.{});
         while (!self.stopped.load(.acquire)) {
-            const idx = self.free_indices.receive() catch return;
+            const idx = self.free_indices.getOne(self.io) catch return;
             const off = @as(usize, idx) * chunk_size;
             const buf = self.chunk_storage[off..][0..chunk_size];
-            const n = self.stream.read(buf, .none) catch |err| {
-                self.free_indices.send(idx) catch {};
-                if (err == error.Canceled) return;
-                self.to_actor.send(.{ .bytes = &.{}, .len = 0 }) catch {};
+            var dest: [1][]u8 = .{buf};
+            const n = reader.interface.readVec(&dest) catch {
+                self.returnIndex(idx);
+                self.postEof();
                 return;
             };
             if (n == 0) {
-                self.free_indices.send(idx) catch {};
-                self.to_actor.send(.{ .bytes = &.{}, .len = 0 }) catch {};
+                self.returnIndex(idx);
+                self.postEof();
                 return;
             }
-            self.to_actor.send(.{
+            self.to_actor.putOne(self.io, .{
                 .bytes = buf,
                 .len = n,
                 .pool_index = idx,
             }) catch {
-                self.free_indices.send(idx) catch {};
+                self.returnIndex(idx);
                 return;
             };
+            self.actor_wake.set(self.io);
         }
     }
 
@@ -86,9 +103,11 @@ pub var test_last_ticket_ok_ns: std.atomic.Value(u64) = .init(0);
 pub var test_last_ticket_ok_id: std.atomic.Value(u64) = .init(0);
 
 pub const WritePump = struct {
-    stream: zio.net.Stream,
-    from_actor: *zio.Channel(WireChunk),
-    completions: *zio.Channel(WriteCompletion),
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    from_actor: *std.Io.Queue(WireChunk),
+    completions: *std.Io.Queue(WriteCompletion),
+    actor_wake: *std.Io.Event,
     gpa: std.mem.Allocator,
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
@@ -96,7 +115,10 @@ pub const WritePump = struct {
     writes_done: u64 = 0,
 
     fn post(self: *WritePump, c: WriteCompletion) void {
-        self.completions.send(c) catch {};
+        self.completions.putOneUncancelable(self.io, c) catch {
+            // Ack queue closure means connection teardown will release queued ownership.
+        };
+        self.actor_wake.set(self.io);
     }
 
     fn releaseChunk(self: *WritePump, chunk: WireChunk, ok: bool, fail_all: bool) void {
@@ -107,7 +129,7 @@ pub const WritePump = struct {
         const has_acct = chunk.outbound_release != 0 or chunk.control_entry;
         if (has_ticket or has_acct or fail_all) {
             if (ok and chunk.ticket != 0) {
-                test_last_ticket_ok_ns.store(zio.Timestamp.now(.monotonic).toNanoseconds(), .release);
+                test_last_ticket_ok_ns.store(nowNs(self.io), .release);
                 test_last_ticket_ok_id.store(chunk.ticket, .release);
             }
             self.post(.{
@@ -124,19 +146,20 @@ pub const WritePump = struct {
 
     fn failDrain(self: *WritePump) void {
         // Transport failed: every remaining queued chunk must free + fail its ticket.
-        while (self.from_actor.tryReceive()) |chunk| {
+        while (io_queue.tryGet(WireChunk, self.from_actor, self.io)) |chunk| {
             if (chunk.len == 0 and chunk.bytes.len == 0 and !chunk.flush_barrier) {
                 self.post(.{ .fail_all = true, .shutdown = false });
                 return;
             }
             self.releaseChunk(chunk, false, false);
-        } else |_| {}
+        }
         self.post(.{ .fail_all = true });
     }
 
-    pub fn run(self: *WritePump) !void {
+    pub fn run(self: *WritePump) void {
+        var writer = self.stream.writer(self.io, &.{});
         while (!self.stopped.load(.acquire)) {
-            const chunk = self.from_actor.receive() catch {
+            const chunk = self.from_actor.getOne(self.io) catch {
                 self.post(.{ .fail_all = true, .shutdown = true });
                 return;
             };
@@ -151,7 +174,13 @@ pub const WritePump = struct {
                 return;
             }
             if (self.test_delay_ms > 0) {
-                zio.sleep(.fromMilliseconds(self.test_delay_ms)) catch {};
+                self.io.sleep(.fromMilliseconds(@intCast(self.test_delay_ms)), .awake) catch {
+                    // Cancellation terminates this pump; queued chunks are failed below.
+                    self.releaseChunk(chunk, false, false);
+                    self.failDrain();
+                    self.post(.{ .shutdown = true });
+                    return;
+                };
             }
             const fail_next = test_fail_next_write.swap(false, .acq_rel);
             if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
@@ -160,7 +189,7 @@ pub const WritePump = struct {
                 self.post(.{ .shutdown = true });
                 return;
             }
-            self.stream.writeAll(chunk.bytes[0..chunk.len], .none) catch {
+            writer.interface.writeAll(chunk.bytes[0..chunk.len]) catch {
                 self.releaseChunk(chunk, false, false);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
@@ -176,6 +205,10 @@ pub const WritePump = struct {
         self.stopped.store(true, .release);
     }
 };
+
+fn nowNs(io: std.Io) u64 {
+    return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
 
 test "WriteCompletion is integer-only payload" {
     try std.testing.expect(@sizeOf(WriteCompletion) <= 64);

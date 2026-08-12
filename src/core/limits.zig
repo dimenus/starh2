@@ -7,7 +7,9 @@ const wire_pump = @import("../edge/wire_pump.zig");
 
 pub const ResourceUpperBound = struct {
     allocator_bytes: usize,
+    /// Task execution storage belongs to the application-selected std.Io backend.
     committed_stack_bytes: usize,
+    /// Task execution storage belongs to the application-selected std.Io backend.
     virtual_stack_bytes: usize,
     /// Exposed for mutation canaries / term accounting.
     terms: Terms = .{},
@@ -25,6 +27,7 @@ pub const Terms = struct {
     on_demand_conn: usize = 0,
     on_demand_server: usize = 0,
     reaper_jobs: usize = 0,
+    /// Retained for source compatibility; std.Io.Group removed the heap slot table.
     conn_slots: usize = 0,
     routes: usize = 0,
     certs: usize = 0,
@@ -36,7 +39,7 @@ pub const Terms = struct {
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
 pub const HANDLER_SLOT_SIZE: usize = 20;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
-pub const REAPER_JOB_SIZE: usize = 32;
+pub const REAPER_JOB_SIZE: usize = 40;
 
 pub const WIRE_CHUNK_SIZE = wire_const.WIRE_CHUNK_SIZE;
 pub const TLS_PLAINTEXT_SCRATCH_SIZE = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
@@ -156,20 +159,25 @@ pub const Limits = struct {
                 try checkedMul(self.control_entries_per_connection, @sizeOf(bound.FramedDataEntryShape)),
             ),
         );
-        const space_sems = try checkedMul(self.max_streams_per_connection, bound.SEMAPHORE_SIZE);
+        const space_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_recv_acc_bytes, try checkedAdd(header_maps, intents)))));
 
-        const per_conn = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_scratch, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_sems, sched_scratch)))))))))))))))));
+        const per_conn = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_scratch, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, sched_scratch)))))))))))))))));
 
-        terms.routes = self.max_route_path_bytes;
+        terms.routes = try checkedAdd(
+            self.max_route_path_bytes,
+            try checkedMul(self.max_routes, bound.ROUTE_SIZE),
+        );
         terms.certs = try checkedAdd(self.certificate_chain_bytes, self.private_key_bytes);
         terms.reaper_jobs = try checkedMul(self.cancellation_reaper_jobs, REAPER_JOB_SIZE);
-        terms.conn_slots = try checkedMul(self.max_connections, bound.CONN_SLOT_SIZE);
+        terms.conn_slots = 0;
         terms.tls_scratch = try checkedMul(self.concurrent_tls_handshakes, self.tls_handshake_scratch_bytes);
-        // listeners + local_addrs + endpoint configs (concrete pointer/slot shapes)
-        const EndpointSlot = struct { a: usize, b: usize, c: usize, d: usize };
-        terms.endpoints_listeners = try checkedMul(self.max_endpoints, @sizeOf(EndpointSlot));
+        const endpoint_slot = try checkedAdd(
+            bound.ENDPOINT_CONFIG_SIZE,
+            try checkedAdd(bound.LISTENER_SIZE, bound.ENDPOINT_ADDRESS_SIZE),
+        );
+        terms.endpoints_listeners = try checkedMul(self.max_endpoints, endpoint_slot);
         const server_static = try checkedAdd(terms.routes, try checkedAdd(terms.certs, try checkedAdd(terms.reaper_jobs, try checkedAdd(terms.conn_slots, terms.endpoints_listeners))));
 
         const all_conns = try checkedMul(self.max_connections, per_conn);
@@ -177,18 +185,16 @@ pub const Limits = struct {
         terms.on_demand_server = try checkedAdd(self.outbound_bytes_per_server, self.request_bytes_per_server);
         const allocator_bytes = try checkedAdd(server_static, try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, terms.on_demand_server)));
 
-        const max_stack: usize = 1024 * 1024;
-        const committed_stack: usize = 64 * 1024;
-        // Exact topology: accept loops + per-conn (actor+read+write+ack) + handlers + reapers.
-        // Cached unused stacks: zio stack_pool.prewarm/slab_slots floor; production uses prewarm=256.
-        const per_conn_tasks: usize = 4;
+        // Maximum std.Io task topology: accept loops + per-connection
+        // actor/read/write/ack and three Select wait branches + handlers + reapers.
+        const per_conn_tasks: usize = 7;
         terms.tasks = try checkedAdd(
             try checkedAdd(self.max_endpoints, try checkedMul(self.max_connections, per_conn_tasks)),
             try checkedAdd(self.max_streams_per_server, self.cancellation_reaper_tasks),
         );
-        const committed_stack_bytes = try checkedMul(terms.tasks, committed_stack);
-        const cached_stacks: usize = 256;
-        const virtual_stack_bytes = try checkedAdd(try checkedMul(terms.tasks, max_stack), try checkedMul(cached_stacks, max_stack));
+        // Backend task storage is intentionally outside starh2's allocator bound.
+        const committed_stack_bytes: usize = 0;
+        const virtual_stack_bytes: usize = 0;
 
         return .{
             .allocator_bytes = allocator_bytes,

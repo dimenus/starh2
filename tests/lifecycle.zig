@@ -101,7 +101,7 @@ fn waitStreamsAtLeast(server: *starh2.Server, want: usize, timeout_ms: u64) !voi
 }
 
 fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } },
         .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = hangSse } },
@@ -119,7 +119,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.outbound_bytes_per_stream = 64 * 1024;
     limits.outbound_bytes_per_connection = 8 * 1024 * 1024;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -322,7 +322,7 @@ fn peerResetWhileBlocked(_: *anyopaque, req: *const starh2.Request, resp: *starh
 }
 
 fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/wf", .handler = .{ .ptr = @constCast(&dummy), .runFn = writeFailHello } },
     };
@@ -335,7 +335,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -514,7 +514,7 @@ test "slot terminal survives job destroy (no resp pointer)" {
 }
 
 fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = hangSse } },
     };
@@ -527,7 +527,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -640,8 +640,8 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
         .path = "/fail-index",
         .handler = .{ .ptr = @constCast(&dummy), .runFn = failIndexHandler },
     }};
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = starh2.Server.init(gpa, rt, .{
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    var server = starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -858,7 +858,7 @@ test "rates: SETTINGS flood trips ENHANCE_YOUR_CALM" {
 }
 
 fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
-    const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = largeBodyHello } },
         .{ .method = .GET, .path = "/rstblock", .handler = .{ .ptr = @constCast(&dummy), .runFn = peerResetWhileBlocked } },
@@ -875,7 +875,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
-    var server = try starh2.Server.init(gpa, rt, .{
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &routes,
         .tls = null,
@@ -1002,8 +1002,8 @@ fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     };
 
     // --- Success: .listening must mean connectable, with no sleep to cover a race. ---
-    const any_port = try zio.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try starh2.Server.init(gpa, rt, .{
+    const any_port = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = any_port }},
         .routes = &routes,
         .tls = null,
@@ -1035,12 +1035,12 @@ fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try serve_handle.join();
 
     // --- Failure: an occupied port must report .failed, not time out. ---
-    const taken = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
-    var squatter = try taken.listen(.{ .reuse_address = false });
-    defer squatter.close();
-    const squatted = squatter.socket.address.ip;
+    const taken = try starh2.EndpointAddress.parseIp4("127.0.0.1", port);
+    var squatter = try taken.listen(rt.io(), .{ .reuse_address = false });
+    defer squatter.deinit(rt.io());
+    const squatted = squatter.socket.address;
 
-    var doomed = try starh2.Server.init(gpa, rt, .{
+    var doomed = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = squatted }},
         .routes = &routes,
         .tls = null,
