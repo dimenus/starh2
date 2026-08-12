@@ -10,11 +10,19 @@ pub const Handler = struct {
 pub const Route = struct {
     method: request.Method,
     path: []const u8,
+    /// When true, `path` is a prefix; exact routes are still tried first.
+    prefix: bool = false,
     handler: Handler,
 };
 
+pub const Found = struct {
+    handler: Handler,
+    /// Bytes of the request path after a matched prefix; empty for exact matches.
+    path_remainder: []const u8 = "",
+};
+
 pub const Match = union(enum) {
-    found: Handler,
+    found: Found,
     not_found,
     method_not_allowed: []const request.Method,
 };
@@ -23,20 +31,101 @@ pub const Router = struct {
     routes: []const Route,
 
     pub fn match(self: Router, method: request.Method, path: []const u8) Match {
+        // Exact routes first — 404/405 semantics for those paths stay unchanged.
         var path_exists = false;
         var allowed: [8]request.Method = undefined;
         var allowed_len: usize = 0;
         for (self.routes) |r| {
+            if (r.prefix) continue;
             if (std.mem.eql(u8, r.path, path)) {
                 path_exists = true;
                 if (allowed_len < allowed.len) {
                     allowed[allowed_len] = r.method;
                     allowed_len += 1;
                 }
-                if (r.method == method) return .{ .found = r.handler };
+                if (r.method == method) return .{ .found = .{ .handler = r.handler } };
             }
         }
-        if (!path_exists) return .not_found;
-        return .{ .method_not_allowed = allowed[0..allowed_len] };
+        if (path_exists) return .{ .method_not_allowed = allowed[0..allowed_len] };
+
+        // Prefix routes: longest prefix wins among method matches; 405 if only method differs.
+        var best_len: usize = 0;
+        var best: ?Found = null;
+        var prefix_path_exists = false;
+        allowed_len = 0;
+        for (self.routes) |r| {
+            if (!r.prefix) continue;
+            if (!std.mem.startsWith(u8, path, r.path)) continue;
+            prefix_path_exists = true;
+            if (allowed_len < allowed.len) {
+                // Dedup methods for 405 Allow list on this path family.
+                var seen = false;
+                for (allowed[0..allowed_len]) |m| {
+                    if (m == r.method) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    allowed[allowed_len] = r.method;
+                    allowed_len += 1;
+                }
+            }
+            if (r.method != method) continue;
+            if (r.path.len >= best_len) {
+                best_len = r.path.len;
+                best = .{ .handler = r.handler, .path_remainder = path[r.path.len..] };
+            }
+        }
+        if (best) |f| return .{ .found = f };
+        if (prefix_path_exists) return .{ .method_not_allowed = allowed[0..allowed_len] };
+        return .not_found;
     }
 };
+
+test "exact match unchanged" {
+    const dummy: u8 = 0;
+    const h: Handler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        fn f(_: *anyopaque, _: *const request.Request, _: *response.Response) anyerror!void {}
+    }.f };
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/hello", .handler = h },
+        .{ .method = .POST, .path = "/hello", .handler = h },
+    };
+    const r: Router = .{ .routes = &routes };
+    switch (r.match(.GET, "/hello")) {
+        .found => |f| try std.testing.expectEqual(@as(usize, 0), f.path_remainder.len),
+        else => return error.ExpectedFound,
+    }
+    switch (r.match(.PUT, "/hello")) {
+        .method_not_allowed => |m| try std.testing.expectEqual(@as(usize, 2), m.len),
+        else => return error.Expected405,
+    }
+    try std.testing.expect(r.match(.GET, "/missing") == .not_found);
+}
+
+test "prefix match yields remainder; exact wins over prefix" {
+    const dummy: u8 = 0;
+    const h: Handler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        fn f(_: *anyopaque, _: *const request.Request, _: *response.Response) anyerror!void {}
+    }.f };
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/v1/tasks/special", .handler = h },
+        .{ .method = .GET, .path = "/v1/tasks/", .prefix = true, .handler = h },
+        .{ .method = .POST, .path = "/v1/tasks/", .prefix = true, .handler = h },
+    };
+    const r: Router = .{ .routes = &routes };
+    switch (r.match(.GET, "/v1/tasks/special")) {
+        .found => |f| try std.testing.expectEqual(@as(usize, 0), f.path_remainder.len),
+        else => return error.ExpectedExact,
+    }
+    switch (r.match(.GET, "/v1/tasks/abc")) {
+        .found => |f| try std.testing.expectEqualStrings("abc", f.path_remainder),
+        else => return error.ExpectedPrefix,
+    }
+    switch (r.match(.DELETE, "/v1/tasks/abc")) {
+        .method_not_allowed => |m| try std.testing.expectEqual(@as(usize, 2), m.len),
+        else => return error.Expected405,
+    }
+    try std.testing.expect(r.match(.GET, "/other") == .not_found);
+}

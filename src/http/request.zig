@@ -45,6 +45,8 @@ pub const Request = struct {
     scheme: []const u8,
     authority: []const u8,
     path: []const u8,
+    /// After a prefix route match: path bytes past the prefix. Empty for exact routes.
+    path_remainder: []const u8 = "",
     query: []const u8,
     headers: []const Header,
     body: []const u8,

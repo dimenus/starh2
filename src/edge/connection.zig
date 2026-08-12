@@ -1609,6 +1609,10 @@ const Connection = struct {
         // HandlerCtx: Response.ctx points at job-local ctx with stable terminal pointer.
         job.hctx = .{ .conn = self, .terminal = undefined, .stream_id = d.stream_id };
         job.matched = self.config.router.match(job.req.method, job.req.path);
+        switch (job.matched) {
+            .found => |f| job.req.path_remainder = f.path_remainder,
+            else => {},
+        }
 
         // Reserve reaper capacity before admitting the handler.
         if (self.config.accounting) |acct| {
@@ -1684,8 +1688,8 @@ const Connection = struct {
         if (job.slot.terminal.cancel_flag.load(.acquire)) return;
         if (job.slot.terminal.getCause() != null) return;
         switch (job.matched) {
-            .found => |h| {
-                h.runFn(h.ptr, &job.req, &job.resp) catch {
+            .found => |f| {
+                f.handler.runFn(f.handler.ptr, &job.req, &job.resp) catch {
                     if (job.slot.terminal.getCause() != null) return;
                     if (!job.resp.committed) {
                         job.resp.send(500, &.{}, "internal error") catch {};

@@ -101,6 +101,7 @@ pub const Server = struct {
             routes[i] = .{
                 .method = r.method,
                 .path = try gpa.dupe(u8, r.path),
+                .prefix = r.prefix,
                 .handler = r.handler,
             };
         }
