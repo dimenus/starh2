@@ -5,10 +5,31 @@ Pins live in `tools/lock.json`. Held-out seeds stay outside this repo (`tools/he
 ## Build / unit
 
 ```sh
+./zb build ci
 ./zb build test
 ./zb build starh2-conformance-server example-hello example-datastar-sse
 ./zb build starh2-conformance-server example-hello example-datastar-sse -Doptimize=ReleaseSafe
-./zb build starh2-conformance-server -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-gnu
+./zb build release   # x86_64-linux-musl + aarch64-linux-musl + aarch64-linux-gnu ReleaseSafe
+```
+
+## Linux musl RUN (container)
+
+`x86_64-linux-musl` and `aarch64-linux-musl` ReleaseSafe binaries are compile-gated
+by `./zb build release` / `ci`. A RUN against h2spec + multiplex-grader needs a
+Linux kernel with working io_uring (privileged container on Colima/Docker).
+
+QEMU amd64 containers on Apple Silicon return `error.SystemOutdated` from
+io_uring (`NOSYS`) — that is not a starh2 failure. Prefer `--platform linux/arm64`
+with an `aarch64-linux-musl` binary, or a real amd64 Linux host for the
+x86_64-linux-musl deploy shape.
+
+```sh
+./zb build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe --prefix zig-out-musl-arm starh2-conformance-server
+docker run --rm --platform linux/arm64 --privileged \
+  -v "$PWD/zig-out-musl-arm/bin/starh2-conformance-server:/srv/starh2-conformance-server:ro" \
+  -v "$PWD/tools/multiplex-grader:/grader:ro" \
+  golang:1.22-bookworm bash -lc '... start server, h2spec http2, go run grader ...'
+# Expected: h2spec 93 pass + 2 published exclusions; multiplex pass true dials 1 sse_ok 100 morph_ok 200
 ```
 
 ## h2c

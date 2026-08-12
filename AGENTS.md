@@ -7,19 +7,18 @@ Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib loo
 ## Gates
 
 ```sh
-./zb build test                                      # complete suite
-./zb build test-exact                                # live writer/lifecycle gates
-./zb build fuzz-frame --fuzz=100K
-./zb build fuzz-hpack --fuzz=100K
-./zb build fuzz-session --fuzz=100K
-./zb build -Doptimize=ReleaseSafe starh2-conformance-server example-hello example-datastar-sse
-./zb build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out-linux starh2-conformance-server example-hello example-datastar-sse
+./zb build ci # definition of done (suite + exact + fuzz smoke + release targets)
 ```
+
+Release targets included in `ci`: native ReleaseSafe examples via `release`, plus
+`x86_64-linux-musl`, `aarch64-linux-musl`, and `aarch64-linux-gnu`. Individual
+steps remain available (`test`, `test-exact`, `fuzz-*`, example names).
 
 Interop commands and expected output are in `tools/README.md`. h2spec has exactly
 the two published RFC 7540 priority exclusions in `tools/h2spec/EXCLUSIONS.md`;
 do not weaken other failures into exclusions. The pinned Darwin h2spec needs
-`GODEBUG=tls13=1`.
+`GODEBUG=tls13=1`. Linux musl RUN proof uses a privileged container (io_uring);
+see `tools/README.md`.
 
 ## Ownership and concurrency
 

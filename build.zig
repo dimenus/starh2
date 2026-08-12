@@ -240,4 +240,61 @@ pub fn build(b: *std.Build) void {
         const build_step = b.step(ex.name, "Build " ++ ex.name);
         build_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
+
+    // Cross release targets — compile-only gates (see tools/README.md for Linux RUN).
+    const release_queries = [_]struct { name: []const u8, query: std.Target.Query }{
+        .{ .name = "x86_64-linux-musl", .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl } },
+        .{ .name = "aarch64-linux-musl", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl } },
+        .{ .name = "aarch64-linux-gnu", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu } },
+    };
+    const release_step = b.step("release", "ReleaseSafe build of shipped binaries for every deploy target");
+    inline for (release_queries) |rq| {
+        const rt = b.resolveTargetQuery(rq.query);
+        const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .ReleaseSafe });
+        const datastar_rt = b.dependency("datastar", .{ .target = rt, .optimize = .ReleaseSafe });
+        const tls_rt = b.dependency("tls", .{ .target = rt, .optimize = .ReleaseSafe });
+        const starh2_rt = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = rt,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zio", .module = zio_rt.module("zio") },
+                .{ .name = "datastar", .module = datastar_rt.module("datastar") },
+                .{ .name = "tls", .module = tls_rt.module("tls") },
+            },
+        });
+        inline for (examples) |ex| {
+            const exe_mod = b.createModule(.{
+                .root_source_file = b.path(ex.path),
+                .target = rt,
+                .optimize = .ReleaseSafe,
+                .imports = &.{
+                    .{ .name = "starh2", .module = starh2_rt },
+                    .{ .name = "zio", .module = zio_rt.module("zio") },
+                },
+            });
+            const exe = b.addExecutable(.{
+                .name = ex.name ++ "-" ++ rq.name,
+                .root_module = exe_mod,
+            });
+            const install = b.addInstallArtifact(exe, .{});
+            release_step.dependOn(&install.step);
+        }
+    }
+
+    // Nested fuzz smokes so `./zb build ci` always drives a bounded continuous
+    // fuzz without requiring the caller to remember --fuzz=.
+    const fuzz_smoke_step = b.step("fuzz-smoke", "Bounded continuous fuzz for frame/hpack/session");
+    inline for (.{ "frame", "hpack", "session" }) |name| {
+        const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "fuzz-" ++ name, "--fuzz=1K" });
+        cmd.setCwd(b.path("."));
+        cmd.has_side_effects = true;
+        fuzz_smoke_step.dependOn(&cmd.step);
+    }
+
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + every release target");
+    ci_step.dependOn(test_step);
+    ci_step.dependOn(test_exact_step);
+    ci_step.dependOn(fuzz_smoke_step);
+    ci_step.dependOn(release_step);
 }
