@@ -31,16 +31,26 @@ pub const Budget = struct {
     parent: std.mem.Allocator,
     limit: usize,
     used: usize = 0,
+    /// High-water mark of `used`. Chunked compress must keep this window-bounded
+    /// (independent of total input size).
+    peak: usize = 0,
+    /// When zero, the next alloc returns null (OOM canary). maxInt = disabled.
+    fail_remaining: usize = std.math.maxInt(usize),
 
     const prefix_len: usize = 16;
 
     pub fn alloc(self: *Budget, size: usize) ?[*]u8 {
         if (size == 0) return null;
+        if (self.fail_remaining != std.math.maxInt(usize)) {
+            if (self.fail_remaining == 0) return null;
+            self.fail_remaining -= 1;
+        }
         const total = std.math.add(usize, size, prefix_len) catch return null;
         if (self.used > self.limit or self.limit - self.used < total) return null;
         const block = self.parent.alignedAlloc(u8, .fromByteUnits(16), total) catch return null;
         @as(*usize, @ptrCast(@alignCast(block.ptr))).* = size;
         self.used += total;
+        if (self.used > self.peak) self.peak = self.used;
         return block[prefix_len..].ptr;
     }
 
@@ -90,13 +100,11 @@ pub const Encoder = struct {
     finished: bool = false,
 
     pub fn create(parent: std.mem.Allocator, limit: usize, quality: u8, window_bits: u8) EncodeError!*Encoder {
-        // Refuse a budget that cannot cover peak for this quality/window.
-        // libbrotli may hang if a custom alloc returns NULL mid-stream; failing
-        // here keeps OOM on the identity-fallback / init path instead.
+        // Parameter range only. Production budgets are floored at boot by
+        // `minBrotliContextBytes`. A deliberately tiny limit is allowed so OOM
+        // during compress surfaces as EncoderFailed (with CLEANUP_ON_OOM) rather
+        // than being rejected before the C path runs.
         if (window_bits < 10 or window_bits > 24 or quality > 11) return error.EncoderFailed;
-        const window_bytes: usize = @as(usize, 1) << @intCast(window_bits);
-        const min_limit = window_bytes * 4 + @as(usize, quality) * 128 * 1024 + 1024 * 1024;
-        if (limit < min_limit) return error.OutOfMemory;
 
         const budget = try parent.create(Budget);
         errdefer parent.destroy(budget);
@@ -184,13 +192,33 @@ pub const Encoder = struct {
         }
     }
 
-    pub fn compressAll(self: *Encoder, input: []const u8, gpa: std.mem.Allocator) EncodeError![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        try self.compress(input, .finish, &out, gpa);
-        return try out.toOwnedSlice(gpa);
+    /// One-shot compress. Input is fed in ≤ `process_chunk` steps so encoder
+/// memory stays window-bounded and does not scale with body size.
+///
+/// Non-final chunks use FLUSH (not bare PROCESS): at quality ≥ 4 brotli
+/// accumulates commands until a full metablock (~1 MiB at w19), and
+/// `commands_` + `GetBrotliStorage(2*metablock)` alone exceed a 4 MiB
+/// context budget. Flushing each chunk keeps those buffers chunk-sized.
+/// A single multi-MiB CompressStream call also made GetBrotliStorage
+/// allocate input-proportional scratch and exit/OOM under the budget.
+pub const process_chunk: usize = 64 * 1024;
+
+pub fn compressAll(self: *Encoder, input: []const u8, gpa: std.mem.Allocator) EncodeError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var off: usize = 0;
+    while (off < input.len) {
+        const end = @min(off + process_chunk, input.len);
+        const last = end == input.len;
+        try self.compress(input[off..end], if (last) .finish else .flush, &out, gpa);
+        off = end;
     }
-};
+    if (input.len == 0) {
+        try self.compress(&.{}, .finish, &out, gpa);
+    }
+    return try out.toOwnedSlice(gpa);
+}
+    };
 
 pub const Decoder = struct {
     state: *c.BrotliDecoderState,
@@ -404,9 +432,48 @@ test "pool caps concurrent contexts and counts identity fallback" {
     try std.testing.expectEqual(@as(usize, 1), pool.liveCount());
 }
 
-test "budget rejects undersized context before create" {
+test "budget OOM during compress returns Zig error not process exit" {
     const gpa = std.testing.allocator;
-    // Below min budget for q5/w19: must fail at create (not hang mid-stream).
-    try std.testing.expectError(error.OutOfMemory, Encoder.create(gpa, 256, 5, 19));
-    try std.testing.expectError(error.OutOfMemory, Encoder.create(gpa, 2 * 1024 * 1024, 5, 19));
+    // Accept one block under a real budget, then force every subsequent custom
+    // alloc to return null. OOM must surface as EncoderFailed.
+    //
+    // Without -DBROTLI_ENCODER_CLEANUP_ON_OOM the C core calls exit(1) and this
+    // test process dies — that is the canary for fix 1.
+    //
+    // Note: failing *before* any input is ring-buffered is not a usable canary:
+    // brotli may still emit an empty finalized stream and return BROTLI_TRUE.
+    const enc = try Encoder.create(gpa, test_budget, 5, 19);
+    defer enc.destroy();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const block = "x" ** (64 * 1024);
+    try enc.compress(block, .process, &out, gpa);
+    enc.budget.fail_remaining = 0;
+    try std.testing.expectError(error.EncoderFailed, enc.compress(block, .finish, &out, gpa));
+}
+
+test "chunked compressAll body larger than context budget stays within budget" {
+    const gpa = std.testing.allocator;
+    // 16 MiB body under the default 4 MiB context budget: proves compressAll
+    // feeds PROCESS in 64 KiB steps so peak memory is window-bounded, not
+    // input-proportional.
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    const pad = "<div class=\"row\">pad pad pad pad</div>\n";
+    while (plain.items.len < 16 * 1024 * 1024) {
+        try plain.appendSlice(gpa, pad);
+    }
+    const enc = try Encoder.create(gpa, test_budget, 5, 19);
+    defer enc.destroy();
+    const compressed = try enc.compressAll(plain.items, gpa);
+    defer gpa.free(compressed);
+    try std.testing.expect(compressed.len > 0);
+    try std.testing.expect(compressed.len < plain.items.len);
+    // Peak must stay inside the context budget and must not track body size.
+    try std.testing.expect(enc.budget.peak <= test_budget);
+    try std.testing.expect(enc.budget.peak < plain.items.len / 4);
+    const decoded = try Decoder.decompressAll(gpa, test_budget, compressed);
+    defer gpa.free(decoded);
+    try std.testing.expectEqual(@as(usize, plain.items.len), decoded.len);
+    try std.testing.expectEqualSlices(u8, plain.items, decoded);
 }

@@ -212,6 +212,13 @@ fn sendBigHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Respo
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/html" }}, plain);
 }
 
+/// `/big` shape from the conformance server: ≥5 MiB one-shot send.
+fn sendFiveMiBHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    const plain = try req.arena.alloc(u8, 5 * 1024 * 1024);
+    @memset(plain, 'B');
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, plain);
+}
+
 fn sendWithContentEncoding(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
     const plain = "already-encoded-body-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad";
@@ -389,6 +396,66 @@ test "I3 big compressible body shrinks under 25 percent" {
                     const decoded = try brotli.Decoder.decompressAll(alloc, 4 * 1024 * 1024, cap.body.items);
                     defer alloc.free(decoded);
                     try std.testing.expect(decoded.len >= 64 * 1024);
+                }
+            }.go);
+        }
+    }.f);
+}
+
+// Pins fix-round-1: 5 MiB one-shot + br must not kill the process; second
+// request on the same connection proves the server stayed up.
+test "five MiB one-shot br round-trip keeps server alive" {
+    try withRuntime(struct {
+        fn f(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+            const routes = [_]starh2.Route{
+                .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendFiveMiBHandler } },
+                .{ .method = .GET, .path = "/t", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } },
+            };
+            try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
+                fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
+                    const port = server.localAddress(0).getPort();
+                    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+                    var stream = try peer.connect(.{});
+                    defer stream.close();
+
+                    // Large client windows so a multi-MiB payload can drain even
+                    // if compression unexpectedly falls back to identity.
+                    var wire = try h2c.buildClientPrefaceAndSettings(alloc);
+                    defer wire.deinit(alloc);
+                    {
+                        var sbuf: [64]u8 = undefined;
+                        const settings = [_]frame.Setting{.{ .id = .initial_window_size, .value = 1 << 23 }};
+                        const sn = try frame.Serializer.settingsFrame(&sbuf, false, &settings);
+                        try wire.appendSlice(alloc, sbuf[0..sn]);
+                    }
+                    try h2c.appendWindowUpdate(alloc, &wire, 0, 1 << 23);
+                    const extra = [_]hpack.HeaderField{.{ .name = "accept-encoding", .value = "br" }};
+                    try h2c.appendHeadersExtra(alloc, &wire, 1, "GET", "/big", true, &extra);
+                    try writeAllStream(stream, wire.items);
+
+                    var cap = try Capture.init(alloc);
+                    defer cap.deinit();
+                    try readUntil(stream, &cap, 30000, doneEnd);
+                    try std.testing.expect(!cap.saw_rst);
+                    try std.testing.expectEqualStrings("br", cap.headerValue("content-encoding").?);
+                    const decoded = try brotli.Decoder.decompressAll(alloc, 4 * 1024 * 1024, cap.body.items);
+                    defer alloc.free(decoded);
+                    try std.testing.expectEqual(@as(usize, 5 * 1024 * 1024), decoded.len);
+                    try std.testing.expect(std.mem.allEqual(u8, decoded, 'B'));
+
+                    // Keep-alive probe: server must still accept work.
+                    var wire2: std.ArrayList(u8) = .empty;
+                    defer wire2.deinit(alloc);
+                    try h2c.appendHeadersExtra(alloc, &wire2, 3, "GET", "/t", true, &extra);
+                    try writeAllStream(stream, wire2.items);
+                    var cap2 = try Capture.init(alloc);
+                    defer cap2.deinit();
+                    try readUntil(stream, &cap2, 8000, doneEnd);
+                    try std.testing.expectEqualStrings("br", cap2.headerValue("content-encoding").?);
+                    const d2 = try brotli.Decoder.decompressAll(alloc, 4 * 1024 * 1024, cap2.body.items);
+                    defer alloc.free(d2);
+                    const expect = "hello compressed world " ** 20;
+                    try std.testing.expectEqualStrings(expect, d2);
                 }
             }.go);
         }

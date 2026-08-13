@@ -49,10 +49,15 @@ const brotli_dec_sources = [_][]const u8{
 };
 
 fn brotliFlags(target: std.Build.ResolvedTarget) []const []const u8 {
+    // BROTLI_ENCODER_CLEANUP_ON_OOM: without it, enc/memory.h defaults to
+    // BROTLI_ENCODER_EXIT_ON_OOM and the first null custom-alloc calls exit(1),
+    // taking the whole server with it. With CLEANUP, CompressStream returns
+    // BROTLI_FALSE and our Zig error paths (identity pre-commit / RST post-commit)
+    // engage.
     return switch (target.result.os.tag) {
-        .macos => &[_][]const u8{ "-std=c99", "-O2", "-DOS_MACOSX" },
-        .linux => &[_][]const u8{ "-std=c99", "-O2", "-DOS_LINUX" },
-        else => &[_][]const u8{ "-std=c99", "-O2" },
+        .macos => &[_][]const u8{ "-std=c99", "-O2", "-DOS_MACOSX", "-DBROTLI_ENCODER_CLEANUP_ON_OOM" },
+        .linux => &[_][]const u8{ "-std=c99", "-O2", "-DOS_LINUX", "-DBROTLI_ENCODER_CLEANUP_ON_OOM" },
+        else => &[_][]const u8{ "-std=c99", "-O2", "-DBROTLI_ENCODER_CLEANUP_ON_OOM" },
     };
 }
 

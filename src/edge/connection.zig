@@ -2600,63 +2600,25 @@ const Connection = struct {
         if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
 
         const prep = self.prepareCompression(hctx, status, headers, body.len, false);
+        // Single full-body path parameterized by coding. Pre-commit compress
+        // failure falls back to identity (still with Vary when prep asked for it).
+        var compress = prep.compress;
+        const add_vary = prep.add_vary;
         var body_out = body;
         var compressed_owned: ?[]u8 = null;
         defer if (compressed_owned) |p| self.config.gpa.free(p);
 
-        if (prep.compress) {
+        if (compress) {
             const enc = hctx.encoder.?;
-            const compressed = enc.compressAll(body, self.config.gpa) catch {
-                // Still before headers on the wire: fall back to identity.
-                enc.destroy();
-                hctx.encoder = null;
-                hctx.compressing = false;
+            if (enc.compressAll(body, self.config.gpa)) |compressed| {
+                compressed_owned = compressed;
+                body_out = compressed;
+            } else |_| {
+                // Still before headers on the wire: identity + counted fallback.
                 if (self.config.compression_pool) |pool| pool.noteIdentityFallback();
-                // prep.compress treated as false below
+                compress = false;
                 body_out = body;
-                // rebuild as identity with vary
-                const ticket_pair_fb = self.reserveTicket() catch |err| return err;
-                const ticket_fb = ticket_pair_fb[0];
-                const slot_fb = ticket_pair_fb[1];
-                var armed_fb = true;
-                defer if (armed_fb) self.tickets.releaseReserved(slot_fb);
-                {
-                    try self.lockSession();
-                    defer self.session_mu.unlock(self.config.io);
-                    var hlist: std.ArrayList(hpack.HeaderField) = .empty;
-                    defer hlist.deinit(self.config.gpa);
-                    var owned_vary: ?[]u8 = null;
-                    defer if (owned_vary) |v| self.config.gpa.free(v);
-                    try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
-                        .compress = false,
-                        .add_vary = true,
-                        .strip_content_length = false,
-                    }, &owned_vary);
-                    self.session.applyCommand(.{ .respond_headers = .{
-                        .stream_id = stream_id,
-                        .status = status,
-                        .headers = hlist.items,
-                        .end_stream = body.len == 0,
-                    } }) catch return error.WriteFailed;
-                    if (body.len > 0) {
-                        self.processIntents() catch return error.WriteFailed;
-                        self.enqueuePending(stream_id, body, true, ticket_fb, slot_fb, hctx.terminal) catch |err| return err;
-                        self.processIntents() catch return error.WriteFailed;
-                    } else {
-                        self.next_wire_ticket = ticket_fb;
-                        self.next_wire_slot = slot_fb;
-                        self.processIntents() catch return error.WriteFailed;
-                    }
-                }
-                armed_fb = false;
-                hctx.slot.awaiting_receipt.store(true, .release);
-                defer hctx.slot.awaiting_receipt.store(false, .release);
-                try self.waitTicket(slot_fb, hctx.terminal);
-                return;
-            };
-            compressed_owned = compressed;
-            body_out = compressed;
-            // Full-body path: encoder finished; release before returning.
+            }
             enc.destroy();
             hctx.encoder = null;
             hctx.compressing = false;
@@ -2675,12 +2637,11 @@ const Connection = struct {
             var owned_vary: ?[]u8 = null;
             defer if (owned_vary) |v| self.config.gpa.free(v);
             try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
-                .compress = prep.compress and compressed_owned != null,
-                .add_vary = prep.add_vary,
-                .strip_content_length = prep.compress and compressed_owned != null,
+                .compress = compress,
+                .add_vary = add_vary,
+                .strip_content_length = compress,
             }, &owned_vary);
-            // If we recomputed a compressed body, content-length (if any) was stripped;
-            // do not invent a new one — HTTP/2 length is framing.
+            // Compressed bodies never carry content-length — HTTP/2 length is framing.
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,

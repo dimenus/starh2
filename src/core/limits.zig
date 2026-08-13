@@ -72,14 +72,15 @@ pub const TERMINAL_CONTROL_RESERVE_BYTES: usize = 4 * 1024;
 pub const TERMINAL_CONTROL_RESERVE_ENTRIES: usize = 16;
 
 /// Lower bound on `compression_context_bytes` for a quality/window pair.
-/// Derived from measured libbrotli peaks (ring ≈ 2^lgwin, plus quality-scaled
-/// hash tables and multi-flush residency). Kept in limits so boot validation
-/// and the encoder wrapper share one floor.
+///
+/// With chunked `compressAll` (≤64 KiB PROCESS steps), encoder memory is
+/// window-bounded: ring ≈ 2^lgwin plus quality-scaled hashers and multi-flush
+/// residency. It must NOT scale with body size. Kept in limits so boot
+/// validation and operators share one floor.
 pub fn minBrotliContextBytes(window_bits: u8, quality: u8) usize {
     const window_bytes: usize = @as(usize, 1) << @intCast(window_bits);
     // 4× window covers ring + copy + headroom; quality adds hasher tables;
-    // 1 MiB fixed slack covers streaming flush residency beyond the one-shot
-    // estimate (multi-flush q5/w19 measured ~2.2 MiB vs ~1 MiB base).
+    // 1 MiB fixed slack covers multi-flush SSE residency (q5/w19 ~2.2 MiB peak).
     const q: usize = quality;
     return window_bytes * 4 + q * 128 * 1024 + 1024 * 1024;
 }
@@ -138,11 +139,11 @@ pub const Limits = struct {
     /// Per-encoder allocation budget routed through brotli's custom allocator
     /// hooks. Exhaustion before headers commit → identity; after commit → RST.
     ///
-    /// Default is 4 MiB, not the brief's 2 MiB sketch: measured peak for
-    /// quality 5 / window 19 is ~3.1 MiB on a 64 KiB one-shot and ~2.2 MiB on
-    /// multi-flush SSE. libbrotli can spin forever when a custom alloc returns
-    /// NULL mid-stream, so the budget must cover peak rather than relying on
-    /// OOM as a failure path. Boot rejects a budget below `minBrotliContextBytes`.
+    /// Default is 4 MiB (brief sketched 2 MiB). With chunked PROCESS steps,
+    /// peak is window-bounded (~2.2 MiB multi-flush at q5/w19), not body-sized.
+    /// Built with `-DBROTLI_ENCODER_CLEANUP_ON_OOM` so a null alloc returns
+    /// BROTLI_FALSE instead of exit(1). Boot rejects a budget below
+    /// `minBrotliContextBytes`.
     compression_context_bytes: usize = 4 * 1024 * 1024,
     /// Full-body path only: bodies shorter than this stay identity.
     compression_min_bytes: usize = 256,
@@ -211,9 +212,10 @@ pub const Limits = struct {
         if (self.outbound_slabs_per_server < self.max_streams_per_server) return error.InvalidConfig;
         if (self.compression_quality > 11) return error.InvalidConfig;
         if (self.compression_window_bits < 10 or self.compression_window_bits > 24) return error.InvalidConfig;
-        // Reject budgets that cannot cover measured peak for this quality/window.
-        // A too-small budget does not fail closed under libbrotli — it can hang
-        // inside CompressStream when the custom alloc returns NULL.
+        // Reject budgets that cannot cover window-bounded peak for this quality/window.
+        // CLEANUP_ON_OOM turns a null alloc into EncoderFailed, but a config that
+        // cannot open a context for a normal response would identity-fallback
+        // every request — fail that at boot instead.
         if (self.compression_context_bytes < minBrotliContextBytes(self.compression_window_bits, self.compression_quality)) {
             return error.InvalidConfig;
         }
