@@ -78,6 +78,10 @@ fn buildRstAll(gpa: std.mem.Allocator, n: usize) ![]u8 {
 }
 
 fn waitAccountingZero(server: *starh2.Server, timeout_ms: u64) !void {
+    return waitAccountingZeroAt(server, timeout_ms, 0);
+}
+
+fn waitAccountingZeroAt(server: *starh2.Server, timeout_ms: u64, caller_line: usize) !void {
     const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% timeout_ms * std.time.ns_per_ms;
     while (true) {
         const streams = server.accounting.active_streams.load(.acquire);
@@ -88,7 +92,7 @@ fn waitAccountingZero(server: *starh2.Server, timeout_ms: u64) !void {
         const slots = starh2.edge.connection.test_observed_slots_in_use.load(.acquire);
         if (streams == 0 and reaper == 0 and outbound == 0 and request == 0 and live == 0 and slots == 0) return;
         if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
-            std.debug.print("accounting not zero: streams={d} reaper={d} outbound={d} request={d} live={d} slots={d}\n", .{ streams, reaper, outbound, request, live, slots });
+            std.debug.print("accounting not zero (called from line {d}): streams={d} reaper={d} outbound={d} request={d} live={d} slots={d}\n", .{ caller_line, streams, reaper, outbound, request, live, slots });
             return error.AccountingNotZero;
         }
         zio.sleep(.fromMilliseconds(10)) catch {};
@@ -154,7 +158,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         const wire = try h2c.buildClientHello(gpa, "/hello");
         defer gpa.free(wire);
         try writeAllStream(stream, wire);
-        try waitAccountingZero(&server, 2000);
+        try waitAccountingZeroAt(&server, 2000, 161);
     }
     starh2.edge.connection.test_force_spawn_fail = false;
 
@@ -180,7 +184,17 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         zio.sleep(.fromMilliseconds(50)) catch {};
         // Slot may still be in_use while completion is held.
         starh2.edge.connection.test_hold_completion_drain.store(false, .release);
-        try waitAccountingZero(&server, 2000);
+        // The completion's actor wake was consumed WHILE the drain was held (the
+        // held drainCompletions is a no-op), and releasing the hold re-enables
+        // the drain without re-waking the idle actor — the t-544 flake: the
+        // slot then sits until an incidental timer wake or the gate's timeout,
+        // whichever comes first. Production always pairs post+wake, so the
+        // faithful fix is to wake the actor the way a real peer would: any
+        // inbound frame. PING is the cheapest.
+        var ping_buf: [17]u8 = undefined;
+        const ping_n = try starh2.core.frame.Serializer.ping(&ping_buf, false, &[_]u8{0} ** 8);
+        try writeAllStream(stream, ping_buf[0..ping_n]);
+        try waitAccountingZeroAt(&server, 2000, 187);
     }
 
     // --- Single-connection 100 concurrent SSE: open → RST. ---
@@ -199,7 +213,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         const rsts = try buildRstAll(gpa, 100);
         defer gpa.free(rsts);
         try writeAllStream(stream, rsts);
-        try waitAccountingZero(&server, 5000);
+        try waitAccountingZeroAt(&server, 5000, 206);
     }
 
     // --- Single-connection 100 concurrent SSE → abrupt socket close. ---
@@ -211,7 +225,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try writeAllStream(stream, open);
         try waitStreamsAtLeast(&server, 100, 5000);
         stream.close();
-        try waitAccountingZero(&server, 5000);
+        try waitAccountingZeroAt(&server, 5000, 218);
     }
 
     // --- Delayed writer: flush wait must not return early. ---
@@ -385,7 +399,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try h2c.appendWindowUpdate(gpa, &boost, 1, 64 * 1024);
         try h2c.appendWindowUpdate(gpa, &boost, 0, 64 * 1024);
         writeAllStream(stream, boost.items) catch {};
-        try waitAccountingZero(&server, 2_000);
+        try waitAccountingZeroAt(&server, 2_000, 392);
         try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
@@ -937,7 +951,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
         }
         // defer stream.close() tears down; wait for accounting after block ends.
     }
-    try waitAccountingZero(&server, 5_000);
+    try waitAccountingZeroAt(&server, 5_000, 944);
     try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_queue_wire_bypass.load(.acquire));
 
     // --- RST while blocked on sparse/dense stream. ---
@@ -965,7 +979,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
         }
         stream.close();
     }
-    try waitAccountingZero(&server, 5_000);
+    try waitAccountingZeroAt(&server, 5_000, 972);
     const herr = starh2.edge.connection.test_last_handler_err.load(.acquire);
     try std.testing.expectEqual(@as(u8, 3), herr); // PeerReset only
     const frame = starh2.core.frame;
@@ -1056,7 +1070,7 @@ fn runCapCrossingBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // The body reaching the peer is not the whole contract: resp.send must
     // RETURN. A handler parked forever on the final flush ack is the t-482
     // /ui/tasks hang, and only the accounting can see it from out here.
-    try waitAccountingZero(&server, 3_000);
+    try waitAccountingZeroAt(&server, 3_000, 1063);
     try std.testing.expectEqual(@as(u8, 0), starh2.edge.connection.test_last_handler_err.load(.acquire));
 }
 
@@ -1243,7 +1257,7 @@ fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         const wire = try h2c.buildClientHello(gpa, "/hello");
         defer gpa.free(wire);
         try writeAllStream(stream, wire);
-        try waitAccountingZero(&server, 5_000);
+        try waitAccountingZeroAt(&server, 5_000, 1250);
     }
 
     // A second wait on an already-listening server returns immediately.
