@@ -1,4 +1,41 @@
 //! Deterministic HTTP/2 connection state machine. No I/O, no clocks.
+//!
+//! `Session` is the protocol authority for one connection. It is the only place
+//! that decides what HTTP/2 means, and the edge is the only place that touches
+//! a socket or a clock. The split is the central design choice of this stack,
+//! and it buys three things:
+//!
+//! - A protocol decision is reproducible. The same byte sequence produces the
+//!   same intents on every run, so a conformance failure is a test case and not
+//!   a timing story.
+//! - No lock lives in here. `Connection` serializes every entry point behind
+//!   `session_mu`, so `Session` may assume single-threaded access.
+//! - The edge cannot invent protocol. It may only apply `AppCommand` values and
+//!   execute `Intent` values.
+//!
+//! ## The flow
+//!
+//! Inbound:  wire bytes -> `ingest` -> `frame.Parser` -> `handleFrame`
+//!           -> stream state -> `Intent`.
+//! Outbound: handler -> `AppCommand` -> `applyCommand` -> `Intent`.
+//!
+//! `Session` never writes. It appends an `Intent`, and the edge drains the
+//! intent ring and turns each entry into wire bytes or into a handler dispatch.
+//! Two consequences follow, and both have cost real defects:
+//!
+//! - An intent is queued, not sent. A caller that needs bytes on the wire in a
+//!   given ORDER must materialize the intents at the right moment. See the
+//!   HEADERS-before-DATA note in `edge.connection.sendCb` (t-482).
+//! - `edge_now_ns` is a value the edge stores before each call, and not a clock
+//!   this module reads. Every deadline below compares against that stored
+//!   value.
+//!
+//! ## Ownership
+//!
+//! An `Intent` carries owned memory: a frame payload, or a decoded request.
+//! `pushIntent` transfers that ownership only when it returns success, so an
+//! `error.PoolExhausted` leaves the caller still owning the payload. Whoever
+//! drains an intent must release it with `releaseIntent` exactly once.
 const std = @import("std");
 const frame = @import("frame.zig");
 const hpack = @import("hpack.zig");
@@ -8,6 +45,9 @@ const flow = @import("flow.zig");
 const limits_mod = @import("limits.zig");
 const rates_mod = @import("rates.zig");
 
+/// Work that the edge must perform. `Session` decides; the edge executes.
+/// An intent never contains a callback or a pointer back into edge state, so
+/// the protocol layer cannot reach into the actor and cannot be re-entered.
 pub const Intent = union(enum) {
     outbound_frame: OutboundFrame,
     dispatch_request: DispatchRequest,
@@ -37,6 +77,10 @@ pub const DispatchRequest = struct {
     trailers: []hpack.HeaderField,
 };
 
+/// The handler-facing direction: everything an application may ask of the
+/// connection. The set is closed on purpose. A handler cannot build a frame,
+/// so it cannot violate the protocol, and every response path is auditable
+/// from this one union.
 pub const AppCommand = union(enum) {
     respond_headers: struct {
         stream_id: u31,
@@ -81,6 +125,10 @@ pub const Session = struct {
     intent_storage: []Intent = &.{},
     intent_len: usize = 0,
     /// Slots reserved for GOAWAY / connection_error so PoolExhausted can still fail-close.
+    /// A connection that fills its intent ring must still be able to say WHY it
+    /// is closing. Without the reserve the failure path needs the resource it
+    /// just ran out of, so the connection would die silently and the peer would
+    /// see only a dropped socket.
     terminal_reserve: usize = 2,
     highest_peer_stream: u31 = 0,
     last_processed_stream: u31 = 0,
@@ -109,6 +157,14 @@ pub const Session = struct {
     grace_ping_acked: bool = false,
     control_frames_since_data: usize = 0,
     /// Optional server-wide stream admission (global max_streams_per_server).
+    /// A per-connection limit alone does not bound a server: N connections at
+    /// their own limits still exceed any global budget. The hooks let the edge
+    /// enforce the server-wide counters at the exact moment `Session` admits a
+    /// stream or accepts request bytes, while `Session` stays free of any
+    /// knowledge about other connections. `Session` calls `onRelease` exactly
+    /// once per successful `tryAdmit`, including on the teardown path in
+    /// `deinit`; a missed release leaks server capacity for the process
+    /// lifetime.
     stream_hooks: ?StreamHooks = null,
     /// Edge-owned rate limiter + clock snapshot. Null → rates disabled.
     rate_limiter: ?*rates_mod.RateLimiter = null,
@@ -155,6 +211,12 @@ pub const Session = struct {
         try s.pending_trailers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.body_idle_ns.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.header_block.ensureTotalCapacity(allocator, frame.DEFAULT_MAX_FRAME_SIZE);
+        // The preface is queued at construction, before the peer has said
+        // anything. RFC 9113 requires the server's SETTINGS to be the first
+        // frame it sends, and the only way to guarantee that is to make it the
+        // first intent that can possibly exist. See
+        // `edge.fair_scheduler.classifyControl` for the ordering defect that
+        // appeared when a later ack could overtake this frame (t-538).
         try s.emitServerPreface();
         return s;
     }
@@ -260,6 +322,15 @@ pub const Session = struct {
         };
     }
 
+    /// Last resort when an intent cannot be queued. The connection is already
+    /// unable to express itself, so this path may not allocate a new intent
+    /// slot through the normal route — it spends the terminal reserve directly
+    /// and must never recurse through `pushIntentOrFailClosed`.
+    ///
+    /// Every step degrades rather than gives up: if even the reserved GOAWAY
+    /// cannot be queued, `terminal` is still set, so the actor loop breaks and
+    /// the edge tears the connection down. The rule is that a broken connection
+    /// closes; it never continues in an unknown protocol state.
     pub fn failClosedInternal(self: *Session) !void {
         if (self.terminal != .none) return;
         // Use reserved terminal capacity — must not recurse through pushIntentOrFailClosed.
@@ -306,6 +377,13 @@ pub const Session = struct {
     }
 
     /// Build framed DATA without touching the intent queue (avoids nested drain).
+    ///
+    /// The scheduler calls this while it drains, so the bytes must NOT become
+    /// an intent: the edge would then drain an intent ring that it is already
+    /// inside. Flow-control credit is debited here, at the moment the frame
+    /// exists, so the debit and the frame cannot separate. A caller that gets
+    /// `error.FlowBlocked` has caused no debit and may retry the same bytes
+    /// unchanged after a WINDOW_UPDATE.
     pub fn makeDataFrame(self: *Session, stream_id: u31, data: []const u8, end_stream: bool) ![]u8 {
         const s = self.streams.getPtr(stream_id) orelse return error.StreamClosed;
         const avail = s.window.availableSend(self.windows.conn_send);
@@ -450,6 +528,20 @@ pub const Session = struct {
         self.terminal = .{ .goaway = .{ .code = code, .last_stream_id = last } };
     }
 
+    /// Return the stream's concurrency credit and drop its map entry.
+    ///
+    /// The map entry cannot live for the whole connection, or a long-lived
+    /// connection accumulates one entry per request it ever served. A dropped
+    /// entry, however, makes a late frame for that stream look like a frame for
+    /// an IDLE stream, and the protocol treats those two cases very
+    /// differently. The bounded tombstone list closes that gap: it remembers
+    /// that the id was used and how it ended, at 8 bytes per entry instead of a
+    /// whole `Stream`.
+    ///
+    /// `concurrency_released` makes the release idempotent. Several paths can
+    /// reach a closed stream — a peer RST, a local RST, END_STREAM in both
+    /// directions — and a double release would corrupt the server-wide stream
+    /// count.
     fn releaseConcurrency(self: *Session, stream_id: u31) void {
         const s = self.streams.getPtr(stream_id) orelse return;
         if (s.concurrency_released) return;
@@ -478,6 +570,10 @@ pub const Session = struct {
         self.releaseConcurrency(stream_id);
     }
 
+    /// Oldest-first eviction, because a peer decides how many streams it opens.
+    /// An unbounded list would grow with the connection's lifetime, which is a
+    /// memory target. Losing the oldest tombstone is safe: a frame for a stream
+    /// that closed that long ago falls back to the generic closed-stream rules.
     fn addTombstone(self: *Session, id: u31, code: frame.ErrorCode) !void {
         if (self.tombstones.items.len >= self.limits.stream_tombstones) {
             _ = self.tombstones.orderedRemove(0);
@@ -485,6 +581,18 @@ pub const Session = struct {
         try self.tombstones.append(self.allocator, .{ .id = id, .code = code });
     }
 
+    /// One frame, fully validated, in the order the RFC requires the checks.
+    ///
+    /// The three gates below run BEFORE the type switch, and the order matters:
+    ///
+    /// 1. The peer's first frame must be a non-ack SETTINGS. Anything else means
+    ///    the peer is not speaking HTTP/2, so no later state is trustworthy.
+    /// 2. An unfinished field block accepts only a CONTINUATION for the same
+    ///    stream. HPACK state spans the fragments, so any other frame in the
+    ///    gap would leave the decoder unable to read the rest of the connection.
+    /// 3. `already_terminal` is captured first so that a protocol error wins
+    ///    over a rate-limit error raised by the same frame. The peer must learn
+    ///    the more specific reason.
     fn handleFrame(self: *Session, ev: frame.FrameEvent) !void {
         defer if (ev.payload.len != 0) self.allocator.free(ev.payload);
         const hdr = ev.header;
@@ -527,13 +635,29 @@ pub const Session = struct {
                     try self.addTombstone(hdr.stream_id, code);
                     self.releaseConcurrency(hdr.stream_id);
                     // Cancel handler; never RST in response to peer RST.
+                    // A reset answered by a reset is an infinite exchange
+                    // between two conforming peers (RFC 9113 section 5.4.2).
                     try self.pushIntentOrFailClosed(.{ .stream_reset = .{
                         .stream_id = hdr.stream_id,
                         .code = code,
                         .from_peer = true,
                     } });
+                } else if (hdr.stream_id <= self.highest_peer_stream) {
+                    // CLOSED, not idle. The peer sent this before it learned the
+                    // stream was over — its RST and our END_STREAM crossed on
+                    // the wire. RFC 9113 section 5.1 requires tolerating that,
+                    // and it is not a rare case: it happens every time a browser
+                    // cancels a fetch as the response completes. Failing the
+                    // connection here would kill every OTHER stream on it, which
+                    // is how one canceled request became a dead connection.
+                    //
+                    // There is nothing to do. The stream is already gone, its
+                    // concurrency credit already released, and the handler (if
+                    // any) already canceled when the stream closed.
                 } else {
-                    // RST_STREAM on idle / unknown stream is a connection error (RFC 9113 §5.1 / §5.4.1).
+                    // IDLE: a stream id the peer has never opened has no state
+                    // to reset, so this is a genuine protocol violation
+                    // (RFC 9113 section 5.1 / 5.4.1).
                     try self.failConnection(.protocol_error);
                     return;
                 }
@@ -550,6 +674,9 @@ pub const Session = struct {
                 self.goaway_ceiling = last;
                 self.peer_goaway = true;
                 // Existing streams at or below last may finish; do not tear down transport yet.
+                // A peer GOAWAY announces an intent to stop, not an immediate
+                // close. An instant teardown here would abort in-flight
+                // responses that the peer is still waiting to receive.
             },
             .window_update => try self.onWindowUpdate(hdr, ev.payload),
             .continuation => try self.failConnection(.protocol_error),
@@ -573,6 +700,15 @@ pub const Session = struct {
     }
 
     /// Edge clock: field-block / request-body idle deadlines.
+    ///
+    /// Both deadlines answer the same attack: a peer that opens work and then
+    /// stops, so the server holds state while the peer spends nothing. A
+    /// half-sent field block pins the HPACK buffer and blocks every other frame
+    /// on the connection, so it costs the CONNECTION. A stalled request body
+    /// pins only its own stream, so it costs that stream a RST_STREAM.
+    ///
+    /// The edge passes `now_ns` rather than this module reading a clock. That
+    /// keeps the timeout behaviour deterministic under test.
     pub fn checkIdleDeadlines(self: *Session, now_ns: u64) !void {
         if (self.terminal != .none) return;
         if (self.expect_continuation != null and self.field_block_started_ns != 0) {
@@ -581,6 +717,8 @@ pub const Session = struct {
                 return;
             }
         }
+        // Collect first, act second. `emitRst` removes map entries, and a
+        // mutation during iteration invalidates the iterator.
         var stale: std.ArrayList(u31) = .empty;
         defer stale.deinit(self.allocator);
         var it = self.body_idle_ns.iterator();
@@ -598,6 +736,12 @@ pub const Session = struct {
 
     /// Earliest edge-owned idle deadline, or null when no protocol timer is armed.
     /// This only derives protocol state; the edge chooses how to wait for it.
+    ///
+    /// The actor is event-driven and parks with no timer when nothing is armed.
+    /// Without this query it would have to poll to notice a deadline, which
+    /// costs a wakeup per tick on every idle connection. A `null` result is
+    /// therefore a real answer: no protocol timer exists, so the actor may
+    /// sleep until a peer or a handler wakes it.
     pub fn nextIdleDeadlineNs(self: *Session) ?u64 {
         var next: ?u64 = null;
         if (self.expect_continuation != null and self.field_block_started_ns != 0) {
@@ -636,6 +780,10 @@ pub const Session = struct {
                     try self.failConnection(.protocol_error);
                     return;
                 },
+                // A new initial window retunes every OPEN stream by the
+                // difference. This is the one setting that reaches back into
+                // existing state, and it is why a stream send window may go
+                // negative. See `flow.applyInitialWindowDelta`.
                 .initial_window_size => {
                     if (value > 0x7fffffff) {
                         try self.failConnection(.flow_control_error);
@@ -657,6 +805,11 @@ pub const Session = struct {
                         try self.failConnection(.protocol_error);
                         return;
                     }
+                    // Accept the peer's larger offer, then ignore it. The
+                    // outbound frame size stays at the 16 KiB default, because
+                    // that is what the boot-reserved scratch buffers are sized
+                    // for. A bigger frame would need an allocation that
+                    // `resourceUpperBound` never counted.
                     self.peer_max_frame_size = @min(value, frame.DEFAULT_MAX_FRAME_SIZE);
                 },
                 .header_table_size => self.peer_header_table_size = value,
@@ -706,8 +859,18 @@ pub const Session = struct {
                 const code: frame.ErrorCode = if (err == error.ProtocolError) .protocol_error else .flow_control_error;
                 try self.emitRst(hdr.stream_id, code);
             };
+        } else if (hdr.stream_id <= self.highest_peer_stream) {
+            // CLOSED, not idle. RFC 9113 section 6.9 is explicit: a peer may
+            // send WINDOW_UPDATE for a stream it has not yet learned is over,
+            // and "a receiver MUST NOT treat this as an error". This is the
+            // ordinary flow-control conversation — a client credits the DATA it
+            // just received while the server finishes the body — so failing the
+            // connection here kills every other stream over a normal race.
+            //
+            // Nothing to apply: the stream is gone, and its send window with it.
         } else {
-            // WINDOW_UPDATE on idle stream → connection PROTOCOL_ERROR
+            // IDLE: the peer has never opened this stream, so there is no
+            // window to credit (RFC 9113 section 5.1).
             try self.failConnection(.protocol_error);
         }
     }
@@ -731,13 +894,42 @@ pub const Session = struct {
             }
             data = payload[1 .. payload.len - pad];
         }
+        // Flow control charges the WHOLE payload, padding included. Only the
+        // unpadded slice reaches the request body. A peer that pays for padding
+        // must not gain free window by hiding bytes in it.
         const total: i32 = @intCast(payload.len);
         self.windows.debitConnRecv(total) catch {
             try self.failConnection(.flow_control_error);
             return;
         };
         const s = self.streams.getPtr(hdr.stream_id) orelse {
-            // DATA on idle / unknown stream → connection PROTOCOL_ERROR (RFC 9113 §5.1).
+            if (hdr.stream_id <= self.highest_peer_stream) {
+                // CLOSED, not idle: the client is still uploading a body for a
+                // stream we ended — an abort, a slow-consumer kill, or an early
+                // response. RFC 9113 section 6.4 says an endpoint that has SENT
+                // RST_STREAM must IGNORE later frames on that stream, so this
+                // does not answer with another reset; a reset per DATA frame
+                // would be an amplification against a client that is simply
+                // behind.
+                //
+                // The connection window was already debited above, and must be
+                // (section 6.9.1) — the peer counted these bytes, so dropping
+                // the accounting would desynchronize credit for the rest of the
+                // connection. Replenish at the usual threshold so a large body
+                // sent into a dead stream cannot strand the whole window.
+                if (self.windows.needsConnWindowUpdate()) {
+                    const inc = self.windows.connWindowUpdateIncrement();
+                    if (inc > 0) {
+                        self.windows.creditConnRecv(inc);
+                        var buf: [13]u8 = undefined;
+                        const n = try frame.Serializer.windowUpdate(&buf, 0, inc);
+                        const p = try self.allocator.dupe(u8, buf[0..n]);
+                        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p } });
+                    }
+                }
+                return;
+            }
+            // IDLE: DATA for a stream never opened (RFC 9113 section 5.1).
             try self.failConnection(.protocol_error);
             return;
         };
@@ -750,7 +942,11 @@ pub const Session = struct {
             return;
         };
 
-        // Early-reject streams still consume/discard DATA through remote END_STREAM.
+        // An early-rejected stream (413/414/431) keeps consuming and discarding
+        // its DATA until the peer sends END_STREAM. The server cannot stop the
+        // peer mid-body without a RST, and a RST would race the 413 response
+        // that explains the refusal. So the bytes are charged to flow control,
+        // counted, and dropped — never retained and never dispatched.
         if (s.early_status == null and !s.refused_before_dispatch and s.headers_done) {
             var body = self.pending_bodies.getPtr(hdr.stream_id) orelse blk: {
                 try self.pending_bodies.put(hdr.stream_id, .empty);
@@ -825,6 +1021,13 @@ pub const Session = struct {
         }
     }
 
+    /// Emit exactly one HTTP response for a request that never reaches a
+    /// handler. Several paths can decide the same refusal — an oversized header
+    /// block, an oversized declared body, an oversized observed body, a late
+    /// trailer block — and each may fire more than once as further frames
+    /// arrive. `early_response_sent` makes the frameset exactly-once, because a
+    /// second HEADERS on the same stream is a protocol violation that would
+    /// turn a clean 413 into a broken connection.
     fn emitEarlyReject(self: *Session, stream_id: u31, status: u16) !void {
         const s = self.streams.getPtr(stream_id) orelse return;
         if (s.early_response_sent) return;
@@ -929,6 +1132,26 @@ pub const Session = struct {
         try self.finishHeaderBlock(sid);
     }
 
+    /// A complete field block arrived. This is where a request becomes real.
+    ///
+    /// The sequence, and each step depends on the one before it:
+    ///
+    /// 1. Decode. A compression fault kills the CONNECTION, never one stream,
+    ///    because the shared HPACK table is now out of step with the peer.
+    /// 2. Admit, if the stream is new. The per-connection cap is checked first,
+    ///    then the server-wide hook. A refusal is a RST_STREAM, not a
+    ///    connection error: the peer may simply retry later.
+    /// 3. Classify. A block on a stream that already has headers is a TRAILER
+    ///    block and follows different rules.
+    /// 4. Validate the pseudo-headers, then apply the size policies. A policy
+    ///    breach becomes an `early_status` and not an exception, so the peer
+    ///    receives a real HTTP status instead of a bare reset.
+    /// 5. Store the fields. Dispatch happens only at END_STREAM, in
+    ///    `maybeDispatch`, because a handler must never see a partial body.
+    ///
+    /// Ownership: `decoded.fields` is owned from step 1 onward. Every early
+    /// return frees it with `freeResult`; the two success paths hand it to
+    /// `pending_headers` or `pending_trailers` instead.
     fn finishHeaderBlock(self: *Session, stream_id: u31) !void {
         const decoded = self.decoder.decode(
             self.header_block.items,
@@ -1054,6 +1277,19 @@ pub const Session = struct {
         }
     }
 
+    /// Hand a complete request to the edge, exactly once.
+    ///
+    /// Several frames can reach this point for one stream — HEADERS with
+    /// END_STREAM, the last DATA, or a trailer block — so the three guards are
+    /// the real contract: the remote half must be closed, the stream must not
+    /// have been refused, and no handler may have started yet. `handler_started`
+    /// is what makes a request one request and not one per triggering frame.
+    ///
+    /// This function is the ownership transfer point. Headers, body, and
+    /// trailers are moved out of the pending maps into the `dispatch_request`
+    /// intent, and the three `*_owned` flags exist so that a failure BEFORE the
+    /// transfer frees exactly once, while a success frees nothing here. The
+    /// edge becomes the owner and must release the intent.
     fn maybeDispatch(self: *Session, stream_id: u31) !void {
         const s = self.streams.getPtr(stream_id) orelse return;
         if (!s.end_stream_remote or s.refused_before_dispatch or s.handler_started) return;
@@ -1109,6 +1345,10 @@ pub const Session = struct {
             self.allocator.free(trailers);
         };
 
+        // Past this line the intent owns everything. Clear the flags BEFORE the
+        // push, so that a `PoolExhausted` inside `pushIntentOrFailClosed` — which
+        // releases the intent itself — cannot make the errdefer blocks free the
+        // same memory a second time.
         s.handler_started = true;
         headers_owned = false;
         body_owned = false;

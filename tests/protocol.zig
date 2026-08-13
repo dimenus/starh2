@@ -165,3 +165,265 @@ test "session handles GET /hello headers end_stream" {
     try std.testing.expect(saw_dispatch);
     try std.testing.expect(saw_settings_ack);
 }
+
+test "RST_STREAM on a stream the server already closed is tolerated (RFC 9113 5.1)" {
+    // A peer may send RST_STREAM before it has learned the stream closed: the
+    // reset and the server's END_STREAM cross on the wire. RFC 9113 section 5.1
+    // requires an endpoint to tolerate that on a CLOSED stream — only an IDLE
+    // stream, one never opened, is a connection error.
+    //
+    // Treating the crossing case as a connection error kills every other stream
+    // on the connection, and it happens whenever a browser cancels a fetch just
+    // as the response completes.
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const hpack = starh2.core.hpack;
+    const gpa = std.testing.allocator;
+
+    var session = try session_mod.Session.init(gpa, .defaults);
+    defer session.deinit();
+    freeIntents(session.drainIntents());
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
+    var sbuf: [9]u8 = undefined;
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+    try wire.appendSlice(gpa, sbuf[0..sn]);
+
+    const fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &fields);
+    defer gpa.free(block);
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true, .end_stream = true },
+        .stream_id = 1,
+    }).encode(&hdr_buf);
+    try wire.appendSlice(gpa, &hdr_buf);
+    try wire.appendSlice(gpa, block);
+
+    try session.ingest(wire.items);
+    freeIntents(session.drainIntents());
+
+    // The server completes the response, which closes stream 1 and drops it
+    // from the live map.
+    try session.applyCommand(.{ .respond_headers = .{
+        .stream_id = 1,
+        .status = 200,
+        .headers = &.{},
+        .end_stream = true,
+    } });
+    freeIntents(session.drainIntents());
+    try std.testing.expect(session.streams.get(1) == null);
+    try std.testing.expect(session.terminal == .none);
+
+    // Now the peer's in-flight RST arrives for that closed stream.
+    var rst: [13]u8 = undefined;
+    const rn = try frame.Serializer.rstStream(&rst, 1, .cancel);
+    try session.ingest(rst[0..rn]);
+    freeIntents(session.drainIntents());
+
+    // It must be ignored. The connection carries other streams.
+    try std.testing.expect(session.terminal == .none);
+}
+
+test "RST_STREAM on a never-opened stream is still a connection error" {
+    // The other half of RFC 9113 section 5.1: an IDLE stream has no state to
+    // reset, so a reset for one is a protocol violation. Without this the fix
+    // above would swallow a genuinely malformed peer.
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const gpa = std.testing.allocator;
+
+    var session = try session_mod.Session.init(gpa, .defaults);
+    defer session.deinit();
+    freeIntents(session.drainIntents());
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
+    var sbuf: [9]u8 = undefined;
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+    try wire.appendSlice(gpa, sbuf[0..sn]);
+    try session.ingest(wire.items);
+    freeIntents(session.drainIntents());
+
+    var rst: [13]u8 = undefined;
+    const rn = try frame.Serializer.rstStream(&rst, 99, .cancel);
+    try session.ingest(rst[0..rn]);
+    freeIntents(session.drainIntents());
+
+    try std.testing.expect(session.terminal == .goaway);
+}
+
+test "WINDOW_UPDATE on a stream the server already closed is tolerated (RFC 9113 6.9)" {
+    // The exact companion of the RST_STREAM case, and RFC 9113 section 6.9 is
+    // explicit about it: "A receiver MUST NOT treat this as an error" when a
+    // WINDOW_UPDATE arrives for a stream that has already ended, because the
+    // peer sent the credit before it processed the frame closing the stream.
+    //
+    // This is the ordinary flow-control conversation, not an edge case: a
+    // client grants credit for the DATA it just received while the server is
+    // finishing the body. Failing the connection here kills every other stream
+    // on it — which is how the t-482 gate saw BrokenPipe on its credit write.
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const hpack = starh2.core.hpack;
+    const gpa = std.testing.allocator;
+
+    var session = try session_mod.Session.init(gpa, .defaults);
+    defer session.deinit();
+    freeIntents(session.drainIntents());
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
+    var sbuf: [9]u8 = undefined;
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+    try wire.appendSlice(gpa, sbuf[0..sn]);
+
+    const fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &fields);
+    defer gpa.free(block);
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true, .end_stream = true },
+        .stream_id = 1,
+    }).encode(&hdr_buf);
+    try wire.appendSlice(gpa, &hdr_buf);
+    try wire.appendSlice(gpa, block);
+    try session.ingest(wire.items);
+    freeIntents(session.drainIntents());
+
+    try session.applyCommand(.{ .respond_headers = .{
+        .stream_id = 1,
+        .status = 200,
+        .headers = &.{},
+        .end_stream = true,
+    } });
+    freeIntents(session.drainIntents());
+    try std.testing.expect(session.streams.get(1) == null);
+
+    // The peer's in-flight credit for the stream that just ended.
+    var wu: [13]u8 = undefined;
+    const wn = try frame.Serializer.windowUpdate(&wu, 1, 4096);
+    try session.ingest(wu[0..wn]);
+    freeIntents(session.drainIntents());
+
+    try std.testing.expect(session.terminal == .none);
+}
+
+test "WINDOW_UPDATE on a never-opened stream is still a connection error" {
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const gpa = std.testing.allocator;
+
+    var session = try session_mod.Session.init(gpa, .defaults);
+    defer session.deinit();
+    freeIntents(session.drainIntents());
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
+    var sbuf: [9]u8 = undefined;
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+    try wire.appendSlice(gpa, sbuf[0..sn]);
+    try session.ingest(wire.items);
+    freeIntents(session.drainIntents());
+
+    var wu: [13]u8 = undefined;
+    const wn = try frame.Serializer.windowUpdate(&wu, 77, 4096);
+    try session.ingest(wu[0..wn]);
+    freeIntents(session.drainIntents());
+
+    try std.testing.expect(session.terminal == .goaway);
+}
+
+test "DATA on a closed stream is a STREAM error, not a connection error (RFC 9113 6.1)" {
+    // Reachable whenever the server ends a stream while the client is still
+    // uploading: an abort, a slow-consumer reset, or a handler that responds
+    // early. RFC 9113 section 6.1 makes DATA for a non-open stream a STREAM
+    // error of type STREAM_CLOSED. Killing the connection instead takes every
+    // other stream with it.
+    //
+    // The connection flow-control window must still be debited either way
+    // (section 6.9.1), or the two sides disagree about credit for the rest of
+    // the connection.
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const hpack = starh2.core.hpack;
+    const gpa = std.testing.allocator;
+
+    var session = try session_mod.Session.init(gpa, .defaults);
+    defer session.deinit();
+    freeIntents(session.drainIntents());
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
+    var sbuf: [9]u8 = undefined;
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+    try wire.appendSlice(gpa, sbuf[0..sn]);
+
+    // Open stream 1 WITHOUT end_stream: the client intends to send a body.
+    const fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/upload" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &fields);
+    defer gpa.free(block);
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true },
+        .stream_id = 1,
+    }).encode(&hdr_buf);
+    try wire.appendSlice(gpa, &hdr_buf);
+    try wire.appendSlice(gpa, block);
+    try session.ingest(wire.items);
+    freeIntents(session.drainIntents());
+
+    // The server resets the stream — an abort, or a slow-consumer kill.
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .cancel } });
+    freeIntents(session.drainIntents());
+    try std.testing.expect(session.streams.get(1) == null);
+    try std.testing.expect(session.terminal == .none);
+
+    // The client's in-flight body arrives for the stream that just died.
+    const conn_before = session.windows.conn_recv;
+    var data_hdr: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    const body = "hello body";
+    (frame.FrameHeader{
+        .length = body.len,
+        .type = .data,
+        .flags = .{},
+        .stream_id = 1,
+    }).encode(&data_hdr);
+    var data_wire: std.ArrayList(u8) = .empty;
+    defer data_wire.deinit(gpa);
+    try data_wire.appendSlice(gpa, &data_hdr);
+    try data_wire.appendSlice(gpa, body);
+    try session.ingest(data_wire.items);
+    freeIntents(session.drainIntents());
+
+    // The connection survives, and the credit was accounted for.
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expect(session.windows.conn_recv < conn_before);
+}
