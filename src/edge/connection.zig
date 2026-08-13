@@ -1925,6 +1925,14 @@ const Connection = struct {
                 .end_stream = body.len == 0,
             } }) catch return error.WriteFailed;
             if (body.len > 0) {
+                // Materialize the HEADERS intent onto the wire queue BEFORE any
+                // DATA can drain. enqueuePending unlocks the session while it
+                // waits for stream space, and the actor emits DRR DATA the
+                // moment it wakes — so a body crossing outbound_bytes_per_stream
+                // used to reach the peer as DATA with its HEADERS never sent,
+                // which a browser reports as a protocol error and curl waits
+                // out in silence (t-482, the /ui/tasks page).
+                self.processIntents() catch return error.WriteFailed;
                 self.enqueuePending(stream_id, body, true, ticket, slot_i, hctx.terminal) catch |err| return err;
                 self.processIntents() catch return error.WriteFailed;
             } else {
