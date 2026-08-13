@@ -16,7 +16,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const datastar_dep = b.dependency("datastar", .{
+    // Lazy: the core `starh2` module does not use the Datastar SDK, so a
+    // consumer of an HTTP/2 server must not be made to fetch and compile a
+    // hypermedia SDK. Only `starh2_datastar` and the examples ask for it.
+    const datastar_dep = b.lazyDependency("datastar", .{
         .target = target,
         .optimize = optimize,
     });
@@ -30,8 +33,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "datastar", .module = datastar_dep.module("datastar") },
             .{ .name = "tls", .module = tls_dep.module("tls") },
+        },
+    });
+
+    // The Datastar signal convention: which query parameter carries signals and
+    // how they are bounded. It needs NO Datastar SDK — reading signals is
+    // form-decoding plus std.json — so nothing starh2 ships depends on the SDK.
+    // A consumer that also wants the SDK's emitters declares the SDK itself,
+    // at whatever version it wants, rather than inheriting starh2's pin.
+    const datastar_mod = b.addModule("starh2_datastar", .{
+        .root_source_file = b.path("src/datastar.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "starh2", .module = starh2_mod },
         },
     });
 
@@ -238,6 +254,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example-datastar-sse", .path = "examples/datastar_sse.zig" },
         .{ .name = "starh2-conformance-server", .path = "examples/conformance_server.zig" },
     };
+    // The TLS gate drives this binary, so keep a handle to it.
+    var conformance_exe: ?*std.Build.Step.Compile = null;
     inline for (examples) |ex| {
         const exe_mod = b.createModule(.{
             .root_source_file = b.path(ex.path),
@@ -248,6 +266,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zio", .module = zio_dep.module("zio") },
             },
         });
+        exe_mod.addImport("starh2_datastar", datastar_mod);
+        // Only the examples use the SDK itself, which is why it stays lazy.
+        if (datastar_dep) |dep| exe_mod.addImport("datastar", dep.module("datastar"));
         const exe = b.addExecutable(.{
             .name = ex.name,
             .root_module = exe_mod,
@@ -255,6 +276,9 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
         const build_step = b.step(ex.name, "Build " ++ ex.name);
         build_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        if (comptime std.mem.eql(u8, ex.name, "starh2-conformance-server")) {
+            conformance_exe = exe;
+        }
     }
 
     // Cross release targets — compile-only gates (see tools/README.md for Linux RUN).
@@ -267,15 +291,22 @@ pub fn build(b: *std.Build) void {
     inline for (release_queries) |rq| {
         const rt = b.resolveTargetQuery(rq.query);
         const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .ReleaseSafe });
-        const datastar_rt = b.dependency("datastar", .{ .target = rt, .optimize = .ReleaseSafe });
+        const datastar_rt = b.lazyDependency("datastar", .{ .target = rt, .optimize = .ReleaseSafe });
         const tls_rt = b.dependency("tls", .{ .target = rt, .optimize = .ReleaseSafe });
         const starh2_rt = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = rt,
             .optimize = .ReleaseSafe,
             .imports = &.{
-                .{ .name = "datastar", .module = datastar_rt.module("datastar") },
                 .{ .name = "tls", .module = tls_rt.module("tls") },
+            },
+        });
+        const datastar_mod_rt = b.createModule(.{
+            .root_source_file = b.path("src/datastar.zig"),
+            .target = rt,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_rt },
             },
         });
         inline for (examples) |ex| {
@@ -288,6 +319,8 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "zio", .module = zio_rt.module("zio") },
                 },
             });
+            exe_mod.addImport("starh2_datastar", datastar_mod_rt);
+            if (datastar_rt) |dep| exe_mod.addImport("datastar", dep.module("datastar"));
             const exe = b.addExecutable(.{
                 .name = ex.name ++ "-" ++ rq.name,
                 .root_module = exe_mod,
@@ -307,9 +340,33 @@ pub fn build(b: *std.Build) void {
         fuzz_smoke_step.dependOn(&cmd.step);
     }
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + every release target");
+    // The TLS-edge gate. `zig build test` cannot reach the TLS paths at all —
+    // no test binds a tls_h2 endpoint — so without this step a TLS regression
+    // ships green. It drives the conformance server with real curl connections
+    // because the oracle must share no code with the stack under test; see the
+    // header of tools/tls_smoke.zig for the full reasoning.
+    const tls_smoke_exe = b.addExecutable(.{
+        .name = "tls-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tls_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const tls_smoke_run = b.addRunArtifact(tls_smoke_exe);
+    tls_smoke_run.addArg("--bin");
+    tls_smoke_run.addFileArg(conformance_exe.?.getEmittedBin());
+    // Relative to the repo root, so testdata/cert.pem resolves.
+    tls_smoke_run.setCwd(b.path("."));
+    tls_smoke_run.has_side_effects = true;
+    tls_smoke_run.stdio = .inherit;
+    const tls_smoke_step = b.step("tls-smoke", "TLS-edge gate: fresh curl connections against the conformance server");
+    tls_smoke_step.dependOn(&tls_smoke_run.step);
+
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + every release target");
     ci_step.dependOn(test_step);
     ci_step.dependOn(test_exact_step);
     ci_step.dependOn(fuzz_smoke_step);
+    ci_step.dependOn(&tls_smoke_run.step);
     ci_step.dependOn(release_step);
 }

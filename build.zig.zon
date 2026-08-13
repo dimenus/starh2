@@ -8,9 +8,12 @@
             .url = "git+https://github.com/lalinsky/zio#a2b134a7abe35d9b29e8578fad30adc7a026fb4e",
             .hash = "zio-0.17.0-xHbVVKr9JQBFsFjx4hcL4z3BkqyBkonICNTz5DdJxhE2",
         },
+        // Lazy: only `starh2_datastar` and the examples use the SDK, so a
+        // consumer of the core HTTP/2 module never fetches or compiles it.
         .datastar = .{
             .url = "git+https://github.com/zigster64/datastar-sdk.zig#0c1f91f3d82ecd1dad3c53b9450db12623fc3408",
             .hash = "datastar_sdk_zig-0.1.0-IRNEdq1bAABGAHWmZAq3JuU9B7N0G-XxrvvIka1X_sHN",
+            .lazy = true,
         },
         .tls = .{
             .url = "https://github.com/dimenus/tls.zig/archive/28a034bf16c04a62c15f93c6ace7b79a9cad5270.tar.gz",

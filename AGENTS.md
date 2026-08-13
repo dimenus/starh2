@@ -8,12 +8,32 @@ Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib loo
 ## Gates
 
 ```sh
-./zb build ci # definition of done (suite + exact + fuzz smoke + release targets)
+./zb build ci # definition of done (suite + exact + fuzz smoke + TLS gate + release targets)
 ```
 
 Release targets included in `ci`: native ReleaseSafe examples via `release`, plus
 `x86_64-linux-musl`, `aarch64-linux-musl`, and `aarch64-linux-gnu`. Individual
-steps remain available (`test`, `test-exact`, `fuzz-*`, example names).
+steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example names).
+
+```sh
+./zb build tls-smoke # TLS edge: fresh curl connections + clean shutdown
+```
+
+**`zig build test` cannot reach the TLS edge at all.** No test binds a `tls_h2`
+endpoint, so `tlsHandshakeViaPumps`, `driveDecrypt`, and the TLS branch of
+`queueWire` never run under the suite. That is measured, not assumed: an
+always-false assert inside `driveDecrypt` leaves the suite green and aborts on
+the first curl request. `tls-smoke` is therefore the only gate that covers that
+code, and it is in `ci`.
+
+It uses curl because the oracle must share no code with the stack under test;
+nghttp2 is strict about frame order and pipelines its preface, which is the
+client shape both t-538 defects needed. It checks the server STOPS on SIGTERM,
+not only that it answers — a stranded handler blocks `shutdownHandlers` while
+every response still looks perfect on the wire. Mutation-proven: making the TLS
+encrypt loop never mark its last record keeps all 126 tests green and fails
+`tls-smoke` in 10 s. Needs curl with HTTP2; it ABORTS rather than skipping if
+that is missing, because a skipped TLS gate reads as a pass.
 
 Interop commands and expected output are in `tools/README.md`. h2spec has exactly
 the two published RFC 7540 priority exclusions in `tools/h2spec/EXCLUSIONS.md`;

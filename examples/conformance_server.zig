@@ -3,6 +3,10 @@
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
+// Signals come from starh2's Datastar layer; the emitters come from the SDK
+// itself. starh2's core module knows nothing about either.
+const ds = @import("starh2_datastar");
+const sdk = @import("datastar");
 
 const Signals = struct {
     nonce: []const u8 = "",
@@ -40,7 +44,7 @@ fn helloHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Respons
 }
 
 fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    const signals = starh2.datastar.readSignalsFromQuery(Signals, req) catch {
+    const signals = ds.readSignalsFromQuery(Signals, req) catch {
         try resp.send(400, &.{}, "bad signals");
         return;
     };
@@ -48,7 +52,7 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
     // Immediate nonce/sequence patch
     var arena = std.heap.ArenaAllocator.init(req.arena);
     defer arena.deinit();
-    const patch = try starh2.datastar.patchElementsFmt(
+    const patch = try sdk.patchElementsFmt(
         arena.allocator(),
         "<div id=\"n\">{s}-{d}</div>",
         .{ signals.nonce, signals.sequence },
@@ -80,7 +84,7 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
             return err;
         };
         seq += 1;
-        const ev = try starh2.datastar.patchElementsFmt(
+        const ev = try sdk.patchElementsFmt(
             arena.allocator(),
             "<div id=\"tick\">{s}-{d}</div>",
             .{ signals.nonce, seq },
@@ -105,13 +109,13 @@ fn bigHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
 }
 
 fn morphHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    const signals = starh2.datastar.readSignalsFromBody(Signals, req) catch {
+    const signals = ds.readSignalsFromBody(Signals, req) catch {
         try resp.send(400, &.{}, "bad signals");
         return;
     };
     var arena = std.heap.ArenaAllocator.init(req.arena);
     defer arena.deinit();
-    const patch = try starh2.datastar.patchElementsFmt(
+    const patch = try sdk.patchElementsFmt(
         arena.allocator(),
         "<div id=\"morph\">{s}</div>",
         .{signals.nonce},
@@ -122,25 +126,25 @@ fn morphHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Respons
 }
 
 fn signalsGetHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    const signals = starh2.datastar.readSignalsFromQuery(Signals, req) catch {
+    const signals = ds.readSignalsFromQuery(Signals, req) catch {
         try resp.send(400, &.{}, "bad signals");
         return;
     };
     var arena = std.heap.ArenaAllocator.init(req.arena);
     defer arena.deinit();
-    const patch = try starh2.datastar.patchSignals(arena.allocator(), signals, .{});
+    const patch = try sdk.patchSignals(arena.allocator(), signals, .{});
     const headers = [_]starh2.Header{.{ .name = "content-type", .value = "text/event-stream" }};
     try resp.send(200, &headers, patch);
 }
 
 fn signalsPostHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    const signals = starh2.datastar.readSignalsFromBody(Signals, req) catch {
+    const signals = ds.readSignalsFromBody(Signals, req) catch {
         try resp.send(400, &.{}, "bad signals");
         return;
     };
     var arena = std.heap.ArenaAllocator.init(req.arena);
     defer arena.deinit();
-    const patch = try starh2.datastar.patchSignals(arena.allocator(), signals, .{});
+    const patch = try sdk.patchSignals(arena.allocator(), signals, .{});
     const headers = [_]starh2.Header{.{ .name = "content-type", .value = "text/event-stream" }};
     try resp.send(200, &headers, patch);
 }

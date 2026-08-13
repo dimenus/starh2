@@ -1,4 +1,37 @@
 //! starh2 — server-side HTTP/2 stack shaped around Datastar.
+//!
+//! # How to read this tree
+//!
+//! Three layers, and the dependency direction is one-way:
+//!
+//! - `core` — the protocol, as a deterministic state machine. No I/O, no
+//!   clock, no lock, no knowledge that an edge exists. Given the same bytes it
+//!   produces the same intents on every run.
+//! - `edge` — everything real: sockets, TLS, tasks, timers, memory limits. It
+//!   drives `core` and executes the intents `core` produces.
+//! - `http` — the handler-facing surface. `Request`, `Response`, `Router`.
+//!
+//! `edge` depends on `core`. `core` never depends on `edge` for behaviour. The
+//! split is why a conformance failure is reproducible: the decision lives in a
+//! module that has no timing in it.
+//!
+//! # The shape of a request
+//!
+//! socket -> `ReadPump` -> actor -> `Session.ingest` -> `Intent.dispatch_request`
+//! -> `Router` -> handler task -> `Response` -> `Session` command -> `Intent`
+//! -> `FairScheduler` -> `WritePump` -> socket.
+//!
+//! Start with `edge/connection.zig`. Its module header carries the task
+//! topology, the lock discipline, and the wake protocol, and nearly every
+//! subtle rule in this stack is a consequence of one of those three.
+//!
+//! # What this stack deliberately does not do
+//!
+//! HTTP/2 only: no HTTP/1.1, no h2c Upgrade, no ALPN fallback, no HTTP/3. Also
+//! no server push, no CONNECT, no response trailers, and no streaming request
+//! bodies. Datastar needs multiplexed long-lived SSE beside one-shot updates,
+//! and every omission above removes a code path that would otherwise need the
+//! same conformance and security work as the ones that are used.
 const std = @import("std");
 
 pub const core = struct {
@@ -29,9 +62,11 @@ pub const http = struct {
     pub const request = @import("http/request.zig");
     pub const response = @import("http/response.zig");
     pub const router = @import("http/router.zig");
+    /// Form-urlencoded decoding for query strings. Generic HTTP: nothing in
+    /// here knows about Datastar, and `std` has no form decoder.
+    pub const form = @import("http/form.zig");
 };
 
-pub const datastar = @import("datastar.zig");
 
 pub const Limits = core.limits.Limits;
 pub const ResourceUpperBound = core.limits.ResourceUpperBound;
@@ -76,5 +111,5 @@ test {
     _ = http.request;
     _ = http.response;
     _ = http.router;
-    _ = datastar;
+    _ = http.form;
 }
