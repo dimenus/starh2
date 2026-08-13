@@ -172,6 +172,13 @@ pub const HandlerSlot = struct {
     in_use: bool = false,
     /// True while a reaper job capacity token is held for this slot.
     reaper_reserved: bool = false,
+    /// True while the handler waits on a ticket whose write is already handed
+    /// to the WritePump. The pump's exit contract guarantees every queued
+    /// write posts an ack (ok, fail, or fail_all), so this wait ALWAYS wakes
+    /// without help — and teardown must not cancel it: canceling here is how
+    /// a fully delivered response returned ConnectionClosed when the peer
+    /// closed in the ack's wake-to-run gap (t-537).
+    awaiting_receipt: std.atomic.Value(bool) = .init(false),
 };
 
 const live: u8 = 0;
@@ -1248,6 +1255,13 @@ const Connection = struct {
         const slot = &self.handlers[i];
         slot.terminal.setCause(cause);
         self.wakeHandlerWaiters(stream_id);
+        // A handler waiting on a wire receipt has a GUARANTEED wake: the
+        // WritePump acks or fail-drains every queued chunk on every exit path,
+        // and wakeHandlerWaiters above failed any ticket still in a pending.
+        // Canceling that wait is how a fully delivered response returned
+        // ConnectionClosed (t-537) — leave it to finish; its natural return
+        // posts the completion.
+        if (slot.awaiting_receipt.load(.acquire)) return;
         // Only CAS to reaper_owned when a JoinHandle is present to transfer. Otherwise
         // cooperative cancel via cause; natural return reports the slot.
         // CAS-without-join left ownership stuck: handler exits without posting, reaper
@@ -1283,6 +1297,10 @@ const Connection = struct {
             if (!slot.in_use) continue;
             slot.terminal.setCause(.server_shutdown);
             self.wakeHandlerWaiters(slot.stream_id);
+            // See cancelHandler: a receipt wait always wakes on its own — the
+            // pump acks or fail-drains every queued chunk — and the natural
+            // return posts the completion this loop's tail waits for.
+            if (slot.awaiting_receipt.load(.acquire)) continue;
             if (self.handler_joins[i]) |handle| {
                 const prev = slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
                 if (prev == null) {
@@ -1774,7 +1792,7 @@ const Connection = struct {
             .abortFn = abortCb,
         };
         // HandlerCtx: Response.ctx points at job-local ctx with stable terminal pointer.
-        job.hctx = .{ .conn = self, .terminal = undefined, .stream_id = d.stream_id };
+        job.hctx = .{ .conn = self, .terminal = undefined, .slot = undefined, .stream_id = d.stream_id };
         job.matched = self.config.router.match(job.req.method, job.req.path);
         switch (job.matched) {
             .found => |f| job.req.path_remainder = f.path_remainder,
@@ -1807,6 +1825,7 @@ const Connection = struct {
         job.resp.generation = slot.terminal.currentGeneration();
         job.slot = slot;
         job.hctx.terminal = &slot.terminal;
+        job.hctx.slot = slot;
         job.resp.ctx = &job.hctx;
 
         _ = self.live_handlers.fetchAdd(1, .acq_rel);
@@ -1828,6 +1847,7 @@ const Connection = struct {
     const HandlerCtx = struct {
         conn: *Connection,
         terminal: *response.SlotTerminal,
+        slot: *HandlerSlot,
         stream_id: u31,
     };
 
@@ -1950,6 +1970,8 @@ const Connection = struct {
             }
         }
         armed = false;
+        hctx.slot.awaiting_receipt.store(true, .release);
+        defer hctx.slot.awaiting_receipt.store(false, .release);
         try self.waitTicket(slot_i, hctx.terminal);
     }
 
@@ -1985,6 +2007,8 @@ const Connection = struct {
             self.next_wire_slot = slot_i;
             self.processIntents() catch return error.WriteFailed;
         }
+        hctx.slot.awaiting_receipt.store(true, .release);
+        defer hctx.slot.awaiting_receipt.store(false, .release);
         try self.waitTicket(slot_i, hctx.terminal);
     }
 
@@ -2009,7 +2033,11 @@ const Connection = struct {
             self.enqueuePending(stream_id, bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
             self.processIntents() catch return error.WriteFailed;
         }
-        if (need_wait) try self.waitTicket(slot_i, hctx.terminal);
+        if (need_wait) {
+            hctx.slot.awaiting_receipt.store(true, .release);
+            defer hctx.slot.awaiting_receipt.store(false, .release);
+            try self.waitTicket(slot_i, hctx.terminal);
+        }
     }
 
     fn flushCb(ctx: *anyopaque, stream_id: u31) response.ResponseError!void {
@@ -2036,6 +2064,8 @@ const Connection = struct {
             }
             self.processIntents() catch return error.WriteFailed;
         }
+        hctx.slot.awaiting_receipt.store(true, .release);
+        defer hctx.slot.awaiting_receipt.store(false, .release);
         try self.waitTicket(slot_i, hctx.terminal);
     }
 

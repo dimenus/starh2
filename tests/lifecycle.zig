@@ -1049,38 +1049,15 @@ fn runCapCrossingBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
 
-    // KNOWN-OPEN t-537: the final flush-ticket ack is racy. On a loaded host
-    // (full ci runs suites in parallel) the race widens from "resp.send
-    // returns ConnectionClosed after a complete delivery" to the server
-    // killing the connection mid-transfer (the client's credit write then
-    // fails with BrokenPipe). Both are the SAME open defect, so the gate
-    // retries the whole connection up to three times and prints each
-    // tolerated failure — while the DETERMINISTIC regressions it exists for
-    // stay hard failures on every attempt: DATA before HEADERS, and three
-    // consecutive non-completions. t-537's close must reduce this back to a
-    // single un-retried attempt with a hard handler_err == 0 assert.
-    var attempt: usize = 0;
-    while (true) {
-        attempt += 1;
-        const outcome = capCrossingAttempt(gpa, &server, port);
-        if (outcome) |_| break else |err| switch (err) {
-            error.DataBeforeHeaders => return err,
-            else => {
-                std.debug.print("KNOWN-OPEN t-537: cap-crossing attempt {d} failed with error.{s}\n", .{ attempt, @errorName(err) });
-                if (attempt >= 3) return err;
-            },
-        }
-    }
+    // t-537 closed: a delivered response reports success even when the peer
+    // closes in the ack's wake-to-run gap (awaiting_receipt skip-cancel +
+    // completed-ok wins in TicketTable.wait). One attempt, hard asserts.
+    try capCrossingAttempt(gpa, &server, port);
     // The body reaching the peer is not the whole contract: resp.send must
     // RETURN. A handler parked forever on the final flush ack is the t-482
     // /ui/tasks hang, and only the accounting can see it from out here.
     try waitAccountingZero(&server, 3_000);
-    const handler_err = starh2.edge.connection.test_last_handler_err.load(.acquire);
-    if (handler_err == 2) {
-        std.debug.print("KNOWN-OPEN t-537: cap-crossing send delivered but returned ConnectionClosed\n", .{});
-    } else {
-        try std.testing.expectEqual(@as(u8, 0), handler_err);
-    }
+    try std.testing.expectEqual(@as(u8, 0), starh2.edge.connection.test_last_handler_err.load(.acquire));
 }
 
 /// One connection's fetch of /big with curl-shaped flow control: DEFAULT

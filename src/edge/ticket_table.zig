@@ -106,7 +106,14 @@ pub const TicketTable = struct {
         }
     }
 
-    /// After wake: PeerReset/SlowConsumer win; writer fail → WriteFailed even if slot also closed.
+    /// A completed-ok ticket is a fact about the past: the wire accepted these
+    /// bytes before any teardown could matter to THIS write, so a terminal
+    /// cause that lands after the ack must not rewrite the result. (t-537:
+    /// resp.send returned ConnectionClosed for a fully delivered response
+    /// whenever the peer closed in the wake-to-run gap — the ack had already
+    /// posted ok, and the old order checked the cause first.) `ok` is set true
+    /// only by complete(ok=true); failAll and teardown wakes set false, so on
+    /// a failed wake the cause mapping below still names the reason.
     pub fn wait(self: *TicketTable, slot_i: u32, terminal: ?*response.SlotTerminal) response.ResponseError!void {
         if (slot_i >= self.slots.len) return error.OutOfMemory;
         const slot = &self.slots[slot_i];
@@ -115,14 +122,9 @@ pub const TicketTable = struct {
             if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
             return error.Canceled;
         };
-        if (terminal) |t| if (t.getCause()) |c| {
-            switch (c) {
-                .peer_reset, .slow_consumer, .connection_closed, .server_shutdown => return response.causeToError(c),
-                else => {},
-            }
-        };
-        if (self.write_failed.load(.acquire) or !slot.ok) return error.WriteFailed;
+        if (slot.ok) return;
         if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
+        return error.WriteFailed;
     }
 };
 
@@ -156,6 +158,25 @@ test "reserve after failAll returns WriteFailed" {
     var table = TicketTable.init(std.testing.io, &storage);
     table.failAll();
     try std.testing.expectError(error.WriteFailed, table.reserve());
+}
+
+test "a completed-ok ticket survives a terminal cause that lands after the ack (t-537)" {
+    var storage: [1]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    var term: response.SlotTerminal = .{};
+    const a = try table.reserve();
+    // The wire acked the write, THEN the peer closed (the wake-to-run gap).
+    table.complete(a[1], a[0], true);
+    term.setCause(.connection_closed);
+    // The delivered write must report success; the cause belongs to the NEXT operation.
+    try table.wait(a[1], &term);
+
+    // Same for a global writer failure that lands after this ack.
+    const b = try table.reserve();
+    table.complete(b[1], b[0], true);
+    table.write_failed.store(true, .release);
+    try table.wait(b[1], null);
+    table.write_failed.store(false, .release);
 }
 
 test "wait maps SlotTerminal slow_consumer over WriteFailed" {
