@@ -94,6 +94,16 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
     try body.finish();
 }
 
+/// ~5 MiB one-shot body: the production shape that found t-482's ordering bug
+/// and t-538's TLS crash. Static so the handler allocates nothing.
+const big_body = [_]u8{'B'} ** (5 * 1024 * 1024);
+
+fn bigHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = req;
+    const headers = [_]starh2.Header{.{ .name = "content-type", .value = "text/plain" }};
+    try resp.send(200, &headers, &big_body);
+}
+
 fn morphHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     const signals = starh2.datastar.readSignalsFromBody(Signals, req) catch {
         try resp.send(400, &.{}, "bad signals");
@@ -174,6 +184,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
 
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } },
+        .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = bigHandler } },
         .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } },
         .{ .method = .POST, .path = "/morph", .handler = .{ .ptr = @constCast(&dummy), .runFn = morphHandler } },
         .{ .method = .GET, .path = "/signals", .handler = .{ .ptr = @constCast(&dummy), .runFn = signalsGetHandler } },

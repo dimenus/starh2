@@ -1159,6 +1159,14 @@ const Connection = struct {
         self.tls_conn = tls.nonblock.Connection.init(cipher);
         self.handshake_deadline = null;
         if (self.tls_recv_acc.items.len > 0) {
+            // A client that pipelines its h2 preface and first request into the
+            // handshake flight (curl, every browser) gets its handler DISPATCHED
+            // by this decrypt. From that instant the handler encrypts its
+            // response under session_mu — so this drive must hold the same lock,
+            // or two tasks run the one TLS cipher concurrently and the response
+            // corrupts (t-538: undefined inner.output mid-encrypt, SIGSEGV).
+            self.session_mu.lockUncancelable(self.config.io);
+            defer self.session_mu.unlock(self.config.io);
             try self.driveDecrypt();
         }
     }

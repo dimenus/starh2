@@ -1158,6 +1158,66 @@ test "lifecycle: a single send bigger than outbound_bytes_per_stream completes (
     };
 }
 
+/// The server's FIRST frame must be its own (non-ack) SETTINGS — RFC 7540 3.5.
+/// When the whole client flight (preface + SETTINGS + HEADERS) lands in one
+/// read, the server queues its preface SETTINGS and the client-SETTINGS ack in
+/// the same intent batch before the first drain; ack frames classified as
+/// terminal-class used to jump the queue and reach the wire first (t-538 —
+/// nghttp2 rejects the connection with "expected SETTINGS").
+fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } },
+    };
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+    const frame = starh2.core.frame;
+
+    // Several rounds: the reorder was a race against the first drain.
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+        var stream = try peer.connect(.{});
+        defer stream.close();
+        // The ENTIRE client flight in one write, like a pipelined TLS peer.
+        const wire = try h2c.buildClientHello(gpa, "/hello");
+        defer gpa.free(wire);
+        try writeAllStream(stream, wire);
+        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        try readExact(stream, hdr_buf[0..]);
+        const hdr = frame.FrameHeader.decode(&hdr_buf);
+        try std.testing.expectEqual(frame.FrameType.settings, hdr.type);
+        try std.testing.expect(!hdr.flags.ack());
+    }
+}
+
+test "lifecycle: the first wire frame is the server's own SETTINGS, never an ack (t-538)" {
+    var dbg = std.heap.DebugAllocator(.{}).init;
+    defer {
+        if (dbg.deinit() != .ok) @panic("DebugAllocator leak after preface-first gate");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
+        .executors = .exact(2),
+        .enable_task_migration = true,
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(runPrefaceFirstFrame, .{ rt, gpa });
+    try h.join();
+}
+
 fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } },

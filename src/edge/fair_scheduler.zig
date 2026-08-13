@@ -512,11 +512,29 @@ pub const FairScheduler = struct {
     }
 
     pub fn classifyControl(typ: frame.FrameType, flags: frame.FrameFlags) ControlClass {
+        _ = flags;
+        // Only teardown frames may jump the queue. PING and SETTINGS acks used
+        // to be terminal-class too, and that reordered them AHEAD of the
+        // server preface SETTINGS whenever a client pipelined its preface +
+        // SETTINGS into the TLS handshake flight: both intents were queued
+        // before the first drain, the ack won by class, and the peer saw a
+        // SETTINGS ACK as the connection's first frame — a protocol violation
+        // (t-538; nghttp2 reports it as "expected SETTINGS"). Acks in source
+        // order still precede all DATA, because ordinary-class drains first.
         const terminal = typ == .goaway or typ == .rst_stream;
-        const required_ack = typ == .ping and flags.end_stream;
-        const settings_ack = typ == .settings and flags.end_stream;
-        if (terminal or required_ack or settings_ack) return .terminal;
+        if (terminal) return .terminal;
         return .ordinary;
+    }
+
+    test "acks never outrank the server preface SETTINGS (t-538)" {
+        // The classifier IS the fix: ack frames must be ordinary-class so the
+        // FIFO ordinary queue preserves source order (preface SETTINGS first).
+        const ack_flags: frame.FrameFlags = .{ .end_stream = true };
+        try std.testing.expectEqual(ControlClass.ordinary, classifyControl(.settings, ack_flags));
+        try std.testing.expectEqual(ControlClass.ordinary, classifyControl(.ping, ack_flags));
+        try std.testing.expectEqual(ControlClass.ordinary, classifyControl(.settings, .{}));
+        try std.testing.expectEqual(ControlClass.terminal, classifyControl(.goaway, .{}));
+        try std.testing.expectEqual(ControlClass.terminal, classifyControl(.rst_stream, .{}));
     }
 
     pub fn maxEligibleGapInKinds(self: *const FairScheduler) usize {
