@@ -1,4 +1,76 @@
 //! Connection actor: owns Session, TLS (optional), HPACK, fair write scheduling.
+//!
+//! # Task topology — read this before you change anything here
+//!
+//! One accepted socket runs SIX kinds of concurrent task. Almost every defect
+//! this file has carried came from a wrong assumption about which task owns a
+//! thing, so the ownership table is the contract:
+//!
+//! | task           | count | owns                                          |
+//! |----------------|-------|-----------------------------------------------|
+//! | actor (`run`)  | 1     | `Session`, TLS cipher, `FairScheduler`, slots |
+//! | `ReadPump`     | 1     | the socket READ direction, the chunk pool     |
+//! | `WritePump`    | 1     | the socket WRITE direction, queued payloads   |
+//! | `AckDrainer`   | 1     | `TicketTable` completions, byte releases      |
+//! | handler        | 0..N  | its own arena and request/response objects    |
+//! | reaper worker  | pool  | canceling a handler future (server-wide)      |
+//!
+//! Rules that follow from the table, all of which have been violated at least
+//! once:
+//!
+//! - A pump NEVER touches `Connection` state. A pump exchanges `WireChunk` and
+//!   `WriteCompletion` messages that carry integers only. That is why the pumps
+//!   need no lock.
+//! - Only the actor emits. Every production byte reaches the wire through
+//!   `drainEmit` -> `FairScheduler` sink -> `queueWire`. The
+//!   `test_queue_wire_bypass` counter is the mutation canary for that rule and
+//!   must stay at zero.
+//! - Only ONE task may drive the TLS cipher at a time, and `session_mu` is what
+//!   guarantees it. An unlocked decrypt once let the read task and a handler
+//!   encrypt concurrently, which left `inner.output` undefined mid-write and
+//!   crashed the process (t-538).
+//!
+//! # Lock discipline
+//!
+//! `session_mu` is the ONLY mutex. It covers `Session`, the `FairScheduler`,
+//! and the TLS connection together, because the three are one consistency
+//! domain: a frame is built from session state, debited against session flow
+//! control, and encrypted, and no other task may observe a partial step.
+//!
+//! There is exactly one place that releases the lock inside an operation:
+//! `waitForStreamSpace`. It must, because the capacity it waits for can only be
+//! freed by the actor, which needs the same lock. It always reacquires
+//! UNCANCELABLE before it returns, so the caller's `defer unlock` stays
+//! balanced on every path, including cancellation.
+//!
+//! Handler code never holds the lock. `Response` callbacks take it, do their
+//! work, release it, and only then wait on a ticket.
+//!
+//! # The wake protocol
+//!
+//! The actor is event-driven and parks with no timer when nothing is armed, so
+//! a lost wakeup is a hang and not a delay. Two mechanisms close the race:
+//!
+//! 1. The actor RESETS `actor_wake` first, then re-checks every
+//!    producer-owned source, and only then waits. A `set` that lands between
+//!    the check and the reset would otherwise be erased.
+//! 2. A producer that frees a resource sets a FLAG before it sets the event
+//!    (`sched_refilled` is the example). A flag survives a reset; an event
+//!    edge does not. This is what closes the refill race by construction
+//!    rather than by timing.
+//!
+//! # Byte accounting: two kinds, released at different moments
+//!
+//! Outbound bytes are held in two disjoint pools, and the split is deliberate:
+//!
+//! - PENDING bytes sit in a `FairScheduler` slab and are released when the
+//!   scheduler sink accepts the framed output.
+//! - WIRE bytes are the framed frame and are released only when the
+//!   `WritePump` reports the write through `AckDrainer`.
+//!
+//! One counter cannot express both, because a byte is briefly present as
+//! pending body AND as framed wire. `deinit` asserts that the two parts sum to
+//! the total and that both reach zero, which is the leak check.
 const std = @import("std");
 const tls = @import("tls");
 const session_mod = @import("../core/session.zig");
@@ -16,6 +88,7 @@ const ticket_table = @import("ticket_table.zig");
 const control_pool = @import("control_pool.zig");
 const fair_scheduler = @import("fair_scheduler.zig");
 const io_queue = @import("io_queue.zig");
+const slab_pool = @import("slab_pool.zig");
 
 /// Test-only: when true, handler spawn fails closed into synchronous runHandlerJob.
 pub var test_force_spawn_fail: bool = false;
@@ -78,11 +151,22 @@ pub const ConnConfig = struct {
     reaper: ?*ReaperPool = null,
     /// Server-wide stream + reaper reservation (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
+    /// Server-wide outbound DATA slabs, borrowed for this connection's lifetime.
+    slab_pool: *slab_pool.SlabPool,
     /// True when accept path reserved a concurrent TLS handshake slot.
     handshake_held: bool = false,
 };
 
 /// Shared with Server: global stream/reaper/memory/handshake admission.
+///
+/// Every counter here is touched by many connections at once, so each one uses
+/// a compare-and-swap loop and not a read-then-add. A `fetchAdd` followed by a
+/// limit check would admit past the limit whenever two connections raced, and
+/// the overshoot is exactly the case the limit exists to prevent.
+///
+/// The release paths use `fetchSub` with an assert instead. A release is always
+/// paired with a successful reserve, so it cannot fail; the assert is there to
+/// catch a double release, which is the failure this shape actually has.
 pub const GlobalAccounting = struct {
     active_streams: std.atomic.Value(usize) = .init(0),
     max_streams: usize,
@@ -165,6 +249,22 @@ pub const GlobalAccounting = struct {
     }
 };
 
+/// Actor-owned state for one running handler.
+///
+/// The slot exists because a handler's own memory cannot hold this. A handler
+/// job is destroyed when the handler returns, but the actor may still need to
+/// record a terminal cause for that stream, so the terminal state has to
+/// outlive the job. `Response.terminal` therefore points here and never into
+/// the arena.
+///
+/// `completion_owner` is a three-state race arbiter, and it is what makes the
+/// slot release exactly-once. Two tasks can decide that a handler is finished:
+/// the handler itself when it returns, and the actor when it cancels. Both
+/// attempt a CAS; the winner posts the completion, the loser does nothing.
+/// - `live` (0): the handler is running and will report itself.
+/// - `reaper_owned` (1): the actor won the race and moved the join handle to a
+///   reaper worker, which reports after `cancel` returns.
+/// - `reported` (2): the completion is posted or queued. Also the free state.
 pub const HandlerSlot = struct {
     terminal: response.SlotTerminal = .{},
     completion_owner: std.atomic.Value(u8) = .init(2), // start reported/free
@@ -202,6 +302,18 @@ comptime {
     }
 }
 
+/// Cancellation happens off the actor, and this pool is why.
+///
+/// `Future.cancel` BLOCKS until the target task actually stops. If the actor
+/// called it directly, one handler that is slow to notice cancellation would
+/// stall the whole connection — including the reads and the writes that might
+/// be what lets the handler finish. So the actor hands the join handle to a
+/// worker here and continues at once.
+///
+/// The reaper capacity is reserved BEFORE a handler is admitted
+/// (`tryReserveReaper` in `dispatch`), never at cancel time. Cancellation must
+/// not be able to fail for want of a resource, because there is no way to
+/// retry it and no other path that would release the slot.
 pub const ReaperPool = struct {
     io: std.Io,
     jobs: std.Io.Queue(ReaperJob),
@@ -219,6 +331,15 @@ pub const ReaperPool = struct {
         self.* = undefined;
     }
 
+    /// The worker's order is fixed and load-bearing:
+    ///
+    /// 1. `cancel` — waits until the handler task has really stopped. Only then
+    ///    is the handler's arena unused and its slot safe to reuse.
+    /// 2. `swap(reported)` — claim the right to report. If the handler returned
+    ///    naturally in the meantime it already reported, and the previous value
+    ///    is not `reaper_owned`; this worker then stays silent.
+    /// 3. post the completion, then WAKE the actor. A post without a wake is a
+    ///    slot that sits until an unrelated event happens to arrive.
     pub fn worker(self: *ReaperPool) std.Io.Cancelable!void {
         while (true) {
             var job = self.jobs.getOne(self.io) catch |err| switch (err) {
@@ -237,6 +358,13 @@ pub const ReaperPool = struct {
     }
 };
 
+/// Entry point for one accepted socket. Owns the `Connection` for its whole
+/// life, so `defer conn.deinit()` is the single cleanup point.
+///
+/// The stream hook context is patched after construction because the hooks need
+/// a pointer to the `Connection`, which does not exist while `Session.init`
+/// runs. The read-chunk free list is seeded here rather than in `init` for the
+/// same reason: the queues are only live once the struct has its final address.
 pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cancelable!void {
     var conn = Connection.init(stream, config) catch {
         if (config.handshake_held) {
@@ -430,7 +558,7 @@ const Connection = struct {
             term_cap,
             config.limits.control_entries_per_connection,
             config.limits.max_streams_per_connection,
-            config.limits.outbound_bytes_per_stream,
+            config.slab_pool,
         );
         errdefer sched.deinit();
 
@@ -468,6 +596,20 @@ const Connection = struct {
         return self;
     }
 
+    /// Release everything, in an order that cannot double-free.
+    ///
+    /// Every channel is drained BEFORE its backing buffer is freed, and each
+    /// drain applies the accounting the AckDrainer would have applied — the
+    /// drainer has already stopped by now. Queued read chunks return their pool
+    /// index; queued write chunks free their payload and release wire bytes.
+    ///
+    /// The completion drain uses `releaseSlot` and never discards. A reaper can
+    /// post after `shutdownHandlers` returned, and a discarded completion would
+    /// leak the reaper token.
+    ///
+    /// The closing asserts are the leak detector: the two outbound parts must
+    /// sum to the whole, and both must be zero. A mismatch means some path
+    /// released the wrong kind, which no test would otherwise notice.
     fn deinit(self: *Connection) void {
         const io = self.config.io;
         // Must not free while handlers still live.
@@ -606,6 +748,23 @@ const Connection = struct {
         self.sched.ctrl.release(n, entry);
     }
 
+    /// The AckDrainer task. It exists so that the WritePump can stay a pure
+    /// byte mover: the pump reports what it did, and this task applies the
+    /// consequences to `Connection` state.
+    ///
+    /// Per completion, in this order:
+    /// 1. Release the WIRE bytes and any control-pool occupancy. This must
+    ///    precede the wake, or a woken waiter re-checks capacity that is not
+    ///    free yet and parks again.
+    /// 2. `fail_all` -> mark the writer failed and fail every in-flight ticket.
+    ///    Note what it does NOT do: it never touches `handlers[]`. Terminal
+    ///    causes are actor-owned, and a second writer of that state would race
+    ///    the actor's own teardown.
+    /// 3. Otherwise complete the one ticket the chunk carried.
+    /// 4. Wake the space waiters, then the actor.
+    ///
+    /// The loop exits on the `shutdown` completion, which the WritePump posts
+    /// as its last act. That is the join point the actor's `defer` waits on.
     fn ackDrainer(self: *Connection) void {
         while (true) {
             const ack = self.write_ack_ch.getOne(self.config.io) catch break;
@@ -642,6 +801,27 @@ const Connection = struct {
 
     /// AckDrainer-signaled writer failure: terminate connection, reset every stream,
     /// release reservations exactly once, wake waiters. Idempotent.
+    ///
+    /// The AckDrainer only SETS the flag; this runs on the actor, under
+    /// `session_mu`. That separation is the point: teardown touches `Session`,
+    /// the scheduler, and every handler slot, so it must run where those are
+    /// owned. `writer_fail_handled` makes it once-only, because both the actor
+    /// loop and `drainEmit`'s error path can arrive here.
+    ///
+    /// Order, and each step has a reason:
+    /// 1. Mark every live handler `.internal` (WriteFailed). The write actually
+    ///    failed, so this is not a peer-side ConnectionClosed.
+    /// 2. Drop pending DATA, wake its flush waiters, release the pending bytes.
+    ///    A dead connection can never emit those bytes, so holding the
+    ///    reservation would keep server capacity charged until the process ends.
+    /// 3. Drain the control queues WITHOUT writing, and free the payloads.
+    /// 4. Reset every open stream and emit a GOAWAY through `Session`, so the
+    ///    stream hooks release the server-wide stream credit.
+    /// 5. Free the resulting intents instead of sending them.
+    ///
+    /// What it must NOT do: drain `write_ch`. The WritePump is the sole
+    /// consumer while the connection lives. Stealing chunks races the
+    /// AckDrainer's releases and can double-free payload bytes.
     fn handleWriterFailed(self: *Connection) void {
         if (!self.writer_failed.load(.acquire)) return;
         if (self.writer_fail_handled) return;
@@ -755,6 +935,23 @@ const Connection = struct {
         return self.tickets.wait(slot_i, terminal);
     }
 
+    /// Reset streams whose peer stopped reading.
+    ///
+    /// A peer that opens a stream and then never grants window costs the server
+    /// a full per-stream slab for as long as it likes. Flow control cannot help
+    /// here, because withholding credit is legal behaviour. So progress is
+    /// measured instead: `last_progress_ns` advances whenever bytes enter or
+    /// leave the pending slab, and a stream with pending bytes and no progress
+    /// inside `slow_consumer_timeout_ns` loses its stream.
+    ///
+    /// The wake order matters. The flush waiter is woken with `ok = false`
+    /// AFTER the terminal cause is set, so `TicketTable.wait` finds the cause
+    /// and returns the exact `error.SlowConsumer` rather than a generic
+    /// `WriteFailed`. The handler then learns why it was stopped.
+    ///
+    /// This is a deliberate kill and not a regression. A test host under load
+    /// can starve a healthy client, which is why the timeout is a limit and not
+    /// a short deadline.
     fn checkSlowConsumers(self: *Connection) !void {
         const limit_ns = self.config.limits.slow_consumer_timeout_ns;
         if (limit_ns == 0) return;
@@ -841,6 +1038,15 @@ const Connection = struct {
         return timeout.sleep(io);
     }
 
+    /// Park until something the actor cares about happens.
+    ///
+    /// Three sources race here: the actor event that every producer sets, the
+    /// server shutdown event, and the earliest armed protocol deadline. The
+    /// timer branch is added ONLY when a deadline exists, so an idle connection
+    /// with no armed timer costs no periodic wakeup at all.
+    ///
+    /// The caller is responsible for the reset-then-recheck sequence that makes
+    /// this safe. See `run`.
     fn waitForActivity(self: *Connection) !void {
         const io = self.config.io;
         if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
@@ -873,6 +1079,45 @@ const Connection = struct {
         }
     }
 
+    /// The actor. One task, one connection, from first byte to close.
+    ///
+    /// ## Startup sequence
+    /// 1. Spawn ReadPump, WritePump, AckDrainer. The pumps must exist before
+    ///    the TLS handshake, because the handshake itself exchanges bytes
+    ///    through them — there is no separate handshake I/O path.
+    /// 2. TLS handshake, if the endpoint is TLS. It ends by draining any
+    ///    leftover bytes, and that drive holds `session_mu`. See
+    ///    `tlsHandshakeViaPumps`.
+    /// 3. Flush the server preface that `Session.init` already queued.
+    /// 4. For h2c, wait for the client preface under the preface deadline.
+    ///
+    /// ## Steady-state iteration
+    /// Each pass does the same five things, and the order is the contract:
+    /// 1. Clear `sched_refilled`, then drain handler completions. Clearing
+    ///    first means a refill that lands during this pass is still seen.
+    /// 2. Under `session_mu`: apply a pending writer failure, publish the
+    ///    clock, check protocol deadlines, advance graceful shutdown, kill slow
+    ///    consumers, then EMIT. Emission is last because every earlier step can
+    ///    add to what must be emitted.
+    /// 3. Check for the graceful finish condition.
+    /// 4. Try to take a read chunk without blocking.
+    /// 5. If there is none: RESET the wake event, re-check every producer-owned
+    ///    source, and only then park. This reset-then-recheck order is what
+    ///    makes a `set` that races the reset harmless — the flag or the queue
+    ///    still holds the evidence.
+    ///
+    /// ## Teardown sequence (the `defer` block, then the tail)
+    /// 1. Tell both pumps to stop, and push a sentinel so a WritePump parked on
+    ///    an empty queue wakes.
+    /// 2. `shutdown` the socket. A read parked in the kernel does not observe a
+    ///    flag, so this is what unblocks it; task cancellation is the
+    ///    authoritative backstop.
+    /// 3. Cancel the write pump, then the read pump, then AWAIT the AckDrainer.
+    ///    The drainer must be last, because it is the task that applies the
+    ///    releases the pumps emit while they stop.
+    /// 4. `shutdownHandlers` runs after the loop and returns only when every
+    ///    slot has passed through `releaseSlot`.
+    /// 5. Close the socket exactly once, guarded by `socket_closed`.
     fn run(self: *Connection) !void {
         const gpa = self.config.gpa;
         const io = self.config.io;
@@ -967,12 +1212,19 @@ const Connection = struct {
                 try self.checkSlowConsumers();
                 self.drainEmit() catch {
                     // Fail-closed: Session may already be debited — terminate connection.
+                    // A frame that failed after its flow-control debit cannot
+                    // be retried and cannot be un-debited, so the connection's
+                    // window state no longer matches the peer's. The only
+                    // correct move left is to close.
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                 };
             }
 
             if (self.session.terminal != .none) break;
+            // Graceful finish needs all three conditions together: phase 2
+            // reached, nothing left to write, and no handler still running. Any
+            // one alone would cut off work that is still in flight.
             if (self.shutting_down and self.session.grace_phase == .phase2 and
                 self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0)
             {
@@ -986,6 +1238,11 @@ const Connection = struct {
             if (maybe_chunk == null) {
                 // Reset before rechecking every producer-owned source; this closes
                 // the set-before-reset lost-wakeup race.
+                // The recheck list below must name EVERY producer: read chunks,
+                // handler completions, scheduler refills, writer failure, and
+                // the shutdown flag. A source left out of this list is a hang,
+                // not a slow path, because the actor then parks with work
+                // already waiting for it.
                 self.actor_wake.reset();
                 self.drainCompletions();
                 maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
@@ -1102,10 +1359,24 @@ const Connection = struct {
         }
     }
 
+    /// Append ciphertext to the boot-reserved accumulator.
+    ///
+    /// `appendSliceAssumeCapacity` is required here and not an optimization.
+    /// The accumulator is reserved once at connection boot and counted in
+    /// `resourceUpperBound`; a growing append would let a peer choose the
+    /// server's memory use by never completing a record. The explicit check
+    /// above turns that into a refused connection instead.
     fn appendTlsInput(self: *Connection, bytes: []const u8) !void {
         const limit = self.config.limits.tls_recv_acc_bytes;
         const held = self.tls_recv_acc.items.len;
         if (held > limit or bytes.len > limit - held) return error.TlsInputTooLarge;
+        // The guard above tests the CONFIGURED limit; the append below relies on
+        // the RESERVED capacity. Those are two different numbers that happen to
+        // be equal, because `init` reserves exactly `tls_recv_acc_bytes`. Assert
+        // the one that actually protects the write, so a future change that
+        // reserves less than it admits fails here by name instead of corrupting
+        // memory inside `appendSliceAssumeCapacity`.
+        std.debug.assert(held + bytes.len <= self.tls_recv_acc.capacity);
         self.tls_recv_acc.appendSliceAssumeCapacity(bytes);
     }
 
@@ -1128,6 +1399,18 @@ const Connection = struct {
         self.handshake_deadline = null;
     }
 
+    /// Drive the TLS handshake through the same pumps that carry application
+    /// data. There is no separate handshake socket path, so the read pump owns
+    /// the read direction from the very first byte.
+    ///
+    /// The loop is a state machine over `serverDrive`: emit whatever ciphertext
+    /// it produced, consume whatever input it accepted, then act on the status.
+    /// The accumulator is compacted with `memmove` rather than reallocated,
+    /// because it is reserved once at boot and must never grow.
+    ///
+    /// ALPN is checked before the connection is accepted. This stack serves
+    /// HTTP/2 only, so a peer that did not agree to `h2` is refused at the
+    /// handshake instead of at its first frame.
     fn tlsHandshakeViaPumps(self: *Connection) !void {
         const gpa = self.config.gpa;
         const srv = &(self.tls_server orelse return error.InvalidConfig);
@@ -1142,6 +1425,13 @@ const Connection = struct {
                 const out = try gpa.dupe(u8, self.ciphertext_scratch[0..drive.ciphertext_len]);
                 try self.sendAccountedWire(out, true, 0, 0, 0, false);
             }
+            // `consumed` crosses the boundary from the pinned tls.zig fork. A
+            // value larger than the input would underflow `rest` — a usize
+            // underflow reports as a slice panic several lines later, and the
+            // real cause (a fork or patch that no longer matches the ABI) would
+            // not appear anywhere in the message. Name the contract here.
+            std.debug.assert(drive.consumed <= self.tls_recv_acc.items.len);
+            std.debug.assert(drive.ciphertext_len <= self.ciphertext_scratch.len);
             if (drive.consumed > 0) {
                 const rest = self.tls_recv_acc.items.len - drive.consumed;
                 if (rest > 0) {
@@ -1178,6 +1468,16 @@ const Connection = struct {
         }
     }
 
+    /// Claim a handler slot. Actor-only, so the linear scan needs no lock and
+    /// no free list. The slot count equals `max_streams_per_connection`, so the
+    /// scan is bounded by a configured limit and a `null` result means the
+    /// connection is genuinely at its stream cap.
+    ///
+    /// The generation bump is the safety mechanism for slot REUSE. A `Body`
+    /// held by an old handler still points at this slot, so a stale write must
+    /// be rejected rather than applied to the new stream. The `Body` carries
+    /// the generation it was created with, and any mismatch becomes
+    /// `error.BodyClosed`.
     fn allocSlot(self: *Connection, stream_id: u31) ?*HandlerSlot {
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) {
@@ -1203,6 +1503,16 @@ const Connection = struct {
         return null;
     }
 
+    /// Free a slot after its handler has finished. Actor-only.
+    ///
+    /// The `await` is the memory-safety barrier and not bookkeeping. The
+    /// handler's arena is destroyed when the handler task returns, so the slot
+    /// may only be reused after this task confirms it has really stopped.
+    ///
+    /// The reaper token is released here, at the single point where the slot's
+    /// lifetime actually ends. Releasing it earlier — at cancel time — would
+    /// hand the capacity to a new stream while the old handler was still
+    /// running.
     fn releaseSlot(self: *Connection, stream_id: u31) void {
         if (self.slotIndex(stream_id)) |i| {
             const slot = &self.handlers[i];
@@ -1250,6 +1560,22 @@ const Connection = struct {
         }
     }
 
+    /// Stop a handler because its stream is over — a peer RST, or a local
+    /// reset. Actor-only.
+    ///
+    /// The sequence is ordered so that a handler always has a way out:
+    /// 1. Publish the terminal cause. Every `Response` entry point reads it
+    ///    first, so a handler that is running notices at its next call.
+    /// 2. Wake anything that waits on this stream: the flush ticket and the
+    ///    capacity event. A waiter that is not woken here waits forever,
+    ///    because the stream will produce no further events.
+    /// 3. Skip the join-cancel if the handler is awaiting a wire receipt (see
+    ///    `HandlerSlot.awaiting_receipt`).
+    /// 4. Otherwise transfer the join handle to a reaper, but ONLY when a
+    ///    handle exists to transfer. A CAS without a handle once left the
+    ///    ownership stuck at `reaper_owned`: the handler exited without
+    ///    reporting, no reaper ever ran, and the slot plus its reaper token
+    ///    leaked for the life of the connection.
     fn cancelHandler(self: *Connection, stream_id: u31, cause: response.TerminalCause) void {
         const i = self.slotIndex(stream_id) orelse return;
         const slot = &self.handlers[i];
@@ -1273,6 +1599,9 @@ const Connection = struct {
         self.enqueueReaperOrFail(slot, handle, stream_id);
     }
 
+    /// Release everything a terminal stream still holds, and wake whoever waits
+    /// on it. This is called before any cancellation decision, so that a
+    /// handler which is about to be left alone still has its wake guaranteed.
     fn wakeHandlerWaiters(self: *Connection, stream_id: u31) void {
         if (self.sched.findPending(stream_id)) |pw| {
             if (pw.flush_ticket != 0) {
@@ -1292,6 +1621,19 @@ const Connection = struct {
         self.wakeStreamSpace(stream_id);
     }
 
+    /// Stop every handler and wait until all slots are released. This is the
+    /// last thing the actor does, and it must be exhaustive: `deinit` asserts
+    /// that no slot is still in use, and frees the storage the handlers point
+    /// into.
+    ///
+    /// Two passes, and the second is the one that is easy to get wrong. The
+    /// first pass sets causes, wakes waiters, and hands off join handles. The
+    /// second waits — and it waits on SLOTS, not on `live_handlers`. The
+    /// difference is a real race: a reaper posts its completion only after
+    /// `cancel` returns, and `cancel` returns after the handler has already
+    /// decremented `live_handlers`. A wait on `live_handlers == 0` can
+    /// therefore finish before the completion is posted, and the release is
+    /// then dropped.
     fn shutdownHandlers(self: *Connection) !void {
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) continue;
@@ -1335,6 +1677,20 @@ const Connection = struct {
         }
     }
 
+    /// Decrypt accumulated TLS input and feed the plaintext to `Session`.
+    ///
+    /// The CALLER must hold `session_mu`. Both call sites do. The lock is not
+    /// taken inside because the other caller already holds it, and a
+    /// locked/unlocked variant would hide one site's mistake behind a
+    /// parameter (t-538 was exactly that mistake).
+    ///
+    /// `firstRecord` feeds ONE TLS record per call on purpose. See the note on
+    /// that function: a coalesced small record followed by a maximum-size one
+    /// can advance the cipher sequence and only then fail for want of output
+    /// space, which is unrecoverable.
+    ///
+    /// The final guard exits when a pass consumed nothing and produced nothing.
+    /// Without it a record that can never make progress spins the actor.
     fn driveDecrypt(self: *Connection) !void {
         const tc = &(self.tls_conn orelse return);
         while (self.tls_recv_acc.items.len > 0) {
@@ -1349,6 +1705,11 @@ const Connection = struct {
                 // TLS close-notify is best-effort; sendAccountedWire releases `out` on failure.
                 self.sendAccountedWire(out, true, 0, 0, 0, false) catch {};
             }
+            // Same ABI contract as the handshake drive above, plus the two
+            // output lengths this path slices with.
+            std.debug.assert(res.consumed <= self.tls_recv_acc.items.len);
+            std.debug.assert(res.ciphertext_len <= self.ciphertext_scratch.len);
+            std.debug.assert(res.plaintext_len <= self.plaintext_scratch.len);
             if (res.consumed > 0) {
                 const rest = self.tls_recv_acc.items.len - res.consumed;
                 if (rest > 0) {
@@ -1375,6 +1736,21 @@ const Connection = struct {
         try self.processIntents();
     }
 
+    /// Two-phase graceful shutdown (RFC 9113 section 6.8).
+    ///
+    /// One GOAWAY is not enough, because the server and the client can be
+    /// choosing stream ids at the same instant. A request already in flight
+    /// would be refused for no reason. So:
+    ///
+    /// - Phase 1 sends GOAWAY with the maximum stream id — "I am going away,
+    ///   but nothing is refused yet" — followed by a PING. The PING ack proves
+    ///   the peer has processed everything sent before it, which fixes the set
+    ///   of streams that were genuinely in flight.
+    /// - Phase 2 sends a second GOAWAY naming the highest stream actually
+    ///   accepted, and refuses everything above it.
+    ///
+    /// The one-second deadline between the phases is a liveness guard: a peer
+    /// that never acks the PING must not be able to hold the shutdown open.
     fn maybeBeginGraceful(self: *Connection) !void {
         const sf = self.config.shutdown_flag orelse return;
         if (!sf.load(.acquire)) return;
@@ -1418,6 +1794,26 @@ const Connection = struct {
         try self.processIntents();
     }
 
+    /// Block a handler until its stream's pending slab has room.
+    ///
+    /// This is the backpressure boundary: a handler that produces faster than
+    /// the peer reads is parked here rather than allowed to grow a buffer. That
+    /// is what keeps a single stream inside `outbound_bytes_per_stream` and the
+    /// connection inside `resourceUpperBound`.
+    ///
+    /// This is the ONLY place that releases `session_mu` mid-operation, and it
+    /// must, because only the actor can free this capacity and the actor needs
+    /// the same lock. The sequence per attempt:
+    /// 1. Check the terminal cause and the writer state FIRST, so a dead stream
+    ///    returns an exact error instead of parking.
+    /// 2. Re-read the pending length; return if there is room.
+    /// 3. Reset the capacity event BEFORE releasing the lock, so a wake that
+    ///    arrives during the gap is not lost.
+    /// 4. Unlock, wait, and reacquire UNCANCELABLE. The uncancelable
+    ///    reacquisition is what keeps the caller's `defer unlock` correct even
+    ///    when the handler is being canceled.
+    /// 5. Re-check the terminal state before trusting the wait result, because
+    ///    a cancel and a capacity wake can arrive together.
     fn waitForStreamSpace(self: *Connection, stream_id: u31, terminal: *response.SlotTerminal) response.ResponseError!void {
         const cap = self.config.limits.outbound_bytes_per_stream;
         while (true) {
@@ -1445,6 +1841,17 @@ const Connection = struct {
 
     /// Bounded streaming enqueue into FairScheduler boot-reserved slabs.
     /// Handler may block cancellably until actor drains capacity. No post-boot GPA.
+    ///
+    /// A body of any size is copied in cap-sized pieces, so an arbitrarily
+    /// large response never needs an arbitrarily large buffer. Per piece:
+    /// reserve the outbound bytes, copy into the slab, then set
+    /// `sched_refilled` and wake the actor. The flag is set BEFORE the wake for
+    /// the reason given in the module header — an event edge can be erased by
+    /// the actor's reset, a flag cannot.
+    ///
+    /// The trailing zero-length enqueue is not redundant. It carries the
+    /// END_STREAM marker or the flush ticket for a body whose bytes are all
+    /// already queued, and for an empty body it is the only enqueue there is.
     fn enqueuePending(
         self: *Connection,
         stream_id: u31,
@@ -1465,7 +1872,7 @@ const Connection = struct {
             if (room == 0) continue;
             const take = @min(bytes.len - off, room);
             if (!self.tryReserveOutboundBytes(take, .pending)) return error.OutOfMemory;
-            self.sched.enqueueDataBytes(stream_id, bytes[off..][0..take], false, 0, 0, cap) catch {
+            self.sched.enqueueDataBytes(stream_id, bytes[off..][0..take], false, 0, 0) catch {
                 self.applyOutboundRelease(take, .pending);
                 return error.OutOfMemory;
             };
@@ -1474,7 +1881,7 @@ const Connection = struct {
             self.actor_wake.set(self.config.io);
         }
         if (bytes.len == 0 or end or flush_ticket != 0) {
-            self.sched.enqueueDataBytes(stream_id, &.{}, end, flush_ticket, flush_slot, cap) catch {
+            self.sched.enqueueDataBytes(stream_id, &.{}, end, flush_ticket, flush_slot) catch {
                 if (flush_ticket != 0) return error.WriteFailed;
                 return error.OutOfMemory;
             };
@@ -1485,6 +1892,18 @@ const Connection = struct {
 
     /// Single FairScheduler drain: terminal → ordinary(+forced DATA) → DRR DATA.
     /// All emits go through queueWire via scheduler sink only.
+    ///
+    /// Actor-only, under `session_mu`. The three callbacks below are how the
+    /// scheduler reaches protocol state without knowing what a protocol is: it
+    /// asks for the windows, asks for a framed DATA frame, and hands the result
+    /// to the sink.
+    ///
+    /// The `buildData` -> `sink` pair has a strict order. `buildData` DEBITS
+    /// flow control, so the pending-byte release is deferred through
+    /// `pending_data_outbound_release` and applied only after the sink accepts
+    /// the frame. If the sink fails, the debit has already happened and cannot
+    /// be undone, so the connection fails closed rather than continuing with
+    /// window state the peer does not share.
     fn drainEmit(self: *Connection) !void {
         const SinkCtx = struct {
             fn sink(
@@ -1552,6 +1971,20 @@ const Connection = struct {
         test_observed_sched_emits.store(self.sched.emits_total, .release);
     }
 
+    /// Turn queued `Session` intents into scheduler work, then emit.
+    ///
+    /// Intents are copied into an actor-owned batch first. Draining into the
+    /// session's own storage would break as soon as a branch below pushes a new
+    /// intent — which `dispatch` and the reset paths both do — because the
+    /// slice would alias storage that is being written.
+    ///
+    /// `consumed` advances BEFORE each branch runs, so the `errdefer` owns only
+    /// the untouched tail. Every branch takes ownership of its own intent on
+    /// both the success and the failure path, so a shared cleanup would double
+    /// free.
+    ///
+    /// DATA never goes straight to the wire here. It enters the scheduler, so
+    /// that fairness between streams is decided in one place.
     fn processIntents(self: *Connection) anyerror!void {
         const n = self.session.drainIntentsInto(self.intent_batch);
         var consumed: usize = 0;
@@ -1633,6 +2066,17 @@ const Connection = struct {
         }) catch return error.WriteFailed;
     }
 
+    /// Hand finished wire bytes to the WritePump, with their accounting
+    /// attached.
+    ///
+    /// The chunk carries the release amounts rather than a callback, so the
+    /// pump needs no access to `Connection`. The AckDrainer applies them when
+    /// the write completes. That is the whole reason the pumps can run without
+    /// a lock.
+    ///
+    /// Both failure paths release the reservation AND free the bytes before
+    /// they return. After a successful `putOne` the pump owns the memory, and
+    /// this function must not touch it again.
     fn sendAccountedWire(
         self: *Connection,
         out: []u8,
@@ -1664,6 +2108,23 @@ const Connection = struct {
         };
     }
 
+    /// The single exit from protocol bytes to transport bytes. Called ONLY by
+    /// the `FairScheduler` sink; `test_queue_wire_bypass` proves it.
+    ///
+    /// For h2c the frame goes straight to the pump. For TLS it is encrypted
+    /// here, on the actor, under `session_mu` — the cipher is actor-owned, and
+    /// two tasks driving it concurrently is what crashed the process in t-538.
+    ///
+    /// One plaintext frame can become several TLS records, and the ticket, the
+    /// flush flag, and the control-pool release must ride on the LAST record
+    /// only. A ticket attached to an earlier record would tell the handler its
+    /// write was delivered while a later part of the same frame was still
+    /// queued.
+    ///
+    /// Note the two reservations. The plaintext holds a wire reservation while
+    /// it is being encrypted, and each ciphertext record takes its own. The
+    /// plaintext reservation is released once the last record is queued, so the
+    /// peak accounts for both, which is what actually exists in memory.
     fn queueWire(
         self: *Connection,
         bytes: []u8,
@@ -1694,6 +2155,11 @@ const Connection = struct {
             var off: usize = 0;
             while (off < bytes.len) {
                 const res = tls_edge.connectionEncrypt(tc, bytes[off..], self.ciphertext_scratch);
+                // Same ABI contract. An over-large `consumed` would push `off`
+                // past the end and panic on the NEXT iteration's slice, which
+                // points at the loop rather than at the encrypt that caused it.
+                std.debug.assert(res.consumed <= bytes.len - off);
+                std.debug.assert(res.ciphertext_len <= self.ciphertext_scratch.len);
                 if (res.ciphertext_len > 0) {
                     const out = self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]) catch {
                         self.config.gpa.free(bytes);
@@ -1724,6 +2190,28 @@ const Connection = struct {
         }
     }
 
+    /// Build a handler job and spawn it. Actor-only.
+    ///
+    /// Everything the handler will read is COPIED into a per-job arena, and the
+    /// session-owned originals are freed by the `defer` on return. The handler
+    /// runs on another task with no lock, so it must not hold a borrow into
+    /// session memory that the actor may free or reuse at any moment. One arena
+    /// per job also makes cleanup a single call on every exit path.
+    ///
+    /// Admission order is reserve-then-claim, and it is deliberate:
+    /// 1. Reserve reaper capacity. A handler that cannot be canceled must never
+    ///    start, because cancellation has no retry path.
+    /// 2. Claim a handler slot.
+    /// 3. Point `Response` at the SLOT's terminal state, never at job memory.
+    /// 4. Increment the live counters, then spawn.
+    ///
+    /// Each failure step undoes the step before it and answers the peer with
+    /// REFUSED_STREAM, which is retryable, rather than dropping the request.
+    ///
+    /// A spawn failure runs the handler INLINE on the actor. That blocks the
+    /// connection for the duration, which is bad, and it is still better than
+    /// the alternative: a stream that is admitted and accounted for but never
+    /// answered.
     fn dispatch(self: *Connection, d: session_mod.DispatchRequest) anyerror!void {
         const gpa = self.config.gpa;
         defer {
@@ -1862,6 +2350,26 @@ const Connection = struct {
         hctx: HandlerCtx = undefined,
     };
 
+    /// The handler task entry point.
+    ///
+    /// The `defer` runs on every exit, including a cancellation, and its order
+    /// is the contract with the actor:
+    /// 1. CAS `live` -> `reported`. The winner posts the completion. If a
+    ///    reaper already claimed the slot, this handler stays silent and the
+    ///    reaper reports after its `cancel` returns.
+    /// 2. Post the completion, then wake the actor. Without the wake the slot
+    ///    sits until an unrelated event arrives.
+    /// 3. Decrement the live counter, then destroy the arena and the job.
+    ///
+    /// The counters are published at the MUTATION sites, not once per actor
+    /// iteration. A parked actor republishes nothing, so a per-iteration value
+    /// stays stale for as long as the connection is quiet and reports handlers
+    /// that have already exited.
+    ///
+    /// Every fallback response is guarded by a terminal-cause check. A stream
+    /// that is already dead must not receive a synthetic 404 or 500: the write
+    /// would fail anyway, and the real cause is the one the handler should
+    /// report.
     fn runHandlerJob(job: *HandlerJob) void {
         const self = job.conn;
         defer {
@@ -1928,6 +2436,24 @@ const Connection = struct {
         self.session_mu.lock(self.config.io) catch return error.Canceled;
     }
 
+    /// One-shot response: headers plus a complete body.
+    ///
+    /// Runs on the HANDLER task. The shared shape of all five callbacks below:
+    /// 1. Check the terminal cause before doing any work.
+    /// 2. Reserve a ticket BEFORE taking the lock. Ticket reservation can fail,
+    ///    and it is better to fail without the connection's only mutex held.
+    /// 3. Take `session_mu`, apply the command, materialize the intents.
+    /// 4. RELEASE the lock.
+    /// 5. Only then wait on the ticket.
+    ///
+    /// Step 5 must be outside the lock. The ticket is completed by the
+    /// AckDrainer after the WritePump has written the bytes, and the actor
+    /// needs `session_mu` to produce those bytes. A wait inside the lock is a
+    /// deadlock.
+    ///
+    /// The `armed` flag releases the ticket slot on any failure that happens
+    /// before the wait begins. Once the wait starts the slot belongs to
+    /// `TicketTable.wait`, which releases it in its own `defer`.
     fn sendCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
@@ -1970,11 +2496,24 @@ const Connection = struct {
             }
         }
         armed = false;
+        // From here until the wait returns, teardown must NOT cancel this
+        // handler. The wait is guaranteed to wake on its own — see
+        // `HandlerSlot.awaiting_receipt` and `cancelHandler`.
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
         try self.waitTicket(slot_i, hctx.terminal);
     }
 
+    /// Streaming response: headers now, body later. The SSE path adds the three
+    /// fields that keep an event stream unbuffered end to end —
+    /// `text/event-stream`, `no-cache`, and `x-accel-buffering: no` for
+    /// intermediaries that would otherwise hold events until a buffer fills.
+    ///
+    /// `next_wire_ticket` is how the ticket reaches a frame that this function
+    /// does not build. The HEADERS frame is produced inside `Session`, so the
+    /// ticket is parked on the connection and `processIntents` attaches it to
+    /// the next outbound frame it creates. This is safe only because the whole
+    /// sequence runs under `session_mu` on one task.
     fn startCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, sse: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
@@ -2012,6 +2551,13 @@ const Connection = struct {
         try self.waitTicket(slot_i, hctx.terminal);
     }
 
+    /// Streaming body write.
+    ///
+    /// A ticket is taken only when the caller needs a receipt — a flush or an
+    /// end-of-stream. A plain write returns as soon as the bytes are queued, so
+    /// a handler that writes many small chunks pays one round trip per flush
+    /// and not one per chunk. Backpressure still applies through
+    /// `enqueuePending`, so this is not an unbounded fire-and-forget.
     fn writeCb(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool, flush: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
@@ -2040,6 +2586,15 @@ const Connection = struct {
         }
     }
 
+    /// Wait until everything written so far has reached the wire.
+    ///
+    /// Two cases, and the distinction is what makes a flush mean something:
+    /// - Bytes are still pending. The ticket is attached to the pending entry
+    ///   with `flush_remain` set to the current length, so the scheduler
+    ///   completes it only after that many bytes have actually drained.
+    /// - Nothing is pending. A bare flush barrier goes through the write queue
+    ///   instead. The pump completes it in FIFO order, so it still proves that
+    ///   every earlier write was written.
     fn flushCb(ctx: *anyopaque, stream_id: u31) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
@@ -2069,6 +2624,10 @@ const Connection = struct {
         try self.waitTicket(slot_i, hctx.terminal);
     }
 
+    /// Kill one stream without harming the connection. A handler uses this when
+    /// it has already committed a response and then discovers it cannot
+    /// complete it. A RST_STREAM tells the peer the response is broken, which
+    /// is honest; a silent truncation would look like a complete body.
     fn abortCb(ctx: *anyopaque, stream_id: u31) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;

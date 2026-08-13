@@ -1,4 +1,25 @@
 //! Checked Limits.resourceUpperBound from concrete `@sizeOf` shapes + configured capacities.
+//!
+//! Why this file exists at all: an operator must be able to answer "how much
+//! memory can this configuration use?" BEFORE the process serves a request, and
+//! must get the answer from the code rather than from a measurement of one run.
+//! `resourceUpperBound` is that answer. `Server.init` calls it first and refuses
+//! to start on `error.InvalidConfig`, so an inconsistent configuration fails at
+//! boot instead of under load.
+//!
+//! Two properties keep the number honest:
+//!
+//! - Every term uses a real `@sizeOf` of a real type, never an estimate. The
+//!   comptime block below fails the BUILD when a struct grows and its recorded
+//!   size no longer matches. A term that silently undercounts is worse than no
+//!   bound, because it still answers.
+//! - The checked arithmetic is not defensive style. A large configured limit
+//!   multiplied by a struct size can overflow `usize`, and a wrapped product is
+//!   a small, plausible, wrong bound.
+//!
+//! `Terms` is public so a test can assert that a term moves when the limit that
+//! feeds it moves. That is the mutation canary against a term that gets dropped
+//! from the sum during a refactor: the total would still look reasonable.
 const std = @import("std");
 const bound = @import("bound_shapes.zig");
 const wire_const = @import("wire_const.zig");
@@ -33,6 +54,8 @@ pub const Terms = struct {
     certs: usize = 0,
     tls_scratch: usize = 0,
     endpoints_listeners: usize = 0,
+    /// The server-wide outbound slab pool, counted once.
+    outbound_slabs: usize = 0,
     tasks: usize = 0,
 };
 
@@ -84,6 +107,13 @@ pub const Limits = struct {
     /// to B with S streams requires `request_bytes_per_connection >= B*S` (and a
     /// matching server ceiling) if every stream may hold a full body at once.
     request_body_bytes: usize = 256 * 1024,
+    /// Outbound DATA slabs for the WHOLE SERVER, each `outbound_bytes_per_stream`
+    /// bytes. Slabs are rented when a stream first queues DATA and returned when
+    /// it drains, so this bounds CONCURRENT WRITERS rather than connections.
+    /// The old per-connection reservation cost `max_streams_per_connection`
+    /// slabs on every connection — 16 MiB each at the defaults — whether the
+    /// connection wrote one byte or saturated every stream.
+    outbound_slabs_per_server: usize = 4_096,
     /// Intent backlog entries per connection (session).
     intent_entries_per_connection: usize = 512,
     preface_timeout_ns: u64 = 5 * std.time.ns_per_s,
@@ -110,19 +140,41 @@ pub const Limits = struct {
         if (self.max_connections == 0 or self.max_streams_per_connection == 0) return error.InvalidConfig;
         if (self.max_streams_per_server == 0) return error.InvalidConfig;
         if (self.cancellation_reaper_tasks == 0 or self.cancellation_reaper_jobs == 0) return error.InvalidConfig;
+        // Every live stream may need a reaper job at once, because a peer may
+        // reset all of them in one flight. A smaller reaper queue would reject a
+        // job that the cancel path has no way to retry, which strands the
+        // handler slot and its capacity token.
         if (self.cancellation_reaper_jobs < self.max_streams_per_server) return error.InvalidConfig;
         if (self.inbound_wire_chunks_per_connection == 0) return error.InvalidConfig;
         if (self.outbound_bytes_per_stream == 0 or self.outbound_bytes_per_connection == 0) return error.InvalidConfig;
+        // The three ceilings must nest: stream <= connection <= server. An
+        // inverted pair makes the inner limit unreachable, so a handler would
+        // park forever on capacity that the outer limit already refused.
         if (self.outbound_bytes_per_stream > self.outbound_bytes_per_connection) return error.InvalidConfig;
         if (self.outbound_bytes_per_connection > self.outbound_bytes_per_server) return error.InvalidConfig;
         if (self.request_bytes_per_connection > self.request_bytes_per_server) return error.InvalidConfig;
         // Ordinary SETTINGS/HEADERS must fit without consuming the terminal
-        // GOAWAY/RST/ACK reserve.
+        // GOAWAY/RST/ACK reserve. Without a reserve, a connection that fills its
+        // control pool cannot emit the GOAWAY that says why, so it fails silent
+        // instead of fail-closed.
         if (self.control_bytes_per_connection <= TERMINAL_CONTROL_RESERVE_BYTES) return error.InvalidConfig;
         if (self.control_entries_per_connection <= TERMINAL_CONTROL_RESERVE_ENTRIES) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.tls_recv_acc_bytes < WIRE_CHUNK_SIZE) return error.InvalidConfig;
+        // A server with no slabs can never write DATA.
+        if (self.outbound_slabs_per_server == 0) return error.InvalidConfig;
+        // Every admitted stream can hold at most one slab, and global stream
+        // admission already caps concurrent streams. Requiring at least that
+        // many slabs makes pool exhaustion UNREACHABLE for a valid config, and
+        // that is what removes the deadlock this design would otherwise have:
+        // a writer that cannot rent would have to park until some OTHER
+        // connection released, which nothing on this connection can wake.
+        // Rung 4 — the dangerous configuration cannot be expressed.
+        if (self.outbound_slabs_per_server < self.max_streams_per_server) return error.InvalidConfig;
 
+        // Rung-4 enforcement: these sizes are load-bearing inputs to the bound,
+        // so a struct that gains a field must break the BUILD and not the
+        // number. A drifted size is invisible in a passing test suite.
         comptime {
             if (@sizeOf(ticket_table.TicketWait) != bound.TICKET_WAIT_SIZE) @compileError("TicketWait size drift");
             if (@sizeOf(wire_pump.WriteCompletion) != bound.WRITE_COMPLETION_SIZE) @compileError("WriteCompletion size drift");
@@ -146,8 +198,10 @@ pub const Limits = struct {
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
         terms.stream_maps = bound.streamMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
         const pending_slots = bound.pendingWriteMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
-        const pending_slabs = bound.pendingSlabBytes(self.max_streams_per_connection, self.outbound_bytes_per_stream) catch return error.InvalidConfig;
-        terms.pending_maps = try checkedAdd(pending_slots, pending_slabs);
+        // Slabs are server-wide now, so they are NOT part of the per-connection
+        // term. Counting them here is what made the bound scale with
+        // connections instead of with concurrent work.
+        terms.pending_maps = pending_slots;
         const tombstones = try checkedMul(self.stream_tombstones, 8);
         const header_maps_one = bound.hashMapBytes(u31, usize, self.max_streams_per_connection) catch return error.InvalidConfig;
         const header_maps = try checkedMul(header_maps_one, 3); // pending hdr/body/trailer maps
@@ -182,7 +236,9 @@ pub const Limits = struct {
 
         const all_conns = try checkedMul(self.max_connections, per_conn);
         // Global on-demand ceilings counted once (admission counters + payload pools).
-        terms.on_demand_server = try checkedAdd(self.outbound_bytes_per_server, self.request_bytes_per_server);
+        const slab_bytes = bound.pendingSlabBytes(self.outbound_slabs_per_server, self.outbound_bytes_per_stream) catch return error.InvalidConfig;
+        terms.outbound_slabs = slab_bytes;
+        terms.on_demand_server = try checkedAdd(slab_bytes, try checkedAdd(self.outbound_bytes_per_server, self.request_bytes_per_server));
         const allocator_bytes = try checkedAdd(server_static, try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, terms.on_demand_server)));
 
         // Maximum std.Io task topology: accept loops + per-connection
@@ -218,6 +274,34 @@ test "rejects inconsistent outbound hierarchy" {
     lim.outbound_bytes_per_stream = 8 * 1024 * 1024;
     lim.outbound_bytes_per_connection = 4 * 1024 * 1024;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
+test "rejects a slab pool smaller than the global stream cap" {
+    // Without this the pool can be exhausted, and an exhausted writer has
+    // nothing on its own connection that can wake it.
+    var lim = Limits.defaults;
+    lim.outbound_slabs_per_server = lim.max_streams_per_server - 1;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+
+    lim.outbound_slabs_per_server = 0;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
+test "the slab pool is counted once for the server, not per connection" {
+    // The regression this whole change exists to prevent: if slabs are counted
+    // per connection, halving max_connections halves the slab cost, which means
+    // the term is in the wrong place.
+    const wide = try Limits.defaults.resourceUpperBound();
+    var half = Limits.defaults;
+    half.max_connections = Limits.defaults.max_connections / 2;
+    const narrow = try half.resourceUpperBound();
+    try std.testing.expectEqual(wide.terms.outbound_slabs, narrow.terms.outbound_slabs);
+    try std.testing.expect(wide.terms.outbound_slabs > 0);
+    // And it does track the slab count itself.
+    var more = Limits.defaults;
+    more.outbound_slabs_per_server = Limits.defaults.outbound_slabs_per_server * 2;
+    const bigger = try more.resourceUpperBound();
+    try std.testing.expect(bigger.terms.outbound_slabs > wide.terms.outbound_slabs);
 }
 
 test "rejects reaper jobs below global streams" {

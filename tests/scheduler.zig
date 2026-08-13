@@ -2,6 +2,10 @@
 const std = @import("std");
 const starh2 = @import("starh2");
 
+fn testPool(gpa: std.mem.Allocator, slab_bytes: usize, capacity: usize) !starh2.edge.slab_pool.SlabPool {
+    return starh2.edge.slab_pool.SlabPool.init(gpa, std.testing.io, slab_bytes, capacity);
+}
+
 const SinkState = struct {
     gpa: std.mem.Allocator,
     emitted: std.ArrayList(struct { control: bool, n: usize }) = .empty,
@@ -34,7 +38,9 @@ test "prefill max ordinary queue: emit gap <= 64 when DATA eligible" {
     const fs = starh2.edge.fair_scheduler;
     const cp = starh2.edge.control_pool;
     // Ordinary capacity = 256 - 16 terminal reserve = 240
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, 1024 * 1024);
+    var pool = try testPool(gpa, 1024 * 1024, 16);
+    defer pool.deinit(gpa);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
     defer sched.deinit();
 
     // Eligible DATA before controls (prefilled into boot slab).
@@ -42,7 +48,7 @@ test "prefill max ordinary queue: emit gap <= 64 when DATA eligible" {
     @memset(&big, 'd');
     var i: usize = 0;
     while (i < 64) : (i += 1) {
-        try sched.enqueueDataBytes(1, &big, false, 0, 0, 1024 * 1024);
+        try sched.enqueueDataBytes(1, &big, false, 0, 0);
     }
 
     const caps = sched.ctrl.ordinaryCaps();
@@ -87,14 +93,16 @@ test "fair scheduler: 10k controls interleaved drain gaps <= 64" {
     const gpa = std.testing.allocator;
     const fs = starh2.edge.fair_scheduler;
     // Boot slab holds enough to keep DATA eligible across 10k control drains.
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, 8 * 1024 * 1024);
+    var pool = try testPool(gpa, 8 * 1024 * 1024, 16);
+    defer pool.deinit(gpa);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
     defer sched.deinit();
 
     var big: [16 * 1024]u8 = undefined;
     @memset(&big, 'y');
     var i: usize = 0;
     while (i < 512) : (i += 1) {
-        try sched.enqueueDataBytes(1, &big, false, 0, 0, 8 * 1024 * 1024);
+        try sched.enqueueDataBytes(1, &big, false, 0, 0);
     }
 
     var sink_state: SinkState = .{ .gpa = gpa };
@@ -150,7 +158,9 @@ test "fair scheduler: 10k controls interleaved drain gaps <= 64" {
 test "fair scheduler: terminal when ordinary full; zero windows" {
     const gpa = std.testing.allocator;
     const fs = starh2.edge.fair_scheduler;
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, 64 * 1024);
+    var pool = try testPool(gpa, 64 * 1024, 16);
+    defer pool.deinit(gpa);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
     defer sched.deinit();
     const caps = sched.ctrl.ordinaryCaps();
     var i: usize = 0;
@@ -170,10 +180,12 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
         try sched.enqueueControl(p, .terminal, 0, 0);
     }
 
-    var s2 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, 10_000);
+    var pool2 = try testPool(gpa, 10_000, 16);
+    defer pool2.deinit(gpa);
+    var s2 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool2);
     defer s2.deinit();
-    try s2.enqueueDataBytes(1, &[_]u8{1} ** 100, false, 0, 0, 10_000);
-    try s2.enqueueDataBytes(3, &[_]u8{3} ** 100, true, 0, 0, 10_000);
+    try s2.enqueueDataBytes(1, &[_]u8{1} ** 100, false, 0, 0);
+    try s2.enqueueDataBytes(3, &[_]u8{3} ** 100, true, 0, 0);
     var sink_state: SinkState = .{ .gpa = gpa };
     defer sink_state.emitted.deinit(gpa);
     const win = struct {
@@ -193,9 +205,11 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
     const progressed = try s2.emitOneDataPublic(selfPtr(&sink_state), SinkState.sink, selfPtr(&sink_state), win.stream, win.conn, win.build, selfPtr(&sink_state));
     try std.testing.expect(progressed);
 
-    var s3 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 4, 10_000);
+    var pool3 = try testPool(gpa, 10_000, 16);
+    defer pool3.deinit(gpa);
+    var s3 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 4, &pool3);
     defer s3.deinit();
-    try s3.enqueueDataBytes(1, &[_]u8{9} ** 100, true, 0, 0, 10_000);
+    try s3.enqueueDataBytes(1, &[_]u8{9} ** 100, true, 0, 0);
     const p = try gpa.alloc(u8, 16);
     @memset(p, 8);
     try s3.enqueueControl(p, .ordinary, 0, 0);

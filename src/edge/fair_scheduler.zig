@@ -2,10 +2,48 @@
 //! Terminal/required ACK → ordinary controls+HEADERS → 16KiB DRR DATA.
 //! Pending DATA uses boot-reserved per-stream slabs (no post-boot GPA growth).
 //! Nonterminal controls counted only when emitted.
+//!
+//! # The problem this solves
+//!
+//! HTTP/2 multiplexes many streams over one socket, so something must choose
+//! which stream's bytes go next. A naive queue gives whoever wrote first the
+//! whole connection, which is what makes one large download stall an entire
+//! browser tab's worth of requests. That is precisely the Datastar shape this
+//! stack serves: long-lived SSE streams beside one-shot page loads on the same
+//! connection.
+//!
+//! # The drain order, and why each tier is where it is
+//!
+//! 1. TERMINAL controls — GOAWAY and RST_STREAM. Teardown must not queue behind
+//!    the data it is canceling.
+//! 2. ORDINARY controls — SETTINGS, PING, acks, WINDOW_UPDATE, HEADERS. These
+//!    are small, and they unblock the peer. A WINDOW_UPDATE stuck behind a
+//!    megabyte of DATA deadlocks the very flow control it grants.
+//! 3. DATA — round robin over streams in a fixed 16 KiB quantum.
+//!
+//! The strict tier order would let controls starve DATA forever, so tier 2
+//! yields after `CONTROL_BEFORE_DATA` frames whenever DATA is eligible. That
+//! turns starvation into a bounded delay.
+//!
+//! Within tier 3, `drr_cursor` is what makes the round robin fair. It resumes
+//! at the stream after the one last served, so a low-numbered stream cannot win
+//! every pass. A fixed quantum caps how long any one stream holds the wire.
+//!
+//! # No allocation on the write path
+//!
+//! Pending DATA lives in per-stream slabs carved from ONE boot allocation, and
+//! a slot is a fixed array entry rather than a map. A handler write is a
+//! `memcpy` into an existing slab; when the slab is full the handler parks in
+//! `Connection.waitForStreamSpace`. That is the mechanism behind the promise
+//! that a connection stays inside `Limits.resourceUpperBound` under any load.
 const std = @import("std");
 const control_pool = @import("control_pool.zig");
+const slab_pool = @import("slab_pool.zig");
 const frame = @import("../core/frame.zig");
 
+/// One round-robin turn. It matches the HTTP/2 default max frame size, so a
+/// quantum is exactly one DATA frame and the scheduler never has to split a
+/// turn across frames.
 pub const DATA_QUANTUM: usize = 16 * 1024;
 
 pub const ControlClass = enum { terminal, ordinary };
@@ -28,6 +66,14 @@ pub const FramedDataEntry = struct {
 };
 
 /// Fixed per-stream pending DATA — slab leased at FairScheduler.init.
+///
+/// `stream_id == 0` marks a free slot. Zero is never a real stream id in
+/// HTTP/2, so no sentinel field is needed and a slot cannot be misread as live.
+///
+/// `flush_remain` is what makes a flush ticket honest. It records how many
+/// bytes were outstanding when the handler asked, and the ticket completes only
+/// after that many have drained. Completing on the next quantum would tell the
+/// handler its data reached the peer while most of it was still in the slab.
 pub const DataPending = struct {
     stream_id: u31 = 0, // 0 = free slot
     slab: []u8 = &.{},
@@ -87,8 +133,10 @@ pub const FairScheduler = struct {
     framed_len: usize = 0,
     /// Fixed slots — one per max concurrent stream; slab storage contiguous.
     pending_slots: []DataPending,
-    slab_storage: []u8,
-    slab_bytes_per_stream: usize,
+    /// Borrowed, server-owned. Slabs are rented when a stream first queues
+    /// DATA and returned the moment it has none, so an idle stream — and an
+    /// idle connection — holds none at all.
+    pool: *slab_pool.SlabPool,
     active_pending: usize = 0,
     drr_cursor: u31 = 1,
     data_quanta: usize = 0,
@@ -109,7 +157,7 @@ pub const FairScheduler = struct {
         terminal_cap: usize,
         ordinary_cap: usize,
         max_streams: usize,
-        slab_bytes_per_stream: usize,
+        pool: *slab_pool.SlabPool,
     ) !FairScheduler {
         const tq = try gpa.alloc(ControlEntry, @max(terminal_cap, 1));
         errdefer gpa.free(tq);
@@ -121,15 +169,7 @@ pub const FairScheduler = struct {
         errdefer gpa.free(scratch);
         const slots = try gpa.alloc(DataPending, max_streams);
         errdefer gpa.free(slots);
-        const slab_total = max_streams * @max(slab_bytes_per_stream, 1);
-        const slabs = try gpa.alloc(u8, slab_total);
-        errdefer gpa.free(slabs);
         @memset(slots, .{});
-        var i: usize = 0;
-        while (i < max_streams) : (i += 1) {
-            const off = i * @max(slab_bytes_per_stream, 1);
-            slots[i].slab = slabs[off..][0..@max(slab_bytes_per_stream, 1)];
-        }
         return .{
             .gpa = gpa,
             .io = io,
@@ -138,8 +178,7 @@ pub const FairScheduler = struct {
             .ordinary_q = oq,
             .framed_data_q = fq,
             .pending_slots = slots,
-            .slab_storage = slabs,
-            .slab_bytes_per_stream = @max(slab_bytes_per_stream, 1),
+            .pool = pool,
             .sid_scratch = scratch,
         };
     }
@@ -151,8 +190,11 @@ pub const FairScheduler = struct {
         self.gpa.free(self.terminal_q);
         self.gpa.free(self.ordinary_q);
         self.gpa.free(self.framed_data_q);
+        // A slot still holding a slab here means some teardown path missed it.
+        // Return them rather than leaking into the shared pool, where the loss
+        // would starve every other connection instead of just this one.
+        for (self.pending_slots) |*slot| self.returnSlab(slot);
         self.gpa.free(self.pending_slots);
-        self.gpa.free(self.slab_storage);
         self.gpa.free(self.sid_scratch);
     }
 
@@ -226,7 +268,18 @@ pub const FairScheduler = struct {
         return self.findPending(stream_id) != null;
     }
 
+    /// The ONLY place a slab goes back. Every teardown path routes through
+    /// `freePending`, so exactly one function has to be right — a second
+    /// release site is how a shared pool gets double returns.
+    fn returnSlab(self: *FairScheduler, pw: *DataPending) void {
+        if (pw.slab.len == 0) return;
+        const slab = pw.slab;
+        pw.slab = &.{};
+        self.pool.release(self.io, slab);
+    }
+
     fn freePending(self: *FairScheduler, pw: *DataPending) void {
+        self.returnSlab(pw);
         if (pw.stream_id != 0) {
             std.debug.assert(self.active_pending > 0);
             self.active_pending -= 1;
@@ -304,6 +357,15 @@ pub const FairScheduler = struct {
     }
 
     /// Append into boot-reserved slab — never grows, never calls GPA.
+    ///
+    /// The per-stream cap is the SLAB LENGTH, fixed at `init` from
+    /// `Limits.outbound_bytes_per_stream`. There is deliberately no cap
+    /// argument: a caller that could pass one would appear to choose the limit
+    /// while the slab decided, and the two would drift.
+    ///
+    /// `error.OutOfMemory` here means "this stream's slab is full", not that
+    /// the process is out of memory. It is the backpressure signal that parks
+    /// the handler in `Connection.waitForStreamSpace`.
     pub fn enqueueDataBytes(
         self: *FairScheduler,
         stream_id: u31,
@@ -311,11 +373,26 @@ pub const FairScheduler = struct {
         end: bool,
         flush_ticket: u64,
         flush_slot: u32,
-        max_per_stream: usize,
-    ) error{ OutOfMemory, StreamCap }!void {
-        _ = max_per_stream;
+    ) error{ OutOfMemory, StreamCap, SlabsExhausted }!void {
         const pw = try self.allocPending(stream_id);
+        if (bytes.len != 0 and pw.slab.len == 0) {
+            // First bytes for this stream: take a slab now. Exhaustion is
+            // BACKPRESSURE and gets its own error, because the caller must park
+            // and retry — mapping it onto OutOfMemory would fail the write for
+            // a condition that clears on its own.
+            pw.slab = self.pool.tryRent(self.io) orelse {
+                if (pw.len == 0 and !pw.end_stream and flush_ticket == 0) self.freePending(pw);
+                return error.SlabsExhausted;
+            };
+        }
         if (pw.len + bytes.len > pw.slab.len) return error.OutOfMemory;
+        // Restate the invariant the guard above establishes, immediately before
+        // the copy that depends on it. Without this line a weakened guard is
+        // caught only by the bounds check INSIDE `@memcpy`, which aborts at a
+        // line that says nothing about slabs — so the failure names the symptom
+        // and a reader has to bisect back to the cause. The assert costs
+        // nothing in a release build and names the cause directly.
+        std.debug.assert(pw.len + bytes.len <= pw.slab.len);
         @memcpy(pw.slab[pw.len..][0..bytes.len], bytes);
         pw.len += bytes.len;
         if (end) pw.end_stream = true;
@@ -379,6 +456,16 @@ pub const FairScheduler = struct {
         return self.emitted_controls_since_data >= control_pool.CONTROL_BEFORE_DATA;
     }
 
+    /// Emit as much as the windows and the queues allow, in tier order.
+    ///
+    /// Called only from `Connection.drainEmit`, on the actor, under
+    /// `session_mu`. It runs to exhaustion rather than emitting one frame,
+    /// because the actor drains once per iteration and anything left behind
+    /// waits for the next wakeup.
+    ///
+    /// The `shouldForceDataNow` check inside the ordinary loop is the
+    /// anti-starvation yield. It fires only when DATA is actually eligible, so
+    /// a window-blocked stream cannot make the loop spin.
     pub fn drain(
         self: *FairScheduler,
         sink_ctx: *anyopaque,
@@ -425,6 +512,21 @@ pub const FairScheduler = struct {
         return self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx);
     }
 
+    /// Emit at most one DATA frame. Returns false when nothing is eligible.
+    ///
+    /// Order of decisions:
+    /// 1. The connection window gates everything. No credit, no DATA.
+    /// 2. Already-framed DATA goes first. Those bytes are past `Session`, so
+    ///    holding them would reorder frames that the protocol layer has already
+    ///    committed to.
+    /// 3. Otherwise round-robin the pending slots from `drr_cursor`, and skip
+    ///    any stream whose own window is empty.
+    ///
+    /// Inside the chosen stream the sequence is: build the frame (which DEBITS
+    /// flow control), then shrink the slab, then emit. The `pw.stream_id == sid`
+    /// re-check between build and shrink is not paranoia — building can run
+    /// nested cancellation that frees this very pending entry, and shrinking a
+    /// slot that now belongs to another stream would discard its bytes.
     fn emitOneData(
         self: *FairScheduler,
         sink_ctx: *anyopaque,
@@ -493,9 +595,18 @@ pub const FairScheduler = struct {
                 attach = attachTicket(pw, quantum);
                 const take = @min(quantum, pw.len);
                 const rest = pw.len - take;
+                // The class invariant `pw.len <= pw.slab.len` is what makes this
+                // compaction in-bounds. `enqueueDataBytes` is the only writer
+                // that can break it, so state it at the reader too.
+                std.debug.assert(pw.len <= pw.slab.len);
                 if (rest > 0) @memmove(pw.slab[0..rest], pw.slab[take..][0..rest]);
                 pw.len = rest;
                 pw.last_progress_ns = nowNs(self.io);
+                // Drained empty: hand the slab back at once rather than at
+                // stream close. A long-lived SSE stream is idle between events,
+                // and holding a slab across that idle time is the cost this
+                // pool exists to remove.
+                if (rest == 0 and !pw.end_stream) self.returnSlab(pw);
                 if (end or (pw.len == 0 and pw.end_stream)) {
                     self.freePending(pw);
                 }
@@ -583,9 +694,15 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 
+fn testPool(gpa: std.mem.Allocator, slab_bytes: usize, capacity: usize) !slab_pool.SlabPool {
+    return slab_pool.SlabPool.init(gpa, std.testing.io, slab_bytes, capacity);
+}
+
 test "scheduler queues own payloads and hold control until complete" {
     const gpa = std.testing.allocator;
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, 64 * 1024);
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
     defer sched.deinit();
     const p = try gpa.dupe(u8, "helloctl");
     try sched.enqueueControl(p, .ordinary, 0, 0);
@@ -594,11 +711,93 @@ test "scheduler queues own payloads and hold control until complete" {
     try std.testing.expectEqual(@as(usize, 1), sched.ctrl.entries_held.load(.acquire));
 }
 
-test "pending DATA uses boot slab without GPA growth" {
+test "a stream rents one slab on its first bytes, and none before" {
     const gpa = std.testing.allocator;
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, 1024);
+    var pool = try testPool(gpa, 1024, 4);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
     defer sched.deinit();
-    try sched.enqueueDataBytes(1, "hello", false, 0, 0, 1024);
-    try std.testing.expectEqual(@as(usize, 5), sched.pendingByteLen(1));
-    try std.testing.expectError(error.OutOfMemory, sched.enqueueDataBytes(1, &[_]u8{'x'} ** 2000, false, 0, 0, 1024));
+
+    // An idle scheduler holds nothing. This is the whole point of the pool.
+    try std.testing.expectEqual(@as(usize, 0), pool.rentedCount());
+
+    try sched.enqueueDataBytes(1, "hello", false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), pool.rentedCount());
+    // More bytes for the same stream reuse the slab it already holds.
+    try sched.enqueueDataBytes(1, "world", false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), pool.rentedCount());
+    try std.testing.expectEqual(@as(usize, 10), sched.pendingByteLen(1));
+
+    // A second stream takes its own.
+    try sched.enqueueDataBytes(3, "x", false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), pool.rentedCount());
+}
+
+test "the per-stream cap is the pool's slab length" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64, 4);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    defer sched.deinit();
+
+    try sched.enqueueDataBytes(1, &[_]u8{'a'} ** 40, false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 40), sched.pendingByteLen(1));
+    // Past the slab: OutOfMemory, which is the stream's own cap, distinct from
+    // pool exhaustion.
+    try std.testing.expectError(error.OutOfMemory, sched.enqueueDataBytes(1, &[_]u8{'b'} ** 40, false, 0, 0));
+    try std.testing.expectEqual(@as(usize, 40), sched.pendingByteLen(1));
+}
+
+test "pool exhaustion is its own error, and strands no slot" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64, 2);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    defer sched.deinit();
+
+    try sched.enqueueDataBytes(1, "a", false, 0, 0);
+    try sched.enqueueDataBytes(3, "b", false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), pool.rentedCount());
+
+    // The third stream cannot rent. It must be told so, and must not be left
+    // occupying a pending slot it cannot use.
+    try std.testing.expectError(error.SlabsExhausted, sched.enqueueDataBytes(5, "c", false, 0, 0));
+    try std.testing.expectEqual(@as(usize, 2), pool.rentedCount());
+    try std.testing.expect(!sched.contains(5));
+    try std.testing.expectEqual(@as(usize, 2), sched.pendingCount());
+}
+
+test "removePending returns the slab" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64, 2);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+    defer sched.deinit();
+
+    try sched.enqueueDataBytes(1, "abc", false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), pool.rentedCount());
+    try std.testing.expect(sched.removePending(1));
+    try std.testing.expectEqual(@as(usize, 0), pool.rentedCount());
+
+    // And the returned slab is usable again, so the release was real.
+    try sched.enqueueDataBytes(7, "z", false, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), pool.rentedCount());
+    try std.testing.expect(sched.removePending(7));
+}
+
+test "deinit returns every slab it still holds" {
+    // The teardown-path gate: a connection destroyed with data still queued
+    // must not take slabs with it. SlabPool.deinit asserts rented == 0, so a
+    // miss here fails loudly rather than starving later connections.
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64, 4);
+    defer pool.deinit(gpa);
+    {
+        var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+        defer sched.deinit();
+        try sched.enqueueDataBytes(1, "abc", false, 0, 0);
+        try sched.enqueueDataBytes(3, "def", false, 0, 0);
+        try std.testing.expectEqual(@as(usize, 2), pool.rentedCount());
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.rentedCount());
 }

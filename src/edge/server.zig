@@ -1,9 +1,32 @@
 //! Listen, accept, global limits, graceful stop.
+//!
+//! `Server` owns everything that outlives a single connection: the listeners,
+//! the routes, the TLS key material, the reaper pool, and the server-wide
+//! counters in `GlobalAccounting`. A `Connection` borrows all of it and owns
+//! only its own stream.
+//!
+//! # Task groups, and why there are three
+//!
+//! Shutdown has an ORDER, and one group cannot express it:
+//! 1. Accept loops stop first, so no new connection can arrive during the
+//!    drain.
+//! 2. Connections drain next, so in-flight requests can finish.
+//! 3. Reapers stop last, because a draining connection still needs
+//!    cancellation to work.
+//! A single group would cancel all three at once and abort the very work the
+//! graceful path exists to preserve.
+//!
+//! # Two shutdown signals, not one
+//!
+//! `shutdown_flag` is what a loop polls; `shutdown_event` is what a parked task
+//! waits on. Both are set together, because a connection actor may be blocked
+//! in a `Select` where a flag alone would never be observed.
 const std = @import("std");
 const tls = @import("tls");
 const limits_mod = @import("../core/limits.zig");
 const router_mod = @import("../http/router.zig");
 const connection = @import("connection.zig");
+const slab_pool = @import("slab_pool.zig");
 
 pub const EndpointAddress = std.Io.net.IpAddress;
 
@@ -43,6 +66,18 @@ pub const ServerConfig = struct {
 };
 
 /// Observable progress of `serve` startup.
+///
+/// `serve` binds INSIDE its own spawned task, so a caller holding only a join
+/// handle cannot tell "listening" from "about to fail". Before this state
+/// existed, every caller papered over the gap with a sleep, and
+/// `localAddress` read uninitialized storage until the bind landed. An
+/// embedder that switches routes on a successful start would then report
+/// success while the listener was gone.
+///
+/// `.listening` is published only after EVERY endpoint is bound and its accept
+/// loop is spawned, so a released waiter may connect immediately. An errdefer
+/// publishes `.failed` on all three startup error paths, so a waiter learns of
+/// a failure instead of waiting out its timeout.
 pub const BindState = enum(u8) {
     pending,
     listening,
@@ -64,10 +99,22 @@ pub const Server = struct {
     accounting: connection.GlobalAccounting,
     router: router_mod.Router = undefined,
     reaper: ?connection.ReaperPool = null,
+    /// Server-wide outbound DATA slabs. Shared so an idle connection holds
+    /// none, and capped so the ceiling stays computable.
+    slabs: slab_pool.SlabPool,
     listeners_bound: usize = 0,
     bind_state: std.atomic.Value(BindState) = .init(.pending),
     bind_event: std.Io.Event = .unset,
 
+    /// Validate everything, then own everything.
+    ///
+    /// The memory bound is computed FIRST, before any allocation. A
+    /// configuration whose limits are inconsistent or would overflow must fail
+    /// at boot, where an operator sees it, and not under load.
+    ///
+    /// Routes and endpoints are duplicated rather than borrowed. The server
+    /// outlives its caller's configuration, and a route path that a handler
+    /// matches against must not be able to disappear.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, config: ServerConfig) InitError!Server {
         _ = try config.limits.resourceUpperBound();
         if (config.endpoints.len == 0 or config.endpoints.len > config.limits.max_endpoints) return error.InvalidConfig;
@@ -127,6 +174,14 @@ pub const Server = struct {
         var reaper = connection.ReaperPool.init(gpa, io, config.limits.cancellation_reaper_jobs) catch return error.OutOfMemory;
         errdefer reaper.deinit();
 
+        var slabs = slab_pool.SlabPool.init(
+            gpa,
+            io,
+            config.limits.outbound_bytes_per_stream,
+            config.limits.outbound_slabs_per_server,
+        ) catch return error.OutOfMemory;
+        errdefer slabs.deinit(gpa);
+
         var self: Server = .{
             .gpa = gpa,
             .io = io,
@@ -144,6 +199,7 @@ pub const Server = struct {
                 .max_handshakes = config.limits.concurrent_tls_handshakes,
             },
             .reaper = reaper,
+            .slabs = slabs,
         };
         self.router = .{ .routes = self.routes };
         return self;
@@ -263,6 +319,20 @@ pub const Server = struct {
         return connection.serveAccepted(stream, config);
     }
 
+    /// Accept until shutdown. One loop per endpoint.
+    ///
+    /// Admission happens HERE, before any connection state is built, because a
+    /// refusal must be cheap. The order is connection slot first, then TLS
+    /// handshake slot, and each failure path releases what it already took and
+    /// closes the socket.
+    ///
+    /// The TLS handshake slot is separate from the connection slot on purpose.
+    /// A handshake costs asymmetric CPU — the client sends a few bytes, the
+    /// server performs public-key work — so the concurrent handshake count must
+    /// be bounded independently of the connection count.
+    ///
+    /// `ConnectionAborted` continues the loop. A peer that disappears between
+    /// the SYN and the accept is normal and must not stop the endpoint.
     fn acceptLoop(
         self: *Server,
         endpoint_index: usize,
@@ -304,6 +374,7 @@ pub const Server = struct {
                 .shutdown_event = &self.shutdown_event,
                 .reaper = if (self.reaper) |*pool| pool else null,
                 .accounting = &self.accounting,
+                .slab_pool = &self.slabs,
                 .handshake_held = handshake_held,
             };
             connection_group.concurrent(self.io, connEntry, .{ self, stream, config }) catch {
@@ -355,6 +426,10 @@ pub const Server = struct {
         return self.local_addrs[endpoint_index];
     }
 
+    /// The asserts are the leak gate, not defensive style. Every counter must
+    /// be zero once `serve` has returned, so a release that some path forgot
+    /// fails a test run instead of drifting in production, where it would look
+    /// like a slow capacity leak under load.
     pub fn deinit(self: *Server, gpa: std.mem.Allocator) void {
         std.debug.assert(gpa.vtable == self.gpa.vtable);
         std.debug.assert(self.active_connections.load(.acquire) == 0);
@@ -369,6 +444,9 @@ pub const Server = struct {
         gpa.free(self.listeners);
         gpa.free(self.local_addrs);
         if (self.reaper) |*pool| pool.deinit();
+        // Asserts every slab came home; a connection teardown that missed one
+        // fails here rather than silently shrinking the pool.
+        self.slabs.deinit(gpa);
         if (self.tls_auth) |*auth| {
             if (@hasDecl(@TypeOf(auth.*), "deinit")) auth.deinit(gpa);
         }
