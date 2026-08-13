@@ -27,7 +27,7 @@ const limits_mod = @import("../core/limits.zig");
 const router_mod = @import("../http/router.zig");
 const connection = @import("connection.zig");
 const slab_pool = @import("slab_pool.zig");
-
+const brotli = @import("../http/brotli.zig");
 pub const EndpointAddress = std.Io.net.IpAddress;
 
 pub const EndpointConfig = union(enum) {
@@ -102,6 +102,9 @@ pub const Server = struct {
     /// Server-wide outbound DATA slabs. Shared so an idle connection holds
     /// none, and capped so the ceiling stays computable.
     slabs: slab_pool.SlabPool,
+    /// Server-wide brotli encoder contexts. Present only when
+    /// `limits.response_compression` is on; handlers borrow through ConnConfig.
+    compression_pool: ?brotli.Pool = null,
     listeners_bound: usize = 0,
     bind_state: std.atomic.Value(BindState) = .init(.pending),
     bind_event: std.Io.Event = .unset,
@@ -182,6 +185,17 @@ pub const Server = struct {
         ) catch return error.OutOfMemory;
         errdefer slabs.deinit(gpa);
 
+        var compression_pool: ?brotli.Pool = null;
+        if (config.limits.response_compression) {
+            compression_pool = brotli.Pool.init(
+                gpa,
+                config.limits.compression_contexts_per_server,
+                config.limits.compression_context_bytes,
+                config.limits.compression_quality,
+                config.limits.compression_window_bits,
+            );
+        }
+
         var self: Server = .{
             .gpa = gpa,
             .io = io,
@@ -200,6 +214,7 @@ pub const Server = struct {
             },
             .reaper = reaper,
             .slabs = slabs,
+            .compression_pool = compression_pool,
         };
         self.router = .{ .routes = self.routes };
         return self;
@@ -375,6 +390,7 @@ pub const Server = struct {
                 .reaper = if (self.reaper) |*pool| pool else null,
                 .accounting = &self.accounting,
                 .slab_pool = &self.slabs,
+                .compression_pool = if (self.compression_pool) |*pool| pool else null,
                 .handshake_held = handshake_held,
             };
             connection_group.concurrent(self.io, connEntry, .{ self, stream, config }) catch {
@@ -438,6 +454,9 @@ pub const Server = struct {
         std.debug.assert(self.accounting.outbound_bytes.load(.acquire) == 0);
         std.debug.assert(self.accounting.request_bytes.load(.acquire) == 0);
         std.debug.assert(self.accounting.active_handshakes.load(.acquire) == 0);
+        if (self.compression_pool) |*pool| {
+            std.debug.assert(pool.liveCount() == 0);
+        }
         for (self.routes) |route| gpa.free(route.path);
         gpa.free(self.routes);
         gpa.free(self.endpoints);

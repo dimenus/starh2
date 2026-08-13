@@ -80,6 +80,8 @@ const frame = @import("../core/frame.zig");
 const request = @import("../http/request.zig");
 const response = @import("../http/response.zig");
 const router_mod = @import("../http/router.zig");
+const content_coding = @import("../http/content_coding.zig");
+const brotli = @import("../http/brotli.zig");
 const wire_pump = @import("wire_pump.zig");
 const tls_edge = @import("tls.zig");
 const h2c = @import("h2c.zig");
@@ -153,6 +155,8 @@ pub const ConnConfig = struct {
     accounting: ?*GlobalAccounting = null,
     /// Server-wide outbound DATA slabs, borrowed for this connection's lifetime.
     slab_pool: *slab_pool.SlabPool,
+    /// Server-wide brotli encoder pool when response compression is enabled.
+    compression_pool: ?*brotli.Pool = null,
     /// True when accept path reserved a concurrent TLS handshake slot.
     handshake_held: bool = false,
 };
@@ -2279,8 +2283,28 @@ const Connection = struct {
             .flushFn = flushCb,
             .abortFn = abortCb,
         };
+        // Combine repeated Accept-Encoding lines (RFC 9110) into one value.
+        var ae_parts: std.ArrayList([]const u8) = .empty;
+        defer ae_parts.deinit(a);
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) {
+                ae_parts.append(a, h.value) catch {};
+            }
+        }
+        const accept_encoding = if (ae_parts.items.len == 0)
+            ""
+        else
+            content_coding.joinAcceptEncoding(a, ae_parts.items) catch "";
+
         // HandlerCtx: Response.ctx points at job-local ctx with stable terminal pointer.
-        job.hctx = .{ .conn = self, .terminal = undefined, .slot = undefined, .stream_id = d.stream_id };
+        job.hctx = .{
+            .conn = self,
+            .terminal = undefined,
+            .slot = undefined,
+            .stream_id = d.stream_id,
+            .method = job.req.method,
+            .accept_encoding = accept_encoding,
+        };
         job.matched = self.config.router.match(job.req.method, job.req.path);
         switch (job.matched) {
             .found => |f| job.req.path_remainder = f.path_remainder,
@@ -2337,6 +2361,11 @@ const Connection = struct {
         terminal: *response.SlotTerminal,
         slot: *HandlerSlot,
         stream_id: u31,
+        method: request.Method = .GET,
+        /// Combined Accept-Encoding field value (arena-owned), empty if absent.
+        accept_encoding: []const u8 = "",
+        encoder: ?*brotli.Encoder = null,
+        compressing: bool = false,
     };
 
     const HandlerJob = struct {
@@ -2373,6 +2402,13 @@ const Connection = struct {
     fn runHandlerJob(job: *HandlerJob) void {
         const self = job.conn;
         defer {
+            // Encoder contexts are server-wide; release even on cancel/reset so
+            // a stranded SSE cannot pin a pool slot past handler death.
+            if (job.hctx.encoder) |enc| {
+                enc.destroy();
+                job.hctx.encoder = null;
+                job.hctx.compressing = false;
+            }
             const prev = job.slot.completion_owner.cmpxchgStrong(live, reported, .acq_rel, .acquire);
             if (prev == null) {
                 self.completion_ch.putOneUncancelable(self.config.io, job.stream_id) catch {
@@ -2454,11 +2490,178 @@ const Connection = struct {
     /// The `armed` flag releases the ticket slot on any failure that happens
     /// before the wait begins. Once the wait starts the slot belongs to
     /// `TicketTable.wait`, which releases it in its own `defer`.
+    /// Decide whether this response may use brotli, and optionally open an encoder.
+    ///
+    /// Returns the encoder when compression will actually run. When the response
+    /// is compression-eligible by configuration but the pool/init fails, the
+    /// identity fallback is counted and null is returned — still with Vary.
+    fn prepareCompression(
+        self: *Connection,
+        hctx: *HandlerCtx,
+        status: u16,
+        headers: []const request.Header,
+        body_len: ?usize, // null = streaming; Some(n) = full-body path
+        sse: bool,
+    ) struct { compress: bool, add_vary: bool } {
+        if (!self.config.limits.response_compression) return .{ .compress = false, .add_vary = false };
+        if (hctx.method == .HEAD) return .{ .compress = false, .add_vary = false };
+        if (status == 204 or status == 304) return .{ .compress = false, .add_vary = false };
+        // Handler already chose a coding — pass through untouched (I5).
+        if (content_coding.headerHasContentEncoding(request.Header, headers)) return .{ .compress = false, .add_vary = false };
+
+        const ct = if (sse)
+            "text/event-stream"
+        else
+            content_coding.findHeaderValue(request.Header, headers, "content-type") orelse return .{ .compress = false, .add_vary = false };
+        if (!content_coding.isCompressibleContentType(ct)) return .{ .compress = false, .add_vary = false };
+
+        // Eligible by configuration: Vary even if we serve identity.
+        const add_vary = true;
+        if (!content_coding.acceptsBrotli(if (hctx.accept_encoding.len == 0) null else hctx.accept_encoding)) {
+            return .{ .compress = false, .add_vary = add_vary };
+        }
+        if (body_len) |n| {
+            if (n == 0) return .{ .compress = false, .add_vary = add_vary };
+            if (n < self.config.limits.compression_min_bytes) return .{ .compress = false, .add_vary = add_vary };
+        }
+        const pool = self.config.compression_pool orelse {
+            return .{ .compress = false, .add_vary = add_vary };
+        };
+        const enc = pool.tryAcquire() orelse return .{ .compress = false, .add_vary = add_vary };
+        hctx.encoder = enc;
+        hctx.compressing = true;
+        return .{ .compress = true, .add_vary = add_vary };
+    }
+
+    fn appendResponseHeaders(
+        gpa: std.mem.Allocator,
+        hlist: *std.ArrayList(hpack.HeaderField),
+        headers: []const request.Header,
+        opts: struct {
+            sse: bool = false,
+            compress: bool = false,
+            add_vary: bool = false,
+            strip_content_length: bool = false,
+        },
+        /// Optional gpa-owned merged Vary value; caller frees after applyCommand.
+        owned_vary: *?[]u8,
+    ) response.ResponseError!void {
+        if (opts.sse) {
+            hlist.append(gpa, .{ .name = "content-type", .value = "text/event-stream" }) catch return error.OutOfMemory;
+            hlist.append(gpa, .{ .name = "cache-control", .value = "no-cache" }) catch return error.OutOfMemory;
+            hlist.append(gpa, .{ .name = "x-accel-buffering", .value = "no" }) catch return error.OutOfMemory;
+        }
+        var handler_vary: ?[]const u8 = null;
+        for (headers) |h| {
+            if (opts.strip_content_length and std.ascii.eqlIgnoreCase(h.name, "content-length")) continue;
+            if (opts.sse and std.ascii.eqlIgnoreCase(h.name, "content-type")) continue;
+            if (std.ascii.eqlIgnoreCase(h.name, "vary")) {
+                handler_vary = h.value;
+                continue;
+            }
+            hlist.append(gpa, .{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
+        }
+        if (opts.compress) {
+            hlist.append(gpa, .{ .name = "content-encoding", .value = "br" }) catch return error.OutOfMemory;
+        }
+        if (opts.add_vary) {
+            const merged = content_coding.mergeVaryAcceptEncoding(gpa, handler_vary) catch return error.OutOfMemory;
+            owned_vary.* = merged;
+            hlist.append(gpa, .{ .name = "vary", .value = merged }) catch return error.OutOfMemory;
+        } else if (handler_vary) |v| {
+            hlist.append(gpa, .{ .name = "vary", .value = v }) catch return error.OutOfMemory;
+        }
+    }
+
+    fn compressOrAbort(hctx: *HandlerCtx, stream_id: u31, input: []const u8, op: brotli.Operation, out: *std.ArrayList(u8)) response.ResponseError!void {
+        const enc = hctx.encoder orelse return error.WriteFailed;
+        const self = hctx.conn;
+        enc.compress(input, op, out, self.config.gpa) catch {
+            // Budget/encode failure after headers committed: RST, never switch coding.
+            if (hctx.encoder) |e| {
+                e.destroy();
+                hctx.encoder = null;
+                hctx.compressing = false;
+            }
+            self.withSession(struct {
+                fn go(c: *Connection, sid: u31) void {
+                    c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
+                    c.processIntents() catch {};
+                }
+            }.go, stream_id);
+            return error.WriteFailed;
+        };
+    }
+
     fn sendCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
         if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
+
+        const prep = self.prepareCompression(hctx, status, headers, body.len, false);
+        var body_out = body;
+        var compressed_owned: ?[]u8 = null;
+        defer if (compressed_owned) |p| self.config.gpa.free(p);
+
+        if (prep.compress) {
+            const enc = hctx.encoder.?;
+            const compressed = enc.compressAll(body, self.config.gpa) catch {
+                // Still before headers on the wire: fall back to identity.
+                enc.destroy();
+                hctx.encoder = null;
+                hctx.compressing = false;
+                if (self.config.compression_pool) |pool| pool.noteIdentityFallback();
+                // prep.compress treated as false below
+                body_out = body;
+                // rebuild as identity with vary
+                const ticket_pair_fb = self.reserveTicket() catch |err| return err;
+                const ticket_fb = ticket_pair_fb[0];
+                const slot_fb = ticket_pair_fb[1];
+                var armed_fb = true;
+                defer if (armed_fb) self.tickets.releaseReserved(slot_fb);
+                {
+                    try self.lockSession();
+                    defer self.session_mu.unlock(self.config.io);
+                    var hlist: std.ArrayList(hpack.HeaderField) = .empty;
+                    defer hlist.deinit(self.config.gpa);
+                    var owned_vary: ?[]u8 = null;
+                    defer if (owned_vary) |v| self.config.gpa.free(v);
+                    try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
+                        .compress = false,
+                        .add_vary = true,
+                        .strip_content_length = false,
+                    }, &owned_vary);
+                    self.session.applyCommand(.{ .respond_headers = .{
+                        .stream_id = stream_id,
+                        .status = status,
+                        .headers = hlist.items,
+                        .end_stream = body.len == 0,
+                    } }) catch return error.WriteFailed;
+                    if (body.len > 0) {
+                        self.processIntents() catch return error.WriteFailed;
+                        self.enqueuePending(stream_id, body, true, ticket_fb, slot_fb, hctx.terminal) catch |err| return err;
+                        self.processIntents() catch return error.WriteFailed;
+                    } else {
+                        self.next_wire_ticket = ticket_fb;
+                        self.next_wire_slot = slot_fb;
+                        self.processIntents() catch return error.WriteFailed;
+                    }
+                }
+                armed_fb = false;
+                hctx.slot.awaiting_receipt.store(true, .release);
+                defer hctx.slot.awaiting_receipt.store(false, .release);
+                try self.waitTicket(slot_fb, hctx.terminal);
+                return;
+            };
+            compressed_owned = compressed;
+            body_out = compressed;
+            // Full-body path: encoder finished; release before returning.
+            enc.destroy();
+            hctx.encoder = null;
+            hctx.compressing = false;
+        }
+
         const ticket_pair = self.reserveTicket() catch |err| return err;
         const ticket = ticket_pair[0];
         const slot_i = ticket_pair[1];
@@ -2469,16 +2672,22 @@ const Connection = struct {
             defer self.session_mu.unlock(self.config.io);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
-            for (headers) |h| {
-                hlist.append(self.config.gpa, .{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
-            }
+            var owned_vary: ?[]u8 = null;
+            defer if (owned_vary) |v| self.config.gpa.free(v);
+            try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
+                .compress = prep.compress and compressed_owned != null,
+                .add_vary = prep.add_vary,
+                .strip_content_length = prep.compress and compressed_owned != null,
+            }, &owned_vary);
+            // If we recomputed a compressed body, content-length (if any) was stripped;
+            // do not invent a new one — HTTP/2 length is framing.
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
                 .headers = hlist.items,
-                .end_stream = body.len == 0,
+                .end_stream = body_out.len == 0,
             } }) catch return error.WriteFailed;
-            if (body.len > 0) {
+            if (body_out.len > 0) {
                 // Materialize the HEADERS intent onto the wire queue BEFORE any
                 // DATA can drain. enqueuePending unlocks the session while it
                 // waits for stream space, and the actor emits DRR DATA the
@@ -2487,7 +2696,7 @@ const Connection = struct {
                 // which a browser reports as a protocol error and curl waits
                 // out in silence (t-482, the /ui/tasks page).
                 self.processIntents() catch return error.WriteFailed;
-                self.enqueuePending(stream_id, body, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
                 self.processIntents() catch return error.WriteFailed;
             } else {
                 self.next_wire_ticket = ticket;
@@ -2519,7 +2728,15 @@ const Connection = struct {
         const self = hctx.conn;
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
         if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
-        const ticket_pair = self.reserveTicket() catch |err| return err;
+        const prep = self.prepareCompression(hctx, status, headers, null, sse);
+        const ticket_pair = self.reserveTicket() catch |err| {
+            if (hctx.encoder) |enc| {
+                enc.destroy();
+                hctx.encoder = null;
+                hctx.compressing = false;
+            }
+            return err;
+        };
         const ticket = ticket_pair[0];
         const slot_i = ticket_pair[1];
         {
@@ -2528,14 +2745,14 @@ const Connection = struct {
             defer self.session_mu.unlock(self.config.io);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
-            if (sse) {
-                hlist.append(self.config.gpa, .{ .name = "content-type", .value = "text/event-stream" }) catch return error.OutOfMemory;
-                hlist.append(self.config.gpa, .{ .name = "cache-control", .value = "no-cache" }) catch return error.OutOfMemory;
-                hlist.append(self.config.gpa, .{ .name = "x-accel-buffering", .value = "no" }) catch return error.OutOfMemory;
-            }
-            for (headers) |h| {
-                hlist.append(self.config.gpa, .{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
-            }
+            var owned_vary: ?[]u8 = null;
+            defer if (owned_vary) |v| self.config.gpa.free(v);
+            try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
+                .sse = sse,
+                .compress = prep.compress,
+                .add_vary = prep.add_vary,
+                .strip_content_length = true, // streaming never sends content-length
+            }, &owned_vary);
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
@@ -2564,6 +2781,28 @@ const Connection = struct {
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
         if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
         if (!flush and !end and bytes.len == 0) return;
+
+        var wire_bytes = bytes;
+        var owned: ?[]u8 = null;
+        defer if (owned) |p| self.config.gpa.free(p);
+
+        if (hctx.compressing) {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(self.config.gpa);
+            const op: brotli.Operation = if (end) .finish else if (flush) .flush else .process;
+            try compressOrAbort(hctx, stream_id, bytes, op, &out);
+            if (end and hctx.encoder != null) {
+                // finish already done in compress; release encoder
+                hctx.encoder.?.destroy();
+                hctx.encoder = null;
+                hctx.compressing = false;
+            }
+            owned = try out.toOwnedSlice(self.config.gpa);
+            wire_bytes = owned.?;
+            // A flush/end with no compressed output still needs the receipt path.
+            if (!flush and !end and wire_bytes.len == 0) return;
+        }
+
         const need_wait = flush or end;
         var ticket: u64 = 0;
         var slot_i: u32 = 0;
@@ -2576,7 +2815,7 @@ const Connection = struct {
             errdefer if (need_wait) self.tickets.releaseReserved(slot_i);
             try self.lockSession();
             defer self.session_mu.unlock(self.config.io);
-            self.enqueuePending(stream_id, bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
+            self.enqueuePending(stream_id, wire_bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
             self.processIntents() catch return error.WriteFailed;
         }
         if (need_wait) {
@@ -2599,6 +2838,30 @@ const Connection = struct {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
+
+        // Emit brotli flush output before the wire barrier so I4 holds: after
+        // Body.flush returns, a streaming decoder can read every event so far.
+        if (hctx.compressing) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.config.gpa);
+            try compressOrAbort(hctx, stream_id, &.{}, .flush, &out);
+            if (out.items.len > 0) {
+                const ticket_pair = self.reserveTicket() catch |err| return err;
+                const ticket = ticket_pair[0];
+                const slot_i = ticket_pair[1];
+                {
+                    errdefer self.tickets.releaseReserved(slot_i);
+                    try self.lockSession();
+                    defer self.session_mu.unlock(self.config.io);
+                    self.enqueuePending(stream_id, out.items, false, ticket, slot_i, hctx.terminal) catch |err| return err;
+                    self.processIntents() catch return error.WriteFailed;
+                }
+                hctx.slot.awaiting_receipt.store(true, .release);
+                defer hctx.slot.awaiting_receipt.store(false, .release);
+                try self.waitTicket(slot_i, hctx.terminal);
+            }
+        }
+
         const ticket_pair = self.reserveTicket() catch |err| return err;
         const ticket = ticket_pair[0];
         const slot_i = ticket_pair[1];

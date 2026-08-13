@@ -210,10 +210,13 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         break :blk .{ .tls_h2 = addr };
     } else .{ .h2c_prior_knowledge = addr };
 
+    var limits = starh2.Limits.defaults;
+    limits.response_compression = true;
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{ep},
         .routes = &routes,
         .tls = tls_cfg,
+        .limits = limits,
     });
     defer server.deinit(gpa);
 

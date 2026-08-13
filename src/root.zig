@@ -66,6 +66,8 @@ pub const http = struct {
     /// Form-urlencoded decoding for query strings. Generic HTTP: nothing in
     /// here knows about Datastar, and `std` has no form decoder.
     pub const form = @import("http/form.zig");
+    pub const content_coding = @import("http/content_coding.zig");
+    pub const brotli = @import("http/brotli.zig");
 };
 
 
@@ -114,4 +116,6 @@ test {
     _ = http.response;
     _ = http.router;
     _ = http.form;
+    _ = http.content_coding;
+    _ = http.brotli;
 }

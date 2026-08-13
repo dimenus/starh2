@@ -56,6 +56,8 @@ pub const Terms = struct {
     endpoints_listeners: usize = 0,
     /// The server-wide outbound slab pool, counted once.
     outbound_slabs: usize = 0,
+    /// Concurrent brotli contexts × per-context budget, counted once server-wide.
+    compression_contexts: usize = 0,
     tasks: usize = 0,
 };
 
@@ -68,6 +70,19 @@ pub const WIRE_CHUNK_SIZE = wire_const.WIRE_CHUNK_SIZE;
 pub const TLS_PLAINTEXT_SCRATCH_SIZE = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
 pub const TERMINAL_CONTROL_RESERVE_BYTES: usize = 4 * 1024;
 pub const TERMINAL_CONTROL_RESERVE_ENTRIES: usize = 16;
+
+/// Lower bound on `compression_context_bytes` for a quality/window pair.
+/// Derived from measured libbrotli peaks (ring ≈ 2^lgwin, plus quality-scaled
+/// hash tables and multi-flush residency). Kept in limits so boot validation
+/// and the encoder wrapper share one floor.
+pub fn minBrotliContextBytes(window_bits: u8, quality: u8) usize {
+    const window_bytes: usize = @as(usize, 1) << @intCast(window_bits);
+    // 4× window covers ring + copy + headroom; quality adds hasher tables;
+    // 1 MiB fixed slack covers streaming flush residency beyond the one-shot
+    // estimate (multi-flush q5/w19 measured ~2.2 MiB vs ~1 MiB base).
+    const q: usize = quality;
+    return window_bytes * 4 + q * 128 * 1024 + 1024 * 1024;
+}
 
 pub const Limits = struct {
     max_endpoints: usize = 8,
@@ -116,6 +131,29 @@ pub const Limits = struct {
     outbound_slabs_per_server: usize = 4_096,
     /// Intent backlog entries per connection (session).
     intent_entries_per_connection: usize = 512,
+    /// Concurrent live brotli encoder contexts server-wide. Each context is
+    /// rented for the lifetime of one compressed response (including an SSE
+    /// stream) and returned when that response finishes or aborts.
+    compression_contexts_per_server: usize = 128,
+    /// Per-encoder allocation budget routed through brotli's custom allocator
+    /// hooks. Exhaustion before headers commit → identity; after commit → RST.
+    ///
+    /// Default is 4 MiB, not the brief's 2 MiB sketch: measured peak for
+    /// quality 5 / window 19 is ~3.1 MiB on a 64 KiB one-shot and ~2.2 MiB on
+    /// multi-flush SSE. libbrotli can spin forever when a custom alloc returns
+    /// NULL mid-stream, so the budget must cover peak rather than relying on
+    /// OOM as a failure path. Boot rejects a budget below `minBrotliContextBytes`.
+    compression_context_bytes: usize = 4 * 1024 * 1024,
+    /// Full-body path only: bodies shorter than this stay identity.
+    compression_min_bytes: usize = 256,
+    /// Brotli quality 0–11. Rejected at boot if out of range.
+    compression_quality: u8 = 5,
+    /// Brotli lgwin 10–24. Rejected at boot if out of range or if the window
+    /// cannot fit inside `compression_context_bytes`.
+    compression_window_bits: u8 = 19,
+    /// Master switch. Default off so a consumer that never asked for compression
+    /// does not pay for encoder contexts or Vary surface area.
+    response_compression: bool = false,
     preface_timeout_ns: u64 = 5 * std.time.ns_per_s,
     field_block_timeout_ns: u64 = 5 * std.time.ns_per_s,
     request_body_idle_timeout_ns: u64 = 15 * std.time.ns_per_s,
@@ -171,6 +209,15 @@ pub const Limits = struct {
         // connection released, which nothing on this connection can wake.
         // Rung 4 — the dangerous configuration cannot be expressed.
         if (self.outbound_slabs_per_server < self.max_streams_per_server) return error.InvalidConfig;
+        if (self.compression_quality > 11) return error.InvalidConfig;
+        if (self.compression_window_bits < 10 or self.compression_window_bits > 24) return error.InvalidConfig;
+        // Reject budgets that cannot cover measured peak for this quality/window.
+        // A too-small budget does not fail closed under libbrotli — it can hang
+        // inside CompressStream when the custom alloc returns NULL.
+        if (self.compression_context_bytes < minBrotliContextBytes(self.compression_window_bits, self.compression_quality)) {
+            return error.InvalidConfig;
+        }
+        if (self.response_compression and self.compression_contexts_per_server == 0) return error.InvalidConfig;
 
         // Rung-4 enforcement: these sizes are load-bearing inputs to the bound,
         // so a struct that gains a field must break the BUILD and not the
@@ -238,8 +285,12 @@ pub const Limits = struct {
         // Global on-demand ceilings counted once (admission counters + payload pools).
         const slab_bytes = bound.pendingSlabBytes(self.outbound_slabs_per_server, self.outbound_bytes_per_stream) catch return error.InvalidConfig;
         terms.outbound_slabs = slab_bytes;
+        terms.compression_contexts = try checkedMul(self.compression_contexts_per_server, self.compression_context_bytes);
         terms.on_demand_server = try checkedAdd(slab_bytes, try checkedAdd(self.outbound_bytes_per_server, self.request_bytes_per_server));
-        const allocator_bytes = try checkedAdd(server_static, try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, terms.on_demand_server)));
+        const allocator_bytes = try checkedAdd(
+            server_static,
+            try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, try checkedAdd(terms.on_demand_server, terms.compression_contexts))),
+        );
 
         // Maximum std.Io task topology: accept loops + per-connection
         // actor/read/write/ack and three Select wait branches + handlers + reapers.
@@ -325,4 +376,45 @@ test "mutation canary: dropping handlers term shrinks bound" {
     const b2 = try tiny.resourceUpperBound();
     try std.testing.expect(b.terms.handlers > b2.terms.handlers);
     try std.testing.expect(b.allocator_bytes > b2.allocator_bytes);
+}
+
+test "mutation canary: compression_contexts term moves with the limit" {
+    const base = try Limits.defaults.resourceUpperBound();
+    try std.testing.expect(base.terms.compression_contexts > 0);
+    var more = Limits.defaults;
+    more.compression_contexts_per_server = Limits.defaults.compression_contexts_per_server * 2;
+    const bigger = try more.resourceUpperBound();
+    try std.testing.expect(bigger.terms.compression_contexts > base.terms.compression_contexts);
+    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+    var less = Limits.defaults;
+    // Stay above minBrotliContextBytes(default window, default quality) (~3.6 MiB).
+    less.compression_context_bytes = Limits.defaults.compression_context_bytes - 64 * 1024;
+    const smaller = try less.resourceUpperBound();
+    try std.testing.expect(smaller.terms.compression_contexts < base.terms.compression_contexts);
+}
+
+test "rejects compression quality/window out of range" {
+    var lim = Limits.defaults;
+    lim.compression_quality = 12;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim = Limits.defaults;
+    lim.compression_window_bits = 9;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim = Limits.defaults;
+    lim.compression_window_bits = 25;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
+test "rejects window larger than compression context budget" {
+    var lim = Limits.defaults;
+    lim.compression_window_bits = 22; // 4 MiB window
+    lim.compression_context_bytes = 1 * 1024 * 1024;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
+test "rejects response_compression with zero contexts" {
+    var lim = Limits.defaults;
+    lim.response_compression = true;
+    lim.compression_contexts_per_server = 0;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }

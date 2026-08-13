@@ -8,6 +8,120 @@ comptime {
     }
 }
 
+const brotli_common_sources = [_][]const u8{
+    "common/constants.c",
+    "common/context.c",
+    "common/dictionary.c",
+    "common/platform.c",
+    "common/shared_dictionary.c",
+    "common/transform.c",
+};
+
+const brotli_enc_sources = [_][]const u8{
+    "enc/backward_references.c",
+    "enc/backward_references_hq.c",
+    "enc/bit_cost.c",
+    "enc/block_splitter.c",
+    "enc/brotli_bit_stream.c",
+    "enc/cluster.c",
+    "enc/command.c",
+    "enc/compound_dictionary.c",
+    "enc/compress_fragment.c",
+    "enc/compress_fragment_two_pass.c",
+    "enc/dictionary_hash.c",
+    "enc/encode.c",
+    "enc/encoder_dict.c",
+    "enc/entropy_encode.c",
+    "enc/fast_log.c",
+    "enc/histogram.c",
+    "enc/literal_cost.c",
+    "enc/memory.c",
+    "enc/metablock.c",
+    "enc/static_dict.c",
+    "enc/utf8_util.c",
+};
+
+const brotli_dec_sources = [_][]const u8{
+    "dec/bit_reader.c",
+    "dec/decode.c",
+    "dec/huffman.c",
+    "dec/state.c",
+};
+
+fn brotliFlags(target: std.Build.ResolvedTarget) []const []const u8 {
+    return switch (target.result.os.tag) {
+        .macos => &[_][]const u8{ "-std=c99", "-O2", "-DOS_MACOSX" },
+        .linux => &[_][]const u8{ "-std=c99", "-O2", "-DOS_LINUX" },
+        else => &[_][]const u8{ "-std=c99", "-O2" },
+    };
+}
+
+/// Brotli is linked as a static library rather than `addCSourceFiles` on the
+/// starh2 module. Fuzz rebuilds (`-ffuzz`) instrument every C source on the
+/// module and then fail to resolve `___sanitizer_cov_*` from libbrotli's
+/// object files; a prebuilt static lib is not re-instrumented.
+fn brotliEncLib(
+    b: *std.Build,
+    brotli: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    name: []const u8,
+) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addIncludePath(brotli.path("c/include"));
+    mod.addCSourceFiles(.{
+        .root = brotli.path("c"),
+        .files = &(brotli_common_sources ++ brotli_enc_sources),
+        .flags = brotliFlags(target),
+    });
+    return b.addLibrary(.{
+        .name = name,
+        .linkage = .static,
+        .root_module = mod,
+    });
+}
+
+fn brotliDecLib(
+    b: *std.Build,
+    brotli: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    name: []const u8,
+) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addIncludePath(brotli.path("c/include"));
+    mod.addCSourceFiles(.{
+        .root = brotli.path("c"),
+        .files = &brotli_dec_sources,
+        .flags = brotliFlags(target),
+    });
+    return b.addLibrary(.{
+        .name = name,
+        .linkage = .static,
+        .root_module = mod,
+    });
+}
+
+fn linkBrotliEnc(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *std.Build.Step.Compile) void {
+    mod.addIncludePath(brotli.path("c/include"));
+    mod.link_libc = true;
+    mod.linkLibrary(lib);
+}
+
+fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *std.Build.Step.Compile) void {
+    mod.addIncludePath(brotli.path("c/include"));
+    mod.link_libc = true;
+    mod.linkLibrary(lib);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -27,16 +141,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const brotli_dep = b.dependency("brotli", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const starh2_mod = b.addModule("starh2", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "tls", .module = tls_dep.module("tls") },
         },
     });
-
+    // Encoder only on the production module (static lib — see brotliEncLib).
+    // Decoder is linked only into test artifacts that round-trip.
+    const brotli_enc = brotliEncLib(b, brotli_dep, target, optimize, "brotli_enc");
+    const brotli_dec = brotliDecLib(b, brotli_dep, target, optimize, "brotli_dec");
+    linkBrotliEnc(starh2_mod, brotli_dep, brotli_enc);
     // The Datastar signal convention: which query parameter carries signals and
     // how they are bounded. It needs NO Datastar SDK — reading signals is
     // form-decoding plus std.json — so nothing starh2 ships depends on the SDK.
@@ -61,8 +184,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Separate root module so decoder C sources stay off the production starh2_mod.
+    // `addTest(.{ .root_module = starh2_mod })` plus addBrotliDec would mutate
+    // the shared module and double-link decoder into every test that also calls
+    // addBrotliDec (compression tests).
+    const lib_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "tls", .module = tls_dep.module("tls") },
+        },
+    });
+    linkBrotliEnc(lib_test_mod, brotli_dep, brotli_enc);
+    linkBrotliDec(lib_test_mod, brotli_dep, brotli_dec);
     const lib_tests = b.addTest(.{
-        .root_module = starh2_mod,
+        .root_module = lib_test_mod,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
@@ -139,6 +277,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_regression_tests = b.addRunArtifact(regression_tests);
+
+    const compression_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/compression.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    linkBrotliDec(compression_tests.root_module, brotli_dep, brotli_dec);
+    const run_compression_tests = b.addRunArtifact(compression_tests);
 
     const lifecycle_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -222,6 +376,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_live_exact_tests.step);
     test_step.dependOn(&run_writer_tests.step);
     test_step.dependOn(&run_scheduler_tests.step);
+    test_step.dependOn(&run_compression_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");
     test_exact_step.dependOn(&run_live_exact_tests.step);
@@ -293,14 +448,18 @@ pub fn build(b: *std.Build) void {
         const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .ReleaseSafe });
         const datastar_rt = b.lazyDependency("datastar", .{ .target = rt, .optimize = .ReleaseSafe });
         const tls_rt = b.dependency("tls", .{ .target = rt, .optimize = .ReleaseSafe });
+        const brotli_rt = b.dependency("brotli", .{ .target = rt, .optimize = .ReleaseSafe });
         const starh2_rt = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = rt,
             .optimize = .ReleaseSafe,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "tls", .module = tls_rt.module("tls") },
             },
         });
+        const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .ReleaseSafe, b.fmt("brotli_enc_{s}", .{rq.name}));
+        linkBrotliEnc(starh2_rt, brotli_rt, brotli_enc_rt);
         const datastar_mod_rt = b.createModule(.{
             .root_source_file = b.path("src/datastar.zig"),
             .target = rt,

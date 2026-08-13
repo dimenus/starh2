@@ -10,10 +10,13 @@ const dummy: u8 = 0;
 
 fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    var limits = starh2.Limits.defaults;
+    limits.response_compression = true;
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
         .routes = &.{.{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } }},
         .tls = null,
+        .limits = limits,
     });
     defer server.deinit(gpa);
     try server.serve(gpa);

@@ -30,13 +30,26 @@ pub fn appendHeaders(
     path: []const u8,
     end_stream: bool,
 ) !void {
-    const fields = [_]hpack.HeaderField{
-        .{ .name = ":method", .value = "GET" },
-        .{ .name = ":scheme", .value = "http" },
-        .{ .name = ":path", .value = path },
-        .{ .name = ":authority", .value = "localhost" },
-    };
-    const block = try hpack.Encoder.encode(gpa, &fields);
+    try appendHeadersExtra(gpa, wire, stream_id, "GET", path, end_stream, &.{});
+}
+
+pub fn appendHeadersExtra(
+    gpa: std.mem.Allocator,
+    wire: *std.ArrayList(u8),
+    stream_id: u31,
+    method: []const u8,
+    path: []const u8,
+    end_stream: bool,
+    extra: []const hpack.HeaderField,
+) !void {
+    var fields: std.ArrayList(hpack.HeaderField) = .empty;
+    defer fields.deinit(gpa);
+    try fields.append(gpa, .{ .name = ":method", .value = method });
+    try fields.append(gpa, .{ .name = ":scheme", .value = "http" });
+    try fields.append(gpa, .{ .name = ":path", .value = path });
+    try fields.append(gpa, .{ .name = ":authority", .value = "localhost" });
+    for (extra) |f| try fields.append(gpa, f);
+    const block = try hpack.Encoder.encode(gpa, fields.items);
     defer gpa.free(block);
     var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
     const fh = frame.FrameHeader{
@@ -48,6 +61,17 @@ pub fn appendHeaders(
     fh.encode(&hdr_buf);
     try wire.appendSlice(gpa, &hdr_buf);
     try wire.appendSlice(gpa, block);
+}
+
+pub fn buildClientHelloExtra(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    extra: []const hpack.HeaderField,
+) ![]u8 {
+    var wire = try buildClientPrefaceAndSettings(gpa);
+    errdefer wire.deinit(gpa);
+    try appendHeadersExtra(gpa, &wire, 1, "GET", path, true, extra);
+    return try wire.toOwnedSlice(gpa);
 }
 
 pub fn buildClientPrefaceAndSettings(gpa: std.mem.Allocator) !std.ArrayList(u8) {
