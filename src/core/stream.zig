@@ -1,3 +1,16 @@
+//! Per-stream state machine (RFC 9113 section 5.1).
+//!
+//! `Session` owns one `Stream` per live peer stream and calls the `on*`
+//! transitions as frames arrive. Each transition either advances the state or
+//! returns the error that names the frame's fault, and `toErrorCode` maps that
+//! error to the wire code. `Session` decides whether the fault costs the stream
+//! (RST_STREAM) or the connection (GOAWAY), because only `Session` knows the
+//! connection-wide context.
+//!
+//! The `reserved_local` and `reserved_remote` states exist for server push.
+//! This stack never sends PUSH_PROMISE, so nothing reaches them. They stay in
+//! the enum so that the state names match the RFC that a reader compares
+//! against.
 const std = @import("std");
 const frame = @import("frame.zig");
 const flow = @import("flow.zig");
@@ -37,6 +50,10 @@ pub const Stream = struct {
     /// Concurrent active_streams credit already released for this stream.
     concurrency_released: bool = false,
 
+    /// The first HEADERS opens the stream. A later HEADERS is a trailer block,
+    /// and a trailer block must carry END_STREAM, because nothing may follow
+    /// it. A second header block without END_STREAM is therefore a protocol
+    /// error and not a second request.
     pub fn onHeaders(self: *Stream, end_stream: bool) StreamError!void {
         switch (self.state) {
             .idle => {
@@ -54,6 +71,10 @@ pub const Stream = struct {
         }
     }
 
+    /// A declared `content-length` becomes an enforced promise here. The check
+    /// runs in both directions: too many bytes fail at once, and too few fail
+    /// at END_STREAM. A handler that trusts `content-length` must never see a
+    /// body that disagrees with it.
     pub fn onData(self: *Stream, len: usize, end_stream: bool) StreamError!void {
         switch (self.state) {
             .open, .half_closed_local => {},

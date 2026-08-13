@@ -1,4 +1,14 @@
 //! Small nonblocking helpers over bounded `std.Io.Queue`.
+//!
+//! The actor must poll several queues without committing to any of them: if it
+//! blocked on one, it could not notice work waiting on another. These wrappers
+//! give a zero-timeout attempt with an option result.
+//!
+//! The helpers are UNCANCELABLE by design. They are used on teardown paths that
+//! must drain a queue in full, and a cancellation there would abandon queued
+//! items that own memory or hold accounting. A closed queue is reported as
+//! "nothing available" rather than as an error, because to a poller the two are
+//! the same fact.
 const std = @import("std");
 
 pub fn tryGet(comptime T: type, queue: *std.Io.Queue(T), io: std.Io) ?T {

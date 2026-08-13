@@ -1,3 +1,19 @@
+//! Request field validation — the HTTP/2 half of RFC 9113 section 8.3.
+//!
+//! Every decoded header block passes through here before a handler exists. The
+//! purpose is request smuggling, not tidiness. HTTP/2 and HTTP/1.1 disagree on
+//! what a message is, and a proxy chain usually runs both. A field that this
+//! server accepts and a downstream HTTP/1.1 hop re-reads differently becomes
+//! two requests where the operator counted one. So the rules below reject
+//! rather than repair: no case folding, no whitespace trim, no
+//! `transfer-encoding` translation.
+//!
+//! `validateRequestFields` is called twice for one request, and that is
+//! deliberate. `finishHeaderBlock` calls it to decide admission, and
+//! `maybeDispatch` calls it again on the stored fields just before it hands
+//! ownership to a handler. The function is pure, so the second call costs only
+//! time and proves that the fields a handler receives are the fields that
+//! passed.
 const std = @import("std");
 const hpack = @import("hpack.zig");
 
@@ -17,6 +33,11 @@ pub const ParsedRequest = struct {
     content_length: ?u64,
 };
 
+/// HTTP/2 has no connection-specific header fields. The connection itself
+/// carries what these once expressed, so their presence means the peer speaks
+/// HTTP/1.1 semantics into an HTTP/2 frame. `transfer-encoding` is the
+/// dangerous member: a downstream HTTP/1.1 hop would use it to re-frame the
+/// body and would then disagree with this server about where the request ends.
 const connection_specific = [_][]const u8{
     "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade",
 };
@@ -32,6 +53,11 @@ fn isLowerToken(s: []const u8) bool {
     return true;
 }
 
+/// A CR, an LF, or a NUL inside a field value is the request-smuggling
+/// primitive: a downstream HTTP/1.1 hop reads the same bytes as a field
+/// terminator and gains a field the operator never wrote. Leading and trailing
+/// whitespace is refused for the same reason, because a hop that trims and a
+/// hop that does not will read two different values.
 fn valueOk(v: []const u8) bool {
     if (v.len == 0) return true;
     if (v[0] == ' ' or v[0] == '\t') return false;
@@ -55,6 +81,9 @@ pub fn validateRequestFields(fields: []const hpack.HeaderField) ValidateError!st
     var authority: []const u8 = "";
     var path: ?[]const u8 = null;
     var content_length: ?u64 = null;
+    // Pseudo-header fields must all precede the regular fields, so one flag in
+    // source order is enough to enforce it. A pseudo-header after a regular one
+    // is a protocol error and not a late field.
     var seen_regular = false;
 
     for (fields) |f| {

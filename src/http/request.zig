@@ -1,5 +1,20 @@
+//! The handler-facing request.
+//!
+//! Every slice here points into the request's own arena, which the connection
+//! destroys after the handler returns. Nothing borrows from session memory or
+//! from a wire chunk, so a handler cannot hold a pointer that the actor may
+//! free or recycle underneath it. The cost is one copy per request; the gain is
+//! that handler lifetime questions do not exist.
+//!
+//! The fields are already validated. `core.fields` rejected a malformed or
+//! smuggling-shaped field block before this struct was built, so a handler
+//! reads them without re-checking.
 const std = @import("std");
 
+/// A closed set with an `other` member, and not a string. A handler switches on
+/// the method, and the router compares it as an integer. An unknown method
+/// reaches `other` rather than an error, because rejection belongs to the
+/// router's 405 answer and not to the parser.
 pub const Method = enum {
     GET,
     POST,

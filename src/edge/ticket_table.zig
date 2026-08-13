@@ -1,6 +1,37 @@
 //! Ticket wait table owned exclusively by AckDrainer for completion posts.
 //! Handlers reserve a slot (CAS), wait on its semaphore, then clear the slot.
 //! No other task mutates slots except reserve (handler) and complete/failAll (AckDrainer).
+//!
+//! # What a ticket is for
+//!
+//! A handler needs to know that its bytes REACHED THE WIRE, not merely that
+//! they were queued. Streaming needs it for backpressure, and `resp.send` needs
+//! it to return an honest result. The write happens on another task, so a
+//! ticket is the rendezvous between the handler that waits and the AckDrainer
+//! that learns the outcome.
+//!
+//! # Lifecycle
+//!
+//! 1. `reserve` — the HANDLER claims a slot by CAS and gets a unique id.
+//! 2. The id rides on a `WireChunk`, or on a pending scheduler entry.
+//! 3. The WritePump writes, then posts a `WriteCompletion` carrying the id.
+//! 4. `complete` — the ACK DRAINER sets `ok` and signals the event.
+//! 5. `wait` — the handler wakes, reads the result, and frees the slot.
+//!
+//! The slot index accompanies the id everywhere, so a completion is an O(1)
+//! index rather than a scan. The id is still compared, because the slot may
+//! already have been reused by another handler; a stale completion must be
+//! ignored, not applied to the new owner.
+//!
+//! # The two races this table exists to survive
+//!
+//! `reserve` re-checks `write_failed` THREE times: before the claim, after the
+//! claim, and after the id is published. `failAll` walks the slots once, so it
+//! can pass a slot that is claimed a moment later. Without the re-checks that
+//! handler waits for a completion nobody will ever post.
+//!
+//! `wait` checks `ok` BEFORE the terminal cause, and that order is the whole
+//! point of `wait`'s doc comment below.
 const std = @import("std");
 const response = @import("../http/response.zig");
 
@@ -83,6 +114,9 @@ pub const TicketTable = struct {
         slot.in_use.store(false, .release);
     }
 
+    /// AckDrainer-only. Both guards reject a STALE completion for a slot that
+    /// has already been released and reused: a completion applied to the new
+    /// owner would wake a handler whose write is still in flight.
     pub fn complete(self: *TicketTable, slot_i: u32, ticket: u64, ok: bool) void {
         if (slot_i >= self.slots.len) return;
         const slot = &self.slots[slot_i];
@@ -97,6 +131,12 @@ pub const TicketTable = struct {
         self.complete(slot_i, ticket, ok);
     }
 
+    /// The transport died. Wake every waiter and refuse every future reserve.
+    ///
+    /// The flag is stored BEFORE the sweep. In the other order, a handler could
+    /// pass its pre-claim check, claim a slot the sweep had already walked past,
+    /// and then wait forever. With the flag first, that handler's post-claim
+    /// re-check sees it and returns `error.WriteFailed`.
     pub fn failAll(self: *TicketTable) void {
         self.write_failed.store(true, .release);
         for (self.slots) |*slot| {

@@ -1,6 +1,27 @@
 //! Sole owners of the raw std.Io stream Reader and Writer directions.
 //! Pumps never mutate Connection state — they only exchange WireChunk / WriteCompletion
 //! messages carrying integer tickets and release amounts.
+//!
+//! Why the pumps exist as separate tasks: a socket read and a socket write both
+//! block. If the actor performed either one, a peer that stops reading would
+//! stop the actor, and the actor is what must notice that fact and react. So
+//! the blocking calls live in tasks that own nothing else, and the actor only
+//! ever exchanges messages with them.
+//!
+//! Why they hold no pointer into `Connection`: message passing is what removes
+//! the need for a lock on this path. A `WireChunk` carries integers and one
+//! slice, so a pump can be canceled at any point without leaving shared state
+//! half-written. Every consequence of a write — released bytes, a completed
+//! ticket, a control-pool entry — travels back as data in a `WriteCompletion`
+//! and is applied by the AckDrainer.
+//!
+//! ## The WritePump exit contract
+//!
+//! Every queued chunk gets exactly one outcome on every exit path: an ok ack, a
+//! failed ack, or a `fail_all`. Nothing is ever dropped silently. That contract
+//! is what lets a handler wait on a ticket with no timeout, and it is why
+//! teardown may leave a waiting handler alone instead of canceling it. If a
+//! future change adds an exit path that skips `failDrain`, handlers will hang.
 const std = @import("std");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
@@ -35,6 +56,22 @@ pub const WireChunk = struct {
     pool_index: ?u32 = null,
 };
 
+/// Reads the socket into pooled chunks and hands them to the actor.
+///
+/// The chunk pool inverts the usual flow-control problem. The pump must LEASE a
+/// free index before it reads, so when the actor falls behind, the free queue
+/// empties and the pump simply blocks. The kernel receive buffer then fills and
+/// TCP applies backpressure to the peer. No allocation and no unbounded queue
+/// exist anywhere on this path.
+///
+/// Ownership of an index moves: free queue -> pump -> actor -> free queue. The
+/// actor returns it in a `defer` immediately after it consumes the bytes. An
+/// index that is not returned is a permanent loss of read capacity, and enough
+/// of them stall the connection.
+///
+/// End of stream is reported as a zero-length chunk rather than by closing the
+/// queue, so the actor sees it in the same place as every other read and can
+/// finish its normal teardown.
 pub const ReadPump = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -144,6 +181,13 @@ pub const WritePump = struct {
         }
     }
 
+    /// The transport is dead. Every chunk still queued must be freed and its
+    /// ticket failed, or the handlers waiting on those tickets never wake.
+    ///
+    /// The drain stops early if it meets the shutdown sentinel, because nothing
+    /// after it was queued by a live writer. `fail_all` is posted in both exits,
+    /// so `TicketTable.failAll` also catches tickets that were reserved but not
+    /// yet attached to any chunk.
     fn failDrain(self: *WritePump) void {
         // Transport failed: every remaining queued chunk must free + fail its ticket.
         while (io_queue.tryGet(WireChunk, self.from_actor, self.io)) |chunk| {
@@ -156,6 +200,16 @@ pub const WritePump = struct {
         self.post(.{ .fail_all = true });
     }
 
+    /// Write chunks in FIFO order, one at a time.
+    ///
+    /// Serial writes are what make a flush barrier meaningful: a completion for
+    /// chunk N proves that chunks 1..N-1 were written first. Frame ORDER is
+    /// decided upstream by the `FairScheduler`; this task only preserves it.
+    ///
+    /// Two zero-length chunks mean different things, and the flag tells them
+    /// apart. With `flush_barrier` it is a flush that had no bytes of its own,
+    /// and it completes successfully because everything before it was written.
+    /// Without it, it is the shutdown sentinel.
     pub fn run(self: *WritePump) void {
         var writer = self.stream.writer(self.io, &.{});
         while (!self.stopped.load(.acquire)) {

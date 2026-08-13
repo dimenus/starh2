@@ -1,4 +1,15 @@
 //! Bounded HTTP/2 frame header/payload parsing and serialization (RFC 9113).
+//!
+//! This module is the lowest layer of the inbound flow:
+//! socket bytes -> `Parser` -> `FrameEvent` -> `core.session` -> `Intent`.
+//! It knows the wire format only. It applies no protocol semantics, keeps no
+//! stream state, and reads no clock. `core.session` owns all of that. The split
+//! exists so that a malformed frame becomes a typed `ParseError` at one place,
+//! and so that the parser stays testable without a socket.
+//!
+//! The parser never borrows from its input. The read pump owns the wire chunk
+//! and recycles it immediately after the actor consumes it, so a `FrameEvent`
+//! that pointed into that chunk would dangle on the next read.
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -38,6 +49,10 @@ pub const ErrorCode = enum(u32) {
     _,
 };
 
+/// The flag byte is positional, and one bit carries two meanings. Bit 0 is
+/// END_STREAM on DATA and HEADERS, and it is ACK on SETTINGS and PING. The
+/// struct keeps the single bit and gives it two readers (`end_stream` and
+/// `ack`), because a second field would let the two names disagree.
 pub const FrameFlags = packed struct(u8) {
     end_stream: bool = false, // bit 0 / ACK for SETTINGS/PING
     unused1: bool = false,
@@ -99,6 +114,18 @@ pub const FrameEvent = struct {
     payload: []u8,
 };
 
+/// Incremental frame parser. A TCP read gives an arbitrary byte count, so a
+/// frame header, a payload, or both can arrive in pieces across many chunks.
+/// The parser holds that partial state between calls and only reports a frame
+/// when it is complete.
+///
+/// Two payload strategies exist, and the choice decides who allocates:
+/// - `initReserved` (production) reserves one max-size scratch buffer at
+///   connection boot. Each completed frame gets a right-sized dupe. The hot
+///   path therefore never grows a buffer, which is what keeps the connection
+///   inside `Limits.resourceUpperBound`.
+/// - `init` (tests) allocates per frame. It is simpler to reason about, and a
+///   test does not need the boot-time bound.
 pub const Parser = struct {
     max_frame_size: u32 = DEFAULT_MAX_FRAME_SIZE,
     header_buf: [FRAME_HEADER_LEN]u8 = undefined,
@@ -146,6 +173,10 @@ pub const Parser = struct {
         self.preface_remaining = 0;
     }
 
+    /// A frame larger than the scratch buffer is a FRAME_SIZE_ERROR, not an
+    /// allocation. The peer agreed to `max_frame_size` in SETTINGS, so a bigger
+    /// frame is a peer fault. An allocation here would let a peer choose the
+    /// server's memory use.
     fn preparePayloadBuf(self: *Parser, length: u32) ParseError!void {
         self.payload_filled = 0;
         if (length == 0) {
@@ -424,6 +455,12 @@ pub const Setting = struct {
     value: u32,
 };
 
+/// The server sends these SETTINGS as the first frame of every connection.
+/// `enable_push = 0` is load-bearing: this stack never implements PUSH_PROMISE,
+/// so it refuses the capability at the handshake instead of at frame receipt.
+/// The other values match the profile that the rest of the stack is sized for.
+/// `max_concurrent_streams` mirrors `Limits.max_streams_per_connection`, and
+/// `max_frame_size` mirrors the parser's boot-reserved scratch buffer.
 pub const serverPrefaceSettings = [_]Setting{
     .{ .id = .header_table_size, .value = 4096 },
     .{ .id = .enable_push, .value = 0 },

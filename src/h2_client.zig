@@ -1,5 +1,15 @@
 //! Shared HTTP/2 client frame builders for tests and dependent packages.
 //! Zig 0.16 std.http.Client is HTTP/1.1-only; these are the h2 client bytes.
+//!
+//! A test needs a client that sends EXACTLY the bytes it means to send,
+//! including the malformed and adversarial ones a real client would never
+//! produce. So these helpers build wire bytes and hold no connection state.
+//! A test drives the socket itself.
+//!
+//! This is exported rather than kept in `tests/`, because a dependent package
+//! has the same need and would otherwise reimplement it — and a second copy of
+//! a frame builder is a second place for the two to disagree about what a
+//! correct request looks like.
 const std = @import("std");
 const starh2 = @import("starh2");
 

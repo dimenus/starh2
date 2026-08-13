@@ -1,8 +1,28 @@
 //! Ordinary vs terminal/ack control-frame occupancy + CONTROL_BEFORE_DATA fairness.
 //! Connection actor owns one pool; write completion releases held entries/bytes.
+//!
+//! Control frames are bounded because a peer generates them. A flood of PING or
+//! SETTINGS produces a matching flood of acks, so an unbounded control queue is
+//! a memory target that costs the peer almost nothing.
+//!
+//! The pool is split rather than merely capped. Ordinary controls may use only
+//! `max - reserve`; terminal frames may use the whole pool. The reserved slice
+//! is what guarantees a connection can always emit the GOAWAY or RST_STREAM
+//! that ENDS the flood. Without it, the frame that stops the attack is the one
+//! frame the attack has already made impossible.
+//!
+//! Occupancy is held from the moment a frame is queued until its write
+//! completes, and not merely until it is emitted. Bytes waiting in the write
+//! queue are real memory, so releasing them at emit time would report capacity
+//! the connection does not have.
 const std = @import("std");
 const limits_mod = @import("../core/limits.zig");
 
+/// The starvation bound. Controls drain before DATA, so a peer that keeps a
+/// control frame always available would otherwise stop every response body on
+/// the connection while every individual frame is answered correctly. After
+/// this many controls the scheduler forces one DATA quantum, which converts
+/// unbounded starvation into a bounded delay.
 pub const CONTROL_BEFORE_DATA: usize = 64;
 pub const TERMINAL_CONTROL_RESERVE_BYTES = limits_mod.TERMINAL_CONTROL_RESERVE_BYTES;
 pub const TERMINAL_CONTROL_RESERVE_ENTRIES = limits_mod.TERMINAL_CONTROL_RESERVE_ENTRIES;
@@ -78,13 +98,6 @@ pub const ControlPool = struct {
         return self.controls_since_data >= CONTROL_BEFORE_DATA;
     }
 
-    /// Deterministic fairness: 10k nonterminal controls with DATA always eligible
-    /// must force a DATA quantum at most every CONTROL_BEFORE_DATA controls.
-    pub fn simulateFairnessGaps(controls: usize) []usize {
-        // Caller owns result via testing allocator path — use stack for unit test helper.
-        _ = controls;
-        return &.{};
-    }
 };
 
 test "ordinary pool leaves terminal reserve" {
@@ -103,6 +116,11 @@ test "ordinary pool leaves terminal reserve" {
     try std.testing.expectEqual(caps.entries + 1, pool.entries_held.load(.acquire));
 }
 
+// The fairness gate. It replaced a `simulateFairnessGaps` helper that ignored
+// its argument and returned an empty slice — a checker that reports "clean"
+// while measuring nothing. This test drives the real counters instead, and
+// asserts both directions: DATA is forced often enough, and no gap ever
+// exceeds the bound.
 test "10k nonterminal controls force DATA at <=64 gaps" {
     var pool = ControlPool.init(64 * 1024, 256);
     var max_gap: usize = 0;

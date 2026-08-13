@@ -1,3 +1,19 @@
+//! Route table lookup. A linear scan on purpose: the table is bounded by
+//! `Limits.max_routes`, it is built once at server start, and it is read by
+//! every request without a lock. A tree or a map would add build-time state and
+//! an allocation to save a scan over a list that is typically tens of entries.
+//!
+//! # Match order, and why it is this way
+//!
+//! 1. EXACT paths, always first. Adding a prefix route must never change what
+//!    an existing exact route answers.
+//! 2. PREFIX paths, longest wins. Where `/v1/tasks/` and `/v1/tasks/special/`
+//!    both match, the more specific one is the one the author meant.
+//!
+//! The 404-versus-405 distinction is kept at each tier. A path that exists but
+//! carries the wrong method returns `method_not_allowed` with the methods that
+//! do exist, so a client learns the difference between "no such resource" and
+//! "wrong verb".
 const std = @import("std");
 const request = @import("request.zig");
 const response = @import("response.zig");

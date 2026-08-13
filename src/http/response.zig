@@ -1,7 +1,24 @@
+//! The handler-facing response API, and the state that makes it safe to use
+//! from a task the connection can cancel at any moment.
+//!
+//! A handler runs concurrently with the connection actor, so the stream it is
+//! answering can end underneath it: the peer resets, the peer stops reading,
+//! the transport fails, or the server shuts down. Every one of those must reach
+//! the handler as an EXACT error rather than as a generic failure, because a
+//! handler's correct reaction differs — a peer reset is normal and needs no
+//! log, while a write failure is not.
+//!
+//! `Response` therefore holds no connection state of its own. It carries
+//! function pointers into `edge.connection` and a pointer to actor-owned
+//! `SlotTerminal`. Every entry point reads the terminal cause first, so a
+//! handler cannot act on a stream that is already gone.
 const std = @import("std");
 const request = @import("request.zig");
 const frame = @import("../core/frame.zig");
 
+/// Why a stream ended before its handler finished. The variants exist so that
+/// `causeToError` can hand the handler the precise reason, and so that a log
+/// can tell a peer's decision apart from a server fault.
 pub const TerminalCause = union(enum) {
     peer_reset: frame.ErrorCode,
     slow_consumer,
@@ -24,6 +41,19 @@ pub const ResponseError = error{
 };
 
 /// Actor-owned slot state. Never points into handler-job memory.
+///
+/// It lives in the `HandlerSlot` because the actor must be able to record a
+/// cause after the handler job is gone, and a handler must be able to read one
+/// while the actor writes it. All fields are atomic for that reason: the two
+/// tasks share this struct with no lock between them.
+///
+/// Two independent facts are stored here, and confusing them is a bug:
+/// - the CAUSE, which is first-writer-wins, because the first reason is the
+///   real one and every later cause is a consequence of it;
+/// - the GENERATION, which bumps on every cause and on every slot reuse. A
+///   `Body` records the generation it was created under, so a stale `Body`
+///   fails with `BodyClosed` instead of writing into a stream that now belongs
+///   to a different request.
 pub const SlotTerminal = struct {
     kind: std.atomic.Value(u8) = .init(0),
     code: std.atomic.Value(u32) = .init(0),
@@ -79,6 +109,10 @@ pub const SlotTerminal = struct {
     }
 };
 
+/// A handle to an open response body. It is a capability with an expiry: the
+/// generation it was created under. That is what makes a stale handle — one
+/// kept across a stream reset and a slot reuse — fail loudly instead of writing
+/// into another request's stream.
 pub const Body = struct {
     response: *Response,
     stream_id: u31,
@@ -151,6 +185,13 @@ pub const Response = struct {
         return .{ .response = self, .stream_id = self.stream_id, .generation = self.terminal.currentGeneration() };
     }
 
+    /// The guard every body operation runs first.
+    ///
+    /// The order is deliberate: a terminal CAUSE outranks a generation
+    /// mismatch. Setting a cause also bumps the generation, so both conditions
+    /// are true at once on a reset stream. Reporting `BodyClosed` there would
+    /// replace the real reason — "the peer reset this stream" — with a
+    /// misuse-shaped error that tells the handler nothing.
     fn checkBody(self: *Response, body: *Body) ResponseError!void {
         // Exact terminal cause before stale-generation BodyClosed.
         if (self.terminal.getCause()) |c| return causeToError(c);
@@ -161,6 +202,10 @@ pub const Response = struct {
     fn writeBody(self: *Response, body: *Body, bytes: []const u8) ResponseError!void {
         try self.checkBody(body);
         // SSE write has exactly one implicit flush — no second flushCb.
+        // An event that sits in a buffer is a lost event as far as the browser
+        // is concerned, so an SSE write must reach the wire before it returns.
+        // The flush is folded into the write, because a separate flush call
+        // would take a second ticket and a second round trip per event.
         try self.writeFn(self.ctx, self.stream_id, bytes, false, self.sse);
     }
 

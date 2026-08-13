@@ -1,0 +1,183 @@
+# starh2
+
+A server-side HTTP/2 stack in Zig, shaped around [Datastar](https://data-star.dev).
+
+HTTP/2 is the whole surface. Datastar's load is long-lived SSE multiplexed with
+latency-sensitive one-shot responses on one connection, and HTTP/2 already gives
+stream isolation, flow control, and fair multiplexing for that shape. Everything
+below follows from serving that one shape well rather than serving everything.
+
+**Status:** used in production by one consumer. The API is not yet stable.
+
+## Non-goals
+
+These are refused on purpose, not missing. Each one would pull in parsers or
+lifecycle modes that the target workload does not use, and every one of them
+would need the same conformance and security work as the paths that are used.
+
+- HTTP/1.1, h2c `Upgrade`, ALPN fallback to http/1.1, HTTP/3
+- Server push, `CONNECT`, WebSockets, response trailers
+- Streaming request bodies, response compression
+- A client library
+- Framework surface: middleware, sessions, CORS, route parameters, wildcards,
+  static files, templates
+
+## Requirements
+
+- Zig 0.16.0 (pinned; the TLS dependency is not source-compatible with 0.17-dev)
+- For TLS, a certificate and key in PEM form
+- curl built with HTTP/2, to run the TLS gate
+
+## Install
+
+```sh
+zig fetch --save git+https://github.com/dimenus/starh2
+```
+
+```zig
+const starh2 = b.dependency("starh2", .{ .target = target, .optimize = optimize });
+exe_mod.addImport("starh2", starh2.module("starh2"));
+```
+
+## Use
+
+A cleartext server, prior-knowledge HTTP/2. There is no `Upgrade` handshake: a
+client speaks HTTP/2 immediately or it is refused.
+
+```zig
+const std = @import("std");
+const zio = @import("zio");
+const starh2 = @import("starh2");
+
+fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, "hello");
+}
+
+const ctx: u8 = 0;
+
+fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 8080);
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &.{.{
+            .method = .GET,
+            .path = "/hello",
+            .handler = .{ .ptr = @constCast(&ctx), .runFn = hello },
+        }},
+        .tls = null,
+    });
+    defer server.deinit(gpa);
+    try server.serve(gpa);
+}
+```
+
+`serve` blocks until shutdown. It binds inside its own task, so a caller that
+needs to know the listener is up calls `server.waitUntilListening(timeout_ns)`
+rather than sleeping; it reports `BindFailed` instead of timing out when a bind
+failed. `server.requestShutdown()` starts a graceful stop.
+
+For TLS, swap the endpoint and supply PEM bytes:
+
+```zig
+.endpoints = &.{.{ .tls_h2 = addr }},
+.tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
+```
+
+ALPN must reach `h2`. A peer that does not agree to HTTP/2 is refused at the
+handshake.
+
+### Responses
+
+```zig
+// One shot: headers and a complete body.
+try resp.send(200, &.{}, body);
+
+// Streaming: headers now, body later.
+var out = try resp.start(200, &.{});
+try out.writeAll(chunk);
+try out.finish();
+
+// Server-sent events. Each write reaches the wire before it returns.
+var events = try resp.startSse(&.{});
+try events.writeAll("data: hello\n\n");
+```
+
+A handler runs on its own task, so the stream can end underneath it. Every call
+returns the exact reason rather than a generic failure — `error.PeerReset`,
+`error.SlowConsumer`, `error.ConnectionClosed`, `error.WriteFailed` — because a
+peer that reset a stream and a server that failed to write need different
+reactions. `Body.terminalCause()` reports it without attempting a write.
+
+### Routes
+
+Exact paths are matched first, so adding a prefix route never changes what an
+existing exact route answers. Among prefix routes the longest match wins, and
+`Request.path_remainder` carries the bytes past the prefix.
+
+```zig
+.{ .method = .GET, .path = "/v1/tasks/", .prefix = true, .handler = h },
+```
+
+## Bounded by construction
+
+Every per-connection buffer is reserved at connection boot, and the write path
+does not allocate. A response larger than a stream's slab parks the handler
+until the peer reads, rather than growing a buffer.
+
+That makes the memory ceiling computable before the process serves anything:
+
+```zig
+const bound = try starh2.Limits.defaults.resourceUpperBound();
+// bound.allocator_bytes, plus bound.terms for the per-term breakdown
+```
+
+`Server.init` calls it first and refuses to start on `error.InvalidConfig`, so
+an inconsistent configuration fails at boot instead of under load. The terms are
+built from real `@sizeOf` values, and a struct that grows without its recorded
+size being updated fails the build.
+
+`Limits` also carries the admission and timeout budgets — streams per
+connection and per server, request and outbound byte ceilings, header and
+CONTINUATION caps, and the idle deadlines that bound a peer that opens work and
+then stops.
+
+## Datastar
+
+`starh2.datastar` re-exports the Datastar SDK and adds bounded signal reads:
+
+```zig
+const Signals = struct { query: []const u8 = "" };
+const signals = try starh2.datastar.readSignalsFromQuery(Signals, req);
+```
+
+Signal JSON is attacker-controlled, so size, nesting depth, and field count are
+bounded before the typed parse runs. Values live in the request arena.
+
+## Architecture
+
+Three layers, one-way dependencies:
+
+- `core` — the protocol as a deterministic state machine. No I/O, no clock, no
+  lock. The same bytes produce the same intents on every run, which is why a
+  conformance failure is a test case rather than a timing story.
+- `edge` — sockets, TLS, tasks, timers, memory limits. It drives `core` and
+  executes the intents `core` emits.
+- `http` — the handler-facing surface.
+
+`core` never depends on `edge`. Start reading at `src/root.zig` for the request
+path, then `src/edge/connection.zig`, whose header carries the task topology,
+the lock discipline, and the wake protocol — most of the subtle rules in this
+stack follow from those three.
+
+Decisions and their rationale live in the git log, not in this file.
+
+## Testing
+
+`AGENTS.md` carries the gates and how to run them, including the TLS gate and
+the interop commands. Conformance runs against h2spec; the only accepted
+failures are the two documented RFC 7540 priority exclusions in
+`tools/h2spec/EXCLUSIONS.md`.
+
+## License
+
+MIT. See `LICENSE`.

@@ -1,4 +1,13 @@
 //! Cleartext prior-knowledge HTTP/2 startup.
+//!
+//! Prior knowledge only. There is no HTTP/1.1 Upgrade path, because supporting
+//! one would mean carrying an HTTP/1.1 parser for the sole purpose of leaving
+//! HTTP/1.1. A client on an h2c endpoint sends the HTTP/2 preface immediately
+//! or it is refused.
+//!
+//! The preface is matched incrementally, because a client may split those 24
+//! bytes across TCP segments — and a client that pipelines its preface with its
+//! first request is the normal case, not an edge case.
 const std = @import("std");
 const frame = @import("../core/frame.zig");
 

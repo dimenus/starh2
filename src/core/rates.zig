@@ -1,4 +1,15 @@
 //! Edge-clock token buckets for non-DATA / RST / SETTINGS / PING rate budgets.
+//!
+//! These buckets exist for one attack family. A frame that costs the server
+//! work but no flow-control credit is free for the peer to repeat. RST_STREAM
+//! is the well-known case (CVE-2023-44487): a client opens a stream, the server
+//! allocates for it, the client resets it at once, and no window ever fills.
+//! SETTINGS and PING have the same shape, because each one forces an ack.
+//!
+//! The buckets do not read a clock. `Session` passes `edge_now_ns`, the
+//! timestamp that the connection actor already took. That keeps `core`
+//! deterministic and testable: a test drives the rate limiter by choosing the
+//! nanosecond value, and needs no wall-clock wait.
 const std = @import("std");
 const frame = @import("frame.zig");
 
@@ -38,6 +49,15 @@ pub const RateLimiter = struct {
     ping: TokenBucket = .init(100, 10),
 
     /// Returns false → caller should GOAWAY ENHANCE_YOUR_CALM (unless a protocol error wins).
+    ///
+    /// Two buckets charge each abusive type: its own bucket, then the shared
+    /// `non_data` bucket. The specific bucket stops one type on its own. The
+    /// shared bucket stops a peer that spreads the same total volume across
+    /// several types to stay under each individual limit.
+    ///
+    /// DATA is exempt and takes no token. DATA already pays flow control, so a
+    /// peer cannot repeat it for free. A token charge here would let the rate
+    /// limiter refuse a legitimate large upload.
     pub fn admit(self: *RateLimiter, typ: frame.FrameType, now_ns: u64) bool {
         switch (typ) {
             .data => return true,

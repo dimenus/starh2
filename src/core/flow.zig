@@ -1,6 +1,24 @@
+//! HTTP/2 flow-control windows (RFC 9113 section 5.2).
+//!
+//! Two independent credit systems apply to every DATA byte: one for the
+//! connection and one for the stream. A byte needs credit from both. The
+//! sender-side effect is in `availableSend`, which returns the minimum.
+//!
+//! Windows are `i32` and not unsigned on purpose. A send window can go
+//! negative, and only through one route: the peer lowers
+//! SETTINGS_INITIAL_WINDOW_SIZE after the server already sent bytes under the
+//! older, larger window. The protocol allows that state and forbids more
+//! sending until a WINDOW_UPDATE restores credit. An unsigned type would have
+//! to clamp, and a clamp would let the server send bytes the peer never
+//! credited.
 const std = @import("std");
 
 pub const INITIAL_WINDOW: i32 = 65_535;
+/// The server raises its own receive window to 4 MiB right after the preface.
+/// The 64 KiB protocol default costs one WINDOW_UPDATE round trip per 64 KiB of
+/// request body, which caps upload throughput at one window per round trip.
+/// This is the receive side only, so it spends server memory the request-byte
+/// limits already bound. It does not change what the peer accepts.
 pub const CONNECTION_RECV_TARGET: i32 = 4 * 1024 * 1024;
 
 pub const FlowError = error{
@@ -30,6 +48,8 @@ pub const Windows = struct {
         self.conn_send = @intCast(sum);
     }
 
+    /// Replenish at the half-way point, not when the window empties. A sender
+    /// that waits for zero stalls the peer for one round trip on every window.
     pub fn needsConnWindowUpdate(self: *const Windows) bool {
         return self.conn_recv <= CONNECTION_RECV_TARGET / 2;
     }
@@ -62,6 +82,10 @@ pub const StreamWindow = struct {
         self.send = @intCast(sum);
     }
 
+    /// A new SETTINGS_INITIAL_WINDOW_SIZE retunes every OPEN stream by the
+    /// difference, and not by an assignment. Bytes already in flight were sent
+    /// against the old window, so a plain assignment would credit them twice.
+    /// This is the one path that can make `send` negative.
     pub fn applyInitialWindowDelta(self: *StreamWindow, delta: i32) FlowError!void {
         const sum = @as(i64, self.send) + @as(i64, delta);
         if (sum > std.math.maxInt(i32) or sum < std.math.minInt(i32)) return error.ConnectionFlowControl;

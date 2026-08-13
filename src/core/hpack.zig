@@ -1,4 +1,21 @@
 //! HPACK decoder/encoder (RFC 7541). Encoder: static indices + literal never/without indexing only.
+//!
+//! The two directions are deliberately asymmetric.
+//!
+//! The DECODER must be complete, because the peer chooses the encoding. It
+//! keeps a dynamic table and decodes Huffman, or it cannot read a browser.
+//! The dynamic table is connection state and not stream state: entry N of one
+//! header block can name a string that an earlier block on another stream
+//! inserted. That is why a compression fault is always a CONNECTION error. The
+//! decoder can no longer track the peer's table, so every later block on the
+//! connection is undecodable.
+//!
+//! The ENCODER is minimal on purpose. It emits static-table indices and
+//! literals, and it inserts nothing into a dynamic table. The server therefore
+//! keeps no encoder-side table. The cost is a few bytes on each response. The
+//! gain is that responses cannot leak across streams through shared compression
+//! state, which is the HPACK form of the CRIME attack, and that the encoder has
+//! no state a bug could desynchronize.
 const std = @import("std");
 
 pub const MAX_DYNAMIC_TABLE: usize = 4096;
@@ -208,6 +225,11 @@ fn huffDecode(allocator: std.mem.Allocator, encoded: []const u8) (CompressionErr
             if (!found) break;
         }
     }
+    // RFC 7541 section 5.2 makes both of these a compression error, and both
+    // are decoder-fingerprint tricks rather than accidents. More than 7 padding
+    // bits means a whole symbol was dropped. Padding that is not all-ones is a
+    // second encoding of the same string, which lets a peer smuggle a value
+    // past a byte comparison somewhere downstream.
     if (bits >= 8) return error.CompressionError;
     if (bits > 0) {
         const pad_mask: u64 = (@as(u64, 1) << @intCast(bits)) - 1;
@@ -233,6 +255,10 @@ fn decodeInt(data: []const u8, prefix_bits: u3, start: *usize) CompressionError!
     var value: usize = data[start.*] & mask;
     start.* += 1;
     if (value < mask) return value;
+    // The continuation bytes are bounded twice. `m > 28` caps the shift, and the
+    // overflow check caps the sum. Without both, a peer sends a long run of
+    // continuation bytes and chooses either an integer overflow or a huge length
+    // that a later allocation would honour.
     var m: u6 = 0;
     while (true) {
         if (start.* >= data.len) return error.CompressionError;
@@ -296,6 +322,13 @@ pub const Decoder = struct {
         }
     }
 
+    /// The `+ 32` is RFC 7541 section 4.1. It is not a guess: the accounted
+    /// size of an entry must match the peer's accounting exactly, or the two
+    /// sides evict at different moments and every later index disagrees.
+    ///
+    /// An entry larger than the whole table empties the table and is not
+    /// stored. That is the RFC's own rule, and it is why the eviction loop
+    /// below cannot spin.
     fn insert(self: *Decoder, name: []u8, value: []u8) (CompressionError || error{OutOfMemory})!void {
         const size = name.len + value.len + 32;
         if (size > self.max_size) {
@@ -330,6 +363,16 @@ pub const Decoder = struct {
         return .{ e.name, e.value };
     }
 
+    /// Decode a complete header block.
+    ///
+    /// A policy breach is NOT an error here. A field block that exceeds
+    /// `max_fields`, `max_decoded_size`, `max_name`, or `max_value` still
+    /// decodes in full, and the result carries `policy_exceeded = true`.
+    /// The reason is the dynamic table: an early return would leave the
+    /// decoder's table out of step with the peer's, which corrupts every later
+    /// block on the connection. So the decoder always finishes its work, and
+    /// `Session` turns the flag into a 431 response for that one stream while
+    /// the connection survives.
     pub fn decode(
         self: *Decoder,
         block: []const u8,
@@ -384,6 +427,9 @@ pub const Decoder = struct {
                 try fields.append(self.allocator, .{ .name = name, .value = value });
                 first = false;
             } else if ((b & 0xe0) == 0x20) {
+                // A dynamic table size update is legal only at the start of a
+                // block (RFC 7541 section 4.2). Mid-block it would resize the
+                // table between two indices that the peer chose under one size.
                 if (!first) return error.CompressionError;
                 const new_size = try decodeInt(block, 5, &i);
                 try self.setMaxSize(new_size);
@@ -452,6 +498,10 @@ fn findStatic(name: []const u8, value: []const u8) struct { ?usize, ?usize } {
     return .{ null, name_only };
 }
 
+/// These fields carry credentials or session identity. The encoder marks them
+/// "literal never indexed" so that no intermediary may place them in a shared
+/// compression table. A value in a shared table is recoverable by a
+/// compression-ratio oracle, which is how CRIME recovered session cookies.
 fn neverIndexName(name: []const u8) bool {
     return std.mem.eql(u8, name, "authorization") or
         std.mem.eql(u8, name, "proxy-authorization") or

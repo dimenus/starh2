@@ -1,5 +1,19 @@
 //! Concrete allocation shapes for Limits.resourceUpperBound — no magic estimates.
 //! HashMap bytes use Zig 0.16 `std.hash_map` allocate layout (Header + Metadata + keys + values).
+//!
+//! The hash-map functions reproduce the standard library's own layout instead
+//! of approximating it, because a memory bound that undercounts is worse than
+//! none: it still returns a confident number. A HashMap does not allocate
+//! `n * (key + value)`. It rounds the capacity up to a power of two above the
+//! load factor, then packs a header, a metadata byte per slot, the keys, and
+//! the values into ONE allocation with alignment padding between the regions.
+//! Every one of those steps adds bytes that a naive product misses.
+//!
+//! This is a copy of standard-library internals, so it can drift when Zig
+//! changes `std.hash_map`. Two guards catch that: the constants below are
+//! named and comparable against the source, and the unit tests pin the
+//! capacity formula at known inputs. If a Zig upgrade changes the layout, fix
+//! it here — do not widen the bound to hide the difference.
 const std = @import("std");
 const ticket_table = @import("../edge/ticket_table.zig");
 const wire_pump = @import("../edge/wire_pump.zig");
@@ -86,6 +100,10 @@ pub fn streamMapBytes(max_streams: usize) error{Overflow}!usize {
     return hashMapBytes(u31, stream_mod.Stream, max_streams);
 }
 
+/// Pending outbound DATA uses a fixed slot array and not a HashMap. The
+/// scheduler must add a pending entry on a handler write, and a HashMap can
+/// resize on insert. A resize after boot would allocate on the write path,
+/// which breaks the promise that `resourceUpperBound` is an upper bound.
 pub fn pendingWriteMapBytes(max_streams: usize) error{Overflow}!usize {
     // Fixed DataPending slots (no HashMap) — slabs counted separately in Limits.
     return std.math.mul(usize, max_streams, @sizeOf(fair_scheduler.DataPending));
