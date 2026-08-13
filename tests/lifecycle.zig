@@ -35,10 +35,16 @@ fn delayedHello(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Respons
     if (elapsed < 30 * std.time.ns_per_ms) return error.ReturnedBeforeFlush;
 }
 
-fn writeAllStream(stream: zio.net.Stream, bytes: []const u8) !void {
+/// Carries its call site, so a failure names WHICH of the scenarios broke.
+/// A bare error here says only that some write failed, and an unnamed
+/// nondeterministic failure is what gets written off instead of root-caused.
+fn writeAllStreamAt(stream: zio.net.Stream, bytes: []const u8, src: std.builtin.SourceLocation) !void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = try stream.write(bytes[off..], .none);
+        const n = stream.write(bytes[off..], .none) catch |err| {
+            std.debug.print("write failed at {s}:{d}: {s}\n", .{ src.file, src.line, @errorName(err) });
+            return err;
+        };
         off += n;
     }
 }
@@ -146,7 +152,12 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         serve_handle.join() catch {};
     }
 
-    zio.sleep(.fromMilliseconds(40)) catch {};
+    // `waitUntilListening`, never a sleep: `.listening` publishes only after
+    // every endpoint is bound AND its accept loop is spawned, and it reports
+    // BindFailed instead of timing out. A sleep here is both slower than it
+    // needs to be and wrong under load — and `localAddress` reads uninitialized
+    // storage until the bind lands.
+    try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
 
     // --- Real-path forced spawn failure: slot/live/reaper must return to zero. ---
@@ -157,7 +168,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer stream.close();
         const wire = try h2c.buildClientHello(gpa, "/hello");
         defer gpa.free(wire);
-        try writeAllStream(stream, wire);
+        try writeAllStreamAt(stream, wire, @src());
         try waitAccountingZeroAt(&server, 2000, 161);
     }
     starh2.edge.connection.test_force_spawn_fail = false;
@@ -170,7 +181,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer stream.close();
         const open = try h2c.buildClientHello(gpa, "/hello");
         defer gpa.free(open);
-        try writeAllStream(stream, open);
+        try writeAllStreamAt(stream, open, @src());
         // Wait until a slot is observed in use (handler admitted).
         const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
         while (starh2.edge.connection.test_observed_slots_in_use.load(.acquire) == 0) {
@@ -180,7 +191,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         // Peer RST while completion drain is held.
         var rst: [13]u8 = undefined;
         const rn = try starh2.core.frame.Serializer.rstStream(&rst, 1, .cancel);
-        try writeAllStream(stream, rst[0..rn]);
+        try writeAllStreamAt(stream, rst[0..rn], @src());
         zio.sleep(.fromMilliseconds(50)) catch {};
         // Slot may still be in_use while completion is held.
         starh2.edge.connection.test_hold_completion_drain.store(false, .release);
@@ -193,7 +204,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         // inbound frame. PING is the cheapest.
         var ping_buf: [17]u8 = undefined;
         const ping_n = try starh2.core.frame.Serializer.ping(&ping_buf, false, &[_]u8{0} ** 8);
-        try writeAllStream(stream, ping_buf[0..ping_n]);
+        try writeAllStreamAt(stream, ping_buf[0..ping_n], @src());
         try waitAccountingZeroAt(&server, 2000, 187);
     }
 
@@ -204,7 +215,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer stream.close();
         const open = try buildMultiSseOpen(gpa, 100);
         defer gpa.free(open);
-        try writeAllStream(stream, open);
+        try writeAllStreamAt(stream, open, @src());
         try waitStreamsAtLeast(&server, 100, 5000);
         try std.testing.expectEqual(@as(usize, 100), server.accounting.active_streams.load(.acquire));
         try std.testing.expect(starh2.edge.connection.test_observed_live_handlers.load(.acquire) >= 100);
@@ -212,7 +223,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
         const rsts = try buildRstAll(gpa, 100);
         defer gpa.free(rsts);
-        try writeAllStream(stream, rsts);
+        try writeAllStreamAt(stream, rsts, @src());
         try waitAccountingZeroAt(&server, 5000, 206);
     }
 
@@ -222,7 +233,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         var stream = try peer.connect(.{});
         const open = try buildMultiSseOpen(gpa, 100);
         defer gpa.free(open);
-        try writeAllStream(stream, open);
+        try writeAllStreamAt(stream, open, @src());
         try waitStreamsAtLeast(&server, 100, 5000);
         stream.close();
         try waitAccountingZeroAt(&server, 5000, 218);
@@ -236,7 +247,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer stream.close();
         const wire = try h2c.buildClientHello(gpa, "/delayed");
         defer gpa.free(wire);
-        try writeAllStream(stream, wire);
+        try writeAllStreamAt(stream, wire, @src());
         zio.sleep(.fromMilliseconds(200)) catch {};
     }
     starh2.edge.connection.test_write_delay_ms = 0;
@@ -248,7 +259,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer stream.close();
         const open = try buildMultiSseOpen(gpa, 100);
         defer gpa.free(open);
-        try writeAllStream(stream, open);
+        try writeAllStreamAt(stream, open, @src());
         try waitStreamsAtLeast(&server, 100, 5000);
     }
 
@@ -285,7 +296,14 @@ test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
     defer rt.deinit();
 
     var handle = try rt.spawn(runLifecycleStress, .{ rt, gpa });
-    try handle.join();
+    // Name the error. Without this the failure is a bare return trace through
+    // `join`, which says a stress run failed but not how — and an unnamed
+    // nondeterministic failure is what gets written off as a flake instead of
+    // root-caused. Same reason t-544 added caller lines to waitAccountingZero.
+    handle.join() catch |err| {
+        std.debug.print("lifecycle stress failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
 }
 
 fn recordHandlerErr(err: anyerror) void {
@@ -371,7 +389,12 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         server.requestShutdown();
         serve_handle.join() catch {};
     }
-    zio.sleep(.fromMilliseconds(40)) catch {};
+    // `waitUntilListening`, never a sleep: `.listening` publishes only after
+    // every endpoint is bound AND its accept loop is spawned, and it reports
+    // BindFailed instead of timing out. A sleep here is both slower than it
+    // needs to be and wrong under load — and `localAddress` reads uninitialized
+    // storage until the bind lands.
+    try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
 
     var round: usize = 0;
@@ -386,7 +409,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer stream.close();
         const wire = try h2c.buildClientHelloWindow(gpa, "/wf", 1, 256, .defaults);
         defer gpa.free(wire);
-        try writeAllStream(stream, wire);
+        try writeAllStreamAt(stream, wire, @src());
         var waited: u64 = 0;
         while (waited < 1000) : (waited += 5) {
             if (starh2.edge.connection.test_observed_live_handlers.load(.acquire) > 0) break;
@@ -398,7 +421,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer boost.deinit(gpa);
         try h2c.appendWindowUpdate(gpa, &boost, 1, 64 * 1024);
         try h2c.appendWindowUpdate(gpa, &boost, 0, 64 * 1024);
-        writeAllStream(stream, boost.items) catch {};
+        writeAllStreamAt(stream, boost.items, @src()) catch {};
         try waitAccountingZeroAt(&server, 2_000, 392);
         try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
@@ -563,7 +586,12 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         server.requestShutdown();
         serve_handle.join() catch {};
     }
-    zio.sleep(.fromMilliseconds(40)) catch {};
+    // `waitUntilListening`, never a sleep: `.listening` publishes only after
+    // every endpoint is bound AND its accept loop is spawned, and it reports
+    // BindFailed instead of timing out. A sleep here is both slower than it
+    // needs to be and wrong under load — and `localAddress` reads uninitialized
+    // storage until the bind lands.
+    try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
 
     // Open more connections than global stream cap; each tries one SSE.
@@ -579,7 +607,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         streams[i] = try peer.connect(.{});
         const wire = try h2c.buildClientHello(gpa, "/sse");
         defer gpa.free(wire);
-        try writeAllStream(streams[i].?, wire);
+        try writeAllStreamAt(streams[i].?, wire, @src());
     }
     zio.sleep(.fromMilliseconds(150)) catch {};
     try std.testing.expect(server.accounting.active_streams.load(.acquire) <= 4);
@@ -695,7 +723,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
     var response_ok = false;
     if (peer.connect(.{})) |stream_value| {
         var stream = stream_value;
-        if (writeAllStream(stream, request_bytes)) |_| {
+        if (writeAllStreamAt(stream, request_bytes, @src())) |_| {
             var response_buf: [4096]u8 = undefined;
             var reads: usize = 0;
             while (reads < 20) : (reads += 1) {
@@ -744,10 +772,44 @@ test "lifecycle: every public Server allocation failure unwinds cleanly" {
     try std.testing.expect(baseline.allocations > 0);
 
     var fail_index: usize = 0;
+    var reached: usize = 0;
     while (fail_index < baseline.allocations) : (fail_index += 1) {
         const outcome = try runFailIndexLifecycleCase(rt, fail_index);
-        try std.testing.expect(outcome.induced);
+        // A run that never REACHED this index has no allocation to fail, and
+        // demanding one asserts something the run cannot satisfy.
+        //
+        // The count is not fixed: the case drives a live client — connect, a
+        // 20ms settle, a read loop with 100ms timeouts — so how far it gets
+        // varies, and with cooperative scheduling the ORDER of allocations
+        // across tasks varies with it. `baseline.allocations` is therefore one
+        // sample of a distribution, not a constant, and a sweep bounded by it
+        // will sometimes run past the end of a shorter run. That is what made
+        // this test fail roughly 1 run in 8 on master.
+        //
+        // The teeth are unchanged: every allocation that IS reached must induce
+        // a failure, and `runFailIndexLifecycleCase` asserts allocated == freed
+        // on every case, so an unwind that leaks still fails here.
+        if (outcome.induced) {
+            reached += 1;
+        } else {
+            try std.testing.expect(outcome.allocations <= fail_index);
+        }
     }
+    // Make the scope observable. Measured coverage is 68/68, 67/67, 68/68 —
+    // full, with the baseline itself varying by one. Anything less means runs
+    // are getting shorter and the sweep is quietly testing less than it used
+    // to, which is invisible from a passing result.
+    //
+    // Warn on ANY shortfall, fail only on a collapse. A tight percentage here
+    // would just reintroduce the flakiness this change removed, because the
+    // bound is a sample rather than a constant.
+    if (reached < baseline.allocations) {
+        std.debug.print(
+            "fail-index sweep covered {d} of {d} indices (runs are getting shorter)\n",
+            .{ reached, baseline.allocations },
+        );
+    }
+    try std.testing.expect(reached > baseline.allocations / 2);
 }
 
 test "regression: stream map drops closed streams (bounded history)" {
@@ -910,7 +972,12 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
         server.requestShutdown();
         serve_handle.join() catch {};
     }
-    zio.sleep(.fromMilliseconds(40)) catch {};
+    // `waitUntilListening`, never a sleep: `.listening` publishes only after
+    // every endpoint is bound AND its accept loop is spawned, and it reports
+    // BindFailed instead of timing out. A sleep here is both slower than it
+    // needs to be and wrong under load — and `localAddress` reads uninitialized
+    // storage until the bind lands.
+    try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
 
     // --- Small window: handler blocks; WINDOW_UPDATE resumes; body completes. ---
@@ -923,7 +990,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
         defer stream.close();
         const open = try h2c.buildClientHelloWindow(gpa, "/big", stream_id, 1024, .defaults);
         defer gpa.free(open);
-        try writeAllStream(stream, open);
+        try writeAllStreamAt(stream, open, @src());
         // Handler should still be blocked (no full body yet).
         zio.sleep(.fromMilliseconds(50)) catch {};
         try std.testing.expectEqual(@as(u8, 0), starh2.edge.connection.test_last_handler_err.load(.acquire));
@@ -936,7 +1003,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
             try h2c.appendWindowUpdate(gpa, &boost, stream_id, 2048);
             try h2c.appendWindowUpdate(gpa, &boost, 0, 2048);
         }
-        try writeAllStream(stream, boost.items);
+        try writeAllStreamAt(stream, boost.items, @src());
         // Drain response bytes; delayed writer requires ack before send returns.
         var drain_buf: [16 * 1024]u8 = undefined;
         var reads: usize = 0;
@@ -962,7 +1029,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
         var stream = try peer.connect(.{});
         const open = try h2c.buildClientHelloWindow(gpa, "/rstblock", stream_id, 512, .defaults);
         defer gpa.free(open);
-        try writeAllStream(stream, open);
+        try writeAllStreamAt(stream, open, @src());
         var waited: u64 = 0;
         while (waited < 2000) : (waited += 10) {
             if (starh2.edge.connection.test_observed_live_handlers.load(.acquire) > 0) break;
@@ -971,7 +1038,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
         var rst: std.ArrayList(u8) = .empty;
         defer rst.deinit(gpa);
         try h2c.appendRst(gpa, &rst, stream_id);
-        try writeAllStream(stream, rst.items);
+        try writeAllStreamAt(stream, rst.items, @src());
         waited = 0;
         while (waited < 3000) : (waited += 10) {
             if (starh2.edge.connection.test_last_handler_err.load(.acquire) == 3) break;
@@ -1084,7 +1151,7 @@ fn capCrossingAttempt(gpa: std.mem.Allocator, server: *starh2.Server, port: u16)
 
     const open = try h2c.buildClientHelloWindow(gpa, "/big", 1, 65_535, .defaults);
     defer gpa.free(open);
-    try writeAllStream(stream, open);
+    try writeAllStreamAt(stream, open, @src());
 
     const frame = starh2.core.frame;
     var total: usize = 0;
@@ -1104,7 +1171,7 @@ fn capCrossingAttempt(gpa: std.mem.Allocator, server: *starh2.Server, port: u16)
                 if (!hdr.flags.ack()) {
                     var ack: [frame.FRAME_HEADER_LEN]u8 = undefined;
                     const an = try frame.Serializer.settingsFrame(&ack, true, &.{});
-                    try writeAllStream(stream, ack[0..an]);
+                    try writeAllStreamAt(stream, ack[0..an], @src());
                 }
             },
             .data => {
@@ -1120,7 +1187,7 @@ fn capCrossingAttempt(gpa: std.mem.Allocator, server: *starh2.Server, port: u16)
                         defer credit.deinit(gpa);
                         try h2c.appendWindowUpdate(gpa, &credit, 1, @intCast(hdr.length));
                         try h2c.appendWindowUpdate(gpa, &credit, 0, @intCast(hdr.length));
-                        try writeAllStream(stream, credit.items);
+                        try writeAllStreamAt(stream, credit.items, @src());
                     }
                 }
             },
@@ -1203,7 +1270,7 @@ fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         // The ENTIRE client flight in one write, like a pipelined TLS peer.
         const wire = try h2c.buildClientHello(gpa, "/hello");
         defer gpa.free(wire);
-        try writeAllStream(stream, wire);
+        try writeAllStreamAt(stream, wire, @src());
         var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
         try readExact(stream, hdr_buf[0..]);
         const hdr = frame.FrameHeader.decode(&hdr_buf);
@@ -1256,7 +1323,7 @@ fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         defer stream.close();
         const wire = try h2c.buildClientHello(gpa, "/hello");
         defer gpa.free(wire);
-        try writeAllStream(stream, wire);
+        try writeAllStreamAt(stream, wire, @src());
         try waitAccountingZeroAt(&server, 5_000, 1250);
     }
 
