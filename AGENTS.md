@@ -3,7 +3,13 @@
 Server-side HTTP/2 stack shaped around Datastar. Rationale lives in the git log
 (initial commit and the design-retirement commit).
 
-Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib lookups. Do not guess 0.16 APIs.
+- **Search before you reinvent.** qmdsync indexes this repo (documents plus
+  session transcripts) and the task store — sources grep cannot read. Run
+  `qmdsync find "<topic>" --repo starh2`, or omit `--repo` to search every
+  synced repo; `qmdsync repos` shows valid scopes. Worth it before proposing a
+  design that may already be decided, before filing a task, and when a constraint
+  here has no stated reason.
+- Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib lookups. Do not guess 0.16 APIs.
 
 ## Gates
 
