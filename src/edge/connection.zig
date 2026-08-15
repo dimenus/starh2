@@ -428,6 +428,16 @@ const Connection = struct {
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
     session_mu: std.Io.Mutex = .init,
+    /// Debug proof that `session_mu` is held where Session or the scheduler is
+    /// touched. Written only while the mutex is held, so it needs no atomic.
+    ///
+    /// It proves SOMEBODY holds the mutex, not that this task does. A thread id
+    /// would be wrong: zio migrates tasks, and a holder can park inside the
+    /// critical section (`sendAccountedWire` can block on `write_ch.putOne`).
+    /// That is still enough to catch the class it exists for — a call made with
+    /// the mutex not held at all — which is exactly how the two sites in t-731
+    /// read Session and scheduler state unsynchronized.
+    session_held: bool = false,
     live_handlers: std.atomic.Value(usize) = .init(0),
     reaper: ?*ReaperPool = null,
     completion_ch_buf: []u31 = &.{},
@@ -1191,7 +1201,16 @@ const Connection = struct {
             }
         }
 
-        try self.flushSessionIntents();
+        // Under the lock: the TLS leftover-decrypt path above can already have
+        // DISPATCHED a handler (see the comment at `driveDecrypt`'s call in the
+        // handshake), and that handler emits through `session_mu`. Draining
+        // intents here without the lock races it on Session, the scheduler and
+        // the TLS cipher at once.
+        {
+            self.lockSessionUncancelable(io);
+            defer self.unlockSession(io);
+            try self.flushSessionIntents();
+        }
 
         if (self.config.mode == .h2c) {
             self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
@@ -1205,8 +1224,8 @@ const Connection = struct {
             self.drainCompletions();
 
             {
-                self.session_mu.lockUncancelable(io);
-                defer self.session_mu.unlock(io);
+                self.lockSessionUncancelable(io);
+                defer self.unlockSession(io);
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
                 if (self.session.terminal != .none) break;
                 const now = nowNs(io);
@@ -1223,19 +1242,28 @@ const Connection = struct {
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                 };
-            }
 
-            if (self.session.terminal != .none) break;
-            // Graceful finish needs all three conditions together: phase 2
-            // reached, nothing left to write, and no handler still running. Any
-            // one alone would cut off work that is still in flight.
-            if (self.shutting_down and self.session.grace_phase == .phase2 and
-                self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0)
-            {
-                self.session_mu.lockUncancelable(io);
-                defer self.session_mu.unlock(io);
-                try self.finishGraceful();
-                break;
+                // Both checks stay INSIDE this lock. `drainEmit` above can
+                // terminate the connection, so the terminal check has to run
+                // after it — and `grace_phase`, `terminal` and
+                // `sched.pendingCount()` are all plain fields that a handler
+                // task mutates under this same mutex. Reading them outside it
+                // was a data race, and the `live_handlers` guard did not cover
+                // it: `and` evaluates left to right, so `pendingCount()` was
+                // read BEFORE the handler count was known to be zero.
+                // The assert travels with the checks: move them back out of the
+                // lock and this fires, instead of the race returning silently.
+                self.assertSessionHeld("graceful finish check");
+                if (self.session.terminal != .none) break;
+                // Graceful finish needs all three conditions together: phase 2
+                // reached, nothing left to write, and no handler still running.
+                // Any one alone would cut off work that is still in flight.
+                if (self.shutting_down and self.session.grace_phase == .phase2 and
+                    self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0)
+                {
+                    try self.finishGraceful();
+                    break;
+                }
             }
 
             var maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
@@ -1272,8 +1300,8 @@ const Connection = struct {
                 }
             }
 
-            self.session_mu.lockUncancelable(io);
-            defer self.session_mu.unlock(io);
+            self.lockSessionUncancelable(io);
+            defer self.unlockSession(io);
             self.session.edge_now_ns = nowNs(io);
             if (self.config.mode == .tls_h2 and self.tls_conn == null) {
                 try self.appendTlsInput(chunk.bytes[0..chunk.len]);
@@ -1392,9 +1420,9 @@ const Connection = struct {
             };
             defer self.recycleReadChunk(chunk);
             if (chunk.len == 0) return error.ConnectionClosed;
-            self.session_mu.lockUncancelable(self.config.io);
+            self.lockSessionUncancelable(self.config.io);
             {
-                defer self.session_mu.unlock(self.config.io);
+                defer self.unlockSession(self.config.io);
                 try self.session.ingest(chunk.bytes[0..chunk.len]);
                 try self.processIntents();
                 if (self.session.terminal != .none) return error.ConnectionClosed;
@@ -1466,8 +1494,8 @@ const Connection = struct {
             // response under session_mu — so this drive must hold the same lock,
             // or two tasks run the one TLS cipher concurrently and the response
             // corrupts (t-538: undefined inner.output mid-encrypt, SIGSEGV).
-            self.session_mu.lockUncancelable(self.config.io);
-            defer self.session_mu.unlock(self.config.io);
+            self.lockSessionUncancelable(self.config.io);
+            defer self.unlockSession(self.config.io);
             try self.driveDecrypt();
         }
     }
@@ -1831,9 +1859,9 @@ const Connection = struct {
             // before any return so caller defer unlock stays balanced.
             const event = if (self.spaceIndex(stream_id)) |i| &self.space_events[i] else null;
             if (event) |e| e.reset();
-            self.session_mu.unlock(self.config.io);
+            self.unlockSession(self.config.io);
             const wait_res: anyerror!void = if (event) |e| e.wait(self.config.io) else error.Canceled;
-            self.session_mu.lockUncancelable(self.config.io);
+            self.lockSessionUncancelable(self.config.io);
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             wait_res catch {
@@ -1909,6 +1937,7 @@ const Connection = struct {
     /// be undone, so the connection fails closed rather than continuing with
     /// window state the peer does not share.
     fn drainEmit(self: *Connection) !void {
+        self.assertSessionHeld("drainEmit");
         const SinkCtx = struct {
             fn sink(
                 ctx: *anyopaque,
@@ -1990,6 +2019,7 @@ const Connection = struct {
     /// DATA never goes straight to the wire here. It enters the scheduler, so
     /// that fairness between streams is decided in one place.
     fn processIntents(self: *Connection) anyerror!void {
+        self.assertSessionHeld("processIntents");
         const n = self.session.drainIntentsInto(self.intent_batch);
         var consumed: usize = 0;
         errdefer while (consumed < n) : (consumed += 1) {
@@ -2464,12 +2494,36 @@ const Connection = struct {
 
     fn withSession(self: *Connection, comptime f: anytype, arg: anytype) void {
         self.session_mu.lock(self.config.io) catch return;
-        defer self.session_mu.unlock(self.config.io);
+        self.session_held = true;
+        defer self.unlockSession(self.config.io);
         f(self, arg);
     }
 
     fn lockSession(self: *Connection) response.ResponseError!void {
         self.session_mu.lock(self.config.io) catch return error.Canceled;
+        self.session_held = true;
+    }
+
+    /// Every acquisition and release of `session_mu` goes through these two, so
+    /// `session_held` cannot drift from the mutex. Do not call the mutex
+    /// directly.
+    fn lockSessionUncancelable(self: *Connection, io: std.Io) void {
+        self.session_mu.lockUncancelable(io);
+        self.session_held = true;
+    }
+
+    fn unlockSession(self: *Connection, io: std.Io) void {
+        // Cleared while the mutex is still held, or the next holder would see a
+        // stale false.
+        self.session_held = false;
+        self.session_mu.unlock(io);
+    }
+
+    /// Called where Session or the scheduler is about to be read or mutated.
+    fn assertSessionHeld(self: *const Connection, comptime site: []const u8) void {
+        if (std.debug.runtime_safety and !self.session_held) {
+            std.debug.panic("session_mu not held at {s}", .{site});
+        }
     }
 
     /// One-shot response: headers plus a complete body.
@@ -2631,7 +2685,7 @@ const Connection = struct {
         defer if (armed) self.tickets.releaseReserved(slot_i);
         {
             try self.lockSession();
-            defer self.session_mu.unlock(self.config.io);
+            defer self.unlockSession(self.config.io);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
             var owned_vary: ?[]u8 = null;
@@ -2703,7 +2757,7 @@ const Connection = struct {
         {
             errdefer self.tickets.releaseReserved(slot_i);
             try self.lockSession();
-            defer self.session_mu.unlock(self.config.io);
+            defer self.unlockSession(self.config.io);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
             var owned_vary: ?[]u8 = null;
@@ -2775,7 +2829,7 @@ const Connection = struct {
         {
             errdefer if (need_wait) self.tickets.releaseReserved(slot_i);
             try self.lockSession();
-            defer self.session_mu.unlock(self.config.io);
+            defer self.unlockSession(self.config.io);
             self.enqueuePending(stream_id, wire_bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
             self.processIntents() catch return error.WriteFailed;
         }
@@ -2813,7 +2867,7 @@ const Connection = struct {
                 {
                     errdefer self.tickets.releaseReserved(slot_i);
                     try self.lockSession();
-                    defer self.session_mu.unlock(self.config.io);
+                    defer self.unlockSession(self.config.io);
                     self.enqueuePending(stream_id, out.items, false, ticket, slot_i, hctx.terminal) catch |err| return err;
                     self.processIntents() catch return error.WriteFailed;
                 }
@@ -2829,7 +2883,7 @@ const Connection = struct {
         {
             errdefer self.tickets.releaseReserved(slot_i);
             try self.lockSession();
-            defer self.session_mu.unlock(self.config.io);
+            defer self.unlockSession(self.config.io);
             if (self.sched.findPending(stream_id)) |pw| {
                 if (pw.len > 0 or pw.end_stream) {
                     pw.flush_ticket = ticket;
@@ -2856,7 +2910,7 @@ const Connection = struct {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         try self.lockSession();
-        defer self.session_mu.unlock(self.config.io);
+        defer self.unlockSession(self.config.io);
         self.session.applyCommand(.{ .reset_stream = .{ .stream_id = stream_id, .code = .cancel } }) catch return error.WriteFailed;
         self.processIntents() catch return error.WriteFailed;
     }
