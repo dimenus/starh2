@@ -47,6 +47,24 @@ pub const RateLimiter = struct {
     rst: TokenBucket = .init(1_000, 100),
     settings: TokenBucket = .init(100, 10),
     ping: TokenBucket = .init(100, 10),
+    /// WINDOW_UPDATE gets its OWN budget and does not charge `non_data`.
+    ///
+    /// It is the credit for DATA already delivered, so its rate scales with
+    /// useful traffic: a connection serving many small frames returns credit
+    /// far faster than the 1,000/s the shared bucket allows. Charging it there
+    /// silently capped one connection at about 121k SSE events/s — silently,
+    /// because the peer kept every stream open and nothing was logged. Two
+    /// independent implementations of an unrelated change both plateaued on
+    /// exactly that number until this bucket was sized; see
+    /// `tools/sse_bench/run.sh`.
+    ///
+    /// It is NOT exempt like DATA. DATA is exempt because it is self-limiting:
+    /// a peer cannot send more than the window allows. WINDOW_UPDATE has no
+    /// such property — a peer can send it forever while receiving nothing — so
+    /// removing the charge entirely would remove the flood control instead of
+    /// sizing it. This bucket is generous enough for credit that tracks real
+    /// delivery and still bounds a flood.
+    window_update: TokenBucket = .init(100_000, 10_000),
 
     /// Returns false → caller should GOAWAY ENHANCE_YOUR_CALM (unless a protocol error wins).
     ///
@@ -73,6 +91,9 @@ pub const RateLimiter = struct {
                 if (!self.ping.tryTake(now_ns)) return false;
                 return self.non_data.tryTake(now_ns);
             },
+            // Its own bucket only. See the field comment for why it is neither
+            // exempt nor charged against the shared budget.
+            .window_update => return self.window_update.tryTake(now_ns),
             else => return self.non_data.tryTake(now_ns),
         }
     }
@@ -83,6 +104,29 @@ test "token bucket refills and refuses when empty" {
     try std.testing.expect(b.tryTake(1));
     try std.testing.expect(b.tryTake(1));
     try std.testing.expect(!b.tryTake(1));
+}
+
+test "rate limiter WINDOW_UPDATE does not consume the shared non-data budget" {
+    var r: RateLimiter = .{};
+    var i: usize = 0;
+    // Far more than the shared bucket holds, at a rate a real fast connection
+    // reaches. The shared budget must be untouched afterwards.
+    while (i < 50_000) : (i += 1) {
+        try std.testing.expect(r.admit(.window_update, 1));
+    }
+    try std.testing.expect(r.admit(.ping, 1));
+}
+
+test "rate limiter WINDOW_UPDATE flood is still refused" {
+    // The defence is kept, not removed: a peer that sends credit it cannot
+    // possibly have earned runs its own bucket dry and gets refused. Without
+    // this, exempting WINDOW_UPDATE would look identical to sizing it.
+    var r: RateLimiter = .{};
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        _ = r.admit(.window_update, 1);
+    }
+    try std.testing.expect(!r.admit(.window_update, 1));
 }
 
 test "rate limiter DATA never consumes non-data budget" {
