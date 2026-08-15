@@ -30,6 +30,8 @@ pub const WriteCompletion = struct {
     /// Nonzero: complete this ticket wait slot.
     ticket: u64 = 0,
     ticket_slot: u32 = 0,
+    /// Number of ticket slots linked from `ticket_slot` for this one write.
+    ticket_count: u32 = 0,
     ok: bool = true,
     /// Connection-local outbound bytes to release (AckDrainer applies).
     outbound_release: usize = 0,
@@ -48,6 +50,8 @@ pub const WireChunk = struct {
     flush_barrier: bool = false,
     ticket: u64 = 0,
     ticket_slot: u32 = 0,
+    /// Number of ticket slots linked from `ticket_slot` for this one write.
+    ticket_count: u32 = 0,
     /// Amounts echoed into WriteCompletion after write/free (no Connection callback).
     outbound_release: usize = 0,
     control_release: usize = 0,
@@ -162,7 +166,7 @@ pub const WritePump = struct {
         if (chunk.bytes.len != 0) {
             self.gpa.free(chunk.bytes);
         }
-        const has_ticket = chunk.ticket != 0;
+        const has_ticket = chunk.ticket_count != 0 or chunk.ticket != 0;
         const has_acct = chunk.outbound_release != 0 or chunk.control_entry;
         if (has_ticket or has_acct or fail_all) {
             if (ok and chunk.ticket != 0) {
@@ -172,6 +176,7 @@ pub const WritePump = struct {
             self.post(.{
                 .ticket = chunk.ticket,
                 .ticket_slot = chunk.ticket_slot,
+                .ticket_count = if (chunk.ticket_count != 0) chunk.ticket_count else if (chunk.ticket != 0) 1 else 0,
                 .ok = ok,
                 .outbound_release = chunk.outbound_release,
                 .control_release = chunk.control_release,

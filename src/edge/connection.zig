@@ -855,6 +855,36 @@ const Connection = struct {
     ///
     /// The loop exits on the `shutdown` completion, which the WritePump posts
     /// as its last act. That is the join point the actor's `defer` waits on.
+    fn completeAckTickets(self: *Connection, ack: wire_pump.WriteCompletion) bool {
+        var remaining = ack.ticket_count;
+        if (remaining == 0 and ack.ticket != 0) remaining = 1;
+        if (remaining == 0) return true;
+        if (remaining > self.ticket_slots.len) return false;
+
+        var slot_i = ack.ticket_slot;
+        var first = true;
+        const ack_ns = if (trace.enabled) nowNs(self.config.io) else 0;
+        while (remaining > 0) : (remaining -= 1) {
+            // Snapshot the link BEFORE complete wakes the handler. The handler
+            // owns release/reuse after that wake and may reset this slot before
+            // the AckDrainer reaches the next loop iteration.
+            const meta = self.tickets.completion(slot_i) orelse return false;
+            if (first and meta.ticket != ack.ticket) return false;
+            first = false;
+            if (trace.enabled and self.trace_ticket.load(.acquire) == meta.ticket) {
+                self.trace_ack_ns.store(ack_ns, .release);
+            }
+            self.tickets.complete(slot_i, meta.ticket, ack.ok);
+            if (remaining > 1) {
+                if (meta.next == ticket_table.no_completion_slot) return false;
+                slot_i = meta.next;
+            } else if (meta.next != ticket_table.no_completion_slot) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     fn ackDrainer(self: *Connection) void {
         while (true) {
             const ack = self.write_ack_ch.getOne(self.config.io) catch break;
@@ -866,10 +896,14 @@ const Connection = struct {
                 // Do NOT touch handlers[] — actor applies connection_closed terminals.
                 self.wakeAllSpace();
             } else if (ack.ticket != 0) {
-                if (trace.enabled and self.trace_ticket.load(.acquire) == ack.ticket) {
-                    self.trace_ack_ns.store(nowNs(self.config.io), .release);
+                if (!self.completeAckTickets(ack)) {
+                    // A malformed chain would strand at least one synchronous
+                    // write forever. Fail every waiter instead of converting
+                    // internal metadata corruption into a silent hang.
+                    self.writer_failed.store(true, .release);
+                    self.tickets.failAll();
+                    self.wakeAllSpace();
                 }
-                self.tickets.complete(ack.ticket_slot, ack.ticket, ack.ok);
             }
             if (ack.outbound_release != 0) self.wakeAllSpace();
             self.actor_wake.set(self.config.io);
@@ -1403,7 +1437,7 @@ const Connection = struct {
             const res = tls_edge.connectionClose(tc, self.ciphertext_scratch);
             if (res.ciphertext_len > 0) {
                 const out = try gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
-                self.sendAccountedWire(out, true, 0, 0, 0, false) catch {
+                self.sendAccountedWire(out, true, 0, 0, 0, 0, false) catch {
                     // The connection is already terminal; close-notify is best-effort.
                 };
             }
@@ -1534,7 +1568,7 @@ const Connection = struct {
             const drive = tls_edge.serverDrive(srv, self.tls_recv_acc.items, self.ciphertext_scratch);
             if (drive.ciphertext_len > 0) {
                 const out = try gpa.dupe(u8, self.ciphertext_scratch[0..drive.ciphertext_len]);
-                try self.sendAccountedWire(out, true, 0, 0, 0, false);
+                try self.sendAccountedWire(out, true, 0, 0, 0, 0, false);
             }
             // `consumed` crosses the boundary from the pinned tls.zig fork. A
             // value larger than the input would underflow `rest` — a usize
@@ -1814,7 +1848,7 @@ const Connection = struct {
             if (res.ciphertext_len > 0) {
                 const out = try self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
                 // TLS close-notify is best-effort; sendAccountedWire releases `out` on failure.
-                self.sendAccountedWire(out, true, 0, 0, 0, false) catch {};
+                self.sendAccountedWire(out, true, 0, 0, 0, 0, false) catch {};
             }
             // Same ABI contract as the handshake drive above, plus the two
             // output lengths this path slices with.
@@ -2033,7 +2067,15 @@ const Connection = struct {
                 // Body bytes were reserved at enqueuePending; release only after the
                 // sink accepted the framed lease. Wire chunk.outbound_release tracks
                 // the framed size reserved in sendAccountedWire (acked separately).
-                try c.queueWire(payload, flush, ticket, ticket_slot, control_n, control_entry);
+                try c.queueWire(
+                    payload,
+                    flush,
+                    ticket,
+                    ticket_slot,
+                    if (ticket != 0) 1 else 0,
+                    control_n,
+                    control_entry,
+                );
                 if (!control_entry and c.pending_data_outbound_release != 0) {
                     c.applyOutboundRelease(c.pending_data_outbound_release, .pending);
                     c.wakeStreamSpace(c.pending_data_wake_sid);
@@ -2176,6 +2218,7 @@ const Connection = struct {
             .flush_barrier = true,
             .ticket = ticket,
             .ticket_slot = slot,
+            .ticket_count = 1,
         }) catch return error.WriteFailed;
     }
 
@@ -2196,6 +2239,7 @@ const Connection = struct {
         flush: bool,
         ticket: u64,
         ticket_slot: u32,
+        ticket_count: u32,
         control_n: usize,
         control_entry: bool,
     ) anyerror!void {
@@ -2210,6 +2254,7 @@ const Connection = struct {
             .flush_barrier = flush,
             .ticket = ticket,
             .ticket_slot = ticket_slot,
+            .ticket_count = ticket_count,
             .outbound_release = out.len,
             .control_release = control_n,
             .control_entry = control_entry,
@@ -2244,6 +2289,7 @@ const Connection = struct {
         flush: bool,
         ticket: u64,
         ticket_slot: u32,
+        ticket_count: u32,
         control_n: usize,
         control_entry: bool,
     ) anyerror!void {
@@ -2284,9 +2330,10 @@ const Connection = struct {
                     const is_last = next_off >= bytes.len;
                     const t: u64 = if (is_last) ticket else 0;
                     const s: u32 = if (is_last) ticket_slot else 0;
+                    const tn: u32 = if (is_last) ticket_count else 0;
                     const cn: usize = if (is_last) control_n else 0;
                     const ce = is_last and control_entry;
-                    self.sendAccountedWire(out, flush and is_last, t, s, cn, ce) catch {
+                    self.sendAccountedWire(out, flush and is_last, t, s, tn, cn, ce) catch {
                         self.config.gpa.free(bytes);
                         reserved_plain = 0;
                         return error.WriteFailed;
@@ -2299,7 +2346,7 @@ const Connection = struct {
             reserved_plain = 0;
             self.config.gpa.free(bytes);
         } else {
-            try self.sendAccountedWire(bytes, flush, ticket, ticket_slot, control_n, control_entry);
+            try self.sendAccountedWire(bytes, flush, ticket, ticket_slot, ticket_count, control_n, control_entry);
         }
     }
 

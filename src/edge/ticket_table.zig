@@ -35,11 +35,15 @@
 const std = @import("std");
 const response = @import("../http/response.zig");
 
+pub const no_completion_slot = std.math.maxInt(u32);
+
 pub const TicketWait = struct {
     event: std.Io.Event = .unset,
     ok: bool = false,
     in_use: std.atomic.Value(bool) = .init(false),
     ticket: std.atomic.Value(u64) = .init(0),
+    /// Actor-written, AckDrainer-read link for tickets sharing one wire chunk.
+    completion_next: std.atomic.Value(u32) = .init(no_completion_slot),
 };
 
 /// Test-only two-task barrier around reserve preclaim/postclaim.
@@ -92,6 +96,7 @@ pub const TicketTable = struct {
                 }
                 slot.ok = false;
                 slot.event.reset();
+                slot.completion_next.store(no_completion_slot, .release);
                 slot.ticket.store(ticket, .release);
                 // Recheck again after publishing ticket (failAll may race between checks).
                 if (self.write_failed.load(.acquire)) {
@@ -107,9 +112,37 @@ pub const TicketTable = struct {
         return error.OutOfMemory;
     }
 
+    /// Link two reserved tickets that will complete on the same wire write.
+    ///
+    /// The actor publishes the link before queueing the chunk. The AckDrainer
+    /// reads it before waking the current slot, because that wake lets the
+    /// handler release and immediately reuse the slot.
+    pub fn linkCompletion(self: *TicketTable, from_slot: u32, to_slot: u32) error{InvalidSlot}!void {
+        if (from_slot >= self.slots.len or to_slot >= self.slots.len) return error.InvalidSlot;
+        const from = &self.slots[from_slot];
+        const to = &self.slots[to_slot];
+        if (!from.in_use.load(.acquire) or !to.in_use.load(.acquire)) return error.InvalidSlot;
+        from.completion_next.store(to_slot, .release);
+    }
+
+    /// AckDrainer-only snapshot. Call before `complete`, whose event wake lets
+    /// the handler release and reuse this slot.
+    pub fn completion(self: *TicketTable, slot_i: u32) ?struct { ticket: u64, next: u32 } {
+        if (slot_i >= self.slots.len) return null;
+        const slot = &self.slots[slot_i];
+        if (!slot.in_use.load(.acquire)) return null;
+        const ticket = slot.ticket.load(.acquire);
+        if (ticket == 0) return null;
+        return .{
+            .ticket = ticket,
+            .next = slot.completion_next.load(.acquire),
+        };
+    }
+
     pub fn releaseReserved(self: *TicketTable, slot_i: u32) void {
         if (slot_i >= self.slots.len) return;
         const slot = &self.slots[slot_i];
+        slot.completion_next.store(no_completion_slot, .release);
         slot.ticket.store(0, .release);
         slot.in_use.store(false, .release);
     }
@@ -180,6 +213,35 @@ test "ticket reserve wait complete reuse" {
     _ = c;
     table.complete(b[1], b[0], false);
     try std.testing.expectError(error.WriteFailed, table.wait(b[1], null));
+}
+
+test "completion links survive until every batched ticket is snapped" {
+    var storage: [4]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    const a = try table.reserve();
+    const b = try table.reserve();
+    const c = try table.reserve();
+    try table.linkCompletion(a[1], b[1]);
+    try table.linkCompletion(b[1], c[1]);
+
+    const a_meta = table.completion(a[1]).?;
+    try std.testing.expectEqual(a[0], a_meta.ticket);
+    try std.testing.expectEqual(b[1], a_meta.next);
+    table.complete(a[1], a_meta.ticket, true);
+
+    const b_meta = table.completion(a_meta.next).?;
+    try std.testing.expectEqual(b[0], b_meta.ticket);
+    try std.testing.expectEqual(c[1], b_meta.next);
+    table.complete(b[1], b_meta.ticket, true);
+
+    const c_meta = table.completion(b_meta.next).?;
+    try std.testing.expectEqual(c[0], c_meta.ticket);
+    try std.testing.expectEqual(no_completion_slot, c_meta.next);
+    table.complete(c[1], c_meta.ticket, true);
+
+    try table.wait(a[1], null);
+    try table.wait(b[1], null);
+    try table.wait(c[1], null);
 }
 
 test "ticket releaseReserved on abandon" {
