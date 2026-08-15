@@ -2932,8 +2932,25 @@ const Connection = struct {
             try self.lockSession();
             if (traced) t_acquired = nowNs(self.config.io);
             defer self.unlockSession(self.config.io);
+            // The handler enqueues and leaves. It does NOT drain.
+            //
+            // `enqueuePending` already sets `sched_refilled` and wakes the
+            // actor, and the actor drains under this same lock every turn, so
+            // the bytes still reach the wire — one actor turn later instead of
+            // inside this critical section.
+            //
+            // Draining here made every handler the emitter for its own event:
+            // 200 streams took 200 separate acquisitions, each framing,
+            // debiting, encrypting and pushing one frame. Measured, that
+            // critical section is 20.3us wide and 95% of an event's life was
+            // spent queueing for it, which capped one connection at 1/20.3us,
+            // about 49k events/s. The actor drains every stream that arrived
+            // while it was busy in ONE acquisition, so the width stops being
+            // paid per event.
+            //
+            // It also restores the ownership rule this module states at the
+            // top: only the actor emits.
             self.enqueuePending(stream_id, wire_bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
-            self.processIntents() catch return error.WriteFailed;
         }
         if (traced) t_unlocked = nowNs(self.config.io);
         if (need_wait) {
