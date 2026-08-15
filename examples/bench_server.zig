@@ -26,11 +26,53 @@ fn helloHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, BODY);
 }
 
+/// The SSE arm: one event every `--sse-interval-ms`, each carrying the
+/// monotonic nanosecond count at the moment the server wrote it.
+///
+/// The timestamp is the whole point. A client that only counts events measures
+/// throughput, and throughput is not the property that matters for a long-lived
+/// stream — delivery latency under many concurrent streams is. Both ends run on
+/// one machine and read the same clock, so the subtraction is valid.
+///
+/// The stream runs forever. The client closes it, because a server-side event
+/// budget would end the measurement early on exactly the slow streams that the
+/// benchmark is looking for.
+var g_sse_interval_ms: u64 = 100;
+
+fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.startSse(&.{});
+    var buf: [64]u8 = undefined;
+
+    // Sleep to a DEADLINE, never for a duration. `sleep(interval)` in a loop
+    // makes the period interval plus the work, so the emitted rate drifts below
+    // the requested rate and the arm looks like it dropped events when it only
+    // ticked slowly. That is a defect in a benchmark, not a measurement of the
+    // server. Go's time.Ticker keeps a schedule, so the arms must match.
+    const interval_ns: i128 = @as(i128, @intCast(g_sse_interval_ms)) * std.time.ns_per_ms;
+    var next: i128 = zio.Timestamp.now(.realtime).toNanoseconds() + interval_ns;
+    while (true) {
+        const now_ns: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
+        if (next > now_ns) {
+            zio.sleep(.fromNanoseconds(@intCast(next - now_ns))) catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+                return err;
+            };
+        }
+        next += interval_ns;
+        const sent: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
+        const ev = try std.fmt.bufPrint(&buf, "data: {d}\n\n", .{sent});
+        body.writeAll(ev) catch break;
+        try zio.maybeYield();
+    }
+    try body.finish();
+}
+
 const Args = struct {
     port: u16 = 0,
     tls: bool = true,
     cert: []const u8 = "testdata/cert.pem",
     key: []const u8 = "testdata/key.pem",
+    sse_interval_ms: u64 = 100,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
@@ -47,6 +89,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.cert = try gpa.dupe(u8, args.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, a, "--key")) {
             out.key = try gpa.dupe(u8, args.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, a, "--sse-interval-ms")) {
+            out.sse_interval_ms = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
         } else {
             return error.UnknownArgument;
         }
@@ -56,10 +100,12 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 
 fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process.Args, io: std.Io) !void {
     const args = try parseArgs(gpa, process_args);
+    g_sse_interval_ms = args.sse_interval_ms;
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", args.port);
 
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/", .handler = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } },
+        .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } },
     };
 
     var cert_pem: []u8 = &.{};
