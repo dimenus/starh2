@@ -42,6 +42,14 @@ const std = @import("std");
 /// near 5%.
 const client_limit_ratio: f64 = 1.10;
 
+/// Below this fraction of the mean, the doubled-threads run did not measure the
+/// server — it failed. Observed: an arm read 3,311 req/s against a mean of
+/// 224,682, a 68x collapse, because a leftover process still held the port. The
+/// client-limited check above only looks for a RISE, so it called that run
+/// "server-bound" and the tool exited 0. A benchmark that reports a broken run
+/// as a good one is worse than one that crashes.
+const collapse_ratio: f64 = 0.5;
+
 const Config = struct {
     server: []const u8 = "",
     opponent: []const u8 = "",
@@ -261,18 +269,30 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n  {s:<12} {s:>12} {s:>14} {s:>10}\n", .{ "arm", "mean req/s", "at 2x threads", "verdict" });
     var limited_any = false;
+    var collapsed_any = false;
     for (arms.items) |arm| {
         const m = mean(arm.rps[0..cfg.rounds]);
         const limited = arm.rps_double > m * client_limit_ratio;
+        const collapsed = arm.rps_double < m * collapse_ratio;
         if (limited) limited_any = true;
+        if (collapsed) collapsed_any = true;
         std.debug.print("  {s:<12} {d:>12.0} {d:>14.0} {s:>10}\n", .{
             arm.name,
             m,
             arm.rps_double,
-            if (limited) "CLIENT-LIMITED" else "server-bound",
+            if (collapsed) "BROKEN RUN" else if (limited) "CLIENT-LIMITED" else "server-bound",
         });
     }
 
+    if (collapsed_any) {
+        std.debug.print(
+            "\nbench: an arm fell below {d:.0}% of its own mean when h2load got twice the\n" ++
+                "threads. That is not a slower server, it is a run that did not happen —\n" ++
+                "a port still held by a previous process is the usual cause. Re-run.\n",
+            .{collapse_ratio * 100},
+        );
+        std.process.exit(3);
+    }
     if (limited_any) {
         std.debug.print(
             "\nbench: at least one arm rose more than {d:.0}% when h2load got twice the threads.\n" ++
