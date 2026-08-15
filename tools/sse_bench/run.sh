@@ -53,8 +53,13 @@ go build -o "$OUT/sse-server" ./server.go || exit 1
 go build -o "$OUT/sse-client" ./client.go || exit 1
 
 cd "$REPO"
-./zb build starh2-bench-server -Doptimize=ReleaseFast || exit 1
-STARH2=$(ls -t "$REPO"/.zig-cache/o/*/starh2-bench-server | head -1)
+# Install to a known prefix and use THAT path. Picking the newest binary in
+# .zig-cache by mtime measures whatever the last build step happened to write:
+# after `zig build ci`, that is an example at a different optimize level, and
+# the run then reports a number for a binary nobody asked for. Observed: a
+# 4.7x improvement read back as no change at all.
+./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
+STARH2="$OUT/starh2/bin/starh2-bench-server"
 
 "$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" > "$OUT/starh2.log" 2>&1 &
 S_PID=$!

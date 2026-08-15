@@ -13,8 +13,13 @@ set -u
 OUT=${OUT:-/tmp/starh2-sse-bench}
 REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 cd "$REPO"
-./zb build starh2-bench-server -Doptimize=ReleaseFast || exit 1
-STARH2=$(ls -t "$REPO"/.zig-cache/o/*/starh2-bench-server | head -1)
+# Install to a known prefix and use THAT path. Picking the newest binary in
+# .zig-cache by mtime measures whatever the last build step happened to write:
+# after `zig build ci`, that is an example at a different optimize level, and
+# the run then reports a number for a binary nobody asked for. Observed: a
+# 4.7x improvement read back as no change at all.
+./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
+STARH2="$OUT/starh2/bin/starh2-bench-server"
 [ -x "$OUT/sse-client" ] || { echo "run tools/sse_bench/run.sh first to build the client" >&2; exit 1; }
 "$STARH2" --mode tls --port 19448 --sse-interval-ms 1 --trace --trace-every 256 > /tmp/tr-server.log 2>&1 &
 S_PID=$!
