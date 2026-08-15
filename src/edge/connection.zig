@@ -139,6 +139,77 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 
+/// Phase trace for one flushed write, off unless a benchmark turns it on.
+///
+/// # Why this exists
+///
+/// A saturated connection delivers ~45k SSE events/s while the process uses
+/// 1.7 of 12 cores, and a CPU profile cannot say why: contention on
+/// `session_mu`, work done under it, transport handoff, and wake-to-run latency
+/// all produce the same futex and scheduler frames. On-CPU sampling cannot see
+/// time a task spends blocked or runnable-but-not-scheduled, which is where a
+/// serialized pipeline actually spends its time.
+///
+/// So each sampled event is timestamped at four boundaries and reported as
+/// three intervals plus the receipt:
+///
+/// - `block`   before `lockSession` -> after acquire. Dominant means a convoy on
+///             the mutex: tasks queue for the lock itself.
+/// - `hold`    after acquire -> after unlock. Dominant means the serial section
+///             is genuinely expensive: framing, flow-control debit, encryption,
+///             or the blocking `write_ch.putOne` that runs while the lock is
+///             held.
+/// - `ack`     unlock -> `tickets.complete` on the AckDrainer. Dominant means
+///             the transport handoff, not the connection's own work.
+/// - `resume`  `tickets.complete` -> `waitTicket` returns. Dominant means
+///             wake-to-run scheduler latency, not any of the above.
+///
+/// One event in `trace_sample_every` is measured, so the instrument cannot
+/// become the load. Counters are server-wide and monotonic; a harness reads
+/// them before and after a run and divides.
+pub const trace = struct {
+    /// Set once at boot by a benchmark binary. A plain bool: it is written
+    /// before any connection exists and only read afterwards.
+    pub var enabled: bool = false;
+    pub var sample_every: u64 = 1024;
+
+    pub var writes: std.atomic.Value(u64) = .init(0);
+    /// Sampled events refused because another sample was already in flight on
+    /// that connection. Printed, because a low sample count with a silent skip
+    /// count is how a trace hides that it measured a biased subset.
+    pub var skipped: std.atomic.Value(u64) = .init(0);
+    pub var samples: std.atomic.Value(u64) = .init(0);
+    pub var block_ns: std.atomic.Value(u64) = .init(0);
+    pub var hold_ns: std.atomic.Value(u64) = .init(0);
+    pub var ack_ns: std.atomic.Value(u64) = .init(0);
+    pub var resume_ns: std.atomic.Value(u64) = .init(0);
+    /// Worst single sample of each, so a mean cannot hide a stall.
+    pub var block_max: std.atomic.Value(u64) = .init(0);
+    pub var hold_max: std.atomic.Value(u64) = .init(0);
+    pub var ack_max: std.atomic.Value(u64) = .init(0);
+    pub var resume_max: std.atomic.Value(u64) = .init(0);
+
+    fn bumpMax(cell: *std.atomic.Value(u64), v: u64) void {
+        var cur = cell.load(.monotonic);
+        while (v > cur) {
+            cur = cell.cmpxchgWeak(cur, v, .monotonic, .monotonic) orelse break;
+        }
+    }
+
+    pub fn snapshot(out: *[10]u64) void {
+        out[0] = samples.load(.acquire);
+        out[1] = block_ns.load(.acquire);
+        out[2] = hold_ns.load(.acquire);
+        out[3] = ack_ns.load(.acquire);
+        out[4] = resume_ns.load(.acquire);
+        out[5] = block_max.load(.acquire);
+        out[6] = hold_max.load(.acquire);
+        out[7] = ack_max.load(.acquire);
+        out[8] = writes.load(.acquire);
+        out[9] = skipped.load(.acquire);
+    }
+};
+
 pub const Mode = enum { h2c, tls_h2 };
 
 pub const ConnConfig = struct {
@@ -438,6 +509,11 @@ const Connection = struct {
     /// the mutex not held at all — which is exactly how the two sites in t-731
     /// read Session and scheduler state unsynchronized.
     session_held: bool = false,
+    /// Phase-trace handoff for ONE sampled write at a time. The handler stores
+    /// the ticket it is about to wait on; the AckDrainer stamps the completion
+    /// time for that exact ticket. See `trace`.
+    trace_ticket: std.atomic.Value(u64) = .init(0),
+    trace_ack_ns: std.atomic.Value(u64) = .init(0),
     live_handlers: std.atomic.Value(usize) = .init(0),
     reaper: ?*ReaperPool = null,
     completion_ch_buf: []u31 = &.{},
@@ -790,6 +866,9 @@ const Connection = struct {
                 // Do NOT touch handlers[] — actor applies connection_closed terminals.
                 self.wakeAllSpace();
             } else if (ack.ticket != 0) {
+                if (trace.enabled and self.trace_ticket.load(.acquire) == ack.ticket) {
+                    self.trace_ack_ns.store(nowNs(self.config.io), .release);
+                }
                 self.tickets.complete(ack.ticket_slot, ack.ticket, ack.ok);
             }
             if (ack.outbound_release != 0) self.wakeAllSpace();
@@ -2826,17 +2905,64 @@ const Connection = struct {
             ticket = ticket_pair[0];
             slot_i = ticket_pair[1];
         }
+
+        // Sampled phase trace. `traced` is decided once, so every stamp below
+        // belongs to the same event.
+        // One sample in flight per connection. Claiming the slot with a CAS
+        // rather than a store matters: a plain store lets a later sample
+        // overwrite an earlier one, and the overwritten event is then dropped
+        // at the end — which silently selects for events that finished before
+        // the next sample started, i.e. the fast ones. Refusing to start a
+        // second overlapping sample removes that bias.
+        var traced = trace.enabled and need_wait and
+            (trace.writes.fetchAdd(1, .monotonic) % trace.sample_every == 0);
+        if (traced) {
+            traced = self.trace_ticket.cmpxchgStrong(0, ticket, .acq_rel, .monotonic) == null;
+            if (!traced) _ = trace.skipped.fetchAdd(1, .monotonic);
+        }
+        var t_before: u64 = 0;
+        var t_acquired: u64 = 0;
+        var t_unlocked: u64 = 0;
+        if (traced) {
+            self.trace_ack_ns.store(0, .release);
+            t_before = nowNs(self.config.io);
+        }
         {
             errdefer if (need_wait) self.tickets.releaseReserved(slot_i);
             try self.lockSession();
+            if (traced) t_acquired = nowNs(self.config.io);
             defer self.unlockSession(self.config.io);
             self.enqueuePending(stream_id, wire_bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
             self.processIntents() catch return error.WriteFailed;
         }
+        if (traced) t_unlocked = nowNs(self.config.io);
         if (need_wait) {
             hctx.slot.awaiting_receipt.store(true, .release);
             defer hctx.slot.awaiting_receipt.store(false, .release);
             try self.waitTicket(slot_i, hctx.terminal);
+        }
+        if (traced) {
+            const t_done = nowNs(self.config.io);
+            // The AckDrainer stamps this when it completes THIS ticket. Zero
+            // means the receipt never went through that path, so the sample is
+            // dropped rather than folded in with a bogus split.
+            const t_ack = self.trace_ack_ns.load(.acquire);
+            self.trace_ticket.store(0, .release);
+            if (t_ack >= t_unlocked and t_done >= t_ack) {
+                const block = t_acquired - t_before;
+                const hold = t_unlocked - t_acquired;
+                const ack = t_ack - t_unlocked;
+                const res = t_done - t_ack;
+                _ = trace.samples.fetchAdd(1, .monotonic);
+                _ = trace.block_ns.fetchAdd(block, .monotonic);
+                _ = trace.hold_ns.fetchAdd(hold, .monotonic);
+                _ = trace.ack_ns.fetchAdd(ack, .monotonic);
+                _ = trace.resume_ns.fetchAdd(res, .monotonic);
+                trace.bumpMax(&trace.block_max, block);
+                trace.bumpMax(&trace.hold_max, hold);
+                trace.bumpMax(&trace.ack_max, ack);
+                trace.bumpMax(&trace.resume_max, res);
+            }
         }
     }
 

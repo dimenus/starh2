@@ -20,6 +20,24 @@ const starh2 = @import("starh2");
 
 const dummy: u8 = 0;
 
+const trace = starh2.edge.connection.trace;
+
+/// GET /trace returns the phase-trace counters as JSON. The harness reads it
+/// before and after a run and divides, so the numbers are deltas over a known
+/// window rather than lifetime averages.
+fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var snap: [10]u64 = undefined;
+    trace.snapshot(&snap);
+    var buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &buf,
+        "{{\"samples\":{d},\"block_ns\":{d},\"hold_ns\":{d},\"ack_ns\":{d},\"resume_ns\":{d}," ++
+            "\"block_max\":{d},\"hold_max\":{d},\"ack_max\":{d},\"writes\":{d},\"skipped\":{d}}}\n",
+        .{ snap[0], snap[1], snap[2], snap[3], snap[4], snap[5], snap[6], snap[7], snap[8], snap[9] },
+    );
+    try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, body);
+}
+
 const BODY = "Hello, World!";
 
 fn helloHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
@@ -133,6 +151,8 @@ const Args = struct {
     cert: []const u8 = "testdata/cert.pem",
     key: []const u8 = "testdata/key.pem",
     sse_interval_ms: u64 = 100,
+    trace: bool = false,
+    trace_every: u64 = 1024,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
@@ -151,6 +171,10 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.key = try gpa.dupe(u8, args.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, a, "--sse-interval-ms")) {
             out.sse_interval_ms = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--trace")) {
+            out.trace = true;
+        } else if (std.mem.eql(u8, a, "--trace-every")) {
+            out.trace_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
         } else {
             return error.UnknownArgument;
         }
@@ -161,6 +185,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process.Args, io: std.Io) !void {
     const args = try parseArgs(gpa, process_args);
     g_sse_interval_ms = args.sse_interval_ms;
+    trace.enabled = args.trace;
+    trace.sample_every = args.trace_every;
     g_io = rt.io();
     var ticker_handle = try rt.spawn(tickerTask, .{});
     defer ticker_handle.cancel();
@@ -170,6 +196,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .{ .method = .GET, .path = "/", .handler = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } },
         .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } },
         .{ .method = .GET, .path = "/sse-broadcast", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseBroadcastHandler } },
+        .{ .method = .GET, .path = "/trace", .handler = .{ .ptr = @constCast(&dummy), .runFn = traceHandler } },
     };
 
     var cert_pem: []u8 = &.{};
