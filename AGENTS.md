@@ -11,6 +11,39 @@ Server-side HTTP/2 stack shaped around Datastar. Rationale lives in the git log
   here has no stated reason.
 - Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib lookups. Do not guess 0.16 APIs.
 
+## Premises — treat these as settled, and say so when you delegate
+
+State these in any brief you hand to another agent or reviewer. A reviewer
+cannot tell which of your constraints are real, and it will argue a false one
+with more confidence than a true one, costing a whole round.
+
+- **This stack is malleable and not in real use.** There are no external
+  consumers. A breaking change costs its lifetime minimum today and rises from
+  here. Do NOT weigh backward compatibility, do not add a compatible shim beside
+  the better design, and do not defer a redesign to protect a caller that does
+  not exist. Propose the breaking change, name what it breaks, and land it.
+- **Prefer share-nothing.** A task should own its state outright and exchange
+  messages, rather than share state behind a lock. Where this stack shares, it
+  has paid for it twice: `session_mu` covers `Session`, the `FairScheduler` and
+  the TLS connection together, and that single domain is both the measured
+  throughput ceiling of one connection and the site of the ownership violations
+  fixed in `cad283d`. When a design needs a new mutex, that is the signal to ask
+  which task should have owned the state instead.
+- **Do not fight `std.Io` or `zio`.** Use the grain: a buffered writer with an
+  explicit `flush`, `std.Io` ownership and cancellation, zio's tasks and
+  channels. Building parallel machinery beside the standard shape is how a
+  contract ends up stated in a comment and contradicted by the code. If the
+  grain genuinely does not fit, say which API and why, in the commit message.
+
+Re-derive the performance claims above rather than citing them; the numbers move
+with the machine:
+
+```sh
+./zb build bench -Doptimize=ReleaseFast -- -n 100000 -c 50 -m 10 -t 4 --rounds 3
+tools/sse_bench/run.sh          # concurrent SSE against Go net/http
+tools/sse_bench/phase-trace.sh  # where one flushed event spends its time
+```
+
 ## Gates
 
 ```sh
