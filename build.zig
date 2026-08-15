@@ -413,9 +413,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example-hello", .path = "examples/hello.zig" },
         .{ .name = "example-datastar-sse", .path = "examples/datastar_sse.zig" },
         .{ .name = "starh2-conformance-server", .path = "examples/conformance_server.zig" },
+        .{ .name = "starh2-bench-server", .path = "examples/bench_server.zig" },
     };
     // The TLS gate drives this binary, so keep a handle to it.
     var conformance_exe: ?*std.Build.Step.Compile = null;
+    // The bench harness drives this one, and only at ReleaseFast.
+    var bench_server_exe: ?*std.Build.Step.Compile = null;
     inline for (examples) |ex| {
         const exe_mod = b.createModule(.{
             .root_source_file = b.path(ex.path),
@@ -438,6 +441,9 @@ pub fn build(b: *std.Build) void {
         build_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         if (comptime std.mem.eql(u8, ex.name, "starh2-conformance-server")) {
             conformance_exe = exe;
+        }
+        if (comptime std.mem.eql(u8, ex.name, "starh2-bench-server")) {
+            bench_server_exe = exe;
         }
     }
 
@@ -553,6 +559,27 @@ pub fn build(b: *std.Build) void {
     readme_doctest_run.stdio = .inherit;
     const readme_doctest_step = b.step("readme-doctest", "Compile every marked zig block in README.md as an external consumer");
     readme_doctest_step.dependOn(&readme_doctest_run.step);
+
+    // One-shot throughput, against another implementation when one is given.
+    // Deliberately NOT in `ci`: a throughput number on a shared machine is
+    // noise, and a gate that fails on noise gets ignored. Run it on purpose.
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_run.addArg("--server");
+    bench_run.addFileArg(bench_server_exe.?.getEmittedBin());
+    if (b.args) |extra| bench_run.addArgs(extra);
+    bench_run.setCwd(b.path("."));
+    bench_run.has_side_effects = true;
+    bench_run.stdio = .inherit;
+    const bench_step = b.step("bench", "One-shot h2 throughput: starh2 tls vs h2c, plus --opponent <binary>");
+    bench_step.dependOn(&bench_run.step);
 
     const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + every release target");
     ci_step.dependOn(test_step);
