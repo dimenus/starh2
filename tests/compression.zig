@@ -341,16 +341,13 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
     const e1 = "data: <div id=\"a\">one</div>\n\n";
     const e2 = "data: <div id=\"a\">two-repeats-similar-html</div>\n\n";
     const e3 = "data: <div id=\"a\">three-still-similar</div>\n\n";
-    // Separated in TIME, which is the shape I4 is about. Written back to back
-    // they may legitimately share one DATA frame, because the actor coalesces a
-    // drain turn — and then a stream that buffered everything would look
-    // identical to one that emitted each event. A real SSE producer waits
-    // between events, so this one does too, and the gap is what makes the
-    // difference observable.
+    // No sleep, and no explicit flush: an SSE write is its own barrier. It
+    // returns only once its bytes have reached the wire, so event 2 cannot
+    // share a DATA frame with event 1 — which is precisely the property the
+    // assertions downstream check. A timed gap would test the clock instead,
+    // and would go quiet the moment the barrier was removed.
     try body.writeAll(e1);
-    try zio.sleep(.fromMilliseconds(5));
     try body.writeAll(e2);
-    try zio.sleep(.fromMilliseconds(5));
     try body.writeAll(e3);
     try body.finish();
 }
