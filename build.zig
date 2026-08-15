@@ -527,10 +527,38 @@ pub fn build(b: *std.Build) void {
     const tls_smoke_step = b.step("tls-smoke", "TLS-edge gate: fresh curl connections against the conformance server");
     tls_smoke_step.dependOn(&tls_smoke_run.step);
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + every release target");
+    // The README gate. `zig build test` compiles the examples, never the
+    // README, so a snippet can name an API no consumer can reach and stay
+    // green for months — which is exactly what happened to the Datastar
+    // section between 23dd119 and 4be7eb9. This writes a package that declares
+    // starh2 as a path dependency, wires it with the addImport lines copied
+    // out of README.md, and compiles every marked block against it.
+    const readme_doctest_exe = b.addExecutable(.{
+        .name = "readme-doctest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/readme_doctest.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const readme_doctest_run = b.addRunArtifact(readme_doctest_exe);
+    readme_doctest_run.addArgs(&.{ "--readme", "README.md" });
+    readme_doctest_run.addArgs(&.{ "--out", ".zig-cache/readme-doctest" });
+    // Relative path from the generated package back to this repo, for its path
+    // dependency. It follows --out, so both live on this one line.
+    readme_doctest_run.addArgs(&.{ "--repo-rel", "../.." });
+    readme_doctest_run.addArgs(&.{ "--zig", b.graph.zig_exe });
+    readme_doctest_run.setCwd(b.path("."));
+    readme_doctest_run.has_side_effects = true;
+    readme_doctest_run.stdio = .inherit;
+    const readme_doctest_step = b.step("readme-doctest", "Compile every marked zig block in README.md as an external consumer");
+    readme_doctest_step.dependOn(&readme_doctest_run.step);
+
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + every release target");
     ci_step.dependOn(test_step);
     ci_step.dependOn(test_exact_step);
     ci_step.dependOn(fuzz_smoke_step);
     ci_step.dependOn(&tls_smoke_run.step);
+    ci_step.dependOn(&readme_doctest_run.step);
     ci_step.dependOn(release_step);
 }

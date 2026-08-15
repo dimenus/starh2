@@ -32,11 +32,19 @@ would need the same conformance and security work as the paths that are used.
 
 ```sh
 zig fetch --save git+https://github.com/dimenus/starh2
+zig fetch --save git+https://github.com/lalinsky/zio
 ```
 
+<!-- doctest: build -->
 ```zig
 const starh2 = b.dependency("starh2", .{ .target = target, .optimize = optimize });
 exe_mod.addImport("starh2", starh2.module("starh2"));
+
+// `Server.init` takes a `std.Io`. zio provides one, and it is the
+// implementation starh2 is built and tested against. Declare it yourself, so
+// starh2's pin of zio is not forced on you.
+const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+exe_mod.addImport("zio", zio.module("zio"));
 ```
 
 ## Use
@@ -44,6 +52,7 @@ exe_mod.addImport("starh2", starh2.module("starh2"));
 A cleartext server, prior-knowledge HTTP/2. There is no `Upgrade` handshake: a
 client speaks HTTP/2 immediately or it is refused.
 
+<!-- doctest: program -->
 ```zig
 const std = @import("std");
 const zio = @import("zio");
@@ -78,6 +87,7 @@ failed. `server.requestShutdown()` starts a graceful stop.
 
 For TLS, swap the endpoint and supply PEM bytes:
 
+<!-- doctest: config -->
 ```zig
 .endpoints = &.{.{ .tls_h2 = addr }},
 .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
@@ -88,6 +98,7 @@ handshake.
 
 ### Responses
 
+<!-- doctest: handler -->
 ```zig
 // One shot: headers and a complete body.
 try resp.send(200, &.{}, body);
@@ -114,6 +125,7 @@ Exact paths are matched first, so adding a prefix route never changes what an
 existing exact route answers. Among prefix routes the longest match wins, and
 `Request.path_remainder` carries the bytes past the prefix.
 
+<!-- doctest: route -->
 ```zig
 .{ .method = .GET, .path = "/v1/tasks/", .prefix = true, .handler = h },
 ```
@@ -126,9 +138,11 @@ until the peer reads, rather than growing a buffer.
 
 That makes the memory ceiling computable before the process serves anything:
 
+<!-- doctest: snippet -->
 ```zig
 const bound = try starh2.Limits.defaults.resourceUpperBound();
-// bound.allocator_bytes, plus bound.terms for the per-term breakdown
+// bound.terms holds the per-term breakdown behind this total.
+std.debug.print("upper bound: {d} bytes\n", .{bound.allocator_bytes});
 ```
 
 `Server.init` calls it first and refuses to start on `error.InvalidConfig`, so
@@ -146,15 +160,18 @@ then stops.
 Signal reads live in their own module, `starh2_datastar`. Add it beside the core
 module only if you want them:
 
+<!-- doctest: build -->
 ```zig
 exe_mod.addImport("starh2_datastar", starh2.module("starh2_datastar"));
 ```
 
+<!-- doctest: handler -->
 ```zig
 const ds = @import("starh2_datastar");
 
 const Signals = struct { query: []const u8 = "" };
 const signals = try ds.readSignalsFromQuery(Signals, req); // or ...FromBody
+try resp.send(200, &.{}, signals.query);
 ```
 
 Datastar sends client-side state as JSON, in the `datastar` query parameter for
