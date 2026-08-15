@@ -2062,6 +2062,8 @@ const Connection = struct {
             last_ticket_slot: u32 = 0,
             ticket_count: u32 = 0,
             needs_flush: bool = false,
+            control_n: usize = 0,
+            control_entry: bool = false,
 
             fn capacity(batch: *const @This()) usize {
                 // TLS 1.3 application plaintext is at most 16 KiB. The extra
@@ -2099,13 +2101,20 @@ const Connection = struct {
             fn flushBatch(batch: *@This()) anyerror!void {
                 if (batch.len == 0) {
                     std.debug.assert(batch.ticket_count == 0);
+                    std.debug.assert(!batch.control_entry);
                     return;
                 }
-                std.debug.assert(batch.ticket_count > 0);
+                // A response with a body contributes an ordinary HEADERS
+                // control followed by ticketed DATA. A headers-only response
+                // contributes one ticketed control. Either is sufficient to
+                // make a non-empty batch meaningful.
+                std.debug.assert(batch.ticket_count > 0 or batch.control_entry);
                 const flush = batch.needs_flush;
                 const ticket = batch.first_ticket;
                 const ticket_slot = batch.first_ticket_slot;
                 const ticket_count = batch.ticket_count;
+                const control_n = batch.control_n;
+                const control_entry = batch.control_entry;
                 // queueWire encrypts this borrowed slice synchronously. The
                 // buffer is the connection's boot-counted TLS plaintext
                 // scratch, so a batch adds no allocation and no new limit.
@@ -2115,8 +2124,8 @@ const Connection = struct {
                     ticket,
                     ticket_slot,
                     ticket_count,
-                    0,
-                    false,
+                    control_n,
+                    control_entry,
                     false,
                 );
                 batch.len = 0;
@@ -2125,6 +2134,8 @@ const Connection = struct {
                 batch.last_ticket_slot = 0;
                 batch.ticket_count = 0;
                 batch.needs_flush = false;
+                batch.control_n = 0;
+                batch.control_entry = false;
             }
 
             fn sink(
@@ -2141,8 +2152,18 @@ const Connection = struct {
                 // Body bytes were reserved at enqueuePending; release only after the
                 // sink accepted the framed lease. Wire chunk.outbound_release tracks
                 // the framed size reserved in sendAccountedWire (acked separately).
+                //
+                // At most one control entry joins a batch because WireChunk
+                // carries one control-entry release. A second control flushes
+                // the first instead of silently under-releasing the pool.
+                if (control_entry and batch.control_entry) {
+                    batch.flushBatch() catch |err| {
+                        c.config.gpa.free(payload);
+                        return err;
+                    };
+                }
                 const batchable = c.tls_conn != null and
-                    !control_entry and ticket != 0 and
+                    (control_entry or ticket != 0) and
                     payload.len <= batch.capacity();
                 if (batchable) {
                     if (batch.len + payload.len > batch.capacity()) {
@@ -2151,23 +2172,34 @@ const Connection = struct {
                             return err;
                         };
                     }
-                    if (batch.ticket_count != 0) {
-                        c.tickets.linkCompletion(batch.last_ticket_slot, ticket_slot) catch {
-                            c.config.gpa.free(payload);
-                            return error.WriteFailed;
-                        };
-                    } else {
-                        batch.first_ticket = ticket;
-                        batch.first_ticket_slot = ticket_slot;
+                    if (ticket != 0) {
+                        if (batch.ticket_count != 0) {
+                            c.tickets.linkCompletion(batch.last_ticket_slot, ticket_slot) catch {
+                                if (batch.control_entry) {
+                                    c.applyControlRelease(batch.control_n, true);
+                                    batch.control_n = 0;
+                                    batch.control_entry = false;
+                                }
+                                c.config.gpa.free(payload);
+                                return error.WriteFailed;
+                            };
+                        } else {
+                            batch.first_ticket = ticket;
+                            batch.first_ticket_slot = ticket_slot;
+                        }
+                        batch.last_ticket_slot = ticket_slot;
+                        batch.ticket_count += 1;
                     }
                     @memcpy(
                         c.plaintext_scratch[batch.len..][0..payload.len],
                         payload,
                     );
                     batch.len += payload.len;
-                    batch.last_ticket_slot = ticket_slot;
-                    batch.ticket_count += 1;
                     batch.needs_flush = batch.needs_flush or flush;
+                    if (control_entry) {
+                        batch.control_n = control_n;
+                        batch.control_entry = true;
+                    }
                     c.config.gpa.free(payload);
                 } else {
                     batch.flushBatch() catch |err| {
@@ -2966,15 +2998,23 @@ const Connection = struct {
                 .end_stream = body_out.len == 0,
             } }) catch return error.WriteFailed;
             if (body_out.len > 0) {
-                // Materialize the HEADERS intent onto the wire queue BEFORE any
-                // DATA can drain. enqueuePending unlocks the session while it
-                // waits for stream space, and the actor emits DRR DATA the
-                // moment it wakes — so a body crossing outbound_bytes_per_stream
-                // used to reach the peer as DATA with its HEADERS never sent,
-                // which a browser reports as a protocol error and curl waits
-                // out in silence (t-482, the /ui/tasks page).
-                self.processIntents() catch return error.WriteFailed;
-                self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                const pending_len = self.sched.pendingByteLen(stream_id);
+                const fits_without_wait = pending_len < self.config.limits.outbound_bytes_per_stream and
+                    body_out.len <= self.config.limits.outbound_bytes_per_stream - pending_len;
+                if (fits_without_wait) {
+                    // The lock makes this one atomic scheduler turn: DATA is
+                    // staged first, then processIntents places HEADERS in the
+                    // ordinary-control queue and drains control before DATA.
+                    // SinkCtx combines both frames into one TLS plaintext
+                    // input, so one-shot responses pay one pump handoff.
+                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                } else {
+                    // A body that can fill the stream slab may release this
+                    // lock while waiting for capacity. Materialize HEADERS
+                    // first so the actor cannot emit DATA ahead of them (t-482).
+                    self.processIntents() catch return error.WriteFailed;
+                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                }
                 self.processIntents() catch return error.WriteFailed;
             } else {
                 self.next_wire_ticket = ticket;
@@ -3074,11 +3114,11 @@ const Connection = struct {
     /// and not one per chunk. Backpressure still applies through
     /// `enqueuePending`, so this is not an unbounded fire-and-forget.
     /// `flush` means EMIT NOW (the compressor is told to flush and the bytes are
-/// queued). `wait` means BLOCK UNTIL THE WIRE HAS THEM (reserve a ticket and
-/// wait for the receipt). They were one flag, and conflating them cost an SSE
-/// stream a full receipt round trip per event for a barrier nothing was waiting
-/// on. `Body.flush()` sets both; an SSE write sets only the first.
-fn writeCb(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool, flush: bool, wait: bool) response.ResponseError!void {
+    /// queued). `wait` means BLOCK UNTIL THE WIRE HAS THEM (reserve a ticket and
+    /// wait for the receipt). They were one flag, and conflating them cost an SSE
+    /// stream a full receipt round trip per event for a barrier nothing was waiting
+    /// on. `Body.flush()` sets both; an SSE write sets only the first.
+    fn writeCb(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool, flush: bool, wait: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
