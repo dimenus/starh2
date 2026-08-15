@@ -1,4 +1,81 @@
-//! Response brotli compression — I1–I8 live gates.
+//! Response brotli compression — the I1 to I8 live gates.
+//!
+//! These invariants define what this module grades. All of them must hold at
+//! the same time. Each one names the test that pins it. `src/edge/connection.zig`
+//! and `src/http/brotli.zig` refer to these numbers, so keep the list here.
+//!
+//! I1 — Negotiation is exact, per RFC 9110 section 12.5.3. The parser matches
+//! the `br` token without case, and never as a substring. It reads q-values:
+//! `q=0` means the client refuses `br`, and a missing q means 1. A `*` matches
+//! `br`, unless the header names `br` itself. Several `accept-encoding` lines
+//! join into one comma-separated list. No header at all means identity. The
+//! parser drops a malformed member, not the whole header. Pinned by:
+//! - `acceptsBrotli: q-values` (src/http/content_coding.zig)
+//! - `acceptsBrotli: no substring match` (src/http/content_coding.zig)
+//! - `acceptsBrotli: star` (src/http/content_coding.zig)
+//! - `acceptsBrotli: malformed member ignored` (src/http/content_coding.zig)
+//!
+//! I2 — Round-trip identity. The wire bytes of a compressed response decode to
+//! exactly the bytes the handler wrote. `finish()` must emit the final brotli
+//! block, because a truncated stream is a failure. Pinned by:
+//! - `I2 send path round-trips brotli`
+//! - `I2 streaming start path round-trips`
+//!
+//! I3 — The encoder compresses. A compressible body of 64 KiB or more must
+//! reach 25 percent of its original size, or less, at the default quality. This
+//! gate rejects an encoder that emits stored metablocks, and a quality-0
+//! default. Pinned by:
+//! - `I3 big compressible body shrinks under 25 percent`
+//!
+//! I4 — A flush reaches the wire as decodable bytes. This is the SSE invariant,
+//! and it carries the load: a compressor that buffers across events breaks a
+//! Datastar client. After an SSE write, or after an explicit `Body.flush()`, the
+//! bytes sent so far must decode to the complete plaintext of the events so far.
+//! The encoder uses BROTLI_OPERATION_FLUSH at each flush point, and
+//! BROTLI_OPERATION_FINISH at the end of the stream. The test feeds a streaming
+//! decoder one chunk at a time. It asserts that event N decodes before event
+//! N+1 exists. A check of the final bytes alone does not pin this. Pinned by:
+//! - `I4 SSE flush is incrementally decodable before next event`
+//! - `I4 large SSE event over outbound_bytes_per_stream still flushes decodably`
+//!
+//! I5 — Header hygiene. `content-encoding: br` is present exactly when the body
+//! bytes are brotli, never on an identity body, and never absent on a compressed
+//! body. A response for which the configuration made compression eligible
+//! carries `vary: accept-encoding`, merged into a `vary` value that the handler
+//! set. A `content-length` from the handler must never survive next to a
+//! compressed body: the full-body path recomputes or omits it, and the streaming
+//! path omits it. The layer never compresses an empty body, a body below
+//! `compression_min_bytes` on the full-body path, status 204 or 304, a HEAD
+//! response, or a content-type outside the compressible set. If the handler set
+//! any `content-encoding` itself, the layer leaves that response untouched.
+//! Pinned by:
+//! - `I5 hygiene: min bytes, content-encoding passthrough, png, vary merge, no content-length`
+//! - `no accept-encoding stays identity`
+//!
+//! I6 — Memory is bounded and accounted. Every brotli allocation goes through
+//! the custom allocator hooks into a per-context budget of
+//! `compression_context_bytes`. An encoder-init failure BEFORE the response
+//! commits serves identity, and a counter records it. Budget exhaustion AFTER
+//! the headers commit aborts the stream with RST. The layer never changes the
+//! encoding in the middle of a stream. `compression_contexts_per_server` bounds
+//! the live contexts server-wide, and `limits.resourceUpperBound` carries the
+//! `compression_contexts` term. Boot rejects a window that cannot fit the
+//! context budget. Pinned by:
+//! - `I6 pool exhaustion serves identity and counts fallback`
+//! - `lifecycle: shutdown releases live encoder context`
+//! - `mutation canary: compression_contexts term moves with the limit` (src/core/limits.zig)
+//! - `rejects response_compression with zero contexts` (src/core/limits.zig)
+//!
+//! I7 — The whole suite is the gate. `./zb build ci` is the definition of done:
+//! the suite, the exact tests, the fuzz smoke, the TLS gate, and every release
+//! cross-target. Never run a filtered subset and call the work done. Keep the
+//! `test_queue_wire_bypass == 0` mutation canary.
+//!
+//! I8 — Error paths carry exact causes. The compression layer must not turn
+//! `PeerReset`, `SlowConsumer`, or `ConnectionClosed` into `WriteFailed`, and
+//! must not swallow them. A compressed streaming body surfaces a mid-stream peer
+//! reset with the same error as an uncompressed one. Pinned by:
+//! - `I8 compressed stream surfaces PeerReset exactly`
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -860,4 +937,59 @@ test "no accept-encoding stays identity" {
             }.go);
         }
     }.f);
+}
+
+// The invariant list at the top of this file is the only definition of I1 to I8.
+// A rename that leaves a "Pinned by" bullet naming a test which no longer exists
+// makes that list read as covered when it is not, and nothing else reports it.
+// This test reads its own source and proves every local bullet still resolves.
+//
+// A bullet that ends with a parenthesized path names a test in another test
+// binary, which this binary cannot enumerate. Those are reported, not checked.
+test "every Pinned by bullet names a test that exists" {
+    const src = @embedFile("compression.zig");
+    const builtin = @import("builtin");
+
+    var checked: usize = 0;
+    var foreign: usize = 0;
+    var missing: usize = 0;
+
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        const bullet = "//! - `";
+        if (!std.mem.startsWith(u8, line, bullet)) {
+            continue;
+        }
+        const rest = line[bullet.len..];
+        const end = std.mem.indexOfScalar(u8, rest, '`') orelse {
+            std.debug.print("unterminated test name in: {s}\n", .{line});
+            return error.MalformedPinnedBullet;
+        };
+        const name = rest[0..end];
+        // A trailing "(path)" marks a test that lives in another binary.
+        if (std.mem.indexOfScalar(u8, rest[end..], '(') != null) {
+            foreign += 1;
+            continue;
+        }
+        var found = false;
+        for (builtin.test_functions) |t| {
+            if (std.mem.endsWith(u8, t.name, name)) {
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            checked += 1;
+        } else {
+            missing += 1;
+            std.debug.print("docstring pins a test that does not exist: \"{s}\"\n", .{name});
+        }
+    }
+
+    // Zero local bullets means the list was gutted, or the prefix changed.
+    // Silence there would read exactly like a pass, so fail on it.
+    if (checked == 0 or missing != 0) {
+        std.debug.print("pinned bullets: {d} checked, {d} foreign, {d} missing\n", .{ checked, foreign, missing });
+        return error.PinnedTestMissing;
+    }
 }
