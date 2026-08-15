@@ -1,6 +1,7 @@
 //! Ticket wait table owned exclusively by AckDrainer for completion posts.
 //! Handlers reserve a slot (CAS), wait on its semaphore, then clear the slot.
-//! No other task mutates slots except reserve (handler) and complete/failAll (AckDrainer).
+//! Handlers reserve/release, the actor links receipts that share one wire
+//! chunk, and the AckDrainer completes/fails. Cross-task link fields are atomic.
 //!
 //! # What a ticket is for
 //!

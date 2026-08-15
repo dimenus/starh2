@@ -850,7 +850,7 @@ const Connection = struct {
     ///    Note what it does NOT do: it never touches `handlers[]`. Terminal
     ///    causes are actor-owned, and a second writer of that state would race
     ///    the actor's own teardown.
-    /// 3. Otherwise complete the one ticket the chunk carried.
+    /// 3. Otherwise complete every linked ticket the chunk carried.
     /// 4. Wake the space waiters, then the actor.
     ///
     /// The loop exits on the `shutdown` completion, which the WritePump posts
@@ -2036,7 +2036,10 @@ const Connection = struct {
     }
 
     /// Single FairScheduler drain: terminal → ordinary(+forced DATA) → DRR DATA.
-    /// All emits go through queueWire via scheduler sink only.
+    /// Ticketed TLS DATA from that turn is copied into the existing plaintext
+    /// scratch and handed to queueWire as one record-sized input. Non-ticketed
+    /// DATA and controls preserve their immediate per-frame handoff. All emits
+    /// still go through queueWire via the scheduler sink only.
     ///
     /// Actor-only, under `session_mu`. The three callbacks below are how the
     /// scheduler reaches protocol state without knowing what a protocol is: it
@@ -2052,6 +2055,78 @@ const Connection = struct {
     fn drainEmit(self: *Connection) !void {
         self.assertSessionHeld("drainEmit");
         const SinkCtx = struct {
+            c: *Connection,
+            len: usize = 0,
+            first_ticket: u64 = 0,
+            first_ticket_slot: u32 = 0,
+            last_ticket_slot: u32 = 0,
+            ticket_count: u32 = 0,
+            needs_flush: bool = false,
+
+            fn capacity(batch: *const @This()) usize {
+                // TLS 1.3 application plaintext is at most 16 KiB. The extra
+                // scratch byte is decrypt's inner content type, not payload.
+                return batch.c.plaintext_scratch.len - 1;
+            }
+
+            fn queue(
+                batch: *@This(),
+                payload: []u8,
+                flush: bool,
+                ticket: u64,
+                ticket_slot: u32,
+                ticket_count: u32,
+                control_n: usize,
+                control_entry: bool,
+                owns_payload: bool,
+            ) anyerror!void {
+                // A completed batch is still scheduler-originated output even
+                // when it is handed off after `sched.drain` returns.
+                test_in_sched_sink = true;
+                defer test_in_sched_sink = false;
+                try batch.c.queueWire(
+                    payload,
+                    flush,
+                    ticket,
+                    ticket_slot,
+                    ticket_count,
+                    control_n,
+                    control_entry,
+                    owns_payload,
+                );
+            }
+
+            fn flushBatch(batch: *@This()) anyerror!void {
+                if (batch.len == 0) {
+                    std.debug.assert(batch.ticket_count == 0);
+                    return;
+                }
+                std.debug.assert(batch.ticket_count > 0);
+                const flush = batch.needs_flush;
+                const ticket = batch.first_ticket;
+                const ticket_slot = batch.first_ticket_slot;
+                const ticket_count = batch.ticket_count;
+                // queueWire encrypts this borrowed slice synchronously. The
+                // buffer is the connection's boot-counted TLS plaintext
+                // scratch, so a batch adds no allocation and no new limit.
+                try batch.queue(
+                    batch.c.plaintext_scratch[0..batch.len],
+                    flush,
+                    ticket,
+                    ticket_slot,
+                    ticket_count,
+                    0,
+                    false,
+                    false,
+                );
+                batch.len = 0;
+                batch.first_ticket = 0;
+                batch.first_ticket_slot = 0;
+                batch.last_ticket_slot = 0;
+                batch.ticket_count = 0;
+                batch.needs_flush = false;
+            }
+
             fn sink(
                 ctx: *anyopaque,
                 payload: []u8,
@@ -2061,21 +2136,55 @@ const Connection = struct {
                 control_n: usize,
                 control_entry: bool,
             ) anyerror!void {
-                const c: *Connection = @ptrCast(@alignCast(ctx));
-                test_in_sched_sink = true;
-                defer test_in_sched_sink = false;
+                const batch: *@This() = @ptrCast(@alignCast(ctx));
+                const c = batch.c;
                 // Body bytes were reserved at enqueuePending; release only after the
                 // sink accepted the framed lease. Wire chunk.outbound_release tracks
                 // the framed size reserved in sendAccountedWire (acked separately).
-                try c.queueWire(
-                    payload,
-                    flush,
-                    ticket,
-                    ticket_slot,
-                    if (ticket != 0) 1 else 0,
-                    control_n,
-                    control_entry,
-                );
+                const batchable = c.tls_conn != null and
+                    !control_entry and ticket != 0 and
+                    payload.len <= batch.capacity();
+                if (batchable) {
+                    if (batch.len + payload.len > batch.capacity()) {
+                        batch.flushBatch() catch |err| {
+                            c.config.gpa.free(payload);
+                            return err;
+                        };
+                    }
+                    if (batch.ticket_count != 0) {
+                        c.tickets.linkCompletion(batch.last_ticket_slot, ticket_slot) catch {
+                            c.config.gpa.free(payload);
+                            return error.WriteFailed;
+                        };
+                    } else {
+                        batch.first_ticket = ticket;
+                        batch.first_ticket_slot = ticket_slot;
+                    }
+                    @memcpy(
+                        c.plaintext_scratch[batch.len..][0..payload.len],
+                        payload,
+                    );
+                    batch.len += payload.len;
+                    batch.last_ticket_slot = ticket_slot;
+                    batch.ticket_count += 1;
+                    batch.needs_flush = batch.needs_flush or flush;
+                    c.config.gpa.free(payload);
+                } else {
+                    batch.flushBatch() catch |err| {
+                        c.config.gpa.free(payload);
+                        return err;
+                    };
+                    try batch.queue(
+                        payload,
+                        flush,
+                        ticket,
+                        ticket_slot,
+                        if (ticket != 0) 1 else 0,
+                        control_n,
+                        control_entry,
+                        true,
+                    );
+                }
                 if (!control_entry and c.pending_data_outbound_release != 0) {
                     c.applyOutboundRelease(c.pending_data_outbound_release, .pending);
                     c.wakeStreamSpace(c.pending_data_wake_sid);
@@ -2104,8 +2213,9 @@ const Connection = struct {
                 return data_payload;
             }
         };
+        var sink_ctx: SinkCtx = .{ .c = self };
         self.sched.drain(
-            self,
+            &sink_ctx,
             SinkCtx.sink,
             self,
             SinkCtx.streamWin,
@@ -2118,6 +2228,11 @@ const Connection = struct {
                 self.pending_data_outbound_release = 0;
                 self.pending_data_wake_sid = 0;
             }
+            self.writer_failed.store(true, .release);
+            self.handleWriterFailed();
+            return err;
+        };
+        sink_ctx.flushBatch() catch |err| {
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
             return err;
@@ -2273,16 +2388,16 @@ const Connection = struct {
     /// here, on the actor, under `session_mu` — the cipher is actor-owned, and
     /// two tasks driving it concurrently is what crashed the process in t-538.
     ///
-    /// One plaintext frame can become several TLS records, and the ticket, the
-    /// flush flag, and the control-pool release must ride on the LAST record
-    /// only. A ticket attached to an earlier record would tell the handler its
-    /// write was delivered while a later part of the same frame was still
-    /// queued.
+    /// One plaintext input can hold one frame or a drain-turn batch and can
+    /// become several TLS records. The ticket chain, flush flag, and
+    /// control-pool release ride on the LAST record only. A receipt attached to
+    /// an earlier record would tell handlers their writes were delivered while
+    /// later bytes from the same input were still queued.
     ///
-    /// Note the two reservations. The plaintext holds a wire reservation while
-    /// it is being encrypted, and each ciphertext record takes its own. The
-    /// plaintext reservation is released once the last record is queued, so the
-    /// peak accounts for both, which is what actually exists in memory.
+    /// Owned plaintext holds a wire reservation while it is encrypted, and each
+    /// ciphertext record takes its own. A coalesced batch instead borrows the
+    /// boot-counted plaintext scratch, so only its ciphertext needs a dynamic
+    /// reservation. Owned plaintext is released after the last record queues.
     fn queueWire(
         self: *Connection,
         bytes: []u8,
@@ -2292,6 +2407,7 @@ const Connection = struct {
         ticket_count: u32,
         control_n: usize,
         control_entry: bool,
+        owns_bytes: bool,
     ) anyerror!void {
         if (!test_in_sched_sink) {
             _ = test_queue_wire_bypass.fetchAdd(1, .acq_rel);
@@ -2299,17 +2415,20 @@ const Connection = struct {
         const sends = test_wire_sends.fetchAdd(1, .acq_rel);
         const fail_after = test_force_wire_fail_after.load(.acquire);
         if (fail_after != 0 and sends + 1 >= fail_after) {
-            self.config.gpa.free(bytes);
+            if (owns_bytes) self.config.gpa.free(bytes);
             if (control_entry) self.applyControlRelease(control_n, true);
             return error.WriteFailed;
         }
         if (self.tls_conn) |*tc| {
-            if (!self.tryReserveOutboundBytes(bytes.len, .wire)) {
-                self.config.gpa.free(bytes);
-                if (control_entry) self.applyControlRelease(control_n, true);
-                return error.OutOfMemory;
+            var reserved_plain: usize = 0;
+            if (owns_bytes) {
+                if (!self.tryReserveOutboundBytes(bytes.len, .wire)) {
+                    self.config.gpa.free(bytes);
+                    if (control_entry) self.applyControlRelease(control_n, true);
+                    return error.OutOfMemory;
+                }
+                reserved_plain = bytes.len;
             }
-            var reserved_plain = bytes.len;
             errdefer self.applyOutboundRelease(reserved_plain, .wire);
             var off: usize = 0;
             while (off < bytes.len) {
@@ -2321,8 +2440,7 @@ const Connection = struct {
                 std.debug.assert(res.ciphertext_len <= self.ciphertext_scratch.len);
                 if (res.ciphertext_len > 0) {
                     const out = self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]) catch {
-                        self.config.gpa.free(bytes);
-                        reserved_plain = 0;
+                        if (owns_bytes) self.config.gpa.free(bytes);
                         if (control_entry) self.applyControlRelease(control_n, true);
                         return error.OutOfMemory;
                     };
@@ -2334,8 +2452,7 @@ const Connection = struct {
                     const cn: usize = if (is_last) control_n else 0;
                     const ce = is_last and control_entry;
                     self.sendAccountedWire(out, flush and is_last, t, s, tn, cn, ce) catch {
-                        self.config.gpa.free(bytes);
-                        reserved_plain = 0;
+                        if (owns_bytes) self.config.gpa.free(bytes);
                         return error.WriteFailed;
                     };
                 }
@@ -2344,8 +2461,9 @@ const Connection = struct {
             }
             self.applyOutboundRelease(reserved_plain, .wire);
             reserved_plain = 0;
-            self.config.gpa.free(bytes);
+            if (owns_bytes) self.config.gpa.free(bytes);
         } else {
+            std.debug.assert(owns_bytes);
             try self.sendAccountedWire(bytes, flush, ticket, ticket_slot, ticket_count, control_n, control_entry);
         }
     }
