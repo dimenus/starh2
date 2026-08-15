@@ -143,15 +143,35 @@ then stops.
 
 ## Datastar
 
-`starh2.datastar` re-exports the Datastar SDK and adds bounded signal reads:
+Signal reads live in their own module, `starh2_datastar`. Add it beside the core
+module only if you want them:
 
 ```zig
-const Signals = struct { query: []const u8 = "" };
-const signals = try starh2.datastar.readSignalsFromQuery(Signals, req);
+exe_mod.addImport("starh2_datastar", starh2.module("starh2_datastar"));
 ```
+
+```zig
+const ds = @import("starh2_datastar");
+
+const Signals = struct { query: []const u8 = "" };
+const signals = try ds.readSignalsFromQuery(Signals, req); // or ...FromBody
+```
+
+Datastar sends client-side state as JSON, in the `datastar` query parameter for
+a GET and in the body otherwise. This module is that convention and nothing
+else. The generic parts, form decoding and parameter lookup, stay in
+`starh2.http.form`, because they are ordinary HTTP.
 
 Signal JSON is attacker-controlled, so size, nesting depth, and field count are
 bounded before the typed parse runs. Values live in the request arena.
+
+The module does **not** re-export the Datastar SDK, and nothing starh2 ships
+depends on the SDK. The SDK emitters take an allocator and return bytes, so they
+carry no transport coupling and a consumer calls them directly. A re-export
+would oblige every user of an HTTP/2 server to compile a hypermedia SDK, and it
+would force starh2's pin of the SDK onto that consumer. Declare the SDK
+yourself, at the version you want. Inside this repo the SDK is a lazy
+dependency, and `starh2-conformance-server` is the only target that imports it.
 
 ## Architecture
 
