@@ -341,8 +341,16 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
     const e1 = "data: <div id=\"a\">one</div>\n\n";
     const e2 = "data: <div id=\"a\">two-repeats-similar-html</div>\n\n";
     const e3 = "data: <div id=\"a\">three-still-similar</div>\n\n";
-    try body.writeAll(e1); // implicit flush
+    // Separated in TIME, which is the shape I4 is about. Written back to back
+    // they may legitimately share one DATA frame, because the actor coalesces a
+    // drain turn — and then a stream that buffered everything would look
+    // identical to one that emitted each event. A real SSE producer waits
+    // between events, so this one does too, and the gap is what makes the
+    // difference observable.
+    try body.writeAll(e1);
+    try zio.sleep(.fromMilliseconds(5));
     try body.writeAll(e2);
+    try zio.sleep(.fromMilliseconds(5));
     try body.writeAll(e3);
     try body.finish();
 }
@@ -647,6 +655,13 @@ test "I4 SSE flush is incrementally decodable before next event" {
                         if (!saw_e1 and plain.items.len >= e1.len) {
                             try std.testing.expectEqualStrings(e1, plain.items[0..e1.len]);
                             saw_e1 = true;
+                            // Event 1 must be decodable while event 3 is still
+                            // absent. Without this, a stream that buffers every
+                            // event and emits them together at the end passes:
+                            // the final concatenation starts with e1, so the
+                            // check above is satisfied by data that arrived all
+                            // at once, which is exactly what I4 forbids.
+                            try std.testing.expect(plain.items.len < e1.len + e2.len + e3.len);
                         }
                         if (saw_e1 and !saw_e2 and plain.items.len >= e1.len + e2.len) {
                             try std.testing.expectEqualStrings(e1 ++ e2, plain.items[0 .. e1.len + e2.len]);
@@ -656,6 +671,10 @@ test "I4 SSE flush is incrementally decodable before next event" {
                     }
                     try std.testing.expect(saw_e1);
                     try std.testing.expect(saw_e2);
+                    // Three writes, so the events cannot all have ridden one
+                    // DATA frame. A single frame means the per-write emit was
+                    // lost and only the end-of-stream finish produced output.
+                    try std.testing.expect(cap.data_frames >= 2);
                     try std.testing.expect(cap.end_stream);
                     try std.testing.expectEqualStrings("br", cap.headerValue("content-encoding").?);
                     try std.testing.expectEqualStrings(e1 ++ e2 ++ e3, plain.items);

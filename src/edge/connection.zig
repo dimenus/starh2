@@ -3034,7 +3034,12 @@ const Connection = struct {
     /// a handler that writes many small chunks pays one round trip per flush
     /// and not one per chunk. Backpressure still applies through
     /// `enqueuePending`, so this is not an unbounded fire-and-forget.
-    fn writeCb(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool, flush: bool) response.ResponseError!void {
+    /// `flush` means EMIT NOW (the compressor is told to flush and the bytes are
+/// queued). `wait` means BLOCK UNTIL THE WIRE HAS THEM (reserve a ticket and
+/// wait for the receipt). They were one flag, and conflating them cost an SSE
+/// stream a full receipt round trip per event for a barrier nothing was waiting
+/// on. `Body.flush()` sets both; an SSE write sets only the first.
+fn writeCb(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool, flush: bool, wait: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
@@ -3062,7 +3067,7 @@ const Connection = struct {
             if (!flush and !end and wire_bytes.len == 0) return;
         }
 
-        const need_wait = flush or end;
+        const need_wait = wait or end;
         var ticket: u64 = 0;
         var slot_i: u32 = 0;
         if (need_wait) {

@@ -148,7 +148,7 @@ pub const Response = struct {
     ctx: *anyopaque,
     sendFn: *const fn (*anyopaque, u31, u16, []const request.Header, []const u8) ResponseError!void,
     startFn: *const fn (*anyopaque, u31, u16, []const request.Header, bool) ResponseError!void,
-    writeFn: *const fn (*anyopaque, u31, []const u8, bool, bool) ResponseError!void,
+    writeFn: *const fn (*anyopaque, u31, []const u8, bool, bool, bool) ResponseError!void,
     flushFn: *const fn (*anyopaque, u31) ResponseError!void,
     abortFn: *const fn (*anyopaque, u31) ResponseError!void,
 
@@ -201,12 +201,26 @@ pub const Response = struct {
 
     fn writeBody(self: *Response, body: *Body, bytes: []const u8) ResponseError!void {
         try self.checkBody(body);
-        // SSE write has exactly one implicit flush — no second flushCb.
-        // An event that sits in a buffer is a lost event as far as the browser
-        // is concerned, so an SSE write must reach the wire before it returns.
-        // The flush is folded into the write, because a separate flush call
-        // would take a second ticket and a second round trip per event.
-        try self.writeFn(self.ctx, self.stream_id, bytes, false, self.sse);
+        // Two things that used to be one flag, now separate:
+        //
+        // - EMIT. An SSE write still emits immediately: the compressor is told
+        //   to flush, so the bytes leave the encoder and the actor puts them on
+        //   the wire on its next turn. Without this a compressed stream keeps
+        //   every event until the response ends, which for a long-lived stream
+        //   means the client sees nothing at all. That failure is silent, and
+        //   the I4 gates could not see it, so it is not left to the caller.
+        //
+        // - WAIT. The handler does NOT block for a receipt. That cost a ticket
+        //   and a full round trip per event, measured at 140 to 180
+        //   microseconds of waiting that nothing needed: the actor emits an
+        //   enqueued event whether or not the handler is blocked on it.
+        //
+        // `Body.flush()` is the barrier and still waits. Call it when the
+        // handler must know the bytes reached the wire. Backpressure does not
+        // depend on it either way: a handler that outruns the connection blocks
+        // in `waitForStreamSpace`, because the per-stream slab is bounded by
+        // `outbound_bytes_per_stream`.
+        try self.writeFn(self.ctx, self.stream_id, bytes, false, self.sse, self.sse);
     }
 
     fn flushBody(self: *Response, body: *Body) ResponseError!void {
@@ -218,7 +232,8 @@ pub const Response = struct {
         if (self.terminal.getCause()) |c| return causeToError(c);
         if (body.generation != self.terminal.currentGeneration()) return error.BodyClosed;
         if (self.finished) return error.BodyClosed;
-        try self.writeFn(self.ctx, self.stream_id, &.{}, true, true);
+        // end: emit and WAIT — finish must not return before the wire has it.
+        try self.writeFn(self.ctx, self.stream_id, &.{}, true, true, true);
         self.body_open = false;
         self.finished = true;
     }
@@ -252,7 +267,7 @@ test "Body terminal cause precedes generation bump" {
         .sendFn = undefined,
         .startFn = undefined,
         .writeFn = struct {
-            fn f(_: *anyopaque, _: u31, _: []const u8, _: bool, _: bool) ResponseError!void {
+            fn f(_: *anyopaque, _: u31, _: []const u8, _: bool, _: bool, _: bool) ResponseError!void {
                 return error.WriteFailed;
             }
         }.f,
@@ -295,7 +310,7 @@ test "every terminal cause maps to exact Body error" {
             .sendFn = undefined,
             .startFn = undefined,
             .writeFn = struct {
-                fn f(_: *anyopaque, _: u31, _: []const u8, _: bool, _: bool) ResponseError!void {
+                fn f(_: *anyopaque, _: u31, _: []const u8, _: bool, _: bool, _: bool) ResponseError!void {
                     return;
                 }
             }.f,
