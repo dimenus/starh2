@@ -67,6 +67,66 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
     try body.finish();
 }
 
+// The broadcast arm. One ticker wakes every stream, instead of every stream
+// holding its own timer.
+//
+// This exists to separate two explanations of the per-connection ceiling that
+// the profile cannot tell apart: the connection's serialized write path, or the
+// benchmark's own shape of one armed timer per stream. A real hypermedia app
+// pushes when data changes, which is this shape, not a per-viewer tick.
+//
+// If this arm lifts the per-connection number, the timers were the cost. If it
+// does not move, the serialization is.
+var g_io: std.Io = undefined;
+var g_bc_mutex: std.Io.Mutex = .init;
+var g_bc_cond: std.Io.Condition = .init;
+var g_bc_seq: u64 = 0;
+var g_bc_ts: i128 = 0;
+
+fn tickerTask() !void {
+    const interval_ns: i128 = @as(i128, @intCast(g_sse_interval_ms)) * std.time.ns_per_ms;
+    var next: i128 = zio.Timestamp.now(.realtime).toNanoseconds() + interval_ns;
+    while (true) {
+        const now_ns: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
+        if (next > now_ns) {
+            try zio.sleep(.fromNanoseconds(@intCast(next - now_ns)));
+        }
+        next += interval_ns;
+        try g_bc_mutex.lock(g_io);
+        g_bc_seq += 1;
+        g_bc_ts = zio.Timestamp.now(.realtime).toNanoseconds();
+        g_bc_mutex.unlock(g_io);
+        g_bc_cond.broadcast(g_io);
+    }
+}
+
+fn sseBroadcastHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.startSse(&.{});
+    var buf: [64]u8 = undefined;
+
+    try g_bc_mutex.lock(g_io);
+    var seen: u64 = g_bc_seq;
+    g_bc_mutex.unlock(g_io);
+
+    while (true) {
+        try g_bc_mutex.lock(g_io);
+        while (g_bc_seq == seen) {
+            g_bc_cond.wait(g_io, &g_bc_mutex) catch {
+                g_bc_mutex.unlock(g_io);
+                return error.Canceled;
+            };
+        }
+        seen = g_bc_seq;
+        const ts = g_bc_ts;
+        g_bc_mutex.unlock(g_io);
+
+        const ev = try std.fmt.bufPrint(&buf, "data: {d}\n\n", .{ts});
+        body.writeAll(ev) catch break;
+        try zio.maybeYield();
+    }
+    try body.finish();
+}
+
 const Args = struct {
     port: u16 = 0,
     tls: bool = true,
@@ -101,11 +161,15 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process.Args, io: std.Io) !void {
     const args = try parseArgs(gpa, process_args);
     g_sse_interval_ms = args.sse_interval_ms;
+    g_io = rt.io();
+    var ticker_handle = try rt.spawn(tickerTask, .{});
+    defer ticker_handle.cancel();
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", args.port);
 
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/", .handler = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } },
         .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } },
+        .{ .method = .GET, .path = "/sse-broadcast", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseBroadcastHandler } },
     };
 
     var cert_pem: []u8 = &.{};

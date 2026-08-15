@@ -47,6 +47,7 @@ func main() {
 	streams := flag.Int("streams", 100, "concurrent streams")
 	seconds := flag.Int("seconds", 10, "measurement window")
 	stall := flag.Bool("stall", false, "one stream stops reading after 1s")
+	conns := flag.Int("conns", 1, "TCP connections to spread the streams over")
 	label := flag.String("label", "arm", "name for the report")
 	flag.Parse()
 	if *url == "" {
@@ -54,14 +55,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	tr := &http.Transport{
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}},
-		ForceAttemptHTTP2: true,
-		// One connection, so the streams really are multiplexed rather than
-		// quietly spread over many sockets.
-		MaxConnsPerHost: 1,
+	// One http.Client per connection. Go pools one h2 connection per host per
+	// Transport, so N Transports is exactly N connections, and -conns 1 keeps
+	// the default shape: every stream multiplexed over ONE socket.
+	clients := make([]*http.Client, *conns)
+	for i := range clients {
+		tr := &http.Transport{
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}},
+			ForceAttemptHTTP2: true,
+			MaxConnsPerHost:   1,
+		}
+		clients[i] = &http.Client{Transport: tr}
 	}
-	client := &http.Client{Transport: tr}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*seconds)*time.Second)
 	defer cancel()
@@ -81,7 +86,7 @@ func main() {
 				results[i] = r
 				return
 			}
-			resp, err := client.Do(req)
+			resp, err := clients[i%len(clients)].Do(req)
 			if err != nil {
 				r.err = err
 				results[i] = r
@@ -150,8 +155,8 @@ func main() {
 		return all[i]
 	}
 
-	fmt.Printf("%-12s streams=%d opened=%d delivering=%d failed=%d events=%d\n",
-		*label, *streams, opened, delivered, failed, totalEvents)
+	fmt.Printf("%-12s streams=%d conns=%d opened=%d delivering=%d failed=%d events=%d\n",
+		*label, *streams, *conns, opened, delivered, failed, totalEvents)
 	if len(all) == 0 {
 		fmt.Printf("%-12s NO EVENTS — nothing was measured\n", *label)
 		os.Exit(1)
