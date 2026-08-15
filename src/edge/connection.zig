@@ -2927,8 +2927,27 @@ const Connection = struct {
         const slot_i = ticket_pair[1];
         var armed = true;
         defer if (armed) self.tickets.releaseReserved(slot_i);
+
+        // One-shot responses use the same ticket-correlated phase trace as
+        // streaming writes. Without this arm the one-shot benchmark reports
+        // zero samples and the instrument silently measures only SSE.
+        var traced = trace.enabled and
+            (trace.writes.fetchAdd(1, .monotonic) % trace.sample_every == 0);
+        if (traced) {
+            traced = self.trace_ticket.cmpxchgStrong(0, ticket, .acq_rel, .monotonic) == null;
+            if (!traced) _ = trace.skipped.fetchAdd(1, .monotonic);
+        }
+        defer if (traced) self.trace_ticket.store(0, .release);
+        var t_before: u64 = 0;
+        var t_acquired: u64 = 0;
+        var t_unlocked: u64 = 0;
+        if (traced) {
+            self.trace_ack_ns.store(0, .release);
+            t_before = nowNs(self.config.io);
+        }
         {
             try self.lockSession();
+            if (traced) t_acquired = nowNs(self.config.io);
             defer self.unlockSession(self.config.io);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
@@ -2963,6 +2982,7 @@ const Connection = struct {
                 self.processIntents() catch return error.WriteFailed;
             }
         }
+        if (traced) t_unlocked = nowNs(self.config.io);
         armed = false;
         // From here until the wait returns, teardown must NOT cancel this
         // handler. The wait is guaranteed to wake on its own — see
@@ -2970,6 +2990,25 @@ const Connection = struct {
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
         try self.waitTicket(slot_i, hctx.terminal);
+        if (traced) {
+            const t_done = nowNs(self.config.io);
+            const t_ack = self.trace_ack_ns.load(.acquire);
+            if (t_ack >= t_unlocked and t_done >= t_ack) {
+                const block = t_acquired - t_before;
+                const hold = t_unlocked - t_acquired;
+                const ack = t_ack - t_unlocked;
+                const res = t_done - t_ack;
+                _ = trace.samples.fetchAdd(1, .monotonic);
+                _ = trace.block_ns.fetchAdd(block, .monotonic);
+                _ = trace.hold_ns.fetchAdd(hold, .monotonic);
+                _ = trace.ack_ns.fetchAdd(ack, .monotonic);
+                _ = trace.resume_ns.fetchAdd(res, .monotonic);
+                trace.bumpMax(&trace.block_max, block);
+                trace.bumpMax(&trace.hold_max, hold);
+                trace.bumpMax(&trace.ack_max, ack);
+                trace.bumpMax(&trace.resume_max, res);
+            }
+        }
     }
 
     /// Streaming response: headers now, body later. The SSE path adds the three
