@@ -1,10 +1,10 @@
 //! The handler-facing request.
 //!
-//! Every slice here points into the request's own arena, which the connection
-//! destroys after the handler returns. Nothing borrows from session memory or
-//! from a wire chunk, so a handler cannot hold a pointer that the actor may
-//! free or recycle underneath it. The cost is one copy per request; the gain is
-//! that handler lifetime questions do not exist.
+//! Every slice here points into storage owned by the handler job: decoded
+//! request storage transferred out of Session, or the job's scratch arena. The
+//! connection releases both after the handler returns. Nothing borrows from
+//! Session or from a wire chunk, so the actor cannot free or recycle a
+//! handler-visible pointer underneath it.
 //!
 //! The fields are already validated. `core.fields` rejected a malformed or
 //! smuggling-shaped field block before this struct was built, so a handler

@@ -2272,7 +2272,7 @@ const Connection = struct {
         test_observed_sched_emits.store(self.sched.emits_total, .release);
     }
 
-    /// Turn queued `Session` intents into scheduler work, then emit.
+    /// Turn queued `Session` intents into scheduler work without emitting.
     ///
     /// Intents are copied into an actor-owned batch first. Draining into the
     /// session's own storage would break as soon as a branch below pushes a new
@@ -2286,8 +2286,8 @@ const Connection = struct {
     ///
     /// DATA never goes straight to the wire here. It enters the scheduler, so
     /// that fairness between streams is decided in one place.
-    fn processIntents(self: *Connection) anyerror!void {
-        self.assertSessionHeld("processIntents");
+    fn materializeIntents(self: *Connection) anyerror!void {
+        self.assertSessionHeld("materializeIntents");
         const n = self.session.drainIntentsInto(self.intent_batch);
         var consumed: usize = 0;
         errdefer while (consumed < n) : (consumed += 1) {
@@ -2355,6 +2355,12 @@ const Connection = struct {
                 },
             }
         }
+    }
+
+    /// Materialize every Session intent and emit all scheduler work now.
+    fn processIntents(self: *Connection) anyerror!void {
+        self.assertSessionHeld("processIntents");
+        try self.materializeIntents();
         try self.drainEmit();
     }
 
@@ -2502,11 +2508,11 @@ const Connection = struct {
 
     /// Build a handler job and spawn it. Actor-only.
     ///
-    /// Everything the handler will read is COPIED into a per-job arena, and the
-    /// session-owned originals are freed by the `defer` on return. The handler
-    /// runs on another task with no lock, so it must not hold a borrow into
-    /// session memory that the actor may free or reuse at any moment. One arena
-    /// per job also makes cleanup a single call on every exit path.
+    /// Ownership of the decoded request moves from the Session intent to the
+    /// handler job. Request slices borrow that job-owned storage; only the
+    /// lightweight Header arrays and handler scratch use the per-job arena.
+    /// The handler therefore shares nothing with Session without copying every
+    /// decoded string and body a second time.
     ///
     /// Admission order is reserve-then-claim, and it is deliberate:
     /// 1. Reserve reaper capacity. A handler that cannot be canceled must never
@@ -2522,27 +2528,31 @@ const Connection = struct {
     /// connection for the duration, which is bad, and it is still better than
     /// the alternative: a stream that is admitted and accounted for but never
     /// answered.
+    fn releaseDispatchRequest(gpa: std.mem.Allocator, d: session_mod.DispatchRequest) void {
+        for (d.headers) |h| {
+            gpa.free(@constCast(h.name));
+            gpa.free(@constCast(h.value));
+        }
+        gpa.free(d.headers);
+        for (d.trailers) |h| {
+            gpa.free(@constCast(h.name));
+            gpa.free(@constCast(h.value));
+        }
+        if (d.trailers.len != 0) gpa.free(d.trailers);
+        gpa.free(d.body);
+    }
+
     fn dispatch(self: *Connection, d: session_mod.DispatchRequest) anyerror!void {
         const gpa = self.config.gpa;
-        defer {
-            for (d.headers) |h| {
-                gpa.free(@constCast(h.name));
-                gpa.free(@constCast(h.value));
-            }
-            gpa.free(d.headers);
-            for (d.trailers) |h| {
-                gpa.free(@constCast(h.name));
-                gpa.free(@constCast(h.value));
-            }
-            if (d.trailers.len != 0) gpa.free(d.trailers);
-            gpa.free(d.body);
-        }
+        var dispatch_owned = true;
+        defer if (dispatch_owned) releaseDispatchRequest(gpa, d);
         const job = try gpa.create(HandlerJob);
         errdefer gpa.destroy(job);
         job.* = .{
             .conn = self,
             .arena = std.heap.ArenaAllocator.init(gpa),
             .stream_id = d.stream_id,
+            .owned_request = undefined,
             .req = undefined,
             .resp = undefined,
             .matched = .not_found,
@@ -2550,31 +2560,24 @@ const Connection = struct {
         errdefer job.arena.deinit();
         const a = job.arena.allocator();
 
-        const method_str = try a.dupe(u8, d.method);
-        const scheme = try a.dupe(u8, d.scheme);
-        const authority = try a.dupe(u8, d.authority);
-        const path = try a.dupe(u8, d.path);
-        const query = try a.dupe(u8, d.query);
-        const body = try a.dupe(u8, d.body);
-
-        var headers = try a.alloc(request.Header, d.headers.len);
+        const headers = try a.alloc(request.Header, d.headers.len);
         for (d.headers, 0..) |h, i| {
-            headers[i] = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
+            headers[i] = .{ .name = h.name, .value = h.value };
         }
 
-        var trailers = try a.alloc(request.Header, d.trailers.len);
+        const trailers = try a.alloc(request.Header, d.trailers.len);
         for (d.trailers, 0..) |h, i| {
-            trailers[i] = .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
+            trailers[i] = .{ .name = h.name, .value = h.value };
         }
 
         job.req = .{
-            .method = .parse(method_str),
-            .scheme = scheme,
-            .authority = authority,
-            .path = path,
-            .query = query,
+            .method = .parse(d.method),
+            .scheme = d.scheme,
+            .authority = d.authority,
+            .path = d.path,
+            .query = d.query,
             .headers = headers,
-            .body = body,
+            .body = d.body,
             .trailers = trailers,
             .arena = a,
         };
@@ -2639,6 +2642,10 @@ const Connection = struct {
             return;
         };
         slot.reaper_reserved = self.config.accounting != null;
+        // From here every exit runs runHandlerJob's cleanup, including the
+        // synchronous spawn-failure fallback.
+        job.owned_request = d;
+        dispatch_owned = false;
         job.resp.terminal = &slot.terminal;
         job.resp.generation = slot.terminal.currentGeneration();
         job.slot = slot;
@@ -2678,6 +2685,7 @@ const Connection = struct {
         conn: *Connection,
         arena: std.heap.ArenaAllocator,
         stream_id: u31,
+        owned_request: session_mod.DispatchRequest,
         req: request.Request,
         resp: response.Response,
         matched: router_mod.Match,
@@ -2694,7 +2702,8 @@ const Connection = struct {
     ///    reaper reports after its `cancel` returns.
     /// 2. Post the completion, then wake the actor. Without the wake the slot
     ///    sits until an unrelated event arrives.
-    /// 3. Decrement the live counter, then destroy the arena and the job.
+    /// 3. Decrement the live counter, then release the decoded request, arena,
+    ///    and job.
     ///
     /// The counters are published at the MUTATION sites, not once per actor
     /// iteration. A parked actor republishes nothing, so a per-iteration value
@@ -2725,6 +2734,7 @@ const Connection = struct {
             _ = self.live_handlers.fetchSub(1, .acq_rel);
             _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
             job.arena.deinit();
+            releaseDispatchRequest(self.config.gpa, job.owned_request);
             self.config.gpa.destroy(job);
         }
         if (job.slot.terminal.cancel_flag.load(.acquire)) return;
@@ -3002,20 +3012,21 @@ const Connection = struct {
                 const fits_without_wait = pending_len < self.config.limits.outbound_bytes_per_stream and
                     body_out.len <= self.config.limits.outbound_bytes_per_stream - pending_len;
                 if (fits_without_wait) {
-                    // The lock makes this one atomic scheduler turn: DATA is
-                    // staged first, then processIntents places HEADERS in the
-                    // ordinary-control queue and drains control before DATA.
-                    // SinkCtx combines both frames into one TLS plaintext
-                    // input, so one-shot responses pay one pump handoff.
+                    // Stage DATA first, then place HEADERS in the ordinary
+                    // control queue. The actor wake from enqueuePending drains
+                    // control before DATA, and can coalesce every response that
+                    // became ready in this turn. The handler remains a producer
+                    // and waits for its exact linked wire receipt.
                     self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                    self.materializeIntents() catch return error.WriteFailed;
                 } else {
                     // A body that can fill the stream slab may release this
                     // lock while waiting for capacity. Materialize HEADERS
                     // first so the actor cannot emit DATA ahead of them (t-482).
                     self.processIntents() catch return error.WriteFailed;
                     self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                    self.processIntents() catch return error.WriteFailed;
                 }
-                self.processIntents() catch return error.WriteFailed;
             } else {
                 self.next_wire_ticket = ticket;
                 self.next_wire_slot = slot_i;
