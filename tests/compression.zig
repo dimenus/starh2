@@ -37,6 +37,7 @@
 //! N+1 exists. A check of the final bytes alone does not pin this. Pinned by:
 //! - `I4 SSE flush is incrementally decodable before next event`
 //! - `I4 large SSE event over outbound_bytes_per_stream still flushes decodably`
+//! - `I4 empty compressed SSE write does not strand its receipt`
 //!
 //! I5 — Header hygiene. `content-encoding: br` is present exactly when the body
 //! bytes are brotli, never on an identity body, and never absent on a compressed
@@ -114,8 +115,7 @@ const Capture = struct {
     fn deinit(self: *Capture) void {
         self.body.deinit(self.gpa);
         for (self.headers.items) |h| {
-            self.gpa.free(h.name);
-            self.gpa.free(h.value);
+            h.freeOwned(self.gpa);
         }
         self.headers.deinit(self.gpa);
         for (self.data_chunks.items) |c| self.gpa.free(c);
@@ -143,17 +143,13 @@ const Capture = struct {
                         var dec = hpack.Decoder.init(self.gpa);
                         defer dec.deinit();
                         const result = try dec.decode(r.event.payload, 100, 64 * 1024, 256, 8 * 1024);
-                        defer {
-                            for (result.fields) |f| {
-                                self.gpa.free(f.name);
-                                self.gpa.free(f.value);
-                            }
-                            self.gpa.free(result.fields);
-                        }
+                        defer dec.freeResult(result);
                         for (result.fields) |f| {
                             try self.headers.append(self.gpa, .{
                                 .name = try self.gpa.dupe(u8, f.name),
                                 .value = try self.gpa.dupe(u8, f.value),
+                                .name_owned = true,
+                                .value_owned = true,
                             });
                         }
                         if (hdr.flags.end_stream) self.end_stream = true;
@@ -227,12 +223,11 @@ fn enableCompressionLimits(base: starh2.Limits) starh2.Limits {
     return lim;
 }
 
-
 fn withRuntime(comptime func: anytype) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(func, .{ rt, gpa });
@@ -349,6 +344,18 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
     try body.writeAll(e1);
     try body.writeAll(e2);
     try body.writeAll(e3);
+    try body.finish();
+}
+
+fn sseEmptyWriteHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = req;
+    var body = try resp.startSse(&.{});
+    try body.writeAll("data: before-empty\n\n");
+    // After the preceding Brotli flush, another empty flush legitimately emits
+    // no compressed bytes. Its receipt must use a wire barrier rather than a
+    // zero-length scheduler entry, which can never produce a DATA frame.
+    try body.writeAll("");
+    try body.writeAll("data: after-empty\n\n");
     try body.finish();
 }
 
@@ -681,6 +688,43 @@ test "I4 SSE flush is incrementally decodable before next event" {
     }.f);
 }
 
+test "I4 empty compressed SSE write does not strand its receipt" {
+    try withRuntime(struct {
+        fn f(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+            const routes = [_]starh2.Route{.{
+                .method = .GET,
+                .path = "/sse-empty",
+                .handler = .{ .ptr = @constCast(&dummy), .runFn = sseEmptyWriteHandler },
+            }};
+            try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
+                fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
+                    const port = server.localAddress(0).getPort();
+                    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+                    var stream = try peer.connect(.{});
+                    defer stream.close();
+                    const extra = [_]hpack.HeaderField{.{ .name = "accept-encoding", .value = "br" }};
+                    const wire = try h2c.buildClientHelloExtra(alloc, "/sse-empty", &extra);
+                    defer alloc.free(wire);
+                    try writeAllStream(stream, wire);
+
+                    var cap = try Capture.init(alloc);
+                    defer cap.deinit();
+                    try readUntil(stream, &cap, 5000, doneEnd);
+                    try std.testing.expect(cap.end_stream);
+                    try std.testing.expect(!cap.saw_rst);
+                    try std.testing.expectEqualStrings("br", cap.headerValue("content-encoding").?);
+                    const decoded = try brotli.Decoder.decompressAll(alloc, 2 * 1024 * 1024, cap.body.items);
+                    defer alloc.free(decoded);
+                    try std.testing.expectEqualStrings(
+                        "data: before-empty\n\ndata: after-empty\n\n",
+                        decoded,
+                    );
+                }
+            }.go);
+        }
+    }.f);
+}
+
 test "I2 streaming start path round-trips" {
     try withRuntime(struct {
         fn f(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
@@ -860,11 +904,16 @@ test "lifecycle: shutdown releases live encoder context" {
                 .handler = .{ .ptr = @constCast(&dummy), .runFn = hangCompressedSse },
             }};
             const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+            var lim = enableCompressionLimits(.{});
+            // This client deliberately never ACKs the graceful PING. Force the
+            // phase-2 deadline so the test proves that path exits the actor
+            // loop and reaches handler cancellation.
+            lim.graceful_drain_timeout_ns = 10 * std.time.ns_per_ms;
             var server = try starh2.Server.init(gpa, rt.io(), .{
                 .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
                 .routes = &routes,
                 .tls = null,
-                .limits = enableCompressionLimits(.{}),
+                .limits = lim,
             });
             defer server.deinit(gpa);
             var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });

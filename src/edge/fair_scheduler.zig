@@ -373,7 +373,16 @@ pub const FairScheduler = struct {
         end: bool,
         flush_ticket: u64,
         flush_slot: u32,
-    ) error{ OutOfMemory, StreamCap, SlabsExhausted }!void {
+    ) error{ OutOfMemory, StreamCap, SlabsExhausted, TicketWithoutFrame }!void {
+        // dataEligible deliberately ignores empty, non-final entries: there is
+        // no legal DATA frame to emit. Refuse a receipt that could never reach
+        // the WritePump instead of turning an internal mistake into a hang.
+        if (bytes.len == 0 and !end and flush_ticket != 0) {
+            const pending = self.findPending(stream_id);
+            if (pending == null or (pending.?.len == 0 and !pending.?.end_stream)) {
+                return error.TicketWithoutFrame;
+            }
+        }
         const pw = try self.allocPending(stream_id);
         if (bytes.len != 0 and pw.slab.len == 0) {
             // First bytes for this stream: take a slab now. Exhaustion is
@@ -746,6 +755,28 @@ test "the per-stream cap is the pool's slab length" {
     // pool exhaustion.
     try std.testing.expectError(error.OutOfMemory, sched.enqueueDataBytes(1, &[_]u8{'b'} ** 40, false, 0, 0));
     try std.testing.expectEqual(@as(usize, 40), sched.pendingByteLen(1));
+}
+
+test "ticket requires an existing DATA frame instead of stranding" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64, 2);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    defer sched.deinit();
+
+    try std.testing.expectError(
+        error.TicketWithoutFrame,
+        sched.enqueueDataBytes(1, &.{}, false, 1, 0),
+    );
+    try std.testing.expect(!sched.contains(1));
+
+    // enqueuePending appends bytes first, then attaches the receipt with a
+    // zero-byte call. That split is valid because the existing DATA carries it.
+    try sched.enqueueDataBytes(1, "x", false, 0, 0);
+    try sched.enqueueDataBytes(1, &.{}, false, 2, 1);
+    const pending = sched.findPending(1).?;
+    try std.testing.expectEqual(@as(u64, 2), pending.flush_ticket);
+    try std.testing.expectEqual(@as(usize, 1), pending.flush_remain);
 }
 
 test "pool exhaustion is its own error, and strands no slot" {

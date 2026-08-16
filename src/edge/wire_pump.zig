@@ -35,6 +35,8 @@ pub const WriteCompletion = struct {
     ok: bool = true,
     /// Connection-local outbound bytes to release (AckDrainer applies).
     outbound_release: usize = 0,
+    /// Successful socket-write completion time for trace attribution.
+    written_ns: u64 = 0,
     /// Control-pool bytes/entry to release (AckDrainer applies).
     control_release: usize = 0,
     control_entry: bool = false,
@@ -143,12 +145,28 @@ pub var test_last_ticket_ok_ns: std.atomic.Value(u64) = .init(0);
 /// Test-only: ticket id of that completion (0 = none).
 pub var test_last_ticket_ok_id: std.atomic.Value(u64) = .init(0);
 
+pub const write_trace = struct {
+    pub var enabled: bool = false;
+    pub var calls: std.atomic.Value(u64) = .init(0);
+    pub var chunks: std.atomic.Value(u64) = .init(0);
+    pub var max_chunks: std.atomic.Value(u64) = .init(0);
+
+    fn note(count: usize) void {
+        const count_u64: u64 = @intCast(count);
+        _ = calls.fetchAdd(1, .monotonic);
+        _ = chunks.fetchAdd(count_u64, .monotonic);
+        var cur = max_chunks.load(.monotonic);
+        while (count_u64 > cur) {
+            cur = max_chunks.cmpxchgWeak(cur, count_u64, .monotonic, .monotonic) orelse break;
+        }
+    }
+};
+
 pub const WritePump = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     from_actor: *std.Io.Queue(WireChunk),
     completions: *std.Io.Queue(WriteCompletion),
-    actor_wake: *std.Io.Event,
     gpa: std.mem.Allocator,
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
@@ -159,7 +177,6 @@ pub const WritePump = struct {
         self.completions.putOneUncancelable(self.io, c) catch {
             // Ack queue closure means connection teardown will release queued ownership.
         };
-        self.actor_wake.set(self.io);
     }
 
     fn releaseChunk(self: *WritePump, chunk: WireChunk, ok: bool, fail_all: bool) void {
@@ -169,8 +186,10 @@ pub const WritePump = struct {
         const has_ticket = chunk.ticket_count != 0 or chunk.ticket != 0;
         const has_acct = chunk.outbound_release != 0 or chunk.control_entry;
         if (has_ticket or has_acct or fail_all) {
+            var written_ns: u64 = 0;
             if (ok and chunk.ticket != 0) {
-                test_last_ticket_ok_ns.store(nowNs(self.io), .release);
+                written_ns = nowNs(self.io);
+                test_last_ticket_ok_ns.store(written_ns, .release);
                 test_last_ticket_ok_id.store(chunk.ticket, .release);
             }
             self.post(.{
@@ -179,6 +198,7 @@ pub const WritePump = struct {
                 .ticket_count = if (chunk.ticket_count != 0) chunk.ticket_count else if (chunk.ticket != 0) 1 else 0,
                 .ok = ok,
                 .outbound_release = chunk.outbound_release,
+                .written_ns = written_ns,
                 .control_release = chunk.control_release,
                 .control_entry = chunk.control_entry,
                 .fail_all = fail_all,
@@ -205,7 +225,9 @@ pub const WritePump = struct {
         self.post(.{ .fail_all = true });
     }
 
-    /// Write chunks in FIFO order, one at a time.
+    /// Write chunks in FIFO order, gathering already-queued chunks into one
+    /// vectored socket write. Each chunk still receives its own ordered
+    /// completion after the whole vector succeeds.
     ///
     /// Serial writes are what make a flush barrier meaningful: a completion for
     /// chunk N proves that chunks 1..N-1 were written first. Frame ORDER is
@@ -217,25 +239,48 @@ pub const WritePump = struct {
     /// Without it, it is the shutdown sentinel.
     pub fn run(self: *WritePump) void {
         var writer = self.stream.writer(self.io, &.{});
+        var carried: ?WireChunk = null;
         while (!self.stopped.load(.acquire)) {
-            const chunk = self.from_actor.getOne(self.io) catch {
+            const first = if (carried) |chunk| blk: {
+                carried = null;
+                break :blk chunk;
+            } else self.from_actor.getOne(self.io) catch {
                 self.post(.{ .fail_all = true, .shutdown = true });
                 return;
             };
-            if (chunk.len == 0 and chunk.bytes.len == 0) {
-                if (chunk.flush_barrier) {
+            if (first.len == 0 and first.bytes.len == 0) {
+                if (first.flush_barrier) {
                     // Empty flush barrier: success after prior writes already completed.
-                    self.releaseChunk(chunk, true, false);
+                    self.releaseChunk(first, true, false);
                     continue;
                 }
                 // Shutdown sentinel.
                 self.post(.{ .shutdown = true });
                 return;
             }
+
+            const max_batch = 16;
+            var chunks: [max_batch]WireChunk = undefined;
+            var slices: [max_batch][]const u8 = undefined;
+            chunks[0] = first;
+            var count: usize = 1;
+            // Keep fault-injection timing exact: those tests describe one
+            // attempted chunk per configured delay/failure boundary.
+            if (self.test_delay_ms == 0 and self.test_fail_after == 0) {
+                while (count < max_batch) {
+                    const next = io_queue.tryGet(WireChunk, self.from_actor, self.io) orelse break;
+                    if (next.len == 0 and next.bytes.len == 0) {
+                        carried = next;
+                        break;
+                    }
+                    chunks[count] = next;
+                    count += 1;
+                }
+            }
             if (self.test_delay_ms > 0) {
                 self.io.sleep(.fromMilliseconds(@intCast(self.test_delay_ms)), .awake) catch {
                     // Cancellation terminates this pump; queued chunks are failed below.
-                    self.releaseChunk(chunk, false, false);
+                    self.releaseChunk(first, false, false);
                     self.failDrain();
                     self.post(.{ .shutdown = true });
                     return;
@@ -243,19 +288,27 @@ pub const WritePump = struct {
             }
             const fail_next = test_fail_next_write.swap(false, .acq_rel);
             if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
-                self.releaseChunk(chunk, false, false);
+                for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return;
             }
-            writer.interface.writeAll(chunk.bytes[0..chunk.len]) catch {
-                self.releaseChunk(chunk, false, false);
+            for (chunks[0..count], 0..) |chunk, i| {
+                slices[i] = chunk.bytes[0..chunk.len];
+            }
+            if (write_trace.enabled) write_trace.note(count);
+            const write_result = if (count == 1)
+                writer.interface.writeAll(slices[0])
+            else
+                writer.interface.writeVecAll(slices[0..count]);
+            write_result catch {
+                for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return;
             };
-            self.writes_done += 1;
-            self.releaseChunk(chunk, true, false);
+            self.writes_done += count;
+            for (chunks[0..count]) |chunk| self.releaseChunk(chunk, true, false);
         }
         self.post(.{ .shutdown = true });
     }

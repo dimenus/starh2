@@ -27,47 +27,52 @@
 //!   write and never to a stalled drainer — a stream that already HOLDS a slab
 //!   must always be able to make progress, or the pool deadlocks under load.
 //!
-//! The lease shape matches the inbound read-chunk pool in `wire_pump.zig`:
-//! one contiguous allocation, a queue of free indices, and an index handed
-//! back on release.
+//! Storage stays one contiguous virtual allocation, while an atomic bitmap
+//! tracks free indices. A FIFO free-index queue is wrong here: a workload with
+//! one tiny write at a time eventually rotates through every slab and faults
+//! one OS page from each. At 4,096 × 64 KiB slabs on a 16 KiB-page host that
+//! turns a one-slab working set into 64 MiB RSS. Claiming the lowest free bit
+//! keeps resident memory proportional to concurrent writers while preserving
+//! the same hard capacity and allocation-free hot path.
 const std = @import("std");
-const io_queue = @import("io_queue.zig");
 
 pub const SlabPool = struct {
     storage: []u8,
     slab_bytes: usize,
     capacity: usize,
-    free_buf: []u32,
-    free_q: std.Io.Queue(u32) = undefined,
+    free_words: []std.atomic.Value(u64),
     /// Observable so a test and `deinit` can prove every slab came home.
     rented: std.atomic.Value(usize) = .init(0),
 
-    /// One contiguous allocation for the bytes, one queue of free indices.
+    /// One contiguous allocation for the bytes, one atomic free bitmap.
     /// Both are sized at boot and never grow, so the pool's own cost is exactly
     /// what `resourceUpperBound` reports.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, slab_bytes: usize, capacity: usize) !SlabPool {
+        _ = io;
         std.debug.assert(slab_bytes > 0);
         std.debug.assert(capacity > 0);
+        std.debug.assert(capacity <= std.math.maxInt(u32));
         const storage = try gpa.alloc(u8, slab_bytes * capacity);
         errdefer gpa.free(storage);
-        const free_buf = try gpa.alloc(u32, capacity);
-        errdefer gpa.free(free_buf);
+        const word_count = (capacity + 63) / 64;
+        const free_words = try gpa.alloc(std.atomic.Value(u64), word_count);
+        errdefer gpa.free(free_words);
+        for (free_words, 0..) |*word, wi| {
+            const remaining = capacity - wi * 64;
+            const valid_bits = @min(remaining, 64);
+            const bits = if (valid_bits == 64)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @intCast(valid_bits)) - 1;
+            word.* = .init(bits);
+        }
 
-        var self: SlabPool = .{
+        return .{
             .storage = storage,
             .slab_bytes = slab_bytes,
             .capacity = capacity,
-            .free_buf = free_buf,
+            .free_words = free_words,
         };
-        self.free_q = .init(self.free_buf);
-        var i: u32 = 0;
-        while (i < capacity) : (i += 1) {
-            self.free_q.putOneUncancelable(io, i) catch {
-                // The queue was sized for exactly `capacity` indices.
-                unreachable;
-            };
-        }
-        return self;
     }
 
     /// Every slab must be back before the storage goes away. A rented slab at
@@ -76,7 +81,7 @@ pub const SlabPool = struct {
     pub fn deinit(self: *SlabPool, gpa: std.mem.Allocator) void {
         std.debug.assert(self.rented.load(.acquire) == 0);
         gpa.free(self.storage);
-        gpa.free(self.free_buf);
+        gpa.free(self.free_words);
         self.* = undefined;
     }
 
@@ -86,10 +91,25 @@ pub const SlabPool = struct {
     /// and retry, never drop the write. A stream that already holds a slab is
     /// unaffected, which is what keeps exhaustion from stalling the drainer.
     pub fn tryRent(self: *SlabPool, io: std.Io) ?[]u8 {
-        const idx = io_queue.tryGet(u32, &self.free_q, io) orelse return null;
-        _ = self.rented.fetchAdd(1, .acq_rel);
-        const off = @as(usize, idx) * self.slab_bytes;
-        return self.storage[off..][0..self.slab_bytes];
+        _ = io;
+        for (self.free_words, 0..) |*word, wi| {
+            var bits = word.load(.acquire);
+            while (bits != 0) {
+                const bit: u6 = @intCast(@ctz(bits));
+                const mask = @as(u64, 1) << bit;
+                const next = bits & ~mask;
+                if (word.cmpxchgWeak(bits, next, .acq_rel, .acquire)) |observed| {
+                    bits = observed;
+                    continue;
+                }
+                const idx = wi * 64 + bit;
+                std.debug.assert(idx < self.capacity);
+                _ = self.rented.fetchAdd(1, .acq_rel);
+                const off = idx * self.slab_bytes;
+                return self.storage[off..][0..self.slab_bytes];
+            }
+        }
+        return null;
     }
 
     /// Give a slab back. It must have come from this pool.
@@ -99,23 +119,23 @@ pub const SlabPool = struct {
     /// foreign pointer and a misaligned one, which is what a double return or a
     /// subslice would look like.
     pub fn release(self: *SlabPool, io: std.Io, slab: []u8) void {
+        _ = io;
         const base = @intFromPtr(self.storage.ptr);
         const here = @intFromPtr(slab.ptr);
         std.debug.assert(here >= base);
         const off = here - base;
         std.debug.assert(off % self.slab_bytes == 0);
-        const idx: u32 = @intCast(off / self.slab_bytes);
+        const idx = off / self.slab_bytes;
         std.debug.assert(idx < self.capacity);
         std.debug.assert(slab.len == self.slab_bytes);
 
+        const wi = idx / 64;
+        const bit: u6 = @intCast(idx % 64);
+        const mask = @as(u64, 1) << bit;
         const prev = self.rented.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
-        if (!io_queue.tryPut(u32, &self.free_q, io, idx)) {
-            // The queue holds exactly `capacity` indices and this one was taken
-            // out of it, so there is always room. A full queue means the index
-            // is already in it: a double return.
-            unreachable;
-        }
+        const old = self.free_words[wi].fetchOr(mask, .release);
+        std.debug.assert(old & mask == 0);
     }
 
     pub fn rentedCount(self: *const SlabPool) usize {
@@ -168,6 +188,20 @@ test "a released slab is reusable, and accounting returns to zero" {
     const second = pool.tryRent(testing.io) orelse return error.ExpectedSlab;
     defer pool.release(testing.io, second);
     try testing.expectEqual(@as(usize, 64), second.len);
+}
+
+test "released low slab is reused before untouched slabs" {
+    var pool = try SlabPool.init(testing.allocator, testing.io, 64, 4);
+    defer pool.deinit(testing.allocator);
+
+    const first = pool.tryRent(testing.io) orelse return error.ExpectedSlab;
+    const first_ptr = first.ptr;
+    pool.release(testing.io, first);
+    const second = pool.tryRent(testing.io) orelse return error.ExpectedSlab;
+    defer pool.release(testing.io, second);
+    // Locality is load-bearing: rotating through all free slabs faults one OS
+    // page per slab and turns a tiny working set into the pool's full RSS.
+    try testing.expectEqual(first_ptr, second.ptr);
 }
 
 test "two live slabs never alias" {

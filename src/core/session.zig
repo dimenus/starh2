@@ -113,6 +113,21 @@ const Tombstone = struct {
     code: frame.ErrorCode,
 };
 
+fn encodeDataFrame(allocator: std.mem.Allocator, stream_id: u31, data: []const u8, end_stream: bool) ![]u8 {
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    const fh = frame.FrameHeader{
+        .length = @intCast(data.len),
+        .type = .data,
+        .flags = .{ .end_stream = end_stream },
+        .stream_id = stream_id,
+    };
+    fh.encode(&hdr_buf);
+    const out = try allocator.alloc(u8, frame.FRAME_HEADER_LEN + data.len);
+    @memcpy(out[0..frame.FRAME_HEADER_LEN], &hdr_buf);
+    if (data.len > 0) @memcpy(out[frame.FRAME_HEADER_LEN..], data);
+    return out;
+}
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     limits: limits_mod.Limits,
@@ -121,6 +136,7 @@ pub const Session = struct {
     windows: flow.Windows = .{},
     streams: std.AutoHashMap(u31, stream_mod.Stream),
     tombstones: std.ArrayList(Tombstone),
+    tombstone_next: usize = 0,
     /// Fixed-capacity intent ring — enqueue fails before ownership transfer when full.
     intent_storage: []Intent = &.{},
     intent_len: usize = 0,
@@ -247,19 +263,13 @@ pub const Session = struct {
         self.pending_bodies.deinit();
         var hit = self.pending_headers.iterator();
         while (hit.next()) |e| {
-            for (e.value_ptr.*) |f| {
-                self.allocator.free(@constCast(f.name));
-                self.allocator.free(@constCast(f.value));
-            }
+            hpack.HeaderField.freeOwnedSlice(self.allocator, e.value_ptr.*);
             self.allocator.free(e.value_ptr.*);
         }
         self.pending_headers.deinit();
         var tit = self.pending_trailers.iterator();
         while (tit.next()) |e| {
-            for (e.value_ptr.*) |f| {
-                self.allocator.free(@constCast(f.name));
-                self.allocator.free(@constCast(f.value));
-            }
+            hpack.HeaderField.freeOwnedSlice(self.allocator, e.value_ptr.*);
             self.allocator.free(e.value_ptr.*);
         }
         self.pending_trailers.deinit();
@@ -279,15 +289,9 @@ pub const Session = struct {
         switch (it.*) {
             .outbound_frame => |*f| self.allocator.free(f.payload),
             .dispatch_request => |*d| {
-                for (d.headers) |f| {
-                    self.allocator.free(@constCast(f.name));
-                    self.allocator.free(@constCast(f.value));
-                }
+                hpack.HeaderField.freeOwnedSlice(self.allocator, d.headers);
                 self.allocator.free(d.headers);
-                for (d.trailers) |f| {
-                    self.allocator.free(@constCast(f.name));
-                    self.allocator.free(@constCast(f.value));
-                }
+                hpack.HeaderField.freeOwnedSlice(self.allocator, d.trailers);
                 if (d.trailers.len != 0) self.allocator.free(d.trailers);
                 self.allocator.free(d.body);
             },
@@ -385,7 +389,20 @@ pub const Session = struct {
     /// `error.FlowBlocked` has caused no debit and may retry the same bytes
     /// unchanged after a WINDOW_UPDATE.
     pub fn makeDataFrame(self: *Session, stream_id: u31, data: []const u8, end_stream: bool) ![]u8 {
-        const s = self.streams.getPtr(stream_id) orelse return error.StreamClosed;
+        const s = self.streams.getPtr(stream_id) orelse {
+            // Scheduler still holds the body after releaseConcurrency dropped
+            // the map entry. Treating that as StreamClosed/zero credit makes
+            // emitOneData skip forever and the actor parks until slow-consumer.
+            // A non-no_error tombstone is a RST: do not emit DATA after it.
+            if (data.len > 16 * 1024) return error.FlowBlocked;
+            if (data.len > 0 and self.windows.conn_send <= 0) return error.FlowBlocked;
+            if (self.tombstoneCode(stream_id)) |code| {
+                if (code != .no_error) return error.FlowBlocked;
+            }
+            const out = try encodeDataFrame(self.allocator, stream_id, data, end_stream);
+            if (data.len > 0) self.windows.conn_send -= @intCast(data.len);
+            return out;
+        };
         const avail = s.window.availableSend(self.windows.conn_send);
         if (data.len == 0) {
             if (!end_stream) return error.FlowBlocked;
@@ -397,24 +414,14 @@ pub const Session = struct {
         else
             @min(data.len, @as(usize, @intCast(avail)), 16 * 1024);
         if (data.len > 0 and take < data.len) return error.FlowBlocked;
-        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
-        const fh = frame.FrameHeader{
-            .length = @intCast(take),
-            .type = .data,
-            .flags = .{ .end_stream = end_stream },
-            .stream_id = stream_id,
-        };
-        fh.encode(&hdr_buf);
-        const out = try self.allocator.alloc(u8, frame.FRAME_HEADER_LEN + take);
-        @memcpy(out[0..frame.FRAME_HEADER_LEN], &hdr_buf);
-        if (take > 0) @memcpy(out[frame.FRAME_HEADER_LEN..], data[0..take]);
+        const out = try encodeDataFrame(self.allocator, stream_id, data[0..take], end_stream);
         if (take > 0) {
             s.window.send -= @intCast(take);
             self.windows.conn_send -= @intCast(take);
         }
         if (end_stream) {
             s.localEndStream();
-            self.releaseConcurrency(stream_id);
+            self.releaseConcurrency(stream_id, .no_error);
         }
         return out;
     }
@@ -542,7 +549,7 @@ pub const Session = struct {
     /// reach a closed stream — a peer RST, a local RST, END_STREAM in both
     /// directions — and a double release would corrupt the server-wide stream
     /// count.
-    fn releaseConcurrency(self: *Session, stream_id: u31) void {
+    fn releaseConcurrency(self: *Session, stream_id: u31, tombstone_code: frame.ErrorCode) void {
         const s = self.streams.getPtr(stream_id) orelse return;
         if (s.concurrency_released) return;
         if (s.state != .closed) return;
@@ -550,10 +557,11 @@ pub const Session = struct {
         if (self.active_streams > 0) self.active_streams -= 1;
         if (self.stream_hooks) |h| h.onRelease(h.ctx);
         // Drop map entry; late frames classify via bounded tombstones.
-        if (!self.isTombstoned(stream_id)) {
-            // Tombstone exhaustion still permits removal; late frames use generic closed-stream rules.
-            self.addTombstone(stream_id, .no_error) catch {};
-        }
+        // The live-stream entry proves this ID has not yet been tombstoned:
+        // stream IDs cannot be reused, and every close removes the entry below.
+        // Passing the terminal code here avoids a linear duplicate scan on
+        // every normal response while preserving the peer/local RST code.
+        self.addTombstone(stream_id, tombstone_code) catch {};
         _ = self.streams.remove(stream_id);
     }
 
@@ -566,19 +574,22 @@ pub const Session = struct {
         if (self.streams.getPtr(stream_id)) |s| {
             s.onRst();
         }
-        try self.addTombstone(stream_id, code);
-        self.releaseConcurrency(stream_id);
+        self.releaseConcurrency(stream_id, code);
     }
 
-    /// Oldest-first eviction, because a peer decides how many streams it opens.
+    /// Oldest-first ring overwrite, because a peer decides how many streams it opens.
     /// An unbounded list would grow with the connection's lifetime, which is a
     /// memory target. Losing the oldest tombstone is safe: a frame for a stream
     /// that closed that long ago falls back to the generic closed-stream rules.
     fn addTombstone(self: *Session, id: u31, code: frame.ErrorCode) !void {
-        if (self.tombstones.items.len >= self.limits.stream_tombstones) {
-            _ = self.tombstones.orderedRemove(0);
+        const capacity = self.limits.stream_tombstones;
+        if (capacity == 0) return;
+        if (self.tombstones.items.len < capacity) {
+            try self.tombstones.append(self.allocator, .{ .id = id, .code = code });
+            return;
         }
-        try self.tombstones.append(self.allocator, .{ .id = id, .code = code });
+        self.tombstones.items[self.tombstone_next] = .{ .id = id, .code = code };
+        self.tombstone_next = (self.tombstone_next + 1) % capacity;
     }
 
     /// One frame, fully validated, in the order the RFC requires the checks.
@@ -632,8 +643,7 @@ pub const Session = struct {
                 const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, ev.payload[0..4], .big));
                 if (self.streams.getPtr(hdr.stream_id)) |s| {
                     s.onRst();
-                    try self.addTombstone(hdr.stream_id, code);
-                    self.releaseConcurrency(hdr.stream_id);
+                    self.releaseConcurrency(hdr.stream_id, code);
                     // Cancel handler; never RST in response to peer RST.
                     // A reset answered by a reset is an infinite exchange
                     // between two conforming peers (RFC 9113 section 5.4.2).
@@ -996,7 +1006,7 @@ pub const Session = struct {
                 try self.maybeDispatch(hdr.stream_id);
             }
         }
-        self.releaseConcurrency(hdr.stream_id);
+        self.releaseConcurrency(hdr.stream_id, .no_error);
 
         // WINDOW_UPDATE at half
         if (s.window.needsWindowUpdate()) {
@@ -1051,7 +1061,10 @@ pub const Session = struct {
             try self.failConnection(.protocol_error);
             return;
         }
-        if (self.isTombstoned(hdr.stream_id)) {
+        // A stream ID above the highest one ever opened cannot be a closed
+        // stream. Check the watermark first so the normal monotonic request
+        // path does not scan the bounded tombstone ring.
+        if (hdr.stream_id <= self.highest_peer_stream and self.isTombstoned(hdr.stream_id)) {
             // HEADERS on a closed stream: connection STREAM_CLOSED (RFC 9113 §5.1 / h2spec 5.1/12).
             try self.failConnection(.stream_closed);
             return;
@@ -1146,12 +1159,14 @@ pub const Session = struct {
     /// 4. Validate the pseudo-headers, then apply the size policies. A policy
     ///    breach becomes an `early_status` and not an exception, so the peer
     ///    receives a real HTTP status instead of a bare reset.
-    /// 5. Store the fields. Dispatch happens only at END_STREAM, in
-    ///    `maybeDispatch`, because a handler must never see a partial body.
+    /// 5. Transfer a complete header-only request directly to its dispatch
+    ///    intent. Requests with bodies store fields until DATA END_STREAM.
     ///
-    /// Ownership: `decoded.fields` is owned from step 1 onward. Every early
-    /// return frees it with `freeResult`; the two success paths hand it to
-    /// `pending_headers` or `pending_trailers` instead.
+    /// Ownership: the `decoded.fields` slice is owned from step 1 onward.
+    /// Each field's strings are independently owned or borrowed; `freeResult`
+    /// and `HeaderField.freeOwnedSlice` free only the owned ones. Every early
+    /// return frees with `freeResult`; success hands the slice to an intent or
+    /// to `pending_headers` / `pending_trailers`.
     fn finishHeaderBlock(self: *Session, stream_id: u31) !void {
         const decoded = self.decoder.decode(
             self.header_block.items,
@@ -1218,7 +1233,7 @@ pub const Session = struct {
                 // The early-reject state is already terminal and owns the response.
                 s.onHeaders(true) catch {};
                 try self.emitEarlyReject(stream_id, st);
-                self.releaseConcurrency(stream_id);
+                self.releaseConcurrency(stream_id, .no_error);
                 return;
             }
             s.onHeaders(true) catch |err| {
@@ -1228,7 +1243,7 @@ pub const Session = struct {
             };
             try self.pending_trailers.put(stream_id, decoded.fields);
             try self.maybeDispatch(stream_id);
-            self.releaseConcurrency(stream_id);
+            self.releaseConcurrency(stream_id, .no_error);
             return;
         }
 
@@ -1240,7 +1255,7 @@ pub const Session = struct {
                 // The early-reject state is already terminal and owns the response.
                 s.onHeaders(self.header_end_stream) catch {};
                 try self.emitEarlyReject(stream_id, 414);
-                self.releaseConcurrency(stream_id);
+                self.releaseConcurrency(stream_id, .no_error);
                 return;
             }
             try self.emitRst(stream_id, .protocol_error);
@@ -1267,13 +1282,17 @@ pub const Session = struct {
         if (early) |st| {
             self.decoder.freeResult(decoded);
             try self.emitEarlyReject(stream_id, st);
-            self.releaseConcurrency(stream_id);
+            self.releaseConcurrency(stream_id, .no_error);
         } else {
-            try self.pending_headers.put(stream_id, decoded.fields);
             if (self.header_end_stream) {
-                try self.maybeDispatch(stream_id);
+                // The common one-shot path already has a complete request and
+                // the validated pseudo-header slices. Do not put/fetch the
+                // fields through a hash map and validate them a second time.
+                try self.dispatchOwnedRequest(stream_id, parsed, decoded.fields, &.{}, &.{});
+            } else {
+                try self.pending_headers.put(stream_id, decoded.fields);
             }
-            self.releaseConcurrency(stream_id);
+            self.releaseConcurrency(stream_id, .no_error);
         }
     }
 
@@ -1285,21 +1304,15 @@ pub const Session = struct {
     /// have been refused, and no handler may have started yet. `handler_started`
     /// is what makes a request one request and not one per triggering frame.
     ///
-    /// This function is the ownership transfer point. Headers, body, and
-    /// trailers are moved out of the pending maps into the `dispatch_request`
-    /// intent, and the three `*_owned` flags exist so that a failure BEFORE the
-    /// transfer frees exactly once, while a success frees nothing here. The
-    /// edge becomes the owner and must release the intent.
+    /// Headers, body, and trailers are moved out of the pending maps, then
+    /// `dispatchOwnedRequest` transfers them to the intent.
     fn maybeDispatch(self: *Session, stream_id: u31) !void {
         const s = self.streams.getPtr(stream_id) orelse return;
         if (!s.end_stream_remote or s.refused_before_dispatch or s.handler_started) return;
         const hdrs = self.pending_headers.fetchRemove(stream_id) orelse return;
         var headers_owned = true;
         errdefer if (headers_owned) {
-            for (hdrs.value) |f| {
-                self.allocator.free(@constCast(f.name));
-                self.allocator.free(@constCast(f.value));
-            }
+            hpack.HeaderField.freeOwnedSlice(self.allocator, hdrs.value);
             self.allocator.free(hdrs.value);
         };
         const body_entry = self.pending_bodies.fetchRemove(stream_id);
@@ -1322,14 +1335,6 @@ pub const Session = struct {
         errdefer if (body_owned) self.allocator.free(body);
 
         const parsed = fields.validateRequestFields(hdrs.value) catch {
-            for (hdrs.value) |f| {
-                self.allocator.free(@constCast(f.name));
-                self.allocator.free(@constCast(f.value));
-            }
-            self.allocator.free(hdrs.value);
-            headers_owned = false;
-            if (body.len != 0) self.allocator.free(body);
-            body_owned = false;
             try self.emitRst(stream_id, .protocol_error);
             return;
         };
@@ -1338,13 +1343,46 @@ pub const Session = struct {
         const trailers: []hpack.HeaderField = if (trailers_entry) |e| e.value else try self.allocator.alloc(hpack.HeaderField, 0);
         var trailers_owned = trailers.len != 0;
         errdefer if (trailers_owned) {
-            for (trailers) |f| {
-                self.allocator.free(@constCast(f.name));
-                self.allocator.free(@constCast(f.value));
-            }
+            hpack.HeaderField.freeOwnedSlice(self.allocator, trailers);
             self.allocator.free(trailers);
         };
 
+        // The helper owns every slice from this point, including its failures.
+        headers_owned = false;
+        body_owned = false;
+        trailers_owned = false;
+        try self.dispatchOwnedRequest(stream_id, parsed, hdrs.value, body, trailers);
+    }
+
+    /// Ownership transfer point for a complete request. On entry this function
+    /// owns all three slices; on success the intent owns them. Failures before
+    /// transfer free exactly once, while `pushIntentOrFailClosed` owns and
+    /// releases an intent it accepted before failing closed.
+    fn dispatchOwnedRequest(
+        self: *Session,
+        stream_id: u31,
+        parsed: fields.ValidatedRequestFields,
+        headers: []hpack.HeaderField,
+        body: []const u8,
+        trailers: []hpack.HeaderField,
+    ) !void {
+        var headers_owned = true;
+        errdefer if (headers_owned) {
+            hpack.HeaderField.freeOwnedSlice(self.allocator, headers);
+            self.allocator.free(headers);
+        };
+        var body_owned = body.len != 0;
+        errdefer if (body_owned) self.allocator.free(body);
+        var trailers_owned = trailers.len != 0;
+        errdefer if (trailers_owned) {
+            hpack.HeaderField.freeOwnedSlice(self.allocator, trailers);
+            self.allocator.free(trailers);
+        };
+
+        const s = self.streams.getPtr(stream_id) orelse return error.StreamClosed;
+        if (!s.end_stream_remote or s.refused_before_dispatch or s.handler_started) {
+            return error.StreamClosed;
+        }
         // Past this line the intent owns everything. Clear the flags BEFORE the
         // push, so that a `PoolExhausted` inside `pushIntentOrFailClosed` — which
         // releases the intent itself — cannot make the errdefer blocks free the
@@ -1360,34 +1398,42 @@ pub const Session = struct {
             .authority = parsed.authority,
             .path = parsed.path,
             .query = parsed.query,
-            .headers = hdrs.value,
+            .headers = headers,
             .body = body,
             .trailers = trailers,
         } });
     }
 
     fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool) !void {
-        var list: std.ArrayList(hpack.HeaderField) = .empty;
-        defer list.deinit(self.allocator);
+        // A RST tombstone already released the map entry. Emitting HEADERS
+        // after that is how a handler that took `session_mu` late queued a
+        // body the scheduler can never emit (TLS stall: pending DATA, tomb_rst).
+        if (self.streams.get(stream_id) == null) return error.StreamClosed;
         var status_buf: [3]u8 = undefined;
         const status_str = try std.fmt.bufPrint(&status_buf, "{d}", .{status});
-        try list.append(self.allocator, .{ .name = ":status", .value = status_str });
-        for (headers) |h| try list.append(self.allocator, h);
-        const block = try hpack.Encoder.encode(self.allocator, list.items);
-        defer self.allocator.free(block);
+        const status_field = [_]hpack.HeaderField{.{ .name = ":status", .value = status_str }};
+        const status_len = hpack.Encoder.encodedLen(&status_field) catch return error.OutOfMemory;
+        const headers_len = hpack.Encoder.encodedLen(headers) catch return error.OutOfMemory;
+        const block_len = std.math.add(usize, status_len, headers_len) catch return error.OutOfMemory;
+        if (block_len > std.math.maxInt(u24)) return error.OutOfMemory;
+        const total = std.math.add(usize, frame.FRAME_HEADER_LEN, block_len) catch return error.OutOfMemory;
 
-        // Build HEADERS frame bytes
-        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        const out = try self.allocator.alloc(u8, total);
+        var out_owned = true;
+        errdefer if (out_owned) self.allocator.free(out);
+
         const fh = frame.FrameHeader{
-            .length = @intCast(block.len),
+            .length = @intCast(block_len),
             .type = .headers,
             .flags = .{ .end_headers = true, .end_stream = end_stream },
             .stream_id = stream_id,
         };
-        fh.encode(&hdr_buf);
-        const out = try self.allocator.alloc(u8, frame.FRAME_HEADER_LEN + block.len);
-        @memcpy(out[0..frame.FRAME_HEADER_LEN], &hdr_buf);
-        @memcpy(out[frame.FRAME_HEADER_LEN..], block);
+        fh.encode(out[0..frame.FRAME_HEADER_LEN]);
+        const n1 = hpack.Encoder.encodeInto(out[frame.FRAME_HEADER_LEN..], &status_field) catch return error.OutOfMemory;
+        const n2 = hpack.Encoder.encodeInto(out[frame.FRAME_HEADER_LEN + n1 ..], headers) catch return error.OutOfMemory;
+        std.debug.assert(n1 + n2 == block_len);
+
+        out_owned = false;
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{
             .typ = .headers,
             .payload = out,
@@ -1397,7 +1443,7 @@ pub const Session = struct {
         if (self.streams.getPtr(stream_id)) |s| {
             if (end_stream) {
                 s.localEndStream();
-                self.releaseConcurrency(stream_id);
+                self.releaseConcurrency(stream_id, .no_error);
             }
         }
     }
@@ -1414,9 +1460,27 @@ pub const Session = struct {
     }
 
     /// Outbound DATA credit for a stream (0 when negative/exhausted).
+    ///
+    /// A missing map entry is not the same as a blocked window. The TLS stall
+    /// parked with scheduler slabs still holding the response body after
+    /// `releaseConcurrency` had dropped the stream; treating that as zero
+    /// credit made `FairScheduler.drain` skip those streams forever.
     pub fn streamSendAvailable(self: *const Session, stream_id: u31) i32 {
-        const s = self.streams.get(stream_id) orelse return 0;
-        return s.window.availableSend(self.windows.conn_send);
+        if (self.streams.get(stream_id)) |s| {
+            return s.window.availableSend(self.windows.conn_send);
+        }
+        if (self.windows.conn_send <= 0) return 0;
+        if (self.tombstoneCode(stream_id)) |code| {
+            if (code != .no_error) return 0;
+        }
+        return self.windows.conn_send;
+    }
+
+    pub fn tombstoneCode(self: *const Session, id: u31) ?frame.ErrorCode {
+        for (self.tombstones.items) |t| {
+            if (t.id == id) return t.code;
+        }
+        return null;
     }
 
     pub fn connectionSendAvailable(self: *const Session) i32 {
@@ -1424,6 +1488,81 @@ pub const Session = struct {
         return self.windows.conn_send;
     }
 };
+
+test "tombstones overwrite oldest in place" {
+    var session = try Session.init(std.testing.allocator, .{ .stream_tombstones = 2 });
+    defer session.deinit();
+
+    try session.addTombstone(1, .cancel);
+    try session.addTombstone(3, .stream_closed);
+    try session.addTombstone(5, .no_error);
+
+    try std.testing.expectEqual(@as(usize, 2), session.tombstones.items.len);
+    try std.testing.expect(!session.isTombstoned(1));
+    try std.testing.expect(session.isTombstoned(3));
+    try std.testing.expect(session.isTombstoned(5));
+    try std.testing.expectEqual(@as(u31, 5), session.tombstones.items[0].id);
+    try std.testing.expectEqual(@as(u31, 3), session.tombstones.items[1].id);
+}
+
+test "makeDataFrame still frames DATA after the stream map entry is gone" {
+    var session = try Session.init(std.testing.allocator, .defaults);
+    defer session.deinit();
+    const body = "Hello, World!";
+    try session.streams.put(1, .{
+        .id = 1,
+        .state = .half_closed_remote,
+        .window = .{ .send = flow.INITIAL_WINDOW },
+    });
+    session.active_streams = 1;
+    const live = try session.makeDataFrame(1, body, true);
+    defer std.testing.allocator.free(live);
+    try std.testing.expectEqual(@as(usize, frame.FRAME_HEADER_LEN + body.len), live.len);
+    try std.testing.expect(session.streams.get(1) == null);
+
+    try session.addTombstone(3, .no_error);
+    try std.testing.expect(session.streamSendAvailable(3) > 0);
+    const orphan = try session.makeDataFrame(3, body, true);
+    defer std.testing.allocator.free(orphan);
+    try std.testing.expectEqual(@as(usize, frame.FRAME_HEADER_LEN + body.len), orphan.len);
+    try std.testing.expectEqual(@as(u8, 1), orphan[4] & 1);
+
+    try session.addTombstone(5, .cancel);
+    try std.testing.expectEqual(@as(i32, 0), session.streamSendAvailable(5));
+}
+
+test "respond_headers after RST is StreamClosed" {
+    var session = try Session.init(std.testing.allocator, .defaults);
+    defer session.deinit();
+    {
+        const intents = session.drainIntents();
+        for (intents) |*it| switch (it.*) {
+            .outbound_frame => |f| std.testing.allocator.free(f.payload),
+            else => {},
+        };
+    }
+    try session.streams.put(1, .{
+        .id = 1,
+        .state = .half_closed_remote,
+        .window = .{ .send = flow.INITIAL_WINDOW },
+    });
+    session.active_streams = 1;
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
+    {
+        const intents = session.drainIntents();
+        for (intents) |*it| switch (it.*) {
+            .outbound_frame => |f| std.testing.allocator.free(f.payload),
+            else => {},
+        };
+    }
+    try std.testing.expect(session.streams.get(1) == null);
+    try std.testing.expectError(error.StreamClosed, session.applyCommand(.{ .respond_headers = .{
+        .stream_id = 1,
+        .status = 200,
+        .headers = &.{},
+        .end_stream = true,
+    } }));
+}
 
 test "session preface and settings ack" {
     var session = try Session.init(std.testing.allocator, .defaults);
@@ -1516,16 +1655,10 @@ test "SETTINGS_INITIAL_WINDOW_SIZE negative send window holds queued DATA (real 
         for (intents) |*it| switch (it.*) {
             .outbound_frame => |f| gpa.free(f.payload),
             .dispatch_request => |d| {
-                for (d.headers) |h| {
-                    gpa.free(@constCast(h.name));
-                    gpa.free(@constCast(h.value));
-                }
+                hpack_mod.HeaderField.freeOwnedSlice(gpa, d.headers);
                 gpa.free(d.headers);
                 if (d.trailers.len != 0) {
-                    for (d.trailers) |h| {
-                        gpa.free(@constCast(h.name));
-                        gpa.free(@constCast(h.value));
-                    }
+                    hpack_mod.HeaderField.freeOwnedSlice(gpa, d.trailers);
                     gpa.free(d.trailers);
                 }
                 if (d.body.len != 0) gpa.free(d.body);
@@ -1716,5 +1849,87 @@ test "intent capacity: flood fails closed without silent drop" {
             .outbound_frame => |f| gpa.free(f.payload),
             else => {},
         };
+    }
+}
+
+test "respond HEADERS allocates only the final frame" {
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = counting.allocator();
+    const hpack_mod = @import("hpack.zig");
+    var session = try Session.init(gpa, .defaults);
+    defer session.deinit();
+    {
+        const intents = session.drainIntents();
+        for (intents) |*it| switch (it.*) {
+            .outbound_frame => |f| gpa.free(f.payload),
+            else => {},
+        };
+    }
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
+    {
+        var sbuf: [9]u8 = undefined;
+        const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+        try wire.appendSlice(gpa, sbuf[0..sn]);
+    }
+    const req_fields = [_]hpack_mod.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack_mod.Encoder.encode(gpa, &req_fields);
+    defer gpa.free(block);
+    {
+        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        const fh = frame.FrameHeader{
+            .length = @intCast(block.len),
+            .type = .headers,
+            .flags = .{ .end_headers = true, .end_stream = true },
+            .stream_id = 1,
+        };
+        fh.encode(&hdr_buf);
+        try wire.appendSlice(gpa, &hdr_buf);
+        try wire.appendSlice(gpa, block);
+    }
+    try session.ingest(wire.items);
+    {
+        const intents = session.drainIntents();
+        for (intents) |*it| switch (it.*) {
+            .outbound_frame => |f| gpa.free(f.payload),
+            .dispatch_request => |d| {
+                hpack_mod.HeaderField.freeOwnedSlice(gpa, d.headers);
+                gpa.free(d.headers);
+                if (d.trailers.len != 0) {
+                    hpack_mod.HeaderField.freeOwnedSlice(gpa, d.trailers);
+                    gpa.free(d.trailers);
+                }
+                if (d.body.len != 0) gpa.free(d.body);
+            },
+            else => {},
+        };
+    }
+
+    const extra = [_]hpack_mod.HeaderField{.{ .name = "content-type", .value = "text/plain" }};
+    const before = counting.allocations;
+    try session.applyCommand(.{ .respond_headers = .{
+        .stream_id = 1,
+        .status = 200,
+        .headers = &extra,
+        .end_stream = false,
+    } });
+    try std.testing.expectEqual(@as(usize, 1), counting.allocations - before);
+    {
+        const more = session.drainIntents();
+        try std.testing.expectEqual(@as(usize, 1), more.len);
+        switch (more[0]) {
+            .outbound_frame => |f| {
+                try std.testing.expectEqual(frame.FrameType.headers, f.typ);
+                gpa.free(f.payload);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }

@@ -6,15 +6,9 @@ fn freeIntents(intents: []starh2.core.session.Intent) void {
         switch (it.*) {
             .outbound_frame => |f| std.testing.allocator.free(f.payload),
             .dispatch_request => |d| {
-                for (d.headers) |h| {
-                    std.testing.allocator.free(@constCast(h.name));
-                    std.testing.allocator.free(@constCast(h.value));
-                }
+                starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.headers);
                 std.testing.allocator.free(d.headers);
-                for (d.trailers) |h| {
-                    std.testing.allocator.free(@constCast(h.name));
-                    std.testing.allocator.free(@constCast(h.value));
-                }
+                starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.trailers);
                 if (d.trailers.len != 0) std.testing.allocator.free(d.trailers);
                 if (d.body.len != 0) std.testing.allocator.free(d.body);
             },
@@ -461,15 +455,9 @@ test "regression: >256 sequential streams reuse concurrency on same session" {
             switch (it.*) {
                 .dispatch_request => |d| {
                     respond_sid = d.stream_id;
-                    for (d.headers) |h| {
-                        std.testing.allocator.free(@constCast(h.name));
-                        std.testing.allocator.free(@constCast(h.value));
-                    }
+                    starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.headers);
                     std.testing.allocator.free(d.headers);
-                    for (d.trailers) |h| {
-                        std.testing.allocator.free(@constCast(h.name));
-                        std.testing.allocator.free(@constCast(h.value));
-                    }
+                    starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.trailers);
                     if (d.trailers.len != 0) std.testing.allocator.free(d.trailers);
                     if (d.body.len != 0) std.testing.allocator.free(d.body);
                 },

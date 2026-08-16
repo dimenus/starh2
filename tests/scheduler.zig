@@ -287,16 +287,10 @@ test "zero stream window does not block other stream or control (session)" {
         for (intents) |*it| switch (it.*) {
             .outbound_frame => |f| gpa.free(f.payload),
             .dispatch_request => |d| {
-                for (d.headers) |h| {
-                    gpa.free(@constCast(h.name));
-                    gpa.free(@constCast(h.value));
-                }
+                starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.headers);
                 gpa.free(d.headers);
                 if (d.trailers.len != 0) {
-                    for (d.trailers) |h| {
-                        gpa.free(@constCast(h.name));
-                        gpa.free(@constCast(h.value));
-                    }
+                    starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.trailers);
                     gpa.free(d.trailers);
                 }
                 if (d.body.len != 0) gpa.free(d.body);
@@ -354,4 +348,177 @@ test "zero stream window does not block other stream or control (session)" {
     };
     try std.testing.expect(saw_data3);
     try std.testing.expect(saw_ping_ack);
+}
+
+test "drain emits pending DATA after Session dropped the stream" {
+    // TLS stall snapshot: FairScheduler still holds the body, Session already
+    // dropped the map entry, connection window is huge. streamSendAvailable
+    // used to return 0 for a missing stream, so drain skipped forever and the
+    // actor parked until slow-consumer. Revert that and this test fails.
+    const gpa = std.testing.allocator;
+    const Session = starh2.Session;
+    const flow = starh2.core.flow;
+    const fs = starh2.edge.fair_scheduler;
+    var session = try Session.init(gpa, .defaults);
+    defer session.deinit();
+    {
+        const intents = session.drainIntents();
+        for (intents) |*it| switch (it.*) {
+            .outbound_frame => |f| gpa.free(f.payload),
+            else => {},
+        };
+    }
+
+    try session.streams.put(1, .{
+        .id = 1,
+        .state = .half_closed_remote,
+        .window = .{ .send = flow.INITIAL_WINDOW },
+    });
+    session.active_streams = 1;
+    const closer = try session.makeDataFrame(1, &.{}, true);
+    defer gpa.free(closer);
+    try std.testing.expect(session.streams.get(1) == null);
+    try std.testing.expect(session.streamSendAvailable(1) > 0);
+
+    var pool = try testPool(gpa, 1024, 4);
+    defer pool.deinit(gpa);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    defer sched.deinit();
+    const body = "Hello, World!";
+    try sched.enqueueDataBytes(1, body, true, 0, 0);
+
+    const DrainCtx = struct {
+        gpa: std.mem.Allocator,
+        session: *Session,
+        data_frames: usize = 0,
+        fn sink(
+            ctx: *anyopaque,
+            payload: []u8,
+            flush: bool,
+            ticket: u64,
+            ticket_slot: u32,
+            control_n: usize,
+            control_entry: bool,
+        ) anyerror!void {
+            _ = flush;
+            _ = ticket;
+            _ = ticket_slot;
+            _ = control_n;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!control_entry) self.data_frames += 1;
+            self.gpa.free(payload);
+        }
+        fn streamWin(ctx: *anyopaque, stream_id: u31) i32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.session.streamSendAvailable(stream_id);
+        }
+        fn connWin(ctx: *anyopaque) i32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.session.connectionSendAvailable();
+        }
+        fn build(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.session.makeDataFrame(stream_id, bytes, end);
+        }
+    };
+    var ctx: DrainCtx = .{ .gpa = gpa, .session = &session };
+    try sched.drain(
+        @ptrCast(&ctx),
+        DrainCtx.sink,
+        @ptrCast(&ctx),
+        DrainCtx.streamWin,
+        DrainCtx.connWin,
+        DrainCtx.build,
+        @ptrCast(&ctx),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ctx.data_frames);
+    try std.testing.expectEqual(@as(usize, 0), sched.pendingCount());
+}
+
+test "drain does not emit pending DATA after a RST tombstone" {
+    // The stall snapshot: pending body, stream map gone, RST tombstone.
+    // streamSendAvailable is 0, so drain must skip. Progress is cancelHandler
+    // dropping the pending (or fail-closed), not framing DATA after RST.
+    const gpa = std.testing.allocator;
+    const Session = starh2.Session;
+    const flow = starh2.core.flow;
+    const fs = starh2.edge.fair_scheduler;
+    var session = try Session.init(gpa, .defaults);
+    defer session.deinit();
+    {
+        const intents = session.drainIntents();
+        for (intents) |*it| switch (it.*) {
+            .outbound_frame => |f| gpa.free(f.payload),
+            else => {},
+        };
+    }
+    try session.streams.put(1, .{
+        .id = 1,
+        .state = .half_closed_remote,
+        .window = .{ .send = flow.INITIAL_WINDOW },
+    });
+    session.active_streams = 1;
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
+    {
+        const intents = session.drainIntents();
+        for (intents) |*it| switch (it.*) {
+            .outbound_frame => |f| gpa.free(f.payload),
+            else => {},
+        };
+    }
+    try std.testing.expect(session.streams.get(1) == null);
+    try std.testing.expectEqual(@as(i32, 0), session.streamSendAvailable(1));
+
+    var pool = try testPool(gpa, 1024, 4);
+    defer pool.deinit(gpa);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    defer sched.deinit();
+    try sched.enqueueDataBytes(1, "Hello, World!", true, 0, 0);
+
+    const DrainCtx = struct {
+        gpa: std.mem.Allocator,
+        session: *Session,
+        data_frames: usize = 0,
+        fn sink(
+            ctx: *anyopaque,
+            payload: []u8,
+            flush: bool,
+            ticket: u64,
+            ticket_slot: u32,
+            control_n: usize,
+            control_entry: bool,
+        ) anyerror!void {
+            _ = flush;
+            _ = ticket;
+            _ = ticket_slot;
+            _ = control_n;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!control_entry) self.data_frames += 1;
+            self.gpa.free(payload);
+        }
+        fn streamWin(ctx: *anyopaque, stream_id: u31) i32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.session.streamSendAvailable(stream_id);
+        }
+        fn connWin(ctx: *anyopaque) i32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.session.connectionSendAvailable();
+        }
+        fn build(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.session.makeDataFrame(stream_id, bytes, end);
+        }
+    };
+    var ctx: DrainCtx = .{ .gpa = gpa, .session = &session };
+    try sched.drain(
+        @ptrCast(&ctx),
+        DrainCtx.sink,
+        @ptrCast(&ctx),
+        DrainCtx.streamWin,
+        DrainCtx.connWin,
+        DrainCtx.build,
+        @ptrCast(&ctx),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.data_frames);
+    try std.testing.expectEqual(@as(usize, 1), sched.pendingCount());
 }

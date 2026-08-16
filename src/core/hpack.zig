@@ -25,6 +25,20 @@ pub const HeaderField = struct {
     name: []const u8,
     value: []const u8,
     never_index: bool = false,
+    /// Decoder results set this. Encoder/response literals stay `false` so a
+    /// `.{ .name = "...", .value = "..." }` is a borrow of the source, not an
+    /// allocation the caller must free.
+    name_owned: bool = false,
+    value_owned: bool = false,
+
+    pub fn freeOwned(self: HeaderField, allocator: std.mem.Allocator) void {
+        if (self.name_owned) allocator.free(self.name);
+        if (self.value_owned) allocator.free(self.value);
+    }
+
+    pub fn freeOwnedSlice(allocator: std.mem.Allocator, fields: []const HeaderField) void {
+        for (fields) |f| f.freeOwned(allocator);
+    }
 };
 
 const StaticEntry = struct { name: []const u8, value: []const u8 };
@@ -351,16 +365,77 @@ pub const Decoder = struct {
         self.dyn_size += size;
     }
 
-    fn lookup(self: *const Decoder, index: usize) CompressionError!struct { []const u8, []const u8 } {
+    const Indexed = struct {
+        name: []const u8,
+        value: []const u8,
+        static: bool,
+    };
+
+    fn lookup(self: *const Decoder, index: usize) CompressionError!Indexed {
         if (index == 0) return error.CompressionError;
         if (index <= static_table.len) {
             const e = static_table[index - 1];
-            return .{ e.name, e.value };
+            return .{ .name = e.name, .value = e.value, .static = true };
         }
         const dyn_index = index - static_table.len - 1;
         if (dyn_index >= self.dyn.items.len) return error.CompressionError;
         const e = self.dyn.items[dyn_index];
-        return .{ e.name, e.value };
+        return .{ .name = e.name, .value = e.value, .static = false };
+    }
+
+    /// Static-table strings are immutable process-lifetime data. Dynamic-table
+    /// strings are not: a later block can evict the entry while a request still
+    /// holds the decoded field, so those must be independently owned.
+    fn copyIndexedString(self: *Decoder, src: []const u8, from_static: bool) error{OutOfMemory}!struct { []const u8, bool } {
+        if (from_static) return .{ src, false };
+        return .{ try self.allocator.dupe(u8, src), true };
+    }
+
+    fn decodeName(self: *Decoder, block: []const u8, idx: usize, i: *usize) (CompressionError || error{OutOfMemory})!struct { []const u8, bool } {
+        if (idx == 0) return .{ try decodeString(self.allocator, block, i), true };
+        const pair = try self.lookup(idx);
+        return self.copyIndexedString(pair.name, pair.static);
+    }
+
+    fn takeIndexed(self: *Decoder, pair: Indexed) error{OutOfMemory}!HeaderField {
+        const name, const name_owned = try self.copyIndexedString(pair.name, pair.static);
+        errdefer if (name_owned) self.allocator.free(name);
+        const value, const value_owned = try self.copyIndexedString(pair.value, pair.static);
+        return .{
+            .name = name,
+            .value = value,
+            .name_owned = name_owned,
+            .value_owned = value_owned,
+        };
+    }
+
+    fn takeLiteral(self: *Decoder, block: []const u8, idx: usize, i: *usize, never: bool) (CompressionError || error{OutOfMemory})!HeaderField {
+        const name, const name_owned = try self.decodeName(block, idx, i);
+        errdefer if (name_owned) self.allocator.free(name);
+        const value = try decodeString(self.allocator, block, i);
+        return .{
+            .name = name,
+            .value = value,
+            .never_index = never,
+            .name_owned = name_owned,
+            .value_owned = true,
+        };
+    }
+
+    /// Copies `name`/`value` into the dynamic table. The result field keeps its
+    /// own ownership; the table must not alias it.
+    fn indexIntoTable(self: *Decoder, name: []const u8, value: []const u8) (CompressionError || error{OutOfMemory})!void {
+        const n2 = try self.allocator.dupe(u8, name);
+        const v2 = self.allocator.dupe(u8, value) catch {
+            self.allocator.free(n2);
+            return error.OutOfMemory;
+        };
+        try self.insert(n2, v2);
+    }
+
+    fn appendField(self: *Decoder, fields: *std.ArrayList(HeaderField), field: HeaderField) error{OutOfMemory}!void {
+        errdefer field.freeOwned(self.allocator);
+        try fields.append(self.allocator, field);
     }
 
     /// Decode a complete header block.
@@ -383,10 +458,7 @@ pub const Decoder = struct {
     ) (CompressionError || error{OutOfMemory})!DecodeResult {
         var fields: std.ArrayList(HeaderField) = .empty;
         errdefer {
-            for (fields.items) |f| {
-                self.allocator.free(@constCast(f.name));
-                self.allocator.free(@constCast(f.value));
-            }
+            HeaderField.freeOwnedSlice(self.allocator, fields.items);
             fields.deinit(self.allocator);
         }
         var decoded_size: usize = 0;
@@ -397,34 +469,21 @@ pub const Decoder = struct {
             const b = block[i];
             if ((b & 0x80) != 0) {
                 const idx = try decodeInt(block, 7, &i);
-                const pair = try self.lookup(idx);
-                const name = try self.allocator.dupe(u8, pair[0]);
-                errdefer self.allocator.free(name);
-                const value = try self.allocator.dupe(u8, pair[1]);
-                errdefer self.allocator.free(value);
-                decoded_size += name.len + value.len + 32;
-                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or name.len > max_name or value.len > max_value) policy = true;
-                try fields.append(self.allocator, .{ .name = name, .value = value });
+                const field = try self.takeIndexed(try self.lookup(idx));
+                decoded_size += field.name.len + field.value.len + 32;
+                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
+                try self.appendField(&fields, field);
                 first = false;
             } else if ((b & 0xc0) == 0x40) {
                 const idx = try decodeInt(block, 6, &i);
-                const name = if (idx == 0)
-                    try decodeString(self.allocator, block, &i)
-                else blk: {
-                    const pair = try self.lookup(idx);
-                    break :blk (try self.allocator.dupe(u8, pair[0]));
+                const field = try self.takeLiteral(block, idx, &i, false);
+                decoded_size += field.name.len + field.value.len + 32;
+                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
+                self.indexIntoTable(field.name, field.value) catch |err| {
+                    field.freeOwned(self.allocator);
+                    return err;
                 };
-                errdefer self.allocator.free(name);
-                const value = try decodeString(self.allocator, block, &i);
-                errdefer self.allocator.free(value);
-                decoded_size += name.len + value.len + 32;
-                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or name.len > max_name or value.len > max_value) policy = true;
-                const n2 = try self.allocator.dupe(u8, name);
-                errdefer self.allocator.free(n2);
-                const v2 = try self.allocator.dupe(u8, value);
-                errdefer self.allocator.free(v2);
-                try self.insert(n2, v2);
-                try fields.append(self.allocator, .{ .name = name, .value = value });
+                try self.appendField(&fields, field);
                 first = false;
             } else if ((b & 0xe0) == 0x20) {
                 // A dynamic table size update is legal only at the start of a
@@ -436,18 +495,10 @@ pub const Decoder = struct {
             } else {
                 const never = (b & 0xf0) == 0x10;
                 const idx = try decodeInt(block, 4, &i);
-                const name = if (idx == 0)
-                    try decodeString(self.allocator, block, &i)
-                else blk: {
-                    const pair = try self.lookup(idx);
-                    break :blk (try self.allocator.dupe(u8, pair[0]));
-                };
-                errdefer self.allocator.free(name);
-                const value = try decodeString(self.allocator, block, &i);
-                errdefer self.allocator.free(value);
-                decoded_size += name.len + value.len + 32;
-                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or name.len > max_name or value.len > max_value) policy = true;
-                try fields.append(self.allocator, .{ .name = name, .value = value, .never_index = never });
+                const field = try self.takeLiteral(block, idx, &i, never);
+                decoded_size += field.name.len + field.value.len + 32;
+                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
+                try self.appendField(&fields, field);
                 first = false;
             }
         }
@@ -459,32 +510,100 @@ pub const Decoder = struct {
     }
 
     pub fn freeResult(self: *Decoder, result: DecodeResult) void {
-        for (result.fields) |f| {
-            self.allocator.free(@constCast(f.name));
-            self.allocator.free(@constCast(f.value));
-        }
+        HeaderField.freeOwnedSlice(self.allocator, result.fields);
         self.allocator.free(result.fields);
     }
 };
 
-fn encodeInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize, prefix_bits: u3, first_byte_hi: u8) !void {
+fn encodedIntLen(value: usize, prefix_bits: u3) usize {
     const mask: usize = (@as(usize, 1) << prefix_bits) - 1;
-    if (value < mask) {
-        try buf.append(allocator, first_byte_hi | @as(u8, @intCast(value)));
-        return;
-    }
-    try buf.append(allocator, first_byte_hi | @as(u8, @intCast(mask)));
+    if (value < mask) return 1;
+    var len: usize = 1;
     var v = value - mask;
     while (v >= 128) {
-        try buf.append(allocator, @as(u8, @intCast((v % 128) + 128)));
+        len += 1;
         v /= 128;
     }
-    try buf.append(allocator, @intCast(v));
+    return len + 1;
 }
 
-fn encodeStringLiteral(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try encodeInt(buf, allocator, s.len, 7, 0);
-    try buf.appendSlice(allocator, s);
+fn encodeIntInto(out: []u8, pos: *usize, value: usize, prefix_bits: u3, first_byte_hi: u8) error{NoSpace}!void {
+    const mask: usize = (@as(usize, 1) << prefix_bits) - 1;
+    if (value < mask) {
+        if (pos.* >= out.len) return error.NoSpace;
+        out[pos.*] = first_byte_hi | @as(u8, @intCast(value));
+        pos.* += 1;
+        return;
+    }
+    if (pos.* >= out.len) return error.NoSpace;
+    out[pos.*] = first_byte_hi | @as(u8, @intCast(mask));
+    pos.* += 1;
+    var v = value - mask;
+    while (v >= 128) {
+        if (pos.* >= out.len) return error.NoSpace;
+        out[pos.*] = @as(u8, @intCast((v % 128) + 128));
+        pos.* += 1;
+        v /= 128;
+    }
+    if (pos.* >= out.len) return error.NoSpace;
+    out[pos.*] = @intCast(v);
+    pos.* += 1;
+}
+
+fn encodedStringLen(s: []const u8) error{Overflow}!usize {
+    return std.math.add(usize, encodedIntLen(s.len, 7), s.len);
+}
+
+fn encodeStringInto(out: []u8, pos: *usize, s: []const u8) error{NoSpace}!void {
+    try encodeIntInto(out, pos, s.len, 7, 0);
+    if (s.len > out.len - pos.*) return error.NoSpace;
+    @memcpy(out[pos.*..][0..s.len], s);
+    pos.* += s.len;
+}
+
+fn writeByte(out: []u8, pos: *usize, b: u8) error{NoSpace}!void {
+    if (pos.* >= out.len) return error.NoSpace;
+    out[pos.*] = b;
+    pos.* += 1;
+}
+
+fn encodedFieldLen(f: HeaderField) error{Overflow}!usize {
+    const full, const name_idx = findStatic(f.name, f.value);
+    if (full) |idx| return encodedIntLen(idx, 7);
+    var n: usize = 0;
+    if (name_idx) |ni| {
+        n = encodedIntLen(ni, 4);
+    } else {
+        n = 1;
+        n = try std.math.add(usize, n, try encodedStringLen(f.name));
+    }
+    return std.math.add(usize, n, try encodedStringLen(f.value));
+}
+
+fn encodeFieldInto(out: []u8, pos: *usize, f: HeaderField) error{NoSpace}!void {
+    const full, const name_idx = findStatic(f.name, f.value);
+    if (full) |idx| {
+        try encodeIntInto(out, pos, idx, 7, 0x80);
+        return;
+    }
+    const never = f.never_index or neverIndexName(f.name);
+    if (never) {
+        if (name_idx) |ni| {
+            try encodeIntInto(out, pos, ni, 4, 0x10);
+        } else {
+            try writeByte(out, pos, 0x10);
+            try encodeStringInto(out, pos, f.name);
+        }
+        try encodeStringInto(out, pos, f.value);
+    } else {
+        if (name_idx) |ni| {
+            try encodeIntInto(out, pos, ni, 4, 0x00);
+        } else {
+            try writeByte(out, pos, 0x00);
+            try encodeStringInto(out, pos, f.name);
+        }
+        try encodeStringInto(out, pos, f.value);
+    }
 }
 
 fn findStatic(name: []const u8, value: []const u8) struct { ?usize, ?usize } {
@@ -510,35 +629,27 @@ fn neverIndexName(name: []const u8) bool {
 }
 
 pub const Encoder = struct {
-    pub fn encode(allocator: std.mem.Allocator, fields: []const HeaderField) ![]u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(allocator);
+    pub fn encodedLen(fields: []const HeaderField) error{Overflow}!usize {
+        var n: usize = 0;
         for (fields) |f| {
-            const full, const name_idx = findStatic(f.name, f.value);
-            if (full) |idx| {
-                try encodeInt(&buf, allocator, idx, 7, 0x80);
-                continue;
-            }
-            const never = f.never_index or neverIndexName(f.name);
-            if (never) {
-                if (name_idx) |ni| {
-                    try encodeInt(&buf, allocator, ni, 4, 0x10);
-                } else {
-                    try buf.append(allocator, 0x10);
-                    try encodeStringLiteral(&buf, allocator, f.name);
-                }
-                try encodeStringLiteral(&buf, allocator, f.value);
-            } else {
-                if (name_idx) |ni| {
-                    try encodeInt(&buf, allocator, ni, 4, 0x00);
-                } else {
-                    try buf.append(allocator, 0x00);
-                    try encodeStringLiteral(&buf, allocator, f.name);
-                }
-                try encodeStringLiteral(&buf, allocator, f.value);
-            }
+            n = try std.math.add(usize, n, try encodedFieldLen(f));
         }
-        return buf.toOwnedSlice(allocator);
+        return n;
+    }
+
+    pub fn encodeInto(out: []u8, fields: []const HeaderField) error{NoSpace}!usize {
+        var pos: usize = 0;
+        for (fields) |f| try encodeFieldInto(out, &pos, f);
+        return pos;
+    }
+
+    pub fn encode(allocator: std.mem.Allocator, fields: []const HeaderField) (error{ OutOfMemory, Overflow })![]u8 {
+        const n = try encodedLen(fields);
+        const out = try allocator.alloc(u8, n);
+        errdefer allocator.free(out);
+        const wrote = encodeInto(out, fields) catch unreachable;
+        std.debug.assert(wrote == n);
+        return out;
     }
 };
 
@@ -593,4 +704,136 @@ test "invalid index is compression error" {
     // 0xff = indexed 127 — may be OOB
     const result = dec.decode(&block, 100, 32 * 1024, 256, 8 * 1024);
     try std.testing.expectError(error.CompressionError, result);
+}
+
+test "indexed static fields are borrowed and freeResult does not free them" {
+    // Eight fully-indexed static fields. Copying each name and value would
+    // allocate 16 strings plus the result slice; borrowing allocates only the
+    // slice (and at most a shrink). FailingAllocator.allocations is the GPA
+    // count, not a decoder-reported counter.
+    const block = [_]u8{ 0x82, 0x86, 0x84, 0x81, 0x82, 0x86, 0x84, 0x81 };
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var dec = Decoder.init(counting.allocator());
+    defer dec.deinit();
+    const res = try dec.decode(&block, 100, 32 * 1024, 256, 8 * 1024);
+    defer dec.freeResult(res);
+    try std.testing.expectEqual(@as(usize, 8), res.fields.len);
+    try std.testing.expect(!res.fields[0].name_owned);
+    try std.testing.expect(!res.fields[0].value_owned);
+    try std.testing.expectEqual(static_table[1].name.ptr, res.fields[0].name.ptr);
+    try std.testing.expectEqual(static_table[1].value.ptr, res.fields[0].value.ptr);
+    try std.testing.expectEqual(static_table[5].name.ptr, res.fields[1].name.ptr);
+    try std.testing.expectEqual(static_table[5].value.ptr, res.fields[1].value.ptr);
+    try std.testing.expect(counting.allocations <= 2);
+}
+
+test "dynamic-indexed result strings survive table eviction" {
+    const insert = [_]u8{ 0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79, 0x0d, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72 };
+    var dec = Decoder.init(std.testing.allocator);
+    defer dec.deinit();
+    const first = try dec.decode(&insert, 100, 32 * 1024, 256, 8 * 1024);
+    dec.freeResult(first);
+
+    const indexed = [_]u8{0xbe}; // dynamic index 62
+    const res = try dec.decode(&indexed, 100, 32 * 1024, 256, 8 * 1024);
+    defer dec.freeResult(res);
+    try std.testing.expectEqual(@as(usize, 1), res.fields.len);
+    try std.testing.expect(res.fields[0].name_owned);
+    try std.testing.expect(res.fields[0].value_owned);
+
+    const resize = [_]u8{0x20}; // dynamic table size update to 0
+    const emptied = try dec.decode(&resize, 100, 32 * 1024, 256, 8 * 1024);
+    dec.freeResult(emptied);
+    try std.testing.expectEqual(@as(usize, 0), dec.dyn.items.len);
+    try std.testing.expectEqualStrings("custom-key", res.fields[0].name);
+    try std.testing.expectEqualStrings("custom-header", res.fields[0].value);
+}
+
+test "literal indexed-name and literal-name ownership" {
+    // C.2.2: name is static index 4 (:path), value is a literal.
+    const indexed_name = [_]u8{ 0x04, 0x0c, 0x2f, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2f, 0x70, 0x61, 0x74, 0x68 };
+    var dec = Decoder.init(std.testing.allocator);
+    defer dec.deinit();
+    const borrowed_name = try dec.decode(&indexed_name, 100, 32 * 1024, 256, 8 * 1024);
+    defer dec.freeResult(borrowed_name);
+    try std.testing.expect(!borrowed_name.fields[0].name_owned);
+    try std.testing.expect(borrowed_name.fields[0].value_owned);
+    try std.testing.expectEqual(static_table[3].name.ptr, borrowed_name.fields[0].name.ptr);
+    try std.testing.expectEqualStrings("/sample/path", borrowed_name.fields[0].value);
+
+    // New name and value are both literals, so both owned. Encoder literals
+    // stay borrowed by default (name_owned/value_owned omitted).
+    const both_literal = [_]u8{ 0x00, 0x01, 'n', 0x01, 'v' };
+    const owned_both = try dec.decode(&both_literal, 100, 32 * 1024, 256, 8 * 1024);
+    defer dec.freeResult(owned_both);
+    try std.testing.expect(owned_both.fields[0].name_owned);
+    try std.testing.expect(owned_both.fields[0].value_owned);
+    try std.testing.expectEqualStrings("n", owned_both.fields[0].name);
+    try std.testing.expectEqualStrings("v", owned_both.fields[0].value);
+
+    const enc_fields = [_]HeaderField{.{ .name = "cookie", .value = "a=b" }};
+    try std.testing.expect(!enc_fields[0].name_owned);
+    try std.testing.expect(!enc_fields[0].value_owned);
+}
+
+fn expectEncodeMatch(fields: []const HeaderField, expected: []const u8) !void {
+    try std.testing.expectEqual(expected.len, try Encoder.encodedLen(fields));
+    var into_buf: [256]u8 = undefined;
+    try std.testing.expect(expected.len <= into_buf.len);
+    const n = try Encoder.encodeInto(into_buf[0..], fields);
+    try std.testing.expectEqualSlices(u8, expected, into_buf[0..n]);
+    const alloced = try Encoder.encode(std.testing.allocator, fields);
+    defer std.testing.allocator.free(alloced);
+    try std.testing.expectEqualSlices(u8, expected, alloced);
+}
+
+test "encodeInto matches encode and RFC bytes for each encoding class" {
+    try expectEncodeMatch(&[_]HeaderField{.{ .name = ":method", .value = "GET" }}, &[_]u8{0x82});
+
+    const sample_path = [_]u8{ 0x04, 0x0c, 0x2f, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2f, 0x70, 0x61, 0x74, 0x68 };
+    try expectEncodeMatch(&[_]HeaderField{.{ .name = ":path", .value = "/sample/path" }}, &sample_path);
+
+    const custom = [_]u8{
+        0x00, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79,
+        0x0d, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72,
+    };
+    try expectEncodeMatch(&[_]HeaderField{.{ .name = "custom-key", .value = "custom-header" }}, &custom);
+
+    const cookie = [_]u8{ 0x1f, 0x11, 0x03, 'a', '=', 'b' };
+    try expectEncodeMatch(&[_]HeaderField{.{ .name = "cookie", .value = "a=b" }}, &cookie);
+
+    var long_val: [127]u8 = undefined;
+    @memset(&long_val, 'x');
+    const long_fields = [_]HeaderField{.{ .name = ":path", .value = &long_val }};
+    var long_expected: [130]u8 = undefined;
+    long_expected[0] = 0x04;
+    long_expected[1] = 0x7f;
+    long_expected[2] = 0x00;
+    @memset(long_expected[3..], 'x');
+    try expectEncodeMatch(&long_fields, &long_expected);
+}
+
+test "encodeInto undersized output is NoSpace without writing past the slice" {
+    const fields = [_]HeaderField{.{ .name = ":method", .value = "GET" }};
+    const exact = try Encoder.encode(std.testing.allocator, &fields);
+    defer std.testing.allocator.free(exact);
+    try std.testing.expect(exact.len >= 1);
+    const short = try std.testing.allocator.alloc(u8, exact.len - 1);
+    defer std.testing.allocator.free(short);
+    try std.testing.expectError(error.NoSpace, Encoder.encodeInto(short, &fields));
+    try std.testing.expectError(error.NoSpace, Encoder.encodeInto(&.{}, &fields));
+}
+
+test "Encoder.encode allocates exactly once" {
+    const fields = [_]HeaderField{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "custom-key", .value = "custom-header" },
+        .{ .name = "cookie", .value = "a=b" },
+    };
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const enc = try Encoder.encode(counting.allocator(), &fields);
+    defer counting.allocator().free(enc);
+    try std.testing.expectEqual(@as(usize, 1), counting.allocations);
+    try std.testing.expectEqual(try Encoder.encodedLen(&fields), enc.len);
 }

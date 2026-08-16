@@ -287,11 +287,9 @@ test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
     const gpa = dbg.allocator();
 
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 64 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 64 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
 
@@ -447,11 +445,9 @@ test "waitForStreamSpace: cancel while blocked is lock-balanced under DebugAlloc
     }
     const gpa = dbg.allocator();
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 8, .prewarm = 8 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 8, .prewarm = 8 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
 
@@ -490,11 +486,9 @@ test "lifecycle: 100x write-fail ticket wake (no hang)" {
     }
     const gpa = dbg.allocator();
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(runWriteFailStress, .{ rt, gpa });
@@ -635,11 +629,9 @@ test "lifecycle: global stream cap and cancellation storm" {
     }
     const gpa = dbg.allocator();
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 64 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 64 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(runGlobalCapStorm, .{ rt, gpa });
@@ -756,9 +748,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
 
 test "lifecycle: every public Server allocation failure unwinds cleanly" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         // FailingAllocator is deliberately not thread-safe. One executor makes
         // fail-index ordering deterministic while still exercising task unwind.
         .executors = .exact(1),
@@ -865,15 +855,9 @@ test "regression: stream map drops closed streams (bounded history)" {
             switch (it.*) {
                 .dispatch_request => |d| {
                     respond_sid = d.stream_id;
-                    for (d.headers) |h| {
-                        std.testing.allocator.free(@constCast(h.name));
-                        std.testing.allocator.free(@constCast(h.value));
-                    }
+                    starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.headers);
                     std.testing.allocator.free(d.headers);
-                    for (d.trailers) |h| {
-                        std.testing.allocator.free(@constCast(h.name));
-                        std.testing.allocator.free(@constCast(h.value));
-                    }
+                    starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.trailers);
                     if (d.trailers.len != 0) std.testing.allocator.free(d.trailers);
                     if (d.body.len != 0) std.testing.allocator.free(d.body);
                 },
@@ -1060,9 +1044,9 @@ test "lifecycle: >64KiB body under small window + RST (stream 1)" {
     }
     const gpa = dbg.allocator();
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024 , .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     var h = try rt.spawn(runLargeBodyWindowGate, .{ rt, gpa, @as(u31, 1) });
@@ -1076,9 +1060,9 @@ test "lifecycle: >64KiB body under small window + RST (sparse stream id)" {
     }
     const gpa = dbg.allocator();
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024 , .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     // Sparse odd client stream id — must use handler-slot space waiter, not (id-1)/2.
@@ -1225,7 +1209,7 @@ test "lifecycle: a single send bigger than outbound_bytes_per_stream completes (
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     var h = try rt.spawn(runCapCrossingBody, .{ rt, gpa });
@@ -1288,7 +1272,7 @@ test "lifecycle: the first wire frame is the server's own SETTINGS, never an ack
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     var h = try rt.spawn(runPrefaceFirstFrame, .{ rt, gpa });
@@ -1359,7 +1343,7 @@ test "lifecycle: waitUntilListening is authoritative for bind success and failur
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 32, .prewarm = 32 },
         .executors = .exact(2),
-        .enable_task_migration = true,
+        .enable_task_migration = false,
     });
     defer rt.deinit();
     var h = try rt.spawn(runListeningReadiness, .{ rt, gpa });

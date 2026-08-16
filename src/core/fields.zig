@@ -33,6 +33,15 @@ pub const ParsedRequest = struct {
     content_length: ?u64,
 };
 
+pub const ValidatedRequestFields = struct {
+    method: []const u8,
+    scheme: []const u8,
+    authority: []const u8,
+    path: []const u8,
+    query: []const u8,
+    content_length: ?u64,
+};
+
 /// HTTP/2 has no connection-specific header fields. The connection itself
 /// carries what these once expressed, so their presence means the peer speaks
 /// HTTP/1.1 semantics into an HTTP/2 frame. `transfer-encoding` is the
@@ -44,7 +53,7 @@ const connection_specific = [_][]const u8{
 
 fn isLowerToken(s: []const u8) bool {
     for (s) |c| {
-        if (c == ':' ) continue;
+        if (c == ':') continue;
         if (c < 'a' or c > 'z') {
             if (c == '-' or c == '_' or (c >= '0' and c <= '9')) continue;
             return false;
@@ -68,14 +77,7 @@ fn valueOk(v: []const u8) bool {
     return true;
 }
 
-pub fn validateRequestFields(fields: []const hpack.HeaderField) ValidateError!struct {
-    method: []const u8,
-    scheme: []const u8,
-    authority: []const u8,
-    path: []const u8,
-    query: []const u8,
-    content_length: ?u64,
-} {
+pub fn validateRequestFields(fields: []const hpack.HeaderField) ValidateError!ValidatedRequestFields {
     var method: ?[]const u8 = null;
     var scheme: ?[]const u8 = null;
     var authority: []const u8 = "";

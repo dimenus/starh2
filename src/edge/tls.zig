@@ -51,7 +51,28 @@ pub fn firstRecord(input: []const u8) []const u8 {
     return input[0..@min(input.len, record_len)];
 }
 
+/// True when `input` holds at least one full TLS record. Incomplete bytes at
+/// the tail of a coalesced read are not a complete record; a full record that
+/// the actor then parks on is stranded work, because `driveDecrypt` only runs
+/// when a new socket chunk arrives.
+pub fn hasCompleteRecord(input: []const u8) bool {
+    const header_len = 5;
+    if (input.len < header_len) return false;
+    const payload_len = (@as(usize, input[3]) << 8) | input[4];
+    return input.len >= header_len + payload_len;
+}
+
 pub fn requireH2(server: *const tls.nonblock.Server) bool {
     const proto = serverAlpnProtocol(server) orelse return false;
     return std.mem.eql(u8, proto, alpn_h2);
+}
+
+test "hasCompleteRecord needs the header and the declared payload" {
+    try std.testing.expect(!hasCompleteRecord(&.{}));
+    try std.testing.expect(!hasCompleteRecord(&.{ 0x17, 0x03, 0x03, 0x00 }));
+    var rec: [10]u8 = .{ 0x17, 0x03, 0x03, 0x00, 0x05, 1, 2, 3, 4, 5 };
+    try std.testing.expect(hasCompleteRecord(rec[0..]));
+    try std.testing.expect(!hasCompleteRecord(rec[0..9]));
+    rec[4] = 0;
+    try std.testing.expect(hasCompleteRecord(rec[0..5]));
 }

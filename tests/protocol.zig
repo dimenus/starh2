@@ -6,10 +6,7 @@ fn freeIntents(intents: []starh2.core.session.Intent) void {
         switch (it.*) {
             .outbound_frame => |f| std.testing.allocator.free(f.payload),
             .dispatch_request => |d| {
-                for (d.headers) |h| {
-                    std.testing.allocator.free(@constCast(h.name));
-                    std.testing.allocator.free(@constCast(h.value));
-                }
+                starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.headers);
                 std.testing.allocator.free(d.headers);
                 if (d.body.len != 0) std.testing.allocator.free(d.body);
             },

@@ -110,7 +110,11 @@ pub fn pendingWriteMapBytes(max_streams: usize) error{Overflow}!usize {
 }
 
 pub fn pendingSlabBytes(max_streams: usize, bytes_per_stream: usize) error{Overflow}!usize {
-    return std.math.mul(usize, max_streams, bytes_per_stream);
+    const storage = try std.math.mul(usize, max_streams, bytes_per_stream);
+    const rounded = try std.math.add(usize, max_streams, 63);
+    const words = rounded / 64;
+    const bitmap = try std.math.mul(usize, words, @sizeOf(std.atomic.Value(u64)));
+    return std.math.add(usize, storage, bitmap);
 }
 
 test "hash map capacity matches std formula" {

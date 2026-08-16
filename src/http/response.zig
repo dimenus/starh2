@@ -210,14 +210,12 @@ pub const Response = struct {
         //   means the client sees nothing at all. That failure is silent, and
         //   the I4 gates could not see it, so it is not left to the caller.
         //
-        // - WAIT. The handler does NOT block for a receipt. That cost a ticket
-        //   and a full round trip per event, measured at 140 to 180
-        //   microseconds of waiting that nothing needed: the actor emits an
-        //   enqueued event whether or not the handler is blocked on it.
+        // - WAIT. An SSE write blocks for a receipt. Removing that wait kept
+        //   throughput flat but made latency 21x worse: the receipt keeps the
+        //   producer self-clocked instead of turning queue depth into latency.
         //
-        // `Body.flush()` is the barrier and still waits. Call it when the
-        // handler must know the bytes reached the wire. Backpressure does not
-        // depend on it either way: a handler that outruns the connection blocks
+        // `Body.flush()` also emits and waits. Capacity backpressure remains
+        // independent of receipts: a handler that outruns the connection blocks
         // in `waitForStreamSpace`, because the per-stream slab is bounded by
         // `outbound_bytes_per_stream`.
         try self.writeFn(self.ctx, self.stream_id, bytes, false, self.sse, self.sse);

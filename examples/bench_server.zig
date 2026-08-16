@@ -21,21 +21,196 @@ const starh2 = @import("starh2");
 const dummy: u8 = 0;
 
 const trace = starh2.edge.connection.trace;
+const write_trace = starh2.edge.wire_pump.write_trace;
+
+/// Bench-only counting wrapper. Installed on the server GPA when `--trace` is
+/// set, so the official bench path (no `--trace`) does not pay atomic increments
+/// or extra vtable hops. Sites are hashed by caller return address; collisions
+/// overflow rather than merge distinct callers.
+const AllocTrace = struct {
+    parent: std.mem.Allocator,
+    allocs: std.atomic.Value(u64) = .init(0),
+    bytes: std.atomic.Value(u64) = .init(0),
+    frees: std.atomic.Value(u64) = .init(0),
+    free_bytes: std.atomic.Value(u64) = .init(0),
+    overflow: std.atomic.Value(u64) = .init(0),
+    sites: [128]Site = @splat(.{}),
+
+    const Site = struct {
+        addr: std.atomic.Value(usize) = .init(0),
+        count: std.atomic.Value(u64) = .init(0),
+        bytes: std.atomic.Value(u64) = .init(0),
+    };
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *AllocTrace) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn note(self: *AllocTrace, addr: usize, n: usize) void {
+        if (addr == 0) {
+            _ = self.overflow.fetchAdd(1, .monotonic);
+            return;
+        }
+        const idx = addr *% 11400714819323198485;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const slot = &self.sites[(idx +% i) % self.sites.len];
+            const cur = slot.addr.load(.monotonic);
+            if (cur == addr) {
+                _ = slot.count.fetchAdd(1, .monotonic);
+                _ = slot.bytes.fetchAdd(n, .monotonic);
+                return;
+            }
+            if (cur == 0) {
+                if (slot.addr.cmpxchgStrong(0, addr, .monotonic, .monotonic) == null or
+                    slot.addr.load(.monotonic) == addr)
+                {
+                    _ = slot.count.fetchAdd(1, .monotonic);
+                    _ = slot.bytes.fetchAdd(n, .monotonic);
+                    return;
+                }
+            }
+        }
+        _ = self.overflow.fetchAdd(1, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *AllocTrace = @ptrCast(@alignCast(ctx));
+        const p = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+        _ = self.allocs.fetchAdd(1, .monotonic);
+        _ = self.bytes.fetchAdd(len, .monotonic);
+        self.note(ret_addr, len);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *AllocTrace = @ptrCast(@alignCast(ctx));
+        return self.parent.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *AllocTrace = @ptrCast(@alignCast(ctx));
+        return self.parent.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *AllocTrace = @ptrCast(@alignCast(ctx));
+        _ = self.frees.fetchAdd(1, .monotonic);
+        _ = self.free_bytes.fetchAdd(memory.len, .monotonic);
+        self.parent.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+var g_alloc_trace: ?*AllocTrace = null;
 
 /// GET /trace returns the phase-trace counters as JSON. The harness reads it
 /// before and after a run and divides, so the numbers are deltas over a known
-/// window rather than lifetime averages.
+/// window rather than lifetime averages. Allocation fields are zero unless the
+/// process was started with `--trace` (counting allocator installed).
 fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     var snap: [10]u64 = undefined;
     trace.snapshot(&snap);
-    var buf: [512]u8 = undefined;
-    const body = try std.fmt.bufPrint(
-        &buf,
+    var allocs: u64 = 0;
+    var alloc_bytes: u64 = 0;
+    var frees: u64 = 0;
+    var free_bytes: u64 = 0;
+    var overflow: u64 = 0;
+    const Top = struct { addr: usize, n: u64, bytes: u64 };
+    var top: [8]Top = @splat(.{ .addr = 0, .n = 0, .bytes = 0 });
+    if (g_alloc_trace) |t| {
+        allocs = t.allocs.load(.acquire);
+        alloc_bytes = t.bytes.load(.acquire);
+        frees = t.frees.load(.acquire);
+        free_bytes = t.free_bytes.load(.acquire);
+        overflow = t.overflow.load(.acquire);
+        for (&t.sites) |*s| {
+            const n = s.count.load(.acquire);
+            if (n == 0) continue;
+            const cand = Top{ .addr = s.addr.load(.acquire), .n = n, .bytes = s.bytes.load(.acquire) };
+            var i: usize = 0;
+            while (i < top.len and top[i].n >= cand.n) i += 1;
+            if (i < top.len) {
+                var j: usize = top.len - 1;
+                while (j > i) : (j -= 1) top[j] = top[j - 1];
+                top[i] = cand;
+            }
+        }
+    }
+    var sites_buf: [512]u8 = undefined;
+    var sites_len: usize = 0;
+    sites_buf[sites_len] = '[';
+    sites_len += 1;
+    var first = true;
+    for (top) |s| {
+        if (s.n == 0) continue;
+        const piece = std.fmt.bufPrint(
+            sites_buf[sites_len..],
+            "{s}[{d},{d},{d}]",
+            .{ if (first) "" else ",", s.addr, s.n, s.bytes },
+        ) catch break;
+        sites_len += piece.len;
+        first = false;
+    }
+    if (sites_len < sites_buf.len) {
+        sites_buf[sites_len] = ']';
+        sites_len += 1;
+    }
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.print(
         "{{\"samples\":{d},\"block_ns\":{d},\"hold_ns\":{d},\"ack_ns\":{d},\"resume_ns\":{d}," ++
-            "\"block_max\":{d},\"hold_max\":{d},\"ack_max\":{d},\"writes\":{d},\"skipped\":{d}}}\n",
-        .{ snap[0], snap[1], snap[2], snap[3], snap[4], snap[5], snap[6], snap[7], snap[8], snap[9] },
+            "\"actor_ns\":{d},\"queue_ns\":{d},\"pump_ns\":{d},\"ack_split_samples\":{d}," ++
+            "\"write_ns\":{d},\"drain_ns\":{d},\"pump_split_samples\":{d}," ++
+            "\"block_max\":{d},\"hold_max\":{d},\"ack_max\":{d},\"writes\":{d},\"skipped\":{d}," ++
+            "\"lifecycle\":{d},\"spawn_ns\":{d},\"to_send_ns\":{d},\"hpack_ns\":{d}," ++
+            "\"spawn_max\":{d},\"to_send_max\":{d},\"hpack_max\":{d},\"jobs\":{d},",
+        .{
+            snap[0],                       snap[1],                                 snap[2],                                snap[3],                                snap[4],
+            trace.actor_ns.load(.acquire), trace.queue_ns.load(.acquire),           trace.pump_ns.load(.acquire),           trace.ack_split_samples.load(.acquire), trace.write_ns.load(.acquire),
+            trace.drain_ns.load(.acquire), trace.pump_split_samples.load(.acquire), snap[5],                                snap[6],                                snap[7],
+            snap[8],                       snap[9],                                 trace.lifecycle_samples.load(.acquire), trace.spawn_ns.load(.acquire),          trace.to_send_ns.load(.acquire),
+            trace.hpack_ns.load(.acquire), trace.spawn_max.load(.acquire),          trace.to_send_max.load(.acquire),       trace.hpack_max.load(.acquire),         trace.jobs.load(.acquire),
+        },
     );
-    try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, body);
+    try w.print(
+        "\"handoffs\":{d},\"tickets\":{d},\"handoff_bytes\":{d},\"handoff_max\":{d}," ++
+            "\"batch_1\":{d},\"batch_2\":{d},\"batch_le4\":{d},\"batch_le8\":{d}," ++
+            "\"batch_le16\":{d},\"batch_ge17\":{d},\"records\":{d}," ++
+            "\"emit_turns\":{d},\"emit_tickets\":{d},\"emit_max\":{d}," ++
+            "\"write_calls\":{d},\"write_chunks\":{d},\"write_max\":{d},",
+        .{
+            trace.handoffs.load(.acquire),
+            trace.tickets.load(.acquire),
+            trace.handoff_bytes.load(.acquire),
+            trace.handoff_max.load(.acquire),
+            trace.batch_1.load(.acquire),
+            trace.batch_2.load(.acquire),
+            trace.batch_le4.load(.acquire),
+            trace.batch_le8.load(.acquire),
+            trace.batch_le16.load(.acquire),
+            trace.batch_ge17.load(.acquire),
+            trace.records.load(.acquire),
+            trace.emit_turns.load(.acquire),
+            trace.emit_tickets.load(.acquire),
+            trace.emit_max.load(.acquire),
+            write_trace.calls.load(.acquire),
+            write_trace.chunks.load(.acquire),
+            write_trace.max_chunks.load(.acquire),
+        },
+    );
+    try w.print(
+        "\"allocs\":{d},\"alloc_bytes\":{d},\"frees\":{d},\"free_bytes\":{d}," ++
+            "\"alloc_overflow\":{d},\"sites\":{s}}}\n",
+        .{ allocs, alloc_bytes, frees, free_bytes, overflow, sites_buf[0..sites_len] },
+    );
+    try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
 }
 
 const BODY = "Hello, World!";
@@ -153,6 +328,9 @@ const Args = struct {
     sse_interval_ms: u64 = 100,
     trace: bool = false,
     trace_every: u64 = 1024,
+    executors: ?u8 = null,
+    task_migration: bool = false,
+    diag: bool = false,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
@@ -175,8 +353,36 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.trace = true;
         } else if (std.mem.eql(u8, a, "--trace-every")) {
             out.trace_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--executors")) {
+            out.executors = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--task-migration")) {
+            out.task_migration = true;
+        } else if (std.mem.eql(u8, a, "--diag")) {
+            out.diag = true;
         } else {
             return error.UnknownArgument;
+        }
+    }
+    return out;
+}
+
+const RuntimeArgs = struct {
+    executors: ?u8 = null,
+    task_migration: bool = false,
+};
+
+fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !RuntimeArgs {
+    var out: RuntimeArgs = .{};
+    var args = try std.process.Args.Iterator.initAllocator(process_args, gpa);
+    defer args.deinit();
+    _ = args.next();
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--executors")) {
+            const n = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
+            if (n == 0) return error.InvalidExecutorCount;
+            out.executors = n;
+        } else if (std.mem.eql(u8, a, "--task-migration")) {
+            out.task_migration = true;
         }
     }
     return out;
@@ -185,8 +391,15 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process.Args, io: std.Io) !void {
     const args = try parseArgs(gpa, process_args);
     g_sse_interval_ms = args.sse_interval_ms;
+    starh2.edge.connection.diag_park = args.diag;
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
+    write_trace.enabled = args.trace;
+    var alloc_trace_storage: AllocTrace = .{ .parent = gpa };
+    const server_gpa: std.mem.Allocator = if (args.trace) blk: {
+        g_alloc_trace = &alloc_trace_storage;
+        break :blk alloc_trace_storage.allocator();
+    } else gpa;
     g_io = rt.io();
     var ticker_handle = try rt.spawn(tickerTask, .{});
     defer ticker_handle.cancel();
@@ -211,14 +424,14 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         break :blk .{ .tls_h2 = addr };
     } else .{ .h2c_prior_knowledge = addr };
 
-    var server = try starh2.Server.init(gpa, rt.io(), .{
+    var server = try starh2.Server.init(server_gpa, rt.io(), .{
         .endpoints = &.{ep},
         .routes = &routes,
         .tls = tls_cfg,
     });
-    defer server.deinit(gpa);
+    defer server.deinit(server_gpa);
 
-    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, server_gpa });
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
     // Same ready-line contract as the conformance server: a harness connects
@@ -240,16 +453,20 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    const runtime_args = try parseRuntimeArgs(gpa, init.minimal.args);
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024,
+            .committed_size = 16 * 1024,
             .shrink_interval = .fromSeconds(30),
             .slab_slots = 256,
             .prewarm = 256,
         },
-        .executors = .auto,
-        .enable_task_migration = true,
+        .executors = if (runtime_args.executors) |n| .exact(n) else .auto,
+        // zio a2b134a can strand a migrated socket task while both directions
+        // have queued kernel data. Keep I/O tasks on their home executor; the
+        // opt-in flag exists only to preserve the upstream reproducer.
+        .enable_task_migration = runtime_args.task_migration,
     });
     defer rt.deinit();
 

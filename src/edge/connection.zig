@@ -134,6 +134,14 @@ pub var test_actor_waiting: std.Io.Event = .unset;
 pub var test_release_actor_wait: std.Io.Event = .unset;
 /// Test-only fallback timer raced against actor events by the wakeup canary.
 pub var test_polling_canary_tick_ns: std.atomic.Value(u64) = .init(0);
+/// Bench `--diag`: print one line when the actor parks with scheduler or TLS
+/// work still sitting in userspace. Off unless the benchmark server sets it.
+pub var diag_park: bool = false;
+pub var diag_rst_handler: std.atomic.Value(u32) = .init(0);
+pub var diag_rst_compress: std.atomic.Value(u32) = .init(0);
+pub var diag_ctrl_fail: std.atomic.Value(u32) = .init(0);
+pub var diag_reset_after_ctrl_fail: std.atomic.Value(u32) = .init(0);
+var diag_last_empty_park_ns: u64 = 0;
 
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
@@ -164,9 +172,26 @@ fn nowNs(io: std.Io) u64 {
 /// - `resume`  `tickets.complete` -> `waitTicket` returns. Dominant means
 ///             wake-to-run scheduler latency, not any of the above.
 ///
-/// One event in `trace_sample_every` is measured, so the instrument cannot
-/// become the load. Counters are server-wide and monotonic; a harness reads
-/// them before and after a run and divides.
+/// One-shot requests add three more intervals, sampled at dispatch so a CPU
+/// profile cannot hide blocked spawn or job-lifecycle time:
+///
+/// - `spawn`   `dispatch` decides to sample -> `runHandlerJob` starts. Dominant
+///             means the zio task is slow to become runnable.
+/// - `to_send` handler start -> `sendCb` entry. Dominant means the application
+///             handler, not the stack.
+/// - `hpack`   inside `hold`, `applyCommand(.respond_headers)`. Dominant means
+///             response header encode + HEADERS frame allocation.
+///
+/// Those intervals are wall latency on one sampled request. Concurrent streams
+/// overlap them, so a large mean is not by itself a throughput cost. Batch
+/// counters below are the throughput-shaped instrument: they fire only when
+/// `enabled` is set at boot, and they count tickets per `queueWire` handoff
+/// and WritePump records. A harness cross-checks ticket deltas against h2load
+/// succeeded, not against a second self-reported request counter.
+///
+/// One event in `trace_sample_every` is measured for the latency intervals, so
+/// that instrument cannot become the load. Batch counters are per-handoff, not
+/// per-request, and stay off on the official bench path.
 pub const trace = struct {
     /// Set once at boot by a benchmark binary. A plain bool: it is written
     /// before any connection exists and only read afterwards.
@@ -183,11 +208,50 @@ pub const trace = struct {
     pub var hold_ns: std.atomic.Value(u64) = .init(0);
     pub var ack_ns: std.atomic.Value(u64) = .init(0);
     pub var resume_ns: std.atomic.Value(u64) = .init(0);
+    /// Receipt sub-phases: handler unlock -> scheduler sink, TLS/enqueue, then
+    /// queued WritePump work -> AckDrainer completion.
+    pub var actor_ns: std.atomic.Value(u64) = .init(0);
+    pub var queue_ns: std.atomic.Value(u64) = .init(0);
+    pub var pump_ns: std.atomic.Value(u64) = .init(0);
+    pub var ack_split_samples: std.atomic.Value(u64) = .init(0);
+    pub var write_ns: std.atomic.Value(u64) = .init(0);
+    pub var drain_ns: std.atomic.Value(u64) = .init(0);
+    pub var pump_split_samples: std.atomic.Value(u64) = .init(0);
     /// Worst single sample of each, so a mean cannot hide a stall.
     pub var block_max: std.atomic.Value(u64) = .init(0);
     pub var hold_max: std.atomic.Value(u64) = .init(0);
     pub var ack_max: std.atomic.Value(u64) = .init(0);
     pub var resume_max: std.atomic.Value(u64) = .init(0);
+
+    pub var jobs: std.atomic.Value(u64) = .init(0);
+    pub var spawn_ns: std.atomic.Value(u64) = .init(0);
+    pub var to_send_ns: std.atomic.Value(u64) = .init(0);
+    pub var hpack_ns: std.atomic.Value(u64) = .init(0);
+    pub var spawn_max: std.atomic.Value(u64) = .init(0);
+    pub var to_send_max: std.atomic.Value(u64) = .init(0);
+    pub var hpack_max: std.atomic.Value(u64) = .init(0);
+    pub var lifecycle_samples: std.atomic.Value(u64) = .init(0);
+
+    /// Ticketed `queueWire` handoffs and the tickets they carried. Gated by
+    /// `enabled`. Histogram buckets are inclusive upper bounds: 1, 2, ≤4, ≤8,
+    /// ≤16, ≥17.
+    pub var handoffs: std.atomic.Value(u64) = .init(0);
+    pub var tickets: std.atomic.Value(u64) = .init(0);
+    pub var handoff_bytes: std.atomic.Value(u64) = .init(0);
+    pub var handoff_max: std.atomic.Value(u64) = .init(0);
+    pub var batch_1: std.atomic.Value(u64) = .init(0);
+    pub var batch_2: std.atomic.Value(u64) = .init(0);
+    pub var batch_le4: std.atomic.Value(u64) = .init(0);
+    pub var batch_le8: std.atomic.Value(u64) = .init(0);
+    pub var batch_le16: std.atomic.Value(u64) = .init(0);
+    pub var batch_ge17: std.atomic.Value(u64) = .init(0);
+    /// WritePump chunks (h2c frames or TLS records) actually queued.
+    pub var records: std.atomic.Value(u64) = .init(0);
+    /// `drainEmit` turns that flushed at least one ticket, and tickets in those
+    /// turns. Mean tickets/turn is a batching signal distinct from wall waits.
+    pub var emit_turns: std.atomic.Value(u64) = .init(0);
+    pub var emit_tickets: std.atomic.Value(u64) = .init(0);
+    pub var emit_max: std.atomic.Value(u64) = .init(0);
 
     fn bumpMax(cell: *std.atomic.Value(u64), v: u64) void {
         var cur = cell.load(.monotonic);
@@ -207,6 +271,27 @@ pub const trace = struct {
         out[7] = ack_max.load(.acquire);
         out[8] = writes.load(.acquire);
         out[9] = skipped.load(.acquire);
+    }
+
+    fn noteHandoff(ticket_count: u32, nbytes: usize) void {
+        if (ticket_count == 0) return;
+        _ = handoffs.fetchAdd(1, .monotonic);
+        _ = tickets.fetchAdd(ticket_count, .monotonic);
+        _ = handoff_bytes.fetchAdd(nbytes, .monotonic);
+        bumpMax(&handoff_max, ticket_count);
+        if (ticket_count == 1) {
+            _ = batch_1.fetchAdd(1, .monotonic);
+        } else if (ticket_count == 2) {
+            _ = batch_2.fetchAdd(1, .monotonic);
+        } else if (ticket_count <= 4) {
+            _ = batch_le4.fetchAdd(1, .monotonic);
+        } else if (ticket_count <= 8) {
+            _ = batch_le8.fetchAdd(1, .monotonic);
+        } else if (ticket_count <= 16) {
+            _ = batch_le16.fetchAdd(1, .monotonic);
+        } else {
+            _ = batch_ge17.fetchAdd(1, .monotonic);
+        }
     }
 };
 
@@ -514,6 +599,9 @@ const Connection = struct {
     /// time for that exact ticket. See `trace`.
     trace_ticket: std.atomic.Value(u64) = .init(0),
     trace_ack_ns: std.atomic.Value(u64) = .init(0),
+    trace_emit_ns: std.atomic.Value(u64) = .init(0),
+    trace_queued_ns: std.atomic.Value(u64) = .init(0),
+    trace_written_ns: std.atomic.Value(u64) = .init(0),
     live_handlers: std.atomic.Value(usize) = .init(0),
     reaper: ?*ReaperPool = null,
     completion_ch_buf: []u31 = &.{},
@@ -872,6 +960,7 @@ const Connection = struct {
             if (first and meta.ticket != ack.ticket) return false;
             first = false;
             if (trace.enabled and self.trace_ticket.load(.acquire) == meta.ticket) {
+                self.trace_written_ns.store(ack.written_ns, .release);
                 self.trace_ack_ns.store(ack_ns, .release);
             }
             self.tickets.complete(slot_i, meta.ticket, ack.ok);
@@ -888,6 +977,7 @@ const Connection = struct {
     fn ackDrainer(self: *Connection) void {
         while (true) {
             const ack = self.write_ack_ch.getOne(self.config.io) catch break;
+            var wake_actor = ack.shutdown;
             self.applyOutboundRelease(ack.outbound_release, .wire);
             if (ack.control_entry) self.applyControlRelease(ack.control_release, true);
             if (ack.fail_all) {
@@ -895,6 +985,7 @@ const Connection = struct {
                 self.tickets.failAll();
                 // Do NOT touch handlers[] — actor applies connection_closed terminals.
                 self.wakeAllSpace();
+                wake_actor = true;
             } else if (ack.ticket != 0) {
                 if (!self.completeAckTickets(ack)) {
                     // A malformed chain would strand at least one synchronous
@@ -903,10 +994,15 @@ const Connection = struct {
                     self.writer_failed.store(true, .release);
                     self.tickets.failAll();
                     self.wakeAllSpace();
+                    wake_actor = true;
                 }
             }
-            if (ack.outbound_release != 0) self.wakeAllSpace();
-            self.actor_wake.set(self.config.io);
+            // A successful WIRE release cannot unblock waitForStreamSpace:
+            // handlers park only on their stream's pending-slab length, and
+            // that release already wakes the one affected stream in drainEmit.
+            // Waking every handler here made each tiny SSE record do O(streams)
+            // Event.set calls after it was already on the wire.
+            if (wake_actor) self.actor_wake.set(self.config.io);
             if (ack.shutdown) break;
         }
     }
@@ -1020,16 +1116,10 @@ const Connection = struct {
         for (self.intent_batch[0..n]) |*intent| switch (intent.*) {
             .outbound_frame => |f| self.config.gpa.free(f.payload),
             .dispatch_request => |d| {
-                for (d.headers) |h| {
-                    self.config.gpa.free(@constCast(h.name));
-                    self.config.gpa.free(@constCast(h.value));
-                }
+                hpack.HeaderField.freeOwnedSlice(self.config.gpa, d.headers);
                 self.config.gpa.free(d.headers);
                 if (d.trailers.len != 0) {
-                    for (d.trailers) |h| {
-                        self.config.gpa.free(@constCast(h.name));
-                        self.config.gpa.free(@constCast(h.value));
-                    }
+                    hpack.HeaderField.freeOwnedSlice(self.config.gpa, d.trailers);
                     self.config.gpa.free(d.trailers);
                 }
                 if (d.body.len != 0) self.config.gpa.free(d.body);
@@ -1174,8 +1264,79 @@ const Connection = struct {
     ///
     /// The caller is responsible for the reset-then-recheck sequence that makes
     /// this safe. See `run`.
+    fn traceParkSnapshot(self: *Connection) void {
+        const acc = self.tls_recv_acc.items.len;
+        const complete = tls_edge.hasCompleteRecord(self.tls_recv_acc.items);
+        const pending = self.sched.pendingCount();
+        const ordinary = self.sched.ordinary_len;
+        const framed = self.sched.framed_len;
+        if (!complete and pending == 0 and ordinary == 0 and framed == 0) {
+            // dropResetPending / refuseResetStream hung here with nothing to
+            // print. Throttle empty parks so an infinite hang is still visible.
+            const now = nowNs(self.config.io);
+            if (now -% diag_last_empty_park_ns < 5 * std.time.ns_per_s) return;
+            diag_last_empty_park_ns = now;
+        }
+        var missing: u32 = 0;
+        var zero_win: u32 = 0;
+        var eligible: u32 = 0;
+        var tomb_noerr: u32 = 0;
+        var tomb_rst: u32 = 0;
+        var pend_slots: u32 = 0;
+        var rst0: u32 = 0;
+        var min_win: i32 = std.math.maxInt(i32);
+        var pending_bytes: usize = 0;
+        for (self.sched.pending_slots) |s| {
+            if (s.stream_id == 0) continue;
+            pending_bytes += s.len;
+            if (self.slotIndex(s.stream_id) != null) pend_slots += 1;
+            const sw = self.session.streamSendAvailable(s.stream_id);
+            if (self.session.streams.get(s.stream_id) == null) {
+                missing += 1;
+                if (self.session.tombstoneCode(s.stream_id)) |c| {
+                    if (c == .no_error) tomb_noerr += 1 else tomb_rst += 1;
+                    if (rst0 == 0 and c != .no_error) rst0 = @intFromEnum(c);
+                }
+            } else if (sw <= 0) {
+                zero_win += 1;
+            } else {
+                eligible += 1;
+            }
+            if (sw < min_win) min_win = sw;
+        }
+        std.debug.print(
+            "STARH2_PARK acc={d} complete={} pending={d} bytes={d} ordinary={d} framed={d} live={d} refilled={} conn_win={d} eligible={d} missing={d} tomb_noerr={d} tomb_rst={d} pend_slots={d} rst0={d} intents={d} zero_win={d} min_swin={d} active={d} rst_h={d} rst_c={d} ctrl_fail={d} rst_after_fail={d}\n",
+            .{
+                acc,
+                complete,
+                pending,
+                pending_bytes,
+                ordinary,
+                framed,
+                self.live_handlers.load(.acquire),
+                self.sched_refilled.load(.acquire),
+                self.session.connectionSendAvailable(),
+                eligible,
+                missing,
+                tomb_noerr,
+                tomb_rst,
+                pend_slots,
+                rst0,
+                self.session.intentLen(),
+                zero_win,
+                min_win,
+                self.session.active_streams,
+                diag_rst_handler.load(.monotonic),
+                diag_rst_compress.load(.monotonic),
+                diag_ctrl_fail.load(.monotonic),
+                diag_reset_after_ctrl_fail.load(.monotonic),
+            },
+        );
+    }
+
     fn waitForActivity(self: *Connection) !void {
         const io = self.config.io;
+        if (diag_park) self.traceParkSnapshot();
         if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
             test_actor_waiting.set(io);
             try test_release_actor_wait.wait(io);
@@ -1263,7 +1424,6 @@ const Connection = struct {
             .stream = self.stream,
             .from_actor = &self.write_ch,
             .completions = &self.write_ack_ch,
-            .actor_wake = &self.actor_wake,
             .gpa = gpa,
             .test_delay_ms = test_write_delay_ms,
             .test_fail_after = test_write_fail_after,
@@ -1344,8 +1504,19 @@ const Connection = struct {
                 const now = nowNs(io);
                 self.session.edge_now_ns = now;
                 try self.session.checkIdleDeadlines(now);
-                try self.maybeBeginGraceful();
+                if (try self.maybeBeginGraceful()) break;
                 try self.checkSlowConsumers();
+                // Deadlines and slow-consumer kills push Session intents
+                // (RST_STREAM, stream_reset). drainEmit only walks the
+                // scheduler, so those intents have to be materialized first or
+                // the RST'd streams keep their pending DATA, drain skips them
+                // forever, and the actor parks until slow-consumer. That is
+                // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
+                self.materializeIntents() catch {
+                    // Terminal enqueue failure sets writer_failed inside
+                    // materializeIntents. Ordinary PoolFull is per-stream.
+                    self.failClosedOnIntentError();
+                };
                 self.drainEmit() catch {
                     // Fail-closed: Session may already be debited — terminate connection.
                     // A frame that failed after its flow-control debit cannot
@@ -1722,7 +1893,14 @@ const Connection = struct {
     ///    reporting, no reaper ever ran, and the slot plus its reaper token
     ///    leaked for the life of the connection.
     fn cancelHandler(self: *Connection, stream_id: u31, cause: response.TerminalCause) void {
-        const i = self.slotIndex(stream_id) orelse return;
+        const i = self.slotIndex(stream_id) orelse {
+            // The handler already posted its completion and released the slot.
+            // RST still owns any scheduler body queued for this id: leaving it
+            // makes `emitOneData` skip forever (RST tombstone ⇒ zero credit)
+            // and the actor parks until slow-consumer. That is the TLS stall.
+            self.wakeHandlerWaiters(stream_id);
+            return;
+        };
         const slot = &self.handlers[i];
         slot.terminal.setCause(cause);
         self.wakeHandlerWaiters(stream_id);
@@ -1896,16 +2074,16 @@ const Connection = struct {
     ///
     /// The one-second deadline between the phases is a liveness guard: a peer
     /// that never acks the PING must not be able to hold the shutdown open.
-    fn maybeBeginGraceful(self: *Connection) !void {
-        const sf = self.config.shutdown_flag orelse return;
-        if (!sf.load(.acquire)) return;
+    fn maybeBeginGraceful(self: *Connection) !bool {
+        const sf = self.config.shutdown_flag orelse return false;
+        if (!sf.load(.acquire)) return false;
         if (!self.shutting_down) {
             self.shutting_down = true;
             try self.session.applyCommand(.graceful_phase1);
             try self.processIntents();
             const now_ns = nowNs(self.config.io);
             self.grace_deadline = std.Io.Timestamp.fromNanoseconds(@as(i96, now_ns +% std.time.ns_per_s));
-            return;
+            return false;
         }
         if (self.session.grace_phase == .phase1) {
             const now = nowNs(self.config.io);
@@ -1922,9 +2100,14 @@ const Connection = struct {
             if (self.grace_deadline) |dl| {
                 if (nowNs(self.config.io) >= @as(u64, @intCast(dl.nanoseconds))) {
                     try self.finishGraceful();
+                    // The remaining handlers are canceled by shutdownHandlers
+                    // after the actor loop. Staying in this loop waits for
+                    // work whose cancellation cannot begin: a circular hang.
+                    return true;
                 }
             }
         }
+        return false;
     }
 
     fn finishGraceful(self: *Connection) !void {
@@ -2064,6 +2247,7 @@ const Connection = struct {
             needs_flush: bool = false,
             control_n: usize = 0,
             control_entry: bool = false,
+            tickets_emitted: u32 = 0,
 
             fn capacity(batch: *const @This()) usize {
                 // TLS 1.3 application plaintext is at most 16 KiB. The extra
@@ -2086,6 +2270,7 @@ const Connection = struct {
                 // when it is handed off after `sched.drain` returns.
                 test_in_sched_sink = true;
                 defer test_in_sched_sink = false;
+                if (trace.enabled) batch.tickets_emitted += ticket_count;
                 try batch.c.queueWire(
                     payload,
                     flush,
@@ -2269,7 +2454,49 @@ const Connection = struct {
             self.handleWriterFailed();
             return err;
         };
+        if (trace.enabled) {
+            if (sink_ctx.tickets_emitted > 0) {
+                _ = trace.emit_turns.fetchAdd(1, .monotonic);
+                _ = trace.emit_tickets.fetchAdd(sink_ctx.tickets_emitted, .monotonic);
+                trace.bumpMax(&trace.emit_max, sink_ctx.tickets_emitted);
+            }
+        }
         test_observed_sched_emits.store(self.sched.emits_total, .release);
+    }
+
+    fn applyStreamResetIntent(self: *Connection, r: anytype) void {
+        const cause: response.TerminalCause = if (r.from_peer)
+            .{ .peer_reset = r.code }
+        else if (self.shutting_down)
+            .server_shutdown
+        else
+            .{ .peer_reset = r.code };
+        self.cancelHandler(r.stream_id, cause);
+    }
+
+    /// A RST frame that cannot be queued has already tombstoned the stream.
+    /// Dropping the paired `stream_reset` intent leaves FairScheduler DATA that
+    /// `emitOneData` will skip forever (TLS stall). Run every remaining reset
+    /// locally, then fail the connection so the peer is not left waiting.
+    fn finishIntentsAfterEnqueueFail(self: *Connection, rest: []session_mod.Intent) void {
+        for (rest) |*it| {
+            switch (it.*) {
+                .stream_reset => |r| {
+                    if (diag_park) _ = diag_reset_after_ctrl_fail.fetchAdd(1, .monotonic);
+                    self.applyStreamResetIntent(r);
+                },
+                else => self.session.releaseIntent(it),
+            }
+        }
+    }
+
+    fn failClosedOnIntentError(self: *Connection) void {
+        // Ordinary control/framed enqueue failure is per-stream WriteFailed.
+        // Only a terminal frame that could not be queued fail-closes: that is
+        // the RST-without-wire stall. Killing the connection on HEADERS
+        // PoolFull dropped one of 50 clients and showed up as not-started.
+        if (!self.writer_failed.load(.acquire)) return;
+        self.handleWriterFailed();
     }
 
     /// Turn queued `Session` intents into scheduler work without emitting.
@@ -2310,7 +2537,12 @@ const Connection = struct {
                             self.next_wire_ticket = 0;
                             self.next_wire_slot = 0;
                         }
-                        try self.sched.enqueueFramedData(f.payload, f.stream_id, f.flags.end_stream, t, s);
+                        self.sched.enqueueFramedData(f.payload, f.stream_id, f.flags.end_stream, t, s) catch {
+                            if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
+                            self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
+                            consumed = n;
+                            return error.OutOfMemory;
+                        };
                     } else {
                         const class = fair_scheduler.FairScheduler.classifyControl(f.typ, f.flags);
                         var t: u64 = 0;
@@ -2323,7 +2555,13 @@ const Connection = struct {
                         }
                         self.sched.enqueueControl(f.payload, class, t, s) catch |err| switch (err) {
                             error.PoolFull, error.QueueFull => {
-                                // Fail closed: release ownership already consumed by enqueueControl on error.
+                                // Payload already freed by enqueueControl. Do not
+                                // drop the rest of the batch: the next intent is
+                                // often `stream_reset` for this same RST.
+                                if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
+                                self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
+                                consumed = n;
+                                if (class == .terminal) self.writer_failed.store(true, .release);
                                 return error.OutOfMemory;
                             },
                         };
@@ -2331,15 +2569,7 @@ const Connection = struct {
                 },
                 .dispatch_request => |d| try self.dispatch(d),
                 .early_reject => {},
-                .stream_reset => |r| {
-                    const cause: response.TerminalCause = if (r.from_peer)
-                        .{ .peer_reset = r.code }
-                    else if (self.shutting_down)
-                        .server_shutdown
-                    else
-                        .{ .peer_reset = r.code };
-                    self.cancelHandler(r.stream_id, cause);
-                },
+                .stream_reset => |r| self.applyStreamResetIntent(r),
                 .connection_error => {
                     for (self.handlers) |*slot| {
                         if (!slot.in_use) continue;
@@ -2401,6 +2631,7 @@ const Connection = struct {
             if (control_entry) self.applyControlRelease(control_n, true);
             return error.OutOfMemory;
         }
+        if (trace.enabled) _ = trace.records.fetchAdd(1, .monotonic);
         self.write_ch.putOne(self.config.io, .{
             .bytes = out,
             .len = out.len,
@@ -2436,6 +2667,22 @@ const Connection = struct {
     /// ciphertext record takes its own. A coalesced batch instead borrows the
     /// boot-counted plaintext scratch, so only its ciphertext needs a dynamic
     /// reservation. Owned plaintext is released after the last record queues.
+    fn batchContainsTraceTicket(self: *Connection, ticket_slot: u32, ticket_count: u32) bool {
+        const target = self.trace_ticket.load(.acquire);
+        if (target == 0 or ticket_count == 0) return false;
+        var slot_i = ticket_slot;
+        var remaining = ticket_count;
+        while (remaining > 0) : (remaining -= 1) {
+            const meta = self.tickets.completion(slot_i) orelse return false;
+            if (meta.ticket == target) return true;
+            if (remaining > 1) {
+                if (meta.next == ticket_table.no_completion_slot) return false;
+                slot_i = meta.next;
+            }
+        }
+        return false;
+    }
+
     fn queueWire(
         self: *Connection,
         bytes: []u8,
@@ -2450,6 +2697,9 @@ const Connection = struct {
         if (!test_in_sched_sink) {
             _ = test_queue_wire_bypass.fetchAdd(1, .acq_rel);
         }
+        if (trace.enabled) trace.noteHandoff(ticket_count, bytes.len);
+        const trace_batch = trace.enabled and self.batchContainsTraceTicket(ticket_slot, ticket_count);
+        if (trace_batch) self.trace_emit_ns.store(nowNs(self.config.io), .release);
         const sends = test_wire_sends.fetchAdd(1, .acq_rel);
         const fail_after = test_force_wire_fail_after.load(.acquire);
         if (fail_after != 0 and sends + 1 >= fail_after) {
@@ -2504,6 +2754,7 @@ const Connection = struct {
             std.debug.assert(owns_bytes);
             try self.sendAccountedWire(bytes, flush, ticket, ticket_slot, ticket_count, control_n, control_entry);
         }
+        if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
 
     /// Build a handler job and spawn it. Actor-only.
@@ -2529,15 +2780,9 @@ const Connection = struct {
     /// the alternative: a stream that is admitted and accounted for but never
     /// answered.
     fn releaseDispatchRequest(gpa: std.mem.Allocator, d: session_mod.DispatchRequest) void {
-        for (d.headers) |h| {
-            gpa.free(@constCast(h.name));
-            gpa.free(@constCast(h.value));
-        }
+        hpack.HeaderField.freeOwnedSlice(gpa, d.headers);
         gpa.free(d.headers);
-        for (d.trailers) |h| {
-            gpa.free(@constCast(h.name));
-            gpa.free(@constCast(h.value));
-        }
+        hpack.HeaderField.freeOwnedSlice(gpa, d.trailers);
         if (d.trailers.len != 0) gpa.free(d.trailers);
         gpa.free(d.body);
     }
@@ -2655,6 +2900,13 @@ const Connection = struct {
 
         _ = self.live_handlers.fetchAdd(1, .acq_rel);
         _ = test_observed_live_handlers.fetchAdd(1, .acq_rel);
+        if (trace.enabled) {
+            const n = trace.jobs.fetchAdd(1, .monotonic);
+            if (n % trace.sample_every == 0) {
+                job.hctx.trace_on = true;
+                job.hctx.t_dispatch = nowNs(self.config.io);
+            }
+        }
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
@@ -2679,6 +2931,10 @@ const Connection = struct {
         accept_encoding: []const u8 = "",
         encoder: ?*brotli.Encoder = null,
         compressing: bool = false,
+        /// One-shot lifecycle sample, decided at dispatch so spawn delay is visible.
+        trace_on: bool = false,
+        t_dispatch: u64 = 0,
+        t_handler: u64 = 0,
     };
 
     const HandlerJob = struct {
@@ -2737,6 +2993,7 @@ const Connection = struct {
             releaseDispatchRequest(self.config.gpa, job.owned_request);
             self.config.gpa.destroy(job);
         }
+        if (job.hctx.trace_on) job.hctx.t_handler = nowNs(self.config.io);
         if (job.slot.terminal.cancel_flag.load(.acquire)) return;
         if (job.slot.terminal.getCause() != null) return;
         switch (job.matched) {
@@ -2749,10 +3006,12 @@ const Connection = struct {
                     } else if (!job.resp.finished) {
                         self.withSession(struct {
                             fn go(c: *Connection, sid: u31) void {
+                                if (diag_park) _ = diag_rst_handler.fetchAdd(1, .monotonic);
                                 // A concurrently terminal stream needs no second reset.
                                 c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
-                                // Connection teardown is authoritative when reset output cannot be queued.
-                                c.processIntents() catch {};
+                                // Swallowing OOM here left RST-tombstoned DATA in
+                                // the scheduler and the connection up — the TLS stall.
+                                c.processIntents() catch c.failClosedOnIntentError();
                             }
                         }.go, job.stream_id);
                     }
@@ -2925,12 +3184,31 @@ const Connection = struct {
             }
             self.withSession(struct {
                 fn go(c: *Connection, sid: u31) void {
+                    if (diag_park) _ = diag_rst_compress.fetchAdd(1, .monotonic);
                     c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
-                    c.processIntents() catch {};
+                    c.processIntents() catch c.failClosedOnIntentError();
                 }
             }.go, stream_id);
             return error.WriteFailed;
         };
+    }
+
+    /// Recheck after taking `session_mu`. The pre-lock `getCause()` is stale:
+    /// the actor can RST and `cancelHandler` between that load and this
+    /// acquisition, and `cmdHeaders` used to encode HEADERS for a missing
+    /// stream anyway. Enqueueing DATA after a RST tombstone is the TLS stall.
+    fn refuseIfStreamDead(
+        self: *Connection,
+        stream_id: u31,
+        terminal: *response.SlotTerminal,
+    ) response.ResponseError!void {
+        self.assertSessionHeld("refuseIfStreamDead");
+        if (terminal.getCause()) |c| return response.causeToError(c);
+        if (self.writer_failed.load(.acquire)) return error.WriteFailed;
+        if (self.session.tombstoneCode(stream_id)) |code| {
+            if (code != .no_error) return error.PeerReset;
+        }
+        if (self.session.streams.get(stream_id) == null) return error.WriteFailed;
     }
 
     fn sendCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {
@@ -2973,8 +3251,11 @@ const Connection = struct {
         // One-shot responses use the same ticket-correlated phase trace as
         // streaming writes. Without this arm the one-shot benchmark reports
         // zero samples and the instrument silently measures only SSE.
-        var traced = trace.enabled and
-            (trace.writes.fetchAdd(1, .monotonic) % trace.sample_every == 0);
+        // A dispatch-sampled job also traces spawn/to_send on this same request.
+        const lifecycle = hctx.trace_on;
+        var traced = lifecycle or (trace.enabled and
+            (trace.writes.fetchAdd(1, .monotonic) % trace.sample_every == 0));
+        if (lifecycle) _ = trace.writes.fetchAdd(1, .monotonic);
         if (traced) {
             traced = self.trace_ticket.cmpxchgStrong(0, ticket, .acq_rel, .monotonic) == null;
             if (!traced) _ = trace.skipped.fetchAdd(1, .monotonic);
@@ -2982,15 +3263,31 @@ const Connection = struct {
         defer if (traced) self.trace_ticket.store(0, .release);
         var t_before: u64 = 0;
         var t_acquired: u64 = 0;
+        var t_hpack: u64 = 0;
         var t_unlocked: u64 = 0;
-        if (traced) {
-            self.trace_ack_ns.store(0, .release);
+        if (traced or lifecycle) {
+            if (traced) {
+                self.trace_ack_ns.store(0, .release);
+                self.trace_emit_ns.store(0, .release);
+                self.trace_queued_ns.store(0, .release);
+                self.trace_written_ns.store(0, .release);
+            }
             t_before = nowNs(self.config.io);
+        }
+        if (lifecycle and hctx.t_handler >= hctx.t_dispatch and t_before >= hctx.t_handler) {
+            const spawn = hctx.t_handler - hctx.t_dispatch;
+            const to_send = t_before - hctx.t_handler;
+            _ = trace.lifecycle_samples.fetchAdd(1, .monotonic);
+            _ = trace.spawn_ns.fetchAdd(spawn, .monotonic);
+            _ = trace.to_send_ns.fetchAdd(to_send, .monotonic);
+            trace.bumpMax(&trace.spawn_max, spawn);
+            trace.bumpMax(&trace.to_send_max, to_send);
         }
         {
             try self.lockSession();
             if (traced) t_acquired = nowNs(self.config.io);
             defer self.unlockSession(self.config.io);
+            try self.refuseIfStreamDead(stream_id, hctx.terminal);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
             var owned_vary: ?[]u8 = null;
@@ -3001,12 +3298,14 @@ const Connection = struct {
                 .strip_content_length = compress,
             }, &owned_vary);
             // Compressed bodies never carry content-length — HTTP/2 length is framing.
+            const t_hpack0 = if (traced) nowNs(self.config.io) else 0;
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
                 .headers = hlist.items,
                 .end_stream = body_out.len == 0,
             } }) catch return error.WriteFailed;
+            if (traced) t_hpack = nowNs(self.config.io) - t_hpack0;
             if (body_out.len > 0) {
                 const pending_len = self.sched.pendingByteLen(stream_id);
                 const fits_without_wait = pending_len < self.config.limits.outbound_bytes_per_stream and
@@ -3018,19 +3317,31 @@ const Connection = struct {
                     // became ready in this turn. The handler remains a producer
                     // and waits for its exact linked wire receipt.
                     self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
-                    self.materializeIntents() catch return error.WriteFailed;
+                    self.materializeIntents() catch {
+                        self.failClosedOnIntentError();
+                        return error.WriteFailed;
+                    };
                 } else {
                     // A body that can fill the stream slab may release this
                     // lock while waiting for capacity. Materialize HEADERS
                     // first so the actor cannot emit DATA ahead of them (t-482).
-                    self.processIntents() catch return error.WriteFailed;
+                    self.processIntents() catch {
+                        self.failClosedOnIntentError();
+                        return error.WriteFailed;
+                    };
                     self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
-                    self.processIntents() catch return error.WriteFailed;
+                    self.processIntents() catch {
+                        self.failClosedOnIntentError();
+                        return error.WriteFailed;
+                    };
                 }
             } else {
                 self.next_wire_ticket = ticket;
                 self.next_wire_slot = slot_i;
-                self.processIntents() catch return error.WriteFailed;
+                self.processIntents() catch {
+                    self.failClosedOnIntentError();
+                    return error.WriteFailed;
+                };
             }
         }
         if (traced) t_unlocked = nowNs(self.config.io);
@@ -3045,6 +3356,9 @@ const Connection = struct {
             const t_done = nowNs(self.config.io);
             const t_ack = self.trace_ack_ns.load(.acquire);
             if (t_ack >= t_unlocked and t_done >= t_ack) {
+                const t_emit = self.trace_emit_ns.load(.acquire);
+                const t_queued = self.trace_queued_ns.load(.acquire);
+                const t_written = self.trace_written_ns.load(.acquire);
                 const block = t_acquired - t_before;
                 const hold = t_unlocked - t_acquired;
                 const ack = t_ack - t_unlocked;
@@ -3054,10 +3368,23 @@ const Connection = struct {
                 _ = trace.hold_ns.fetchAdd(hold, .monotonic);
                 _ = trace.ack_ns.fetchAdd(ack, .monotonic);
                 _ = trace.resume_ns.fetchAdd(res, .monotonic);
+                _ = trace.hpack_ns.fetchAdd(t_hpack, .monotonic);
+                if (t_emit >= t_unlocked and t_queued >= t_emit and t_ack >= t_queued) {
+                    _ = trace.ack_split_samples.fetchAdd(1, .monotonic);
+                    _ = trace.actor_ns.fetchAdd(t_emit - t_unlocked, .monotonic);
+                    _ = trace.queue_ns.fetchAdd(t_queued - t_emit, .monotonic);
+                    _ = trace.pump_ns.fetchAdd(t_ack - t_queued, .monotonic);
+                    if (t_written >= t_queued and t_ack >= t_written) {
+                        _ = trace.pump_split_samples.fetchAdd(1, .monotonic);
+                        _ = trace.write_ns.fetchAdd(t_written - t_queued, .monotonic);
+                        _ = trace.drain_ns.fetchAdd(t_ack - t_written, .monotonic);
+                    }
+                }
                 trace.bumpMax(&trace.block_max, block);
                 trace.bumpMax(&trace.hold_max, hold);
                 trace.bumpMax(&trace.ack_max, ack);
                 trace.bumpMax(&trace.resume_max, res);
+                trace.bumpMax(&trace.hpack_max, t_hpack);
             }
         }
     }
@@ -3092,6 +3419,7 @@ const Connection = struct {
             errdefer self.tickets.releaseReserved(slot_i);
             try self.lockSession();
             defer self.unlockSession(self.config.io);
+            try self.refuseIfStreamDead(stream_id, hctx.terminal);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             defer hlist.deinit(self.config.gpa);
             var owned_vary: ?[]u8 = null;
@@ -3110,7 +3438,10 @@ const Connection = struct {
             } }) catch return error.WriteFailed;
             self.next_wire_ticket = ticket;
             self.next_wire_slot = slot_i;
-            self.processIntents() catch return error.WriteFailed;
+            self.processIntents() catch {
+                self.failClosedOnIntentError();
+                return error.WriteFailed;
+            };
         }
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
@@ -3126,9 +3457,8 @@ const Connection = struct {
     /// `enqueuePending`, so this is not an unbounded fire-and-forget.
     /// `flush` means EMIT NOW (the compressor is told to flush and the bytes are
     /// queued). `wait` means BLOCK UNTIL THE WIRE HAS THEM (reserve a ticket and
-    /// wait for the receipt). They were one flag, and conflating them cost an SSE
-    /// stream a full receipt round trip per event for a barrier nothing was waiting
-    /// on. `Body.flush()` sets both; an SSE write sets only the first.
+    /// wait for the receipt). They remain separate so callers can choose either
+    /// contract; `Body.flush()` and an SSE write both set both today.
     fn writeCb(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool, flush: bool, wait: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
@@ -3154,6 +3484,8 @@ const Connection = struct {
             owned = try out.toOwnedSlice(self.config.gpa);
             wire_bytes = owned.?;
             // A flush/end with no compressed output still needs the receipt path.
+            // A non-final zero-byte receipt becomes a write-queue barrier below:
+            // the DATA scheduler cannot emit a frame for it.
             if (!flush and !end and wire_bytes.len == 0) return;
         }
 
@@ -3185,6 +3517,9 @@ const Connection = struct {
         var t_unlocked: u64 = 0;
         if (traced) {
             self.trace_ack_ns.store(0, .release);
+            self.trace_emit_ns.store(0, .release);
+            self.trace_queued_ns.store(0, .release);
+            self.trace_written_ns.store(0, .release);
             t_before = nowNs(self.config.io);
         }
         {
@@ -3192,6 +3527,7 @@ const Connection = struct {
             try self.lockSession();
             if (traced) t_acquired = nowNs(self.config.io);
             defer self.unlockSession(self.config.io);
+            try self.refuseIfStreamDead(stream_id, hctx.terminal);
             // The handler enqueues and leaves. It does NOT drain.
             //
             // `enqueuePending` already sets `sched_refilled` and wakes the
@@ -3210,7 +3546,25 @@ const Connection = struct {
             //
             // It also restores the ownership rule this module states at the
             // top: only the actor emits.
-            self.enqueuePending(stream_id, wire_bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
+            if (wire_bytes.len == 0 and need_wait and !end) {
+                // A zero-length, non-final DataPending is ineligible forever:
+                // there is no DATA frame to carry its ticket. Preserve FIFO
+                // receipt semantics by attaching to earlier pending bytes, or
+                // by queueing a bare pump barrier when no DATA remains.
+                if (self.sched.findPending(stream_id)) |pw| {
+                    if (pw.len > 0 or pw.end_stream) {
+                        pw.flush_ticket = ticket;
+                        pw.flush_slot = slot_i;
+                        pw.flush_remain = pw.len;
+                    } else {
+                        self.sendFlushTicket(ticket, slot_i) catch return error.WriteFailed;
+                    }
+                } else {
+                    self.sendFlushTicket(ticket, slot_i) catch return error.WriteFailed;
+                }
+            } else {
+                self.enqueuePending(stream_id, wire_bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
+            }
         }
         if (traced) t_unlocked = nowNs(self.config.io);
         if (need_wait) {
@@ -3226,6 +3580,9 @@ const Connection = struct {
             const t_ack = self.trace_ack_ns.load(.acquire);
             self.trace_ticket.store(0, .release);
             if (t_ack >= t_unlocked and t_done >= t_ack) {
+                const t_emit = self.trace_emit_ns.load(.acquire);
+                const t_queued = self.trace_queued_ns.load(.acquire);
+                const t_written = self.trace_written_ns.load(.acquire);
                 const block = t_acquired - t_before;
                 const hold = t_unlocked - t_acquired;
                 const ack = t_ack - t_unlocked;
@@ -3235,6 +3592,17 @@ const Connection = struct {
                 _ = trace.hold_ns.fetchAdd(hold, .monotonic);
                 _ = trace.ack_ns.fetchAdd(ack, .monotonic);
                 _ = trace.resume_ns.fetchAdd(res, .monotonic);
+                if (t_emit >= t_unlocked and t_queued >= t_emit and t_ack >= t_queued) {
+                    _ = trace.ack_split_samples.fetchAdd(1, .monotonic);
+                    _ = trace.actor_ns.fetchAdd(t_emit - t_unlocked, .monotonic);
+                    _ = trace.queue_ns.fetchAdd(t_queued - t_emit, .monotonic);
+                    _ = trace.pump_ns.fetchAdd(t_ack - t_queued, .monotonic);
+                    if (t_written >= t_queued and t_ack >= t_written) {
+                        _ = trace.pump_split_samples.fetchAdd(1, .monotonic);
+                        _ = trace.write_ns.fetchAdd(t_written - t_queued, .monotonic);
+                        _ = trace.drain_ns.fetchAdd(t_ack - t_written, .monotonic);
+                    }
+                }
                 trace.bumpMax(&trace.block_max, block);
                 trace.bumpMax(&trace.hold_max, hold);
                 trace.bumpMax(&trace.ack_max, ack);
@@ -3271,8 +3639,12 @@ const Connection = struct {
                     errdefer self.tickets.releaseReserved(slot_i);
                     try self.lockSession();
                     defer self.unlockSession(self.config.io);
+                    try self.refuseIfStreamDead(stream_id, hctx.terminal);
                     self.enqueuePending(stream_id, out.items, false, ticket, slot_i, hctx.terminal) catch |err| return err;
-                    self.processIntents() catch return error.WriteFailed;
+                    self.processIntents() catch {
+                        self.failClosedOnIntentError();
+                        return error.WriteFailed;
+                    };
                 }
                 hctx.slot.awaiting_receipt.store(true, .release);
                 defer hctx.slot.awaiting_receipt.store(false, .release);
@@ -3287,6 +3659,7 @@ const Connection = struct {
             errdefer self.tickets.releaseReserved(slot_i);
             try self.lockSession();
             defer self.unlockSession(self.config.io);
+            try self.refuseIfStreamDead(stream_id, hctx.terminal);
             if (self.sched.findPending(stream_id)) |pw| {
                 if (pw.len > 0 or pw.end_stream) {
                     pw.flush_ticket = ticket;
@@ -3298,7 +3671,10 @@ const Connection = struct {
             } else {
                 self.sendFlushTicket(ticket, slot_i) catch return error.WriteFailed;
             }
-            self.processIntents() catch return error.WriteFailed;
+            self.processIntents() catch {
+                self.failClosedOnIntentError();
+                return error.WriteFailed;
+            };
         }
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
