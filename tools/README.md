@@ -100,8 +100,9 @@ upstream runtime failure.
 `bench-pipeline` removes the socket, TLS, client, and lock-contention variables
 from the one-shot path. It times response HPACK encoding, static and
 dynamic-indexed request HPACK decoding, frame parsing, frame-plus-HPACK inbound
-work, the deterministic `Session` request/response path, and an empty task
-spawn/join using the same zio runtime shape as the bench server.
+work, the deterministic `Session` request/response path, packed ticket
+bookkeeping (already-signaled one, packed-6 handoff, parked wake), and an empty
+task spawn/join using the same zio runtime shape as the bench server.
 
 ```sh
 ./zb build bench-pipeline -Doptimize=ReleaseFast -- -n 1000000 --rounds 5
@@ -117,9 +118,9 @@ dispatch, response HPACK/framing, and fixed-buffer output.
 
 Each row reports median ns/op, the full round range, successful allocator calls
 per operation, and requested bytes per operation. Setup, dynamic-table seeding,
-and warmup are excluded. The empty-task row uses `n / 100` iterations because
-it is intentionally much more expensive; its runtime allocator is internal to
-zio, so allocation columns are reported as `n/a`.
+and warmup are excluded. The empty-task and parked-wake ticket rows use
+`n / 100` iterations because they are intentionally much more expensive; zio's
+runtime allocator is internal, so those allocation columns are `n/a`.
 
 These numbers explain local CPU demand, not whole-server throughput. Starh2's
 `Session request + response` includes frame parsing but stops at outbound
@@ -141,8 +142,9 @@ tools/oneshot-phase-trace.sh
 
 Packed drain turns at `-m 10` are about 0.17 TLS records per response. The
 script exits 9 if that ratio exceeds 0.4 (one record per response again).
-Concat itself is a few nanoseconds; the remaining one-shot gap is per-request
-allocation and spawn, not another TLS-record tweak.
+Concat itself is a few nanoseconds. HPACK, Huffman, and frame parse are not
+the live ~5× vs http2.zig; the residue is Connection lifecycle (actor +
+pumps + AckDrainer + receipts). Protocol: `tools/oneshot-gap.md`.
 
 The 30s TLS stall (DATA left in FairScheduler after a RST tombstone) is a
 different defect. Method: `TLS_STALL_BRIEF.md`. It landed in `57359b7`.

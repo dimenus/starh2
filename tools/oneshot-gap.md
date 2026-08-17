@@ -75,9 +75,16 @@ tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
 
 `TLS pack 6 HEADERS+DATA` is a few nanoseconds and zero allocs. Do not
 spend another round on the memcpy. Isolated Session request+response now
-sits close to http2.zig's inline core; empty zio spawn+await is what
-complete handlers no longer pay. The live TLS gap is pumps, tickets, TLS,
-and the one-actor-per-connection domain — re-derive, do not cite a ratio.
+sits close to http2.zig's inline core (~630 ns vs ~567); empty zio
+spawn+await is what complete handlers no longer pay.
+
+Huffman is closed: a comptime prefix trie in `huffDecode` matches
+http2.zig `decodeBounded` (Darwin Chrome UA 658 vs 653 ns). Mixed HPACK
+86 vs 16 ns is required dynamic-table copies vs views (~70 ns), not an
+accidental memcpy. Frame 2.7 vs 0.3 ns is not the same job — they parse
+the 9-byte header only. Ticket bookkeeping: packed-6 ~154 ns handoff
+(~26 ns/req); parked wake ≈ empty spawn (~2 µs) and is the write
+self-clock. Re-derive; do not cite a ratio.
 
 Official one-shot:
 
@@ -104,18 +111,34 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   packed (oracle exits 9 at `records/response > 0.4`). Packed drain turns
   at `-m 10` sit well below that.
 - Starting by changing zio.
+- View-decode Huffman plaintext or dynamic-table strings. Encoded bytes
+  are not the string; a later block can evict a dynamic entry while a
+  request still holds the field. Static-table strings may be borrowed.
+- Parsing only the 9-byte frame header. Starh2's `ingestOne` is the
+  resumable parser plus payload-lifetime union; that is the production
+  job.
 
 ## What is left
 
-Live one-shot TLS is no longer an alloc or spawn story. Re-run
-`tools/oneshot-phase-trace.sh`: after the complete-handler cut it showed
-~0.01 GPA allocs/req and packed `records/response`. Isolated Session
-request+response is close to http2.zig's inline request core; pipeline
-HPACK mixed decode still allocates because that bench uses GPA, not the
-live job-arena path.
+Live one-shot is no longer an alloc, spawn, HPACK, Huffman, or parse
+story. Re-run `tools/oneshot-phase-trace.sh`: after the complete-handler
+cut it showed ~0.01 GPA allocs/req and packed `records/response`.
+Nachos oneshot `-n 100000 -c 50 -m 10 -t 12` (re-derive): starh2 tls
+~716k / ~12 µs, h2c ~1.10M / ~9.3 µs, opponent tls ~3.78M / ~3.1 µs.
+Our h2c is still slower than their TLS, so TLS is not the first
+remaining suspect.
 
-The remaining live gap is pumps, tickets, TLS, and the one-actor-per-
-connection domain. Do not drop scheduler pending without RST-on-wire or
-fail-close. That is the TLS stall in `TLS_STALL_BRIEF.md` / `57359b7`, a
-different defect. `not-started` (`started < total`) is t-761, also
-different.
+The residue is Connection lifecycle: actor + ReadPump + WritePump +
+AckDrainer + receipts. Do not name it “one actor per connection” —
+http2.zig also has one connection task; theirs is a single
+read/dispatch/write/flush loop. Their 3.78M is a narrower contract
+(handler or blocked write stops ingest). We keep the three starve
+stories: other connections, handler work vs actor, peer stops reading.
+
+Reopen HPACK/parse only if an on-CPU h2c profile shows
+ingest+HPACK+Session ≥ 1 µs/req or 15% CPU. Sol Extra High picked A on
+those terms.
+
+Do not drop scheduler pending without RST-on-wire or fail-close. That
+is the TLS stall in `TLS_STALL_BRIEF.md` / `57359b7`, a different
+defect. `not-started` (`started < total`) is t-761, also different.
