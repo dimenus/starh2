@@ -188,6 +188,40 @@ const huff_pairs: [257]HuffPair = load: {
     break :load pairs;
 };
 
+const huff_decode_missing = std.math.maxInt(u16);
+const huff_decode_none: u16 = 257;
+
+const HuffDecodeNode = struct {
+    child: [2]u16 = .{ huff_decode_missing, huff_decode_missing },
+    /// 0–255 byte, 256 EOS, 257 not a leaf.
+    symbol: u16 = huff_decode_none,
+};
+
+const huff_decode_trie = build: {
+    @setEvalBranchQuota(200_000);
+    var storage: [1024]HuffDecodeNode = [_]HuffDecodeNode{.{}} ** 1024;
+    var count: u16 = 1;
+    for (huff_pairs, 0..) |p, sym| {
+        var idx: u16 = 0;
+        var bit_i: u8 = 0;
+        while (bit_i < p.bits) : (bit_i += 1) {
+            const shift: u5 = @intCast(p.bits - 1 - bit_i);
+            const bit: u1 = @intCast((p.code >> shift) & 1);
+            if (storage[idx].child[bit] == huff_decode_missing) {
+                if (count >= storage.len) unreachable;
+                storage[idx].child[bit] = count;
+                count += 1;
+            }
+            idx = storage[idx].child[bit];
+        }
+        if (storage[idx].symbol != huff_decode_none) unreachable;
+        storage[idx].symbol = @intCast(sym);
+    }
+    var exact: [count]HuffDecodeNode = undefined;
+    @memcpy(&exact, storage[0..count]);
+    break :build exact;
+};
+
 pub fn decodeHuffman(allocator: std.mem.Allocator, encoded: []const u8) (CompressionError || error{OutOfMemory})![]u8 {
     return huffDecode(allocator, encoded);
 }
@@ -206,48 +240,41 @@ pub fn huffmanPair(sym: u8) struct { code: u32, bits: u8 } {
 }
 
 fn huffDecode(allocator: std.mem.Allocator, encoded: []const u8) (CompressionError || error{OutOfMemory})![]u8 {
+    // Appendix B shortest code is 5 bits, so decoded.len <= encoded.len * 8 / 5.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    var acc: u64 = 0;
-    var bits: u8 = 0;
+    try out.ensureTotalCapacityPrecise(allocator, (encoded.len * 8) / 5);
+
+    var node: u16 = 0;
+    var leftover: u32 = 0;
+    var leftover_bits: u8 = 0;
     for (encoded) |byte| {
-        acc = (acc << 8) | byte;
-        bits += 8;
-        decode_loop: while (bits > 0) {
-            var found = false;
-            var sym: usize = 0;
-            while (sym < 256) : (sym += 1) {
-                const p = huff_pairs[sym];
-                if (p.bits == 0 or p.bits > bits) continue;
-                const shift: u6 = @intCast(bits - p.bits);
-                const got: u32 = @truncate(acc >> shift);
-                const mask: u32 = if (p.bits == 32) 0xffff_ffff else (@as(u32, 1) << @intCast(p.bits)) - 1;
-                if ((got & mask) == p.code) {
-                    try out.append(allocator, @intCast(sym));
-                    bits -= p.bits;
-                    acc &= (@as(u64, 1) << @intCast(bits)) - 1;
-                    found = true;
-                    continue :decode_loop;
-                }
-            }
-            const eos = huff_pairs[256];
-            if (eos.bits != 0 and eos.bits <= bits) {
-                const shift: u6 = @intCast(bits - eos.bits);
-                const got: u32 = @truncate(acc >> shift);
-                if (got == eos.code) return error.CompressionError;
-            }
-            if (!found) break;
+        var bit_i: u4 = 0;
+        while (bit_i < 8) : (bit_i += 1) {
+            const bit: u1 = @intCast((byte >> @intCast(7 - bit_i)) & 1);
+            const next = huff_decode_trie[node].child[bit];
+            if (next == huff_decode_missing) return error.CompressionError;
+            node = next;
+            leftover = (leftover << 1) | bit;
+            leftover_bits += 1;
+            const sym = huff_decode_trie[node].symbol;
+            if (sym == huff_decode_none) continue;
+            // EOS inside a string is a compression error (RFC 7541 §5.2).
+            if (sym == 256) return error.CompressionError;
+            out.appendAssumeCapacity(@intCast(sym));
+            node = 0;
+            leftover = 0;
+            leftover_bits = 0;
         }
     }
-    // RFC 7541 section 5.2 makes both of these a compression error, and both
-    // are decoder-fingerprint tricks rather than accidents. More than 7 padding
-    // bits means a whole symbol was dropped. Padding that is not all-ones is a
+    // RFC 7541 §5.2: leftover bits are EOS-prefix padding. More than 7 bits
+    // means a whole symbol was dropped. Padding that is not all-ones is a
     // second encoding of the same string, which lets a peer smuggle a value
     // past a byte comparison somewhere downstream.
-    if (bits >= 8) return error.CompressionError;
-    if (bits > 0) {
-        const pad_mask: u64 = (@as(u64, 1) << @intCast(bits)) - 1;
-        if ((acc & pad_mask) != pad_mask) return error.CompressionError;
+    if (leftover_bits >= 8) return error.CompressionError;
+    if (leftover_bits > 0) {
+        const pad_mask: u32 = (@as(u32, 1) << @intCast(leftover_bits)) - 1;
+        if (leftover != pad_mask) return error.CompressionError;
     }
     return try out.toOwnedSlice(allocator);
 }
@@ -830,6 +857,16 @@ test "Huffman decode is owned plaintext, not a view of the encoded slice" {
     try std.testing.expect(@intFromPtr(out.ptr) != @intFromPtr(&enc));
     @memset(&enc, 0);
     try std.testing.expectEqualStrings("www.example.com", out);
+}
+
+test "Huffman padding is EOS prefix and EOS itself is a compression error" {
+    // '0' is 5 zero bits; three trailing ones fill the byte (RFC 7541 §5.2).
+    const padded_zero = try decodeHuffman(std.testing.allocator, &[_]u8{0x07});
+    defer std.testing.allocator.free(padded_zero);
+    try std.testing.expectEqualSlices(u8, "0", padded_zero);
+
+    try std.testing.expectError(error.CompressionError, decodeHuffman(std.testing.allocator, &[_]u8{0x00}));
+    try std.testing.expectError(error.CompressionError, decodeHuffman(std.testing.allocator, &[_]u8{ 0xff, 0xff, 0xff, 0xff }));
 }
 
 fn expectEncodeMatch(fields: []const HeaderField, expected: []const u8) !void {
