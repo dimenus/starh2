@@ -294,6 +294,37 @@ fn currentRssBytes(gpa: std.mem.Allocator, io: std.Io, child: *const std.process
     return kb * 1024;
 }
 
+/// Read the bench server's one JSON ready line and return the port it bound.
+/// The server publishes this only after every endpoint is listening, so
+/// reading it is what removes the need for a sleep here.
+fn awaitReadyPort(io: std.Io, child: *std.process.Child) !u16 {
+    const out = child.stdout orelse abort("server was spawned without a stdout pipe", .{});
+    var buf: [4096]u8 = undefined;
+    var used: usize = 0;
+    while (used < buf.len) {
+        var dest: [1][]u8 = .{buf[used..]};
+        const n = out.readStreaming(io, &dest) catch
+            abort("server closed stdout before printing its ready line", .{});
+        if (n == 0) abort("server exited before printing its ready line", .{});
+        used += n;
+        const line_end = std.mem.indexOfScalar(u8, buf[0..used], '\n') orelse continue;
+        const line = buf[0..line_end];
+        const key = "\"port\":";
+        const at = std.mem.indexOf(u8, line, key) orelse
+            abort("ready line has no port field: {s}", .{line});
+        var i = at + key.len;
+        var port: u32 = 0;
+        var digits: usize = 0;
+        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {
+            port = port * 10 + (line[i] - '0');
+            digits += 1;
+        }
+        if (digits == 0 or port == 0 or port > 65535) abort("ready line has a bad port: {s}", .{line});
+        return @intCast(port);
+    }
+    abort("server ready line exceeded {d} bytes", .{buf.len});
+}
+
 fn stopAndCollect(child: *std.process.Child, io: std.Io) void {
     switch (builtin.os.tag) {
         .windows, .wasi => {
@@ -324,19 +355,24 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try parseArgs(arena, init.minimal.args);
 
     var tls_child = std.process.spawn(io, .{
-        .argv = &.{ cfg.server, "--mode", "tls", "--port", "19443" },
-        .stdout = .ignore,
+        .argv = &.{ cfg.server, "--mode", "tls", "--port", "0" },
+        .stdout = .pipe,
         .stderr = .ignore,
         .request_resource_usage_statistics = true,
     }) catch abort("cannot spawn {s}", .{cfg.server});
     defer tls_child.kill(io);
+    const tls_port = try awaitReadyPort(io, &tls_child);
+    const tls_url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{d}/", .{tls_port});
+
     var h2c_child = std.process.spawn(io, .{
-        .argv = &.{ cfg.server, "--mode", "h2c", "--port", "19445" },
-        .stdout = .ignore,
+        .argv = &.{ cfg.server, "--mode", "h2c", "--port", "0" },
+        .stdout = .pipe,
         .stderr = .ignore,
         .request_resource_usage_statistics = true,
     }) catch abort("cannot spawn {s}", .{cfg.server});
     defer h2c_child.kill(io);
+    const h2c_port = try awaitReadyPort(io, &h2c_child);
+    const h2c_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{h2c_port});
 
     var opponent_child: ?std.process.Child = null;
     if (cfg.opponent.len != 0) {
@@ -350,14 +386,10 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (opponent_child) |*c| c.kill(io);
 
-    // Servers need to be listening before the first sample, and a benchmark
-    // that races its own startup reports the startup.
-    std.Io.sleep(io, .fromSeconds(2), .awake) catch {};
-
     var arms: std.ArrayList(Arm) = .empty;
     if (!cfg.opponent_only) {
-        try arms.append(arena, .{ .name = "starh2 tls", .url = "https://127.0.0.1:19443/", .child = &tls_child });
-        try arms.append(arena, .{ .name = "starh2 h2c", .url = "http://127.0.0.1:19445/", .child = &h2c_child });
+        try arms.append(arena, .{ .name = "starh2 tls", .url = tls_url, .child = &tls_child });
+        try arms.append(arena, .{ .name = "starh2 h2c", .url = h2c_url, .child = &h2c_child });
     }
     if (cfg.opponent.len != 0) {
         try arms.append(arena, .{
