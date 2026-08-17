@@ -11,6 +11,7 @@ const zio = @import("zio");
 const hpack = starh2.core.hpack;
 const frame = starh2.core.frame;
 const emit_batch = starh2.edge.emit_batch;
+const ticket_table = starh2.edge.ticket_table;
 
 const response_fields = [_]hpack.HeaderField{
     .{ .name = ":status", .value = "200" },
@@ -426,6 +427,73 @@ fn taskLifecycleOp(ctx: *TaskCtx) !usize {
     return 1;
 }
 
+/// Production size: control_entries_per_connection + max_streams_per_connection.
+const ticket_slot_n = 256 + 256;
+
+const TicketCtx = struct {
+    io: std.Io,
+    storage: [ticket_slot_n]ticket_table.TicketWait = undefined,
+    table: ticket_table.TicketTable = undefined,
+
+    fn init(self: *TicketCtx) void {
+        self.table = ticket_table.TicketTable.init(self.io, &self.storage);
+    }
+};
+
+fn ticketOneSignaledOp(ctx: *TicketCtx) !usize {
+    const a = try ctx.table.reserve();
+    ctx.table.complete(a[1], a[0], true);
+    try ctx.table.wait(a[1], null);
+    return 1;
+}
+
+fn ticketPackedSixOp(ctx: *TicketCtx) !usize {
+    var ids: [6]struct { u64, u32 } = undefined;
+    for (&ids) |*id| id.* = try ctx.table.reserve();
+    var i: usize = 0;
+    while (i + 1 < ids.len) : (i += 1) {
+        try ctx.table.linkCompletion(ids[i][1], ids[i + 1][1]);
+    }
+    var remaining: u32 = 6;
+    var slot_i = ids[0][1];
+    var first = true;
+    while (remaining > 0) : (remaining -= 1) {
+        const meta = ctx.table.completion(slot_i) orelse return error.BrokenChain;
+        if (first and meta.ticket != ids[0][0]) return error.BrokenChain;
+        first = false;
+        ctx.table.complete(slot_i, meta.ticket, true);
+        if (remaining > 1) {
+            if (meta.next == ticket_table.no_completion_slot) return error.BrokenChain;
+            slot_i = meta.next;
+        }
+    }
+    for (ids) |id| try ctx.table.wait(id[1], null);
+    return 6;
+}
+
+const TicketWakeWork = struct {
+    table: *ticket_table.TicketTable,
+    slot: u32,
+    ticket: u64,
+};
+
+fn completeTicketTask(work: *TicketWakeWork) void {
+    work.table.complete(work.slot, work.ticket, true);
+}
+
+fn ticketParkedWakeOp(ctx: *TicketCtx) !usize {
+    const a = try ctx.table.reserve();
+    var work: TicketWakeWork = .{
+        .table = &ctx.table,
+        .slot = a[1],
+        .ticket = a[0],
+    };
+    var handle = try ctx.io.concurrent(completeTicketTask, .{&work});
+    try ctx.table.wait(a[1], null);
+    handle.await(ctx.io);
+    return 1;
+}
+
 const Stats = struct {
     median_ns: f64,
     min_ns: f64,
@@ -572,10 +640,21 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     const task_stats = try benchmark(io, task_iterations, cfg.rounds, &task, taskLifecycleOp);
     printRow("empty task spawn + await", task_iterations, task_stats, null, null);
 
+    var tickets: TicketCtx = .{ .io = io };
+    tickets.init();
+    const ticket_one_stats = try benchmark(io, cfg.iterations, cfg.rounds, &tickets, ticketOneSignaledOp);
+    printRow("ticket 1 already-signaled", cfg.iterations, ticket_one_stats, 0, 0);
+    const ticket_six_stats = try benchmark(io, cfg.iterations, cfg.rounds, &tickets, ticketPackedSixOp);
+    printRow("ticket packed-6 handoff", cfg.iterations, ticket_six_stats, 0, 0);
+    const ticket_wake_stats = try benchmark(io, task_iterations, cfg.rounds, &tickets, ticketParkedWakeOp);
+    printRow("ticket 1 parked wake", task_iterations, ticket_wake_stats, null, null);
+
     std.debug.print(
         "\npipeline-bench: allocation columns count successful allocator.alloc calls and\n" ++
             "requested bytes; setup, dynamic-table seeding, and warmup are excluded.\n" ++
-            "Rows marked * are interleaved phase samples and include one clock read.\n",
+            "Rows marked * are interleaved phase samples and include one clock read.\n" ++
+            "ticket packed-6 is one handoff (six linked receipts); divide by 6 for per-response.\n" ++
+            "ticket parked wake includes a concurrent complete; compare to empty task spawn.\n",
         .{},
     );
 }
