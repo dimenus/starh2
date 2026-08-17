@@ -1214,16 +1214,16 @@ pub const Session = struct {
         }
 
         self.header_block.clearRetainingCapacity();
-        try self.header_block.appendSlice(self.gpa, fragment);
         self.continuation_count = 0;
         self.header_end_stream = hdr.flags.end_stream;
         if (!hdr.flags.end_headers) {
+            try self.header_block.appendSlice(self.gpa, fragment);
             self.expect_continuation = hdr.stream_id;
             if (self.field_block_started_ns == 0) self.field_block_started_ns = self.edge_now_ns;
             return;
         }
         self.field_block_started_ns = 0;
-        try self.finishHeaderBlock(hdr.stream_id);
+        try self.finishHeaderBlock(hdr.stream_id, fragment);
     }
 
     fn consumeContinuation(self: *Session, hdr: frame.FrameHeader, payload: []const u8) !void {
@@ -1239,7 +1239,8 @@ pub const Session = struct {
         const sid = self.expect_continuation.?;
         self.expect_continuation = null;
         self.field_block_started_ns = 0;
-        try self.finishHeaderBlock(sid);
+        try self.finishHeaderBlock(sid, self.header_block.items);
+        self.header_block.clearRetainingCapacity();
     }
 
     /// A complete field block arrived. This is where a request becomes real.
@@ -1259,16 +1260,18 @@ pub const Session = struct {
     /// 5. Transfer a complete header-only request directly to its dispatch
     ///    intent. Requests with bodies store fields until DATA END_STREAM.
     ///
-    /// Ownership: the `decoded.fields` slice is owned from step 1 onward.
+    /// Ownership: `block` is the HEADERS payload for a single-frame END_HEADERS
+    /// request, or the assembled `header_block` after CONTINUATION. The
+    /// `decoded.fields` slice is owned from step 1 onward.
     /// Each field's strings are independently owned or borrowed. GPA results
     /// are freed with `freeResult`; edge-arena results are discarded via the
     /// header-list hook. Success hands the slice to an intent or to
     /// `pending_headers` / `pending_trailers`.
-    fn finishHeaderBlock(self: *Session, stream_id: u31) !void {
+    fn finishHeaderBlock(self: *Session, stream_id: u31, block: []const u8) !void {
         const req_alloc = self.headerListAllocator(stream_id);
         const decoded = self.decoder.decodeInto(
             req_alloc,
-            self.header_block.items,
+            block,
             self.limits.header_fields,
             self.limits.decoded_header_bytes,
             256,
@@ -2044,4 +2047,114 @@ test "respond HEADERS allocates only the final frame" {
             else => return error.TestUnexpectedResult,
         }
     }
+}
+
+fn freeTestIntents(gpa: std.mem.Allocator, intents: []Intent) void {
+    for (intents) |*it| switch (it.*) {
+        .outbound_frame => |f| gpa.free(f.payload),
+        .dispatch_request => |d| {
+            hpack.HeaderField.freeOwnedSlice(gpa, d.headers);
+            gpa.free(d.headers);
+            if (d.trailers.len != 0) {
+                hpack.HeaderField.freeOwnedSlice(gpa, d.trailers);
+                gpa.free(d.trailers);
+            }
+            if (d.body.len != 0) gpa.free(d.body);
+        },
+        else => {},
+    };
+}
+
+fn ingestPrefaceAndSettings(session: *Session, gpa: std.mem.Allocator) !void {
+    freeTestIntents(gpa, session.drainIntents());
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, frame.CLIENT_PREFACE);
+    var sbuf: [9]u8 = undefined;
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+    try wire.appendSlice(gpa, sbuf[0..sn]);
+    try session.ingest(wire.items);
+    freeTestIntents(gpa, session.drainIntents());
+}
+
+test "single-frame END_HEADERS does not copy into header_block" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+
+    const hdr_fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "x-custom", .value = "literal-value" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &hdr_fields);
+    defer gpa.free(block);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true, .end_stream = true },
+        .stream_id = 1,
+    }).encode(&hdr_buf);
+    try wire.appendSlice(gpa, &hdr_buf);
+    try wire.appendSlice(gpa, block);
+
+    try session.ingest(wire.items);
+    try std.testing.expectEqual(@as(usize, 0), session.header_block.items.len);
+
+    @memset(wire.items, 0xAA);
+    const intents = session.drainIntents();
+    defer freeTestIntents(gpa, intents);
+    var saw = false;
+    for (intents) |it| switch (it) {
+        .dispatch_request => |d| {
+            saw = true;
+            try std.testing.expectEqualStrings("/hello", d.path);
+            var found_custom = false;
+            for (d.headers) |f| {
+                if (std.mem.eql(u8, f.name, "x-custom")) {
+                    found_custom = true;
+                    try std.testing.expectEqualStrings("literal-value", f.value);
+                }
+            }
+            try std.testing.expect(found_custom);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw);
+}
+
+test "HEADERS without END_HEADERS still assembles in header_block" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+
+    const hdr_fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &hdr_fields);
+    defer gpa.free(block);
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = false },
+        .stream_id = 1,
+    }).encode(&hdr_buf);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendSlice(gpa, &hdr_buf);
+    try wire.appendSlice(gpa, block);
+    try session.ingest(wire.items);
+    try std.testing.expectEqual(block.len, session.header_block.items.len);
+    try std.testing.expectEqual(@as(?u31, 1), session.expect_continuation);
 }

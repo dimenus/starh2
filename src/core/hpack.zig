@@ -807,17 +807,29 @@ test "literal indexed-name and literal-name ownership" {
 
     // New name and value are both literals, so both owned. Encoder literals
     // stay borrowed by default (name_owned/value_owned omitted).
-    const both_literal = [_]u8{ 0x00, 0x01, 'n', 0x01, 'v' };
+    var both_literal = [_]u8{ 0x00, 0x01, 'n', 0x01, 'v' };
     const owned_both = try dec.decode(&both_literal, 100, 32 * 1024, 256, 8 * 1024);
     defer dec.freeResult(owned_both);
     try std.testing.expect(owned_both.fields[0].name_owned);
     try std.testing.expect(owned_both.fields[0].value_owned);
+    @memset(&both_literal, 0xAA);
     try std.testing.expectEqualStrings("n", owned_both.fields[0].name);
     try std.testing.expectEqualStrings("v", owned_both.fields[0].value);
 
     const enc_fields = [_]HeaderField{.{ .name = "cookie", .value = "a=b" }};
     try std.testing.expect(!enc_fields[0].name_owned);
     try std.testing.expect(!enc_fields[0].value_owned);
+}
+
+test "Huffman decode is owned plaintext, not a view of the encoded slice" {
+    // RFC 7541 C.4.1 `:authority` www.example.com
+    var enc = [_]u8{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff };
+    const out = try decodeHuffman(std.testing.allocator, &enc);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("www.example.com", out);
+    try std.testing.expect(@intFromPtr(out.ptr) != @intFromPtr(&enc));
+    @memset(&enc, 0);
+    try std.testing.expectEqualStrings("www.example.com", out);
 }
 
 fn expectEncodeMatch(fields: []const HeaderField, expected: []const u8) !void {
