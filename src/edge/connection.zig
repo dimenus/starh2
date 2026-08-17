@@ -1198,8 +1198,21 @@ const Connection = struct {
         };
     }
 
-    fn waitTicket(self: *Connection, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
-        return self.tickets.wait(slot_i, terminal);
+    /// After a failed ticket wait, apply the same terminal mapping as
+    /// `refuseIfStreamDead`. Peer RST sets a Session tombstone in `handleFrame`
+    /// before the `stream_reset` intent reaches `cancelHandler`, and
+    /// `wakeHandlerWaiters` can post `ok = false` in that gap — including the
+    /// no-slot path that drops pending without a `SlotTerminal` cause.
+    ///
+    /// The lock is uncancelable: a cancelable acquire can turn the RST into
+    /// `Canceled` (I8 code 5) in the same gap this mapping exists to close.
+    fn waitTicket(self: *Connection, stream_id: u31, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
+        self.tickets.wait(slot_i, terminal) catch |err| {
+            if (terminal.getCause()) |c| return response.causeToError(c);
+            self.lockSessionUncancelable(self.config.io);
+            defer self.unlockSession(self.config.io);
+            return response.mapFailedTicketWait(terminal, self.session.tombstoneCode(stream_id), err);
+        };
     }
 
     /// Reset streams whose peer stopped reading.
@@ -3400,7 +3413,7 @@ const Connection = struct {
         // `HandlerSlot.awaiting_receipt` and `cancelHandler`.
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
-        try self.waitTicket(slot_i, hctx.terminal);
+        try self.waitTicket(stream_id, slot_i, hctx.terminal);
         if (traced) {
             const t_done = nowNs(self.config.io);
             const t_ack = self.trace_ack_ns.load(.acquire);
@@ -3494,7 +3507,7 @@ const Connection = struct {
         }
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
-        try self.waitTicket(slot_i, hctx.terminal);
+        try self.waitTicket(stream_id, slot_i, hctx.terminal);
     }
 
     /// Streaming body write.
@@ -3619,7 +3632,7 @@ const Connection = struct {
         if (need_wait) {
             hctx.slot.awaiting_receipt.store(true, .release);
             defer hctx.slot.awaiting_receipt.store(false, .release);
-            try self.waitTicket(slot_i, hctx.terminal);
+            try self.waitTicket(stream_id, slot_i, hctx.terminal);
         }
         if (traced) {
             const t_done = nowNs(self.config.io);
@@ -3697,7 +3710,7 @@ const Connection = struct {
                 }
                 hctx.slot.awaiting_receipt.store(true, .release);
                 defer hctx.slot.awaiting_receipt.store(false, .release);
-                try self.waitTicket(slot_i, hctx.terminal);
+                try self.waitTicket(stream_id, slot_i, hctx.terminal);
             }
         }
 
@@ -3727,7 +3740,7 @@ const Connection = struct {
         }
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
-        try self.waitTicket(slot_i, hctx.terminal);
+        try self.waitTicket(stream_id, slot_i, hctx.terminal);
     }
 
     /// Kill one stream without harming the connection. A handler uses this when

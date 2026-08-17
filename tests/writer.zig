@@ -120,3 +120,56 @@ test "two-task barrier: failAll at preclaim/postclaim returns WriteFailed" {
     var handle = try rt.spawn(runTwoTaskBarrier, .{ rt, gpa });
     try handle.join();
 }
+
+test "ticket wait maps peer RST tombstone before SlotTerminal cause (t-718)" {
+    const session_mod = starh2.core.session;
+    const flow = starh2.core.flow;
+    const ticket_table = starh2.edge.ticket_table;
+    const response = starh2.http.response;
+    const gpa = std.testing.allocator;
+
+    var session = try session_mod.Session.init(gpa, .{ .stream_tombstones = 8 });
+    defer session.deinit();
+    {
+        const preface = session.drainIntents();
+        for (preface) |*it| switch (it.*) {
+            .outbound_frame => |f| gpa.free(f.payload),
+            else => {},
+        };
+    }
+    try session.streams.put(1, .{
+        .id = 1,
+        .state = .half_closed_remote,
+        .window = .{ .send = flow.INITIAL_WINDOW },
+    });
+    session.active_streams = 1;
+    // emitRst tombstones synchronously; the stream_reset intent waits for cancelHandler.
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .cancel } });
+    const intents = session.drainIntents();
+    for (intents) |*it| switch (it.*) {
+        .outbound_frame => |f| gpa.free(f.payload),
+        .stream_reset => {},
+        else => {},
+    };
+    try std.testing.expect(session.streams.get(1) == null);
+    try std.testing.expectEqual(starh2.core.frame.ErrorCode.cancel, session.tombstoneCode(1).?);
+
+    var term: response.SlotTerminal = .{};
+    try std.testing.expect(term.getCause() == null);
+
+    var storage: [1]ticket_table.TicketWait = undefined;
+    var table = ticket_table.TicketTable.init(std.testing.io, &storage);
+    const reserved = try table.reserve();
+    table.complete(reserved[1], reserved[0], false);
+
+    if (table.wait(reserved[1], &term)) |_| {
+        return error.TestUnexpectedResult;
+    } else |e| {
+        try std.testing.expectEqual(error.WriteFailed, e);
+        try std.testing.expect(term.getCause() == null);
+        try std.testing.expectEqual(
+            error.PeerReset,
+            response.mapFailedTicketWait(&term, session.tombstoneCode(1), e),
+        );
+    }
+}

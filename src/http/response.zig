@@ -255,6 +255,28 @@ pub fn causeToError(c: TerminalCause) ResponseError {
     };
 }
 
+/// A failed ticket wait with no `SlotTerminal` cause still has to name the
+/// reason. Peer RST tombstones the stream in `Session.handleFrame` before
+/// `cancelHandler` can `setCause`, and a pending-drop can post `ok = false`
+/// in that gap. `WriteFailed`/`Canceled` then become `PeerReset`; other
+/// errors keep their identity.
+pub fn mapFailedTicketWait(
+    terminal: *const SlotTerminal,
+    tombstone: ?frame.ErrorCode,
+    err: ResponseError,
+) ResponseError {
+    if (terminal.getCause()) |c| return causeToError(c);
+    switch (err) {
+        error.WriteFailed, error.Canceled => {
+            if (tombstone) |code| {
+                if (code != .no_error) return error.PeerReset;
+            }
+        },
+        else => {},
+    }
+    return err;
+}
+
 test "Body terminal cause precedes generation bump" {
     var slot: SlotTerminal = .{};
     var resp: Response = .{
@@ -327,4 +349,16 @@ test "every terminal cause maps to exact Body error" {
         try std.testing.expectError(c[1], body.flush());
         try std.testing.expectError(c[1], body.finish());
     }
+}
+
+test "mapFailedTicketWait prefers SlotTerminal, then RST tombstone (t-718)" {
+    var term: SlotTerminal = .{};
+    try std.testing.expectEqual(error.WriteFailed, mapFailedTicketWait(&term, null, error.WriteFailed));
+    try std.testing.expectEqual(error.WriteFailed, mapFailedTicketWait(&term, .no_error, error.WriteFailed));
+    try std.testing.expectEqual(error.PeerReset, mapFailedTicketWait(&term, .cancel, error.WriteFailed));
+    try std.testing.expectEqual(error.PeerReset, mapFailedTicketWait(&term, .cancel, error.Canceled));
+    try std.testing.expectEqual(error.OutOfMemory, mapFailedTicketWait(&term, .cancel, error.OutOfMemory));
+
+    term.setCause(.slow_consumer);
+    try std.testing.expectEqual(error.SlowConsumer, mapFailedTicketWait(&term, .cancel, error.WriteFailed));
 }
