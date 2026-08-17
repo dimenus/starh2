@@ -356,7 +356,7 @@ pub fn main(init: std.process.Init) !void {
                 try fixtures.print(arena,
                     \\// README.md line {d}
                     \\pub fn doctestRoute{d}() void {{
-                    \\    const h: starh2.Handler = .{{ .ptr = @constCast(&doctest_ctx), .runFn = doctestNoopHandler }};
+                    \\    const h: starh2.Handler = .{{ .task = .{{ .ptr = @constCast(&doctest_ctx), .runFn = doctestNoopHandler }} }};
                     \\{s}    const routes = [_]starh2.Route{{
                     \\{s}    }};
                     \\    _ = routes;

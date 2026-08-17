@@ -2,7 +2,7 @@ const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
 
-fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, "hello");
 }
 
@@ -14,7 +14,7 @@ fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.response_compression = true;
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
-        .routes = &.{.{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } }},
+        .routes = &.{.{ .method = .GET, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } }},
         .tls = null,
         .limits = limits,
     });

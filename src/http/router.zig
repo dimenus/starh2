@@ -18,9 +18,25 @@ const std = @import("std");
 const request = @import("request.zig");
 const response = @import("response.zig");
 
-pub const Handler = struct {
+/// A handler that may block, stream, or sleep. Always runs on its own task so
+/// a stuck SSE or a database wait cannot stop ingest on that connection.
+pub const TaskHandler = struct {
     ptr: *anyopaque,
     runFn: *const fn (*anyopaque, *const request.Request, *response.Response) anyerror!void,
+};
+
+/// A handler that only `CompleteResponse.send`s. May run on the connection
+/// actor: no spawn, still FairScheduler → WritePump. A body larger than
+/// `outbound_bytes_per_stream` cannot wait for slab space on the actor — use
+/// a task handler for large or streaming replies.
+pub const CompleteHandler = struct {
+    ptr: *anyopaque,
+    runFn: *const fn (*anyopaque, *const request.Request, *response.CompleteResponse) anyerror!void,
+};
+
+pub const Handler = union(enum) {
+    complete: CompleteHandler,
+    task: TaskHandler,
 };
 
 pub const Route = struct {
@@ -101,9 +117,9 @@ pub const Router = struct {
 
 test "exact match unchanged" {
     const dummy: u8 = 0;
-    const h: Handler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+    const h: Handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = struct {
         fn f(_: *anyopaque, _: *const request.Request, _: *response.Response) anyerror!void {}
-    }.f };
+    }.f } };
     const routes = [_]Route{
         .{ .method = .GET, .path = "/hello", .handler = h },
         .{ .method = .POST, .path = "/hello", .handler = h },
@@ -122,9 +138,9 @@ test "exact match unchanged" {
 
 test "prefix match yields remainder; exact wins over prefix" {
     const dummy: u8 = 0;
-    const h: Handler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+    const h: Handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = struct {
         fn f(_: *anyopaque, _: *const request.Request, _: *response.Response) anyerror!void {}
-    }.f };
+    }.f } };
     const routes = [_]Route{
         .{ .method = .GET, .path = "/v1/tasks/special", .handler = h },
         .{ .method = .GET, .path = "/v1/tasks/", .prefix = true, .handler = h },
@@ -144,4 +160,27 @@ test "prefix match yields remainder; exact wins over prefix" {
         else => return error.Expected405,
     }
     try std.testing.expect(r.match(.GET, "/other") == .not_found);
+}
+
+test "complete and task handlers both match" {
+    const dummy: u8 = 0;
+    const complete: Handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        fn f(_: *anyopaque, _: *const request.Request, _: *response.CompleteResponse) anyerror!void {}
+    }.f } };
+    const task: Handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        fn f(_: *anyopaque, _: *const request.Request, _: *response.Response) anyerror!void {}
+    }.f } };
+    const routes = [_]Route{
+        .{ .method = .GET, .path = "/", .handler = complete },
+        .{ .method = .GET, .path = "/sse", .handler = task },
+    };
+    const r: Router = .{ .routes = &routes };
+    switch (r.match(.GET, "/")) {
+        .found => |f| try std.testing.expect(f.handler == .complete),
+        else => return error.ExpectedComplete,
+    }
+    switch (r.match(.GET, "/sse")) {
+        .found => |f| try std.testing.expect(f.handler == .task),
+        else => return error.ExpectedTask,
+    }
 }

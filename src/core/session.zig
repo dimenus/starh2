@@ -35,7 +35,9 @@
 //! An inbound `FrameEvent` is released by `handleFrame` through `deinit`: a
 //! scratch borrow is a no-op there, a test `gpa` payload is freed there.
 //! An `Intent` carries owned memory: a frame payload, or a decoded request.
-//! `pushIntent` transfers that ownership only when it returns success, so an
+//! Header-list bytes on the live edge are arena-backed (the handler-job arena
+//! leased at decode); isolated Session tests still GPA-own them. `pushIntent`
+//! transfers that ownership only when it returns success, so an
 //! `error.PoolExhausted` leaves the caller still owning the payload. Whoever
 //! drains an intent must release it with `releaseIntent` exactly once.
 const std = @import("std");
@@ -115,19 +117,18 @@ const Tombstone = struct {
     code: frame.ErrorCode,
 };
 
-fn encodeDataFrame(gpa: std.mem.Allocator, stream_id: u31, data: []const u8, end_stream: bool) ![]u8 {
-    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+fn encodeDataFrameInto(out: []u8, stream_id: u31, data: []const u8, end_stream: bool) usize {
+    const total = frame.FRAME_HEADER_LEN + data.len;
+    std.debug.assert(out.len >= total);
     const fh = frame.FrameHeader{
         .length = @intCast(data.len),
         .type = .data,
         .flags = .{ .end_stream = end_stream },
         .stream_id = stream_id,
     };
-    fh.encode(&hdr_buf);
-    const out = try gpa.alloc(u8, frame.FRAME_HEADER_LEN + data.len);
-    @memcpy(out[0..frame.FRAME_HEADER_LEN], &hdr_buf);
-    if (data.len > 0) @memcpy(out[frame.FRAME_HEADER_LEN..], data);
-    return out;
+    fh.encode(out[0..frame.FRAME_HEADER_LEN]);
+    if (data.len > 0) @memcpy(out[frame.FRAME_HEADER_LEN..][0..data.len], data);
+    return total;
 }
 
 pub const Session = struct {
@@ -199,7 +200,88 @@ pub const Session = struct {
         onRelease: *const fn (*anyopaque) void,
         tryReserveRequest: ?*const fn (*anyopaque, usize) bool = null,
         releaseRequest: ?*const fn (*anyopaque, usize) void = null,
+        /// Allocator for one stream's decoded request-list (not the dynamic table).
+        headerListAlloc: ?*const fn (*anyopaque, u31) std.mem.Allocator = null,
+        /// Reset that allocator after a decode that will not be dispatched.
+        discardHeaderList: ?*const fn (*anyopaque, u31) void = null,
+        /// Rent a boot-reserved outbound frame slab. `n` is the on-wire size.
+        /// Returns a full slab (`len == slab_bytes >= n`) or null (too large or
+        /// exhausted — caller GPA-falls-back). Never a used prefix.
+        rentFrame: ?*const fn (*anyopaque, usize) ?[]u8 = null,
+        /// Return a buffer from `rentFrame` or a GPA fallback. Pointer-range
+        /// decides which; a prefix of a slab is reconstructed to the full lease.
+        releaseFrame: ?*const fn (*anyopaque, []u8) void = null,
     };
+
+    fn headerListAllocator(self: *Session, stream_id: u31) std.mem.Allocator {
+        if (self.stream_hooks) |h| {
+            if (h.headerListAlloc) |f| return f(h.ctx, stream_id);
+        }
+        return self.gpa;
+    }
+
+    fn headerListIsGpa(self: *const Session) bool {
+        if (self.stream_hooks) |h| return h.headerListAlloc == null;
+        return true;
+    }
+
+    fn discardHeaderList(self: *Session, stream_id: u31) void {
+        if (self.stream_hooks) |h| {
+            if (h.discardHeaderList) |f| f(h.ctx, stream_id);
+        }
+    }
+
+    fn allocFrame(self: *Session, n: usize) error{OutOfMemory}![]u8 {
+        if (self.stream_hooks) |h| {
+            if (h.rentFrame) |f| {
+                if (f(h.ctx, n)) |slab| return slab;
+            }
+        }
+        return self.gpa.alloc(u8, n);
+    }
+
+    fn freeFrame(self: *Session, buf: []u8) void {
+        if (buf.len == 0) return;
+        if (self.stream_hooks) |h| {
+            if (h.releaseFrame) |f| {
+                f(h.ctx, buf);
+                return;
+            }
+        }
+        self.gpa.free(buf);
+    }
+
+    fn dropDecoded(self: *Session, stream_id: u31, decoded: hpack.Decoder.DecodeResult) void {
+        if (self.headerListIsGpa()) {
+            self.decoder.freeResult(decoded);
+            return;
+        }
+        self.discardHeaderList(stream_id);
+    }
+
+    fn dropPendingRequest(self: *Session, stream_id: u31) void {
+        const had_headers = self.pending_headers.fetchRemove(stream_id);
+        const had_trailers = self.pending_trailers.fetchRemove(stream_id);
+        if (self.headerListIsGpa()) {
+            if (had_headers) |e| {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, e.value);
+                self.gpa.free(e.value);
+            }
+            if (had_trailers) |e| {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, e.value);
+                if (e.value.len != 0) self.gpa.free(e.value);
+            }
+        } else if (had_headers != null or had_trailers != null) {
+            self.discardHeaderList(stream_id);
+        }
+        if (self.pending_bodies.fetchRemove(stream_id)) |e| {
+            var list = e.value;
+            if (self.stream_hooks) |h| {
+                if (h.releaseRequest) |rel| rel(h.ctx, list.items.len);
+            }
+            list.deinit(self.gpa);
+        }
+    }
 
     pub fn init(gpa: std.mem.Allocator, limits: limits_mod.Limits) !Session {
         const intent_cap = @max(limits.intent_entries_per_connection, 16);
@@ -266,14 +348,18 @@ pub const Session = struct {
         self.pending_bodies.deinit();
         var hit = self.pending_headers.iterator();
         while (hit.next()) |e| {
-            hpack.HeaderField.freeOwnedSlice(self.gpa, e.value_ptr.*);
-            self.gpa.free(e.value_ptr.*);
+            if (self.headerListIsGpa()) {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, e.value_ptr.*);
+                self.gpa.free(e.value_ptr.*);
+            }
         }
         self.pending_headers.deinit();
         var tit = self.pending_trailers.iterator();
         while (tit.next()) |e| {
-            hpack.HeaderField.freeOwnedSlice(self.gpa, e.value_ptr.*);
-            self.gpa.free(e.value_ptr.*);
+            if (self.headerListIsGpa()) {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, e.value_ptr.*);
+                self.gpa.free(e.value_ptr.*);
+            }
         }
         self.pending_trailers.deinit();
         self.body_idle_ns.deinit();
@@ -290,12 +376,16 @@ pub const Session = struct {
 
     pub fn releaseIntent(self: *Session, it: *Intent) void {
         switch (it.*) {
-            .outbound_frame => |*f| self.gpa.free(f.payload),
+            .outbound_frame => |*f| self.freeFrame(f.payload),
             .dispatch_request => |*d| {
-                hpack.HeaderField.freeOwnedSlice(self.gpa, d.headers);
-                self.gpa.free(d.headers);
-                hpack.HeaderField.freeOwnedSlice(self.gpa, d.trailers);
-                if (d.trailers.len != 0) self.gpa.free(d.trailers);
+                if (self.headerListIsGpa()) {
+                    hpack.HeaderField.freeOwnedSlice(self.gpa, d.headers);
+                    self.gpa.free(d.headers);
+                    hpack.HeaderField.freeOwnedSlice(self.gpa, d.trailers);
+                    if (d.trailers.len != 0) self.gpa.free(d.trailers);
+                } else {
+                    self.discardHeaderList(d.stream_id);
+                }
                 self.gpa.free(d.body);
             },
             else => {},
@@ -402,7 +492,8 @@ pub const Session = struct {
             if (self.tombstoneCode(stream_id)) |code| {
                 if (code != .no_error) return error.FlowBlocked;
             }
-            const out = try encodeDataFrame(self.gpa, stream_id, data, end_stream);
+            const out = try self.allocFrame(frame.FRAME_HEADER_LEN + data.len);
+            _ = encodeDataFrameInto(out, stream_id, data, end_stream);
             if (data.len > 0) self.windows.conn_send -= @intCast(data.len);
             return out;
         };
@@ -417,7 +508,8 @@ pub const Session = struct {
         else
             @min(data.len, @as(usize, @intCast(avail)), 16 * 1024);
         if (data.len > 0 and take < data.len) return error.FlowBlocked;
-        const out = try encodeDataFrame(self.gpa, stream_id, data[0..take], end_stream);
+        const out = try self.allocFrame(frame.FRAME_HEADER_LEN + take);
+        _ = encodeDataFrameInto(out, stream_id, data[0..take], end_stream);
         if (take > 0) {
             s.window.send -= @intCast(take);
             self.windows.conn_send -= @intCast(take);
@@ -565,6 +657,7 @@ pub const Session = struct {
         // Passing the terminal code here avoids a linear duplicate scan on
         // every normal response while preserving the peer/local RST code.
         self.addTombstone(stream_id, tombstone_code) catch {};
+        self.dropPendingRequest(stream_id);
         _ = self.streams.remove(stream_id);
     }
 
@@ -1167,18 +1260,21 @@ pub const Session = struct {
     ///    intent. Requests with bodies store fields until DATA END_STREAM.
     ///
     /// Ownership: the `decoded.fields` slice is owned from step 1 onward.
-    /// Each field's strings are independently owned or borrowed; `freeResult`
-    /// and `HeaderField.freeOwnedSlice` free only the owned ones. Every early
-    /// return frees with `freeResult`; success hands the slice to an intent or
-    /// to `pending_headers` / `pending_trailers`.
+    /// Each field's strings are independently owned or borrowed. GPA results
+    /// are freed with `freeResult`; edge-arena results are discarded via the
+    /// header-list hook. Success hands the slice to an intent or to
+    /// `pending_headers` / `pending_trailers`.
     fn finishHeaderBlock(self: *Session, stream_id: u31) !void {
-        const decoded = self.decoder.decode(
+        const req_alloc = self.headerListAllocator(stream_id);
+        const decoded = self.decoder.decodeInto(
+            req_alloc,
             self.header_block.items,
             self.limits.header_fields,
             self.limits.decoded_header_bytes,
             256,
             self.limits.regular_field_value_bytes,
         ) catch |err| {
+            self.discardHeaderList(stream_id);
             if (err == error.OutOfMemory) {
                 try self.failConnection(.internal_error);
             } else {
@@ -1190,14 +1286,14 @@ pub const Session = struct {
         var s_ptr = self.streams.getPtr(stream_id);
         if (s_ptr == null) {
             if (self.active_streams >= self.limits.max_streams_per_connection) {
+                self.dropDecoded(stream_id, decoded);
                 try self.emitRst(stream_id, .refused_stream);
-                self.decoder.freeResult(decoded);
                 return;
             }
             if (self.stream_hooks) |h| {
                 if (!h.tryAdmit(h.ctx)) {
+                    self.dropDecoded(stream_id, decoded);
                     try self.emitRst(stream_id, .refused_stream);
-                    self.decoder.freeResult(decoded);
                     return;
                 }
             }
@@ -1215,25 +1311,25 @@ pub const Session = struct {
         if (s.headers_done) {
             // Trailers only legal while remote half is still open, and MUST carry END_STREAM.
             if (!self.header_end_stream) {
-                self.decoder.freeResult(decoded);
+                self.dropDecoded(stream_id, decoded);
                 try self.emitRst(stream_id, .protocol_error);
                 return;
             }
             if (s.end_stream_remote or s.state == .half_closed_remote or s.state == .closed) {
-                self.decoder.freeResult(decoded);
+                self.dropDecoded(stream_id, decoded);
                 try self.emitRst(stream_id, .stream_closed);
                 return;
             }
             for (decoded.fields) |f| {
                 if (f.name.len > 0 and f.name[0] == ':') {
-                    self.decoder.freeResult(decoded);
+                    self.dropDecoded(stream_id, decoded);
                     try self.emitRst(stream_id, .protocol_error);
                     return;
                 }
             }
             // Early-rejected streams: trailers close remote; ensure the one HTTP response exists.
             if (s.early_status) |st| {
-                self.decoder.freeResult(decoded);
+                self.dropDecoded(stream_id, decoded);
                 // The early-reject state is already terminal and owns the response.
                 s.onHeaders(true) catch {};
                 try self.emitEarlyReject(stream_id, st);
@@ -1241,7 +1337,7 @@ pub const Session = struct {
                 return;
             }
             s.onHeaders(true) catch |err| {
-                self.decoder.freeResult(decoded);
+                self.dropDecoded(stream_id, decoded);
                 try self.emitRst(stream_id, stream_mod.Stream.toErrorCode(err));
                 return;
             };
@@ -1252,7 +1348,7 @@ pub const Session = struct {
         }
 
         const parsed = fields.validateRequestFields(decoded.fields) catch |err| {
-            self.decoder.freeResult(decoded);
+            self.dropDecoded(stream_id, decoded);
             if (err == error.PathTooLong) {
                 s.refused_before_dispatch = true;
                 s.early_status = 414;
@@ -1279,12 +1375,12 @@ pub const Session = struct {
         s.content_length = parsed.content_length;
         const early = s.early_status;
         s.onHeaders(self.header_end_stream) catch |err| {
-            self.decoder.freeResult(decoded);
+            self.dropDecoded(stream_id, decoded);
             try self.emitRst(stream_id, stream_mod.Stream.toErrorCode(err));
             return;
         };
         if (early) |st| {
-            self.decoder.freeResult(decoded);
+            self.dropDecoded(stream_id, decoded);
             try self.emitEarlyReject(stream_id, st);
             self.releaseConcurrency(stream_id, .no_error);
         } else {
@@ -1316,8 +1412,12 @@ pub const Session = struct {
         const hdrs = self.pending_headers.fetchRemove(stream_id) orelse return;
         var headers_owned = true;
         errdefer if (headers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.gpa, hdrs.value);
-            self.gpa.free(hdrs.value);
+            if (self.headerListIsGpa()) {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, hdrs.value);
+                self.gpa.free(hdrs.value);
+            } else {
+                self.discardHeaderList(stream_id);
+            }
         };
         const body_entry = self.pending_bodies.fetchRemove(stream_id);
         const body = blk: {
@@ -1344,11 +1444,13 @@ pub const Session = struct {
         };
 
         const trailers_entry = self.pending_trailers.fetchRemove(stream_id);
-        const trailers: []hpack.HeaderField = if (trailers_entry) |e| e.value else try self.gpa.alloc(hpack.HeaderField, 0);
+        const trailers: []hpack.HeaderField = if (trailers_entry) |e| e.value else &.{};
         var trailers_owned = trailers.len != 0;
         errdefer if (trailers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.gpa, trailers);
-            self.gpa.free(trailers);
+            if (self.headerListIsGpa()) {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, trailers);
+                self.gpa.free(trailers);
+            }
         };
 
         // The helper owns every slice from this point, including its failures.
@@ -1372,15 +1474,21 @@ pub const Session = struct {
     ) !void {
         var headers_owned = true;
         errdefer if (headers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.gpa, headers);
-            self.gpa.free(headers);
+            if (self.headerListIsGpa()) {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, headers);
+                self.gpa.free(headers);
+            } else {
+                self.discardHeaderList(stream_id);
+            }
         };
         var body_owned = body.len != 0;
         errdefer if (body_owned) self.gpa.free(body);
         var trailers_owned = trailers.len != 0;
         errdefer if (trailers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.gpa, trailers);
-            self.gpa.free(trailers);
+            if (self.headerListIsGpa()) {
+                hpack.HeaderField.freeOwnedSlice(self.gpa, trailers);
+                self.gpa.free(trailers);
+            }
         };
 
         const s = self.streams.getPtr(stream_id) orelse return error.StreamClosed;
@@ -1422,9 +1530,9 @@ pub const Session = struct {
         if (block_len > std.math.maxInt(u24)) return error.OutOfMemory;
         const total = std.math.add(usize, frame.FRAME_HEADER_LEN, block_len) catch return error.OutOfMemory;
 
-        const out = try self.gpa.alloc(u8, total);
+        const out = try self.allocFrame(total);
         var out_owned = true;
-        errdefer if (out_owned) self.gpa.free(out);
+        errdefer if (out_owned) self.freeFrame(out);
 
         const fh = frame.FrameHeader{
             .length = @intCast(block_len),

@@ -62,7 +62,7 @@ const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
 
-fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, "hello");
 }
 
@@ -75,7 +75,7 @@ fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .routes = &.{.{
             .method = .GET,
             .path = "/hello",
-            .handler = .{ .ptr = @constCast(&ctx), .runFn = hello },
+            .handler = .{ .complete = .{ .ptr = @constCast(&ctx), .runFn = hello } },
         }},
         .tls = null,
     });
@@ -102,23 +102,29 @@ handshake.
 
 ### Responses
 
+A route is `.complete` or `.task`. Complete handlers receive `CompleteResponse`
+and may run on the connection actor — they can only `send` a finished body, so
+they cannot stream, sleep, or wait on that socket's ingest path. Bytes still
+leave through the write pump. Task handlers receive `Response`, always run on
+their own task, and may stream or wait.
+
 <!-- doctest: handler -->
 ```zig
-// One shot: headers and a complete body.
+// Complete / one-shot: headers and a finished body.
 try resp.send(200, &.{}, body);
 
-// Streaming: headers now, body later.
+// Task — streaming: headers now, body later.
 var out = try resp.start(200, &.{});
 try out.writeAll(chunk);
 try out.finish();
 
-// Server-sent events. Each write reaches the wire before it returns.
+// Task — server-sent events. Each write reaches the wire before it returns.
 var events = try resp.startSse(&.{});
 try events.writeAll("data: hello\n\n");
 ```
 
-A handler runs on its own task, so the stream can end underneath it. Every call
-returns the exact reason rather than a generic failure — `error.PeerReset`,
+A task handler runs on its own task, so the stream can end underneath it. Every
+call returns the exact reason rather than a generic failure — `error.PeerReset`,
 `error.SlowConsumer`, `error.ConnectionClosed`, `error.WriteFailed` — because a
 peer that reset a stream and a server that failed to write need different
 reactions. `Body.terminalCause()` reports it without attempting a write.

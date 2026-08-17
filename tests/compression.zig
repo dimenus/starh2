@@ -430,7 +430,7 @@ test "I2 send path round-trips brotli" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/t",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } },
             }};
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -465,7 +465,7 @@ test "I3 big compressible body shrinks under 25 percent" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/big",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = sendBigHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendBigHandler } },
             }};
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -497,8 +497,8 @@ test "five MiB one-shot br round-trip keeps server alive" {
     try withRuntime(struct {
         fn f(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
             const routes = [_]starh2.Route{
-                .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendFiveMiBHandler } },
-                .{ .method = .GET, .path = "/t", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } },
+                .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendFiveMiBHandler } } },
+                .{ .method = .GET, .path = "/t", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } } },
             };
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -555,10 +555,10 @@ test "I5 hygiene: min bytes, content-encoding passthrough, png, vary merge, no c
     try withRuntime(struct {
         fn f(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
             const routes = [_]starh2.Route{
-                .{ .method = .GET, .path = "/small", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendSmallHandler } },
-                .{ .method = .GET, .path = "/ce", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendWithContentEncoding } },
-                .{ .method = .GET, .path = "/png", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendPngHandler } },
-                .{ .method = .GET, .path = "/vary", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendWithVaryAndLength } },
+                .{ .method = .GET, .path = "/small", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendSmallHandler } } },
+                .{ .method = .GET, .path = "/ce", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendWithContentEncoding } } },
+                .{ .method = .GET, .path = "/png", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendPngHandler } } },
+                .{ .method = .GET, .path = "/vary", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendWithVaryAndLength } } },
             };
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -612,7 +612,7 @@ test "I4 SSE flush is incrementally decodable before next event" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/sse",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = sseHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } },
             }};
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -694,7 +694,7 @@ test "I4 empty compressed SSE write does not strand its receipt" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/sse-empty",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = sseEmptyWriteHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseEmptyWriteHandler } },
             }};
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -731,7 +731,7 @@ test "I2 streaming start path round-trips" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/s",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = streamHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = streamHandler } },
             }};
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -763,8 +763,8 @@ test "I6 pool exhaustion serves identity and counts fallback" {
             var lim = enableCompressionLimits(.{});
             lim.compression_contexts_per_server = 1;
             const routes = [_]starh2.Route{
-                .{ .method = .GET, .path = "/hold", .handler = .{ .ptr = @constCast(&dummy), .runFn = hangCompressedSse } },
-                .{ .method = .GET, .path = "/t", .handler = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } },
+                .{ .method = .GET, .path = "/hold", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangCompressedSse } } },
+                .{ .method = .GET, .path = "/t", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } } },
             };
             try runServer(rt, gpa, &routes, lim, struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -811,7 +811,7 @@ test "I8 compressed stream surfaces PeerReset exactly" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/sse",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = ssePeerResetHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = ssePeerResetHandler } },
             }};
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -860,7 +860,7 @@ test "I4 large SSE event over outbound_bytes_per_stream still flushes decodably"
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/sse",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = sseLargeEventHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseLargeEventHandler } },
             }};
             try runServer(rt, gpa, &routes, lim, struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -901,7 +901,7 @@ test "lifecycle: shutdown releases live encoder context" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/hold",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = hangCompressedSse },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangCompressedSse } },
             }};
             const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
             var lim = enableCompressionLimits(.{});
@@ -941,8 +941,8 @@ test "write sizes: one-byte SSE and exact outbound quantum" {
     try withRuntime(struct {
         fn f(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
             const routes = [_]starh2.Route{
-                .{ .method = .GET, .path = "/one", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseOneByteHandler } },
-                .{ .method = .GET, .path = "/exact", .handler = .{ .ptr = @constCast(&dummy), .runFn = streamExactOutboundHandler } },
+                .{ .method = .GET, .path = "/one", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseOneByteHandler } } },
+                .{ .method = .GET, .path = "/exact", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = streamExactOutboundHandler } } },
             };
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
@@ -979,7 +979,7 @@ test "no accept-encoding stays identity" {
             const routes = [_]starh2.Route{.{
                 .method = .GET,
                 .path = "/t",
-                .handler = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler },
+                .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } },
             }};
             try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {

@@ -137,6 +137,10 @@ pub const FairScheduler = struct {
     /// DATA and returned the moment it has none, so an idle stream — and an
     /// idle connection — holds none at all.
     pool: *slab_pool.SlabPool,
+    /// When set, control/framed payloads may be frame-pool slabs. Null (tests)
+    /// means every payload is a GPA allocation of the on-wire size.
+    payload_free_ctx: ?*anyopaque = null,
+    payload_free: ?*const fn (*anyopaque, []u8) void = null,
     active_pending: usize = 0,
     drr_cursor: u31 = 1,
     data_quanta: usize = 0,
@@ -183,10 +187,19 @@ pub const FairScheduler = struct {
         };
     }
 
+    pub fn freePayload(self: *FairScheduler, payload: []u8) void {
+        if (payload.len == 0) return;
+        if (self.payload_free) |f| {
+            f(self.payload_free_ctx.?, payload);
+            return;
+        }
+        self.gpa.free(payload);
+    }
+
     pub fn deinit(self: *FairScheduler) void {
-        while (self.popTerminal()) |e| self.gpa.free(e.payload);
-        while (self.popOrdinary()) |e| self.gpa.free(e.payload);
-        while (self.popFramed()) |e| self.gpa.free(e.payload);
+        while (self.popTerminal()) |e| self.freePayload(e.payload);
+        while (self.popOrdinary()) |e| self.freePayload(e.payload);
+        while (self.popFramed()) |e| self.freePayload(e.payload);
         self.gpa.free(self.terminal_q);
         self.gpa.free(self.ordinary_q);
         self.gpa.free(self.framed_data_q);
@@ -220,7 +233,7 @@ pub const FairScheduler = struct {
     pub fn popOrdinary(self: *FairScheduler) ?ControlEntry {
         return popRing(ControlEntry, self.ordinary_q, &self.ordinary_head, &self.ordinary_len);
     }
-    fn popFramed(self: *FairScheduler) ?FramedDataEntry {
+    pub fn popFramed(self: *FairScheduler) ?FramedDataEntry {
         return popRing(FramedDataEntry, self.framed_data_q, &self.framed_head, &self.framed_len);
     }
 
@@ -301,9 +314,10 @@ pub const FairScheduler = struct {
         ticket: u64,
         ticket_slot: u32,
     ) error{ PoolFull, QueueFull }!void {
+        const n = frame.encodedOnWireLen(payload);
         if (class == .terminal) {
-            if (!self.ctrl.tryReserveTerminal(payload.len)) {
-                self.gpa.free(payload);
+            if (!self.ctrl.tryReserveTerminal(n)) {
+                self.freePayload(payload);
                 return error.PoolFull;
             }
             pushRing(ControlEntry, self.terminal_q, &self.terminal_head, &self.terminal_tail, &self.terminal_len, .{
@@ -311,15 +325,15 @@ pub const FairScheduler = struct {
                 .class = .terminal,
                 .ticket = ticket,
                 .ticket_slot = ticket_slot,
-                .control_n = payload.len,
+                .control_n = n,
             }) catch {
-                self.ctrl.release(payload.len, 1);
-                self.gpa.free(payload);
+                self.ctrl.release(n, 1);
+                self.freePayload(payload);
                 return error.QueueFull;
             };
         } else {
-            if (!self.ctrl.tryReserveOrdinary(payload.len)) {
-                self.gpa.free(payload);
+            if (!self.ctrl.tryReserveOrdinary(n)) {
+                self.freePayload(payload);
                 return error.PoolFull;
             }
             pushRing(ControlEntry, self.ordinary_q, &self.ordinary_head, &self.ordinary_tail, &self.ordinary_len, .{
@@ -327,10 +341,10 @@ pub const FairScheduler = struct {
                 .class = .ordinary,
                 .ticket = ticket,
                 .ticket_slot = ticket_slot,
-                .control_n = payload.len,
+                .control_n = n,
             }) catch {
-                self.ctrl.release(payload.len, 1);
-                self.gpa.free(payload);
+                self.ctrl.release(n, 1);
+                self.freePayload(payload);
                 return error.QueueFull;
             };
         }
@@ -351,7 +365,7 @@ pub const FairScheduler = struct {
             .ticket = ticket,
             .ticket_slot = ticket_slot,
         }) catch {
-            self.gpa.free(payload);
+            self.freePayload(payload);
             return error.QueueFull;
         };
     }

@@ -22,6 +22,7 @@
 //! waits on. Both are set together, because a connection actor may be blocked
 //! in a `Select` where a flag alone would never be observed.
 const std = @import("std");
+const builtin = @import("builtin");
 const tls = @import("tls");
 const limits_mod = @import("../core/limits.zig");
 const router_mod = @import("../http/router.zig");
@@ -364,6 +365,16 @@ pub const Server = struct {
                     return;
                 },
             };
+            // HTTP/2 writes small frames. Linux leaves Nagle on, so a frame can
+            // sit until the peer's delayed ACK (~40 ms). That was nachos h2c at
+            // 21k req/s with p99 glued to 42.01 ms while TLS (larger records)
+            // was fine. Darwin's default is less punishing; the option is still
+            // correct on every accepted socket.
+            setTcpNoDelay(stream) catch {
+                // A TCP listener that cannot take TCP_NODELAY is still a live
+                // connection; refusing it would turn a setsockopt miss into an
+                // outage. The next write just pays Nagle.
+            };
             if (!self.tryAdmitConnection()) {
                 stream.close(self.io);
                 continue;
@@ -472,3 +483,49 @@ pub const Server = struct {
         self.* = undefined;
     }
 };
+
+/// Turn off Nagle on an accepted TCP socket.
+///
+/// `posix.setsockopt` is a Windows compile error (`use std.Io instead`); this
+/// stack's gates are Darwin and Linux, and `builtin.os.tag` is comptime so the
+/// Windows branch is not analyzed there.
+fn setTcpNoDelay(stream: std.Io.net.Stream) std.posix.SetSockOptError!void {
+    if (builtin.os.tag == .windows) return;
+    const on: c_int = 1;
+    try std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&on),
+    );
+}
+
+test "accepted TCP sockets take TCP_NODELAY" {
+    if (builtin.os.tag == .windows) return;
+    const io = std.testing.io;
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try bind.listen(io, .{ .reuse_address = true });
+    defer listener.socket.close(io);
+    const dest = listener.socket.address;
+    const client = try dest.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+    try setTcpNoDelay(accepted);
+    var val: c_int = 0;
+    var len: std.posix.socklen_t = @sizeOf(c_int);
+    switch (std.posix.errno(std.posix.system.getsockopt(
+        accepted.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        @ptrCast(&val),
+        &len,
+    ))) {
+        .SUCCESS => {},
+        else => return error.GetSockOptFailed,
+    }
+    // Darwin's getsockopt(TCP_NODELAY) returns 4 when the option is on, not 1
+    // (verified against CPython on this host). Linux returns 1. Both are "Nagle
+    // is off"; the kernel boolean is nonzero.
+    try std.testing.expect(val != 0);
+}

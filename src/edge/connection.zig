@@ -12,7 +12,9 @@
 //! | `ReadPump`     | 1     | the socket READ direction, the chunk pool     |
 //! | `WritePump`    | 1     | the socket WRITE direction, queued payloads   |
 //! | `AckDrainer`   | 1     | `TicketTable` completions, byte releases      |
-//! | handler        | 0..N  | its own arena and request/response objects    |
+//! | handler        | 0..N  | arena + request/response. Task handlers spawn; |
+//! |                |       | complete oneshots run on the actor, still     |
+//! |                |       | emit through WritePump. SSE always spawns.    |
 //! | reaper worker  | pool  | canceling a handler future (server-wide)      |
 //!
 //! Rules that follow from the table, all of which have been violated at least
@@ -93,7 +95,9 @@ const fair_scheduler = @import("fair_scheduler.zig");
 const io_queue = @import("io_queue.zig");
 const slab_pool = @import("slab_pool.zig");
 
-/// Test-only: when true, handler spawn fails closed into synchronous runHandlerJob.
+/// Test-only: when true, task-handler spawn fails closed with REFUSED_STREAM.
+/// Complete handlers never spawn, so this flag does not touch them. Do not
+/// run the task handler on the actor as a fallback — that parks ingest.
 pub var test_force_spawn_fail: bool = false;
 /// Test-only: when true, actor skips draining completion_ch (sticky until cleared).
 pub var test_hold_completion_drain: std.atomic.Value(bool) = .init(false);
@@ -114,6 +118,8 @@ pub var test_observed_slots_in_use: std.atomic.Value(usize) = .init(0);
 pub var test_observed_sched_emits: std.atomic.Value(usize) = .init(0);
 /// Test-only: true once actor handled writer_failed terminal teardown.
 pub var test_observed_writer_fail_handled: std.atomic.Value(bool) = .init(false);
+/// Test-only: complete handlers run on the actor (no spawn).
+pub var test_observed_inline_jobs: std.atomic.Value(usize) = .init(0);
 /// Test-only: queueWire calls not from FairScheduler sink (must stay 0).
 pub var test_queue_wire_bypass: std.atomic.Value(usize) = .init(0);
 /// Test-only: true while FairScheduler sink is executing queueWire.
@@ -456,6 +462,18 @@ const HandlerCtx = struct {
     trace_on: bool = false,
     t_dispatch: u64 = 0,
     t_handler: u64 = 0,
+    /// Ticket `sendCb` reserved for a complete handler. Waited after the
+    /// batch drain so multiplexed complete responses share one TLS record.
+    /// Also the flag `sendCb` uses: do not key off `running_inline`, which is
+    /// true for the whole connection and would skip a concurrent task handler's wait.
+    defer_receipt: bool = false,
+    deferred_ticket: u64 = 0,
+    deferred_slot: u32 = 0,
+    send_traced: bool = false,
+    t_send_before: u64 = 0,
+    t_send_acquired: u64 = 0,
+    t_send_unlocked: u64 = 0,
+    t_send_hpack: u64 = 0,
 };
 
 /// Per-slot handler state, reserved at connection boot so dispatch never heap-allocates a job.
@@ -488,7 +506,10 @@ comptime {
         @compileError("HANDLER_SLOT_SIZE must match @sizeOf(HandlerSlot)");
     }
     if (@sizeOf(HandlerJob) != limits_mod.HANDLER_JOB_SIZE) {
-        @compileError("HANDLER_JOB_SIZE must match @sizeOf(HandlerJob)");
+        @compileError(std.fmt.comptimePrint(
+            "HANDLER_JOB_SIZE must match @sizeOf(HandlerJob) (got {d})",
+            .{@sizeOf(HandlerJob)},
+        ));
     }
     if (@sizeOf(ReaperJob) != limits_mod.REAPER_JOB_SIZE) {
         @compileError("REAPER_JOB_SIZE must match @sizeOf(ReaperJob)");
@@ -572,12 +593,22 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cance
     }
     conn.session.rate_limiter = &conn.rates;
     conn.handshake_held = config.handshake_held;
+    conn.sched.payload_free_ctx = &conn;
+    conn.sched.payload_free = struct {
+        fn f(ctx: *anyopaque, payload: []u8) void {
+            const c: *Connection = @ptrCast(@alignCast(ctx));
+            c.releaseWireBytes(payload);
+        }
+    }.f;
     test_boot_ready.store(true, .release);
     // Seed read-chunk free list after channels are live.
     var i: u32 = 0;
     while (i < conn.read_pool_n) : (i += 1) {
         conn.read_free_ch.putOneUncancelable(config.io, i) catch {
             // Fresh queue capacity exactly matches the number of pool indices.
+            unreachable;
+        };
+        conn.write_free_ch.putOneUncancelable(config.io, i) catch {
             unreachable;
         };
     }
@@ -606,6 +637,12 @@ const Connection = struct {
     ciphertext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
     handler_jobs: []HandlerJob,
+    /// Parallel to `handlers`. Non-zero means this job's arena holds decoded
+    /// request-list bytes for that stream, so `allocSlot` must not give the
+    /// slot to a different stream.
+    header_lease_sid: []u31,
+    discard_arena: std.heap.ArenaAllocator,
+    discard_lease_sid: u31 = 0,
     shutting_down: bool = false,
     /// Set by a handler after it refills scheduler slab space; cleared by the
     /// actor at the top of each iteration. Emission happens only in the
@@ -666,9 +703,21 @@ const Connection = struct {
     read_chunk_storage: []u8 = &.{},
     read_free_buf: []u32 = &.{},
     read_free_ch: std.Io.Queue(u32) = undefined,
+    write_chunk_storage: []u8 = &.{},
+    write_free_buf: []u32 = &.{},
+    write_free_ch: std.Io.Queue(u32) = undefined,
+    frame_pool: slab_pool.SlabPool = undefined,
     read_pool_n: u32 = 0,
     /// Preallocated scratch for stream-id sweeps (no hot-path ArrayList).
     sid_scratch: []u31 = &.{},
+    /// Complete handlers queued to run on the actor after `session_mu` drops.
+    /// Pushed under the lock in `dispatch`; popped under the lock in
+    /// `runPendingInline`.
+    inline_sids: []u31 = &.{},
+    inline_n: usize = 0,
+    /// True while the actor is encoding or waiting a complete-handler batch.
+    /// `waitForStreamSpace` must not park: that wait is woken by the actor.
+    running_inline: bool = false,
     /// Next outbound wire frame (HEADERS/control/DATA) receives this ticket once.
     next_wire_ticket: u64 = 0,
     next_wire_slot: u32 = 0,
@@ -689,36 +738,67 @@ const Connection = struct {
     fn init(stream: std.Io.net.Stream, config: ConnConfig) !Connection {
         const gpa = config.gpa;
         var session = try session_mod.Session.init(gpa, config.limits);
-        errdefer session.deinit();
+        errdefer {
+            // Hooks are installed below with `ctx` still unset. Session.init
+            // already queued the preface SETTINGS; deinit must gpa-free that
+            // frame rather than calling `releaseFrame` through a dangling ctx
+            // (FailingAllocator walks this path).
+            session.stream_hooks = null;
+            session.deinit();
+        }
+        session.stream_hooks = .{
+            .ctx = undefined, // set after Connection is built — see postInitHooks
+            .tryAdmit = struct {
+                fn f(ctx: *anyopaque) bool {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    if (c.config.accounting) |a| return a.tryAdmitStream();
+                    return true;
+                }
+            }.f,
+            .onRelease = struct {
+                fn f(ctx: *anyopaque) void {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    if (c.config.accounting) |a| a.releaseStream();
+                }
+            }.f,
+            .headerListAlloc = struct {
+                fn f(ctx: *anyopaque, stream_id: u31) std.mem.Allocator {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    return c.borrowHeaderListAlloc(stream_id);
+                }
+            }.f,
+            .discardHeaderList = struct {
+                fn f(ctx: *anyopaque, stream_id: u31) void {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    c.releaseHeaderList(stream_id);
+                }
+            }.f,
+            .rentFrame = struct {
+                fn f(ctx: *anyopaque, n: usize) ?[]u8 {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    return c.rentFrame(n);
+                }
+            }.f,
+            .releaseFrame = struct {
+                fn f(ctx: *anyopaque, buf: []u8) void {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    c.releaseWireBytes(buf);
+                }
+            }.f,
+        };
         if (config.accounting != null) {
-            session.stream_hooks = .{
-                .ctx = undefined, // set after Connection is built — see postInitHooks
-                .tryAdmit = struct {
-                    fn f(ctx: *anyopaque) bool {
-                        const c: *Connection = @ptrCast(@alignCast(ctx));
-                        if (c.config.accounting) |a| return a.tryAdmitStream();
-                        return true;
-                    }
-                }.f,
-                .onRelease = struct {
-                    fn f(ctx: *anyopaque) void {
-                        const c: *Connection = @ptrCast(@alignCast(ctx));
-                        if (c.config.accounting) |a| a.releaseStream();
-                    }
-                }.f,
-                .tryReserveRequest = struct {
-                    fn f(ctx: *anyopaque, n: usize) bool {
-                        const c: *Connection = @ptrCast(@alignCast(ctx));
-                        return c.tryReserveRequestBytes(n);
-                    }
-                }.f,
-                .releaseRequest = struct {
-                    fn f(ctx: *anyopaque, n: usize) void {
-                        const c: *Connection = @ptrCast(@alignCast(ctx));
-                        c.releaseRequestBytes(n);
-                    }
-                }.f,
-            };
+            session.stream_hooks.?.tryReserveRequest = struct {
+                fn f(ctx: *anyopaque, n: usize) bool {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    return c.tryReserveRequestBytes(n);
+                }
+            }.f;
+            session.stream_hooks.?.releaseRequest = struct {
+                fn f(ctx: *anyopaque, n: usize) void {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    c.releaseRequestBytes(n);
+                }
+            }.f;
         }
 
         const read_ch_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
@@ -729,6 +809,9 @@ const Connection = struct {
         errdefer gpa.free(handlers);
         const handler_jobs = try gpa.alloc(HandlerJob, config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_jobs);
+        const header_lease_sid = try gpa.alloc(u31, config.limits.max_streams_per_connection);
+        errdefer gpa.free(header_lease_sid);
+        @memset(header_lease_sid, 0);
         const handler_joins = try gpa.alloc(?std.Io.Future(void), config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_joins);
         const completion_ch_buf = try gpa.alloc(u31, config.limits.max_streams_per_connection);
@@ -746,8 +829,21 @@ const Connection = struct {
         errdefer gpa.free(read_chunk_storage);
         const read_free_buf = try gpa.alloc(u32, n_chunks);
         errdefer gpa.free(read_free_buf);
+        const write_chunk_storage = try gpa.alloc(u8, @as(usize, n_chunks) * limits_mod.WIRE_CHUNK_SIZE);
+        errdefer gpa.free(write_chunk_storage);
+        const write_free_buf = try gpa.alloc(u32, n_chunks);
+        errdefer gpa.free(write_free_buf);
+        var frame_pool = try slab_pool.SlabPool.init(
+            gpa,
+            config.io,
+            config.limits.frame_slab_bytes,
+            config.limits.frame_slabs_per_connection,
+        );
+        errdefer frame_pool.deinit(gpa);
         const sid_scratch = try gpa.alloc(u31, config.limits.max_streams_per_connection);
         errdefer gpa.free(sid_scratch);
+        const inline_sids = try gpa.alloc(u31, config.limits.max_streams_per_connection);
+        errdefer gpa.free(inline_sids);
         const space_events = try gpa.alloc(std.Io.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(space_events);
         @memset(space_events, .unset);
@@ -784,6 +880,8 @@ const Connection = struct {
             .write_ch_buf = write_ch_buf,
             .handlers = handlers,
             .handler_jobs = handler_jobs,
+            .header_lease_sid = header_lease_sid,
+            .discard_arena = std.heap.ArenaAllocator.init(gpa),
             .handler_joins = handler_joins,
             .completion_ch_buf = completion_ch_buf,
             .write_ack_buf = write_ack_buf,
@@ -794,8 +892,12 @@ const Connection = struct {
             .sched = sched,
             .read_chunk_storage = read_chunk_storage,
             .read_free_buf = read_free_buf,
+            .write_chunk_storage = write_chunk_storage,
+            .write_free_buf = write_free_buf,
+            .frame_pool = frame_pool,
             .read_pool_n = n_chunks,
             .sid_scratch = sid_scratch,
+            .inline_sids = inline_sids,
             .space_events = space_events,
             .intent_batch = intent_batch,
             .tls_recv_acc = tls_recv_acc,
@@ -819,6 +921,7 @@ const Connection = struct {
         self.completion_ch = .init(self.completion_ch_buf);
         self.write_ack_ch = .init(self.write_ack_buf);
         self.read_free_ch = .init(self.read_free_buf);
+        self.write_free_ch = .init(self.write_free_buf);
         return self;
     }
 
@@ -827,7 +930,8 @@ const Connection = struct {
     /// Every channel is drained BEFORE its backing buffer is freed, and each
     /// drain applies the accounting the AckDrainer would have applied — the
     /// drainer has already stopped by now. Queued read chunks return their pool
-    /// index; queued write chunks free their payload and release wire bytes.
+    /// index; queued write chunks return a write-pool index or free a GPA
+    /// fallback, then release wire bytes.
     ///
     /// The completion drain uses `releaseSlot` and never discards. A reaper can
     /// post after `shutdownHandlers` returned, and a discarded completion would
@@ -846,7 +950,13 @@ const Connection = struct {
         }
         // Drain channels before freeing their backing buffers.
         while (io_queue.tryGet(wire_pump.WireChunk, &self.write_ch, io)) |chunk| {
-            if (chunk.bytes.len != 0) self.config.gpa.free(chunk.bytes);
+            if (chunk.pool_index) |idx| {
+                self.write_free_ch.putOneUncancelable(io, idx) catch {
+                    unreachable;
+                };
+            } else if (chunk.bytes.len != 0) {
+                self.config.gpa.free(chunk.bytes);
+            }
             // Release amounts without AckDrainer (teardown path).
             self.applyOutboundRelease(chunk.outbound_release, .wire);
             if (chunk.control_entries != 0) self.applyControlRelease(chunk.control_release, chunk.control_entries);
@@ -882,6 +992,7 @@ const Connection = struct {
         var rel: RelCtx = .{ .c = self };
         self.sched.forEachPending(@ptrCast(&rel), RelCtx.cb);
         self.sched.deinit();
+        self.frame_pool.deinit(self.config.gpa);
         self.tls_recv_acc.deinit(self.config.gpa);
 
         self.config.gpa.free(self.read_ch_buf);
@@ -889,6 +1000,8 @@ const Connection = struct {
         self.config.gpa.free(self.handlers);
         for (self.handler_jobs) |*job| job.arena.deinit();
         self.config.gpa.free(self.handler_jobs);
+        self.config.gpa.free(self.header_lease_sid);
+        self.discard_arena.deinit();
         self.config.gpa.free(self.handler_joins);
         self.config.gpa.free(self.completion_ch_buf);
         if (self.write_ack_buf.len != 0) self.config.gpa.free(self.write_ack_buf);
@@ -897,7 +1010,10 @@ const Connection = struct {
         if (self.ciphertext_scratch.len != 0) self.config.gpa.free(self.ciphertext_scratch);
         if (self.read_chunk_storage.len != 0) self.config.gpa.free(self.read_chunk_storage);
         if (self.read_free_buf.len != 0) self.config.gpa.free(self.read_free_buf);
+        if (self.write_chunk_storage.len != 0) self.config.gpa.free(self.write_chunk_storage);
+        if (self.write_free_buf.len != 0) self.config.gpa.free(self.write_free_buf);
         if (self.sid_scratch.len != 0) self.config.gpa.free(self.sid_scratch);
+        if (self.inline_sids.len != 0) self.config.gpa.free(self.inline_sids);
         if (self.space_events.len != 0) self.config.gpa.free(self.space_events);
         if (self.intent_batch.len != 0) self.config.gpa.free(self.intent_batch);
         const held = self.outbound_held.load(.acquire);
@@ -1137,11 +1253,14 @@ const Connection = struct {
         // Drain control queues without writing (connection is dead).
         while (self.sched.popTerminal()) |e| {
             self.sched.ctrl.release(e.control_n, 1);
-            self.config.gpa.free(e.payload);
+            self.sched.freePayload(e.payload);
         }
         while (self.sched.popOrdinary()) |e| {
             self.sched.ctrl.release(e.control_n, 1);
-            self.config.gpa.free(e.payload);
+            self.sched.freePayload(e.payload);
+        }
+        while (self.sched.popFramed()) |e| {
+            self.sched.freePayload(e.payload);
         }
 
         // Close/reset every Session stream → global stream accounting releases via hooks.
@@ -1164,16 +1283,8 @@ const Connection = struct {
         // Consume resulting intents into free (no further writes).
         const n = self.session.drainIntentsInto(self.intent_batch);
         for (self.intent_batch[0..n]) |*intent| switch (intent.*) {
-            .outbound_frame => |f| self.config.gpa.free(f.payload),
-            .dispatch_request => |d| {
-                hpack.HeaderField.freeOwnedSlice(self.config.gpa, d.headers);
-                self.config.gpa.free(d.headers);
-                if (d.trailers.len != 0) {
-                    hpack.HeaderField.freeOwnedSlice(self.config.gpa, d.trailers);
-                    self.config.gpa.free(d.trailers);
-                }
-                if (d.body.len != 0) self.config.gpa.free(d.body);
-            },
+            .outbound_frame => |f| self.releaseWireBytes(f.payload),
+            .dispatch_request => |d| self.releaseDispatchRequest(d),
             else => {},
         };
 
@@ -1186,6 +1297,7 @@ const Connection = struct {
             .bytes = &.{},
             .len = 0,
         });
+        self.write_ch.close(self.config.io);
 
         self.wakeAllSpace();
         self.session.terminal = .transport;
@@ -1488,6 +1600,7 @@ const Connection = struct {
             .from_actor = &self.write_ch,
             .completions = &self.write_ack_ch,
             .gpa = gpa,
+            .free_indices = &self.write_free_ch,
             .test_delay_ms = test_write_delay_ms,
             .test_fail_after = test_write_fail_after,
         };
@@ -1547,17 +1660,20 @@ const Connection = struct {
             defer self.unlockSession(io);
             try self.flushSessionIntents();
         }
+        self.runPendingInline();
 
         if (self.config.mode == .h2c) {
             self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
                 @as(i96, nowNs(io) +% self.config.limits.preface_timeout_ns),
             );
             try self.waitH2cPreface();
+            self.runPendingInline();
         }
 
         while (true) {
             _ = self.sched_refilled.swap(false, .acq_rel);
             self.drainCompletions();
+            self.runPendingInline();
 
             {
                 self.lockSessionUncancelable(io);
@@ -1612,20 +1728,22 @@ const Connection = struct {
                     break;
                 }
             }
+            self.runPendingInline();
 
             var maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
             if (maybe_chunk == null) {
                 // Reset before rechecking every producer-owned source; this closes
                 // the set-before-reset lost-wakeup race.
                 // The recheck list below must name EVERY producer: read chunks,
-                // handler completions, scheduler refills, writer failure, and
-                // the shutdown flag. A source left out of this list is a hang,
-                // not a slow path, because the actor then parks with work
-                // already waiting for it.
+                // handler completions, scheduler refills, writer failure,
+                // queued complete handlers, and the shutdown flag. A source
+                // left out of this list is a hang, not a slow path, because
+                // the actor then parks with work already waiting for it.
                 self.actor_wake.reset();
                 self.drainCompletions();
                 maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
                 if (maybe_chunk == null and
+                    self.inline_n == 0 and
                     !self.sched_refilled.load(.acquire) and
                     !self.writer_failed.load(.acquire) and
                     !(self.config.shutdown_flag != null and self.config.shutdown_flag.?.load(.acquire)))
@@ -1647,20 +1765,27 @@ const Connection = struct {
                 }
             }
 
-            self.lockSessionUncancelable(io);
-            defer self.unlockSession(io);
-            self.session.edge_now_ns = nowNs(io);
-            if (self.config.mode == .tls_h2 and self.tls_conn == null) {
-                try self.appendTlsInput(chunk.bytes[0..chunk.len]);
-            } else if (self.tls_conn != null) {
-                try self.appendTlsInput(chunk.bytes[0..chunk.len]);
-                try self.driveDecrypt();
-            } else {
-                try self.session.ingest(chunk.bytes[0..chunk.len]);
-                try self.processIntents();
+            {
+                self.lockSessionUncancelable(io);
+                defer self.unlockSession(io);
+                self.session.edge_now_ns = nowNs(io);
+                if (self.config.mode == .tls_h2 and self.tls_conn == null) {
+                    try self.appendTlsInput(chunk.bytes[0..chunk.len]);
+                } else if (self.tls_conn != null) {
+                    try self.appendTlsInput(chunk.bytes[0..chunk.len]);
+                    try self.driveDecrypt();
+                } else {
+                    try self.session.ingest(chunk.bytes[0..chunk.len]);
+                    try self.processIntents();
+                }
+                if (self.session.terminal != .none) break;
             }
-            if (self.session.terminal != .none) break;
+            self.runPendingInline();
         }
+
+        // Queued complete handlers still hold slots. Run them so they post
+        // completions; send will fail closed on a terminal connection.
+        self.runPendingInline();
 
         // shutdownHandlers returns only once every slot went through releaseSlot, so
         // both counters have already been decremented for this connection. Storing 0
@@ -1670,8 +1795,7 @@ const Connection = struct {
         if (self.tls_conn) |*tc| {
             const res = tls_edge.connectionClose(tc, self.ciphertext_scratch);
             if (res.ciphertext_len > 0) {
-                const out = try gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
-                self.sendAccountedWire(out, true, 0, 0, 0, 0, 0) catch {
+                self.sendAccountedWire(self.ciphertext_scratch[0..res.ciphertext_len], true, 0, 0, 0, 0, 0) catch {
                     // The connection is already terminal; close-notify is best-effort.
                 };
             }
@@ -1791,7 +1915,6 @@ const Connection = struct {
     /// HTTP/2 only, so a peer that did not agree to `h2` is refused at the
     /// handshake instead of at its first frame.
     fn tlsHandshakeViaPumps(self: *Connection) !void {
-        const gpa = self.config.gpa;
         const srv = &(self.tls_server orelse return error.InvalidConfig);
         while (true) {
             if (self.handshake_deadline) |dl| {
@@ -1801,8 +1924,7 @@ const Connection = struct {
             }
             const drive = tls_edge.serverDrive(srv, self.tls_recv_acc.items, self.ciphertext_scratch);
             if (drive.ciphertext_len > 0) {
-                const out = try gpa.dupe(u8, self.ciphertext_scratch[0..drive.ciphertext_len]);
-                try self.sendAccountedWire(out, true, 0, 0, 0, 0, 0);
+                try self.sendAccountedWire(self.ciphertext_scratch[0..drive.ciphertext_len], true, 0, 0, 0, 0, 0);
             }
             // `consumed` crosses the boundary from the pinned tls.zig fork. A
             // value larger than the input would underflow `rest` — a usize
@@ -1859,20 +1981,71 @@ const Connection = struct {
     /// `error.BodyClosed`.
     fn allocSlot(self: *Connection, stream_id: u31) ?*HandlerSlot {
         for (self.handlers, 0..) |*slot, i| {
-            if (!slot.in_use) {
-                slot.in_use = true;
-                _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
-                slot.stream_id = stream_id;
-                slot.terminal.clear();
-                _ = slot.terminal.generation.fetchAdd(1, .acq_rel);
-                slot.completion_owner.store(live, .release);
-                slot.reaper_reserved = false;
-                self.handler_joins[i] = null;
-                if (i < self.space_events.len) self.space_events[i].reset();
-                return slot;
+            if (!slot.in_use and self.header_lease_sid[i] == stream_id) {
+                return self.claimSlot(slot, i, stream_id);
+            }
+        }
+        for (self.handlers, 0..) |*slot, i| {
+            if (!slot.in_use and self.header_lease_sid[i] == 0) {
+                return self.claimSlot(slot, i, stream_id);
             }
         }
         return null;
+    }
+
+    fn claimSlot(self: *Connection, slot: *HandlerSlot, i: usize, stream_id: u31) *HandlerSlot {
+        slot.in_use = true;
+        _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
+        slot.stream_id = stream_id;
+        slot.terminal.clear();
+        _ = slot.terminal.generation.fetchAdd(1, .acq_rel);
+        slot.completion_owner.store(live, .release);
+        slot.reaper_reserved = false;
+        self.handler_joins[i] = null;
+        if (i < self.space_events.len) self.space_events[i].reset();
+        return slot;
+    }
+
+    /// Lease a request-list allocator for `stream_id` before HPACK decode.
+    /// Prefers a free handler-job arena so dispatch can keep the strings
+    /// without a second copy. Falls back to a connection-local discard arena
+    /// when every job is busy; that path is ephemeral and must be discarded
+    /// or copied before the next acquire.
+    fn borrowHeaderListAlloc(self: *Connection, stream_id: u31) std.mem.Allocator {
+        for (self.header_lease_sid, 0..) |sid, i| {
+            if (sid == stream_id) return self.handler_jobs[i].arena.allocator();
+        }
+        if (self.discard_lease_sid == stream_id) return self.discard_arena.allocator();
+        for (self.handlers, 0..) |slot, i| {
+            if (!slot.in_use and self.header_lease_sid[i] == 0) {
+                self.header_lease_sid[i] = stream_id;
+                _ = self.handler_jobs[i].arena.reset(.retain_capacity);
+                return self.handler_jobs[i].arena.allocator();
+            }
+        }
+        if (self.discard_lease_sid != 0 and self.discard_lease_sid != stream_id) {
+            _ = self.discard_arena.reset(.retain_capacity);
+        }
+        self.discard_lease_sid = stream_id;
+        _ = self.discard_arena.reset(.retain_capacity);
+        return self.discard_arena.allocator();
+    }
+
+    fn releaseHeaderList(self: *Connection, stream_id: u31) void {
+        if (self.discard_lease_sid == stream_id) {
+            _ = self.discard_arena.reset(.retain_capacity);
+            self.discard_lease_sid = 0;
+            return;
+        }
+        for (self.header_lease_sid, 0..) |*sid, i| {
+            if (sid.* == stream_id) {
+                sid.* = 0;
+                if (!self.handlers[i].in_use) {
+                    _ = self.handler_jobs[i].arena.reset(.retain_capacity);
+                }
+                return;
+            }
+        }
     }
 
     fn slotIndex(self: *Connection, stream_id: u31) ?usize {
@@ -2021,14 +2194,32 @@ const Connection = struct {
     /// therefore finish before the completion is posted, and the release is
     /// then dropped.
     fn shutdownHandlers(self: *Connection) !void {
+        // The actor loop has already exited, so nothing else will emit.
+        // Unstick every waiter before waiting on slots:
+        // 1. Shut the socket so an in-flight WritePump write errors.
+        // 2. Close write_ch so a handler parked on putOne (WritePump already
+        //    gone) gets Closed rather than waiting forever.
+        // 3. Cancel remaining handlers. t-537's awaiting_receipt skip is for a
+        //    live connection; after the actor loop, cancel is what wakes a
+        //    hangSse sleep or an unacked wait.
+        // 4. failAll / wakeAllSpace catch tickets whose chunk never reached
+        //    write_ch, and capacity waits that reset after an earlier wake.
+        self.stream.shutdown(self.config.io, .both) catch {};
+        self.writer_failed.store(true, .release);
+        // Wake any handler (or the actor's last emit) parked on a full
+        // write_ch after WritePump has already exited. Cancel does not always
+        // reach that wait; close does.
+        self.write_ch.close(self.config.io);
+
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) continue;
             slot.terminal.setCause(.server_shutdown);
             self.wakeHandlerWaiters(slot.stream_id);
-            // See cancelHandler: a receipt wait always wakes on its own — the
-            // pump acks or fail-drains every queued chunk — and the natural
-            // return posts the completion this loop's tail waits for.
-            if (slot.awaiting_receipt.load(.acquire)) continue;
+            // t-537's awaiting_receipt skip is for a live connection (RST
+            // while an ack is in flight). After the actor loop has exited
+            // nothing else will emit; cancel so a handler in zio.sleep or
+            // an unacked wait still posts a completion. failAll below is
+            // the belt for waiters whose cancel is not a cancellation point.
             if (self.handler_joins[i]) |handle| {
                 const prev = slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
                 if (prev == null) {
@@ -2044,6 +2235,8 @@ const Connection = struct {
                 }
             }
         }
+        self.tickets.failAll();
+        self.wakeAllSpace();
         // Reaper posts completion only AFTER cancel() returns, and cancel waits for the
         // handler — which has already decremented live_handlers. Waiting on live==0 can
         // therefore finish before the completion is posted; draining once then leaving
@@ -2058,6 +2251,8 @@ const Connection = struct {
                 }
             }
             if (!any_in_use) break;
+            self.tickets.failAll();
+            self.wakeAllSpace();
             const sid = self.completion_ch.getOne(self.config.io) catch return error.Canceled;
             self.releaseSlot(sid);
         }
@@ -2087,9 +2282,8 @@ const Connection = struct {
                 self.ciphertext_scratch,
             );
             if (res.ciphertext_len > 0) {
-                const out = try self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
-                // TLS close-notify is best-effort; sendAccountedWire releases `out` on failure.
-                self.sendAccountedWire(out, true, 0, 0, 0, 0, 0) catch {};
+                // TLS close-notify is best-effort; the scratch stays connection-owned.
+                self.sendAccountedWire(self.ciphertext_scratch[0..res.ciphertext_len], true, 0, 0, 0, 0, 0) catch {};
             }
             // Same ABI contract as the handshake drive above, plus the two
             // output lengths this path slices with.
@@ -2212,12 +2406,20 @@ const Connection = struct {
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             const len = self.sched.pendingByteLen(stream_id);
             if (len < cap) return;
+            // Complete handlers run on the actor. This wait is woken by the
+            // actor's drain, so parking here would never return. A body that
+            // does not fit in the stream slab belongs on a task handler.
+            if (self.running_inline) return error.WriteFailed;
             // Prove sparse/dense capacity wait for live gates (HandlerSlot-indexed sem).
             test_waiting_for_space.store(@as(u32, stream_id), .release);
             // Explicit lock ownership: unlock for wait, always reacquire uncancelable
             // before any return so caller defer unlock stays balanced.
             const event = if (self.spaceIndex(stream_id)) |i| &self.space_events[i] else null;
             if (event) |e| e.reset();
+            // Recheck after reset: a teardown wake can land in the gap and be
+            // cleared, after which wait would never return.
+            if (terminal.getCause()) |c| return response.causeToError(c);
+            if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             self.unlockSession(self.config.io);
             const wait_res: anyerror!void = if (event) |e| e.wait(self.config.io) else error.Canceled;
             self.lockSessionUncancelable(self.config.io);
@@ -2381,12 +2583,13 @@ const Connection = struct {
                     c.tls_conn != null,
                     control_entry,
                     ticket,
-                    payload.len,
+                    frame.encodedOnWireLen(payload),
                     batch.emit.capacity(),
                 )) {
-                    if (!batch.emit.wouldFit(payload.len)) {
+                    const wire = frame.encodedOnWire(payload);
+                    if (!batch.emit.wouldFit(wire.len)) {
                         batch.flushBatch() catch |err| {
-                            c.config.gpa.free(payload);
+                            c.releaseWireBytes(payload);
                             return err;
                         };
                     }
@@ -2398,17 +2601,17 @@ const Connection = struct {
                                     batch.emit.control_n = 0;
                                     batch.emit.control_entries = 0;
                                 }
-                                c.config.gpa.free(payload);
+                                c.releaseWireBytes(payload);
                                 return error.WriteFailed;
                             };
                         }
                         batch.emit.noteTicket(ticket, ticket_slot);
                     }
-                    batch.emit.copyFrame(payload, flush, control_n, control_entry);
-                    c.config.gpa.free(payload);
+                    batch.emit.copyFrame(wire, flush, control_n, control_entry);
+                    c.releaseWireBytes(payload);
                 } else {
                     batch.flushBatch() catch |err| {
-                        c.config.gpa.free(payload);
+                        c.releaseWireBytes(payload);
                         return err;
                     };
                     try batch.queue(
@@ -2619,30 +2822,100 @@ const Connection = struct {
     }
 
     fn sendFlushTicket(self: *Connection, ticket: u64, slot: u32) anyerror!void {
-        self.write_ch.putOne(self.config.io, .{
+        try self.pushWriteChunk(.{
             .bytes = &.{},
             .len = 0,
             .flush_barrier = true,
             .ticket = ticket,
             .ticket_slot = slot,
             .ticket_count = 1,
-        }) catch return error.WriteFailed;
+        });
     }
 
-    /// Hand finished wire bytes to the WritePump, with their accounting
-    /// attached.
+    /// True when the actor must not park on `write_ch`. WritePump may already
+    /// have exited (peer close / socket shutdown), and a blocking put then
+    /// waits forever while holding `session_mu`.
+    fn writeGoingAway(self: *Connection) bool {
+        if (self.writer_failed.load(.acquire) or self.shutting_down) return true;
+        const sf = self.config.shutdown_flag orelse return false;
+        return sf.load(.acquire);
+    }
+
+    /// Hand a chunk to WritePump. Never parks the actor once the connection is
+    /// going away: tryPut, shut the socket to unstick a blocked write, retry
+    /// once, then fail. A healthy connection still `putOne`s for backpressure.
+    fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
+        if (self.writeGoingAway()) {
+            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) return;
+            self.stream.shutdown(self.config.io, .both) catch {};
+            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) return;
+            return error.WriteFailed;
+        }
+        self.write_ch.putOne(self.config.io, chunk) catch return error.WriteFailed;
+    }
+
+    fn rentFrame(self: *Connection, n: usize) ?[]u8 {
+        if (n > self.frame_pool.slab_bytes) return null;
+        return self.frame_pool.tryRent(self.config.io);
+    }
+
+    /// Return a frame buffer: a full slab if `buf` is in `frame_pool`, else GPA.
+    /// `buf` may be a used prefix; the pointer must be the slab base.
+    fn releaseWireBytes(self: *Connection, buf: []u8) void {
+        if (buf.len == 0) return;
+        if (self.frame_pool.containsPtr(buf.ptr)) {
+            self.frame_pool.release(self.config.io, self.frame_pool.slabFromPtr(buf.ptr));
+            return;
+        }
+        self.config.gpa.free(buf);
+    }
+
+    const WriteLease = struct {
+        bytes: []u8,
+        pool_index: ?u32,
+    };
+
+    /// Take a write-pool chunk when one is free; otherwise GPA of exact `n`.
+    /// Never blocks: the actor must not park on `write_free_ch` (it would miss
+    /// shutdown, reads, and writer failure while WritePump may already be idle).
+    fn leaseWriteChunk(self: *Connection, n: usize) error{OutOfMemory}!WriteLease {
+        if (n <= limits_mod.WIRE_CHUNK_SIZE) {
+            if (io_queue.tryGet(u32, &self.write_free_ch, self.config.io)) |idx| {
+                const off = @as(usize, idx) * limits_mod.WIRE_CHUNK_SIZE;
+                return .{
+                    .bytes = self.write_chunk_storage[off..][0..limits_mod.WIRE_CHUNK_SIZE],
+                    .pool_index = idx,
+                };
+            }
+        }
+        const buf = self.config.gpa.alloc(u8, n) catch return error.OutOfMemory;
+        return .{ .bytes = buf, .pool_index = null };
+    }
+
+    fn returnWriteChunk(self: *Connection, lease: WriteLease) void {
+        if (lease.pool_index) |idx| {
+            if (!io_queue.tryPut(u32, &self.write_free_ch, self.config.io, idx)) {
+                std.debug.assert(false);
+            }
+        } else if (lease.bytes.len != 0) {
+            self.config.gpa.free(lease.bytes);
+        }
+    }
+
+    /// Copy `src` into a write-pool chunk and hand that to the WritePump, with
+    /// accounting attached. Does not take ownership of `src`.
     ///
     /// The chunk carries the release amounts rather than a callback, so the
     /// pump needs no access to `Connection`. The AckDrainer applies them when
     /// the write completes. That is the whole reason the pumps can run without
     /// a lock.
     ///
-    /// Both failure paths release the reservation AND free the bytes before
-    /// they return. After a successful `putOne` the pump owns the memory, and
-    /// this function must not touch it again.
+    /// Both failure paths release the reservation AND return the write-chunk
+    /// lease before they return. After a successful `putOne` the pump owns the
+    /// lease, and this function must not touch it again.
     fn sendAccountedWire(
         self: *Connection,
-        out: []u8,
+        src: []const u8,
         flush: bool,
         ticket: u64,
         ticket_slot: u32,
@@ -2650,26 +2923,33 @@ const Connection = struct {
         control_n: usize,
         control_entries: u32,
     ) anyerror!void {
-        if (!self.tryReserveOutboundBytes(out.len, .wire)) {
-            self.config.gpa.free(out);
+        if (!self.tryReserveOutboundBytes(src.len, .wire)) {
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return error.OutOfMemory;
         }
+        const lease = self.leaseWriteChunk(src.len) catch |err| {
+            self.applyOutboundRelease(src.len, .wire);
+            if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
+            return err;
+        };
+        std.debug.assert(src.len <= lease.bytes.len);
+        @memcpy(lease.bytes[0..src.len], src);
         if (trace.enabled) _ = trace.records.fetchAdd(1, .monotonic);
-        self.write_ch.putOne(self.config.io, .{
-            .bytes = out,
-            .len = out.len,
+        self.pushWriteChunk(.{
+            .bytes = lease.bytes,
+            .len = src.len,
             .flush_barrier = flush,
             .ticket = ticket,
             .ticket_slot = ticket_slot,
             .ticket_count = ticket_count,
-            .outbound_release = out.len,
+            .outbound_release = src.len,
             .control_release = control_n,
             .control_entries = control_entries,
+            .pool_index = lease.pool_index,
         }) catch {
-            self.applyOutboundRelease(out.len, .wire);
+            self.applyOutboundRelease(src.len, .wire);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
-            self.config.gpa.free(out);
+            self.returnWriteChunk(lease);
             return error.WriteFailed;
         };
     }
@@ -2677,9 +2957,11 @@ const Connection = struct {
     /// The single exit from protocol bytes to transport bytes. Called ONLY by
     /// the `FairScheduler` sink; `test_queue_wire_bypass` proves it.
     ///
-    /// For h2c the frame goes straight to the pump. For TLS it is encrypted
-    /// here, on the actor, under `session_mu` — the cipher is actor-owned, and
-    /// two tasks driving it concurrently is what crashed the process in t-538.
+    /// For h2c the on-wire prefix is copied into a write chunk and the frame
+    /// buffer is released here. For TLS it is encrypted on the actor, under
+    /// `session_mu` — the cipher is actor-owned, and two tasks driving it
+    /// concurrently is what crashed the process in t-538. Ciphertext is copied
+    /// from the boot-counted scratch; a frame slab is never handed to WritePump.
     ///
     /// One plaintext input can hold one frame or a drain-turn batch and can
     /// become several TLS records. The ticket chain, flush flag, and
@@ -2721,43 +3003,38 @@ const Connection = struct {
         if (!test_in_sched_sink) {
             _ = test_queue_wire_bypass.fetchAdd(1, .acq_rel);
         }
-        if (trace.enabled) trace.noteHandoff(ticket_count, bytes.len);
+        defer if (owns_bytes) self.releaseWireBytes(bytes);
+        const plain = if (owns_bytes) frame.encodedOnWire(bytes) else bytes;
+        if (trace.enabled) trace.noteHandoff(ticket_count, plain.len);
         const trace_batch = trace.enabled and self.batchContainsTraceTicket(ticket_slot, ticket_count);
         if (trace_batch) self.trace_emit_ns.store(nowNs(self.config.io), .release);
         const sends = test_wire_sends.fetchAdd(1, .acq_rel);
         const fail_after = test_force_wire_fail_after.load(.acquire);
         if (fail_after != 0 and sends + 1 >= fail_after) {
-            if (owns_bytes) self.config.gpa.free(bytes);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return error.WriteFailed;
         }
         if (self.tls_conn) |*tc| {
             var reserved_plain: usize = 0;
             if (owns_bytes) {
-                if (!self.tryReserveOutboundBytes(bytes.len, .wire)) {
-                    self.config.gpa.free(bytes);
+                if (!self.tryReserveOutboundBytes(plain.len, .wire)) {
                     if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
                     return error.OutOfMemory;
                 }
-                reserved_plain = bytes.len;
+                reserved_plain = plain.len;
             }
             errdefer self.applyOutboundRelease(reserved_plain, .wire);
             var off: usize = 0;
-            while (off < bytes.len) {
-                const res = tls_edge.connectionEncrypt(tc, bytes[off..], self.ciphertext_scratch);
+            while (off < plain.len) {
+                const res = tls_edge.connectionEncrypt(tc, plain[off..], self.ciphertext_scratch);
                 // Same ABI contract. An over-large `consumed` would push `off`
                 // past the end and panic on the NEXT iteration's slice, which
                 // points at the loop rather than at the encrypt that caused it.
-                std.debug.assert(res.consumed <= bytes.len - off);
+                std.debug.assert(res.consumed <= plain.len - off);
                 std.debug.assert(res.ciphertext_len <= self.ciphertext_scratch.len);
                 if (res.ciphertext_len > 0) {
-                    const out = self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]) catch {
-                        if (owns_bytes) self.config.gpa.free(bytes);
-                        if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
-                        return error.OutOfMemory;
-                    };
                     const next_off = off + res.consumed;
-                    const is_last = next_off >= bytes.len;
+                    const is_last = next_off >= plain.len;
                     const meta = emit_batch.lastRecordMeta(is_last, .{
                         .ticket = ticket,
                         .ticket_slot = ticket_slot,
@@ -2766,7 +3043,7 @@ const Connection = struct {
                         .control_entries = control_entries,
                     });
                     self.sendAccountedWire(
-                        out,
+                        self.ciphertext_scratch[0..res.ciphertext_len],
                         emit_batch.lastRecordFlush(is_last, flush),
                         meta.ticket,
                         meta.ticket_slot,
@@ -2774,7 +3051,6 @@ const Connection = struct {
                         meta.control_n,
                         meta.control_entries,
                     ) catch {
-                        if (owns_bytes) self.config.gpa.free(bytes);
                         return error.WriteFailed;
                     };
                 }
@@ -2783,48 +3059,48 @@ const Connection = struct {
             }
             self.applyOutboundRelease(reserved_plain, .wire);
             reserved_plain = 0;
-            if (owns_bytes) self.config.gpa.free(bytes);
         } else {
             std.debug.assert(owns_bytes);
-            try self.sendAccountedWire(bytes, flush, ticket, ticket_slot, ticket_count, control_n, control_entries);
+            try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries);
         }
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
 
-    /// Build a handler job and spawn it. Actor-only.
+    /// Drop the dispatch-intent payload. Header-list bytes live in the job
+    /// arena when this stream still holds the decode lease; `releaseHeaderList`
+    /// is a no-op in that case. A non-empty body is always GPA-owned.
+    fn releaseDispatchRequest(self: *Connection, d: session_mod.DispatchRequest) void {
+        self.releaseHeaderList(d.stream_id);
+        if (d.body.len != 0) self.config.gpa.free(d.body);
+    }
+
+    /// Build a handler job. Actor-only, under `session_mu`.
     ///
     /// Ownership of the decoded request moves from the Session intent to the
-    /// handler job. Request slices borrow that job-owned storage; only the
-    /// lightweight Header arrays and handler scratch use the per-job arena.
-    /// The handler therefore shares nothing with Session without copying every
-    /// decoded string and body a second time.
+    /// handler job. Request header strings already live in the job arena when
+    /// decode leased this slot; only the lightweight Header arrays and handler
+    /// scratch are additional arena allocations. The handler therefore shares
+    /// nothing with Session without copying every decoded string and body a
+    /// second time.
     ///
     /// Admission order is reserve-then-claim, and it is deliberate:
     /// 1. Reserve reaper capacity. A handler that cannot be canceled must never
     ///    start, because cancellation has no retry path.
     /// 2. Claim a handler slot.
     /// 3. Point `Response` at the SLOT's terminal state, never at job memory.
-    /// 4. Increment the live counters, then spawn.
+    /// 4. Increment the live counters, then spawn a task handler or queue a
+    ///    complete handler to run on the actor after this lock drops.
     ///
     /// Each failure step undoes the step before it and answers the peer with
     /// REFUSED_STREAM, which is retryable, rather than dropping the request.
     ///
-    /// A spawn failure runs the handler INLINE on the actor. That blocks the
-    /// connection for the duration, which is bad, and it is still better than
-    /// the alternative: a stream that is admitted and accounted for but never
-    /// answered.
-    fn releaseDispatchRequest(gpa: std.mem.Allocator, d: session_mod.DispatchRequest) void {
-        hpack.HeaderField.freeOwnedSlice(gpa, d.headers);
-        gpa.free(d.headers);
-        hpack.HeaderField.freeOwnedSlice(gpa, d.trailers);
-        if (d.trailers.len != 0) gpa.free(d.trailers);
-        gpa.free(d.body);
-    }
-
+    /// A spawn failure for a *task* handler refuses the stream: running it on
+    /// the actor would park ingest for as long as that handler blocks (SSE).
+    /// Complete handlers are the intentional no-spawn path: they are queued
+    /// here and run in `runPendingInline` with the lock released.
     fn dispatch(self: *Connection, d: session_mod.DispatchRequest) anyerror!void {
-        const gpa = self.config.gpa;
         var dispatch_owned = true;
-        defer if (dispatch_owned) releaseDispatchRequest(gpa, d);
+        defer if (dispatch_owned) self.releaseDispatchRequest(d);
 
         // Reserve reaper capacity before admitting the handler.
         if (self.config.accounting) |acct| {
@@ -2849,8 +3125,13 @@ const Connection = struct {
         errdefer self.releaseSlot(d.stream_id);
         const slot_i = self.slotIndex(d.stream_id) orelse unreachable;
         const job = &self.handler_jobs[slot_i];
+        const keep_arena = self.header_lease_sid[slot_i] == d.stream_id;
         const arena = blk: {
-            _ = job.arena.reset(.retain_capacity);
+            if (keep_arena) {
+                self.header_lease_sid[slot_i] = 0;
+            } else {
+                _ = job.arena.reset(.retain_capacity);
+            }
             break :blk job.arena;
         };
         job.* = .{
@@ -2870,7 +3151,10 @@ const Connection = struct {
             try a.alloc(request.Header, d.headers.len);
         if (d.headers.len != 0) {
             for (d.headers, 0..) |h, i| {
-                headers[i] = .{ .name = h.name, .value = h.value };
+                headers[i] = if (keep_arena)
+                    .{ .name = h.name, .value = h.value }
+                else
+                    .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
             }
         }
 
@@ -2880,16 +3164,25 @@ const Connection = struct {
             try a.alloc(request.Header, d.trailers.len);
         if (d.trailers.len != 0) {
             for (d.trailers, 0..) |h, i| {
-                trailers[i] = .{ .name = h.name, .value = h.value };
+                trailers[i] = if (keep_arena)
+                    .{ .name = h.name, .value = h.value }
+                else
+                    .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
             }
         }
 
+        const scheme = if (keep_arena) d.scheme else try a.dupe(u8, d.scheme);
+        const authority = if (keep_arena) d.authority else try a.dupe(u8, d.authority);
+        const path = if (keep_arena) d.path else try a.dupe(u8, d.path);
+        const query = if (keep_arena) d.query else try a.dupe(u8, d.query);
+        if (!keep_arena) self.releaseHeaderList(d.stream_id);
+
         job.req = .{
             .method = .parse(d.method),
-            .scheme = d.scheme,
-            .authority = d.authority,
-            .path = d.path,
-            .query = d.query,
+            .scheme = scheme,
+            .authority = authority,
+            .path = path,
+            .query = query,
             .headers = headers,
             .body = d.body,
             .trailers = trailers,
@@ -2935,8 +3228,9 @@ const Connection = struct {
         }
 
         slot.reaper_reserved = reaper_reserved;
-        // From here every exit runs runHandlerJob's cleanup, including the
-        // synchronous spawn-failure fallback.
+        // From here every exit must `finishHandlerJob` (task `defer`, complete
+        // batch after receipts, or spawn-fail below). Do not run a task
+        // handler synchronously on this path: that is the ingest-park.
         job.owned_request = d;
         dispatch_owned = false;
         job.resp.terminal = &slot.terminal;
@@ -2955,13 +3249,35 @@ const Connection = struct {
                 job.hctx.t_dispatch = nowNs(self.config.io);
             }
         }
+        const run_inline = switch (job.matched) {
+            .found => |f| f.handler == .complete,
+            else => false,
+        };
+        if (run_inline) {
+            // Run after this lock drops. sendCb takes session_mu itself, and
+            // waitTicket must not hold it. A task handler that cannot spawn
+            // is refused below, not queued here: SSE on the actor parks ingest.
+            std.debug.assert(self.inline_n < self.inline_sids.len);
+            self.inline_sids[self.inline_n] = d.stream_id;
+            self.inline_n += 1;
+            // A task handler's processIntents can queue a complete job while
+            // the actor is parked. The flag-before-wake rule: inline_n is the
+            // flag that survives actor_wake.reset.
+            self.actor_wake.set(self.config.io);
+            return;
+        }
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
             self.config.io.concurrent(runHandlerJob, .{job});
         const h = handle catch {
-            runHandlerJob(job);
-            self.drainCompletions();
+            // Admission already incremented live_handlers and claimed a slot.
+            // Refuse rather than run on the actor: a blocking task handler
+            // (SSE) would stop ingest, TLS, and FairScheduler on this socket.
+            // Do not processIntents here: we are inside materializeIntents and
+            // the intent batch is live. The RST is picked up on the next drain.
+            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
+            finishHandlerJob(job);
             return;
         };
         if (self.slotIndex(d.stream_id)) |i| {
@@ -2990,34 +3306,48 @@ const Connection = struct {
     /// that is already dead must not receive a synthetic 404 or 500: the write
     /// would fail anyway, and the real cause is the one the handler should
     /// report.
-    fn runHandlerJob(job: *HandlerJob) void {
+    fn finishHandlerJob(job: *HandlerJob) void {
         const self = job.conn;
-        defer {
-            // Encoder contexts are server-wide; release even on cancel/reset so
-            // a stranded SSE cannot pin a pool slot past handler death.
-            if (job.hctx.encoder) |enc| {
-                enc.destroy();
-                job.hctx.encoder = null;
-                job.hctx.compressing = false;
-            }
-            const prev = job.slot.completion_owner.cmpxchgStrong(live, reported, .acq_rel, .acquire);
-            if (prev == null) {
-                self.completion_ch.putOneUncancelable(self.config.io, job.stream_id) catch {
-                    // Connection teardown has already assumed completion ownership.
-                };
-                self.actor_wake.set(self.config.io);
-            }
-            _ = self.live_handlers.fetchSub(1, .acq_rel);
-            _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
-            _ = job.arena.reset(.retain_capacity);
-            releaseDispatchRequest(self.config.gpa, job.owned_request);
+        // Encoder contexts are server-wide; release even on cancel/reset so
+        // a stranded SSE cannot pin a pool slot past handler death.
+        if (job.hctx.encoder) |enc| {
+            enc.destroy();
+            job.hctx.encoder = null;
+            job.hctx.compressing = false;
         }
+        const prev = job.slot.completion_owner.cmpxchgStrong(live, reported, .acq_rel, .acquire);
+        if (prev == null) {
+            self.completion_ch.putOneUncancelable(self.config.io, job.stream_id) catch {
+                // Connection teardown has already assumed completion ownership.
+            };
+            self.actor_wake.set(self.config.io);
+        }
+        _ = self.live_handlers.fetchSub(1, .acq_rel);
+        _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
+        _ = job.arena.reset(.retain_capacity);
+        self.releaseDispatchRequest(job.owned_request);
+    }
+
+    fn runHandlerJob(job: *HandlerJob) void {
+        defer finishHandlerJob(job);
+        runHandlerJobBody(job);
+    }
+
+    fn runHandlerJobBody(job: *HandlerJob) void {
+        const self = job.conn;
         if (job.hctx.trace_on) job.hctx.t_handler = nowNs(self.config.io);
         if (job.slot.terminal.cancel_flag.load(.acquire)) return;
         if (job.slot.terminal.getCause() != null) return;
         switch (job.matched) {
             .found => |f| {
-                f.handler.runFn(f.handler.ptr, &job.req, &job.resp) catch {
+                const run_res: anyerror!void = switch (f.handler) {
+                    .task => |h| h.runFn(h.ptr, &job.req, &job.resp),
+                    .complete => |h| blk: {
+                        var complete_resp: response.CompleteResponse = .{ .inner = &job.resp };
+                        break :blk h.runFn(h.ptr, &job.req, &complete_resp);
+                    },
+                };
+                run_res catch {
                     if (job.slot.terminal.getCause() != null) return;
                     if (!job.resp.committed) {
                         // The original handler error remains terminal if the fallback cannot write.
@@ -3053,6 +3383,125 @@ const Connection = struct {
                     job.resp.send(405, &allow, "method not allowed") catch {};
                 }
             },
+        }
+    }
+
+    /// Stage Session intents onto the scheduler without emitting.
+    /// Task handlers leave drain to the actor so this turn can coalesce.
+    /// Complete handlers leave drain to `runPendingInline` after the whole
+    /// inline batch has encoded — per-job drainEmit is one TLS record per
+    /// response (packing oracle exit 9).
+    fn emitQueuedResponse(self: *Connection) anyerror!void {
+        try self.materializeIntents();
+    }
+
+    fn stampSendWait(self: *Connection, hctx: *HandlerCtx) void {
+        if (!hctx.send_traced) return;
+        defer self.trace_ticket.store(0, .release);
+        const t_done = nowNs(self.config.io);
+        const t_ack = self.trace_ack_ns.load(.acquire);
+        const t_unlocked = hctx.t_send_unlocked;
+        if (t_ack >= t_unlocked and t_done >= t_ack) {
+            const t_emit = self.trace_emit_ns.load(.acquire);
+            const t_queued = self.trace_queued_ns.load(.acquire);
+            const t_written = self.trace_written_ns.load(.acquire);
+            const block = t_acquiredGap(hctx.t_send_acquired, hctx.t_send_before);
+            const hold = t_acquiredGap(t_unlocked, hctx.t_send_acquired);
+            const ack = t_ack - t_unlocked;
+            const res = t_done - t_ack;
+            _ = trace.samples.fetchAdd(1, .monotonic);
+            _ = trace.block_ns.fetchAdd(block, .monotonic);
+            _ = trace.hold_ns.fetchAdd(hold, .monotonic);
+            _ = trace.ack_ns.fetchAdd(ack, .monotonic);
+            _ = trace.resume_ns.fetchAdd(res, .monotonic);
+            _ = trace.hpack_ns.fetchAdd(hctx.t_send_hpack, .monotonic);
+            if (t_emit >= t_unlocked and t_queued >= t_emit and t_ack >= t_queued) {
+                _ = trace.ack_split_samples.fetchAdd(1, .monotonic);
+                _ = trace.actor_ns.fetchAdd(t_emit - t_unlocked, .monotonic);
+                _ = trace.queue_ns.fetchAdd(t_queued - t_emit, .monotonic);
+                _ = trace.pump_ns.fetchAdd(t_ack - t_queued, .monotonic);
+                if (t_written >= t_queued and t_ack >= t_written) {
+                    _ = trace.pump_split_samples.fetchAdd(1, .monotonic);
+                    _ = trace.write_ns.fetchAdd(t_written - t_queued, .monotonic);
+                    _ = trace.drain_ns.fetchAdd(t_ack - t_written, .monotonic);
+                }
+            }
+            trace.bumpMax(&trace.block_max, block);
+            trace.bumpMax(&trace.hold_max, hold);
+            trace.bumpMax(&trace.ack_max, ack);
+            trace.bumpMax(&trace.resume_max, res);
+            trace.bumpMax(&trace.hpack_max, hctx.t_send_hpack);
+        }
+    }
+
+    fn t_acquiredGap(later: u64, earlier: u64) u64 {
+        return if (later >= earlier) later - earlier else 0;
+    }
+
+    /// Complete handlers skip spawn. They are queued under `session_mu` and
+    /// run here with the lock released. Encode the whole batch, one drainEmit
+    /// through WritePump, then wait every receipt — that is what keeps
+    /// multiplexed complete responses in one TLS record. SSE and any handler
+    /// that can wait still go through `io.concurrent`.
+    fn runPendingInline(self: *Connection) void {
+        // Do not assert `!session_held`: that flag means SOMEBODY holds the
+        // mutex, often a task handler's sendCb, not this actor. Taking the
+        // lock to discover an empty queue would convoy behind that handler
+        // on every loop iteration.
+        if (self.inline_n == 0) return;
+        self.running_inline = true;
+        defer self.running_inline = false;
+        while (true) {
+            const batch_n: usize = blk: {
+                self.lockSessionUncancelable(self.config.io);
+                defer self.unlockSession(self.config.io);
+                break :blk self.inline_n;
+            };
+            if (batch_n == 0) return;
+
+            var i: usize = 0;
+            while (i < batch_n) : (i += 1) {
+                const sid = self.inline_sids[i];
+                const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                _ = test_observed_inline_jobs.fetchAdd(1, .monotonic);
+                job.hctx.defer_receipt = true;
+                runHandlerJobBody(job);
+            }
+
+            {
+                self.lockSessionUncancelable(self.config.io);
+                defer self.unlockSession(self.config.io);
+                self.processIntents() catch self.failClosedOnIntentError();
+            }
+
+            i = 0;
+            while (i < batch_n) : (i += 1) {
+                const sid = self.inline_sids[i];
+                const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                if (job.hctx.deferred_ticket != 0) {
+                    job.slot.awaiting_receipt.store(true, .release);
+                    defer job.slot.awaiting_receipt.store(false, .release);
+                    self.waitTicket(sid, job.hctx.deferred_slot, job.hctx.terminal) catch {
+                        if (job.hctx.send_traced) self.trace_ticket.store(0, .release);
+                        finishHandlerJob(job);
+                        continue;
+                    };
+                    self.stampSendWait(&job.hctx);
+                }
+                finishHandlerJob(job);
+            }
+            self.drainCompletions();
+
+            {
+                self.lockSessionUncancelable(self.config.io);
+                defer self.unlockSession(self.config.io);
+                std.debug.assert(self.inline_n >= batch_n);
+                const rest = self.inline_n - batch_n;
+                if (rest != 0) {
+                    std.mem.copyForwards(u31, self.inline_sids[0..rest], self.inline_sids[batch_n..self.inline_n]);
+                }
+                self.inline_n = rest;
+            }
         }
     }
 
@@ -3326,7 +3775,8 @@ const Connection = struct {
             traced = self.trace_ticket.cmpxchgStrong(0, ticket, .acq_rel, .monotonic) == null;
             if (!traced) _ = trace.skipped.fetchAdd(1, .monotonic);
         }
-        defer if (traced) self.trace_ticket.store(0, .release);
+        var defer_wait = false;
+        defer if (traced and !defer_wait) self.trace_ticket.store(0, .release);
         var t_before: u64 = 0;
         var t_acquired: u64 = 0;
         var t_hpack: u64 = 0;
@@ -3374,12 +3824,10 @@ const Connection = struct {
                     body_out.len <= self.config.limits.outbound_bytes_per_stream - pending_len;
                 if (fits_without_wait) {
                     // Stage DATA first, then place HEADERS in the ordinary
-                    // control queue. The actor wake from enqueuePending drains
-                    // control before DATA, and can coalesce every response that
-                    // became ready in this turn. The handler remains a producer
-                    // and waits for its exact linked wire receipt.
+                    // control queue. Drain is left to the actor (task) or to
+                    // `runPendingInline` after the whole complete batch encodes.
                     self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
-                    self.materializeIntents() catch {
+                    self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;
                     };
@@ -3400,14 +3848,33 @@ const Connection = struct {
             } else {
                 self.next_wire_ticket = ticket;
                 self.next_wire_slot = slot_i;
-                self.processIntents() catch {
-                    self.failClosedOnIntentError();
-                    return error.WriteFailed;
-                };
+                if (hctx.defer_receipt) {
+                    self.emitQueuedResponse() catch {
+                        self.failClosedOnIntentError();
+                        return error.WriteFailed;
+                    };
+                } else {
+                    self.processIntents() catch {
+                        self.failClosedOnIntentError();
+                        return error.WriteFailed;
+                    };
+                }
             }
         }
         if (traced) t_unlocked = nowNs(self.config.io);
         armed = false;
+        if (hctx.defer_receipt) {
+            // Encode now, wait after `runPendingInline` drainEmit's the batch.
+            defer_wait = true;
+            hctx.deferred_ticket = ticket;
+            hctx.deferred_slot = slot_i;
+            hctx.send_traced = traced;
+            hctx.t_send_before = t_before;
+            hctx.t_send_acquired = t_acquired;
+            hctx.t_send_unlocked = t_unlocked;
+            hctx.t_send_hpack = t_hpack;
+            return;
+        }
         // From here until the wait returns, teardown must NOT cancel this
         // handler. The wait is guaranteed to wake on its own — see
         // `HandlerSlot.awaiting_receipt` and `cancelHandler`.
@@ -3415,39 +3882,12 @@ const Connection = struct {
         defer hctx.slot.awaiting_receipt.store(false, .release);
         try self.waitTicket(stream_id, slot_i, hctx.terminal);
         if (traced) {
-            const t_done = nowNs(self.config.io);
-            const t_ack = self.trace_ack_ns.load(.acquire);
-            if (t_ack >= t_unlocked and t_done >= t_ack) {
-                const t_emit = self.trace_emit_ns.load(.acquire);
-                const t_queued = self.trace_queued_ns.load(.acquire);
-                const t_written = self.trace_written_ns.load(.acquire);
-                const block = t_acquired - t_before;
-                const hold = t_unlocked - t_acquired;
-                const ack = t_ack - t_unlocked;
-                const res = t_done - t_ack;
-                _ = trace.samples.fetchAdd(1, .monotonic);
-                _ = trace.block_ns.fetchAdd(block, .monotonic);
-                _ = trace.hold_ns.fetchAdd(hold, .monotonic);
-                _ = trace.ack_ns.fetchAdd(ack, .monotonic);
-                _ = trace.resume_ns.fetchAdd(res, .monotonic);
-                _ = trace.hpack_ns.fetchAdd(t_hpack, .monotonic);
-                if (t_emit >= t_unlocked and t_queued >= t_emit and t_ack >= t_queued) {
-                    _ = trace.ack_split_samples.fetchAdd(1, .monotonic);
-                    _ = trace.actor_ns.fetchAdd(t_emit - t_unlocked, .monotonic);
-                    _ = trace.queue_ns.fetchAdd(t_queued - t_emit, .monotonic);
-                    _ = trace.pump_ns.fetchAdd(t_ack - t_queued, .monotonic);
-                    if (t_written >= t_queued and t_ack >= t_written) {
-                        _ = trace.pump_split_samples.fetchAdd(1, .monotonic);
-                        _ = trace.write_ns.fetchAdd(t_written - t_queued, .monotonic);
-                        _ = trace.drain_ns.fetchAdd(t_ack - t_written, .monotonic);
-                    }
-                }
-                trace.bumpMax(&trace.block_max, block);
-                trace.bumpMax(&trace.hold_max, hold);
-                trace.bumpMax(&trace.ack_max, ack);
-                trace.bumpMax(&trace.resume_max, res);
-                trace.bumpMax(&trace.hpack_max, t_hpack);
-            }
+            hctx.send_traced = true;
+            hctx.t_send_before = t_before;
+            hctx.t_send_acquired = t_acquired;
+            hctx.t_send_unlocked = t_unlocked;
+            hctx.t_send_hpack = t_hpack;
+            self.stampSendWait(hctx);
         }
     }
 
@@ -3626,6 +4066,12 @@ const Connection = struct {
                 }
             } else {
                 self.enqueuePending(stream_id, wire_bytes, end, if (need_wait) ticket else 0, if (need_wait) slot_i else 0, hctx.terminal) catch |err| return err;
+            }
+            if (self.running_inline and need_wait) {
+                self.processIntents() catch {
+                    self.failClosedOnIntentError();
+                    return error.WriteFailed;
+                };
             }
         }
         if (traced) t_unlocked = nowNs(self.config.io);

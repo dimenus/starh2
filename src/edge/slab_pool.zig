@@ -112,6 +112,27 @@ pub const SlabPool = struct {
         return null;
     }
 
+    /// True when `ptr` is inside this pool's storage (including a used-prefix
+    /// view that shares the slab's base pointer).
+    pub fn containsPtr(self: *const SlabPool, ptr: [*]const u8) bool {
+        if (self.storage.len == 0) return false;
+        const here = @intFromPtr(ptr);
+        const base = @intFromPtr(self.storage.ptr);
+        return here >= base and here < base + self.storage.len;
+    }
+
+    /// Reconstruct the full slab from a pointer that may be a used prefix.
+    /// The prefix MUST start at the slab base; a mid-slab pointer asserts.
+    pub fn slabFromPtr(self: *SlabPool, ptr: [*]u8) []u8 {
+        const here = @intFromPtr(ptr);
+        const base = @intFromPtr(self.storage.ptr);
+        std.debug.assert(here >= base);
+        const off = here - base;
+        std.debug.assert(off % self.slab_bytes == 0);
+        std.debug.assert(off < self.storage.len);
+        return self.storage[off..][0..self.slab_bytes];
+    }
+
     /// Give a slab back. It must have come from this pool.
     ///
     /// The index is derived from the pointer rather than tracked by the caller,
@@ -144,6 +165,20 @@ pub const SlabPool = struct {
 };
 
 const testing = std.testing;
+
+test "containsPtr and slabFromPtr recover a used prefix" {
+    var pool = try SlabPool.init(testing.allocator, testing.io, 64, 2);
+    defer pool.deinit(testing.allocator);
+    const slab = pool.tryRent(testing.io) orelse return error.ExpectedSlab;
+    const prefix = slab[0..9];
+    try testing.expect(pool.containsPtr(prefix.ptr));
+    const full = pool.slabFromPtr(prefix.ptr);
+    try testing.expectEqual(slab.ptr, full.ptr);
+    try testing.expectEqual(slab.len, full.len);
+    pool.release(testing.io, full);
+    var foreign: [8]u8 = undefined;
+    try testing.expect(!pool.containsPtr((&foreign).ptr));
+}
 
 test "a fresh pool has every slab free" {
     var pool = try SlabPool.init(testing.allocator, testing.io, 1024, 4);

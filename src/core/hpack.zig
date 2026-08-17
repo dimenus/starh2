@@ -386,21 +386,26 @@ pub const Decoder = struct {
     /// Static-table strings are immutable process-lifetime data. Dynamic-table
     /// strings are not: a later block can evict the entry while a request still
     /// holds the decoded field, so those must be independently owned.
-    fn copyIndexedString(self: *Decoder, src: []const u8, from_static: bool) error{OutOfMemory}!struct { []const u8, bool } {
+    ///
+    /// `request_alloc` owns the copy. The connection dynamic table stays on
+    /// `self.allocator` (see `indexIntoTable`); mixing the two is how a handler
+    /// arena reset would free table entries, or a GPA free would free arena
+    /// strings.
+    fn copyIndexedString(src: []const u8, from_static: bool, request_alloc: std.mem.Allocator) error{OutOfMemory}!struct { []const u8, bool } {
         if (from_static) return .{ src, false };
-        return .{ try self.allocator.dupe(u8, src), true };
+        return .{ try request_alloc.dupe(u8, src), true };
     }
 
-    fn decodeName(self: *Decoder, block: []const u8, idx: usize, i: *usize) (CompressionError || error{OutOfMemory})!struct { []const u8, bool } {
-        if (idx == 0) return .{ try decodeString(self.allocator, block, i), true };
+    fn decodeName(self: *Decoder, request_alloc: std.mem.Allocator, block: []const u8, idx: usize, i: *usize) (CompressionError || error{OutOfMemory})!struct { []const u8, bool } {
+        if (idx == 0) return .{ try decodeString(request_alloc, block, i), true };
         const pair = try self.lookup(idx);
-        return self.copyIndexedString(pair.name, pair.static);
+        return copyIndexedString(pair.name, pair.static, request_alloc);
     }
 
-    fn takeIndexed(self: *Decoder, pair: Indexed) error{OutOfMemory}!HeaderField {
-        const name, const name_owned = try self.copyIndexedString(pair.name, pair.static);
-        errdefer if (name_owned) self.allocator.free(name);
-        const value, const value_owned = try self.copyIndexedString(pair.value, pair.static);
+    fn takeIndexed(pair: Indexed, request_alloc: std.mem.Allocator) error{OutOfMemory}!HeaderField {
+        const name, const name_owned = try copyIndexedString(pair.name, pair.static, request_alloc);
+        errdefer if (name_owned) request_alloc.free(name);
+        const value, const value_owned = try copyIndexedString(pair.value, pair.static, request_alloc);
         return .{
             .name = name,
             .value = value,
@@ -409,10 +414,10 @@ pub const Decoder = struct {
         };
     }
 
-    fn takeLiteral(self: *Decoder, block: []const u8, idx: usize, i: *usize, never: bool) (CompressionError || error{OutOfMemory})!HeaderField {
-        const name, const name_owned = try self.decodeName(block, idx, i);
-        errdefer if (name_owned) self.allocator.free(name);
-        const value = try decodeString(self.allocator, block, i);
+    fn takeLiteral(self: *Decoder, request_alloc: std.mem.Allocator, block: []const u8, idx: usize, i: *usize, never: bool) (CompressionError || error{OutOfMemory})!HeaderField {
+        const name, const name_owned = try self.decodeName(request_alloc, block, idx, i);
+        errdefer if (name_owned) request_alloc.free(name);
+        const value = try decodeString(request_alloc, block, i);
         return .{
             .name = name,
             .value = value,
@@ -433,12 +438,29 @@ pub const Decoder = struct {
         try self.insert(n2, v2);
     }
 
-    fn appendField(self: *Decoder, fields: *std.ArrayList(HeaderField), field: HeaderField) error{OutOfMemory}!void {
-        errdefer field.freeOwned(self.allocator);
-        try fields.append(self.allocator, field);
+    fn appendField(request_alloc: std.mem.Allocator, fields: *std.ArrayList(HeaderField), field: HeaderField) error{OutOfMemory}!void {
+        errdefer field.freeOwned(request_alloc);
+        try fields.append(request_alloc, field);
+    }
+
+    /// Decode a complete header block into `self.allocator`.
+    pub fn decode(
+        self: *Decoder,
+        block: []const u8,
+        max_fields: usize,
+        max_decoded_size: usize,
+        max_name: usize,
+        max_value: usize,
+    ) (CompressionError || error{OutOfMemory})!DecodeResult {
+        return self.decodeInto(self.allocator, block, max_fields, max_decoded_size, max_name, max_value);
     }
 
     /// Decode a complete header block.
+    ///
+    /// `request_alloc` owns the result field slice and every non-static string
+    /// in it. `self.allocator` owns the connection dynamic table. They may be
+    /// the same (tests, isolated Session). On the live edge they are not: the
+    /// table is GPA and the request list is the handler-job arena.
     ///
     /// A policy breach is NOT an error here. A field block that exceeds
     /// `max_fields`, `max_decoded_size`, `max_name`, or `max_value` still
@@ -448,8 +470,9 @@ pub const Decoder = struct {
     /// block on the connection. So the decoder always finishes its work, and
     /// `Session` turns the flag into a 431 response for that one stream while
     /// the connection survives.
-    pub fn decode(
+    pub fn decodeInto(
         self: *Decoder,
+        request_alloc: std.mem.Allocator,
         block: []const u8,
         max_fields: usize,
         max_decoded_size: usize,
@@ -458,8 +481,8 @@ pub const Decoder = struct {
     ) (CompressionError || error{OutOfMemory})!DecodeResult {
         var fields: std.ArrayList(HeaderField) = .empty;
         errdefer {
-            HeaderField.freeOwnedSlice(self.allocator, fields.items);
-            fields.deinit(self.allocator);
+            HeaderField.freeOwnedSlice(request_alloc, fields.items);
+            fields.deinit(request_alloc);
         }
         var decoded_size: usize = 0;
         var policy = false;
@@ -469,21 +492,21 @@ pub const Decoder = struct {
             const b = block[i];
             if ((b & 0x80) != 0) {
                 const idx = try decodeInt(block, 7, &i);
-                const field = try self.takeIndexed(try self.lookup(idx));
+                const field = try takeIndexed(try self.lookup(idx), request_alloc);
                 decoded_size += field.name.len + field.value.len + 32;
                 if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
-                try self.appendField(&fields, field);
+                try appendField(request_alloc, &fields, field);
                 first = false;
             } else if ((b & 0xc0) == 0x40) {
                 const idx = try decodeInt(block, 6, &i);
-                const field = try self.takeLiteral(block, idx, &i, false);
+                const field = try self.takeLiteral(request_alloc, block, idx, &i, false);
                 decoded_size += field.name.len + field.value.len + 32;
                 if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
                 self.indexIntoTable(field.name, field.value) catch |err| {
-                    field.freeOwned(self.allocator);
+                    field.freeOwned(request_alloc);
                     return err;
                 };
-                try self.appendField(&fields, field);
+                try appendField(request_alloc, &fields, field);
                 first = false;
             } else if ((b & 0xe0) == 0x20) {
                 // A dynamic table size update is legal only at the start of a
@@ -495,23 +518,27 @@ pub const Decoder = struct {
             } else {
                 const never = (b & 0xf0) == 0x10;
                 const idx = try decodeInt(block, 4, &i);
-                const field = try self.takeLiteral(block, idx, &i, never);
+                const field = try self.takeLiteral(request_alloc, block, idx, &i, never);
                 decoded_size += field.name.len + field.value.len + 32;
                 if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
-                try self.appendField(&fields, field);
+                try appendField(request_alloc, &fields, field);
                 first = false;
             }
         }
         return .{
-            .fields = try fields.toOwnedSlice(self.allocator),
+            .fields = try fields.toOwnedSlice(request_alloc),
             .decoded_size = decoded_size,
             .policy_exceeded = policy,
         };
     }
 
     pub fn freeResult(self: *Decoder, result: DecodeResult) void {
-        HeaderField.freeOwnedSlice(self.allocator, result.fields);
-        self.allocator.free(result.fields);
+        self.freeResultInto(self.allocator, result);
+    }
+
+    pub fn freeResultInto(_: *Decoder, request_alloc: std.mem.Allocator, result: DecodeResult) void {
+        HeaderField.freeOwnedSlice(request_alloc, result.fields);
+        request_alloc.free(result.fields);
     }
 };
 
@@ -744,6 +771,23 @@ test "dynamic-indexed result strings survive table eviction" {
     const resize = [_]u8{0x20}; // dynamic table size update to 0
     const emptied = try dec.decode(&resize, 100, 32 * 1024, 256, 8 * 1024);
     dec.freeResult(emptied);
+    try std.testing.expectEqual(@as(usize, 0), dec.dyn.items.len);
+    try std.testing.expectEqualStrings("custom-key", res.fields[0].name);
+    try std.testing.expectEqualStrings("custom-header", res.fields[0].value);
+}
+
+test "request-list allocator is independent of the dynamic table" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var dec = Decoder.init(std.testing.allocator);
+    defer dec.deinit();
+    const insert = [_]u8{ 0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79, 0x0d, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72 };
+    const res = try dec.decodeInto(arena, &insert, 100, 32 * 1024, 256, 8 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), dec.dyn.items.len);
+    try std.testing.expect(res.fields[0].name.ptr != dec.dyn.items[0].name.ptr);
+    const emptied = try dec.decodeInto(arena, &[_]u8{0x20}, 100, 32 * 1024, 256, 8 * 1024);
+    try std.testing.expectEqual(@as(usize, 0), emptied.fields.len);
     try std.testing.expectEqual(@as(usize, 0), dec.dyn.items.len);
     try std.testing.expectEqualStrings("custom-key", res.fields[0].name);
     try std.testing.expectEqualStrings("custom-header", res.fields[0].value);

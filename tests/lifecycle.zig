@@ -122,9 +122,9 @@ fn waitStreamsAtLeast(server: *starh2.Server, want: usize, timeout_ms: u64) !voi
 fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } },
-        .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = hangSse } },
-        .{ .method = .GET, .path = "/delayed", .handler = .{ .ptr = @constCast(&dummy), .runFn = delayedHello } },
+        .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
+        .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangSse } } },
+        .{ .method = .GET, .path = "/delayed", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = delayedHello } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 64;
@@ -363,7 +363,7 @@ fn peerResetWhileBlocked(_: *anyopaque, req: *const starh2.Request, resp: *starh
 fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/wf", .handler = .{ .ptr = @constCast(&dummy), .runFn = writeFailHello } },
+        .{ .method = .GET, .path = "/wf", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = writeFailHello } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 8;
@@ -556,7 +556,7 @@ test "slot terminal survives job destroy (no resp pointer)" {
 fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = hangSse } },
+        .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangSse } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 8;
@@ -681,7 +681,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
     const routes = [_]starh2.Route{.{
         .method = .POST,
         .path = "/fail-index",
-        .handler = .{ .ptr = @constCast(&dummy), .runFn = failIndexHandler },
+        .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = failIndexHandler } },
     }};
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = starh2.Server.init(gpa, rt.io(), .{
@@ -1021,8 +1021,8 @@ test "rates: HEADERS flood trips ENHANCE_YOUR_CALM" {
 fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = largeBodyHello } },
-        .{ .method = .GET, .path = "/rstblock", .handler = .{ .ptr = @constCast(&dummy), .runFn = peerResetWhileBlocked } },
+        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = largeBodyHello } } },
+        .{ .method = .GET, .path = "/rstblock", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = peerResetWhileBlocked } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 4;
@@ -1179,7 +1179,7 @@ fn capCrossingHello(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Res
 fn runCapCrossingBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = capCrossingHello } },
+        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = capCrossingHello } } },
     };
     // qmdsync's limitsFor shape (t-482): streams capped at handler_limit,
     // slow-consumer deadline at the SSE send timeout. outbound_bytes_per_stream
@@ -1320,7 +1320,7 @@ test "lifecycle: a single send bigger than outbound_bytes_per_stream completes (
 fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } },
+        .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -1373,7 +1373,7 @@ test "lifecycle: the first wire frame is the server's own SETTINGS, never an ack
 
 fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = hello } },
+        .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
     };
 
     // --- Success: .listening must mean connectable, with no sleep to cover a race. ---

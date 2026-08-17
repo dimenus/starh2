@@ -18,8 +18,9 @@
 //! # The shape of a request
 //!
 //! socket -> `ReadPump` -> actor -> `Session.ingest` -> `Intent.dispatch_request`
-//! -> `Router` -> handler task -> `Response` -> `Session` command -> `Intent`
-//! -> `FairScheduler` -> `WritePump` -> socket.
+//! -> `Router` -> complete handler on the actor, or a handler task ->
+//! `Response` -> `Session` command -> `Intent` -> `FairScheduler` ->
+//! `WritePump` -> socket.
 //!
 //! Start with `edge/connection.zig`. Its module header carries the task
 //! topology, the lock discipline, and the wake protocol, and nearly every
@@ -83,9 +84,12 @@ pub const InitError = edge.server.InitError;
 pub const ServeError = edge.server.ServeError;
 pub const BindState = edge.server.BindState;
 pub const Handler = http.router.Handler;
+pub const TaskHandler = http.router.TaskHandler;
+pub const CompleteHandler = http.router.CompleteHandler;
 pub const Route = http.router.Route;
 pub const Request = http.request.Request;
 pub const Response = http.response.Response;
+pub const CompleteResponse = http.response.CompleteResponse;
 pub const Body = http.response.Body;
 pub const Header = http.request.Header;
 pub const Method = http.request.Method;

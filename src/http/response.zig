@@ -1,12 +1,15 @@
 //! The handler-facing response API, and the state that makes it safe to use
 //! from a task the connection can cancel at any moment.
 //!
-//! A handler runs concurrently with the connection actor, so the stream it is
-//! answering can end underneath it: the peer resets, the peer stops reading,
-//! the transport fails, or the server shuts down. Every one of those must reach
-//! the handler as an EXACT error rather than as a generic failure, because a
-//! handler's correct reaction differs — a peer reset is normal and needs no
-//! log, while a write failure is not.
+//! A task handler runs concurrently with the connection actor, so the stream
+//! it is answering can end underneath it: the peer resets, the peer stops
+//! reading, the transport fails, or the server shuts down. A complete handler
+//! runs on the actor instead — it still uses this same `Response` core via
+//! `CompleteResponse`, and the stream can still die under it (WritePump,
+//! peer RST). Every one of those must reach the handler as an EXACT error
+//! rather than as a generic failure, because a handler's correct reaction
+//! differs — a peer reset is normal and needs no log, while a write failure
+//! is not.
 //!
 //! `Response` therefore holds no connection state of its own. It carries
 //! function pointers into `edge.connection` and a pointer to actor-owned
@@ -243,6 +246,25 @@ pub const Response = struct {
         self.body_open = false;
         self.finished = true;
         self.terminal.setCause(.internal);
+    }
+};
+
+/// The only response a complete (non-blocking) handler can produce: headers
+/// plus a finished body. `start` / `startSse` are not on this type, so a
+/// complete route cannot stream on the connection actor.
+///
+/// The bytes still leave through FairScheduler and WritePump. This type
+/// forbids handler-task isolation, not the write path. A complete handler
+/// must not sleep, wait, or do I/O — those belong on a task handler.
+pub const CompleteResponse = struct {
+    inner: *Response,
+
+    pub fn send(self: *CompleteResponse, status: u16, headers: []const request.Header, body: []const u8) ResponseError!void {
+        return self.inner.send(status, headers, body);
+    }
+
+    pub fn slotTerminal(self: *const CompleteResponse) ?TerminalCause {
+        return self.inner.slotTerminal();
     }
 };
 

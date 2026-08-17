@@ -107,6 +107,27 @@ pub const FrameHeader = struct {
     }
 };
 
+/// On-wire byte count for a complete HTTP/2 frame sitting in `payload`.
+///
+/// A boot-reserved frame slab is larger than the frame. Callers that copy or
+/// reserve occupancy must use this, not `payload.len`, or they will copy slab
+/// tail bytes onto the wire. A buffer too short to hold a header, or whose
+/// header length overruns the buffer, is treated as opaque: return `payload.len`
+/// so tests that enqueue dummy bytes keep working.
+pub fn encodedOnWireLen(payload: []const u8) usize {
+    if (payload.len < FRAME_HEADER_LEN) return payload.len;
+    const hdr_len = std.mem.readInt(u24, payload[0..3], .big);
+    const total = FRAME_HEADER_LEN + @as(usize, hdr_len);
+    if (total > payload.len) return payload.len;
+    return total;
+}
+
+/// Borrow of the on-wire prefix. Not an ownership transfer: the caller still
+/// frees `payload` as the original slice (full slab or GPA allocation).
+pub fn encodedOnWire(payload: []u8) []u8 {
+    return payload[0..encodedOnWireLen(payload)];
+}
+
 pub const ParseError = error{
     NeedMore,
     FrameSizeError,
@@ -530,6 +551,20 @@ pub const serverPrefaceSettings = [_]Setting{
     .{ .id = .max_frame_size, .value = 16_384 },
     .{ .id = .max_header_list_size, .value = 32_768 },
 };
+
+test "encodedOnWireLen reads the header, not the slab tail" {
+    var slab: [64]u8 = undefined;
+    @memset(&slab, 0xAA);
+    const hdr = FrameHeader{
+        .length = 4,
+        .type = .window_update,
+        .flags = .{},
+        .stream_id = 0,
+    };
+    hdr.encode(slab[0..FRAME_HEADER_LEN]);
+    try std.testing.expectEqual(@as(usize, FRAME_HEADER_LEN + 4), encodedOnWireLen(&slab));
+    try std.testing.expectEqual(@as(usize, 3), encodedOnWireLen("abc"));
+}
 
 test "frame header roundtrip" {
     var buf: [9]u8 = undefined;

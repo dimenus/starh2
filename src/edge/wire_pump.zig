@@ -113,11 +113,16 @@ pub const ReadPump = struct {
             var dest: [1][]u8 = .{buf};
             const n = reader.interface.readVec(&dest) catch {
                 self.returnIndex(idx);
+                // Unblock a write parked on a peer that already closed. The
+                // actor may be in `write_ch.putOne` holding `session_mu` and
+                // cannot observe this EOF until that put returns.
+                self.stream.shutdown(self.io, .send) catch {};
                 self.postEof();
                 return;
             };
             if (n == 0) {
                 self.returnIndex(idx);
+                self.stream.shutdown(self.io, .send) catch {};
                 self.postEof();
                 return;
             }
@@ -168,6 +173,9 @@ pub const WritePump = struct {
     from_actor: *std.Io.Queue(WireChunk),
     completions: *std.Io.Queue(WriteCompletion),
     gpa: std.mem.Allocator,
+    /// When set, `WireChunk.pool_index` is returned here instead of `gpa.free`.
+    /// Tests that feed GPA-owned chunks leave this null.
+    free_indices: ?*std.Io.Queue(u32) = null,
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
     test_fail_after: u64 = 0,
@@ -180,7 +188,17 @@ pub const WritePump = struct {
     }
 
     fn releaseChunk(self: *WritePump, chunk: WireChunk, ok: bool, fail_all: bool) void {
-        if (chunk.bytes.len != 0) {
+        if (chunk.pool_index) |idx| {
+            const q = self.free_indices orelse unreachable;
+            // Never block: the actor is the only consumer of this queue and may
+            // already be parked on write_ch. An uncancelable put into a full
+            // free list deadlocks shutdown (pump cannot fail-drain, actor
+            // cannot take an index). A failed put is a duplicate return; leak
+            // the index and let later sends GPA-fallback.
+            if (!io_queue.tryPut(u32, q, self.io, idx)) {
+                std.debug.assert(false);
+            }
+        } else if (chunk.bytes.len != 0) {
             self.gpa.free(chunk.bytes);
         }
         const has_ticket = chunk.ticket_count != 0 or chunk.ticket != 0;
@@ -245,6 +263,7 @@ pub const WritePump = struct {
                 carried = null;
                 break :blk chunk;
             } else self.from_actor.getOne(self.io) catch {
+                self.failDrain();
                 self.post(.{ .fail_all = true, .shutdown = true });
                 return;
             };
@@ -254,7 +273,9 @@ pub const WritePump = struct {
                     self.releaseChunk(first, true, false);
                     continue;
                 }
-                // Shutdown sentinel.
+                // Shutdown sentinel. Drain anything still queued (a writer
+                // that raced the sentinel) so those tickets still fail.
+                self.failDrain();
                 self.post(.{ .shutdown = true });
                 return;
             }

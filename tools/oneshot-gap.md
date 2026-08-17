@@ -30,9 +30,9 @@ Throughput-shaped (use these for the remaining gap, not wall waits):
 - `tickets/handoff` — responses coalesced into one `queueWire`
 - `tickets/emit` — responses flushed in one `drainEmit` turn
 - `records/response` — TLS records per h2load success. Packed drain turns
-  at `-m 10` are about **0.17**. **1.00** means a second HEADERS flushed
-  the batch again. The script **exits 9** rather than reporting that as a
-  result.
+  at `-m 10` sit well below **0.4**. **1.00** means a second HEADERS
+  flushed the batch again. The script **exits 9** rather than reporting
+  that as a result.
 - `allocs/request` — counting-allocator calls on the server GPA (`--trace`)
 
 Latency-shaped (overlapped across many concurrent streams; not throughput):
@@ -74,8 +74,10 @@ tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
 ```
 
 `TLS pack 6 HEADERS+DATA` is a few nanoseconds and zero allocs. Do not
-spend another round on the memcpy. Session request+response and empty zio
-spawn+await are the rows that can still move a one-shot number.
+spend another round on the memcpy. Isolated Session request+response now
+sits close to http2.zig's inline core; empty zio spawn+await is what
+complete handlers no longer pay. The live TLS gap is pumps, tickets, TLS,
+and the one-actor-per-connection domain — re-derive, do not cite a ratio.
 
 Official one-shot:
 
@@ -92,19 +94,28 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
 - Skipping the one-shot ticket wait collapsed ~176k → ~1.6k req/s with a
   lock-convoy `block` around 10 ms. The receipt is the self-clock, same as
   SSE.
-- Running a complete-response handler on the actor dropped ~176k → ~123k
-  (encode left the parallel handler tasks and serialized onto the actor).
+- Running a complete handler on the actor *while still spawning per
+  response and drain-emitting per job* dropped ~176k → ~123k: encode left
+  the parallel handler tasks and serialized onto the actor. The landed cut
+  is different: complete handlers skip spawn, encode the whole inline
+  batch, one `drainEmit`, then wait every receipt. Do not re-try the first
+  shape, and do not undo the batch wait.
 - More packing micros, or TLS encrypt 6×50 B vs 1×300 B: live already
-  showed `records/response` 1.00 → 0.17 and only a small throughput step.
+  packed (oracle exits 9 at `records/response > 0.4`). Packed drain turns
+  at `-m 10` sit well below that.
 - Starting by changing zio.
 
 ## What is left
 
-Per-request allocation (~11 allocs / ~1.4 KiB on the traced one-shot path)
-and spawn/dispatch. Symbolicate `oneshot-phase-trace.sh` top alloc sites
-against the bench binary. Typical once-per-request sites: HPACK literals,
-`HandlerJob`, HEADERS/DATA frame `alloc`, TLS ciphertext `dupe`.
+Live one-shot TLS is no longer an alloc or spawn story. Re-run
+`tools/oneshot-phase-trace.sh`: after the complete-handler cut it showed
+~0.01 GPA allocs/req and packed `records/response`. Isolated Session
+request+response is close to http2.zig's inline request core; pipeline
+HPACK mixed decode still allocates because that bench uses GPA, not the
+live job-arena path.
 
-Do not drop scheduler pending without RST-on-wire or fail-close. That is
-the TLS stall in `TLS_STALL_BRIEF.md` / `57359b7`, a different defect.
-`not-started` (`started < total`) is t-761, also different.
+The remaining live gap is pumps, tickets, TLS, and the one-actor-per-
+connection domain. Do not drop scheduler pending without RST-on-wire or
+fail-close. That is the TLS stall in `TLS_STALL_BRIEF.md` / `57359b7`, a
+different defect. `not-started` (`started < total`) is t-761, also
+different.

@@ -6,7 +6,7 @@ const h2c = @import("starh2_h2_client");
 const dummy: u8 = 0;
 const response_body = "backend-ok";
 
-fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     try resp.send(200, &.{}, response_body);
 }
 
@@ -52,11 +52,12 @@ fn readUntilBody(io: std.Io, reader: *std.Io.net.Stream.Reader, elapsed_limit_ns
 fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
     starh2.edge.connection.test_observed_sched_emits.store(0, .release);
     starh2.edge.connection.test_wire_sends.store(0, .release);
+    starh2.edge.connection.test_observed_inline_jobs.store(0, .release);
     const listen_addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{.{
         .method = .GET,
         .path = "/parity",
-        .handler = .{ .ptr = @constCast(&dummy), .runFn = hello },
+        .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } },
     }};
     var server = try starh2.Server.init(gpa, io, .{
         .endpoints = &.{.{ .h2c_prior_knowledge = listen_addr }},
@@ -133,6 +134,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
             return err;
         };
     }
+    try std.testing.expect(starh2.edge.connection.test_observed_inline_jobs.load(.acquire) >= 1);
 
     server.requestShutdown();
     try serve_future.await(io);

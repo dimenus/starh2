@@ -44,6 +44,8 @@ pub const Terms = struct {
     write_acks: usize = 0,
     wire_descs: usize = 0,
     read_payload: usize = 0,
+    write_payload: usize = 0,
+    frame_slabs: usize = 0,
     stream_maps: usize = 0,
     pending_maps: usize = 0,
     on_demand_conn: usize = 0,
@@ -64,7 +66,7 @@ pub const Terms = struct {
 
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
 pub const HANDLER_SLOT_SIZE: usize = 20;
-pub const HANDLER_JOB_SIZE: usize = 528;
+pub const HANDLER_JOB_SIZE: usize = 584;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
 pub const REAPER_JOB_SIZE: usize = 40;
 
@@ -95,6 +97,10 @@ pub const Limits = struct {
     max_streams_per_connection: usize = 256,
     max_streams_per_server: usize = 4_096,
     inbound_wire_chunks_per_connection: usize = 8,
+    /// Boot-reserved outbound HEADERS/DATA frame slabs per connection. A frame
+    /// larger than `frame_slab_bytes` falls back to the GPA.
+    frame_slab_bytes: usize = 512,
+    frame_slabs_per_connection: usize = 256,
     outbound_bytes_per_stream: usize = 64 * 1024,
     outbound_bytes_per_connection: usize = 4 * 1024 * 1024,
     outbound_bytes_per_server: usize = 256 * 1024 * 1024,
@@ -202,6 +208,8 @@ pub const Limits = struct {
         if (self.control_entries_per_connection <= TERMINAL_CONTROL_RESERVE_ENTRIES) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.tls_recv_acc_bytes < WIRE_CHUNK_SIZE) return error.InvalidConfig;
+        if (self.frame_slab_bytes < 9) return error.InvalidConfig;
+        if (self.frame_slabs_per_connection == 0) return error.InvalidConfig;
         // A server with no slabs can never write DATA.
         if (self.outbound_slabs_per_server == 0) return error.InvalidConfig;
         // Every admitted stream can hold at most one slab, and global stream
@@ -237,6 +245,8 @@ pub const Limits = struct {
         const ticket_n = try checkedAdd(self.control_entries_per_connection, self.max_streams_per_connection);
 
         terms.read_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
+        terms.write_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
+        terms.frame_slabs = try checkedMul(self.frame_slabs_per_connection, self.frame_slab_bytes);
         terms.wire_descs = try checkedMul(try checkedMul(n_chunks, 2), bound.WIRE_CHUNK_DESC_SIZE); // read+write ch
         terms.handlers = try checkedMul(self.max_streams_per_connection, HANDLER_SLOT_SIZE);
         terms.handler_jobs = try checkedMul(self.max_streams_per_connection, HANDLER_JOB_SIZE);
@@ -247,7 +257,10 @@ pub const Limits = struct {
         const plain_scratch: usize = TLS_PLAINTEXT_SCRATCH_SIZE;
         const cipher_scratch: usize = WIRE_CHUNK_SIZE;
         const sid_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
+        const inline_sids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
+        const header_leases = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
+        const write_free = try checkedMul(n_chunks, @sizeOf(u32));
         terms.stream_maps = bound.streamMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
         const pending_slots = bound.pendingWriteMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
         // Slabs are server-wide now, so they are NOT part of the per-connection
@@ -269,7 +282,9 @@ pub const Limits = struct {
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_recv_acc_bytes, try checkedAdd(header_maps, intents)))));
 
-        const per_conn = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_scratch, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, sched_scratch))))))))))))))))));
+        const sid_and_inline = try checkedAdd(sid_scratch, inline_sids);
+        const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, sched_scratch)))))))))))))))))));
+        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, write_free)));
 
         terms.routes = try checkedAdd(
             self.max_route_path_bytes,
@@ -316,6 +331,17 @@ pub const Limits = struct {
         };
     }
 };
+
+test "mutation canary: frame_slabs term moves with the limit" {
+    const base = try Limits.defaults.resourceUpperBound();
+    try std.testing.expect(base.terms.frame_slabs > 0);
+    try std.testing.expect(base.terms.write_payload > 0);
+    var more = Limits.defaults;
+    more.frame_slabs_per_connection = Limits.defaults.frame_slabs_per_connection * 2;
+    const bigger = try more.resourceUpperBound();
+    try std.testing.expect(bigger.terms.frame_slabs > base.terms.frame_slabs);
+    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+}
 
 test "defaults resource bound" {
     const b = try Limits.defaults.resourceUpperBound();

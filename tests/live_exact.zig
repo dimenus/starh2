@@ -277,7 +277,7 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
 
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = bigBodyHandler } },
+        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigBodyHandler } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 4;
@@ -417,7 +417,7 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
 
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/cap", .handler = .{ .ptr = @constCast(&dummy), .runFn = capWaitBodyHandler } },
+        .{ .method = .GET, .path = "/cap", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = capWaitBodyHandler } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 4;
@@ -506,7 +506,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
 
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/cap", .handler = .{ .ptr = @constCast(&dummy), .runFn = rstBlockHandler } },
+        .{ .method = .GET, .path = "/cap", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = rstBlockHandler } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 4;
@@ -569,7 +569,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
 
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/rstblock", .handler = .{ .ptr = @constCast(&dummy), .runFn = rstBlockHandler } },
+        .{ .method = .GET, .path = "/rstblock", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = rstBlockHandler } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 4;
@@ -626,7 +626,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
 fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/wf", .handler = .{ .ptr = @constCast(&dummy), .runFn = writeFailHandler } },
+        .{ .method = .GET, .path = "/wf", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = writeFailHandler } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 8;
@@ -699,8 +699,8 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/slow", .handler = .{ .ptr = @constCast(&dummy), .runFn = slowBlockHandler } },
-        .{ .method = .GET, .path = "/ok", .handler = .{ .ptr = @constCast(&dummy), .runFn = okProgressHandler } },
+        .{ .method = .GET, .path = "/slow", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = slowBlockHandler } } },
+        .{ .method = .GET, .path = "/ok", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = okProgressHandler } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 4;
@@ -773,7 +773,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = bigBodyHandler } },
+        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigBodyHandler } } },
     };
     var limits = starh2.Limits.defaults;
     limits.max_connections = 4;

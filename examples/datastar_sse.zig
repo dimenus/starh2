@@ -18,7 +18,7 @@ fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.response_compression = true;
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
-        .routes = &.{.{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sse } }},
+        .routes = &.{.{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sse } } }},
         .tls = null,
         .limits = limits,
     });

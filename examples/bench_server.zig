@@ -27,12 +27,20 @@ const write_trace = starh2.edge.wire_pump.write_trace;
 /// set, so the official bench path (no `--trace`) does not pay atomic increments
 /// or extra vtable hops. Sites are hashed by caller return address; collisions
 /// overflow rather than merge distinct callers.
+///
+/// `alloc_ns` / `free_ns` time the parent `rawAlloc` / `rawFree` plus two
+/// `Clock.awake` reads, so they overstate allocator cost. `sample(1)` is 1ms
+/// and this reactor's bursts are tens of microseconds, so it will not resolve
+/// malloc; treat these counters as the allocator-time number, not a CPU %.
 const AllocTrace = struct {
     parent: std.mem.Allocator,
+    io: std.Io,
     allocs: std.atomic.Value(u64) = .init(0),
     bytes: std.atomic.Value(u64) = .init(0),
+    alloc_ns: std.atomic.Value(u64) = .init(0),
     frees: std.atomic.Value(u64) = .init(0),
     free_bytes: std.atomic.Value(u64) = .init(0),
+    free_ns: std.atomic.Value(u64) = .init(0),
     overflow: std.atomic.Value(u64) = .init(0),
     sites: [128]Site = @splat(.{}),
 
@@ -40,6 +48,7 @@ const AllocTrace = struct {
         addr: std.atomic.Value(usize) = .init(0),
         count: std.atomic.Value(u64) = .init(0),
         bytes: std.atomic.Value(u64) = .init(0),
+        ns: std.atomic.Value(u64) = .init(0),
     };
 
     const vtable: std.mem.Allocator.VTable = .{
@@ -53,7 +62,7 @@ const AllocTrace = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn note(self: *AllocTrace, addr: usize, n: usize) void {
+    fn note(self: *AllocTrace, addr: usize, n: usize, dt: u64) void {
         if (addr == 0) {
             _ = self.overflow.fetchAdd(1, .monotonic);
             return;
@@ -66,6 +75,7 @@ const AllocTrace = struct {
             if (cur == addr) {
                 _ = slot.count.fetchAdd(1, .monotonic);
                 _ = slot.bytes.fetchAdd(n, .monotonic);
+                _ = slot.ns.fetchAdd(dt, .monotonic);
                 return;
             }
             if (cur == 0) {
@@ -74,6 +84,7 @@ const AllocTrace = struct {
                 {
                     _ = slot.count.fetchAdd(1, .monotonic);
                     _ = slot.bytes.fetchAdd(n, .monotonic);
+                    _ = slot.ns.fetchAdd(dt, .monotonic);
                     return;
                 }
             }
@@ -83,10 +94,13 @@ const AllocTrace = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *AllocTrace = @ptrCast(@alignCast(ctx));
+        const t0 = nowNs(self.io);
         const p = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+        const dt = nowNs(self.io) - t0;
         _ = self.allocs.fetchAdd(1, .monotonic);
         _ = self.bytes.fetchAdd(len, .monotonic);
-        self.note(ret_addr, len);
+        _ = self.alloc_ns.fetchAdd(dt, .monotonic);
+        self.note(ret_addr, len, dt);
         return p;
     }
 
@@ -102,11 +116,18 @@ const AllocTrace = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *AllocTrace = @ptrCast(@alignCast(ctx));
+        const t0 = nowNs(self.io);
+        self.parent.rawFree(memory, alignment, ret_addr);
+        const dt = nowNs(self.io) - t0;
         _ = self.frees.fetchAdd(1, .monotonic);
         _ = self.free_bytes.fetchAdd(memory.len, .monotonic);
-        self.parent.rawFree(memory, alignment, ret_addr);
+        _ = self.free_ns.fetchAdd(dt, .monotonic);
     }
 };
+
+fn nowNs(io: std.Io) u64 {
+    return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
 
 var g_alloc_trace: ?*AllocTrace = null;
 
@@ -119,21 +140,30 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
     trace.snapshot(&snap);
     var allocs: u64 = 0;
     var alloc_bytes: u64 = 0;
+    var alloc_ns: u64 = 0;
     var frees: u64 = 0;
     var free_bytes: u64 = 0;
+    var free_ns: u64 = 0;
     var overflow: u64 = 0;
-    const Top = struct { addr: usize, n: u64, bytes: u64 };
-    var top: [8]Top = @splat(.{ .addr = 0, .n = 0, .bytes = 0 });
+    const Top = struct { addr: usize, n: u64, bytes: u64, ns: u64 };
+    var top: [8]Top = @splat(.{ .addr = 0, .n = 0, .bytes = 0, .ns = 0 });
     if (g_alloc_trace) |t| {
         allocs = t.allocs.load(.acquire);
         alloc_bytes = t.bytes.load(.acquire);
+        alloc_ns = t.alloc_ns.load(.acquire);
         frees = t.frees.load(.acquire);
         free_bytes = t.free_bytes.load(.acquire);
+        free_ns = t.free_ns.load(.acquire);
         overflow = t.overflow.load(.acquire);
         for (&t.sites) |*s| {
             const n = s.count.load(.acquire);
             if (n == 0) continue;
-            const cand = Top{ .addr = s.addr.load(.acquire), .n = n, .bytes = s.bytes.load(.acquire) };
+            const cand = Top{
+                .addr = s.addr.load(.acquire),
+                .n = n,
+                .bytes = s.bytes.load(.acquire),
+                .ns = s.ns.load(.acquire),
+            };
             var i: usize = 0;
             while (i < top.len and top[i].n >= cand.n) i += 1;
             if (i < top.len) {
@@ -143,7 +173,7 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             }
         }
     }
-    var sites_buf: [512]u8 = undefined;
+    var sites_buf: [768]u8 = undefined;
     var sites_len: usize = 0;
     sites_buf[sites_len] = '[';
     sites_len += 1;
@@ -152,8 +182,8 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         if (s.n == 0) continue;
         const piece = std.fmt.bufPrint(
             sites_buf[sites_len..],
-            "{s}[{d},{d},{d}]",
-            .{ if (first) "" else ",", s.addr, s.n, s.bytes },
+            "{s}[{d},{d},{d},{d}]",
+            .{ if (first) "" else ",", s.addr, s.n, s.bytes, s.ns },
         ) catch break;
         sites_len += piece.len;
         first = false;
@@ -206,16 +236,17 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         },
     );
     try w.print(
-        "\"allocs\":{d},\"alloc_bytes\":{d},\"frees\":{d},\"free_bytes\":{d}," ++
+        "\"allocs\":{d},\"alloc_bytes\":{d},\"alloc_ns\":{d}," ++
+            "\"frees\":{d},\"free_bytes\":{d},\"free_ns\":{d}," ++
             "\"alloc_overflow\":{d},\"sites\":{s}}}\n",
-        .{ allocs, alloc_bytes, frees, free_bytes, overflow, sites_buf[0..sites_len] },
+        .{ allocs, alloc_bytes, alloc_ns, frees, free_bytes, free_ns, overflow, sites_buf[0..sites_len] },
     );
     try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
 }
 
 const BODY = "Hello, World!";
 
-fn helloHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+fn helloHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, BODY);
 }
 
@@ -395,7 +426,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;
-    var alloc_trace_storage: AllocTrace = .{ .parent = gpa };
+    var alloc_trace_storage: AllocTrace = .{ .parent = gpa, .io = io };
     const server_gpa: std.mem.Allocator = if (args.trace) blk: {
         g_alloc_trace = &alloc_trace_storage;
         break :blk alloc_trace_storage.allocator();
@@ -406,10 +437,10 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", args.port);
 
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/", .handler = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } },
-        .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } },
-        .{ .method = .GET, .path = "/sse-broadcast", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseBroadcastHandler } },
-        .{ .method = .GET, .path = "/trace", .handler = .{ .ptr = @constCast(&dummy), .runFn = traceHandler } },
+        .{ .method = .GET, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } } },
+        .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } } },
+        .{ .method = .GET, .path = "/sse-broadcast", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseBroadcastHandler } } },
+        .{ .method = .GET, .path = "/trace", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = traceHandler } } },
     };
 
     var cert_pem: []u8 = &.{};

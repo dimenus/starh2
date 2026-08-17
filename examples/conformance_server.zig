@@ -187,12 +187,12 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const addr = try starh2.EndpointAddress.parseIp4(args.host, args.port);
 
     const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/hello", .handler = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } },
-        .{ .method = .GET, .path = "/big", .handler = .{ .ptr = @constCast(&dummy), .runFn = bigHandler } },
-        .{ .method = .GET, .path = "/sse", .handler = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } },
-        .{ .method = .POST, .path = "/morph", .handler = .{ .ptr = @constCast(&dummy), .runFn = morphHandler } },
-        .{ .method = .GET, .path = "/signals", .handler = .{ .ptr = @constCast(&dummy), .runFn = signalsGetHandler } },
-        .{ .method = .POST, .path = "/signals", .handler = .{ .ptr = @constCast(&dummy), .runFn = signalsPostHandler } },
+        .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } } },
+        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigHandler } } },
+        .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } } },
+        .{ .method = .POST, .path = "/morph", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = morphHandler } } },
+        .{ .method = .GET, .path = "/signals", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = signalsGetHandler } } },
+        .{ .method = .POST, .path = "/signals", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = signalsPostHandler } } },
     };
 
     var tls_cfg: ?starh2.TlsConfig = null;

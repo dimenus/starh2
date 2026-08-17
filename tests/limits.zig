@@ -116,11 +116,11 @@ test "counting allocator: Server.init under published ceiling" {
     const routes = [_]starh2.Route{.{
         .method = .GET,
         .path = "/",
-        .handler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = struct {
             fn f(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
                 try resp.send(200, &.{}, "ok");
             }
-        }.f },
+        }.f } },
     }};
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = try starh2.Server.init(gpa, rt.io(), .{
@@ -176,11 +176,11 @@ test "fail-index iteration: Server.init fails closed" {
         const routes = [_]starh2.Route{.{
             .method = .GET,
             .path = "/",
-            .handler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+            .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = struct {
                 fn f(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
                     try resp.send(200, &.{}, "ok");
                 }
-            }.f },
+            }.f } },
         }};
         const addr = starh2.EndpointAddress.parseIp4("127.0.0.1", 0) catch {
             saw_fail = true;
@@ -244,11 +244,11 @@ test "counting allocator peak under live hello stays under ceiling" {
     const routes = [_]starh2.Route{.{
         .method = .GET,
         .path = "/",
-        .handler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = struct {
             fn f(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
                 try resp.send(200, &.{}, "ok");
             }
-        }.f },
+        }.f } },
     }};
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = try starh2.Server.init(gpa, rt.io(), .{
