@@ -136,28 +136,16 @@ what the diagnostic pass below is for.
 
 ### A second, different defect: requests that never start
 
-`started < total` is a separate class. The client never submitted the rest of
-the requests. It is fast, it loses thousands of requests, and it happens with
-migration both on and off.
+`started < total` is a separate class. It is **not TLS-specific** — h2c
+reproduces it — and it is not a lost wakeup. HEADERS charged the shared
+`non_data` bucket (10k burst, 1k/s). A legitimate one-shot connection then
+GOAWAY'd `ENHANCE_YOUR_CALM` after ~10k requests. h2load reported the
+leftover as `Process Request Failure` / `started < total`.
 
-It is also far easier to reproduce than the stall, which makes it useful:
-
-```sh
-tools/tls-stall-delta.sh notstarted --mode tls --rounds 3 \
-  -n 1000000 -c 50 -m 10 -t 4
-```
-
-That command produced `NOT-STARTED` in 3 of 3 rounds on a migration-off
-server. The `-c 10` case is the same class.
-
-**Instruction change from the earlier brief.** Do not treat this class as
-forbidden evidence. Spend a bounded first pass on it, because it is
-deterministic and the stall is not. Then state whether the two share a cause.
-If they do not, file it and continue. A deterministic reproducer is worth more
-than a 7.5% one, even when it turns out to be a different bug.
-
-The harness never folds the two together. It classifies every round and counts
-the classes separately.
+HEADERS now has its own bucket (same shape as WINDOW_UPDATE). Rapid-reset
+still hits `rst` + `non_data`. Do not put HEADERS back on `non_data`: the
+test `rate limiter HEADERS does not consume the shared non-data budget`
+is the mutation canary. t-761.
 
 ### The plaintext zio reproducer
 
