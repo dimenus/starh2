@@ -110,8 +110,10 @@ pub const ParseError = error{
 
 pub const FrameEvent = struct {
     header: FrameHeader,
-    /// Owned copy of the payload (caller frees with allocator). Empty when length=0.
+    /// Payload bytes. When `payload_owned`, caller frees with allocator.
     payload: []u8,
+    /// False when `payload` borrows the parser scratch until the handler returns.
+    payload_owned: bool = true,
 };
 
 /// Incremental frame parser. A TCP read gives an arbitrary byte count, so a
@@ -121,9 +123,10 @@ pub const FrameEvent = struct {
 ///
 /// Two payload strategies exist, and the choice decides who allocates:
 /// - `initReserved` (production) reserves one max-size scratch buffer at
-///   connection boot. Each completed frame gets a right-sized dupe. The hot
-///   path therefore never grows a buffer, which is what keeps the connection
-///   inside `Limits.resourceUpperBound`.
+///   connection boot. Completed frames borrow that scratch until the handler
+///   returns; `Session` copies anything it must retain. The hot path therefore
+///   never grows a buffer, which is what keeps the connection inside
+///   `Limits.resourceUpperBound`.
 /// - `init` (tests) allocates per frame. It is simpler to reason about, and a
 ///   test does not need the boot-time bound.
 pub const Parser = struct {
@@ -134,7 +137,7 @@ pub const Parser = struct {
     payload_filled: usize = 0,
     payload_buf: []u8 = &.{},
     payload_owned: bool = false,
-    /// When set, payload_buf is reused across frames; completed events get a dupe.
+    /// When set, payload_buf is reused across frames; completed events borrow it.
     payload_scratch: []u8 = &.{},
     allocator: std.mem.Allocator,
     preface_remaining: usize = CLIENT_PREFACE.len,
@@ -192,16 +195,16 @@ pub const Parser = struct {
         self.payload_owned = true;
     }
 
-    fn takeCompletedPayload(self: *Parser, hdr: FrameHeader) ParseError![]u8 {
-        if (hdr.length == 0) return &.{};
+    fn takeCompletedPayload(self: *Parser, hdr: FrameHeader) ParseError!struct { []u8, bool } {
+        if (hdr.length == 0) return .{ &.{}, true };
         if (self.payload_scratch.len != 0) {
-            // Scratch stays owned by parser; caller gets an owned dupe.
-            return self.allocator.dupe(u8, self.payload_buf[0..hdr.length]) catch return error.EnhanceYourCalm;
+            // Scratch stays owned by parser; the handler must copy before return.
+            return .{ self.payload_buf[0..hdr.length], false };
         }
         const owned = self.payload_buf;
         self.payload_buf = &.{};
         self.payload_owned = false;
-        return owned;
+        return .{ owned, true };
     }
 
     /// Ingest a chunk. Returns a completed frame (payload owned by caller) or NeedMore.
@@ -248,10 +251,11 @@ pub const Parser = struct {
                 if (self.payload_filled < hdr.length) return null;
             }
 
-            const payload = try self.takeCompletedPayload(hdr);
+            const payload, const payload_owned = try self.takeCompletedPayload(hdr);
             const event = FrameEvent{
                 .header = hdr,
                 .payload = payload,
+                .payload_owned = payload_owned,
             };
             self.header = null;
             self.payload_filled = 0;
@@ -262,7 +266,7 @@ pub const Parser = struct {
     }
 
     /// Ingest all complete frames from `input`, calling `handler` for each.
-    /// `handler` receives ownership of each payload and must free it.
+    /// `handler` must free each payload when `event.payload_owned`.
     pub fn ingestAll(
         self: *Parser,
         input: []const u8,
@@ -330,8 +334,8 @@ pub const Parser = struct {
                 if (self.payload_filled < hdr.length) return null;
             }
 
-            const payload = try self.takeCompletedPayload(hdr);
-            const event = FrameEvent{ .header = hdr, .payload = payload };
+            const payload, const payload_owned = try self.takeCompletedPayload(hdr);
+            const event = FrameEvent{ .header = hdr, .payload = payload, .payload_owned = payload_owned };
             self.header = null;
             self.payload_filled = 0;
             return .{ .event = event, .consumed = offset };

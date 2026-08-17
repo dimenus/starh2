@@ -605,7 +605,7 @@ pub const Session = struct {
     ///    over a rate-limit error raised by the same frame. The peer must learn
     ///    the more specific reason.
     fn handleFrame(self: *Session, ev: frame.FrameEvent) !void {
-        defer if (ev.payload.len != 0) self.allocator.free(ev.payload);
+        defer if (ev.payload.len != 0 and ev.payload_owned) self.allocator.free(ev.payload);
         const hdr = ev.header;
         const already_terminal = self.terminal != .none;
 

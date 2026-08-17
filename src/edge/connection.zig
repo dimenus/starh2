@@ -442,6 +442,35 @@ pub const HandlerSlot = struct {
     awaiting_receipt: std.atomic.Value(bool) = .init(false),
 };
 
+const HandlerCtx = struct {
+    conn: *Connection,
+    terminal: *response.SlotTerminal,
+    slot: *HandlerSlot,
+    stream_id: u31,
+    method: request.Method = .GET,
+    /// Combined Accept-Encoding field value (arena-owned), empty if absent.
+    accept_encoding: []const u8 = "",
+    encoder: ?*brotli.Encoder = null,
+    compressing: bool = false,
+    /// One-shot lifecycle sample, decided at dispatch so spawn delay is visible.
+    trace_on: bool = false,
+    t_dispatch: u64 = 0,
+    t_handler: u64 = 0,
+};
+
+/// Per-slot handler state, reserved at connection boot so dispatch never heap-allocates a job.
+const HandlerJob = struct {
+    conn: *Connection,
+    arena: std.heap.ArenaAllocator,
+    stream_id: u31,
+    owned_request: session_mod.DispatchRequest,
+    req: request.Request,
+    resp: response.Response,
+    matched: router_mod.Match,
+    slot: *HandlerSlot = undefined,
+    hctx: HandlerCtx = undefined,
+};
+
 const live: u8 = 0;
 const reaper_owned: u8 = 1;
 const reported: u8 = 2;
@@ -457,6 +486,9 @@ pub const ReaperJob = struct {
 comptime {
     if (@sizeOf(HandlerSlot) != limits_mod.HANDLER_SLOT_SIZE) {
         @compileError("HANDLER_SLOT_SIZE must match @sizeOf(HandlerSlot)");
+    }
+    if (@sizeOf(HandlerJob) != limits_mod.HANDLER_JOB_SIZE) {
+        @compileError("HANDLER_JOB_SIZE must match @sizeOf(HandlerJob)");
     }
     if (@sizeOf(ReaperJob) != limits_mod.REAPER_JOB_SIZE) {
         @compileError("REAPER_JOB_SIZE must match @sizeOf(ReaperJob)");
@@ -573,6 +605,7 @@ const Connection = struct {
     plaintext_scratch: []u8 = &.{},
     ciphertext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
+    handler_jobs: []HandlerJob,
     shutting_down: bool = false,
     /// Set by a handler after it refills scheduler slab space; cleared by the
     /// actor at the top of each iteration. Emission happens only in the
@@ -694,6 +727,8 @@ const Connection = struct {
         errdefer gpa.free(write_ch_buf);
         const handlers = try gpa.alloc(HandlerSlot, config.limits.max_streams_per_connection);
         errdefer gpa.free(handlers);
+        const handler_jobs = try gpa.alloc(HandlerJob, config.limits.max_streams_per_connection);
+        errdefer gpa.free(handler_jobs);
         const handler_joins = try gpa.alloc(?std.Io.Future(void), config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_joins);
         const completion_ch_buf = try gpa.alloc(u31, config.limits.max_streams_per_connection);
@@ -748,6 +783,7 @@ const Connection = struct {
             .read_ch_buf = read_ch_buf,
             .write_ch_buf = write_ch_buf,
             .handlers = handlers,
+            .handler_jobs = handler_jobs,
             .handler_joins = handler_joins,
             .completion_ch_buf = completion_ch_buf,
             .write_ack_buf = write_ack_buf,
@@ -766,6 +802,17 @@ const Connection = struct {
         };
         @memset(self.handlers, .{});
         @memset(self.handler_joins, null);
+        for (self.handler_jobs) |*job| {
+            job.* = .{
+                .conn = undefined,
+                .arena = std.heap.ArenaAllocator.init(gpa),
+                .stream_id = 0,
+                .owned_request = undefined,
+                .req = undefined,
+                .resp = undefined,
+                .matched = .not_found,
+            };
+        }
         self.tickets = ticket_table.TicketTable.init(config.io, self.ticket_slots);
         self.read_ch = .init(self.read_ch_buf);
         self.write_ch = .init(self.write_ch_buf);
@@ -840,6 +887,8 @@ const Connection = struct {
         self.config.gpa.free(self.read_ch_buf);
         self.config.gpa.free(self.write_ch_buf);
         self.config.gpa.free(self.handlers);
+        for (self.handler_jobs) |*job| job.arena.deinit();
+        self.config.gpa.free(self.handler_jobs);
         self.config.gpa.free(self.handler_joins);
         self.config.gpa.free(self.completion_ch_buf);
         if (self.write_ack_buf.len != 0) self.config.gpa.free(self.write_ack_buf);
@@ -2763,28 +2812,63 @@ const Connection = struct {
         const gpa = self.config.gpa;
         var dispatch_owned = true;
         defer if (dispatch_owned) releaseDispatchRequest(gpa, d);
-        const job = try gpa.create(HandlerJob);
-        errdefer gpa.destroy(job);
+
+        // Reserve reaper capacity before admitting the handler.
+        if (self.config.accounting) |acct| {
+            if (!acct.tryReserveReaper()) {
+                self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
+                try self.processIntents();
+                return;
+            }
+        }
+        var reaper_reserved = self.config.accounting != null;
+        errdefer if (reaper_reserved) {
+            if (self.config.accounting) |acct| acct.releaseReaper();
+            reaper_reserved = false;
+        };
+
+        const slot = self.allocSlot(d.stream_id) orelse {
+            // A terminal connection needs no additional refusal frame.
+            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
+            try self.processIntents();
+            return;
+        };
+        errdefer self.releaseSlot(d.stream_id);
+        const slot_i = self.slotIndex(d.stream_id) orelse unreachable;
+        const job = &self.handler_jobs[slot_i];
+        const arena = blk: {
+            _ = job.arena.reset(.retain_capacity);
+            break :blk job.arena;
+        };
         job.* = .{
             .conn = self,
-            .arena = std.heap.ArenaAllocator.init(gpa),
+            .arena = arena,
             .stream_id = d.stream_id,
             .owned_request = undefined,
             .req = undefined,
             .resp = undefined,
             .matched = .not_found,
         };
-        errdefer job.arena.deinit();
         const a = job.arena.allocator();
 
-        const headers = try a.alloc(request.Header, d.headers.len);
-        for (d.headers, 0..) |h, i| {
-            headers[i] = .{ .name = h.name, .value = h.value };
+        const headers: []request.Header = if (d.headers.len == 0)
+            &.{}
+        else
+            try a.alloc(request.Header, d.headers.len);
+        if (d.headers.len != 0) {
+            for (d.headers, 0..) |h, i| {
+                headers[i] = .{ .name = h.name, .value = h.value };
+            }
         }
 
-        const trailers = try a.alloc(request.Header, d.trailers.len);
-        for (d.trailers, 0..) |h, i| {
-            trailers[i] = .{ .name = h.name, .value = h.value };
+        const trailers: []request.Header = if (d.trailers.len == 0)
+            &.{}
+        else
+            try a.alloc(request.Header, d.trailers.len);
+        if (d.trailers.len != 0) {
+            for (d.trailers, 0..) |h, i| {
+                trailers[i] = .{ .name = h.name, .value = h.value };
+            }
         }
 
         job.req = .{
@@ -2837,28 +2921,7 @@ const Connection = struct {
             else => {},
         }
 
-        // Reserve reaper capacity before admitting the handler.
-        if (self.config.accounting) |acct| {
-            if (!acct.tryReserveReaper()) {
-                job.arena.deinit();
-                gpa.destroy(job);
-                // A terminal connection needs no additional refusal frame.
-                self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
-                try self.processIntents();
-                return;
-            }
-        }
-
-        const slot = self.allocSlot(d.stream_id) orelse {
-            if (self.config.accounting) |acct| acct.releaseReaper();
-            job.arena.deinit();
-            gpa.destroy(job);
-            // A terminal connection needs no additional refusal frame.
-            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
-            try self.processIntents();
-            return;
-        };
-        slot.reaper_reserved = self.config.accounting != null;
+        slot.reaper_reserved = reaper_reserved;
         // From here every exit runs runHandlerJob's cleanup, including the
         // synchronous spawn-failure fallback.
         job.owned_request = d;
@@ -2892,34 +2955,6 @@ const Connection = struct {
             self.handler_joins[i] = h;
         }
     }
-
-    const HandlerCtx = struct {
-        conn: *Connection,
-        terminal: *response.SlotTerminal,
-        slot: *HandlerSlot,
-        stream_id: u31,
-        method: request.Method = .GET,
-        /// Combined Accept-Encoding field value (arena-owned), empty if absent.
-        accept_encoding: []const u8 = "",
-        encoder: ?*brotli.Encoder = null,
-        compressing: bool = false,
-        /// One-shot lifecycle sample, decided at dispatch so spawn delay is visible.
-        trace_on: bool = false,
-        t_dispatch: u64 = 0,
-        t_handler: u64 = 0,
-    };
-
-    const HandlerJob = struct {
-        conn: *Connection,
-        arena: std.heap.ArenaAllocator,
-        stream_id: u31,
-        owned_request: session_mod.DispatchRequest,
-        req: request.Request,
-        resp: response.Response,
-        matched: router_mod.Match,
-        slot: *HandlerSlot = undefined,
-        hctx: HandlerCtx = undefined,
-    };
 
     /// The handler task entry point.
     ///
@@ -2961,9 +2996,8 @@ const Connection = struct {
             }
             _ = self.live_handlers.fetchSub(1, .acq_rel);
             _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
-            job.arena.deinit();
+            _ = job.arena.reset(.retain_capacity);
             releaseDispatchRequest(self.config.gpa, job.owned_request);
-            self.config.gpa.destroy(job);
         }
         if (job.hctx.trace_on) job.hctx.t_handler = nowNs(self.config.io);
         if (job.slot.terminal.cancel_flag.load(.acquire)) return;
@@ -3144,6 +3178,53 @@ const Connection = struct {
         }
     }
 
+    const PreparedResponseHeaders = struct {
+        fields: []const hpack.HeaderField,
+        heap: bool = false,
+    };
+
+    fn prepareResponseHeaderFields(
+        self: *Connection,
+        stack: []hpack.HeaderField,
+        headers: []const request.Header,
+        compress: bool,
+        add_vary: bool,
+        strip_content_length: bool,
+        sse: bool,
+        owned_vary: *?[]u8,
+    ) response.ResponseError!PreparedResponseHeaders {
+        if (sse or compress or add_vary) {
+            var hlist: std.ArrayList(hpack.HeaderField) = .empty;
+            defer hlist.deinit(self.config.gpa);
+            try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
+                .sse = sse,
+                .compress = compress,
+                .add_vary = add_vary,
+                .strip_content_length = strip_content_length,
+            }, owned_vary);
+            const dup = try self.config.gpa.dupe(hpack.HeaderField, hlist.items);
+            return .{ .fields = dup, .heap = true };
+        }
+        var handler_vary: ?[]const u8 = null;
+        var n: usize = 0;
+        for (headers) |h| {
+            if (strip_content_length and std.ascii.eqlIgnoreCase(h.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(h.name, "vary")) {
+                handler_vary = h.value;
+                continue;
+            }
+            if (n >= stack.len) return error.OutOfMemory;
+            stack[n] = .{ .name = h.name, .value = h.value };
+            n += 1;
+        }
+        if (handler_vary) |v| {
+            if (n >= stack.len) return error.OutOfMemory;
+            stack[n] = .{ .name = "vary", .value = v };
+            n += 1;
+        }
+        return .{ .fields = stack[0..n] };
+    }
+
     fn compressOrAbort(hctx: *HandlerCtx, stream_id: u31, input: []const u8, op: brotli.Operation, out: *std.ArrayList(u8)) response.ResponseError!void {
         const enc = hctx.encoder orelse return error.WriteFailed;
         const self = hctx.conn;
@@ -3260,21 +3341,17 @@ const Connection = struct {
             if (traced) t_acquired = nowNs(self.config.io);
             defer self.unlockSession(self.config.io);
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
-            var hlist: std.ArrayList(hpack.HeaderField) = .empty;
-            defer hlist.deinit(self.config.gpa);
+            var stack_hpack: [32]hpack.HeaderField = undefined;
             var owned_vary: ?[]u8 = null;
             defer if (owned_vary) |v| self.config.gpa.free(v);
-            try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
-                .compress = compress,
-                .add_vary = add_vary,
-                .strip_content_length = compress,
-            }, &owned_vary);
+            const prepared = try self.prepareResponseHeaderFields(&stack_hpack, headers, compress, add_vary, compress, false, &owned_vary);
+            defer if (prepared.heap) self.config.gpa.free(prepared.fields);
             // Compressed bodies never carry content-length — HTTP/2 length is framing.
             const t_hpack0 = if (traced) nowNs(self.config.io) else 0;
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
-                .headers = hlist.items,
+                .headers = prepared.fields,
                 .end_stream = body_out.len == 0,
             } }) catch return error.WriteFailed;
             if (traced) t_hpack = nowNs(self.config.io) - t_hpack0;

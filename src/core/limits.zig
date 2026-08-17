@@ -38,6 +38,7 @@ pub const ResourceUpperBound = struct {
 
 pub const Terms = struct {
     handlers: usize = 0,
+    handler_jobs: usize = 0,
     joins: usize = 0,
     tickets: usize = 0,
     write_acks: usize = 0,
@@ -63,6 +64,7 @@ pub const Terms = struct {
 
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
 pub const HANDLER_SLOT_SIZE: usize = 20;
+pub const HANDLER_JOB_SIZE: usize = 528;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
 pub const REAPER_JOB_SIZE: usize = 40;
 
@@ -237,6 +239,7 @@ pub const Limits = struct {
         terms.read_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
         terms.wire_descs = try checkedMul(try checkedMul(n_chunks, 2), bound.WIRE_CHUNK_DESC_SIZE); // read+write ch
         terms.handlers = try checkedMul(self.max_streams_per_connection, HANDLER_SLOT_SIZE);
+        terms.handler_jobs = try checkedMul(self.max_streams_per_connection, HANDLER_JOB_SIZE);
         terms.joins = try checkedMul(self.max_streams_per_connection, bound.JOIN_HANDLE_SIZE);
         const completion_ids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         terms.write_acks = try checkedMul(ticket_n, bound.WRITE_COMPLETION_SIZE);
@@ -266,7 +269,7 @@ pub const Limits = struct {
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_recv_acc_bytes, try checkedAdd(header_maps, intents)))));
 
-        const per_conn = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_scratch, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, sched_scratch)))))))))))))))));
+        const per_conn = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_scratch, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, sched_scratch))))))))))))))))));
 
         terms.routes = try checkedAdd(
             self.max_route_path_bytes,

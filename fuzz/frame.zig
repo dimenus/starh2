@@ -19,7 +19,7 @@ fn testOne(_: void, smith: *std.testing.Smith) !void {
             return; // classified error
         };
         if (r) |res| {
-            std.testing.allocator.free(res.event.payload);
+            if (res.event.payload_owned) std.testing.allocator.free(res.event.payload);
             remaining = remaining[res.consumed..];
         } else return;
         if (remaining.len == before) return;
