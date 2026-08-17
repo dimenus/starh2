@@ -17,7 +17,8 @@ second HEADERS so it could release one slot per chunk. One-shot TLS then
 paid one record per response (`records/response = 1.00`) while SSE packed,
 because SSE DATA is not a control.
 
-h2c does not batch: each frame is already the wire unit.
+h2c concatenates the same drain-turn into one write chunk. Unticketed DATA
+is still the immediate per-frame handoff.
 
 ## Live packing oracle
 
@@ -59,7 +60,7 @@ the public-surface canary.
 | Byte-only release drops no entry | `release(100, 0)` leaves `entries_held == 1` |
 | Concat past 16 KiB | `wouldFit` false; flush then a new batch |
 | Receipt on a non-last encrypt record | `lastRecordMeta` / `lastRecordFlush` zero tickets and do not flush |
-| h2c or unticketed DATA batched | `frameIsBatchable` is false |
+| unticketed DATA batched | `frameIsBatchable` is false |
 | Packed ticket chain truncated or short | AckDrainer walk canaries (snap `next` before `complete`) |
 | Scratch includes the TLS content-type byte | `max_plaintext + 1 == TLS_PLAINTEXT_SCRATCH_SIZE`, asserted in `drainEmit` |
 
@@ -117,23 +118,26 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
 - Parsing only the 9-byte frame header. Starh2's `ingestOne` is the
   resumable parser plus payload-lifetime union; that is the production
   job.
+- Folding AckDrainer into WritePump. Darwin oneshot `--trace`: ack-drain
+  56 µs → 0.2 µs, but TLS fell ~369k → ~307k req/s and resume/write waits
+  grew. Completing tickets on the write task delayed the next getOne;
+  the third task was overlapping the next write, not serial waste.
 
 ## What is left
 
-Live one-shot is no longer an alloc, spawn, HPACK, Huffman, or parse
-story. Re-run `tools/oneshot-phase-trace.sh`: after the complete-handler
-cut it showed ~0.01 GPA allocs/req and packed `records/response`.
-Nachos oneshot `-n 100000 -c 50 -m 10 -t 12` (re-derive): starh2 tls
-~716k / ~12 µs, h2c ~1.10M / ~9.3 µs, opponent tls ~3.78M / ~3.1 µs.
-Our h2c is still slower than their TLS, so TLS is not the first
-remaining suspect.
+Live one-shot is no longer an alloc, spawn, HPACK, Huffman, parse, or
+h2c-unpacked-write story. h2c now concatenates the same drain-turn as
+TLS (`tickets/handoff` matches; `records/response` packed). Re-run
+`tools/oneshot-phase-trace.sh` and the official bench; they move with
+the machine.
 
-The residue is Connection lifecycle: actor + ReadPump + WritePump +
-AckDrainer + receipts. Do not name it “one actor per connection” —
-http2.zig also has one connection task; theirs is a single
-read/dispatch/write/flush loop. Their 3.78M is a narrower contract
-(handler or blocked write stops ingest). We keep the three starve
-stories: other connections, handler work vs actor, peer stops reading.
+The TLS vs http2.zig residue is still Connection lifecycle: actor +
+ReadPump + WritePump + AckDrainer + receipts. Do not name it “one
+actor per connection” — http2.zig also has one connection task; theirs
+is a single read/dispatch/write/flush loop. Their 3.78M is a narrower
+contract (handler or blocked write stops ingest). We keep the three
+starve stories: other connections, handler work vs actor, peer stops
+reading.
 
 Reopen HPACK/parse only if an on-CPU h2c profile shows
 ingest+HPACK+Session ≥ 1 µs/req or 15% CPU. Sol Extra High picked A on

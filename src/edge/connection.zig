@@ -2484,9 +2484,10 @@ const Connection = struct {
     }
 
     /// Single FairScheduler drain: terminal → ordinary(+forced DATA) → DRR DATA.
-    /// On TLS, every control and ticketed DATA from that turn copies into the
-    /// boot-counted plaintext scratch and becomes one queueWire input, up to
-    /// 16 KiB. WireChunk.control_entries carries how many control-pool slots
+    /// Every control and ticketed DATA from that turn copies into the
+    /// boot-counted scratch and becomes one queueWire input, up to 16 KiB.
+    /// On TLS that input encrypts as one record batch; on h2c it is one write
+    /// chunk. WireChunk.control_entries carries how many control-pool slots
     /// the batch holds, so AckDrainer can release occupancy exactly. A second
     /// HEADERS used to flush the first instead, which is why one-shot TLS
     /// emitted one record per response while SSE (DATA only) packed a turn.
@@ -2580,7 +2581,6 @@ const Connection = struct {
                 // held until the write completes; control_entries is how many
                 // reserved slots that completion must return.
                 if (emit_batch.frameIsBatchable(
-                    c.tls_conn != null,
                     control_entry,
                     ticket,
                     frame.encodedOnWireLen(payload),
@@ -2957,8 +2957,9 @@ const Connection = struct {
     /// The single exit from protocol bytes to transport bytes. Called ONLY by
     /// the `FairScheduler` sink; `test_queue_wire_bypass` proves it.
     ///
-    /// For h2c the on-wire prefix is copied into a write chunk and the frame
-    /// buffer is released here. For TLS it is encrypted on the actor, under
+    /// For h2c the on-wire prefix is copied into a write chunk — either one
+    /// owned frame or a drain-turn concat borrowed from scratch — and an owned
+    /// frame buffer is released here. For TLS it is encrypted on the actor, under
     /// `session_mu` — the cipher is actor-owned, and two tasks driving it
     /// concurrently is what crashed the process in t-538. Ciphertext is copied
     /// from the boot-counted scratch; a frame slab is never handed to WritePump.
@@ -3060,7 +3061,6 @@ const Connection = struct {
             self.applyOutboundRelease(reserved_plain, .wire);
             reserved_plain = 0;
         } else {
-            std.debug.assert(owns_bytes);
             try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries);
         }
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);

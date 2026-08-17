@@ -137,6 +137,15 @@ for name, key in (("block ", "block_ns"), ("hold  ", "hold_ns"), ("hpack ", "hpa
     pct = (100*v/tot) if tot else 0
     print(f"    {name} {v:8.1f}us  {pct:5.1f}%")
 print(f"    total  {tot:8.1f}us")
+split_n = d("ack_split_samples")
+if split_n:
+    print(f"    ack split ({split_n} samples): actor={us(d('actor_ns'), split_n):.1f}us queue={us(d('queue_ns'), split_n):.1f}us pump={us(d('pump_ns'), split_n):.1f}us")
+pump_split_n = d("pump_split_samples")
+if pump_split_n:
+    print(f"    pump split ({pump_split_n} samples): queued/write={us(d('write_ns'), pump_split_n):.1f}us ack-drain={us(d('drain_ns'), pump_split_n):.1f}us")
+write_calls = d("write_calls"); write_chunks = d("write_chunks")
+if write_calls:
+    print(f"    WritePump: calls={write_calls} chunks={write_chunks} chunks/call={write_chunks/write_calls:.2f} max={b.get('write_max', 0)}")
 spawn_ns = d("spawn_ns"); to_send_ns = d("to_send_ns")
 print("  lifecycle means (dispatch-sampled, also latency):")
 print(f"    spawn   {us(spawn_ns, life):8.1f}us")

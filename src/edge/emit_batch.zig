@@ -1,10 +1,11 @@
-//! TLS drain-turn plaintext accumulator.
+//! Drain-turn wire accumulator.
 //!
 //! Connection copies every batchable frame from one FairScheduler drain into
-//! one scratch buffer and encrypts it as one queueWire input. The rules here
-//! are the ones that used to live only inside `drainEmit`'s nested sink, which
-//! is why a second HEADERS silently started a new TLS record: nothing could
-//! name the invariant without standing up a cipher.
+//! one scratch buffer and hands it to queueWire as one input. On TLS that
+//! input is encrypted as one record batch; on h2c it is one write chunk.
+//! The rules here are the ones that used to live only inside `drainEmit`'s
+//! nested sink, which is why a second HEADERS silently started a new TLS
+//! record: nothing could name the invariant without standing up a cipher.
 //!
 //! Occupancy of the control pool stays held until that write completes. The
 //! batch therefore counts entries, not a bool. Releasing 1 after N HEADERS
@@ -37,17 +38,16 @@ pub fn lastRecordFlush(is_last: bool, flush: bool) bool {
     return is_last and flush;
 }
 
-/// h2c never batches (each frame is already the wire unit). Unticketed DATA
-/// keeps the immediate per-frame handoff. A single frame larger than the
-/// scratch cannot join and is also immediate.
+/// Unticketed DATA keeps the immediate per-frame handoff. A single frame
+/// larger than the scratch cannot join and is also immediate. Control frames
+/// and ticketed DATA concat into one queueWire, on h2c and TLS alike.
 pub fn frameIsBatchable(
-    has_tls: bool,
     control_entry: bool,
     ticket: u64,
     payload_len: usize,
     capacity: usize,
 ) bool {
-    return has_tls and (control_entry or ticket != 0) and payload_len <= capacity;
+    return (control_entry or ticket != 0) and payload_len <= capacity;
 }
 
 pub const EmitBatch = struct {
@@ -140,12 +140,12 @@ pub const EmitBatch = struct {
     }
 };
 
-test "h2c and unticketed DATA are not batchable" {
-    try std.testing.expect(!frameIsBatchable(false, true, 1, 40, max_plaintext));
-    try std.testing.expect(!frameIsBatchable(true, false, 0, 40, max_plaintext));
-    try std.testing.expect(frameIsBatchable(true, true, 0, 40, max_plaintext));
-    try std.testing.expect(frameIsBatchable(true, false, 7, 40, max_plaintext));
-    try std.testing.expect(!frameIsBatchable(true, true, 0, 50, 40));
+test "unticketed DATA is not batchable" {
+    try std.testing.expect(!frameIsBatchable(false, 0, 40, max_plaintext));
+    try std.testing.expect(frameIsBatchable(true, 0, 40, max_plaintext));
+    try std.testing.expect(frameIsBatchable(true, 1, 40, max_plaintext));
+    try std.testing.expect(frameIsBatchable(false, 7, 40, max_plaintext));
+    try std.testing.expect(!frameIsBatchable(true, 0, 50, 40));
 }
 
 test "several HEADERS join one batch and sum control occupancy" {
@@ -271,6 +271,6 @@ test "frames fill the TLS plaintext cap without overflowing" {
 }
 
 test "a frame the size of the scratch is batchable; one byte over is not" {
-    try std.testing.expect(frameIsBatchable(true, true, 0, max_plaintext, max_plaintext));
-    try std.testing.expect(!frameIsBatchable(true, true, 0, max_plaintext + 1, max_plaintext));
+    try std.testing.expect(frameIsBatchable(true, 0, max_plaintext, max_plaintext));
+    try std.testing.expect(!frameIsBatchable(true, 0, max_plaintext + 1, max_plaintext));
 }

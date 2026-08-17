@@ -142,9 +142,10 @@ tools/oneshot-phase-trace.sh
 
 Packed drain turns at `-m 10` are about 0.17 TLS records per response. The
 script exits 9 if that ratio exceeds 0.4 (one record per response again).
-Concat itself is a few nanoseconds. HPACK, Huffman, and frame parse are not
-the live ~5× vs http2.zig; the residue is Connection lifecycle (actor +
-pumps + AckDrainer + receipts). Protocol: `tools/oneshot-gap.md`.
+h2c concatenates the same drain-turn into one write chunk. Concat itself is
+a few nanoseconds. HPACK, Huffman, and frame parse are not the live ~5× vs
+http2.zig; the TLS residue is Connection lifecycle (actor + pumps +
+AckDrainer + receipts). Protocol: `tools/oneshot-gap.md`.
 
 The 30s TLS stall (DATA left in FairScheduler after a RST tombstone) is a
 different defect. Method: `TLS_STALL_BRIEF.md`. It landed in `57359b7`.
