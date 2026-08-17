@@ -10,6 +10,12 @@
 //! The parser never borrows from its input. The read pump owns the wire chunk
 //! and recycles it immediately after the actor consumes it, so a `FrameEvent`
 //! that pointed into that chunk would dangle on the next read.
+//!
+//! Payload lifetime is a separate question. `initReserved` (production) fills a
+//! boot-reserved scratch buffer the parser owns until `deinit`; the event
+//! borrows that scratch until the ingest handler returns. `init` (tests)
+//! transfers a `gpa` allocation with the event. `FramePayload`'s tag is the
+//! ownership; `FrameEvent.deinit` is the only free path — a no-op for scratch.
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -108,12 +114,50 @@ pub const ParseError = error{
     EnhanceYourCalm,
 };
 
+/// How long inbound payload bytes live, and who frees them.
+///
+/// The tag is the ownership. `bytes` is a read view; `deinit(gpa)` is the only
+/// free path. A bool named `owned` collapsed two meanings and let a caller free
+/// a scratch borrow.
+pub const PayloadLifetime = enum {
+    /// Zero-length. Nothing to free.
+    empty,
+    /// Slice of the parser's boot-reserved scratch. Valid only until the ingest
+    /// handler returns; the next ingest overwrites it. Do not free.
+    scratch,
+    /// Heap buffer the parser transferred. `FrameEvent.deinit` frees it with `gpa`.
+    gpa,
+};
+
+pub const FramePayload = union(PayloadLifetime) {
+    empty,
+    scratch: []u8,
+    gpa: []u8,
+
+    pub fn bytes(self: FramePayload) []const u8 {
+        return switch (self) {
+            .empty => &.{},
+            .scratch, .gpa => |s| s,
+        };
+    }
+
+    pub fn deinit(self: FramePayload, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .gpa => |buf| if (buf.len != 0) gpa.free(buf),
+            .empty, .scratch => {},
+        }
+    }
+};
+
 pub const FrameEvent = struct {
     header: FrameHeader,
-    /// Payload bytes. When `payload_owned`, caller frees with allocator.
-    payload: []u8,
-    /// False when `payload` borrows the parser scratch until the handler returns.
-    payload_owned: bool = true,
+    payload: FramePayload,
+
+    /// Release a transferred `gpa` payload. Scratch and empty are no-ops, so a
+    /// reserved parser's `deinit` remains the owner of the scratch buffer.
+    pub fn deinit(self: FrameEvent, gpa: std.mem.Allocator) void {
+        self.payload.deinit(gpa);
+    }
 };
 
 /// Incremental frame parser. A TCP read gives an arbitrary byte count, so a
@@ -127,46 +171,50 @@ pub const FrameEvent = struct {
 ///   returns; `Session` copies anything it must retain. The hot path therefore
 ///   never grows a buffer, which is what keeps the connection inside
 ///   `Limits.resourceUpperBound`.
-/// - `init` (tests) allocates per frame. It is simpler to reason about, and a
-///   test does not need the boot-time bound.
+/// - `init` (tests) allocates each payload from `gpa` and transfers it on the
+///   event. A test does not need the boot-time bound.
 pub const Parser = struct {
     max_frame_size: u32 = DEFAULT_MAX_FRAME_SIZE,
     header_buf: [FRAME_HEADER_LEN]u8 = undefined,
     header_filled: usize = 0,
     header: ?FrameHeader = null,
     payload_filled: usize = 0,
+    /// Fill window for the in-progress frame. Prefix of `scratch`, or a `gpa`
+    /// allocation this parser still holds when `payload_kind` is `.gpa`.
     payload_buf: []u8 = &.{},
-    payload_owned: bool = false,
-    /// When set, payload_buf is reused across frames; completed events borrow it.
-    payload_scratch: []u8 = &.{},
-    allocator: std.mem.Allocator,
+    /// What `payload_buf` is while a frame is being assembled.
+    payload_kind: enum { none, scratch, gpa } = .none,
+    /// Boot-reserved payload window. Empty means this parser allocates per frame.
+    scratch: []u8 = &.{},
+    /// Owns `scratch` and any not-yet-transferred `init` payload.
+    gpa: std.mem.Allocator,
     preface_remaining: usize = CLIENT_PREFACE.len,
     expecting_preface: bool = true,
 
-    pub fn init(allocator: std.mem.Allocator, max_frame_size: u32) Parser {
+    pub fn init(gpa: std.mem.Allocator, max_frame_size: u32) Parser {
         return .{
-            .allocator = allocator,
+            .gpa = gpa,
             .max_frame_size = max_frame_size,
         };
     }
 
-    /// Boot-reserved payload scratch — ingest reuses this buffer and dupes out on complete.
-    pub fn initReserved(allocator: std.mem.Allocator, max_frame_size: u32) !Parser {
-        const scratch = try allocator.alloc(u8, max_frame_size);
+    /// Boot-reserved payload scratch. Completed events borrow it until the
+    /// ingest handler returns; the caller copies anything it must retain.
+    pub fn initReserved(gpa: std.mem.Allocator, max_frame_size: u32) !Parser {
+        const scratch = try gpa.alloc(u8, max_frame_size);
         return .{
-            .allocator = allocator,
+            .gpa = gpa,
             .max_frame_size = max_frame_size,
             .payload_buf = scratch,
-            .payload_owned = true,
-            .payload_scratch = scratch,
+            .scratch = scratch,
         };
     }
 
     pub fn deinit(self: *Parser) void {
-        if (self.payload_scratch.len != 0) {
-            self.allocator.free(self.payload_scratch);
-        } else if (self.payload_owned and self.payload_buf.len != 0) {
-            self.allocator.free(self.payload_buf);
+        if (self.scratch.len != 0) {
+            self.gpa.free(self.scratch);
+        } else if (self.payload_kind == .gpa and self.payload_buf.len != 0) {
+            self.gpa.free(self.payload_buf);
         }
         self.* = undefined;
     }
@@ -184,31 +232,39 @@ pub const Parser = struct {
         self.payload_filled = 0;
         if (length == 0) {
             self.payload_buf = &.{};
+            self.payload_kind = .none;
             return;
         }
-        if (self.payload_scratch.len != 0) {
-            if (length > self.payload_scratch.len) return error.FrameSizeError;
-            self.payload_buf = self.payload_scratch[0..length];
+        if (self.scratch.len != 0) {
+            if (length > self.scratch.len) return error.FrameSizeError;
+            self.payload_buf = self.scratch[0..length];
+            self.payload_kind = .scratch;
             return;
         }
-        self.payload_buf = self.allocator.alloc(u8, length) catch return error.EnhanceYourCalm;
-        self.payload_owned = true;
+        self.payload_buf = self.gpa.alloc(u8, length) catch return error.EnhanceYourCalm;
+        self.payload_kind = .gpa;
     }
 
-    fn takeCompletedPayload(self: *Parser, hdr: FrameHeader) ParseError!struct { []u8, bool } {
-        if (hdr.length == 0) return .{ &.{}, true };
-        if (self.payload_scratch.len != 0) {
-            // Scratch stays owned by parser; the handler must copy before return.
-            return .{ self.payload_buf[0..hdr.length], false };
+    fn takeCompletedPayload(self: *Parser, hdr: FrameHeader) FramePayload {
+        if (hdr.length == 0) {
+            self.payload_kind = .none;
+            return .empty;
         }
+        if (self.payload_kind == .scratch) {
+            const view = self.scratch[0..hdr.length];
+            self.payload_kind = .none;
+            return .{ .scratch = view };
+        }
+        assert(self.payload_kind == .gpa);
         const owned = self.payload_buf;
         self.payload_buf = &.{};
-        self.payload_owned = false;
-        return .{ owned, true };
+        self.payload_kind = .none;
+        return .{ .gpa = owned };
     }
 
-    /// Ingest a chunk. Returns a completed frame (payload owned by caller) or NeedMore.
-    /// No result retains a borrow into `input`.
+    /// Ingest a chunk. Returns a completed frame or null (NeedMore).
+    /// No result retains a borrow into `input`. A reserved parser's payload
+    /// borrows `scratch` until the handler returns.
     pub fn ingest(self: *Parser, input: []const u8) ParseError!?FrameEvent {
         var offset: usize = 0;
         if (self.expecting_preface) {
@@ -251,11 +307,9 @@ pub const Parser = struct {
                 if (self.payload_filled < hdr.length) return null;
             }
 
-            const payload, const payload_owned = try self.takeCompletedPayload(hdr);
             const event = FrameEvent{
                 .header = hdr,
-                .payload = payload,
-                .payload_owned = payload_owned,
+                .payload = self.takeCompletedPayload(hdr),
             };
             self.header = null;
             self.payload_filled = 0;
@@ -266,7 +320,8 @@ pub const Parser = struct {
     }
 
     /// Ingest all complete frames from `input`, calling `handler` for each.
-    /// `handler` must free each payload when `event.payload_owned`.
+    /// `handler` must `event.deinit(gpa)` before it returns; that is a no-op
+    /// when the payload is a scratch borrow.
     pub fn ingestAll(
         self: *Parser,
         input: []const u8,
@@ -334,8 +389,10 @@ pub const Parser = struct {
                 if (self.payload_filled < hdr.length) return null;
             }
 
-            const payload, const payload_owned = try self.takeCompletedPayload(hdr);
-            const event = FrameEvent{ .header = hdr, .payload = payload, .payload_owned = payload_owned };
+            const event = FrameEvent{
+                .header = hdr,
+                .payload = self.takeCompletedPayload(hdr),
+            };
             self.header = null;
             self.payload_filled = 0;
             return .{ .event = event, .consumed = offset };
@@ -525,7 +582,35 @@ test "fragmented frame ingest" {
         }
     }
     try std.testing.expect(got != null);
-    defer std.testing.allocator.free(got.?.payload);
+    defer got.?.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.gpa, std.meta.activeTag(got.?.payload));
     try std.testing.expectEqual(FrameType.ping, got.?.header.type);
-    try std.testing.expectEqualSlices(u8, &opaque_data, got.?.payload);
+    try std.testing.expectEqualSlices(u8, &opaque_data, got.?.payload.bytes());
+}
+
+test "reserved parser event borrows scratch" {
+    var parser = try Parser.initReserved(std.testing.allocator, DEFAULT_MAX_FRAME_SIZE);
+    defer parser.deinit();
+    parser.skipPreface();
+
+    var frame_buf: [32]u8 = undefined;
+    const opaque_data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const n = try Serializer.ping(&frame_buf, false, &opaque_data);
+    const r = try parser.ingestOne(frame_buf[0..n]);
+    try std.testing.expect(r != null);
+    try std.testing.expectEqual(.scratch, std.meta.activeTag(r.?.event.payload));
+    try std.testing.expectEqualSlices(u8, &opaque_data, r.?.event.payload.bytes());
+    // Must be a no-op: the parser still owns scratch.
+    r.?.event.deinit(std.testing.allocator);
+
+    var empty_buf: [FRAME_HEADER_LEN]u8 = undefined;
+    (FrameHeader{
+        .length = 0,
+        .type = .settings,
+        .flags = .{ .end_stream = true },
+        .stream_id = 0,
+    }).encode(&empty_buf);
+    const empty = try parser.ingestOne(&empty_buf);
+    try std.testing.expectEqual(.empty, std.meta.activeTag(empty.?.event.payload));
+    empty.?.event.deinit(std.testing.allocator);
 }

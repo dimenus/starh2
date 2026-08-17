@@ -117,17 +117,17 @@ const ClientH2 = struct {
         while (rem.len > 0) {
             const maybe = try self.parser.ingestOne(rem);
             if (maybe) |r| {
-                defer if (r.event.payload.len != 0) self.gpa.free(r.event.payload);
+                defer r.event.deinit(self.gpa);
                 rem = rem[r.consumed..];
                 const hdr = r.event.header;
                 switch (hdr.type) {
                     .data => {
                         if (hdr.stream_id != self.target_sid) continue;
-                        const n: i32 = @intCast(r.event.payload.len);
+                        const n: i32 = @intCast(r.event.payload.bytes().len);
                         if (n > self.stream_credit or n > self.conn_credit) return error.CreditExceeded;
                         self.stream_credit -= n;
                         self.conn_credit -= n;
-                        try self.body.appendSlice(self.gpa, r.event.payload);
+                        try self.body.appendSlice(self.gpa, r.event.payload.bytes());
                         self.data_frames += 1;
                         if (hdr.flags.end_stream) {
                             self.end_stream_count += 1;

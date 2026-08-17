@@ -32,6 +32,8 @@
 //!
 //! ## Ownership
 //!
+//! An inbound `FrameEvent` is released by `handleFrame` through `deinit`: a
+//! scratch borrow is a no-op there, a test `gpa` payload is freed there.
 //! An `Intent` carries owned memory: a frame payload, or a decoded request.
 //! `pushIntent` transfers that ownership only when it returns success, so an
 //! `error.PoolExhausted` leaves the caller still owning the payload. Whoever
@@ -113,7 +115,7 @@ const Tombstone = struct {
     code: frame.ErrorCode,
 };
 
-fn encodeDataFrame(allocator: std.mem.Allocator, stream_id: u31, data: []const u8, end_stream: bool) ![]u8 {
+fn encodeDataFrame(gpa: std.mem.Allocator, stream_id: u31, data: []const u8, end_stream: bool) ![]u8 {
     var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
     const fh = frame.FrameHeader{
         .length = @intCast(data.len),
@@ -122,14 +124,15 @@ fn encodeDataFrame(allocator: std.mem.Allocator, stream_id: u31, data: []const u
         .stream_id = stream_id,
     };
     fh.encode(&hdr_buf);
-    const out = try allocator.alloc(u8, frame.FRAME_HEADER_LEN + data.len);
+    const out = try gpa.alloc(u8, frame.FRAME_HEADER_LEN + data.len);
     @memcpy(out[0..frame.FRAME_HEADER_LEN], &hdr_buf);
     if (data.len > 0) @memcpy(out[frame.FRAME_HEADER_LEN..], data);
     return out;
 }
 
 pub const Session = struct {
-    allocator: std.mem.Allocator,
+    /// Heap that outlives any one ingest or command.
+    gpa: std.mem.Allocator,
     limits: limits_mod.Limits,
     parser: frame.Parser,
     decoder: hpack.Decoder,
@@ -198,35 +201,35 @@ pub const Session = struct {
         releaseRequest: ?*const fn (*anyopaque, usize) void = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator, limits: limits_mod.Limits) !Session {
+    pub fn init(gpa: std.mem.Allocator, limits: limits_mod.Limits) !Session {
         const intent_cap = @max(limits.intent_entries_per_connection, 16);
-        const intent_storage = try allocator.alloc(Intent, intent_cap);
+        const intent_storage = try gpa.alloc(Intent, intent_cap);
         var intent_storage_owned = true;
-        errdefer if (intent_storage_owned) allocator.free(intent_storage);
+        errdefer if (intent_storage_owned) gpa.free(intent_storage);
         var s: Session = .{
-            .allocator = allocator,
+            .gpa = gpa,
             .limits = limits,
-            .parser = try frame.Parser.initReserved(allocator, frame.DEFAULT_MAX_FRAME_SIZE),
-            .decoder = hpack.Decoder.init(allocator),
-            .streams = std.AutoHashMap(u31, stream_mod.Stream).init(allocator),
+            .parser = try frame.Parser.initReserved(gpa, frame.DEFAULT_MAX_FRAME_SIZE),
+            .decoder = hpack.Decoder.init(gpa),
+            .streams = std.AutoHashMap(u31, stream_mod.Stream).init(gpa),
             .tombstones = .empty,
             .intent_storage = intent_storage,
             .intent_len = 0,
             .terminal_reserve = 2,
-            .pending_bodies = std.AutoHashMap(u31, std.ArrayList(u8)).init(allocator),
-            .pending_headers = std.AutoHashMap(u31, []hpack.HeaderField).init(allocator),
-            .pending_trailers = std.AutoHashMap(u31, []hpack.HeaderField).init(allocator),
-            .body_idle_ns = std.AutoHashMap(u31, u64).init(allocator),
+            .pending_bodies = std.AutoHashMap(u31, std.ArrayList(u8)).init(gpa),
+            .pending_headers = std.AutoHashMap(u31, []hpack.HeaderField).init(gpa),
+            .pending_trailers = std.AutoHashMap(u31, []hpack.HeaderField).init(gpa),
+            .body_idle_ns = std.AutoHashMap(u31, u64).init(gpa),
         };
         intent_storage_owned = false;
         errdefer s.deinit();
         try s.streams.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
-        try s.tombstones.ensureTotalCapacity(allocator, limits.stream_tombstones);
+        try s.tombstones.ensureTotalCapacity(gpa, limits.stream_tombstones);
         try s.pending_bodies.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_headers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_trailers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.body_idle_ns.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
-        try s.header_block.ensureTotalCapacity(allocator, frame.DEFAULT_MAX_FRAME_SIZE);
+        try s.header_block.ensureTotalCapacity(gpa, frame.DEFAULT_MAX_FRAME_SIZE);
         // The preface is queued at construction, before the peer has said
         // anything. RFC 9113 requires the server's SETTINGS to be the first
         // frame it sends, and the only way to guarantee that is to make it the
@@ -250,27 +253,27 @@ pub const Session = struct {
         self.parser.deinit();
         self.decoder.deinit();
         self.clearIntents();
-        if (self.intent_storage.len != 0) self.allocator.free(self.intent_storage);
-        self.tombstones.deinit(self.allocator);
-        self.header_block.deinit(self.allocator);
+        if (self.intent_storage.len != 0) self.gpa.free(self.intent_storage);
+        self.tombstones.deinit(self.gpa);
+        self.header_block.deinit(self.gpa);
         var bit = self.pending_bodies.iterator();
         while (bit.next()) |e| {
             if (self.stream_hooks) |h| {
                 if (h.releaseRequest) |rel| rel(h.ctx, e.value_ptr.items.len);
             }
-            e.value_ptr.deinit(self.allocator);
+            e.value_ptr.deinit(self.gpa);
         }
         self.pending_bodies.deinit();
         var hit = self.pending_headers.iterator();
         while (hit.next()) |e| {
-            hpack.HeaderField.freeOwnedSlice(self.allocator, e.value_ptr.*);
-            self.allocator.free(e.value_ptr.*);
+            hpack.HeaderField.freeOwnedSlice(self.gpa, e.value_ptr.*);
+            self.gpa.free(e.value_ptr.*);
         }
         self.pending_headers.deinit();
         var tit = self.pending_trailers.iterator();
         while (tit.next()) |e| {
-            hpack.HeaderField.freeOwnedSlice(self.allocator, e.value_ptr.*);
-            self.allocator.free(e.value_ptr.*);
+            hpack.HeaderField.freeOwnedSlice(self.gpa, e.value_ptr.*);
+            self.gpa.free(e.value_ptr.*);
         }
         self.pending_trailers.deinit();
         self.body_idle_ns.deinit();
@@ -287,13 +290,13 @@ pub const Session = struct {
 
     pub fn releaseIntent(self: *Session, it: *Intent) void {
         switch (it.*) {
-            .outbound_frame => |*f| self.allocator.free(f.payload),
+            .outbound_frame => |*f| self.gpa.free(f.payload),
             .dispatch_request => |*d| {
-                hpack.HeaderField.freeOwnedSlice(self.allocator, d.headers);
-                self.allocator.free(d.headers);
-                hpack.HeaderField.freeOwnedSlice(self.allocator, d.trailers);
-                if (d.trailers.len != 0) self.allocator.free(d.trailers);
-                self.allocator.free(d.body);
+                hpack.HeaderField.freeOwnedSlice(self.gpa, d.headers);
+                self.gpa.free(d.headers);
+                hpack.HeaderField.freeOwnedSlice(self.gpa, d.trailers);
+                if (d.trailers.len != 0) self.gpa.free(d.trailers);
+                self.gpa.free(d.body);
             },
             else => {},
         }
@@ -341,9 +344,9 @@ pub const Session = struct {
         const last = self.last_processed_stream;
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, .internal_error, &.{});
-        const p = self.allocator.dupe(u8, buf[0..n]) catch return error.OutOfMemory;
+        const p = self.gpa.dupe(u8, buf[0..n]) catch return error.OutOfMemory;
         self.pushIntent(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } }) catch {
-            self.allocator.free(p);
+            self.gpa.free(p);
             self.terminal = .{ .goaway = .{ .code = .internal_error, .last_stream_id = last } };
             return;
         };
@@ -399,7 +402,7 @@ pub const Session = struct {
             if (self.tombstoneCode(stream_id)) |code| {
                 if (code != .no_error) return error.FlowBlocked;
             }
-            const out = try encodeDataFrame(self.allocator, stream_id, data, end_stream);
+            const out = try encodeDataFrame(self.gpa, stream_id, data, end_stream);
             if (data.len > 0) self.windows.conn_send -= @intCast(data.len);
             return out;
         };
@@ -414,7 +417,7 @@ pub const Session = struct {
         else
             @min(data.len, @as(usize, @intCast(avail)), 16 * 1024);
         if (data.len > 0 and take < data.len) return error.FlowBlocked;
-        const out = try encodeDataFrame(self.allocator, stream_id, data[0..take], end_stream);
+        const out = try encodeDataFrame(self.gpa, stream_id, data[0..take], end_stream);
         if (take > 0) {
             s.window.send -= @intCast(take);
             self.windows.conn_send -= @intCast(take);
@@ -429,7 +432,7 @@ pub const Session = struct {
     fn emitServerPreface(self: *Session) !void {
         var buf: [256]u8 = undefined;
         const n = try frame.Serializer.settingsFrame(&buf, false, &frame.serverPrefaceSettings);
-        const payload = try self.allocator.dupe(u8, buf[0..n]);
+        const payload = try self.gpa.dupe(u8, buf[0..n]);
         // Store as raw bytes frame — edge writes verbatim. Use typ=settings with full frame in payload.
         // Simpler: outbound is complete wire bytes in a synthetic frame.
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{
@@ -442,7 +445,7 @@ pub const Session = struct {
         const incr: u31 = @intCast(flow.CONNECTION_RECV_TARGET - flow.INITIAL_WINDOW);
         var wbuf: [13]u8 = undefined;
         const wn = try frame.Serializer.windowUpdate(&wbuf, 0, incr);
-        const wp = try self.allocator.dupe(u8, wbuf[0..wn]);
+        const wp = try self.gpa.dupe(u8, wbuf[0..wn]);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{
             .typ = .window_update,
             .payload = wp,
@@ -482,7 +485,7 @@ pub const Session = struct {
             .ping => |opaque_data| {
                 var buf: [17]u8 = undefined;
                 const n = try frame.Serializer.ping(&buf, false, &opaque_data);
-                const p = try self.allocator.dupe(u8, buf[0..n]);
+                const p = try self.gpa.dupe(u8, buf[0..n]);
                 try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
             },
             .goaway => |g| try self.failConnectionWith(g.code, g.last_stream_id),
@@ -494,7 +497,7 @@ pub const Session = struct {
     fn emitGoawayNoTerminal(self: *Session, last: u31, code: frame.ErrorCode) !void {
         var buf: [32]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, code, &.{});
-        const p = try self.allocator.dupe(u8, buf[0..n]);
+        const p = try self.gpa.dupe(u8, buf[0..n]);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } });
     }
 
@@ -504,7 +507,7 @@ pub const Session = struct {
         try self.emitGoawayNoTerminal(std.math.maxInt(u31), .no_error);
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.ping(&buf, false, &self.grace_ping);
-        const p = try self.allocator.dupe(u8, buf[0..n]);
+        const p = try self.gpa.dupe(u8, buf[0..n]);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
         self.grace_phase = .phase1;
         self.grace_ping_acked = false;
@@ -529,7 +532,7 @@ pub const Session = struct {
     fn failConnectionWith(self: *Session, code: frame.ErrorCode, last: u31) !void {
         var buf: [32]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, code, &.{});
-        const p = try self.allocator.dupe(u8, buf[0..n]);
+        const p = try self.gpa.dupe(u8, buf[0..n]);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } });
         try self.pushIntentOrFailClosed(.{ .connection_error = .{ .code = code, .last_stream_id = last } });
         self.terminal = .{ .goaway = .{ .code = code, .last_stream_id = last } };
@@ -568,7 +571,7 @@ pub const Session = struct {
     fn emitRst(self: *Session, stream_id: u31, code: frame.ErrorCode) !void {
         var buf: [13]u8 = undefined;
         const n = try frame.Serializer.rstStream(&buf, stream_id, code);
-        const p = try self.allocator.dupe(u8, buf[0..n]);
+        const p = try self.gpa.dupe(u8, buf[0..n]);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .rst_stream, .payload = p, .stream_id = stream_id } });
         try self.pushIntentOrFailClosed(.{ .stream_reset = .{ .stream_id = stream_id, .code = code, .from_peer = false } });
         if (self.streams.getPtr(stream_id)) |s| {
@@ -585,7 +588,7 @@ pub const Session = struct {
         const capacity = self.limits.stream_tombstones;
         if (capacity == 0) return;
         if (self.tombstones.items.len < capacity) {
-            try self.tombstones.append(self.allocator, .{ .id = id, .code = code });
+            try self.tombstones.append(self.gpa, .{ .id = id, .code = code });
             return;
         }
         self.tombstones.items[self.tombstone_next] = .{ .id = id, .code = code };
@@ -605,8 +608,9 @@ pub const Session = struct {
     ///    over a rate-limit error raised by the same frame. The peer must learn
     ///    the more specific reason.
     fn handleFrame(self: *Session, ev: frame.FrameEvent) !void {
-        defer if (ev.payload.len != 0 and ev.payload_owned) self.allocator.free(ev.payload);
+        defer ev.deinit(self.gpa);
         const hdr = ev.header;
+        const payload = ev.payload.bytes();
         const already_terminal = self.terminal != .none;
 
         if (!self.received_peer_settings) {
@@ -622,14 +626,14 @@ pub const Session = struct {
                 try self.failConnection(.protocol_error);
                 return;
             }
-            try self.consumeContinuation(hdr, ev.payload);
+            try self.consumeContinuation(hdr, payload);
             try self.chargeRate(hdr.type, already_terminal);
             return;
         }
 
         switch (hdr.type) {
-            .data => try self.onData(hdr, ev.payload),
-            .headers => try self.onHeaders(hdr, ev.payload),
+            .data => try self.onData(hdr, payload),
+            .headers => try self.onHeaders(hdr, payload),
             .priority => {
                 if (hdr.stream_id == 0 or hdr.length != 5) {
                     try self.failConnection(if (hdr.length != 5) .frame_size_error else .protocol_error);
@@ -640,7 +644,7 @@ pub const Session = struct {
                     try self.failConnection(if (hdr.length != 4) .frame_size_error else .protocol_error);
                     return;
                 }
-                const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, ev.payload[0..4], .big));
+                const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
                 if (self.streams.getPtr(hdr.stream_id)) |s| {
                     s.onRst();
                     self.releaseConcurrency(hdr.stream_id, code);
@@ -672,15 +676,15 @@ pub const Session = struct {
                     return;
                 }
             },
-            .settings => try self.onSettings(hdr, ev.payload),
+            .settings => try self.onSettings(hdr, payload),
             .push_promise => try self.failConnection(.protocol_error),
-            .ping => try self.onPing(hdr, ev.payload),
+            .ping => try self.onPing(hdr, payload),
             .goaway => {
                 if (hdr.stream_id != 0 or hdr.length < 8) {
                     try self.failConnection(.frame_size_error);
                     return;
                 }
-                const last: u31 = @intCast(std.mem.readInt(u32, ev.payload[0..4], .big) & 0x7fff_ffff);
+                const last: u31 = @intCast(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
                 self.goaway_ceiling = last;
                 self.peer_goaway = true;
                 // Existing streams at or below last may finish; do not tear down transport yet.
@@ -688,7 +692,7 @@ pub const Session = struct {
                 // close. An instant teardown here would abort in-flight
                 // responses that the peer is still waiting to receive.
             },
-            .window_update => try self.onWindowUpdate(hdr, ev.payload),
+            .window_update => try self.onWindowUpdate(hdr, payload),
             .continuation => try self.failConnection(.protocol_error),
             _ => {}, // unknown types ignored after generic validation
         }
@@ -730,12 +734,12 @@ pub const Session = struct {
         // Collect first, act second. `emitRst` removes map entries, and a
         // mutation during iteration invalidates the iterator.
         var stale: std.ArrayList(u31) = .empty;
-        defer stale.deinit(self.allocator);
+        defer stale.deinit(self.gpa);
         var it = self.body_idle_ns.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* == 0) continue;
             if (now_ns -% e.value_ptr.* >= self.limits.request_body_idle_timeout_ns) {
-                try stale.append(self.allocator, e.key_ptr.*);
+                try stale.append(self.gpa, e.key_ptr.*);
             }
         }
         for (stale.items) |sid| {
@@ -829,7 +833,7 @@ pub const Session = struct {
         // ACK
         var buf: [9]u8 = undefined;
         const n = try frame.Serializer.settingsFrame(&buf, true, &.{});
-        const p = try self.allocator.dupe(u8, buf[0..n]);
+        const p = try self.gpa.dupe(u8, buf[0..n]);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } });
     }
 
@@ -848,7 +852,7 @@ pub const Session = struct {
         @memcpy(&opaque_data, payload[0..8]);
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.ping(&buf, true, &opaque_data);
-        const p = try self.allocator.dupe(u8, buf[0..n]);
+        const p = try self.gpa.dupe(u8, buf[0..n]);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } });
     }
 
@@ -933,7 +937,7 @@ pub const Session = struct {
                         self.windows.creditConnRecv(inc);
                         var buf: [13]u8 = undefined;
                         const n = try frame.Serializer.windowUpdate(&buf, 0, inc);
-                        const p = try self.allocator.dupe(u8, buf[0..n]);
+                        const p = try self.gpa.dupe(u8, buf[0..n]);
                         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p } });
                     }
                 }
@@ -977,13 +981,13 @@ pub const Session = struct {
                             try self.emitEarlyReject(hdr.stream_id, 413);
                         } else {
                             errdefer if (h.releaseRequest) |rel| rel(h.ctx, data.len);
-                            try body.appendSlice(self.allocator, data);
+                            try body.appendSlice(self.gpa, data);
                         }
                     } else {
-                        try body.appendSlice(self.allocator, data);
+                        try body.appendSlice(self.gpa, data);
                     }
                 } else {
-                    try body.appendSlice(self.allocator, data);
+                    try body.appendSlice(self.gpa, data);
                 }
             }
         }
@@ -1015,7 +1019,7 @@ pub const Session = struct {
                 s.window.creditRecv(inc);
                 var buf: [13]u8 = undefined;
                 const n = try frame.Serializer.windowUpdate(&buf, hdr.stream_id, inc);
-                const p = try self.allocator.dupe(u8, buf[0..n]);
+                const p = try self.gpa.dupe(u8, buf[0..n]);
                 try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p, .stream_id = hdr.stream_id } });
             }
         }
@@ -1025,7 +1029,7 @@ pub const Session = struct {
                 self.windows.creditConnRecv(inc);
                 var buf: [13]u8 = undefined;
                 const n = try frame.Serializer.windowUpdate(&buf, 0, inc);
-                const p = try self.allocator.dupe(u8, buf[0..n]);
+                const p = try self.gpa.dupe(u8, buf[0..n]);
                 try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p } });
             }
         }
@@ -1117,7 +1121,7 @@ pub const Session = struct {
         }
 
         self.header_block.clearRetainingCapacity();
-        try self.header_block.appendSlice(self.allocator, fragment);
+        try self.header_block.appendSlice(self.gpa, fragment);
         self.continuation_count = 0;
         self.header_end_stream = hdr.flags.end_stream;
         if (!hdr.flags.end_headers) {
@@ -1137,7 +1141,7 @@ pub const Session = struct {
             try self.failConnection(.enhance_your_calm);
             return;
         }
-        try self.header_block.appendSlice(self.allocator, payload);
+        try self.header_block.appendSlice(self.gpa, payload);
         if (!hdr.flags.end_headers) return;
         const sid = self.expect_continuation.?;
         self.expect_continuation = null;
@@ -1312,8 +1316,8 @@ pub const Session = struct {
         const hdrs = self.pending_headers.fetchRemove(stream_id) orelse return;
         var headers_owned = true;
         errdefer if (headers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.allocator, hdrs.value);
-            self.allocator.free(hdrs.value);
+            hpack.HeaderField.freeOwnedSlice(self.gpa, hdrs.value);
+            self.gpa.free(hdrs.value);
         };
         const body_entry = self.pending_bodies.fetchRemove(stream_id);
         const body = blk: {
@@ -1322,8 +1326,8 @@ pub const Session = struct {
                 if (self.stream_hooks) |h| {
                     if (h.releaseRequest) |rel| rel(h.ctx, list.items.len);
                 }
-                break :blk list.toOwnedSlice(self.allocator) catch |err| {
-                    list.deinit(self.allocator);
+                break :blk list.toOwnedSlice(self.gpa) catch |err| {
+                    list.deinit(self.gpa);
                     // Preserve the original allocation error if fail-closed signaling also allocates.
                     self.failClosedInternal() catch {};
                     return err;
@@ -1332,7 +1336,7 @@ pub const Session = struct {
             break :blk &.{};
         };
         var body_owned = body.len != 0;
-        errdefer if (body_owned) self.allocator.free(body);
+        errdefer if (body_owned) self.gpa.free(body);
 
         const parsed = fields.validateRequestFields(hdrs.value) catch {
             try self.emitRst(stream_id, .protocol_error);
@@ -1340,11 +1344,11 @@ pub const Session = struct {
         };
 
         const trailers_entry = self.pending_trailers.fetchRemove(stream_id);
-        const trailers: []hpack.HeaderField = if (trailers_entry) |e| e.value else try self.allocator.alloc(hpack.HeaderField, 0);
+        const trailers: []hpack.HeaderField = if (trailers_entry) |e| e.value else try self.gpa.alloc(hpack.HeaderField, 0);
         var trailers_owned = trailers.len != 0;
         errdefer if (trailers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.allocator, trailers);
-            self.allocator.free(trailers);
+            hpack.HeaderField.freeOwnedSlice(self.gpa, trailers);
+            self.gpa.free(trailers);
         };
 
         // The helper owns every slice from this point, including its failures.
@@ -1368,15 +1372,15 @@ pub const Session = struct {
     ) !void {
         var headers_owned = true;
         errdefer if (headers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.allocator, headers);
-            self.allocator.free(headers);
+            hpack.HeaderField.freeOwnedSlice(self.gpa, headers);
+            self.gpa.free(headers);
         };
         var body_owned = body.len != 0;
-        errdefer if (body_owned) self.allocator.free(body);
+        errdefer if (body_owned) self.gpa.free(body);
         var trailers_owned = trailers.len != 0;
         errdefer if (trailers_owned) {
-            hpack.HeaderField.freeOwnedSlice(self.allocator, trailers);
-            self.allocator.free(trailers);
+            hpack.HeaderField.freeOwnedSlice(self.gpa, trailers);
+            self.gpa.free(trailers);
         };
 
         const s = self.streams.getPtr(stream_id) orelse return error.StreamClosed;
@@ -1418,9 +1422,9 @@ pub const Session = struct {
         if (block_len > std.math.maxInt(u24)) return error.OutOfMemory;
         const total = std.math.add(usize, frame.FRAME_HEADER_LEN, block_len) catch return error.OutOfMemory;
 
-        const out = try self.allocator.alloc(u8, total);
+        const out = try self.gpa.alloc(u8, total);
         var out_owned = true;
-        errdefer if (out_owned) self.allocator.free(out);
+        errdefer if (out_owned) self.gpa.free(out);
 
         const fh = frame.FrameHeader{
             .length = @intCast(block_len),

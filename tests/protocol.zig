@@ -27,7 +27,7 @@ test "frame corpus reaches types" {
     const n = try frame.Serializer.ping(&buf, false, &opaque_data);
     const r = try parser.ingestOne(buf[0..n]);
     try std.testing.expect(r != null);
-    defer std.testing.allocator.free(r.?.event.payload);
+    defer r.?.event.deinit(std.testing.allocator);
     try std.testing.expectEqual(frame.FrameType.ping, r.?.event.header.type);
 }
 

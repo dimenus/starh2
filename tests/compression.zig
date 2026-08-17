@@ -128,13 +128,13 @@ const Capture = struct {
         while (rem.len > 0) {
             const maybe = try self.parser.ingestOne(rem);
             if (maybe) |r| {
-                defer if (r.event.payload.len != 0) self.gpa.free(r.event.payload);
+                defer r.event.deinit(self.gpa);
                 rem = rem[r.consumed..];
                 const hdr = r.event.header;
                 switch (hdr.type) {
                     .data => {
-                        try self.body.appendSlice(self.gpa, r.event.payload);
-                        const chunk = try self.gpa.dupe(u8, r.event.payload);
+                        try self.body.appendSlice(self.gpa, r.event.payload.bytes());
+                        const chunk = try self.gpa.dupe(u8, r.event.payload.bytes());
                         try self.data_chunks.append(self.gpa, chunk);
                         self.data_frames += 1;
                         if (hdr.flags.end_stream) self.end_stream = true;
@@ -142,7 +142,7 @@ const Capture = struct {
                     .headers => {
                         var dec = hpack.Decoder.init(self.gpa);
                         defer dec.deinit();
-                        const result = try dec.decode(r.event.payload, 100, 64 * 1024, 256, 8 * 1024);
+                        const result = try dec.decode(r.event.payload.bytes(), 100, 64 * 1024, 256, 8 * 1024);
                         defer dec.freeResult(result);
                         for (result.fields) |f| {
                             try self.headers.append(self.gpa, .{

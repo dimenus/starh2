@@ -124,12 +124,12 @@ fn encodeIntoOp(ctx: *EncodeIntoCtx) !usize {
 }
 
 const EncodeAllocCtx = struct {
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
 };
 
 fn encodeAllocOp(ctx: *EncodeAllocCtx) !usize {
-    const out = try hpack.Encoder.encode(ctx.allocator, &response_fields);
-    defer ctx.allocator.free(out);
+    const out = try hpack.Encoder.encode(ctx.gpa, &response_fields);
+    defer ctx.gpa.free(out);
     std.mem.doNotOptimizeAway(out);
     return out.len;
 }
@@ -138,8 +138,8 @@ const DecodeCtx = struct {
     decoder: hpack.Decoder,
     block: []const u8,
 
-    fn init(allocator: std.mem.Allocator, block: []const u8, seed_dynamic: bool) !DecodeCtx {
-        var decoder = hpack.Decoder.init(allocator);
+    fn init(gpa: std.mem.Allocator, block: []const u8, seed_dynamic: bool) !DecodeCtx {
+        var decoder = hpack.Decoder.init(gpa);
         errdefer decoder.deinit();
         if (seed_dynamic) {
             const seeded = try decoder.decode(&dynamic_insert_block, 100, 32 * 1024, 256, 8 * 1024);
@@ -161,12 +161,12 @@ fn decodeOp(ctx: *DecodeCtx) !usize {
 }
 
 const ParseCtx = struct {
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     parser: frame.Parser,
     wire: [frame.FRAME_HEADER_LEN + mixed_request_block.len]u8,
 
-    fn init(allocator: std.mem.Allocator) !ParseCtx {
-        var parser = try frame.Parser.initReserved(allocator, frame.DEFAULT_MAX_FRAME_SIZE);
+    fn init(gpa: std.mem.Allocator) !ParseCtx {
+        var parser = try frame.Parser.initReserved(gpa, frame.DEFAULT_MAX_FRAME_SIZE);
         errdefer parser.deinit();
         parser.skipPreface();
 
@@ -180,7 +180,7 @@ const ParseCtx = struct {
         }).encode(&header);
         @memcpy(wire[0..frame.FRAME_HEADER_LEN], &header);
         @memcpy(wire[frame.FRAME_HEADER_LEN..], &mixed_request_block);
-        return .{ .allocator = allocator, .parser = parser, .wire = wire };
+        return .{ .gpa = gpa, .parser = parser, .wire = wire };
     }
 
     fn deinit(self: *ParseCtx) void {
@@ -190,26 +190,26 @@ const ParseCtx = struct {
 
 fn parseOp(ctx: *ParseCtx) !usize {
     const result = (try ctx.parser.ingestOne(&ctx.wire)) orelse return error.IncompleteFrame;
-    defer ctx.allocator.free(result.event.payload);
-    std.mem.doNotOptimizeAway(result.event.payload);
+    defer result.event.deinit(ctx.gpa);
+    std.mem.doNotOptimizeAway(result.event.payload.bytes());
     return result.consumed;
 }
 
 const InboundCtx = struct {
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     parser: frame.Parser,
     decoder: hpack.Decoder,
     wire: [frame.FRAME_HEADER_LEN + mixed_request_block.len]u8,
 
-    fn init(allocator: std.mem.Allocator) !InboundCtx {
-        var parse_ctx = try ParseCtx.init(allocator);
+    fn init(gpa: std.mem.Allocator) !InboundCtx {
+        var parse_ctx = try ParseCtx.init(gpa);
         errdefer parse_ctx.deinit();
-        var decoder = hpack.Decoder.init(allocator);
+        var decoder = hpack.Decoder.init(gpa);
         errdefer decoder.deinit();
         const seeded = try decoder.decode(&dynamic_insert_block, 100, 32 * 1024, 256, 8 * 1024);
         decoder.freeResult(seeded);
         const result: InboundCtx = .{
-            .allocator = allocator,
+            .gpa = gpa,
             .parser = parse_ctx.parser,
             .decoder = decoder,
             .wire = parse_ctx.wire,
@@ -226,8 +226,8 @@ const InboundCtx = struct {
 
 fn inboundOp(ctx: *InboundCtx) !usize {
     const parsed = (try ctx.parser.ingestOne(&ctx.wire)) orelse return error.IncompleteFrame;
-    defer ctx.allocator.free(parsed.event.payload);
-    const decoded = try ctx.decoder.decode(parsed.event.payload, 100, 32 * 1024, 256, 8 * 1024);
+    defer parsed.event.deinit(ctx.gpa);
+    const decoded = try ctx.decoder.decode(parsed.event.payload.bytes(), 100, 32 * 1024, 256, 8 * 1024);
     defer ctx.decoder.freeResult(decoded);
     std.mem.doNotOptimizeAway(decoded.fields);
     return parsed.consumed + decoded.decoded_size;
@@ -238,8 +238,8 @@ const SessionCtx = struct {
     wire: [frame.FRAME_HEADER_LEN + seed_request_block.len]u8,
     next_stream_id: u31,
 
-    fn init(self: *SessionCtx, allocator: std.mem.Allocator) !void {
-        self.session = try starh2.Session.init(allocator, .{});
+    fn init(self: *SessionCtx, gpa: std.mem.Allocator) !void {
+        self.session = try starh2.Session.init(gpa, .{});
         errdefer self.session.deinit();
         self.next_stream_id = 1;
 
@@ -479,7 +479,7 @@ fn allocationRate(counter: *AllocCounter, iterations: usize) struct { allocs: f6
 
 fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     const io = rt.io();
-    const allocator = std.heap.c_allocator;
+    const gpa = std.heap.c_allocator;
     const count_n = @min(cfg.iterations, 10_000);
 
     std.debug.print(
@@ -492,18 +492,18 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     const encode_into_stats = try benchmark(io, cfg.iterations, cfg.rounds, &encode_into, encodeIntoOp);
     printRow("HPACK response encodeInto", cfg.iterations, encode_into_stats, 0, 0);
 
-    var encode_alloc: EncodeAllocCtx = .{ .allocator = allocator };
+    var encode_alloc: EncodeAllocCtx = .{ .gpa = gpa };
     const encode_alloc_stats = try benchmark(io, cfg.iterations, cfg.rounds, &encode_alloc, encodeAllocOp);
-    var encode_counter: AllocCounter = .{ .parent = allocator };
-    var counted_encode: EncodeAllocCtx = .{ .allocator = encode_counter.allocator() };
+    var encode_counter: AllocCounter = .{ .parent = gpa };
+    var counted_encode: EncodeAllocCtx = .{ .gpa = encode_counter.allocator() };
     for (0..count_n) |_| _ = try encodeAllocOp(&counted_encode);
     const encode_rate = allocationRate(&encode_counter, count_n);
     printRow("HPACK response encode alloc", cfg.iterations, encode_alloc_stats, encode_rate.allocs, encode_rate.bytes);
 
-    var static_decode = try DecodeCtx.init(allocator, &static_request_block, false);
+    var static_decode = try DecodeCtx.init(gpa, &static_request_block, false);
     defer static_decode.deinit();
     const static_stats = try benchmark(io, cfg.iterations, cfg.rounds, &static_decode, decodeOp);
-    var static_counter: AllocCounter = .{ .parent = allocator };
+    var static_counter: AllocCounter = .{ .parent = gpa };
     var counted_static = try DecodeCtx.init(static_counter.allocator(), &static_request_block, false);
     defer counted_static.deinit();
     static_counter.reset();
@@ -511,10 +511,10 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     const static_rate = allocationRate(&static_counter, count_n);
     printRow("HPACK request static decode", cfg.iterations, static_stats, static_rate.allocs, static_rate.bytes);
 
-    var mixed_decode = try DecodeCtx.init(allocator, &mixed_request_block, true);
+    var mixed_decode = try DecodeCtx.init(gpa, &mixed_request_block, true);
     defer mixed_decode.deinit();
     const mixed_stats = try benchmark(io, cfg.iterations, cfg.rounds, &mixed_decode, decodeOp);
-    var mixed_counter: AllocCounter = .{ .parent = allocator };
+    var mixed_counter: AllocCounter = .{ .parent = gpa };
     var counted_mixed = try DecodeCtx.init(mixed_counter.allocator(), &mixed_request_block, true);
     defer counted_mixed.deinit();
     mixed_counter.reset();
@@ -522,10 +522,10 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     const mixed_rate = allocationRate(&mixed_counter, count_n);
     printRow("HPACK request mixed decode", cfg.iterations, mixed_stats, mixed_rate.allocs, mixed_rate.bytes);
 
-    var parse = try ParseCtx.init(allocator);
+    var parse = try ParseCtx.init(gpa);
     defer parse.deinit();
     const parse_stats = try benchmark(io, cfg.iterations, cfg.rounds, &parse, parseOp);
-    var parse_counter: AllocCounter = .{ .parent = allocator };
+    var parse_counter: AllocCounter = .{ .parent = gpa };
     var counted_parse = try ParseCtx.init(parse_counter.allocator());
     defer counted_parse.deinit();
     parse_counter.reset();
@@ -533,10 +533,10 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     const parse_rate = allocationRate(&parse_counter, count_n);
     printRow("HTTP/2 frame parse", cfg.iterations, parse_stats, parse_rate.allocs, parse_rate.bytes);
 
-    var inbound = try InboundCtx.init(allocator);
+    var inbound = try InboundCtx.init(gpa);
     defer inbound.deinit();
     const inbound_stats = try benchmark(io, cfg.iterations, cfg.rounds, &inbound, inboundOp);
-    var inbound_counter: AllocCounter = .{ .parent = allocator };
+    var inbound_counter: AllocCounter = .{ .parent = gpa };
     var counted_inbound = try InboundCtx.init(inbound_counter.allocator());
     defer counted_inbound.deinit();
     inbound_counter.reset();
@@ -545,10 +545,10 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     printRow("frame + HPACK request", cfg.iterations, inbound_stats, inbound_rate.allocs, inbound_rate.bytes);
 
     var session: SessionCtx = undefined;
-    try session.init(allocator);
+    try session.init(gpa);
     defer session.deinit();
     const session_stats = try benchmark(io, cfg.iterations, cfg.rounds, &session, sessionOp);
-    var session_counter: AllocCounter = .{ .parent = allocator };
+    var session_counter: AllocCounter = .{ .parent = gpa };
     var counted_session: SessionCtx = undefined;
     try counted_session.init(session_counter.allocator());
     defer counted_session.deinit();
