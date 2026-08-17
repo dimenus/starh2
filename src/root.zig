@@ -55,6 +55,7 @@ pub const edge = struct {
     pub const h2c = @import("edge/h2c.zig");
     pub const ticket_table = @import("edge/ticket_table.zig");
     pub const control_pool = @import("edge/control_pool.zig");
+    pub const emit_batch = @import("edge/emit_batch.zig");
     pub const fair_scheduler = @import("edge/fair_scheduler.zig");
     pub const slab_pool = @import("edge/slab_pool.zig");
 };
@@ -109,6 +110,7 @@ test {
     _ = edge.h2c;
     _ = edge.ticket_table;
     _ = edge.control_pool;
+    _ = edge.emit_batch;
     _ = edge.fair_scheduler;
     _ = edge.slab_pool;
     _ = core.bound_shapes;

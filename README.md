@@ -27,6 +27,10 @@ would need the same conformance and security work as the paths that are used.
 - Zig 0.16.0 (pinned; the TLS dependency is not source-compatible with 0.17-dev)
 - For TLS, a certificate and key in PEM form
 - curl built with HTTP/2, to run the TLS gate
+- With more than one zio executor, set `enable_task_migration = false`. The
+  pinned zio can otherwise strand a migrated socket task under repeated TLS
+  connection churn while readable and writable bytes remain queued in the
+  kernel.
 
 ## Install
 

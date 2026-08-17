@@ -37,9 +37,9 @@ pub const WriteCompletion = struct {
     outbound_release: usize = 0,
     /// Successful socket-write completion time for trace attribution.
     written_ns: u64 = 0,
-    /// Control-pool bytes/entry to release (AckDrainer applies).
+    /// Control-pool bytes and entry count to release (AckDrainer applies).
     control_release: usize = 0,
-    control_entry: bool = false,
+    control_entries: u32 = 0,
     /// Fail every in-flight ticket (write pump transport failure).
     fail_all: bool = false,
     /// Shut down AckDrainer.
@@ -57,7 +57,7 @@ pub const WireChunk = struct {
     /// Amounts echoed into WriteCompletion after write/free (no Connection callback).
     outbound_release: usize = 0,
     control_release: usize = 0,
-    control_entry: bool = false,
+    control_entries: u32 = 0,
     /// Read-pool lease index; null = heap-owned (should not happen for reads after boot).
     pool_index: ?u32 = null,
 };
@@ -184,7 +184,7 @@ pub const WritePump = struct {
             self.gpa.free(chunk.bytes);
         }
         const has_ticket = chunk.ticket_count != 0 or chunk.ticket != 0;
-        const has_acct = chunk.outbound_release != 0 or chunk.control_entry;
+        const has_acct = chunk.outbound_release != 0 or chunk.control_entries != 0;
         if (has_ticket or has_acct or fail_all) {
             var written_ns: u64 = 0;
             if (ok and chunk.ticket != 0) {
@@ -200,7 +200,7 @@ pub const WritePump = struct {
                 .outbound_release = chunk.outbound_release,
                 .written_ns = written_ns,
                 .control_release = chunk.control_release,
-                .control_entry = chunk.control_entry,
+                .control_entries = chunk.control_entries,
                 .fail_all = fail_all,
             });
         }

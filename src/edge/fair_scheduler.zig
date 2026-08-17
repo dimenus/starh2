@@ -313,7 +313,7 @@ pub const FairScheduler = struct {
                 .ticket_slot = ticket_slot,
                 .control_n = payload.len,
             }) catch {
-                self.ctrl.release(payload.len, true);
+                self.ctrl.release(payload.len, 1);
                 self.gpa.free(payload);
                 return error.QueueFull;
             };
@@ -329,7 +329,7 @@ pub const FairScheduler = struct {
                 .ticket_slot = ticket_slot,
                 .control_n = payload.len,
             }) catch {
-                self.ctrl.release(payload.len, true);
+                self.ctrl.release(payload.len, 1);
                 self.gpa.free(payload);
                 return error.QueueFull;
             };

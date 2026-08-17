@@ -75,10 +75,10 @@ pub const ControlPool = struct {
         }
     }
 
-    pub fn release(self: *ControlPool, n: usize, entry: bool) void {
-        if (entry) {
-            const prev = self.entries_held.fetchSub(1, .acq_rel);
-            std.debug.assert(prev >= 1);
+    pub fn release(self: *ControlPool, n: usize, entries: usize) void {
+        if (entries != 0) {
+            const prev = self.entries_held.fetchSub(entries, .acq_rel);
+            std.debug.assert(prev >= entries);
         }
         if (n != 0) {
             const prev = self.bytes_held.fetchSub(n, .acq_rel);
@@ -146,7 +146,50 @@ test "exact occupancy release asserts once" {
     try std.testing.expect(pool.tryReserveOrdinary(100));
     try std.testing.expectEqual(@as(usize, 100), pool.bytes_held.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), pool.entries_held.load(.acquire));
-    pool.release(100, true);
+    pool.release(100, 1);
     try std.testing.expectEqual(@as(usize, 0), pool.bytes_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.entries_held.load(.acquire));
+}
+
+test "release of N entries matches N reserves" {
+    // A TLS drain turn may copy several HEADERS into one plaintext. Occupancy
+    // stays held until that write completes, so the completion must release
+    // every reserved entry, not a bool's worth. Releasing 1 after 3 reserves
+    // would leak two entries for the life of the connection.
+    var pool = ControlPool.init(64 * 1024, 256);
+    try std.testing.expect(pool.tryReserveOrdinary(10));
+    try std.testing.expect(pool.tryReserveOrdinary(20));
+    try std.testing.expect(pool.tryReserveOrdinary(30));
+    try std.testing.expectEqual(@as(usize, 3), pool.entries_held.load(.acquire));
+    pool.release(60, 3);
+    try std.testing.expectEqual(@as(usize, 0), pool.bytes_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.entries_held.load(.acquire));
+}
+
+test "releasing one entry after three reserves leaves occupancy that starves ordinary" {
+    // The bool-shaped WireChunk. The completion looks successful and the
+    // connection stays up, while two slots never return. A later HEADERS then
+    // hits PoolFull on a connection that is not actually full.
+    var pool = ControlPool.init(64 * 1024, 256);
+    const caps = pool.ordinaryCaps();
+    try std.testing.expect(pool.tryReserveOrdinary(10));
+    try std.testing.expect(pool.tryReserveOrdinary(20));
+    try std.testing.expect(pool.tryReserveOrdinary(30));
+    pool.release(60, 1);
+    try std.testing.expectEqual(@as(usize, 2), pool.entries_held.load(.acquire));
+    var i: usize = 2;
+    while (i < caps.entries) : (i += 1) {
+        try std.testing.expect(pool.tryReserveOrdinary(1));
+    }
+    try std.testing.expect(!pool.tryReserveOrdinary(1));
+}
+
+test "byte-only release does not drop an entry" {
+    var pool = ControlPool.init(64 * 1024, 256);
+    try std.testing.expect(pool.tryReserveOrdinary(100));
+    pool.release(100, 0);
+    try std.testing.expectEqual(@as(usize, 0), pool.bytes_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), pool.entries_held.load(.acquire));
+    pool.release(0, 1);
     try std.testing.expectEqual(@as(usize, 0), pool.entries_held.load(.acquire));
 }

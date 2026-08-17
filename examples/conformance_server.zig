@@ -265,11 +265,11 @@ pub fn main(init: std.process.Init) !void {
     installSignalHandlers();
 
     const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(30), .slab_slots = 256, .prewarm = 256 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(30), .slab_slots = 256, .prewarm = 256 },
         .executors = .auto,
-        .enable_task_migration = true,
+        // Socket readiness is loop-owned. zio a2b134a can lose a migrated I/O
+        // wake under repeated TLS connection churn, so keep tasks home-pinned.
+        .enable_task_migration = false,
     });
     defer rt.deinit();
 

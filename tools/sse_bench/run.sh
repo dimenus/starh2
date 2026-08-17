@@ -39,6 +39,9 @@ STREAMS=${STREAMS:-200}
 SECONDS_RUN=${SECONDS_RUN:-10}
 INTERVAL=${INTERVAL:-10}
 ROUNDS=${ROUNDS:-4}
+WARMUP=${WARMUP:-1}
+STARH2_EXECUTORS=${STARH2_EXECUTORS:-2}
+GO_MAX_PROCS=${GO_MAX_PROCS:-auto}
 OUT=${OUT:-/tmp/starh2-sse-bench}
 
 command -v go >/dev/null 2>&1 || {
@@ -61,23 +64,66 @@ cd "$REPO"
 ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 
-"$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" > "$OUT/starh2.log" 2>&1 &
+if [ "$STARH2_EXECUTORS" = auto ]; then
+  "$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" > "$OUT/starh2.log" 2>&1 &
+else
+  "$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" \
+    --executors "$STARH2_EXECUTORS" > "$OUT/starh2.log" 2>&1 &
+fi
 S_PID=$!
-"$OUT/sse-server" -port 19447 -sse-interval-ms "$INTERVAL" -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
+if [ "$GO_MAX_PROCS" = auto ]; then
+  "$OUT/sse-server" -port 19447 -sse-interval-ms "$INTERVAL" -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
+else
+  GOMAXPROCS="$GO_MAX_PROCS" "$OUT/sse-server" -port 19447 -sse-interval-ms "$INTERVAL" -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
+fi
 G_PID=$!
 sleep 2
 
+cleanup() {
+  kill ${S_RSS_PID:-} ${G_RSS_PID:-} $S_PID $G_PID 2>/dev/null
+  wait 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
 # An arm that never answered must not be reported as a slow arm.
 for port in 19446 19447; do
-  if ! "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams 1 -seconds 2 -label probe >/dev/null 2>&1; then
+  if ! "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams 1 -seconds 2 -warmup "$WARMUP" -label probe >/dev/null 2>&1; then
     echo "the server on port $port did not deliver an event — refusing to report" >&2
     kill $S_PID $G_PID 2>/dev/null
     exit 1
   fi
 done
 
+sample_rss() {
+  pid=$1
+  out=$2
+  : > "$out"
+  while kill -0 "$pid" 2>/dev/null; do
+    ps -o rss= -p "$pid" >> "$out"
+    sleep 1
+  done
+}
+
+sample_rss "$S_PID" "$OUT/starh2-rss.txt" &
+S_RSS_PID=$!
+sample_rss "$G_PID" "$OUT/go-rss.txt" &
+G_RSS_PID=$!
+
+cpu_seconds() {
+  ps -o time= -p "$1" | awk '{
+    gsub(/[[:space:]]/, "", $0)
+    fraction_parts = split($0, fraction, ".")
+    clock_parts = split(fraction[1], clock, ":")
+    total = 0
+    for (i = 1; i <= clock_parts; i++) total = (total * 60) + clock[i]
+    if (fraction_parts > 1) total += ("0." fraction[2])
+    printf "%.2f", total
+  }'
+}
+
 target=$(( SECONDS_RUN * 1000 / INTERVAL * STREAMS ))
-echo "== $STREAMS streams, ${SECONDS_RUN}s, one event per ${INTERVAL}ms, $ROUNDS rounds"
+echo "== $STREAMS streams, ${SECONDS_RUN}s + ${WARMUP}s warmup, one event per ${INTERVAL}ms, $ROUNDS rounds"
+echo "== runtime: starh2 executors=$STARH2_EXECUTORS  go GOMAXPROCS=$GO_MAX_PROCS"
 echo "== target $target events per arm per round ($(( STREAMS * 1000 / INTERVAL )) events/s)"
 
 i=1
@@ -90,13 +136,25 @@ while [ "$i" -le "$ROUNDS" ]; do
   fi
   for arm in $order; do
     name=${arm%%:*}; port=${arm##*:}
+    if [ "$name" = starh2 ]; then pid=$S_PID; else pid=$G_PID; fi
+    cpu_before=$(cpu_seconds "$pid")
     "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams "$STREAMS" \
-      -seconds "$SECONDS_RUN" -label "$name" | sed 's/^/  /'
+      -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$name" | sed 's/^/  /'
+    cpu_after=$(cpu_seconds "$pid")
+    cpu_used=$(awk -v before="$cpu_before" -v after="$cpu_after" 'BEGIN { printf "%.2f", after - before }')
+    echo "  $name server CPU=${cpu_used}s (opening + warmup + measurement)"
   done
   i=$((i + 1))
 done
 
-echo "== RSS while $STREAMS streams were open"
-echo "  starh2=$(ps -o rss= -p $S_PID)KB  go=$(ps -o rss= -p $G_PID)KB"
-kill $S_PID $G_PID 2>/dev/null
-wait 2>/dev/null
+starh2_retained=$(ps -o rss= -p $S_PID)
+go_retained=$(ps -o rss= -p $G_PID)
+kill $S_RSS_PID $G_RSS_PID 2>/dev/null
+wait $S_RSS_PID $G_RSS_PID 2>/dev/null
+starh2_peak=$(awk 'BEGIN { m=0 } $1 > m { m=$1 } END { print m }' "$OUT/starh2-rss.txt")
+go_peak=$(awk 'BEGIN { m=0 } $1 > m { m=$1 } END { print m }' "$OUT/go-rss.txt")
+echo "== RSS sampled during benchmark rounds"
+echo "  peak:     starh2=${starh2_peak}KB  go=${go_peak}KB"
+echo "  retained: starh2=${starh2_retained}KB  go=${go_retained}KB"
+cleanup
+trap - EXIT INT TERM

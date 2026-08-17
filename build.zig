@@ -581,6 +581,29 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "One-shot h2 throughput: starh2 tls vs h2c, plus --opponent <binary>");
     bench_step.dependOn(&bench_run.step);
 
+    // Local pipeline costs without sockets, TLS, contention, or a client.
+    // Deliberately ReleaseFast-only in normal use and not a noisy CI gate.
+    const pipeline_bench_exe = b.addExecutable(.{
+        .name = "pipeline-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/pipeline_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const pipeline_bench_run = b.addRunArtifact(pipeline_bench_exe);
+    if (b.args) |extra| pipeline_bench_run.addArgs(extra);
+    pipeline_bench_run.setCwd(b.path("."));
+    pipeline_bench_run.has_side_effects = true;
+    pipeline_bench_run.stdio = .inherit;
+    const pipeline_bench_step = b.step("bench-pipeline", "Isolated HPACK, frame parsing, and task lifecycle costs");
+    pipeline_bench_step.dependOn(&pipeline_bench_run.step);
+
     const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + every release target");
     ci_step.dependOn(test_step);
     ci_step.dependOn(test_exact_step);

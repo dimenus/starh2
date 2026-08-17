@@ -1,0 +1,110 @@
+# One-shot TLS: packing, gates, remaining gap
+
+How a second HEADERS used to start a new TLS record, how that is gated now,
+and which micros are worth running. Re-derive every count; they move with
+the machine.
+
+## What changed
+
+On TLS, one FairScheduler drain copies every control and ticketed DATA into
+the boot-counted plaintext scratch (16 KiB) and encrypts that as one
+`queueWire` input. `WireChunk.control_entries` is how many control-pool
+slots that write still holds. Occupancy stays held until the write
+completes; do not weaken the pool to buy a record.
+
+A bool `control_entry` on the chunk was the defect. The sink flushed on the
+second HEADERS so it could release one slot per chunk. One-shot TLS then
+paid one record per response (`records/response = 1.00`) while SSE packed,
+because SSE DATA is not a control.
+
+h2c does not batch: each frame is already the wire unit.
+
+## Live packing oracle
+
+```sh
+tools/oneshot-phase-trace.sh
+```
+
+Throughput-shaped (use these for the remaining gap, not wall waits):
+
+- `tickets/handoff` — responses coalesced into one `queueWire`
+- `tickets/emit` — responses flushed in one `drainEmit` turn
+- `records/response` — TLS records per h2load success. Packed drain turns
+  at `-m 10` are about **0.17**. **1.00** means a second HEADERS flushed
+  the batch again. The script **exits 9** rather than reporting that as a
+  result.
+- `allocs/request` — counting-allocator calls on the server GPA (`--trace`)
+
+Latency-shaped (overlapped across many concurrent streams; not throughput):
+`block` / `hold` / `ack` / `resume`, and dispatch-sampled `spawn` /
+`to_send` / `hpack`.
+
+Cross-check the ticket delta against h2load `succeeded`, not against
+`jobs`. `jobs` is a dispatch counter and includes `/trace`.
+
+Use a dedicated 400k TLS run for packing, not the official interleaved
+100k TLS+h2c harness. That harness is noisier than the path under test.
+
+## Unit gates (what a nested-sink rewrite used to hide)
+
+The drain-turn rules live in `src/edge/emit_batch.zig` so they can fail
+without standing up a cipher. `tests/transport.zig` imports that module as
+the public-surface canary.
+
+| Edge | What fails if it comes back |
+|---|---|
+| Second HEADERS starts a new TLS record | three HEADERS join; `control_entries == 3` |
+| Ticketed DATA counted as a control | HEADERS+DATA+HEADERS → entries 2, not 3 |
+| Completion releases a bool's worth of occupancy | `ControlPool.release(60, 1)` after 3 reserves starves ordinary |
+| Byte-only release drops no entry | `release(100, 0)` leaves `entries_held == 1` |
+| Concat past 16 KiB | `wouldFit` false; flush then a new batch |
+| Receipt on a non-last encrypt record | `lastRecordMeta` / `lastRecordFlush` zero tickets and do not flush |
+| h2c or unticketed DATA batched | `frameIsBatchable` is false |
+| Packed ticket chain truncated or short | AckDrainer walk canaries (snap `next` before `complete`) |
+| Scratch includes the TLS content-type byte | `max_plaintext + 1 == TLS_PLAINTEXT_SCRATCH_SIZE`, asserted in `drainEmit` |
+
+`zig build test` still cannot reach the TLS encrypt loop. `./zb build ci`
+includes `tls-smoke`. Packing itself is the phase-trace exit 9.
+
+## Isolated CPU (not the remaining gap)
+
+```sh
+./zb build bench-pipeline -Doptimize=ReleaseFast -- -n 1000000 --rounds 5
+tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
+```
+
+`TLS pack 6 HEADERS+DATA` is a few nanoseconds and zero allocs. Do not
+spend another round on the memcpy. Session request+response and empty zio
+spawn+await are the rows that can still move a one-shot number.
+
+Official one-shot:
+
+```sh
+./zb build bench -Doptimize=ReleaseFast -- -n 100000 -c 50 -m 10 -t 4 --rounds 3
+tools/bench-hendrik.sh -n 100000 -c 50 -m 10 -t 4 --rounds 3
+```
+
+Keep `tools/sse_bench/phase-trace.sh` as the paired axis. Drain-turn
+coalescing is what paid SSE; do not undo it to buy one-shot.
+
+## Tried and rejected (do not retry without new evidence)
+
+- Skipping the one-shot ticket wait collapsed ~176k → ~1.6k req/s with a
+  lock-convoy `block` around 10 ms. The receipt is the self-clock, same as
+  SSE.
+- Running a complete-response handler on the actor dropped ~176k → ~123k
+  (encode left the parallel handler tasks and serialized onto the actor).
+- More packing micros, or TLS encrypt 6×50 B vs 1×300 B: live already
+  showed `records/response` 1.00 → 0.17 and only a small throughput step.
+- Starting by changing zio.
+
+## What is left
+
+Per-request allocation (~11 allocs / ~1.4 KiB on the traced one-shot path)
+and spawn/dispatch. Symbolicate `oneshot-phase-trace.sh` top alloc sites
+against the bench binary. Typical once-per-request sites: HPACK literals,
+`HandlerJob`, HEADERS/DATA frame `alloc`, TLS ciphertext `dupe`.
+
+Do not drop scheduler pending without RST-on-wire or fail-close. That is
+the TLS stall in `TLS_STALL_BRIEF.md` / `57359b7`, a different defect.
+`not-started` (`started < total`) is t-761, also different.

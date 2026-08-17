@@ -24,6 +24,8 @@
 //! - `--opponent <binary>` adds a third arm. It is optional, and its absence
 //!   is PRINTED rather than assumed, because a table with a missing row reads
 //!   like a complete table.
+//! - `--opponent-name` and `--opponent-revision` make that arm attributable.
+//!   A number for an unnamed binary at an unknown commit cannot be reproduced.
 //! - Every arm must serve the same number of body bytes. The harness reads
 //!   each arm's body length first and REFUSES to run when they differ. A
 //!   throughput ratio between two different payloads is not a ratio.
@@ -31,11 +33,12 @@
 //! # Rules
 //!
 //! - An arm that does not answer 200 aborts the run. It is never skipped.
-//! - Arms alternate within each round, so drift and background load reach
-//!   every arm rather than only the last one.
+//! - The starting arm rotates across rounds, so drift and background load reach
+//!   every arm rather than consistently favoring one position.
 //! - Rounds are reported individually, not only as a mean. A mean hides the
 //!   spread, and the spread is how a reader judges whether to trust the gap.
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// The point at which a rise between `-t` and `-t*2` means the client, not the
 /// server, set the number. 10% is well above run-to-run noise here, which sits
@@ -53,6 +56,9 @@ const collapse_ratio: f64 = 0.5;
 const Config = struct {
     server: []const u8 = "",
     opponent: []const u8 = "",
+    opponent_name: []const u8 = "opponent",
+    opponent_revision: []const u8 = "",
+    opponent_only: bool = false,
     /// Its own default port, so the opponent runs unmodified and unconfigured.
     opponent_url: []const u8 = "https://127.0.0.1:8443/",
     /// Most servers load a certificate relative to their own working
@@ -77,8 +83,13 @@ const Arm = struct {
     body_bytes: usize = 0,
     /// Per round, at the base thread count.
     rps: [8]f64 = @splat(0),
+    p50_us: [8]f64 = @splat(0),
+    p99_us: [8]f64 = @splat(0),
     /// One run at double the threads, to catch a client-limited arm.
     rps_double: f64 = 0,
+    cpu_seconds: f64 = 0,
+    peak_rss_bytes: usize = 0,
+    retained_rss_bytes: usize = 0,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Config {
@@ -96,6 +107,12 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Config {
             cfg.server = try gpa.dupe(u8, val.next(&args, "--server"));
         } else if (std.mem.eql(u8, a, "--opponent")) {
             cfg.opponent = try gpa.dupe(u8, val.next(&args, "--opponent"));
+        } else if (std.mem.eql(u8, a, "--opponent-name")) {
+            cfg.opponent_name = try gpa.dupe(u8, val.next(&args, "--opponent-name"));
+        } else if (std.mem.eql(u8, a, "--opponent-revision")) {
+            cfg.opponent_revision = try gpa.dupe(u8, val.next(&args, "--opponent-revision"));
+        } else if (std.mem.eql(u8, a, "--opponent-only")) {
+            cfg.opponent_only = true;
         } else if (std.mem.eql(u8, a, "--opponent-url")) {
             cfg.opponent_url = try gpa.dupe(u8, val.next(&args, "--opponent-url"));
         } else if (std.mem.eql(u8, a, "--opponent-cwd")) {
@@ -115,12 +132,34 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Config {
         }
     }
     if (cfg.server.len == 0) abort("--server <starh2-bench-server> is required", .{});
+    if (cfg.opponent_only and cfg.opponent.len == 0) abort("--opponent-only requires --opponent", .{});
     if (cfg.rounds == 0 or cfg.rounds > 8) abort("--rounds must be 1..8; zero rounds is not a result", .{});
     return cfg;
 }
 
 /// Run h2load once and return (req/s, succeeded, failed, body bytes).
-const Sample = struct { rps: f64, succeeded: usize, failed: usize, data_bytes: usize };
+const Sample = struct {
+    rps: f64,
+    succeeded: usize,
+    failed: usize,
+    data_bytes: usize,
+    p50_us: f64,
+    p99_us: f64,
+};
+
+fn durationUs(text: []const u8) ?f64 {
+    const scale: f64, const number = if (std.mem.endsWith(u8, text, "ns"))
+        .{ 0.001, text[0 .. text.len - 2] }
+    else if (std.mem.endsWith(u8, text, "us"))
+        .{ 1.0, text[0 .. text.len - 2] }
+    else if (std.mem.endsWith(u8, text, "ms"))
+        .{ 1_000.0, text[0 .. text.len - 2] }
+    else if (std.mem.endsWith(u8, text, "s"))
+        .{ 1_000_000.0, text[0 .. text.len - 1] }
+    else
+        return null;
+    return (std.fmt.parseFloat(f64, number) catch return null) * scale;
+}
 
 fn h2load(
     gpa: std.mem.Allocator,
@@ -145,8 +184,19 @@ fn h2load(
     }) catch abort("cannot run h2load — install nghttp2", .{});
     defer gpa.free(res.stdout);
     defer gpa.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| if (code != 0) abort("h2load exited {d}: {s}", .{ code, res.stderr }),
+        else => abort("h2load did not exit normally: {any}", .{res.term}),
+    }
 
-    var out: Sample = .{ .rps = 0, .succeeded = 0, .failed = 0, .data_bytes = 0 };
+    var out: Sample = .{
+        .rps = 0,
+        .succeeded = 0,
+        .failed = 0,
+        .data_bytes = 0,
+        .p50_us = 0,
+        .p99_us = 0,
+    };
     var it = std.mem.splitScalar(u8, res.stdout, '\n');
     while (it.next()) |line| {
         if (std.mem.startsWith(u8, line, "finished in")) {
@@ -166,7 +216,19 @@ fn h2load(
                 const open = std.mem.lastIndexOfScalar(u8, head, '(') orelse 0;
                 out.data_bytes = std.fmt.parseInt(usize, head[open + 1 ..], 10) catch 0;
             }
+        } else if (std.mem.startsWith(u8, line, "request")) {
+            var fields = std.mem.tokenizeAny(u8, line, " \t");
+            if (!std.mem.eql(u8, fields.next() orelse continue, "request")) continue;
+            if (!std.mem.eql(u8, fields.next() orelse continue, ":")) continue;
+            _ = fields.next(); // min
+            _ = fields.next(); // max
+            out.p50_us = durationUs(fields.next() orelse continue) orelse 0;
+            _ = fields.next(); // p95
+            out.p99_us = durationUs(fields.next() orelse continue) orelse 0;
         }
+    }
+    if (out.p50_us == 0 or out.p99_us == 0) {
+        abort("could not parse h2load request percentiles", .{});
     }
     return out;
 }
@@ -185,6 +247,72 @@ fn mean(values: []const f64) f64 {
     return sum / @as(f64, @floatFromInt(values.len));
 }
 
+fn timevalSeconds(tv: anytype) f64 {
+    return @as(f64, @floatFromInt(tv.sec)) +
+        @as(f64, @floatFromInt(tv.usec)) / 1_000_000.0;
+}
+
+fn childCpuSeconds(child: *const std.process.Child) ?f64 {
+    return switch (builtin.os.tag) {
+        .dragonfly,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        .illumos,
+        .linux,
+        .serenity,
+        .driverkit,
+        .ios,
+        .maccatalyst,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        => if (child.resource_usage_statistics.rusage) |ru|
+            timevalSeconds(ru.utime) + timevalSeconds(ru.stime)
+        else
+            null,
+        else => null,
+    };
+}
+
+fn currentRssBytes(gpa: std.mem.Allocator, io: std.Io, child: *const std.process.Child) ?usize {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return null,
+        else => {},
+    }
+    const pid = child.id orelse return null;
+    const pid_s = std.fmt.allocPrint(gpa, "{d}", .{pid}) catch return null;
+    defer gpa.free(pid_s);
+    const res = std.process.run(gpa, io, .{
+        .argv = &.{ "ps", "-o", "rss=", "-p", pid_s },
+    }) catch return null;
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+    if (res.term != .exited or res.term.exited != 0) return null;
+    const kb = std.fmt.parseInt(usize, std.mem.trim(u8, res.stdout, " \t\r\n"), 10) catch return null;
+    return kb * 1024;
+}
+
+fn stopAndCollect(child: *std.process.Child, io: std.Io) void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => {
+            child.kill(io);
+            return;
+        },
+        else => {},
+    }
+    const pid = child.id orelse return;
+    std.posix.kill(pid, .TERM) catch {
+        child.kill(io);
+        return;
+    };
+    _ = child.wait(io) catch {
+        child.kill(io);
+        return;
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -199,12 +327,14 @@ pub fn main(init: std.process.Init) !void {
         .argv = &.{ cfg.server, "--mode", "tls", "--port", "19443" },
         .stdout = .ignore,
         .stderr = .ignore,
+        .request_resource_usage_statistics = true,
     }) catch abort("cannot spawn {s}", .{cfg.server});
     defer tls_child.kill(io);
     var h2c_child = std.process.spawn(io, .{
         .argv = &.{ cfg.server, "--mode", "h2c", "--port", "19445" },
         .stdout = .ignore,
         .stderr = .ignore,
+        .request_resource_usage_statistics = true,
     }) catch abort("cannot spawn {s}", .{cfg.server});
     defer h2c_child.kill(io);
 
@@ -215,6 +345,7 @@ pub fn main(init: std.process.Init) !void {
             .cwd = if (cfg.opponent_cwd.len != 0) .{ .path = cfg.opponent_cwd } else .inherit,
             .stdout = .ignore,
             .stderr = .ignore,
+            .request_resource_usage_statistics = true,
         }) catch abort("cannot spawn the opponent at {s}", .{cfg.opponent});
     }
     defer if (opponent_child) |*c| c.kill(io);
@@ -224,10 +355,22 @@ pub fn main(init: std.process.Init) !void {
     std.Io.sleep(io, .fromSeconds(2), .awake) catch {};
 
     var arms: std.ArrayList(Arm) = .empty;
-    try arms.append(arena, .{ .name = "starh2 tls", .url = "https://127.0.0.1:19443/" });
-    try arms.append(arena, .{ .name = "starh2 h2c", .url = "http://127.0.0.1:19445/" });
+    if (!cfg.opponent_only) {
+        try arms.append(arena, .{ .name = "starh2 tls", .url = "https://127.0.0.1:19443/", .child = &tls_child });
+        try arms.append(arena, .{ .name = "starh2 h2c", .url = "http://127.0.0.1:19445/", .child = &h2c_child });
+    }
     if (cfg.opponent.len != 0) {
-        try arms.append(arena, .{ .name = "opponent  ", .url = cfg.opponent_url });
+        try arms.append(arena, .{
+            .name = cfg.opponent_name,
+            .url = cfg.opponent_url,
+            .child = if (opponent_child) |*child| child else unreachable,
+        });
+        if (cfg.opponent_revision.len != 0) {
+            std.debug.print("bench: opponent {s} revision {s}\n", .{
+                cfg.opponent_name,
+                cfg.opponent_revision,
+            });
+        }
     } else {
         std.debug.print("bench: NO OPPONENT. Only the starh2 arms ran; pass --opponent <binary>.\n", .{});
     }
@@ -253,11 +396,23 @@ pub fn main(init: std.process.Init) !void {
 
     var round: usize = 0;
     while (round < cfg.rounds) : (round += 1) {
-        for (arms.items) |*arm| {
+        // Rotate the first arm each round. With three arms and three rounds,
+        // each server runs first, middle, and last once, so thermal/background
+        // drift cannot consistently favor one implementation.
+        for (0..arms.items.len) |offset| {
+            const arm = &arms.items[(round + offset) % arms.items.len];
             const s = try h2load(arena, io, arm.url, cfg.requests, cfg.connections, cfg.streams, cfg.threads);
             if (s.failed != 0) abort("{s} failed {d} requests — the number is meaningless", .{ arm.name, s.failed });
             arm.rps[round] = s.rps;
-            std.debug.print("  round {d}  {s}  {d:.0} req/s\n", .{ round + 1, arm.name, s.rps });
+            arm.p50_us[round] = s.p50_us;
+            arm.p99_us[round] = s.p99_us;
+            std.debug.print("  round {d}  {s}  {d:.0} req/s  p50={d:.1}us p99={d:.1}us\n", .{
+                round + 1,
+                arm.name,
+                s.rps,
+                s.p50_us,
+                s.p99_us,
+            });
         }
     }
 
@@ -267,20 +422,45 @@ pub fn main(init: std.process.Init) !void {
         arm.rps_double = s.rps;
     }
 
-    std.debug.print("\n  {s:<12} {s:>12} {s:>14} {s:>10}\n", .{ "arm", "mean req/s", "at 2x threads", "verdict" });
+    for (arms.items) |*arm| {
+        const child = arm.child.?;
+        arm.retained_rss_bytes = currentRssBytes(arena, io, child) orelse 0;
+        stopAndCollect(child, io);
+        arm.cpu_seconds = childCpuSeconds(child) orelse 0;
+        arm.peak_rss_bytes = child.resource_usage_statistics.getMaxRss() orelse 0;
+    }
+
+    const requests_per_arm = cfg.requests * (cfg.rounds + 1) + 1;
+    std.debug.print("\n  {s:<14} {s:>12} {s:>14} {s:>11} {s:>10} {s:>10} {s:>10}\n", .{
+        "arm",
+        "mean req/s",
+        "at 2x threads",
+        "CPU/req",
+        "CPU total",
+        "peak RSS",
+        "verdict",
+    });
     var limited_any = false;
     var collapsed_any = false;
     for (arms.items) |arm| {
         const m = mean(arm.rps[0..cfg.rounds]);
         const limited = arm.rps_double > m * client_limit_ratio;
         const collapsed = arm.rps_double < m * collapse_ratio;
+        const cpu_ns_per_request = arm.cpu_seconds * 1_000_000_000.0 /
+            @as(f64, @floatFromInt(requests_per_arm));
         if (limited) limited_any = true;
         if (collapsed) collapsed_any = true;
-        std.debug.print("  {s:<12} {d:>12.0} {d:>14.0} {s:>10}\n", .{
+        std.debug.print("  {s:<14} {d:>12.0} {d:>14.0} {d:>8.0}ns {d:>8.2}s {d:>7.1}MiB {s:>10}\n", .{
             arm.name,
             m,
             arm.rps_double,
+            cpu_ns_per_request,
+            arm.cpu_seconds,
+            @as(f64, @floatFromInt(arm.peak_rss_bytes)) / (1024.0 * 1024.0),
             if (collapsed) "BROKEN RUN" else if (limited) "CLIENT-LIMITED" else "server-bound",
+        });
+        std.debug.print("    retained RSS before shutdown: {d:.1}MiB\n", .{
+            @as(f64, @floatFromInt(arm.retained_rss_bytes)) / (1024.0 * 1024.0),
         });
     }
 

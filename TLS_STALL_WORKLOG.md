@@ -106,4 +106,5 @@ source fires; pending DATA is no longer stranded on a RST tombstone.
 not-started remains (~7/40, ~1686 failed ≈ one of 50 clients). Do not fold it
 into this stall. Terminal enqueue fail still fail-closes that connection.
 
-`./zb build test` green. Do not call it done without `./zb build ci`. Not committed.
+Landed as `57359b7`. `./zb build ci` passed on that commit. `not-started`
+remains t-761; do not fold it into this stall.

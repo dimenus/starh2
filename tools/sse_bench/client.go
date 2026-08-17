@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,12 +47,17 @@ func main() {
 	url := flag.String("url", "", "SSE endpoint")
 	streams := flag.Int("streams", 100, "concurrent streams")
 	seconds := flag.Int("seconds", 10, "measurement window")
-	stall := flag.Bool("stall", false, "one stream stops reading after 1s")
+	warmup := flag.Int("warmup", 1, "discarded seconds after every stream opens")
+	stall := flag.Bool("stall", false, "one stream stops reading after opening")
 	conns := flag.Int("conns", 1, "TCP connections to spread the streams over")
 	label := flag.String("label", "arm", "name for the report")
 	flag.Parse()
 	if *url == "" {
 		fmt.Fprintln(os.Stderr, "-url is required")
+		os.Exit(1)
+	}
+	if *streams <= 0 || *seconds <= 0 || *warmup < 0 || *conns <= 0 {
+		fmt.Fprintln(os.Stderr, "-streams, -seconds, and -conns must be positive; -warmup must be non-negative")
 		os.Exit(1)
 	}
 
@@ -68,15 +74,27 @@ func main() {
 		clients[i] = &http.Client{Transport: tr}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*seconds)*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	safety := time.AfterFunc(time.Duration(*seconds+*warmup+30)*time.Second, cancel)
+	defer safety.Stop()
 
 	results := make([]result, *streams)
 	var wg sync.WaitGroup
+	var ready sync.WaitGroup
+	ready.Add(*streams)
+	var measurementStart atomic.Int64
+	measurementStart.Store(1<<63 - 1)
 	for i := 0; i < *streams; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			readyReported := false
+			defer func() {
+				if !readyReported {
+					ready.Done()
+				}
+			}()
 			r := result{stream: i}
 			// The stalled consumer is stream 0 and only when asked for.
 			r.stalled = *stall && i == 0
@@ -98,10 +116,12 @@ func main() {
 				results[i] = r
 				return
 			}
+			ready.Done()
+			readyReported = true
 			if r.stalled {
-				// Read nothing after the first second: the server's window for
-				// this stream fills and stays full.
-				time.Sleep(time.Duration(*seconds) * time.Second)
+				// Read nothing after opening: the server's window for this
+				// stream fills while every other stream is measured.
+				<-ctx.Done()
 				results[i] = r
 				return
 			}
@@ -117,13 +137,21 @@ func main() {
 				if err != nil {
 					continue
 				}
+				if sent < measurementStart.Load() {
+					continue
+				}
 				r.events++
 				r.latencies = append(r.latencies, time.Duration(now-sent))
 			}
 			results[i] = r
 		}(i)
 	}
+	ready.Wait()
+	start := time.Now().Add(time.Duration(*warmup) * time.Second)
+	measurementStart.Store(start.UnixNano())
+	stop := time.AfterFunc(time.Until(start)+time.Duration(*seconds)*time.Second, cancel)
 	wg.Wait()
+	stop.Stop()
 
 	var all []time.Duration
 	opened, delivered, failed, totalEvents := 0, 0, 0, 0

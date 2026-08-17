@@ -79,7 +79,7 @@ test "prefill max ordinary queue: emit gap <= 64 when DATA eligible" {
 
     try sched.drain(selfPtr(&sink_state), SinkState.sink, selfPtr(&sink_state), win.stream, win.conn, win.build, selfPtr(&sink_state));
     for (sink_state.emitted.items) |e| {
-        if (e.control) sched.ctrl.release(e.n, true);
+        if (e.control) sched.ctrl.release(e.n, 1);
     }
 
     try std.testing.expect(sched.maxEligibleGapInKinds() <= cp.CONTROL_BEFORE_DATA);
@@ -130,7 +130,7 @@ test "fair scheduler: 10k controls interleaved drain gaps <= 64" {
                 // enqueueControl frees p on failure — drain and retry with a new buffer.
                 try sched.drain(selfPtr(&sink_state), SinkState.sink, selfPtr(&sink_state), win.stream, win.conn, win.build, selfPtr(&sink_state));
                 for (sink_state.emitted.items) |e| {
-                    if (e.control) sched.ctrl.release(e.n, true);
+                    if (e.control) sched.ctrl.release(e.n, 1);
                 }
                 sink_state.emitted.clearRetainingCapacity();
                 continue;
@@ -140,14 +140,14 @@ test "fair scheduler: 10k controls interleaved drain gaps <= 64" {
         if (sched.shouldForceDataNow()) {
             try sched.drain(selfPtr(&sink_state), SinkState.sink, selfPtr(&sink_state), win.stream, win.conn, win.build, selfPtr(&sink_state));
             for (sink_state.emitted.items) |e| {
-                if (e.control) sched.ctrl.release(e.n, true);
+                if (e.control) sched.ctrl.release(e.n, 1);
             }
             sink_state.emitted.clearRetainingCapacity();
         }
     }
     try sched.drain(selfPtr(&sink_state), SinkState.sink, selfPtr(&sink_state), win.stream, win.conn, win.build, selfPtr(&sink_state));
     for (sink_state.emitted.items) |e| {
-        if (e.control) sched.ctrl.release(e.n, true);
+        if (e.control) sched.ctrl.release(e.n, 1);
     }
 
     const cp = starh2.edge.control_pool;

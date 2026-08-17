@@ -1,5 +1,9 @@
 # TLS stall delta-debug (local)
 
+The 30s `stall` class (started == done == total, a handful of failed
+requests) landed in `57359b7`. This file is the harness protocol. Do not
+fold `not-started` into that result; that class is t-761.
+
 The harness is `tools/tls-stall-delta.sh`. Read its header comment for the
 protocol and for the reason behind each guard. It does not change production
 code.

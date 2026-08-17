@@ -245,6 +245,77 @@ test "completion links survive until every batched ticket is snapped" {
     try table.wait(c[1], null);
 }
 
+test "a truncated completion chain is visible before the next complete" {
+    // ticket_count too high, or a missed linkCompletion: AckDrainer must fail
+    // the walk instead of hanging the un-linked waiter.
+    var storage: [4]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    const a = try table.reserve();
+    const b = try table.reserve();
+    const c = try table.reserve();
+    try table.linkCompletion(a[1], b[1]);
+    _ = c;
+
+    var slot = a[1];
+    var remaining: u32 = 3;
+    var truncated = false;
+    while (remaining > 0) : (remaining -= 1) {
+        const meta = table.completion(slot) orelse return error.BrokenChain;
+        table.complete(slot, meta.ticket, true);
+        if (remaining > 1) {
+            if (meta.next == no_completion_slot) {
+                truncated = true;
+                break;
+            }
+            slot = meta.next;
+        }
+    }
+    try std.testing.expect(truncated);
+}
+
+test "an over-long completion chain is visible on the last hop" {
+    // ticket_count too low: the leftover link would strand the next waiter if
+    // AckDrainer treated the walk as done.
+    var storage: [4]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    const a = try table.reserve();
+    const b = try table.reserve();
+    try table.linkCompletion(a[1], b[1]);
+
+    const meta = table.completion(a[1]) orelse return error.BrokenChain;
+    table.complete(a[1], meta.ticket, true);
+    try std.testing.expect(meta.next != no_completion_slot);
+}
+
+test "a six-ticket one-shot chain snaps in order without dropping a link" {
+    // Packed TLS: six responses, one WriteChunk, AckDrainer walks the chain.
+    // Snapshot next BEFORE complete, because complete wakes the handler which
+    // may reuse the slot. Truncating the walk would hang the un-snapped waiters.
+    var storage: [8]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    var ids: [6]struct { ticket: u64, slot: u32 } = undefined;
+    for (&ids) |*id| {
+        const got = try table.reserve();
+        id.* = .{ .ticket = got[0], .slot = got[1] };
+    }
+    for (0..5) |i| {
+        try table.linkCompletion(ids[i].slot, ids[i + 1].slot);
+    }
+    var slot = ids[0].slot;
+    var remaining: u32 = 6;
+    while (remaining > 0) : (remaining -= 1) {
+        const meta = table.completion(slot) orelse return error.BrokenChain;
+        table.complete(slot, meta.ticket, true);
+        if (remaining > 1) {
+            try std.testing.expect(meta.next != no_completion_slot);
+            slot = meta.next;
+        } else {
+            try std.testing.expectEqual(no_completion_slot, meta.next);
+        }
+    }
+    for (ids) |id| try table.wait(id.slot, null);
+}
+
 test "ticket releaseReserved on abandon" {
     var storage: [2]TicketWait = undefined;
     var table = TicketTable.init(std.testing.io, &storage);

@@ -88,6 +88,7 @@ const h2c = @import("h2c.zig");
 const rates_mod = @import("../core/rates.zig");
 const ticket_table = @import("ticket_table.zig");
 const control_pool = @import("control_pool.zig");
+const emit_batch = @import("emit_batch.zig");
 const fair_scheduler = @import("fair_scheduler.zig");
 const io_queue = @import("io_queue.zig");
 const slab_pool = @import("slab_pool.zig");
@@ -801,7 +802,7 @@ const Connection = struct {
             if (chunk.bytes.len != 0) self.config.gpa.free(chunk.bytes);
             // Release amounts without AckDrainer (teardown path).
             self.applyOutboundRelease(chunk.outbound_release, .wire);
-            if (chunk.control_entry) self.applyControlRelease(chunk.control_release, true);
+            if (chunk.control_entries != 0) self.applyControlRelease(chunk.control_release, chunk.control_entries);
         }
         while (io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io)) |chunk| {
             if (chunk.pool_index) |idx| {
@@ -820,7 +821,7 @@ const Connection = struct {
         for (self.handlers) |s| std.debug.assert(!s.in_use);
         while (io_queue.tryGet(wire_pump.WriteCompletion, &self.write_ack_ch, io)) |ack| {
             self.applyOutboundRelease(ack.outbound_release, .wire);
-            if (ack.control_entry) self.applyControlRelease(ack.control_release, true);
+            if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
         }
 
         self.session.deinit();
@@ -922,8 +923,8 @@ const Connection = struct {
         if (self.config.accounting) |a| a.releaseOutbound(n);
     }
 
-    fn applyControlRelease(self: *Connection, n: usize, entry: bool) void {
-        self.sched.ctrl.release(n, entry);
+    fn applyControlRelease(self: *Connection, n: usize, entries: u32) void {
+        self.sched.ctrl.release(n, @as(usize, entries));
     }
 
     /// The AckDrainer task. It exists so that the WritePump can stay a pure
@@ -979,7 +980,7 @@ const Connection = struct {
             const ack = self.write_ack_ch.getOne(self.config.io) catch break;
             var wake_actor = ack.shutdown;
             self.applyOutboundRelease(ack.outbound_release, .wire);
-            if (ack.control_entry) self.applyControlRelease(ack.control_release, true);
+            if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
             if (ack.fail_all) {
                 self.writer_failed.store(true, .release);
                 self.tickets.failAll();
@@ -1086,11 +1087,11 @@ const Connection = struct {
         }
         // Drain control queues without writing (connection is dead).
         while (self.sched.popTerminal()) |e| {
-            self.sched.ctrl.release(e.control_n, true);
+            self.sched.ctrl.release(e.control_n, 1);
             self.config.gpa.free(e.payload);
         }
         while (self.sched.popOrdinary()) |e| {
-            self.sched.ctrl.release(e.control_n, true);
+            self.sched.ctrl.release(e.control_n, 1);
             self.config.gpa.free(e.payload);
         }
 
@@ -1608,7 +1609,7 @@ const Connection = struct {
             const res = tls_edge.connectionClose(tc, self.ciphertext_scratch);
             if (res.ciphertext_len > 0) {
                 const out = try gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
-                self.sendAccountedWire(out, true, 0, 0, 0, 0, false) catch {
+                self.sendAccountedWire(out, true, 0, 0, 0, 0, 0) catch {
                     // The connection is already terminal; close-notify is best-effort.
                 };
             }
@@ -1739,7 +1740,7 @@ const Connection = struct {
             const drive = tls_edge.serverDrive(srv, self.tls_recv_acc.items, self.ciphertext_scratch);
             if (drive.ciphertext_len > 0) {
                 const out = try gpa.dupe(u8, self.ciphertext_scratch[0..drive.ciphertext_len]);
-                try self.sendAccountedWire(out, true, 0, 0, 0, 0, false);
+                try self.sendAccountedWire(out, true, 0, 0, 0, 0, 0);
             }
             // `consumed` crosses the boundary from the pinned tls.zig fork. A
             // value larger than the input would underflow `rest` — a usize
@@ -2026,7 +2027,7 @@ const Connection = struct {
             if (res.ciphertext_len > 0) {
                 const out = try self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]);
                 // TLS close-notify is best-effort; sendAccountedWire releases `out` on failure.
-                self.sendAccountedWire(out, true, 0, 0, 0, 0, false) catch {};
+                self.sendAccountedWire(out, true, 0, 0, 0, 0, 0) catch {};
             }
             // Same ABI contract as the handshake drive above, plus the two
             // output lengths this path slices with.
@@ -2219,9 +2220,13 @@ const Connection = struct {
     }
 
     /// Single FairScheduler drain: terminal → ordinary(+forced DATA) → DRR DATA.
-    /// Ticketed TLS DATA from that turn is copied into the existing plaintext
-    /// scratch and handed to queueWire as one record-sized input. Non-ticketed
-    /// DATA and controls preserve their immediate per-frame handoff. All emits
+    /// On TLS, every control and ticketed DATA from that turn copies into the
+    /// boot-counted plaintext scratch and becomes one queueWire input, up to
+    /// 16 KiB. WireChunk.control_entries carries how many control-pool slots
+    /// the batch holds, so AckDrainer can release occupancy exactly. A second
+    /// HEADERS used to flush the first instead, which is why one-shot TLS
+    /// emitted one record per response while SSE (DATA only) packed a turn.
+    /// Non-ticketed DATA still takes the immediate per-frame handoff. All emits
     /// still go through queueWire via the scheduler sink only.
     ///
     /// Actor-only, under `session_mu`. The three callbacks below are how the
@@ -2239,21 +2244,8 @@ const Connection = struct {
         self.assertSessionHeld("drainEmit");
         const SinkCtx = struct {
             c: *Connection,
-            len: usize = 0,
-            first_ticket: u64 = 0,
-            first_ticket_slot: u32 = 0,
-            last_ticket_slot: u32 = 0,
-            ticket_count: u32 = 0,
-            needs_flush: bool = false,
-            control_n: usize = 0,
-            control_entry: bool = false,
+            emit: emit_batch.EmitBatch,
             tickets_emitted: u32 = 0,
-
-            fn capacity(batch: *const @This()) usize {
-                // TLS 1.3 application plaintext is at most 16 KiB. The extra
-                // scratch byte is decrypt's inner content type, not payload.
-                return batch.c.plaintext_scratch.len - 1;
-            }
 
             fn queue(
                 batch: *@This(),
@@ -2263,7 +2255,7 @@ const Connection = struct {
                 ticket_slot: u32,
                 ticket_count: u32,
                 control_n: usize,
-                control_entry: bool,
+                control_entries: u32,
                 owns_payload: bool,
             ) anyerror!void {
                 // A completed batch is still scheduler-originated output even
@@ -2278,49 +2270,31 @@ const Connection = struct {
                     ticket_slot,
                     ticket_count,
                     control_n,
-                    control_entry,
+                    control_entries,
                     owns_payload,
                 );
             }
 
             fn flushBatch(batch: *@This()) anyerror!void {
-                if (batch.len == 0) {
-                    std.debug.assert(batch.ticket_count == 0);
-                    std.debug.assert(!batch.control_entry);
+                if (batch.emit.empty()) {
+                    std.debug.assert(batch.emit.ticket_count == 0);
+                    std.debug.assert(batch.emit.control_entries == 0);
                     return;
                 }
-                // A response with a body contributes an ordinary HEADERS
-                // control followed by ticketed DATA. A headers-only response
-                // contributes one ticketed control. Either is sufficient to
-                // make a non-empty batch meaningful.
-                std.debug.assert(batch.ticket_count > 0 or batch.control_entry);
-                const flush = batch.needs_flush;
-                const ticket = batch.first_ticket;
-                const ticket_slot = batch.first_ticket_slot;
-                const ticket_count = batch.ticket_count;
-                const control_n = batch.control_n;
-                const control_entry = batch.control_entry;
+                const taken = batch.emit.take();
                 // queueWire encrypts this borrowed slice synchronously. The
                 // buffer is the connection's boot-counted TLS plaintext
                 // scratch, so a batch adds no allocation and no new limit.
                 try batch.queue(
-                    batch.c.plaintext_scratch[0..batch.len],
-                    flush,
-                    ticket,
-                    ticket_slot,
-                    ticket_count,
-                    control_n,
-                    control_entry,
+                    taken.bytes,
+                    taken.flush,
+                    taken.ticket,
+                    taken.ticket_slot,
+                    taken.ticket_count,
+                    taken.control_n,
+                    taken.control_entries,
                     false,
                 );
-                batch.len = 0;
-                batch.first_ticket = 0;
-                batch.first_ticket_slot = 0;
-                batch.last_ticket_slot = 0;
-                batch.ticket_count = 0;
-                batch.needs_flush = false;
-                batch.control_n = 0;
-                batch.control_entry = false;
             }
 
             fn sink(
@@ -2338,53 +2312,37 @@ const Connection = struct {
                 // sink accepted the framed lease. Wire chunk.outbound_release tracks
                 // the framed size reserved in sendAccountedWire (acked separately).
                 //
-                // At most one control entry joins a batch because WireChunk
-                // carries one control-entry release. A second control flushes
-                // the first instead of silently under-releasing the pool.
-                if (control_entry and batch.control_entry) {
-                    batch.flushBatch() catch |err| {
-                        c.config.gpa.free(payload);
-                        return err;
-                    };
-                }
-                const batchable = c.tls_conn != null and
-                    (control_entry or ticket != 0) and
-                    payload.len <= batch.capacity();
-                if (batchable) {
-                    if (batch.len + payload.len > batch.capacity()) {
+                // Several HEADERS may share one plaintext. Occupancy is still
+                // held until the write completes; control_entries is how many
+                // reserved slots that completion must return.
+                if (emit_batch.frameIsBatchable(
+                    c.tls_conn != null,
+                    control_entry,
+                    ticket,
+                    payload.len,
+                    batch.emit.capacity(),
+                )) {
+                    if (!batch.emit.wouldFit(payload.len)) {
                         batch.flushBatch() catch |err| {
                             c.config.gpa.free(payload);
                             return err;
                         };
                     }
                     if (ticket != 0) {
-                        if (batch.ticket_count != 0) {
-                            c.tickets.linkCompletion(batch.last_ticket_slot, ticket_slot) catch {
-                                if (batch.control_entry) {
-                                    c.applyControlRelease(batch.control_n, true);
-                                    batch.control_n = 0;
-                                    batch.control_entry = false;
+                        if (batch.emit.ticket_count != 0) {
+                            c.tickets.linkCompletion(batch.emit.last_ticket_slot, ticket_slot) catch {
+                                if (batch.emit.control_entries != 0) {
+                                    c.applyControlRelease(batch.emit.control_n, batch.emit.control_entries);
+                                    batch.emit.control_n = 0;
+                                    batch.emit.control_entries = 0;
                                 }
                                 c.config.gpa.free(payload);
                                 return error.WriteFailed;
                             };
-                        } else {
-                            batch.first_ticket = ticket;
-                            batch.first_ticket_slot = ticket_slot;
                         }
-                        batch.last_ticket_slot = ticket_slot;
-                        batch.ticket_count += 1;
+                        batch.emit.noteTicket(ticket, ticket_slot);
                     }
-                    @memcpy(
-                        c.plaintext_scratch[batch.len..][0..payload.len],
-                        payload,
-                    );
-                    batch.len += payload.len;
-                    batch.needs_flush = batch.needs_flush or flush;
-                    if (control_entry) {
-                        batch.control_n = control_n;
-                        batch.control_entry = true;
-                    }
+                    batch.emit.copyFrame(payload, flush, control_n, control_entry);
                     c.config.gpa.free(payload);
                 } else {
                     batch.flushBatch() catch |err| {
@@ -2398,7 +2356,7 @@ const Connection = struct {
                         ticket_slot,
                         if (ticket != 0) 1 else 0,
                         control_n,
-                        control_entry,
+                        if (control_entry) 1 else 0,
                         true,
                     );
                 }
@@ -2430,7 +2388,11 @@ const Connection = struct {
                 return data_payload;
             }
         };
-        var sink_ctx: SinkCtx = .{ .c = self };
+        std.debug.assert(self.plaintext_scratch.len == emit_batch.max_plaintext + 1);
+        var sink_ctx: SinkCtx = .{
+            .c = self,
+            .emit = .{ .buf = self.plaintext_scratch[0 .. self.plaintext_scratch.len - 1] },
+        };
         self.sched.drain(
             &sink_ctx,
             SinkCtx.sink,
@@ -2624,11 +2586,11 @@ const Connection = struct {
         ticket_slot: u32,
         ticket_count: u32,
         control_n: usize,
-        control_entry: bool,
+        control_entries: u32,
     ) anyerror!void {
         if (!self.tryReserveOutboundBytes(out.len, .wire)) {
             self.config.gpa.free(out);
-            if (control_entry) self.applyControlRelease(control_n, true);
+            if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return error.OutOfMemory;
         }
         if (trace.enabled) _ = trace.records.fetchAdd(1, .monotonic);
@@ -2641,10 +2603,10 @@ const Connection = struct {
             .ticket_count = ticket_count,
             .outbound_release = out.len,
             .control_release = control_n,
-            .control_entry = control_entry,
+            .control_entries = control_entries,
         }) catch {
             self.applyOutboundRelease(out.len, .wire);
-            if (control_entry) self.applyControlRelease(control_n, true);
+            if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             self.config.gpa.free(out);
             return error.WriteFailed;
         };
@@ -2691,7 +2653,7 @@ const Connection = struct {
         ticket_slot: u32,
         ticket_count: u32,
         control_n: usize,
-        control_entry: bool,
+        control_entries: u32,
         owns_bytes: bool,
     ) anyerror!void {
         if (!test_in_sched_sink) {
@@ -2704,7 +2666,7 @@ const Connection = struct {
         const fail_after = test_force_wire_fail_after.load(.acquire);
         if (fail_after != 0 and sends + 1 >= fail_after) {
             if (owns_bytes) self.config.gpa.free(bytes);
-            if (control_entry) self.applyControlRelease(control_n, true);
+            if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return error.WriteFailed;
         }
         if (self.tls_conn) |*tc| {
@@ -2712,7 +2674,7 @@ const Connection = struct {
             if (owns_bytes) {
                 if (!self.tryReserveOutboundBytes(bytes.len, .wire)) {
                     self.config.gpa.free(bytes);
-                    if (control_entry) self.applyControlRelease(control_n, true);
+                    if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
                     return error.OutOfMemory;
                 }
                 reserved_plain = bytes.len;
@@ -2729,17 +2691,27 @@ const Connection = struct {
                 if (res.ciphertext_len > 0) {
                     const out = self.config.gpa.dupe(u8, self.ciphertext_scratch[0..res.ciphertext_len]) catch {
                         if (owns_bytes) self.config.gpa.free(bytes);
-                        if (control_entry) self.applyControlRelease(control_n, true);
+                        if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
                         return error.OutOfMemory;
                     };
                     const next_off = off + res.consumed;
                     const is_last = next_off >= bytes.len;
-                    const t: u64 = if (is_last) ticket else 0;
-                    const s: u32 = if (is_last) ticket_slot else 0;
-                    const tn: u32 = if (is_last) ticket_count else 0;
-                    const cn: usize = if (is_last) control_n else 0;
-                    const ce = is_last and control_entry;
-                    self.sendAccountedWire(out, flush and is_last, t, s, tn, cn, ce) catch {
+                    const meta = emit_batch.lastRecordMeta(is_last, .{
+                        .ticket = ticket,
+                        .ticket_slot = ticket_slot,
+                        .ticket_count = ticket_count,
+                        .control_n = control_n,
+                        .control_entries = control_entries,
+                    });
+                    self.sendAccountedWire(
+                        out,
+                        emit_batch.lastRecordFlush(is_last, flush),
+                        meta.ticket,
+                        meta.ticket_slot,
+                        meta.ticket_count,
+                        meta.control_n,
+                        meta.control_entries,
+                    ) catch {
                         if (owns_bytes) self.config.gpa.free(bytes);
                         return error.WriteFailed;
                     };
@@ -2752,7 +2724,7 @@ const Connection = struct {
             if (owns_bytes) self.config.gpa.free(bytes);
         } else {
             std.debug.assert(owns_bytes);
-            try self.sendAccountedWire(bytes, flush, ticket, ticket_slot, ticket_count, control_n, control_entry);
+            try self.sendAccountedWire(bytes, flush, ticket, ticket_slot, ticket_count, control_n, control_entries);
         }
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
