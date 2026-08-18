@@ -127,9 +127,24 @@ fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *st
     mod.linkLibrary(lib);
 }
 
+fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool) void {
+    const opts = b.addOptions();
+    opts.addOption(bool, "observe", observe);
+    mod.addOptions("build_options", opts);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const observe = b.option(
+        bool,
+        "observe",
+        "Keep test-only hot counters in non-Debug artifacts (A/B the counter tax)",
+    ) orelse false;
+    // Gate builds are Debug; ReleaseFast benches compile the counters out unless
+    // `-Dobserve=true`. Do not read `builtin.mode` inside connection.zig — an
+    // imported module's mode is not the test artifact's mode.
+    const observe_hot = observe or (optimize == .Debug);
 
     const zio_dep = b.dependency("zio", .{
         .target = target,
@@ -160,6 +175,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tls", .module = tls_dep.module("tls") },
         },
     });
+    attachStarh2Options(b, starh2_mod, observe_hot);
     // Encoder only on the production module (static lib — see brotliEncLib).
     // Decoder is linked only into test artifacts that round-trip.
     const brotli_enc = brotliEncLib(b, brotli_dep, target, optimize, "brotli_enc");
@@ -202,6 +218,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tls", .module = tls_dep.module("tls") },
         },
     });
+    attachStarh2Options(b, lib_test_mod, true);
     linkBrotliEnc(lib_test_mod, brotli_dep, brotli_enc);
     linkBrotliDec(lib_test_mod, brotli_dep, brotli_dec);
     const lib_tests = b.addTest(.{
@@ -312,6 +329,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
+    const lifecycle_step = b.step("test-lifecycle", "Run lifecycle gates only");
+    lifecycle_step.dependOn(&run_lifecycle_tests.step);
 
     const backend_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -469,6 +488,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tls", .module = tls_rt.module("tls") },
             },
         });
+        attachStarh2Options(b, starh2_rt, false);
         const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .ReleaseSafe, b.fmt("brotli_enc_{s}", .{rq.name}));
         linkBrotliEnc(starh2_rt, brotli_rt, brotli_enc_rt);
         const datastar_mod_rt = b.createModule(.{

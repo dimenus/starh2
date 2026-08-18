@@ -162,6 +162,15 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   ~505k h2c (t-788 was ~288k / ~493k); packing unchanged. The hop is not
   the live gap. A skip keyed on `defer_receipt` stranded SSE shutdown
   (lifecycle hang); do not retry.
+- Treating the process-global `test_observed_*` / `test_wire_sends` RMWs
+  as a 0.10 µs chip. Sol Extra High ranked that first. Nachos ABA at
+  `-n 100000 -c 50 -m 10 -t 16 --rounds 3`, ReleaseFast, P-256, counters
+  on vs compiled out: TLS CPU/req 4.90 / 4.77 / 4.76 µs (on, off, on
+  again); h2c 4.463 / 4.464 / 4.467 µs. The on-vs-off TLS delta is
+  0.06 µs and smaller than the on-vs-on-repeat spread (0.14 µs).
+  Throughput stayed inside a few percent with no consistent winner.
+  The counters still compile out of ReleaseFast (`-Dobserve=true` puts
+  them back); they are not the remaining gap.
 
 ## What is left
 
@@ -211,6 +220,14 @@ read/dispatch/write/flush loop. Their TLS throughput is a narrower
 contract (handler or blocked write stops ingest). We keep the three
 starve stories: other connections, handler work vs actor, peer stops
 reading.
+
+Sol Extra High ranked legal chips inside that split: (1) gate test
+counters — measured, below the bar; (2) skip complete-handler reaper
+reserve; (3) clock inbound accumulator append/compaction. Wakes have
+no legal deletion. `session_mu` hold is uncontended on this
+complete-only load. Outbound ciphertext copy is already inside
+`sendAccountedWire` (~111 ns). Next measurement is (3), not another
+topology collapse.
 
 Reopen HPACK/parse only if an on-CPU h2c profile shows
 ingest+HPACK+Session ≥ 1 µs/req or 15% CPU. Sol Extra High picked A on

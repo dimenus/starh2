@@ -105,6 +105,12 @@ pub var test_hold_completion_drain: std.atomic.Value(bool) = .init(false);
 pub var test_write_delay_ms: u64 = 0;
 /// Test-only: fail write pump after N successful writes (0 = never).
 pub var test_write_fail_after: u64 = 0;
+/// Hot test counters. On in Debug (the gate builds) and when `-Dobserve=true`.
+/// Off in ReleaseFast examples so the oneshot bench does not pay process-global
+/// RMWs. Mutation canaries stay in gate builds; they are not the price of the
+/// connection split.
+pub const test_observe = @import("build_options").observe;
+
 /// Test-only: handlers running across all connections. Published by the mutation
 /// itself, not by the actor loop: an idle actor parks until the next wakeup, so a
 /// value refreshed only per iteration stays stale for as long as the connection is
@@ -1238,7 +1244,7 @@ const Connection = struct {
         if (!self.writer_failed.load(.acquire)) return;
         if (self.writer_fail_handled) return;
         self.writer_fail_handled = true;
-        test_observed_writer_fail_handled.store(true, .release);
+        if (comptime test_observe) test_observed_writer_fail_handled.store(true, .release);
 
         for (self.handlers) |*slot| {
             if (!slot.in_use) continue;
@@ -2028,7 +2034,7 @@ const Connection = struct {
 
     fn claimSlot(self: *Connection, slot: *HandlerSlot, i: usize, stream_id: u31) *HandlerSlot {
         slot.in_use = true;
-        _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
+        if (comptime test_observe) _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
         slot.stream_id = stream_id;
         slot.terminal.clear();
         _ = slot.terminal.generation.fetchAdd(1, .acq_rel);
@@ -2108,7 +2114,7 @@ const Connection = struct {
                 slot.reaper_reserved = false;
             }
             slot.in_use = false;
-            _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
+            if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
             slot.terminal.clear();
             slot.completion_owner.store(reported, .release);
             // Event state is reset only when this slot is admitted again; every
@@ -2732,7 +2738,7 @@ const Connection = struct {
                 trace.bumpMax(&trace.emit_max, sink_ctx.tickets_emitted);
             }
         }
-        test_observed_sched_emits.store(self.sched.emits_total, .release);
+        if (comptime test_observe) test_observed_sched_emits.store(self.sched.emits_total, .release);
     }
 
     /// Complete-handler drain: join unticketed DATA while a drain-turn receipt
@@ -2959,7 +2965,7 @@ const Connection = struct {
                 trace.bumpMax(&trace.emit_max, sink_ctx.tickets_emitted);
             }
         }
-        test_observed_sched_emits.store(self.sched.emits_total, .release);
+        if (comptime test_observe) test_observed_sched_emits.store(self.sched.emits_total, .release);
     }
 
     fn applyStreamResetIntent(self: *Connection, r: anytype) void {
@@ -3284,19 +3290,23 @@ const Connection = struct {
         control_entries: u32,
         owns_bytes: bool,
     ) anyerror!void {
-        if (!test_in_sched_sink) {
-            _ = test_queue_wire_bypass.fetchAdd(1, .acq_rel);
+        if (comptime test_observe) {
+            if (!test_in_sched_sink) {
+                _ = test_queue_wire_bypass.fetchAdd(1, .acq_rel);
+            }
         }
         defer if (owns_bytes) self.releaseWireBytes(bytes);
         const plain = if (owns_bytes) frame.encodedOnWire(bytes) else bytes;
         if (trace.enabled) trace.noteHandoff(ticket_count, plain.len);
         const trace_batch = trace.enabled and self.batchContainsTraceTicket(ticket_slot, ticket_count);
         if (trace_batch) self.trace_emit_ns.store(nowNs(self.config.io), .release);
-        const sends = test_wire_sends.fetchAdd(1, .acq_rel);
-        const fail_after = test_force_wire_fail_after.load(.acquire);
-        if (fail_after != 0 and sends + 1 >= fail_after) {
-            if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
-            return error.WriteFailed;
+        if (comptime test_observe) {
+            const sends = test_wire_sends.fetchAdd(1, .acq_rel);
+            const fail_after = test_force_wire_fail_after.load(.acquire);
+            if (fail_after != 0 and sends + 1 >= fail_after) {
+                if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
+                return error.WriteFailed;
+            }
         }
         if (self.tls_conn) |*tc| {
             var reserved_plain: usize = 0;
@@ -3530,7 +3540,7 @@ const Connection = struct {
         job.resp.ctx = &job.hctx;
 
         _ = self.live_handlers.fetchAdd(1, .acq_rel);
-        _ = test_observed_live_handlers.fetchAdd(1, .acq_rel);
+        if (comptime test_observe) _ = test_observed_live_handlers.fetchAdd(1, .acq_rel);
         if (trace.enabled) {
             const n = trace.jobs.fetchAdd(1, .monotonic);
             if (n % trace.sample_every == 0) {
@@ -3612,7 +3622,7 @@ const Connection = struct {
             self.actor_wake.set(self.config.io);
         }
         _ = self.live_handlers.fetchSub(1, .acq_rel);
-        _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
+        if (comptime test_observe) _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
         _ = job.arena.reset(.retain_capacity);
         self.releaseDispatchRequest(job.owned_request);
     }
@@ -3752,7 +3762,7 @@ const Connection = struct {
             while (i < batch_n) : (i += 1) {
                 const sid = self.inline_sids[i];
                 const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                _ = test_observed_inline_jobs.fetchAdd(1, .monotonic);
+                if (comptime test_observe) _ = test_observed_inline_jobs.fetchAdd(1, .monotonic);
                 job.hctx.defer_receipt = true;
                 runHandlerJobBody(job);
             }
