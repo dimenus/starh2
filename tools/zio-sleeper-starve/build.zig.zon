@@ -1,0 +1,13 @@
+.{
+    .name = .zio_sleeper_starve,
+    .version = "0.0.0",
+    .fingerprint = 0x9ac9444d27324e91,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zio = .{
+            .url = "git+https://github.com/dimenus/zio#489f31f85c134a1a2b587d46729a9fe258f7f890",
+            .hash = "zio-0.17.0-xHbVVMdhJwAj5AjSKXkFUbvCvzcXXe8mLImv3NXBxVAv",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

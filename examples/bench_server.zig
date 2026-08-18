@@ -213,7 +213,7 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         "\"handoffs\":{d},\"tickets\":{d},\"handoff_bytes\":{d},\"handoff_max\":{d}," ++
             "\"batch_1\":{d},\"batch_2\":{d},\"batch_le4\":{d},\"batch_le8\":{d}," ++
             "\"batch_le16\":{d},\"batch_ge17\":{d},\"records\":{d}," ++
-            "\"emit_turns\":{d},\"emit_tickets\":{d},\"emit_max\":{d}," ++
+            "\"emit_turns\":{d},\"emit_tickets\":{d},\"emit_max\":{d},\"complete_receipt_depth_max\":{d}," ++
             "\"write_calls\":{d},\"write_chunks\":{d},\"write_max\":{d},",
         .{
             trace.handoffs.load(.acquire),
@@ -230,6 +230,7 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             trace.emit_turns.load(.acquire),
             trace.emit_tickets.load(.acquire),
             trace.emit_max.load(.acquire),
+            trace.complete_receipt_depth_max.load(.acquire),
             write_trace.calls.load(.acquire),
             write_trace.chunks.load(.acquire),
             write_trace.max_chunks.load(.acquire),
@@ -297,8 +298,63 @@ fn helloHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteR
 /// benchmark is looking for.
 var g_sse_interval_ms: u64 = 100;
 
+/// Bench-only: where `/sse` loop time goes. Reset via GET /sse-cadence-reset.
+/// `loops` is handler iterations; `writes` is successful `writeAll`s. If
+/// `loops` matches the client event count, the ticks were never produced.
+/// If `loops` is ~16k and the client saw ~9k, they were produced and not
+/// delivered. `skipped` is arriving at the deadline already late (no sleep).
+/// `late_*` is sleeping toward a deadline and waking after it.
+const Cadence = struct {
+    loops: std.atomic.Value(u64) = .init(0),
+    sleeps: std.atomic.Value(u64) = .init(0),
+    skipped: std.atomic.Value(u64) = .init(0),
+    writes: std.atomic.Value(u64) = .init(0),
+    first_n: std.atomic.Value(u64) = .init(0),
+    inter_n: std.atomic.Value(u64) = .init(0),
+    late_n: std.atomic.Value(u64) = .init(0),
+    late_ge1ms: std.atomic.Value(u64) = .init(0),
+    sleep_req_ns: std.atomic.Value(u64) = .init(0),
+    sleep_ns: std.atomic.Value(u64) = .init(0),
+    late_ns: std.atomic.Value(u64) = .init(0),
+    write_ns: std.atomic.Value(u64) = .init(0),
+    yield_ns: std.atomic.Value(u64) = .init(0),
+    skip_behind_ns: std.atomic.Value(u64) = .init(0),
+    first_ns: std.atomic.Value(u64) = .init(0),
+    inter_ns: std.atomic.Value(u64) = .init(0),
+    start_sse_n: std.atomic.Value(u64) = .init(0),
+    start_sse_ns: std.atomic.Value(u64) = .init(0),
+    start_sse_max: std.atomic.Value(u64) = .init(0),
+
+    fn reset(self: *Cadence) void {
+        inline for (.{
+            &self.loops,         &self.sleeps,      &self.skipped,
+            &self.writes,        &self.first_n,     &self.inter_n,
+            &self.late_n,        &self.late_ge1ms,
+            &self.sleep_req_ns,  &self.sleep_ns,    &self.late_ns,
+            &self.write_ns,      &self.yield_ns,    &self.skip_behind_ns,
+            &self.first_ns,      &self.inter_ns,
+            &self.start_sse_n,   &self.start_sse_ns, &self.start_sse_max,
+        }) |f| f.store(0, .release);
+    }
+};
+
+var g_cadence: Cadence = .{};
+
 fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    const t_enter = zio.Timestamp.now(.realtime).toNanoseconds();
     var body = try resp.startSse(&.{});
+    const t_ready = zio.Timestamp.now(.realtime).toNanoseconds();
+    if (t_ready >= t_enter) {
+        const dt: u64 = @intCast(t_ready - t_enter);
+        _ = g_cadence.start_sse_n.fetchAdd(1, .monotonic);
+        _ = g_cadence.start_sse_ns.fetchAdd(dt, .monotonic);
+        var max = g_cadence.start_sse_max.load(.monotonic);
+        while (dt > max) {
+            if (g_cadence.start_sse_max.cmpxchgWeak(max, dt, .monotonic, .monotonic)) |cur| {
+                max = cur;
+            } else break;
+        }
+    }
     var buf: [64]u8 = undefined;
 
     // Sleep to a DEADLINE, never for a duration. `sleep(interval)` in a loop
@@ -307,22 +363,93 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
     // ticked slowly. That is a defect in a benchmark, not a measurement of the
     // server. Go's time.Ticker keeps a schedule, so the arms must match.
     const interval_ns: i128 = @as(i128, @intCast(g_sse_interval_ms)) * std.time.ns_per_ms;
-    var next: i128 = zio.Timestamp.now(.realtime).toNanoseconds() + interval_ns;
+    var prev_write: ?i128 = null;
+    const t_start: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
+    var next: i128 = t_start + interval_ns;
     while (true) {
+        _ = g_cadence.loops.fetchAdd(1, .monotonic);
         const now_ns: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
-        if (next > now_ns) {
-            zio.sleep(.fromNanoseconds(@intCast(next - now_ns))) catch |err| {
+        const deadline = next;
+        if (deadline > now_ns) {
+            _ = g_cadence.sleeps.fetchAdd(1, .monotonic);
+            zio.sleep(.fromNanoseconds(@intCast(deadline - now_ns))) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 return err;
             };
+        } else {
+            _ = g_cadence.skipped.fetchAdd(1, .monotonic);
+            _ = g_cadence.skip_behind_ns.fetchAdd(@intCast(now_ns - deadline), .monotonic);
         }
         next += interval_ns;
-        const sent: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
-        const ev = try std.fmt.bufPrint(&buf, "data: {d}\n\n", .{sent});
+        const t_write = zio.Timestamp.now(.realtime).toNanoseconds();
+        if (deadline < t_write) {
+            const late: u64 = @intCast(t_write - deadline);
+            _ = g_cadence.late_n.fetchAdd(1, .monotonic);
+            _ = g_cadence.late_ns.fetchAdd(late, .monotonic);
+            if (late >= std.time.ns_per_ms) _ = g_cadence.late_ge1ms.fetchAdd(1, .monotonic);
+        }
+        const ev = try std.fmt.bufPrint(&buf, "data: {d}\n\n", .{t_write});
         body.writeAll(ev) catch break;
-        try zio.maybeYield();
+        _ = g_cadence.writes.fetchAdd(1, .monotonic);
+        if (prev_write) |p| {
+            if (t_write >= p) {
+                _ = g_cadence.inter_n.fetchAdd(1, .monotonic);
+                _ = g_cadence.inter_ns.fetchAdd(@intCast(t_write - p), .monotonic);
+            }
+        } else {
+            _ = g_cadence.first_n.fetchAdd(1, .monotonic);
+            if (t_write >= t_start) {
+                _ = g_cadence.first_ns.fetchAdd(@intCast(t_write - t_start), .monotonic);
+            }
+        }
+        prev_write = t_write;
     }
     try body.finish();
+}
+
+fn cadenceJson(w: *std.Io.Writer) !void {
+    try w.print(
+        "{{\"loops\":{d},\"sleeps\":{d},\"skipped\":{d},\"writes\":{d}," ++
+            "\"first_n\":{d},\"inter_n\":{d}," ++
+            "\"late_n\":{d},\"late_ge1ms\":{d}," ++
+            "\"sleep_req_ns\":{d},\"sleep_ns\":{d},\"late_ns\":{d}," ++
+            "\"write_ns\":{d},\"yield_ns\":{d},\"skip_behind_ns\":{d}," ++
+            "\"first_ns\":{d},\"inter_ns\":{d}," ++
+            "\"start_sse_n\":{d},\"start_sse_ns\":{d},\"start_sse_max\":{d}}}\n",
+        .{
+            g_cadence.loops.load(.acquire),
+            g_cadence.sleeps.load(.acquire),
+            g_cadence.skipped.load(.acquire),
+            g_cadence.writes.load(.acquire),
+            g_cadence.first_n.load(.acquire),
+            g_cadence.inter_n.load(.acquire),
+            g_cadence.late_n.load(.acquire),
+            g_cadence.late_ge1ms.load(.acquire),
+            g_cadence.sleep_req_ns.load(.acquire),
+            g_cadence.sleep_ns.load(.acquire),
+            g_cadence.late_ns.load(.acquire),
+            g_cadence.write_ns.load(.acquire),
+            g_cadence.yield_ns.load(.acquire),
+            g_cadence.skip_behind_ns.load(.acquire),
+            g_cadence.first_ns.load(.acquire),
+            g_cadence.inter_ns.load(.acquire),
+            g_cadence.start_sse_n.load(.acquire),
+            g_cadence.start_sse_ns.load(.acquire),
+            g_cadence.start_sse_max.load(.acquire),
+        },
+    );
+}
+
+fn cadenceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    var buf: [768]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try cadenceJson(&w);
+    try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
+}
+
+fn cadenceResetHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    g_cadence.reset();
+    try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, "{\"reset\":true}\n");
 }
 
 // The broadcast arm. One ticker wakes every stream, instead of every stream
@@ -380,7 +507,6 @@ fn sseBroadcastHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Re
 
         const ev = try std.fmt.bufPrint(&buf, "data: {d}\n\n", .{ts});
         body.writeAll(ev) catch break;
-        try zio.maybeYield();
     }
     try body.finish();
 }
@@ -475,6 +601,8 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } } },
         .{ .method = .GET, .path = "/sse-broadcast", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseBroadcastHandler } } },
         .{ .method = .GET, .path = "/trace", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = traceHandler } } },
+        .{ .method = .GET, .path = "/sse-cadence", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceHandler } } },
+        .{ .method = .GET, .path = "/sse-cadence-reset", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceResetHandler } } },
     };
 
     var cert_pem: []u8 = &.{};

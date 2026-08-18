@@ -61,9 +61,13 @@ Verified at `http2.zig` revision
   stream-storage allocation.
 - TLS is outside the HTTP/2 core: the benchmark uses `http2-boring` with
   BoringSSL and requires ALPN `h2`.
-- The response API is one-shot. It cannot represent a long-lived streaming
-  response, so it is an opponent only for the one-shot benchmark; the SSE
-  benchmark continues to use Go `net/http`.
+- The response API is one-shot (`setBody`, no flush). It cannot hold a
+  Datastar `/updates` stream or post patches onto one from another task, so
+  it is an opponent only for the one-shot benchmark; SSE and mixed continue
+  to use Go `net/http`. A zero-window oneshot stream does not park sibling
+  GETs on that connection (measured at this revision: tiny
+  `SETTINGS_INITIAL_WINDOW_SIZE`, WU withheld on stream 1, 99 sibling `GET /`
+  completed under their 100-stream cap). Protocol: `tools/oneshot-gap.md`.
 
 This is not an identical stack comparison: starh2 uses its pure-Zig TLS fork,
 while the opponent uses BoringSSL. The starh2 h2c arm remains in the same run so

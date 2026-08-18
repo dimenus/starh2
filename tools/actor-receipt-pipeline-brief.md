@@ -33,6 +33,13 @@ Unloaded hop matches Go (~129 µs vs 128 µs). Eight in-flight oneshots on one
 TLS connection: starh2 p50 ~704 µs / 8.9k rps vs Go 303 µs / 22.6k. SSE event
 p50 was not the gap.
 
+Go already does this split. `net/http` `serverConn.serve` never waits for a
+handler or for TCP; handlers wait for their frames (`writeDataFromHandler`).
+Tiny writes that fit the bufio buffer run inline on `serve`. That is why a
+managed runtime wins this oneshot shape: the protocol loop is not the waiter.
+http2.zig is not the Datastar opponent (one-shot `setBody`; measured
+zero-window oneshots still multiplex). Detail: `tools/oneshot-gap.md`.
+
 AckDrainer `tickets.complete`s; only `TicketTable.wait` reclaims the ticket
 slot. Successful acks do **not** `actor_wake.set` (only shutdown / fail_all /
 malformed chain). `waitTicket` is today's waiter.

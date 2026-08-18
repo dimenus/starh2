@@ -192,11 +192,13 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
 
 ## What is left
 
-Live one-shot is no longer an alloc, spawn, HPACK, Huffman, parse,
-h2c-unpacked-write, or per-response ticket-wait story. Complete oneshots
-wait one drain-turn receipt (`tickets/handoff` near 1; packing is
-`records/response`). Re-run `tools/oneshot-phase-trace.sh` and the
-official bench; they move with the machine.
+Live one-shot is no longer an alloc, spawn, HPACK, Huffman, parse, or
+h2c-unpacked-write story. Complete oneshots share one drain-turn receipt
+(`tickets/handoff` near 1; packing is `records/response`). The actor no
+longer `waitTicket`s that receipt: pending complete-batch receipts are
+depth 2, AckDrainer reports, the actor consumes already-complete tickets.
+Re-run `tools/oneshot-phase-trace.sh` and the official bench; they move
+with the machine.
 
 After h2c concat, the live gap vs http2.zig is TLS. Isolated
 Session/HPACK are tied. Re-derive the official numbers; the shape on
@@ -232,21 +234,70 @@ sys so a future RSA cert cannot hide as “TLS”. The remaining gap vs
 http2.zig is Connection lifecycle again, not AES, not packing, and not
 handshake.
 
-Do not name the remaining HTTP/2 residue “one actor per connection” —
-http2.zig also has one connection task; theirs is a single
-read/dispatch/write/flush loop. Their TLS throughput is a narrower
-contract (handler or blocked write stops ingest). We keep the three
-starve stories: other connections, handler work vs actor, peer stops
-reading.
+Do not name the remaining HTTP/2 residue “one actor per connection”.
+http2.zig also has one connection task. The oneshot p50 vs Go was **who
+waits the write**: keep (`67c96ab`) encoded complete oneshots on the
+actor and `waitTicket`ed, so ingest of the next HEADERS waited on
+WritePump. That wait moved off the actor (receipt kept; AckDrainer still
+only reports). AES, packing, HPACK, and handshake are not that gap.
 
-`tools/sse_bench/mixed.sh` exercises the last two on one TLS connection
-(32 SSE streams, 10 ms, 8 oneshot workers; Go opponent; http2.zig is
-not an arm). Darwin: starh2 mixed SSE delivered the 16,000-event target
-every round; mixed oneshot stayed 6.8k–8.4k rps against oneshot-only
-7.9k–9.1k on that 8-worker client (not the official h2load 50-conn
-shape). Go ~24k oneshot rps with or without SSE. One stalled SSE
-reader: 31/32 still delivering, starh2 oneshot 10.5k rps. Ingest did
-not park, and the blocked peer did not stop the others.
+Darwin, 2026-08-18, interleaved 8 workers / 1 TLS connection /
+`STARH2_EXECUTORS=2` / same Go client as `mixed.sh` oneshot-only,
+3 s + 1 s warmup, 3 rounds. Keep is the `67c96ab` binary; pipeline is
+this working tree. Keep-vs-keep p50 spread was 1 µs.
+
+| arm | oneshot-only p50 | rps | err |
+|---|---|---|---|
+| keep `67c96ab` | 461–462 µs | 17.3k | 0 |
+| pipeline | 205–211 µs | 36.5–37.4k | 1–2 |
+| Go net/http | 202–212 µs | 37.1–38.8k | 0 |
+
+`complete_receipt_depth_max` reached **2** on that 8-worker load
+(`--trace` `/trace`) and on `tools/oneshot-phase-trace.sh` (h2load
+`-n 400000 -c 50 -m 10 -t 4`). Packing: `records/response = 0.10`.
+Do not retry a 50 µs actor sleep to buy SSE cadence.
+
+Go `net/http` h2 (`h2_bundle.go` `serverConn.serve`) is the same three-way
+split we keep for Datastar, cheaper: `readFrames` only reads; `serve`
+never blocks on a handler or on TCP (stdlib comment: handlers wait for
+their frames to hit the wire); `go runHandler` per stream. A tiny write
+that fits the bufio buffer is inlined on `serve` (`staysWithinBuffer`);
+otherwise `writeFrameAsync`. TLS is a `Conn` wrapper on that write, not a
+third owner under `session_mu`. SSE `/updates` is a handler goroutine that
+`Flush`es; a command is another `runHandler` that 204s. `writeSched.Pop`
+skips a zero-window stream. GC is not the advantage.
+
+http2.zig cannot be that opponent. Handler API is `fn(ctx) !Response` /
+`setBody` — no flush, no stream to post onto after return, `ProcessStream`
+is a documented no-op. A 204 oneshot they can do; a long-lived Datastar
+`/updates` bus they cannot. Blocking in the handler to fake SSE would run
+on the connection task and park ingest of the 204. Mixed.sh correctly
+omits them.
+
+A flow-control stall of one oneshot stream does **not** park their ingest.
+Darwin, `a2859f8`, TLS `GET /` (13-byte body), client
+`SETTINGS_INITIAL_WINDOW_SIZE=8`, WINDOW_UPDATE withheld on stream 1:
+stream 1 stuck at 8 bytes without `END_STREAM`; sibling `GET /` 50/50 in
+9 ms, 99/99 in 18 ms (their cap is 100 streams; the stalled one occupies a
+slot). Control (WU sent) finishes stream 1 at 13 bytes. Their unit test
+`flush_ready_streams does not let a blocked stream stall other responses`
+matches the wire. Evented I/O is real; a zero-window stream is skipped.
+A client that stops reading the **socket** still fills TCP and blocks
+`flush` for every stream on that connection — including Go and us.
+
+`tools/sse_bench/mixed.sh` exercises starve stories 2 and 3 on one TLS
+connection (32 SSE streams, 10 ms, 8 oneshot workers; Go opponent).
+Darwin, same day as the table above, pipeline binary, default
+`STARH2_EXECUTORS=2`. Oneshot-only stayed 36.6–36.7k rps (p50 210 µs).
+Mixed oneshot stayed 33.9–37.6k — ingest did not park. Mixed SSE did
+**not** hit the 16,000-event target: 8960 / 8064 / 10338, all 32/32
+streams delivering. Go mixed was 16,000 every round, oneshot ~35k.
+Stall: starh2 31/32 delivering, 7874 events, oneshot 37.7k rps; Go
+31/32, 15,500 events (exactly 31×500). The blocked peer did not stop
+ingest or the other streams. The 10 ms cadence is the miss: keep
+`waitTicket` yielded the actor; depth-2 pipeline keeps it busy. That
+is not a silent drop of streams. It fails the brief’s 16,000-event
+inspect. Do not satisfy it with a 50 µs actor sleep.
 
 Sol Extra High ranked legal chips inside that split: (1) gate test
 counters — measured, below the bar; (3) clock inbound accumulator

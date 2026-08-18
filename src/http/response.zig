@@ -213,14 +213,17 @@ pub const Response = struct {
         //   means the client sees nothing at all. That failure is silent, and
         //   the I4 gates could not see it, so it is not left to the caller.
         //
-        // - WAIT. An SSE write blocks for a receipt. Removing that wait kept
-        //   throughput flat but made latency 21x worse: the receipt keeps the
-        //   producer self-clocked instead of turning queue depth into latency.
+        // - WAIT. An SSE write asks for backpressure, not a per-record receipt.
+        //   Open-loop against the 64 KiB slab kept saturating throughput but
+        //   made p50 21x worse. Waiting for every TLS receipt self-clocks that
+        //   load, and also parks mixed-cadence handlers while oneshots occupy
+        //   the actor. Occupancy-capped wait parks only when this stream's
+        //   pending DATA is at the flush watermark.
         //
-        // `Body.flush()` also emits and waits. Capacity backpressure remains
-        // independent of receipts: a handler that outruns the connection blocks
-        // in `waitForStreamSpace`, because the per-stream slab is bounded by
-        // `outbound_bytes_per_stream`.
+        // `Body.flush()` and end-of-stream still wait for a wire receipt.
+        // Capacity backpressure remains independent of receipts: a handler that
+        // outruns the connection also blocks in `waitForStreamSpace`, because
+        // the per-stream slab is bounded by `outbound_bytes_per_stream`.
         try self.writeFn(self.ctx, self.stream_id, bytes, false, self.sse, self.sse);
     }
 

@@ -44,6 +44,9 @@ pub const WriteCompletion = struct {
     fail_all: bool = false,
     /// Shut down AckDrainer.
     shutdown: bool = false,
+    /// This write carries a complete-handler drain-turn receipt. AckDrainer
+    /// wakes the actor only for these, not for ordinary/SSE tickets.
+    complete_batch_receipt: bool = false,
 };
 
 pub const WireChunk = struct {
@@ -60,6 +63,8 @@ pub const WireChunk = struct {
     control_entries: u32 = 0,
     /// Read-pool lease index; null = heap-owned (should not happen for reads after boot).
     pool_index: ?u32 = null,
+    /// Echoed into WriteCompletion: this chunk's ticket is a complete-batch receipt.
+    complete_batch_receipt: bool = false,
 };
 
 /// Reads the socket into pooled chunks and hands them to the actor.
@@ -220,6 +225,7 @@ pub const WritePump = struct {
                 .control_release = chunk.control_release,
                 .control_entries = chunk.control_entries,
                 .fail_all = fail_all,
+                .complete_batch_receipt = chunk.complete_batch_receipt,
             });
         }
     }

@@ -336,13 +336,14 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
     const e1 = "data: <div id=\"a\">one</div>\n\n";
     const e2 = "data: <div id=\"a\">two-repeats-similar-html</div>\n\n";
     const e3 = "data: <div id=\"a\">three-still-similar</div>\n\n";
-    // No sleep, and no explicit flush: an SSE write is its own barrier. It
-    // returns only once its bytes have reached the wire, so event 2 cannot
-    // share a DATA frame with event 1 — which is precisely the property the
-    // assertions downstream check. A timed gap would test the clock instead,
-    // and would go quiet the moment the barrier was removed.
+    // No sleep: an SSE write emits immediately. Occupancy-capped wait does not
+    // separate two tiny events, so the incremental-decode pin uses `flush()`
+    // as the wire barrier between them. A timed gap would test the clock
+    // instead.
     try body.writeAll(e1);
+    try body.flush();
     try body.writeAll(e2);
+    try body.flush();
     try body.writeAll(e3);
     try body.finish();
 }

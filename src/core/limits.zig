@@ -260,6 +260,7 @@ pub const Limits = struct {
         const cipher_scratch: usize = WIRE_CHUNK_SIZE;
         const sid_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const inline_sids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
+        const complete_receipt_sids = try checkedMul(inline_sids, 2);
         const header_leases = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
         const write_free = try checkedMul(n_chunks, @sizeOf(u32));
@@ -284,7 +285,7 @@ pub const Limits = struct {
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_recv_acc_bytes, try checkedAdd(header_maps, intents)))));
 
-        const sid_and_inline = try checkedAdd(sid_scratch, inline_sids);
+        const sid_and_inline = try checkedAdd(sid_scratch, try checkedAdd(inline_sids, complete_receipt_sids));
         const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, sched_scratch)))))))))))))))))));
         const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, write_free)));
 

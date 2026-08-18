@@ -46,6 +46,10 @@ test "WriteCompletion is integer-only payload" {
     try std.testing.expectEqual(usize, @TypeOf(@as(W, undefined).outbound_release));
 }
 
+test "complete receipt pipeline is bounded at two drain turns" {
+    try std.testing.expectEqual(@as(usize, 2), starh2.edge.connection.complete_receipt_capacity);
+}
+
 test "100x failAll vs reserve never hangs" {
     const ticket_table = starh2.edge.ticket_table;
     var storage: [8]ticket_table.TicketWait = undefined;

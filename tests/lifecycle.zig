@@ -35,6 +35,10 @@ fn delayedHello(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Respons
     if (elapsed < 30 * std.time.ns_per_ms) return error.ReturnedBeforeFlush;
 }
 
+fn completeHello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    try resp.send(200, &.{}, "ok");
+}
+
 /// Carries its call site, so a failure names WHICH of the scenarios broke.
 /// A bare error here says only that some write failed, and an unnamed
 /// nondeterministic failure is what gets written off instead of root-caused.
@@ -276,6 +280,108 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_observed_slots_in_use.load(.acquire));
 }
 
+fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/complete", .handler = .{ .complete = .{
+            .ptr = @constCast(&dummy),
+            .runFn = completeHello,
+        } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 16;
+    limits.max_streams_per_server = 32;
+    limits.cancellation_reaper_jobs = 32;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const c = starh2.edge.connection;
+    const io = rt.io();
+    c.test_release_complete_receipt_ack.reset();
+    c.test_complete_receipt_ack_held.store(false, .release);
+    c.test_hold_complete_receipt_ack.store(true, .release);
+    defer {
+        c.test_hold_complete_receipt_ack.store(false, .release);
+        c.test_release_complete_receipt_ack.set(io);
+        c.test_complete_receipt_ack_held.store(false, .release);
+    }
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    var stream_open = true;
+    defer if (stream_open) stream.close();
+
+    var first = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer first.deinit(gpa);
+    try h2c.appendHeaders(gpa, &first, 1, "/complete", true);
+    try writeAllStreamAt(stream, first.items, @src());
+
+    var deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
+    while (c.test_observed_live_handlers.load(.acquire) < 1) {
+        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
+            return error.FirstCompleteNotDispatched;
+        }
+        zio.sleep(.fromMilliseconds(1)) catch {};
+    }
+    while (!c.test_complete_receipt_ack_held.load(.acquire)) {
+        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
+            return error.CompleteReceiptAckNotHeld;
+        }
+        zio.sleep(.fromMilliseconds(1)) catch {};
+    }
+
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(gpa);
+    try h2c.appendHeaders(gpa, &second, 3, "/complete", true);
+    try writeAllStreamAt(stream, second.items, @src());
+
+    deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 250 * std.time.ns_per_ms;
+    while (c.test_observed_live_handlers.load(.acquire) < 2) {
+        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
+            std.debug.print("complete receipt pipeline did not dispatch B while A ack was held: live={d} slots={d}\n", .{
+                c.test_observed_live_handlers.load(.acquire),
+                c.test_observed_slots_in_use.load(.acquire),
+            });
+            return error.SecondCompleteBlockedByFirstAck;
+        }
+        zio.sleep(.fromMilliseconds(1)) catch {};
+    }
+
+    c.test_hold_complete_receipt_ack.store(false, .release);
+    c.test_release_complete_receipt_ack.set(io);
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+    stream.close();
+    stream_open = false;
+
+    server.requestShutdown();
+    serve_handle.join() catch {};
+
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.request_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), c.test_observed_live_handlers.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), c.test_observed_slots_in_use.load(.acquire));
+}
+
 test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
     var dbg = std.heap.DebugAllocator(.{}).init;
     defer {
@@ -288,8 +394,11 @@ test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
 
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 64 },
-        .executors = .exact(2),
-        .enable_task_migration = false,
+        // 100 live SSE tasks plus pumps: two executors is the hang that
+        // inlined a write-ack hold into this test. Keep this suite off that
+        // trap; the dedicated complete-receipt test is the hold coverage.
+        .executors = .exact(4),
+        .enable_task_migration = true,
     });
     defer rt.deinit();
 
@@ -300,6 +409,28 @@ test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
     // root-caused. Same reason t-544 added caller lines to waitAccountingZero.
     handle.join() catch |err| {
         std.debug.print("lifecycle stress failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+test "complete receipt pipeline ingests B while A write ack is held" {
+    var dbg = std.heap.DebugAllocator(.{}).init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in complete receipt pipeline");
+    }
+    const gpa = dbg.allocator();
+
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+        .enable_task_migration = false,
+    });
+    defer rt.deinit();
+
+    var handle = try rt.spawn(runCompleteReceiptPipeline, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("complete receipt pipeline failed: {s}\n", .{@errorName(err)});
         return err;
     };
 }
