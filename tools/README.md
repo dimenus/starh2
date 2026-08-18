@@ -186,7 +186,11 @@ nghttp -nv "http://127.0.0.1:$PORT/hello" -H 'x-grader-nonce: ng1'
 ## TLS
 
 ```sh
-openssl req -x509 -newkey rsa:2048 -keyout testdata/key.pem -out testdata/cert.pem -days 365 -nodes -subj '/CN=localhost'
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout testdata/key.pem -out testdata/cert.pem -days 365 -nodes -subj '/CN=localhost'
+# P-256, not rsa:2048. tls.zig's 2048-bit RSA handshake was ~17 ms user on
+# Nachos; a 100k-request official run then measured handshake amortization,
+# not the record layer.
 ./zig-out/bin/starh2-conformance-server --mode tls --bind 127.0.0.1:0 --cert testdata/cert.pem --key testdata/key.pem
 curl -vk --http2 -H 'x-grader-nonce: tls1' "https://127.0.0.1:$PORT/hello"
 # ALPN reject (expect TLS alert 120):

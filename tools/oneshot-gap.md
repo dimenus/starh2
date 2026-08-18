@@ -142,7 +142,10 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   (`inbound_records/req` ≈ 0.10); do not treat `firstRecord` as a 1:1 tax.
 - Treating `connectionEncrypt` / AES-GCM as the several-µs TLS tax.
   Isolated and live clocks are tens of nanoseconds per request.
-  `sendAccountedWire` is ~0.2 µs/req on TLS and h2c.
+  `sendAccountedWire` is ~0.2 µs/req on TLS and h2c. Official 100k CPU/req
+  was 2048-bit RSA handshake (~17 ms user each, 50 conns) amortized over
+  the request budget. ECDSA P-256 testdata is the recipe in
+  `tools/README.md`; do not regenerate `rsa:2048` for a throughput run.
 - Starting by changing zio.
 - View-decode Huffman plaintext or dynamic-table strings. Encoded bytes
   are not the string; a later block can evict a dynamic entry while a
@@ -187,14 +190,20 @@ owner of the socket unless it sits behind the same byte-transform ABI.
 Live `--trace` 400k packs inbound and outbound at ~0.10 records/req on
 Darwin and Nachos, so `firstRecord` is not a 1:1 tax. Nachos clocks:
 encrypt 28 ns/req, decrypt 30 ns/req, `sendAccountedWire` 111 vs 107 ns
-(h2c), ingest 1119 vs 1187 ns. The cipher is not the tax. Official
-Nachos `-n 100000 -c 50 -m 10 -t 12 --rounds 3` still showed TLS ~761k
-at 12.2 µs CPU/req vs h2c ~2.23M at 4.5 µs — a ~7.7 µs process-CPU gap
-that those calls do not contain. The dedicated 400k TLS burst was
-1.49M req/s; that is not the 3-round mean. TLS p99 was milliseconds vs
-h2c hundreds of µs. Next isolate is where the extra CPU lives
-(`perf` / rusage user vs sys, handshake, WritePump, zio wakes), not
-another packing micro and not encrypt-on-WritePump.
+(h2c), ingest 1119 vs 1187 ns. The record-layer cipher is not the tax.
+
+Official 100k CPU/req was handshake. testdata was 2048-bit RSA;
+tls.zig spent ~17 ms user per handshake. Fifty connections amortized
+over 100k requests is ~8 µs/req — the whole TLS-minus-h2c gap. The same
+50 handshakes over 1M requests left ~0.8 µs/req. ECDSA P-256 cut
+handshake user from ~16 ms to ~0.6 ms (n=50) and 100k TLS CPU/req from
+12.4 µs to 5.2 µs, next to h2c at 4.8 µs. Official Nachos 3-round after
+P-256 testdata: TLS ~2.05M at 4.81 µs CPU (user 3.60, sys 1.21) vs h2c
+~2.21M at 4.56 µs (user 3.43, sys 1.13). Record-layer residue ~0.25 µs.
+p99 is hundreds of µs on both arms. `tools/bench.zig` prints user vs
+sys so a future RSA cert cannot hide as “TLS”. The remaining gap vs
+http2.zig is Connection lifecycle again, not AES, not packing, and not
+handshake.
 
 Do not name the remaining HTTP/2 residue “one actor per connection” —
 http2.zig also has one connection task; theirs is a single

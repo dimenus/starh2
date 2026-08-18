@@ -19,8 +19,9 @@
 //! # What it compares, and what it refuses to compare
 //!
 //! - `starh2 tls` and `starh2 h2c` are the same binary and the same handler.
-//!   The only difference is the record layer, so the gap between them is the
-//!   cost of TLS and nothing else.
+//!   testdata must be ECDSA P-256 (`tools/README.md`). rsa:2048 made a 100k
+//!   run measure tls.zig's RSA handshake (~17 ms user), not the record layer.
+//!   The harness prints user vs sys CPU so that cannot hide in one number.
 //! - `--opponent <binary>` adds a third arm. It is optional, and its absence
 //!   is PRINTED rather than assumed, because a table with a missing row reads
 //!   like a complete table.
@@ -88,6 +89,10 @@ const Arm = struct {
     /// One run at double the threads, to catch a client-limited arm.
     rps_double: f64 = 0,
     cpu_seconds: f64 = 0,
+    cpu_user_seconds: f64 = 0,
+    cpu_sys_seconds: f64 = 0,
+    nvcsw: i64 = 0,
+    nivcsw: i64 = 0,
     peak_rss_bytes: usize = 0,
     retained_rss_bytes: usize = 0,
 };
@@ -252,8 +257,8 @@ fn timevalSeconds(tv: anytype) f64 {
         @as(f64, @floatFromInt(tv.usec)) / 1_000_000.0;
 }
 
-fn childCpuSeconds(child: *const std.process.Child) ?f64 {
-    return switch (builtin.os.tag) {
+fn childRusage(child: *const std.process.Child, arm: *Arm) void {
+    const ru = switch (builtin.os.tag) {
         .dragonfly,
         .freebsd,
         .netbsd,
@@ -268,12 +273,15 @@ fn childCpuSeconds(child: *const std.process.Child) ?f64 {
         .tvos,
         .visionos,
         .watchos,
-        => if (child.resource_usage_statistics.rusage) |ru|
-            timevalSeconds(ru.utime) + timevalSeconds(ru.stime)
-        else
-            null,
+        => child.resource_usage_statistics.rusage,
         else => null,
     };
+    const usage = ru orelse return;
+    arm.cpu_user_seconds = timevalSeconds(usage.utime);
+    arm.cpu_sys_seconds = timevalSeconds(usage.stime);
+    arm.cpu_seconds = arm.cpu_user_seconds + arm.cpu_sys_seconds;
+    arm.nvcsw = @intCast(usage.nvcsw);
+    arm.nivcsw = @intCast(usage.nivcsw);
 }
 
 fn currentRssBytes(gpa: std.mem.Allocator, io: std.Io, child: *const std.process.Child) ?usize {
@@ -458,7 +466,7 @@ pub fn main(init: std.process.Init) !void {
         const child = arm.child.?;
         arm.retained_rss_bytes = currentRssBytes(arena, io, child) orelse 0;
         stopAndCollect(child, io);
-        arm.cpu_seconds = childCpuSeconds(child) orelse 0;
+        childRusage(child, arm);
         arm.peak_rss_bytes = child.resource_usage_statistics.getMaxRss() orelse 0;
     }
 
@@ -490,6 +498,14 @@ pub fn main(init: std.process.Init) !void {
             arm.cpu_seconds,
             @as(f64, @floatFromInt(arm.peak_rss_bytes)) / (1024.0 * 1024.0),
             if (collapsed) "BROKEN RUN" else if (limited) "CLIENT-LIMITED" else "server-bound",
+        });
+        std.debug.print("    CPU user={d:.2}s ({d:.0}ns/req) sys={d:.2}s ({d:.0}ns/req) nvcsw={d} nivcsw={d}\n", .{
+            arm.cpu_user_seconds,
+            arm.cpu_user_seconds * 1_000_000_000.0 / @as(f64, @floatFromInt(requests_per_arm)),
+            arm.cpu_sys_seconds,
+            arm.cpu_sys_seconds * 1_000_000_000.0 / @as(f64, @floatFromInt(requests_per_arm)),
+            arm.nvcsw,
+            arm.nivcsw,
         });
         std.debug.print("    retained RSS before shutdown: {d:.1}MiB\n", .{
             @as(f64, @floatFromInt(arm.retained_rss_bytes)) / (1024.0 * 1024.0),
