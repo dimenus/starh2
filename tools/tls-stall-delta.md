@@ -6,9 +6,9 @@ fold `not-started` into that result.
 
 `not-started` (`started < total`) was the shared `non_data` HEADERS budget
 (10k burst, 1k/s). A legitimate one-shot connection GOAWAY'd
-`ENHANCE_YOUR_CALM` after ~10k requests. HEADERS now has its own bucket,
-same shape as WINDOW_UPDATE. Rapid-reset still hits `rst` + `non_data`.
-t-761.
+`ENHANCE_YOUR_CALM` after ~10k requests. HEADERS is exempt, like DATA;
+rapid-reset still hits `rst` + `non_data`. Do not put HEADERS back on
+`non_data`. t-761.
 
 The harness is `tools/tls-stall-delta.sh`. Read its header comment for the
 protocol and for the reason behind each guard. It does not change production

@@ -287,23 +287,18 @@ A client that stops reading the **socket** still fills TCP and blocks
 
 `tools/sse_bench/mixed.sh` exercises starve stories 2 and 3 on one TLS
 connection (32 SSE streams, 10 ms, 8 oneshot workers; Go opponent).
-Darwin, 2026-08-18, `37f04e0` (actor-owned handler deadline heap on
-`2612a13`), `STARH2_EXECUTORS=2`, 5 s + 1 s warmup, 3 rounds. Oneshot-only
-stayed in the hot band: 35670 / 34753 / 33778 rps (p50 214 / 219 / 223 µs).
-Mixed oneshot held 0.85× and p50 ≤ 300 µs: 34603 / 33804 / 32840 rps
-(p50 226 / 230 / 234 µs). Mixed delivering 32/32 every round. Mixed SSE
-did **not** hit 16,000: 10082 / 10658 / 10784. Go mixed was 16,000 every
-round at 38325 / 37533 / 37360 oneshot rps. Stall: starh2 31/32
-delivering, 10266 events, oneshot 33364 rps; Go 31/32, 15502 events,
-oneshot 38105 rps. SSE-only at the same STREAMS/INTERVAL/SECONDS
-(`tools/sse_bench/run.sh`) hit 16000/16000 — idle `waitForActivity`
-ticks the heap. Packing after this cut:
-`tools/oneshot-phase-trace.sh` `records/response = 0.10`,
-`complete_receipt_depth_max = 2`. T1/T2/T3 are green; `/sse` uses
-`waitUntil`, not `zio.sleep`. The 10 ms mixed cadence is still the miss,
-not a silent drop. Do not claim 16k from this run. Do not satisfy the
-remainder with a 50 µs actor sleep, yield-every-turn, zio#687, or by
-softening oneshot.
+Darwin, 2026-08-18, deadline heap plus HEADERS exempt like DATA
+(`STARH2_EXECUTORS=2`, 5 s + 1 s warmup, 3 rounds). Oneshot-only stayed
+in the hot band: 34889 / 35093 / 34863 rps (p50 221 / 220 / 221 µs).
+Mixed oneshot held the band: 36618 / 36161 / 36310 rps (p50 216 / 218 /
+218 µs). Mixed delivering 32/32. Mixed SSE: 15999 / 16004 / 16008. Go
+mixed was 16000 every round. Stall: starh2 31/32 delivering, 15507
+events, oneshot 36338 rps; Go 31/32, 15500 events, oneshot 48048 rps.
+The earlier ~10–11k mixed count was a HEADERS lifetime pot GOAWAY
+(`ENHANCE_YOUR_CALM` at ~4.2 s), not a `waitUntil` miss. Rapid-reset
+still hits `rst` + `non_data`. Do not put HEADERS on `non_data` (t-761)
+and do not restore a lifetime HEADERS pot. Do not satisfy mixed with a
+50 µs actor sleep, yield-every-turn, or zio#687.
 
 Sol Extra High ranked legal chips inside that split: (1) gate test
 counters — measured, below the bar; (3) clock inbound accumulator

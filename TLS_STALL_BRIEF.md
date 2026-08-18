@@ -142,10 +142,12 @@ reproduces it — and it is not a lost wakeup. HEADERS charged the shared
 GOAWAY'd `ENHANCE_YOUR_CALM` after ~10k requests. h2load reported the
 leftover as `Process Request Failure` / `started < total`.
 
-HEADERS now has its own bucket (same shape as WINDOW_UPDATE). Rapid-reset
-still hits `rst` + `non_data`. Do not put HEADERS back on `non_data`: the
-test `rate limiter HEADERS does not consume the shared non-data budget`
-is the mutation canary. t-761.
+HEADERS is exempt, like DATA: a completed request takes a stream slot and
+releases it. Do not put HEADERS on `non_data` (t-761 `not-started`) and do
+not restore a lifetime HEADERS pot (that GOAWAY'd live SSE under mixed
+oneshot). Rapid-reset hits `rst` + `non_data`. The test `rate limiter
+HEADERS does not consume the shared non-data budget` is the mutation
+canary. t-761.
 
 ### The plaintext zio reproducer
 

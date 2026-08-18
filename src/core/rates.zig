@@ -65,21 +65,6 @@ pub const RateLimiter = struct {
     /// sizing it. This bucket is generous enough for credit that tracks real
     /// delivery and still bounds a flood.
     window_update: TokenBucket = .init(100_000, 10_000),
-    /// HEADERS gets its OWN budget and does not charge `non_data`.
-    ///
-    /// A one-shot request is a HEADERS frame. Useful request rate therefore
-    /// scales with this bucket the same way WINDOW_UPDATE scales with DATA
-    /// credit. Charging HEADERS against the shared 10,000 / 1,000/s bucket
-    /// GOAWAY'd a connection after ~10k requests (`ENHANCE_YOUR_CALM`) and
-    /// showed up as h2load `started < total` — the not-started class, TLS and
-    /// h2c alike. h2load's 2-client threads assign 12.5k requests each at
-    /// `-c 10 -n 100000`, which is past that burst; the leftover is
-    /// `Process Request Failure`.
-    ///
-    /// It is NOT exempt like DATA. A peer can open streams forever without
-    /// filling a window. Rapid-reset (HEADERS then RST) still hits `rst` and
-    /// `non_data`; this bucket bounds stream creation that never resets.
-    headers: TokenBucket = .init(100_000, 10_000),
 
     /// Returns false → caller should GOAWAY ENHANCE_YOUR_CALM (unless a protocol error wins).
     ///
@@ -91,9 +76,17 @@ pub const RateLimiter = struct {
     /// DATA is exempt and takes no token. DATA already pays flow control, so a
     /// peer cannot repeat it for free. A token charge here would let the rate
     /// limiter refuse a legitimate large upload.
+    ///
+    /// HEADERS is exempt the same way. A completed request takes a stream slot
+    /// and releases it; concurrency (`max_streams_per_connection`) bounds
+    /// opens that never finish. Charging every HEADERS against a lifetime pot
+    /// GOAWAY'd a Datastar connection: live SSE cannot move sockets, oneshots
+    /// can, and mixed.sh then looked like a cadence miss. Rapid-reset
+    /// (HEADERS then RST) still hits `rst` + `non_data`. Do not put HEADERS
+    /// back on `non_data` either — that is t-761 `not-started`.
     pub fn admit(self: *RateLimiter, typ: frame.FrameType, now_ns: u64) bool {
         switch (typ) {
-            .data => return true,
+            .data, .headers => return true,
             .rst_stream => {
                 if (!self.rst.tryTake(now_ns)) return false;
                 return self.non_data.tryTake(now_ns);
@@ -109,7 +102,6 @@ pub const RateLimiter = struct {
             // Its own bucket only. See the field comment for why it is neither
             // exempt nor charged against the shared budget.
             .window_update => return self.window_update.tryTake(now_ns),
-            .headers => return self.headers.tryTake(now_ns),
             else => return self.non_data.tryTake(now_ns),
         }
     }
@@ -157,18 +149,26 @@ test "rate limiter HEADERS does not consume the shared non-data budget" {
     var r: RateLimiter = .{};
     var i: usize = 0;
     // Past the shared 10k burst, at a frozen timestamp so refill cannot help.
-    // Putting HEADERS back on `non_data` fails here and is the not-started bug.
+    // Putting HEADERS on `non_data` fails here and is the not-started bug.
     while (i < 20_000) : (i += 1) {
         try std.testing.expect(r.admit(.headers, 1));
     }
     try std.testing.expect(r.admit(.ping, 1));
 }
 
-test "rate limiter HEADERS flood is still refused" {
+test "rate limiter completed HEADERS are not refused" {
     var r: RateLimiter = .{};
     var i: usize = 0;
-    while (i < 100_000) : (i += 1) {
-        _ = r.admit(.headers, 1);
+    while (i < 200_000) : (i += 1) {
+        try std.testing.expect(r.admit(.headers, 1));
     }
-    try std.testing.expect(!r.admit(.headers, 1));
+}
+
+test "rate limiter RST flood is still refused" {
+    var r: RateLimiter = .{};
+    var i: usize = 0;
+    while (i < 1_000) : (i += 1) {
+        _ = r.admit(.rst_stream, 1);
+    }
+    try std.testing.expect(!r.admit(.rst_stream, 1));
 }

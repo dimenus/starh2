@@ -1057,22 +1057,32 @@ test "rates: SETTINGS flood trips ENHANCE_YOUR_CALM" {
     // intent_drain scratch — do not free slice
 }
 
-test "rates: HEADERS flood trips ENHANCE_YOUR_CALM" {
+fn drainSessionIntents(gpa: std.mem.Allocator, session: *starh2.core.session.Session) void {
+    const intents = session.drainIntents();
+    for (intents) |*it| switch (it.*) {
+        .outbound_frame => |f| gpa.free(f.payload),
+        .dispatch_request => |d| {
+            starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.headers);
+            gpa.free(d.headers);
+            if (d.trailers.len != 0) {
+                starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.trailers);
+                gpa.free(d.trailers);
+            }
+            if (d.body.len != 0) gpa.free(d.body);
+        },
+        else => {},
+    };
+}
+
+test "rates: completed HEADERS do not trip ENHANCE_YOUR_CALM" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
     const gpa = std.testing.allocator;
     var session = try session_mod.Session.init(gpa, .defaults);
     defer session.deinit();
-    {
-        const intents = session.drainIntents();
-        for (intents) |*it| switch (it.*) {
-            .outbound_frame => |f| gpa.free(f.payload),
-            else => {},
-        };
-    }
+    drainSessionIntents(gpa, &session);
     var rates: starh2.core.rates.RateLimiter = .{};
-    rates.headers = .init(2, 0);
     session.rate_limiter = &rates;
     session.edge_now_ns = 1;
 
@@ -1080,13 +1090,54 @@ test "rates: HEADERS flood trips ENHANCE_YOUR_CALM" {
     var sbuf: [9]u8 = undefined;
     const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
     try session.ingest(sbuf[0..sn]);
-    {
-        const intents = session.drainIntents();
-        for (intents) |*it| switch (it.*) {
-            .outbound_frame => |f| gpa.free(f.payload),
-            else => {},
+    drainSessionIntents(gpa, &session);
+
+    const fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &fields);
+    defer gpa.free(block);
+    // Past the old 100k HEADERS burst. A lifetime pot would GOAWAY here.
+    var i: u31 = 1;
+    while (i < 201) : (i += 2) {
+        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        const fh = frame.FrameHeader{
+            .length = @intCast(block.len),
+            .type = .headers,
+            .flags = .{ .end_headers = true, .end_stream = true },
+            .stream_id = i,
         };
+        fh.encode(&hdr_buf);
+        var wire: [64]u8 = undefined;
+        @memcpy(wire[0..hdr_buf.len], &hdr_buf);
+        @memcpy(wire[hdr_buf.len..][0..block.len], block);
+        try session.ingest(wire[0 .. hdr_buf.len + block.len]);
+        drainSessionIntents(gpa, &session);
+        try std.testing.expectEqual(.none, session.terminal);
     }
+}
+
+test "rates: RST flood trips ENHANCE_YOUR_CALM" {
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const hpack = starh2.core.hpack;
+    const gpa = std.testing.allocator;
+    var session = try session_mod.Session.init(gpa, .defaults);
+    defer session.deinit();
+    drainSessionIntents(gpa, &session);
+    var rates: starh2.core.rates.RateLimiter = .{};
+    rates.rst = .init(2, 0);
+    session.rate_limiter = &rates;
+    session.edge_now_ns = 1;
+
+    try session.ingest(frame.CLIENT_PREFACE);
+    var sbuf: [9]u8 = undefined;
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
+    try session.ingest(sbuf[0..sn]);
+    drainSessionIntents(gpa, &session);
 
     const fields = [_]hpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
@@ -1102,7 +1153,7 @@ test "rates: HEADERS flood trips ENHANCE_YOUR_CALM" {
         const fh = frame.FrameHeader{
             .length = @intCast(block.len),
             .type = .headers,
-            .flags = .{ .end_headers = true, .end_stream = true },
+            .flags = .{ .end_headers = true },
             .stream_id = i,
         };
         fh.encode(&hdr_buf);
@@ -1110,22 +1161,11 @@ test "rates: HEADERS flood trips ENHANCE_YOUR_CALM" {
         @memcpy(wire[0..hdr_buf.len], &hdr_buf);
         @memcpy(wire[hdr_buf.len..][0..block.len], block);
         try session.ingest(wire[0 .. hdr_buf.len + block.len]);
-        {
-            const intents = session.drainIntents();
-            for (intents) |*it| switch (it.*) {
-                .outbound_frame => |f| gpa.free(f.payload),
-                .dispatch_request => |d| {
-                    starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.headers);
-                    gpa.free(d.headers);
-                    if (d.trailers.len != 0) {
-                        starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.trailers);
-                        gpa.free(d.trailers);
-                    }
-                    if (d.body.len != 0) gpa.free(d.body);
-                },
-                else => {},
-            };
-        }
+        drainSessionIntents(gpa, &session);
+        var rst: [13]u8 = undefined;
+        const rn = try frame.Serializer.rstStream(&rst, i, .cancel);
+        try session.ingest(rst[0..rn]);
+        drainSessionIntents(gpa, &session);
         if (session.terminal != .none) break;
     }
     try std.testing.expect(session.terminal != .none);
@@ -1133,20 +1173,6 @@ test "rates: HEADERS flood trips ENHANCE_YOUR_CALM" {
         .goaway => |g| try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, g.code),
         else => return error.ExpectedGoaway,
     }
-    const more = session.drainIntents();
-    for (more) |*it| switch (it.*) {
-        .outbound_frame => |f| gpa.free(f.payload),
-        .dispatch_request => |d| {
-            starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.headers);
-            gpa.free(d.headers);
-            if (d.trailers.len != 0) {
-                starh2.core.hpack.HeaderField.freeOwnedSlice(gpa, d.trailers);
-                gpa.free(d.trailers);
-            }
-            if (d.body.len != 0) gpa.free(d.body);
-        },
-        else => {},
-    };
 }
 
 fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
