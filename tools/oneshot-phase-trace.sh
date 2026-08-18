@@ -2,8 +2,10 @@
 # Where does a one-shot 13-byte response actually spend its resources?
 #
 # Throughput-shaped (use these for the live gap, not wall waits):
-#   tickets/handoff  = responses coalesced into one queueWire
-#   tickets/emit     = responses flushed in one drainEmit turn
+#   tickets/handoff  = receipts coalesced into one queueWire. Complete oneshots
+#                      attach one receipt per packed write, so this sits near 1.
+#                      Packing authority is records/response.
+#   tickets/emit     = receipts flushed in one drainEmit turn
 #   records/response = TLS records per h2load success. 1.00 means a second
 #   HEADERS flushed the batch again; the script exits 9 rather than reporting
 #   that as a result. Packed drain turns at -m 10 sit well below 0.4.
@@ -15,15 +17,16 @@
 #   block/hold/ack/resume  ticket-correlated send-path samples
 #   spawn/to_send/hpack    dispatch-sampled lifecycle (complete handlers skip spawn)
 #
-# Cross-check the ticket delta against h2load succeeded, not against `jobs`.
+# Cross-check writes against h2load succeeded, not tickets. Complete oneshots
+# use one receipt per packed write, so tickets track handoffs, not responses.
 # `jobs` is a dispatch counter and includes /trace.
 #
 # Tried and rejected (do not retry without new evidence): skipping the one-shot
 # ticket wait collapsed 176k -> 1.6k req/s with lock-convoy block~10ms (receipt
 # is the self-clock, same as SSE). Running a complete handler on the actor while
 # still spawning per response and drain-emitting per job dropped 176k -> 123k.
-# The landed cut skips spawn, encodes the inline batch, one drainEmit, then
-# waits every receipt. Do not re-try the first shape.
+# Do not re-try those shapes. The live cut is one drain-turn receipt, not one
+# ticket per response and not a skipped wait.
 set -eu
 OUT=${OUT:-/tmp/starh2-oneshot-trace}
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -87,16 +90,24 @@ if not m:
     print("  could not parse h2load succeeded count")
     raise SystemExit(6)
 succeeded = int(m.group(4))
-print(f"  h2load succeeded={succeeded}  jobs={jobs}  writes={writes}  tickets={tickets}")
+print(f"  h2load succeeded={succeeded}  jobs={jobs}  writes={writes}  tickets={tickets}  handoffs={handoffs}")
 if succeeded == 0:
     print("  NO SUCCEEDED REQUESTS")
     raise SystemExit(7)
 if tickets == 0:
     print("  NO TICKETS — batch counters did not fire; trace.enabled gating is wrong")
     raise SystemExit(3)
-ratio = tickets / succeeded
-if ratio < 0.9 or ratio > 1.1:
-    print(f"  ticket/succeeded ratio {ratio:.3f} is outside 0.9-1.1 — denominator mismatch")
+write_ratio = writes / succeeded
+if write_ratio < 0.9 or write_ratio > 1.1:
+    print(f"  writes/succeeded ratio {write_ratio:.3f} is outside 0.9-1.1 — denominator mismatch")
+    raise SystemExit(8)
+# One receipt per packed write: tickets ≈ handoffs, not ≈ succeeded.
+if handoffs == 0:
+    print("  NO HANDOFFS — packed writes did not fire")
+    raise SystemExit(3)
+th = tickets / handoffs
+if th < 0.5 or th > 2.0:
+    print(f"  tickets/handoff {th:.3f} is outside 0.5-2.0 — drain-turn receipt did not attach")
     raise SystemExit(8)
 if n == 0:
     print("  NO SAMPLES — the send-path trace never fired")
@@ -139,13 +150,13 @@ for name, key in (("block ", "block_ns"), ("hold  ", "hold_ns"), ("hpack ", "hpa
 print(f"    total  {tot:8.1f}us")
 split_n = d("ack_split_samples")
 if split_n:
-    print(f"    ack split ({split_n} samples): actor={us(d('actor_ns'), split_n):.1f}us queue={us(d('queue_ns'), split_n):.1f}us pump={us(d('pump_ns'), split_n):.1f}us")
+    print(f"    ack split ({split_n} samples): actor={us(d("actor_ns"), split_n):.1f}us queue={us(d("queue_ns"), split_n):.1f}us pump={us(d("pump_ns"), split_n):.1f}us")
 pump_split_n = d("pump_split_samples")
 if pump_split_n:
-    print(f"    pump split ({pump_split_n} samples): queued/write={us(d('write_ns'), pump_split_n):.1f}us ack-drain={us(d('drain_ns'), pump_split_n):.1f}us")
+    print(f"    pump split ({pump_split_n} samples): queued/write={us(d("write_ns"), pump_split_n):.1f}us ack-drain={us(d("drain_ns"), pump_split_n):.1f}us")
 write_calls = d("write_calls"); write_chunks = d("write_chunks")
 if write_calls:
-    print(f"    WritePump: calls={write_calls} chunks={write_chunks} chunks/call={write_chunks/write_calls:.2f} max={b.get('write_max', 0)}")
+    print(f"    WritePump: calls={write_calls} chunks={write_chunks} chunks/call={write_chunks/write_calls:.2f} max={b.get("write_max", 0)}")
 spawn_ns = d("spawn_ns"); to_send_ns = d("to_send_ns")
 print("  lifecycle means (dispatch-sampled, also latency):")
 print(f"    spawn   {us(spawn_ns, life):8.1f}us")

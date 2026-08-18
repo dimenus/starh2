@@ -58,6 +58,9 @@ test "emit batch packing is the production drain-turn rule" {
     // cannot hide them; this import is the canary that they still run in ci.
     const batch = starh2.edge.emit_batch;
     try std.testing.expect(!batch.frameIsBatchable(false, 0, 40, batch.max_plaintext));
+    try std.testing.expect(!batch.frameJoinsInProgress(false, 0, 40, batch.max_plaintext, 0, false));
+    try std.testing.expect(!batch.frameJoinsInProgress(false, 0, 40, batch.max_plaintext, 10, false));
+    try std.testing.expect(batch.frameJoinsInProgress(false, 0, 40, batch.max_plaintext, 0, true));
     var storage: [64]u8 = undefined;
     var emit: batch.EmitBatch = .{ .buf = &storage };
     emit.copyFrame("H1", true, 8, true);

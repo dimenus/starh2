@@ -467,6 +467,8 @@ const HandlerCtx = struct {
     /// Also the flag `sendCb` uses: do not key off `running_inline`, which is
     /// true for the whole connection and would skip a concurrent task handler's wait.
     defer_receipt: bool = false,
+    /// `1` means encode succeeded. The drain-turn receipt is reserved after
+    /// the inline batch, not per response (`deferred_slot` is unused then).
     deferred_ticket: u64 = 0,
     deferred_slot: u32 = 0,
     send_traced: bool = false,
@@ -2547,6 +2549,189 @@ const Connection = struct {
                     return;
                 }
                 const taken = batch.emit.take();
+                try batch.queue(
+                    taken.bytes,
+                    taken.flush,
+                    taken.ticket,
+                    taken.ticket_slot,
+                    taken.ticket_count,
+                    taken.control_n,
+                    taken.control_entries,
+                    false,
+                );
+            }
+
+            fn sink(
+                ctx: *anyopaque,
+                payload: []u8,
+                flush: bool,
+                ticket: u64,
+                ticket_slot: u32,
+                control_n: usize,
+                control_entry: bool,
+            ) anyerror!void {
+                const batch: *@This() = @ptrCast(@alignCast(ctx));
+                const c = batch.c;
+                if (emit_batch.frameIsBatchable(
+                    control_entry,
+                    ticket,
+                    frame.encodedOnWireLen(payload),
+                    batch.emit.capacity(),
+                )) {
+                    const wire = frame.encodedOnWire(payload);
+                    if (!batch.emit.wouldFit(wire.len)) {
+                        batch.flushBatch() catch |err| {
+                            c.releaseWireBytes(payload);
+                            return err;
+                        };
+                    }
+                    if (ticket != 0) {
+                        if (batch.emit.ticket_count != 0) {
+                            c.tickets.linkCompletion(batch.emit.last_ticket_slot, ticket_slot) catch {
+                                if (batch.emit.control_entries != 0) {
+                                    c.applyControlRelease(batch.emit.control_n, batch.emit.control_entries);
+                                    batch.emit.control_n = 0;
+                                    batch.emit.control_entries = 0;
+                                }
+                                c.releaseWireBytes(payload);
+                                return error.WriteFailed;
+                            };
+                        }
+                        batch.emit.noteTicket(ticket, ticket_slot);
+                    }
+                    batch.emit.copyFrame(wire, flush, control_n, control_entry);
+                    c.releaseWireBytes(payload);
+                } else {
+                    batch.flushBatch() catch |err| {
+                        c.releaseWireBytes(payload);
+                        return err;
+                    };
+                    try batch.queue(
+                        payload,
+                        flush,
+                        ticket,
+                        ticket_slot,
+                        if (ticket != 0) 1 else 0,
+                        control_n,
+                        if (control_entry) 1 else 0,
+                        true,
+                    );
+                }
+                if (!control_entry and c.pending_data_outbound_release != 0) {
+                    c.applyOutboundRelease(c.pending_data_outbound_release, .pending);
+                    c.wakeStreamSpace(c.pending_data_wake_sid);
+                    c.pending_data_outbound_release = 0;
+                    c.pending_data_wake_sid = 0;
+                }
+            }
+            fn streamWin(ctx: *anyopaque, stream_id: u31) i32 {
+                const c: *Connection = @ptrCast(@alignCast(ctx));
+                return c.session.streamSendAvailable(stream_id);
+            }
+            fn connWin(ctx: *anyopaque) i32 {
+                const c: *Connection = @ptrCast(@alignCast(ctx));
+                return c.session.connectionSendAvailable();
+            }
+            fn buildData(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool) anyerror![]u8 {
+                const c: *Connection = @ptrCast(@alignCast(ctx));
+                const data_payload = c.session.makeDataFrame(stream_id, bytes, end) catch |err| {
+                    if (err == error.FlowBlocked) return error.FlowBlocked;
+                    return err;
+                };
+                c.pending_data_outbound_release = bytes.len;
+                c.pending_data_wake_sid = stream_id;
+                return data_payload;
+            }
+        };
+        std.debug.assert(self.plaintext_scratch.len == emit_batch.max_plaintext + 1);
+        var sink_ctx: SinkCtx = .{
+            .c = self,
+            .emit = .{ .buf = self.plaintext_scratch[0 .. self.plaintext_scratch.len - 1] },
+        };
+        self.sched.drain(
+            &sink_ctx,
+            SinkCtx.sink,
+            self,
+            SinkCtx.streamWin,
+            SinkCtx.connWin,
+            SinkCtx.buildData,
+            self,
+        ) catch |err| {
+            if (self.pending_data_outbound_release != 0) {
+                self.applyOutboundRelease(self.pending_data_outbound_release, .pending);
+                self.pending_data_outbound_release = 0;
+                self.pending_data_wake_sid = 0;
+            }
+            self.writer_failed.store(true, .release);
+            self.handleWriterFailed();
+            return err;
+        };
+        sink_ctx.flushBatch() catch |err| {
+            self.writer_failed.store(true, .release);
+            self.handleWriterFailed();
+            return err;
+        };
+        if (trace.enabled) {
+            if (sink_ctx.tickets_emitted > 0) {
+                _ = trace.emit_turns.fetchAdd(1, .monotonic);
+                _ = trace.emit_tickets.fetchAdd(sink_ctx.tickets_emitted, .monotonic);
+                trace.bumpMax(&trace.emit_max, sink_ctx.tickets_emitted);
+            }
+        }
+        test_observed_sched_emits.store(self.sched.emits_total, .release);
+    }
+
+    /// Complete-handler drain: join unticketed DATA while a drain-turn receipt
+    /// is live, and attach that receipt to the last `queueWire`. Do not route
+    /// the actor or SSE through this sink — that hung 100-stream shutdown even
+    /// with `receipt_ticket == 0`. Actor emit stays on `drainEmit`.
+    fn drainEmitReceipt(self: *Connection, receipt_ticket: u64, receipt_slot: u32, attached: *bool) !void {
+        self.assertSessionHeld("drainEmitReceipt");
+        const ReceiptSink = struct {
+            c: *Connection,
+            emit: emit_batch.EmitBatch,
+            tickets_emitted: u32 = 0,
+            receipt_ticket: u64 = 0,
+            receipt_slot: u32 = 0,
+            receipt_attached: bool = false,
+            queued_any: bool = false,
+
+            fn queue(
+                batch: *@This(),
+                payload: []u8,
+                flush: bool,
+                ticket: u64,
+                ticket_slot: u32,
+                ticket_count: u32,
+                control_n: usize,
+                control_entries: u32,
+                owns_payload: bool,
+            ) anyerror!void {
+                // A completed batch is still scheduler-originated output even
+                // when it is handed off after `sched.drain` returns.
+                test_in_sched_sink = true;
+                defer test_in_sched_sink = false;
+                if (trace.enabled) batch.tickets_emitted += ticket_count;
+                batch.queued_any = true;
+                try batch.c.queueWire(
+                    payload,
+                    flush,
+                    ticket,
+                    ticket_slot,
+                    ticket_count,
+                    control_n,
+                    control_entries,
+                    owns_payload,
+                );
+            }
+
+            fn flushBatch(batch: *@This()) anyerror!void {
+                if (batch.emit.empty()) {
+                    std.debug.assert(batch.emit.ticket_count == 0);
+                    std.debug.assert(batch.emit.control_entries == 0);
+                    return;
+                }
+                const taken = batch.emit.take();
                 // queueWire encrypts this borrowed slice synchronously. The
                 // buffer is the connection's boot-counted TLS plaintext
                 // scratch, so a batch adds no allocation and no new limit.
@@ -2580,11 +2765,13 @@ const Connection = struct {
                 // Several HEADERS may share one plaintext. Occupancy is still
                 // held until the write completes; control_entries is how many
                 // reserved slots that completion must return.
-                if (emit_batch.frameIsBatchable(
+                if (emit_batch.frameJoinsInProgress(
                     control_entry,
                     ticket,
                     frame.encodedOnWireLen(payload),
                     batch.emit.capacity(),
+                    batch.emit.len,
+                    batch.receipt_ticket != 0,
                 )) {
                     const wire = frame.encodedOnWire(payload);
                     if (!batch.emit.wouldFit(wire.len)) {
@@ -2654,17 +2841,20 @@ const Connection = struct {
             }
         };
         std.debug.assert(self.plaintext_scratch.len == emit_batch.max_plaintext + 1);
-        var sink_ctx: SinkCtx = .{
+        var sink_ctx: ReceiptSink = .{
             .c = self,
             .emit = .{ .buf = self.plaintext_scratch[0 .. self.plaintext_scratch.len - 1] },
+            .receipt_ticket = receipt_ticket,
+            .receipt_slot = receipt_slot,
         };
+        defer attached.* = sink_ctx.receipt_attached;
         self.sched.drain(
             &sink_ctx,
-            SinkCtx.sink,
+            ReceiptSink.sink,
             self,
-            SinkCtx.streamWin,
-            SinkCtx.connWin,
-            SinkCtx.buildData,
+            ReceiptSink.streamWin,
+            ReceiptSink.connWin,
+            ReceiptSink.buildData,
             self,
         ) catch |err| {
             if (self.pending_data_outbound_release != 0) {
@@ -2676,11 +2866,38 @@ const Connection = struct {
             self.handleWriterFailed();
             return err;
         };
-        sink_ctx.flushBatch() catch |err| {
-            self.writer_failed.store(true, .release);
-            self.handleWriterFailed();
-            return err;
-        };
+        if (sink_ctx.receipt_ticket != 0 and !sink_ctx.receipt_attached) {
+            if (!sink_ctx.emit.empty()) {
+                if (sink_ctx.emit.ticket_count != 0) {
+                    self.tickets.linkCompletion(sink_ctx.emit.last_ticket_slot, sink_ctx.receipt_slot) catch {
+                        self.writer_failed.store(true, .release);
+                        self.handleWriterFailed();
+                        return error.WriteFailed;
+                    };
+                }
+                sink_ctx.emit.noteTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot);
+                sink_ctx.flushBatch() catch |err| {
+                    self.writer_failed.store(true, .release);
+                    self.handleWriterFailed();
+                    return err;
+                };
+                sink_ctx.receipt_attached = true;
+            } else if (sink_ctx.queued_any) {
+                self.sendFlushTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot) catch |err| {
+                    self.writer_failed.store(true, .release);
+                    self.handleWriterFailed();
+                    return err;
+                };
+                if (trace.enabled) trace.noteHandoff(1, 0);
+                sink_ctx.receipt_attached = true;
+            }
+        } else {
+            sink_ctx.flushBatch() catch |err| {
+                self.writer_failed.store(true, .release);
+                self.handleWriterFailed();
+                return err;
+            };
+        }
         if (trace.enabled) {
             if (sink_ctx.tickets_emitted > 0) {
                 _ = trace.emit_turns.fetchAdd(1, .monotonic);
@@ -2819,6 +3036,12 @@ const Connection = struct {
         self.assertSessionHeld("processIntents");
         try self.materializeIntents();
         try self.drainEmit();
+    }
+
+    fn processIntentsWithReceipt(self: *Connection, ticket: u64, slot: u32, attached: *bool) anyerror!void {
+        self.assertSessionHeld("processIntentsWithReceipt");
+        try self.materializeIntents();
+        try self.drainEmitReceipt(ticket, slot, attached);
     }
 
     fn sendFlushTicket(self: *Connection, ticket: u64, slot: u32) anyerror!void {
@@ -3440,9 +3663,9 @@ const Connection = struct {
 
     /// Complete handlers skip spawn. They are queued under `session_mu` and
     /// run here with the lock released. Encode the whole batch, one drainEmit
-    /// through WritePump, then wait every receipt — that is what keeps
-    /// multiplexed complete responses in one TLS record. SSE and any handler
-    /// that can wait still go through `io.concurrent`.
+    /// through WritePump, then wait the one drain-turn receipt — that is the
+    /// self-clock that keeps multiplexed complete responses in one TLS record.
+    /// SSE and any handler that can wait still go through `io.concurrent`.
     fn runPendingInline(self: *Connection) void {
         // Do not assert `!session_held`: that flag means SOMEBODY holds the
         // mutex, often a task handler's sendCb, not this actor. Taking the
@@ -3468,26 +3691,100 @@ const Connection = struct {
                 runHandlerJobBody(job);
             }
 
+            var receipt_ticket: u64 = 0;
+            var receipt_slot: u32 = ticket_table.no_completion_slot;
+            var receipt_attached = false;
+            var wait_sid: u31 = 0;
+            var wait_job: ?*HandlerJob = null;
             {
                 self.lockSessionUncancelable(self.config.io);
                 defer self.unlockSession(self.config.io);
-                self.processIntents() catch self.failClosedOnIntentError();
+
+                i = 0;
+                while (i < batch_n) : (i += 1) {
+                    const sid = self.inline_sids[i];
+                    const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                    if (job.hctx.deferred_ticket != 0 and wait_job == null) {
+                        wait_sid = sid;
+                        wait_job = job;
+                    }
+                }
+
+                if (wait_job != null) {
+                    if (self.reserveTicket()) |pair| {
+                        receipt_ticket = pair[0];
+                        receipt_slot = pair[1];
+                        i = 0;
+                        while (i < batch_n) : (i += 1) {
+                            const sid = self.inline_sids[i];
+                            const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                            if (!job.hctx.send_traced) continue;
+                            if (self.trace_ticket.cmpxchgStrong(0, pair[0], .acq_rel, .monotonic) == null) {
+                                self.trace_ack_ns.store(0, .release);
+                                self.trace_emit_ns.store(0, .release);
+                                self.trace_queued_ns.store(0, .release);
+                                self.trace_written_ns.store(0, .release);
+                            } else {
+                                job.hctx.send_traced = false;
+                                _ = trace.skipped.fetchAdd(1, .monotonic);
+                            }
+                        }
+                    } else |_| {}
+                }
+
+                self.processIntentsWithReceipt(receipt_ticket, receipt_slot, &receipt_attached) catch self.failClosedOnIntentError();
+            }
+
+            if (receipt_ticket != 0) {
+                if (receipt_attached) {
+                    i = 0;
+                    while (i < batch_n) : (i += 1) {
+                        const sid = self.inline_sids[i];
+                        const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                        if (job.hctx.deferred_ticket != 0) {
+                            job.slot.awaiting_receipt.store(true, .release);
+                        }
+                    }
+                    var receipt_ok = true;
+                    if (wait_job) |job| {
+                        self.waitTicket(wait_sid, receipt_slot, job.hctx.terminal) catch {
+                            i = 0;
+                            while (i < batch_n) : (i += 1) {
+                                const sid = self.inline_sids[i];
+                                const wjob = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                                if (wjob.hctx.send_traced) self.trace_ticket.store(0, .release);
+                            }
+                            receipt_ok = false;
+                        };
+                    } else {
+                        self.tickets.releaseReserved(receipt_slot);
+                        receipt_ok = false;
+                    }
+                    if (receipt_ok) {
+                        i = 0;
+                        while (i < batch_n) : (i += 1) {
+                            const sid = self.inline_sids[i];
+                            const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                            self.stampSendWait(&job.hctx);
+                        }
+                    }
+                    i = 0;
+                    while (i < batch_n) : (i += 1) {
+                        const sid = self.inline_sids[i];
+                        const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+                        if (job.hctx.deferred_ticket != 0) {
+                            job.slot.awaiting_receipt.store(false, .release);
+                        }
+                    }
+                } else {
+                    self.tickets.releaseReserved(receipt_slot);
+                }
             }
 
             i = 0;
             while (i < batch_n) : (i += 1) {
                 const sid = self.inline_sids[i];
                 const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                if (job.hctx.deferred_ticket != 0) {
-                    job.slot.awaiting_receipt.store(true, .release);
-                    defer job.slot.awaiting_receipt.store(false, .release);
-                    self.waitTicket(sid, job.hctx.deferred_slot, job.hctx.terminal) catch {
-                        if (job.hctx.send_traced) self.trace_ticket.store(0, .release);
-                        finishHandlerJob(job);
-                        continue;
-                    };
-                    self.stampSendWait(&job.hctx);
-                }
                 finishHandlerJob(job);
             }
             self.drainCompletions();
@@ -3541,18 +3838,11 @@ const Connection = struct {
 
     /// One-shot response: headers plus a complete body.
     ///
-    /// Runs on the HANDLER task. The shared shape of all five callbacks below:
-    /// 1. Check the terminal cause before doing any work.
-    /// 2. Reserve a ticket BEFORE taking the lock. Ticket reservation can fail,
-    ///    and it is better to fail without the connection's only mutex held.
-    /// 3. Take `session_mu`, apply the command, materialize the intents.
-    /// 4. RELEASE the lock.
-    /// 5. Only then wait on the ticket.
-    ///
-    /// Step 5 must be outside the lock. The ticket is completed by the
-    /// AckDrainer after the WritePump has written the bytes, and the actor
-    /// needs `session_mu` to produce those bytes. A wait inside the lock is a
-    /// deadlock.
+    /// Task handlers: reserve a ticket before the lock, encode, release the
+    /// lock, then wait. Complete handlers skip the per-response ticket;
+    /// `runPendingInline` waits one drain-turn receipt after the packed write.
+    /// A wait inside `session_mu` is a deadlock: AckDrainer completes the
+    /// ticket after WritePump, and the actor needs the mutex to produce bytes.
     ///
     /// The `armed` flag releases the ticket slot on any failure that happens
     /// before the wait begins. Once the wait starts the slot belongs to
@@ -3757,10 +4047,15 @@ const Connection = struct {
             hctx.compressing = false;
         }
 
-        const ticket_pair = self.reserveTicket() catch |err| return err;
-        const ticket = ticket_pair[0];
-        const slot_i = ticket_pair[1];
-        var armed = true;
+        var ticket: u64 = 0;
+        var slot_i: u32 = 0;
+        var armed = false;
+        if (!hctx.defer_receipt) {
+            const ticket_pair = self.reserveTicket() catch |err| return err;
+            ticket = ticket_pair[0];
+            slot_i = ticket_pair[1];
+            armed = true;
+        }
         defer if (armed) self.tickets.releaseReserved(slot_i);
 
         // One-shot responses use the same ticket-correlated phase trace as
@@ -3771,18 +4066,18 @@ const Connection = struct {
         var traced = lifecycle or (trace.enabled and
             (trace.writes.fetchAdd(1, .monotonic) % trace.sample_every == 0));
         if (lifecycle) _ = trace.writes.fetchAdd(1, .monotonic);
-        if (traced) {
+        if (traced and !hctx.defer_receipt) {
             traced = self.trace_ticket.cmpxchgStrong(0, ticket, .acq_rel, .monotonic) == null;
             if (!traced) _ = trace.skipped.fetchAdd(1, .monotonic);
         }
         var defer_wait = false;
-        defer if (traced and !defer_wait) self.trace_ticket.store(0, .release);
+        defer if (traced and !defer_wait and !hctx.defer_receipt) self.trace_ticket.store(0, .release);
         var t_before: u64 = 0;
         var t_acquired: u64 = 0;
         var t_hpack: u64 = 0;
         var t_unlocked: u64 = 0;
         if (traced or lifecycle) {
-            if (traced) {
+            if (traced and !hctx.defer_receipt) {
                 self.trace_ack_ns.store(0, .release);
                 self.trace_emit_ns.store(0, .release);
                 self.trace_queued_ns.store(0, .release);
@@ -3822,10 +4117,12 @@ const Connection = struct {
                 const pending_len = self.sched.pendingByteLen(stream_id);
                 const fits_without_wait = pending_len < self.config.limits.outbound_bytes_per_stream and
                     body_out.len <= self.config.limits.outbound_bytes_per_stream - pending_len;
-                if (fits_without_wait) {
+                if (hctx.defer_receipt or fits_without_wait) {
                     // Stage DATA first, then place HEADERS in the ordinary
                     // control queue. Drain is left to the actor (task) or to
                     // `runPendingInline` after the whole complete batch encodes.
+                    // Complete handlers carry no per-response ticket: the
+                    // drain-turn receipt is reserved after this encode loop.
                     self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
@@ -3846,8 +4143,10 @@ const Connection = struct {
                     };
                 }
             } else {
-                self.next_wire_ticket = ticket;
-                self.next_wire_slot = slot_i;
+                if (ticket != 0) {
+                    self.next_wire_ticket = ticket;
+                    self.next_wire_slot = slot_i;
+                }
                 if (hctx.defer_receipt) {
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
@@ -3864,10 +4163,9 @@ const Connection = struct {
         if (traced) t_unlocked = nowNs(self.config.io);
         armed = false;
         if (hctx.defer_receipt) {
-            // Encode now, wait after `runPendingInline` drainEmit's the batch.
+            // Encode now, wait the one drain-turn receipt after `runPendingInline`.
             defer_wait = true;
-            hctx.deferred_ticket = ticket;
-            hctx.deferred_slot = slot_i;
+            hctx.deferred_ticket = 1;
             hctx.send_traced = traced;
             hctx.t_send_before = t_before;
             hctx.t_send_acquired = t_acquired;

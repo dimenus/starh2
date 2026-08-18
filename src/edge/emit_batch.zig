@@ -38,9 +38,10 @@ pub fn lastRecordFlush(is_last: bool, flush: bool) bool {
     return is_last and flush;
 }
 
-/// Unticketed DATA keeps the immediate per-frame handoff. A single frame
-/// larger than the scratch cannot join and is also immediate. Control frames
-/// and ticketed DATA concat into one queueWire, on h2c and TLS alike.
+/// Unticketed DATA keeps the immediate per-frame handoff when the scratch is
+/// empty. A single frame larger than the scratch cannot join and is also
+/// immediate. Control frames and ticketed DATA concat into one queueWire, on
+/// h2c and TLS alike.
 pub fn frameIsBatchable(
     control_entry: bool,
     ticket: u64,
@@ -48,6 +49,33 @@ pub fn frameIsBatchable(
     capacity: usize,
 ) bool {
     return (control_entry or ticket != 0) and payload_len <= capacity;
+}
+
+/// Whether this frame joins the drain-turn already in `batch_len`.
+///
+/// `frameIsBatchable` is the empty-scratch rule: unticketed DATA does not
+/// *start* a batch, so an SSE body write without a wait stays an immediate
+/// handoff. Complete oneshots skip a per-response ticket; their DATA would
+/// miss the packed write under that rule. `hold_unticketed` is the drain-turn
+/// receipt: those DATA join, including as the first byte of a new scratch
+/// after a 16 KiB overflow, so the receipt can ride the last `queueWire`.
+///
+/// Do not join unticketed DATA merely because the scratch is non-empty.
+/// SSE `writeAll` puts the receipt on a trailing empty DATA after an
+/// unticketed body; joining that body onto someone else's HEADERS was a
+/// shutdown hang (lifecycle 100-stream SSE).
+pub fn frameJoinsInProgress(
+    control_entry: bool,
+    ticket: u64,
+    payload_len: usize,
+    capacity: usize,
+    batch_len: usize,
+    hold_unticketed: bool,
+) bool {
+    _ = batch_len;
+    if (payload_len > capacity) return false;
+    if (control_entry or ticket != 0) return true;
+    return hold_unticketed;
 }
 
 pub const EmitBatch = struct {
@@ -114,7 +142,8 @@ pub const EmitBatch = struct {
 
     pub fn take(self: *EmitBatch) Taken {
         std.debug.assert(!self.empty());
-        std.debug.assert(self.ticket_count > 0 or self.control_entries != 0);
+        // DATA-only leftover after a 16 KiB overflow has neither a ticket nor
+        // a control entry: the drain-turn receipt rides the last queueWire.
         const out: Taken = .{
             .bytes = self.buf[0..self.len],
             .flush = self.needs_flush,
@@ -146,6 +175,40 @@ test "unticketed DATA is not batchable" {
     try std.testing.expect(frameIsBatchable(true, 1, 40, max_plaintext));
     try std.testing.expect(frameIsBatchable(false, 7, 40, max_plaintext));
     try std.testing.expect(!frameIsBatchable(true, 0, 50, 40));
+}
+
+test "unticketed DATA joins a drain-turn already in progress" {
+    // Empty scratch, no drain-turn receipt: SSE/body writes without a wait
+    // stay immediate. A non-empty scratch without a receipt is the same —
+    // joining here hung lifecycle SSE shutdown.
+    try std.testing.expect(!frameJoinsInProgress(false, 0, 40, max_plaintext, 0, false));
+    try std.testing.expect(!frameJoinsInProgress(false, 0, 40, max_plaintext, 10, false));
+    // Drain-turn receipt: oneshot DATA joins, including after overflow.
+    try std.testing.expect(frameJoinsInProgress(false, 0, 40, max_plaintext, 0, true));
+    try std.testing.expect(frameJoinsInProgress(false, 0, 40, max_plaintext, 10, true));
+    try std.testing.expect(frameJoinsInProgress(true, 0, 40, max_plaintext, 0, false));
+    try std.testing.expect(frameJoinsInProgress(false, 7, 40, max_plaintext, 0, false));
+    try std.testing.expect(!frameJoinsInProgress(false, 0, 50, 40, 10, true));
+}
+
+test "unticketed DATA overflow can take before the receipt is attached" {
+    var storage: [5]u8 = undefined;
+    var batch: EmitBatch = .{ .buf = &storage };
+    batch.copyFrame("aa", true, 2, true);
+    try std.testing.expect(!batch.wouldFit(4));
+    const first = batch.take();
+    try std.testing.expectEqualStrings("aa", first.bytes);
+    try std.testing.expectEqual(@as(u32, 1), first.control_entries);
+    batch.copyFrame("bbb", true, 0, false);
+    const mid = batch.take();
+    try std.testing.expectEqualStrings("bbb", mid.bytes);
+    try std.testing.expectEqual(@as(u32, 0), mid.ticket_count);
+    try std.testing.expectEqual(@as(u32, 0), mid.control_entries);
+    batch.copyFrame("cc", true, 0, false);
+    batch.noteTicket(9, 1);
+    const last = batch.take();
+    try std.testing.expectEqualStrings("cc", last.bytes);
+    try std.testing.expectEqual(@as(u64, 9), last.ticket);
 }
 
 test "several HEADERS join one batch and sum control occupancy" {

@@ -18,7 +18,11 @@ paid one record per response (`records/response = 1.00`) while SSE packed,
 because SSE DATA is not a control.
 
 h2c concatenates the same drain-turn into one write chunk. Unticketed DATA
-is still the immediate per-frame handoff.
+is the immediate per-frame handoff unless the drain holds a complete-handler
+receipt (`hold_unticketed`). Complete oneshots share one drain-turn receipt,
+so their DATA joins — including after a 16 KiB overflow — and that receipt
+rides the last `queueWire`. Joining unticketed DATA merely because the
+scratch already held HEADERS hung lifecycle SSE shutdown.
 
 ## Live packing oracle
 
@@ -28,8 +32,10 @@ tools/oneshot-phase-trace.sh
 
 Throughput-shaped (use these for the remaining gap, not wall waits):
 
-- `tickets/handoff` — responses coalesced into one `queueWire`
-- `tickets/emit` — responses flushed in one `drainEmit` turn
+- `tickets/handoff` — receipts coalesced into one `queueWire`. Complete
+  oneshots attach **one receipt per packed write**, so this sits near **1**
+  on purpose. Packing authority is `records/response`.
+- `tickets/emit` — receipts flushed in one `drainEmit` turn
 - `records/response` — TLS records per h2load success. Packed drain turns
   at `-m 10` sit well below **0.4**. **1.00** means a second HEADERS
   flushed the batch again. The script **exits 9** rather than reporting
@@ -40,8 +46,9 @@ Latency-shaped (overlapped across many concurrent streams; not throughput):
 `block` / `hold` / `ack` / `resume`, and dispatch-sampled `spawn` /
 `to_send` / `hpack`.
 
-Cross-check the ticket delta against h2load `succeeded`, not against
-`jobs`. `jobs` is a dispatch counter and includes `/trace`.
+Cross-check `writes` against h2load `succeeded`, not tickets against
+`succeeded`. Tickets now track packed writes. `jobs` is a dispatch
+counter and includes `/trace`.
 
 Use a dedicated 400k TLS run for packing, not the official interleaved
 100k TLS+h2c harness. That harness is noisier than the path under test.
@@ -60,7 +67,8 @@ the public-surface canary.
 | Byte-only release drops no entry | `release(100, 0)` leaves `entries_held == 1` |
 | Concat past 16 KiB | `wouldFit` false; flush then a new batch |
 | Receipt on a non-last encrypt record | `lastRecordMeta` / `lastRecordFlush` zero tickets and do not flush |
-| unticketed DATA batched | `frameIsBatchable` is false |
+| unticketed DATA batched from empty scratch | `frameIsBatchable` is false |
+| oneshot DATA missing a drain-turn receipt | `frameJoinsInProgress` is true only when `hold_unticketed` |
 | Packed ticket chain truncated or short | AckDrainer walk canaries (snap `next` before `complete`) |
 | Scratch includes the TLS content-type byte | `max_plaintext + 1 == TLS_PLAINTEXT_SCRATCH_SIZE`, asserted in `drainEmit` |
 
@@ -106,7 +114,8 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   response and drain-emitting per job* dropped ~176k → ~123k: encode left
   the parallel handler tasks and serialized onto the actor. The landed cut
   is different: complete handlers skip spawn, encode the whole inline
-  batch, one `drainEmit`, then wait every receipt. Do not re-try the first
+  batch, one `drainEmit`, then wait one drain-turn receipt (not one
+  ticket per response, and not a skipped wait). Do not re-try the first
   shape, and do not undo the batch wait.
 - More packing micros, or TLS encrypt 6×50 B vs 1×300 B: live already
   packed (oracle exits 9 at `records/response > 0.4`). Packed drain turns
@@ -122,19 +131,41 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   56 µs → 0.2 µs, but TLS fell ~369k → ~307k req/s and resume/write waits
   grew. Completing tickets on the write task delayed the next getOne;
   the third task was overlapping the next write, not serial waste.
+- Skipping the completion-channel hop for complete handlers (actor
+  `releaseSlot` after the batch wait). Darwin official stayed ~283k TLS /
+  ~505k h2c (t-788 was ~288k / ~493k); packing unchanged. The hop is not
+  the live gap. A skip keyed on `defer_receipt` stranded SSE shutdown
+  (lifecycle hang); do not retry.
 
 ## What is left
 
-Live one-shot is no longer an alloc, spawn, HPACK, Huffman, parse, or
-h2c-unpacked-write story. h2c now concatenates the same drain-turn as
-TLS (`tickets/handoff` matches; `records/response` packed). Re-run
-`tools/oneshot-phase-trace.sh` and the official bench; they move with
-the machine.
+Live one-shot is no longer an alloc, spawn, HPACK, Huffman, parse,
+h2c-unpacked-write, or per-response ticket-wait story. Complete oneshots
+wait one drain-turn receipt (`tickets/handoff` near 1; packing is
+`records/response`). Re-run `tools/oneshot-phase-trace.sh` and the
+official bench; they move with the machine.
 
-The TLS vs http2.zig residue is still Connection lifecycle: actor +
-ReadPump + WritePump + AckDrainer + receipts. Do not name it “one
-actor per connection” — http2.zig also has one connection task; theirs
-is a single read/dispatch/write/flush loop. Their 3.78M is a narrower
+After h2c concat, the live gap vs http2.zig is TLS. Isolated
+Session/HPACK are tied. Re-derive the official numbers; the shape on
+Nachos after this cut was h2c catching TLS’s packing (CPU/req a few
+microseconds) while TLS still paid several extra microseconds on top.
+Sol Extra High’s “TLS is not the first remaining suspect” applied when
+h2c was still unpacked; retire that sentence.
+
+The stacks terminate TLS differently. http2.zig’s bench uses BoringSSL
+via `http2-boring`; `serveConnection` gets already-decrypted
+reader/writer and coalesces `SSL_write`. starh2 uses patched
+`dimenus/tls.zig` — AES-GCM from `std.crypto`, not a homerolled AES —
+actor-owned, encrypt under `session_mu`, then memcpy ciphertext into a
+write chunk. Do not treat the TLS tax as “Zig AES vs C AES” until
+`connectionEncrypt` of a packed oneshot is timed against AES-GCM of the
+same bytes and against h2c write of the same bytes. Switching to
+BoringSSL would make a third owner of the socket unless it sits behind
+the same byte-transform ABI.
+
+Do not name the remaining HTTP/2 residue “one actor per connection” —
+http2.zig also has one connection task; theirs is a single
+read/dispatch/write/flush loop. Their TLS throughput is a narrower
 contract (handler or blocked write stops ingest). We keep the three
 starve stories: other connections, handler work vs actor, peer stops
 reading.
