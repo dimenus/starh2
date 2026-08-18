@@ -50,6 +50,8 @@ Throughput-shaped (use these for the remaining gap, not wall waits):
 - `ingest` / `intents` ns/req — `Session.ingest` then `processIntents`
   under `session_mu` (TLS: inside `driveDecrypt`; h2c: the plaintext
   chunk path).
+- `accAppend` / `accCompact` ns/req — socket chunk into `tls_recv_acc`,
+  then leftover memmove after `firstRecord`. Outside the decrypt clock.
 - `allocs/request` — counting-allocator calls on the server GPA (`--trace`)
 
 Latency-shaped (overlapped across many concurrent streams; not throughput):
@@ -171,6 +173,10 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   Throughput stayed inside a few percent with no consistent winner.
   The counters still compile out of ReleaseFast (`-Dobserve=true` puts
   them back); they are not the remaining gap.
+- Treating `tls_recv_acc` append/compaction as the TLS-minus-h2c residue.
+  400k packed `--trace` (Darwin and Nachos): append 8 ns/req (16.3 B),
+  compact 0 ns/req (leftover/record ≈ 0 — `firstRecord` consumes the
+  whole chunk). Outside the decrypt clock, and two orders below 0.10 µs.
 
 ## What is left
 
@@ -223,11 +229,12 @@ reading.
 
 Sol Extra High ranked legal chips inside that split: (1) gate test
 counters — measured, below the bar; (2) skip complete-handler reaper
-reserve; (3) clock inbound accumulator append/compaction. Wakes have
-no legal deletion. `session_mu` hold is uncontended on this
-complete-only load. Outbound ciphertext copy is already inside
-`sendAccountedWire` (~111 ns). Next measurement is (3), not another
-topology collapse.
+reserve; (3) clock inbound accumulator append/compaction — 8 ns/req
+append, compact never on packed oneshot. Wakes have no legal deletion.
+`session_mu` hold is uncontended on this complete-only load. Outbound
+ciphertext copy is already inside `sendAccountedWire` (~111 ns). Reaper
+reserve is the remaining unmeasured legal chip; one CAS pair is smaller
+than the five RMWs that did not move 0.10 µs.
 
 Reopen HPACK/parse only if an on-CPU h2c profile shows
 ingest+HPACK+Session ≥ 1 µs/req or 15% CPU. Sol Extra High picked A on

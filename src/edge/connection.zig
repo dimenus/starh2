@@ -281,6 +281,16 @@ pub const trace = struct {
     pub var send_ns: std.atomic.Value(u64) = .init(0);
     pub var send_n: std.atomic.Value(u64) = .init(0);
     pub var send_bytes: std.atomic.Value(u64) = .init(0);
+    /// TLS recv accumulator copies, gated by `enabled`, every call. Outside
+    /// the decrypt clock: append of a socket chunk, then memmove of leftover
+    /// ciphertext after `firstRecord` consumes one record. `compact_n` counts
+    /// only a nonzero leftover; compare to `inbound_records` for the skip rate.
+    pub var acc_append_ns: std.atomic.Value(u64) = .init(0);
+    pub var acc_append_n: std.atomic.Value(u64) = .init(0);
+    pub var acc_append_bytes: std.atomic.Value(u64) = .init(0);
+    pub var acc_compact_ns: std.atomic.Value(u64) = .init(0);
+    pub var acc_compact_n: std.atomic.Value(u64) = .init(0);
+    pub var acc_compact_bytes: std.atomic.Value(u64) = .init(0);
     /// `drainEmit` turns that flushed at least one ticket, and tickets in those
     /// turns. Mean tickets/turn is a batching signal distinct from wall waits.
     pub var emit_turns: std.atomic.Value(u64) = .init(0);
@@ -1919,7 +1929,13 @@ const Connection = struct {
         // reserves less than it admits fails here by name instead of corrupting
         // memory inside `appendSliceAssumeCapacity`.
         std.debug.assert(held + bytes.len <= self.tls_recv_acc.capacity);
+        const t0 = if (trace.enabled) nowNs(self.config.io) else 0;
         self.tls_recv_acc.appendSliceAssumeCapacity(bytes);
+        if (trace.enabled) {
+            _ = trace.acc_append_ns.fetchAdd(nowNs(self.config.io) -% t0, .monotonic);
+            _ = trace.acc_append_n.fetchAdd(1, .monotonic);
+            _ = trace.acc_append_bytes.fetchAdd(bytes.len, .monotonic);
+        }
     }
 
     fn waitH2cPreface(self: *Connection) !void {
@@ -2345,7 +2361,13 @@ const Connection = struct {
             if (res.consumed > 0) {
                 const rest = self.tls_recv_acc.items.len - res.consumed;
                 if (rest > 0) {
+                    const t0 = if (trace.enabled) nowNs(self.config.io) else 0;
                     @memmove(self.tls_recv_acc.items[0..rest], self.tls_recv_acc.items[res.consumed..][0..rest]);
+                    if (trace.enabled) {
+                        _ = trace.acc_compact_ns.fetchAdd(nowNs(self.config.io) -% t0, .monotonic);
+                        _ = trace.acc_compact_n.fetchAdd(1, .monotonic);
+                        _ = trace.acc_compact_bytes.fetchAdd(rest, .monotonic);
+                    }
                 }
                 self.tls_recv_acc.shrinkRetainingCapacity(rest);
             }

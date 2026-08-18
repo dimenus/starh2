@@ -15,6 +15,8 @@
 #   connectionDecrypt, and sendAccountedWire. Throughput-shaped; compare to
 #   isolated bench-pipeline cipher rows, not to overlapped queue_ns.
 #   decrypt_loop ns/req = whole driveDecrypt including ingest under session_mu.
+#   accAppend/accCompact ns/req = tls_recv_acc memcpy and leftover memmove;
+#   outside the decrypt clock. compact_n/inbound_records is the leftover rate.
 #   allocs/request   = counting-allocator calls on the server GPA (--trace only)
 #   alloc_ns/request = GPA rawAlloc wall time including two Clock.awake reads.
 #                      Overstates allocator cost; sample(1) is CPU-share authority.
@@ -150,6 +152,10 @@ print(f"    sendWire    {d("send_ns")/succeeded:8.0f} ns/req  n={send_n}  {d("se
 print(f"    decryptLoop {d("decrypt_loop_ns")/succeeded:8.0f} ns/req  n={loop_n}  {d("decrypt_loop_ns")/max(loop_n,1):.0f} ns/entry  [decrypt+ingest+intents under session_mu]")
 print(f"    ingest      {d("ingest_ns")/succeeded:8.0f} ns/req  n={d("ingest_n")}  {d("ingest_ns")/max(d("ingest_n"),1):.0f} ns/call")
 print(f"    intents     {d("intent_ns")/succeeded:8.0f} ns/req  n={d("intent_n")}  {d("intent_ns")/max(d("intent_n"),1):.0f} ns/call")
+acc_n = d("acc_append_n")
+cmp_n = d("acc_compact_n")
+print(f"    accAppend   {d("acc_append_ns")/succeeded:8.0f} ns/req  n={acc_n}  {d("acc_append_bytes")/succeeded:.1f} B/req  [socket chunk -> tls_recv_acc]")
+print(f"    accCompact  {d("acc_compact_ns")/succeeded:8.0f} ns/req  n={cmp_n}  {d("acc_compact_bytes")/succeeded:.1f} B/req  leftover/record={cmp_n/max(inbound,1):.2f}")
 emit_max = d("emit_max")
 print(f"    emit_turns={emit_turns}  mean tickets/turn={emit_tickets/max(emit_turns,1):.2f}  max={emit_max}")
 print(f"    allocs={allocs}  ({allocs/succeeded:.2f}/req)  bytes={alloc_bytes}  ({alloc_bytes/succeeded:.1f} B/req)")

@@ -240,7 +240,9 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             "\"decrypt_ns\":{d},\"decrypt_n\":{d},\"decrypt_in\":{d},\"decrypt_plain\":{d}," ++
             "\"inbound_records\":{d},\"decrypt_loop_ns\":{d},\"decrypt_loop_n\":{d}," ++
             "\"ingest_ns\":{d},\"ingest_n\":{d},\"intent_ns\":{d},\"intent_n\":{d}," ++
-            "\"send_ns\":{d},\"send_n\":{d},\"send_bytes\":{d},",
+            "\"send_ns\":{d},\"send_n\":{d},\"send_bytes\":{d}," ++
+            "\"acc_append_ns\":{d},\"acc_append_n\":{d},\"acc_append_bytes\":{d}," ++
+            "\"acc_compact_ns\":{d},\"acc_compact_n\":{d},\"acc_compact_bytes\":{d},",
         .{
             trace.encrypt_ns.load(.acquire),
             trace.encrypt_n.load(.acquire),
@@ -259,6 +261,12 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             trace.send_ns.load(.acquire),
             trace.send_n.load(.acquire),
             trace.send_bytes.load(.acquire),
+            trace.acc_append_ns.load(.acquire),
+            trace.acc_append_n.load(.acquire),
+            trace.acc_append_bytes.load(.acquire),
+            trace.acc_compact_ns.load(.acquire),
+            trace.acc_compact_n.load(.acquire),
+            trace.acc_compact_bytes.load(.acquire),
         },
     );
     try w.print(
