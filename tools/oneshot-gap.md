@@ -287,17 +287,23 @@ A client that stops reading the **socket** still fills TCP and blocks
 
 `tools/sse_bench/mixed.sh` exercises starve stories 2 and 3 on one TLS
 connection (32 SSE streams, 10 ms, 8 oneshot workers; Go opponent).
-Darwin, same day as the table above, pipeline binary, default
-`STARH2_EXECUTORS=2`. Oneshot-only stayed 36.6–36.7k rps (p50 210 µs).
-Mixed oneshot stayed 33.9–37.6k — ingest did not park. Mixed SSE did
-**not** hit the 16,000-event target: 8960 / 8064 / 10338, all 32/32
-streams delivering. Go mixed was 16,000 every round, oneshot ~35k.
-Stall: starh2 31/32 delivering, 7874 events, oneshot 37.7k rps; Go
-31/32, 15,500 events (exactly 31×500). The blocked peer did not stop
-ingest or the other streams. The 10 ms cadence is the miss: keep
-`waitTicket` yielded the actor; depth-2 pipeline keeps it busy. That
-is not a silent drop of streams. It fails the brief’s 16,000-event
-inspect. Do not satisfy it with a 50 µs actor sleep.
+Darwin, 2026-08-18, `37f04e0` (actor-owned handler deadline heap on
+`2612a13`), `STARH2_EXECUTORS=2`, 5 s + 1 s warmup, 3 rounds. Oneshot-only
+stayed in the hot band: 35670 / 34753 / 33778 rps (p50 214 / 219 / 223 µs).
+Mixed oneshot held 0.85× and p50 ≤ 300 µs: 34603 / 33804 / 32840 rps
+(p50 226 / 230 / 234 µs). Mixed delivering 32/32 every round. Mixed SSE
+did **not** hit 16,000: 10082 / 10658 / 10784. Go mixed was 16,000 every
+round at 38325 / 37533 / 37360 oneshot rps. Stall: starh2 31/32
+delivering, 10266 events, oneshot 33364 rps; Go 31/32, 15502 events,
+oneshot 38105 rps. SSE-only at the same STREAMS/INTERVAL/SECONDS
+(`tools/sse_bench/run.sh`) hit 16000/16000 — idle `waitForActivity`
+ticks the heap. Packing after this cut:
+`tools/oneshot-phase-trace.sh` `records/response = 0.10`,
+`complete_receipt_depth_max = 2`. T1/T2/T3 are green; `/sse` uses
+`waitUntil`, not `zio.sleep`. The 10 ms mixed cadence is still the miss,
+not a silent drop. Do not claim 16k from this run. Do not satisfy the
+remainder with a 50 µs actor sleep, yield-every-turn, zio#687, or by
+softening oneshot.
 
 Sol Extra High ranked legal chips inside that split: (1) gate test
 counters — measured, below the bar; (3) clock inbound accumulator
