@@ -95,6 +95,10 @@ repeated TLS connection churn can otherwise strand a socket task. Pass
 `--task-migration` directly to `starh2-bench-server` only when reproducing that
 upstream runtime failure.
 
+`tools/sse_bench/mixed.sh` keeps SSE streams live on one TLS connection and
+fires oneshots on the same socket (Go opponent; http2.zig cannot stream).
+Oneshot-only is the control. `STALL=0` skips the blocked-reader pass.
+
 ## Isolated pipeline benchmark
 
 `bench-pipeline` removes the socket, TLS, client, and lock-contention variables

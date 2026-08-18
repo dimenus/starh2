@@ -239,16 +239,24 @@ contract (handler or blocked write stops ingest). We keep the three
 starve stories: other connections, handler work vs actor, peer stops
 reading.
 
+`tools/sse_bench/mixed.sh` exercises the last two on one TLS connection
+(32 SSE streams, 10 ms, 8 oneshot workers; Go opponent; http2.zig is
+not an arm). Darwin: starh2 mixed SSE delivered the 16,000-event target
+every round; mixed oneshot stayed 6.8k–8.4k rps against oneshot-only
+7.9k–9.1k on that 8-worker client (not the official h2load 50-conn
+shape). Go ~24k oneshot rps with or without SSE. One stalled SSE
+reader: 31/32 still delivering, starh2 oneshot 10.5k rps. Ingest did
+not park, and the blocked peer did not stop the others.
+
 Sol Extra High ranked legal chips inside that split: (1) gate test
 counters — measured, below the bar; (3) clock inbound accumulator
 append/compaction — 8 ns/req append, compact never on packed oneshot;
 (2) skip complete-handler reaper reserve — measured, below the bar,
 kept so complete oneshots do not take cancellation tokens. Wakes have
-no legal deletion. `session_mu` hold is uncontended on this
-complete-only load. Outbound ciphertext copy is already inside
-`sendAccountedWire` (~111 ns). Those legal chips are done. A oneshot
-bench cannot value the connection split (the three starve stories stay
-unexercised).
+no legal deletion. `session_mu` hold is uncontended on a complete-only
+load. Outbound ciphertext copy is already inside `sendAccountedWire`
+(~111 ns). Those legal chips are done. A oneshot ABA still cannot price
+the split; the mixed run above can.
 
 Reopen HPACK/parse only if an on-CPU h2c profile shows
 ingest+HPACK+Session ≥ 1 µs/req or 15% CPU. Sol Extra High picked A on
