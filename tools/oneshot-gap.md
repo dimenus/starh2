@@ -87,6 +87,15 @@ spend another round on the memcpy. Isolated Session request+response now
 sits close to http2.zig's inline core (~630 ns vs ~567); empty zio
 spawn+await is what complete handlers no longer pay.
 
+The TLS cipher is not the live tax. `bench-pipeline` now times
+`std.crypto` AES-GCM and `connectionEncrypt` of a 64-byte inbound record
+and a 300-byte packed outbound record. Re-derive; on Darwin both sit in
+the low hundreds of nanoseconds, and tls.zig's record wrapper is tens of
+nanoseconds over AES-GCM, not microseconds. Packed outbound / 6 is tens
+of nanoseconds per response. Do not retry packing 6×50 vs 1×300, and do
+not treat BoringSSL vs tls.zig as a cipher-speed story until an on-CPU
+TLS profile shows encrypt/decrypt as the slice.
+
 Huffman is closed: a comptime prefix trie in `huffDecode` matches
 http2.zig `decodeBounded` (Darwin Chrome UA 658 vs 653 ns). Mixed HPACK
 86 vs 16 ns is required dynamic-table copies vs views (~70 ns), not an
@@ -157,11 +166,14 @@ via `http2-boring`; `serveConnection` gets already-decrypted
 reader/writer and coalesces `SSL_write`. starh2 uses patched
 `dimenus/tls.zig` — AES-GCM from `std.crypto`, not a homerolled AES —
 actor-owned, encrypt under `session_mu`, then memcpy ciphertext into a
-write chunk. Do not treat the TLS tax as “Zig AES vs C AES” until
-`connectionEncrypt` of a packed oneshot is timed against AES-GCM of the
-same bytes and against h2c write of the same bytes. Switching to
-BoringSSL would make a third owner of the socket unless it sits behind
-the same byte-transform ABI.
+write chunk. Isolated `connectionEncrypt` is tens of nanoseconds over
+AES-GCM of the same bytes; that cannot explain several microseconds per
+request. The live TLS tax is where the cipher runs (actor lock, extra
+ciphertext copy, `firstRecord` decrypt) versus BoringSSL on the socket
+adapter. Switching to BoringSSL would make a third owner of the socket
+unless it sits behind the same byte-transform ABI. Next isolate is
+`queueWire` wall time (encrypt + copy + push) and inbound TLS records
+per request, not another packing micro and not encrypt-on-WritePump.
 
 Do not name the remaining HTTP/2 residue “one actor per connection” —
 http2.zig also has one connection task; theirs is a single

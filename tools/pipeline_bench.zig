@@ -1,17 +1,19 @@
 //! Isolated CPU/allocation costs for the one-shot request pipeline.
 //!
-//! This is intentionally not a throughput benchmark. It removes sockets, TLS,
+//! This is intentionally not a throughput benchmark. It removes sockets,
 //! contention, and client scheduling so a large full-server gap can be assigned
 //! to concrete local work (or shown not to live there). Each row runs multiple
 //! rounds and reports the median plus the observed range.
 const std = @import("std");
 const starh2 = @import("starh2");
 const zio = @import("zio");
+const tls = @import("tls");
 
 const hpack = starh2.core.hpack;
 const frame = starh2.core.frame;
 const emit_batch = starh2.edge.emit_batch;
 const ticket_table = starh2.edge.ticket_table;
+const tls_edge = starh2.edge.tls_edge;
 
 const response_fields = [_]hpack.HeaderField{
     .{ .name = ":status", .value = "200" },
@@ -415,6 +417,103 @@ fn packSixOp(ctx: *PackCtx) !usize {
     return n;
 }
 
+const aes128_only = [_]tls.config.CipherSuite{.AES_128_GCM_SHA256};
+
+const AesGcmCtx = struct {
+    key: [std.crypto.aead.aes_gcm.Aes128Gcm.key_length]u8 = @splat(0x11),
+    nonce: [std.crypto.aead.aes_gcm.Aes128Gcm.nonce_length]u8 = @splat(0),
+    ad: [5]u8 = .{ 0x17, 0x03, 0x03, 0x00, 0x00 },
+    msg: [300]u8 = @splat('P'),
+    out: [300]u8 = undefined,
+    tag: [std.crypto.aead.aes_gcm.Aes128Gcm.tag_length]u8 = undefined,
+    len: usize,
+
+    fn op(self: *AesGcmCtx) !usize {
+        const Aes = std.crypto.aead.aes_gcm.Aes128Gcm;
+        const n = self.len;
+        self.nonce[11] +%= 1;
+        Aes.encrypt(self.out[0..n], &self.tag, self.msg[0..n], &self.ad, self.nonce, self.key);
+        return self.out[0];
+    }
+};
+
+const TlsRecordCtx = struct {
+    srv: tls.nonblock.Connection,
+    cli: tls.nonblock.Connection,
+    cipher_buf: [tls.max_ciphertext_record_len]u8 = undefined,
+    plain_buf: [tls.max_ciphertext_record_len]u8 = undefined,
+    alert_buf: [256]u8 = undefined,
+    msg: [300]u8 = @splat('T'),
+    len: usize,
+
+    fn init(io: std.Io, len: usize) TlsRecordCtx {
+        const rng_impl: std.Random.IoSource = .{ .io = io };
+        const rng = rng_impl.interface();
+        var sc_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+        var cs_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+
+        var cli_hs = tls.nonblock.Client.init(.{
+            .rng = rng,
+            .root_ca = .empty,
+            .host = &.{},
+            .insecure_skip_verify = true,
+            .now = .zero,
+            .cipher_suites = &aes128_only,
+        });
+        var srv_hs = tls.nonblock.Server.init(.{
+            .rng = rng,
+            .auth = null,
+            .now = .zero,
+            .cipher_suites = &aes128_only,
+        });
+
+        const cr1 = cli_hs.run(&sc_buf, &cs_buf) catch
+            abort("tls handshake: client hello failed", .{});
+        const sr1 = srv_hs.run(cs_buf[0..cr1.send_pos], &sc_buf) catch
+            abort("tls handshake: server hello failed", .{});
+        const cr2 = cli_hs.run(sc_buf[0..sr1.send_pos], &cs_buf) catch
+            abort("tls handshake: client finished failed", .{});
+        if (!cli_hs.done()) abort("tls handshake: client not done", .{});
+        _ = srv_hs.run(cs_buf[0..cr2.send_pos], &sc_buf) catch
+            abort("tls handshake: server finished failed", .{});
+        if (!srv_hs.done()) abort("tls handshake: server not done", .{});
+        const cli_cipher = cli_hs.cipher() orelse abort("tls handshake: no client cipher", .{});
+        const srv_cipher = srv_hs.cipher() orelse abort("tls handshake: no server cipher", .{});
+        return .{
+            .srv = tls.nonblock.Connection.init(srv_cipher),
+            .cli = tls.nonblock.Connection.init(cli_cipher),
+            .len = len,
+        };
+    }
+
+    fn encryptOp(self: *TlsRecordCtx) !usize {
+        const res = tls_edge.connectionEncrypt(&self.srv, self.msg[0..self.len], &self.cipher_buf);
+        switch (res.status) {
+            .complete => {},
+            .tls_error => |err| abort("tls.zig encrypt: {s}", .{@errorName(err)}),
+            else => abort("tls.zig encrypt status {s}", .{@tagName(res.status)}),
+        }
+        return res.ciphertext_len;
+    }
+
+    fn decryptOp(self: *TlsRecordCtx) !usize {
+        const enc = tls_edge.connectionEncrypt(&self.cli, self.msg[0..self.len], &self.cipher_buf);
+        switch (enc.status) {
+            .complete => {},
+            .tls_error => |err| abort("tls.zig peer encrypt: {s}", .{@errorName(err)}),
+            else => abort("tls.zig peer encrypt status {s}", .{@tagName(enc.status)}),
+        }
+        const rec = tls_edge.firstRecord(self.cipher_buf[0..enc.ciphertext_len]);
+        const dec = tls_edge.connectionDecrypt(&self.srv, rec, &self.plain_buf, &self.alert_buf);
+        switch (dec.status) {
+            .complete => {},
+            .tls_error => |err| abort("tls.zig decrypt: {s}", .{@errorName(err)}),
+            else => abort("tls.zig decrypt status {s}", .{@tagName(dec.status)}),
+        }
+        return dec.plaintext_len;
+    }
+};
+
 const TaskCtx = struct {
     io: std.Io,
 };
@@ -635,6 +734,25 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     const pack_stats = try benchmark(io, cfg.iterations, cfg.rounds, &pack, packSixOp);
     printRow("TLS pack 6 HEADERS+DATA", cfg.iterations, pack_stats, 0, 0);
 
+    var aes64: AesGcmCtx = .{ .len = 64 };
+    const aes64_stats = try benchmark(io, cfg.iterations, cfg.rounds, &aes64, AesGcmCtx.op);
+    printRow("AES-GCM 64B", cfg.iterations, aes64_stats, 0, 0);
+    var aes300: AesGcmCtx = .{ .len = 300 };
+    const aes300_stats = try benchmark(io, cfg.iterations, cfg.rounds, &aes300, AesGcmCtx.op);
+    printRow("AES-GCM 300B packed", cfg.iterations, aes300_stats, 0, 0);
+
+    const tls_rec = gpa.create(TlsRecordCtx) catch abort("tls record ctx alloc", .{});
+    defer gpa.destroy(tls_rec);
+    tls_rec.* = TlsRecordCtx.init(io, 64);
+    const tls_enc64 = try benchmark(io, cfg.iterations, cfg.rounds, tls_rec, TlsRecordCtx.encryptOp);
+    printRow("tls.zig encrypt 64B", cfg.iterations, tls_enc64, 0, 0);
+    tls_rec.len = 300;
+    const tls_enc300 = try benchmark(io, cfg.iterations, cfg.rounds, tls_rec, TlsRecordCtx.encryptOp);
+    printRow("tls.zig encrypt 300B", cfg.iterations, tls_enc300, 0, 0);
+    tls_rec.len = 64;
+    const tls_dec64 = try benchmark(io, cfg.iterations, cfg.rounds, tls_rec, TlsRecordCtx.decryptOp);
+    printRow("tls.zig enc+dec 64B", cfg.iterations, tls_dec64, 0, 0);
+
     const task_iterations = @max(@as(usize, 1_000), cfg.iterations / 100);
     var task: TaskCtx = .{ .io = io };
     const task_stats = try benchmark(io, task_iterations, cfg.rounds, &task, taskLifecycleOp);
@@ -654,7 +772,10 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
             "requested bytes; setup, dynamic-table seeding, and warmup are excluded.\n" ++
             "Rows marked * are interleaved phase samples and include one clock read.\n" ++
             "ticket packed-6 is one handoff (six linked receipts); divide by 6 for per-response.\n" ++
-            "ticket parked wake includes a concurrent complete; compare to empty task spawn.\n",
+            "ticket parked wake includes a concurrent complete; compare to empty task spawn.\n" ++
+            "AES-GCM is std.crypto; tls.zig encrypt is one TLS 1.3 record via connectionEncrypt.\n" ++
+            "enc+dec 64B is peer encrypt plus our decrypt (inbound oneshot-sized record).\n" ++
+            "encrypt 300B / 6 is packed outbound per response; do not cite as the live TLS tax.\n",
         .{},
     );
 }
