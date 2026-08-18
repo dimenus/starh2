@@ -180,13 +180,15 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
 - Treating complete-handler reaper reserve as a 0.10 µs chip. Sol Extra
   High ranked that second (then leftover after #1 and #3). Complete
   oneshots skip `tryReserveReaper`; 404/405 and task handlers still
-  take a token. Darwin ABA at `-n 100000 -c 50 -m 10 -t 4 --rounds 3`,
-  P-256, keep/skip/keep: TLS CPU/req 11.32 / 11.18 / 11.16 µs; h2c
-  11.18 / 11.04 / 11.10 µs. Skip sits inside keep-vs-keep. Nachos ABA
-  did not run (SSH agent empty). The skip stays as correctness:
-  complete must not consume the cancellation budget SSE needs. The
-  numeric `cancellation_reaper_jobs >= max_streams_per_server` bound
-  is unchanged; a config cannot promise the mix.
+  take a token. Nachos ABA at `-n 100000 -c 50 -m 10 -t 16 --rounds 3`,
+  ReleaseFast, P-256, keep/skip/keep: TLS CPU/req 4.72 / 4.75 / 4.62 µs
+  (user 3.56 / 3.61 / 3.40); h2c 4.37 / 4.42 / 4.35 µs. Skip-vs-keep
+  TLS is 0.03 µs, smaller than keep-vs-keep (0.11 µs). Throughput had
+  no consistent winner (TLS 2.14M / 2.10M / 2.17M). Darwin t=4 was the
+  same shape. The skip stays as correctness: complete must not consume
+  the cancellation budget SSE needs. The numeric
+  `cancellation_reaper_jobs >= max_streams_per_server` bound is
+  unchanged; a config cannot promise the mix.
 
 ## What is left
 
