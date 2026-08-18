@@ -181,23 +181,20 @@ reader/writer and coalesces `SSL_write`. starh2 uses patched
 `dimenus/tls.zig` — AES-GCM from `std.crypto`, not a homerolled AES —
 actor-owned, encrypt under `session_mu`, then memcpy ciphertext into a
 write chunk. Isolated `connectionEncrypt` is tens of nanoseconds over
-AES-GCM of the same bytes; that cannot explain several microseconds per
-request. The live TLS tax is where the cipher runs (actor lock, extra
-ciphertext copy, `firstRecord` decrypt) versus BoringSSL on the socket
-adapter. Switching to BoringSSL would make a third owner of the socket
-unless it sits behind the same byte-transform ABI.
+AES-GCM of the same bytes. Switching to BoringSSL would make a third
+owner of the socket unless it sits behind the same byte-transform ABI.
 
-Live `--trace` 400k (re-derive; Darwin this round): inbound is packed
-(`inbound_records/req` ≈ `records/response` ≈ 0.10), so `firstRecord` is
-not a 1:1 tax. `connectionEncrypt` + `connectionDecrypt` are tens of
-nanoseconds per request. `sendAccountedWire` is ~0.2 µs/req on both TLS
-and h2c. `driveDecrypt` is ~2.4 µs/req, almost all `Session.ingest`
-(~2.1 µs) which h2c also pays (~1.6 µs). Clocked TLS-minus-h2c on that
-machine was ~0.7 µs/req (cipher ~0.12, extra ingest ~0.5) and matched
-wall. That cannot explain Nachos’ several-µs TLS CPU tax; re-run
-`tools/oneshot-phase-trace.sh` there before treating Darwin as the
-shape. Next isolate on Nachos is these same counters, not another
-packing micro and not encrypt-on-WritePump.
+Live `--trace` 400k packs inbound and outbound at ~0.10 records/req on
+Darwin and Nachos, so `firstRecord` is not a 1:1 tax. Nachos clocks:
+encrypt 28 ns/req, decrypt 30 ns/req, `sendAccountedWire` 111 vs 107 ns
+(h2c), ingest 1119 vs 1187 ns. The cipher is not the tax. Official
+Nachos `-n 100000 -c 50 -m 10 -t 12 --rounds 3` still showed TLS ~761k
+at 12.2 µs CPU/req vs h2c ~2.23M at 4.5 µs — a ~7.7 µs process-CPU gap
+that those calls do not contain. The dedicated 400k TLS burst was
+1.49M req/s; that is not the 3-round mean. TLS p99 was milliseconds vs
+h2c hundreds of µs. Next isolate is where the extra CPU lives
+(`perf` / rusage user vs sys, handshake, WritePump, zio wakes), not
+another packing micro and not encrypt-on-WritePump.
 
 Do not name the remaining HTTP/2 residue “one actor per connection” —
 http2.zig also has one connection task; theirs is a single
