@@ -563,10 +563,11 @@ comptime {
 /// be what lets the handler finish. So the actor hands the join handle to a
 /// worker here and continues at once.
 ///
-/// The reaper capacity is reserved BEFORE a handler is admitted
+/// The reaper capacity is reserved BEFORE a *task* handler is admitted
 /// (`tryReserveReaper` in `dispatch`), never at cancel time. Cancellation must
 /// not be able to fail for want of a resource, because there is no way to
-/// retry it and no other path that would release the slot.
+/// retry it and no other path that would release the slot. Complete oneshots
+/// never spawn and never own a join handle, so they do not take a token.
 pub const ReaperPool = struct {
     io: std.Io,
     jobs: std.Io.Queue(ReaperJob),
@@ -3405,11 +3406,13 @@ const Connection = struct {
     /// second time.
     ///
     /// Admission order is reserve-then-claim, and it is deliberate:
-    /// 1. Reserve reaper capacity. A handler that cannot be canceled must never
-    ///    start, because cancellation has no retry path.
-    /// 2. Claim a handler slot.
-    /// 3. Point `Response` at the SLOT's terminal state, never at job memory.
-    /// 4. Increment the live counters, then spawn a task handler or queue a
+    /// 1. Classify the route. Complete oneshots never spawn, so they skip the
+    ///    reaper token. A task handler that cannot be canceled must never start,
+    ///    because cancellation has no retry path.
+    /// 2. Reserve reaper capacity for a task handler (and 404/405, which spawn).
+    /// 3. Claim a handler slot.
+    /// 4. Point `Response` at the SLOT's terminal state, never at job memory.
+    /// 5. Increment the live counters, then spawn a task handler or queue a
     ///    complete handler to run on the actor after this lock drops.
     ///
     /// Each failure step undoes the step before it and answers the peer with
@@ -3423,15 +3426,27 @@ const Connection = struct {
         var dispatch_owned = true;
         defer if (dispatch_owned) self.releaseDispatchRequest(d);
 
-        // Reserve reaper capacity before admitting the handler.
-        if (self.config.accounting) |acct| {
-            if (!acct.tryReserveReaper()) {
-                self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
-                try self.processIntents();
-                return;
+        // Classify before reserving: complete oneshots have no join handle.
+        // Reuse this match when the job keeps the header-lease path (same
+        // bytes). Rematch after a dupe so `path_remainder` cannot alias the
+        // dispatch intent that releaseDispatchRequest may free.
+        const classified = self.config.router.match(request.Method.parse(d.method), d.path);
+        const complete_inline = switch (classified) {
+            .found => |f| f.handler == .complete,
+            else => false,
+        };
+
+        var reaper_reserved = false;
+        if (!complete_inline) {
+            if (self.config.accounting) |acct| {
+                if (!acct.tryReserveReaper()) {
+                    self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
+                    try self.processIntents();
+                    return;
+                }
+                reaper_reserved = true;
             }
         }
-        var reaper_reserved = self.config.accounting != null;
         errdefer if (reaper_reserved) {
             if (self.config.accounting) |acct| acct.releaseReaper();
             reaper_reserved = false;
@@ -3542,7 +3557,7 @@ const Connection = struct {
             .method = job.req.method,
             .accept_encoding = accept_encoding,
         };
-        job.matched = self.config.router.match(job.req.method, job.req.path);
+        job.matched = if (keep_arena) classified else self.config.router.match(job.req.method, job.req.path);
         switch (job.matched) {
             .found => |f| job.req.path_remainder = f.path_remainder,
             else => {},
@@ -3574,6 +3589,7 @@ const Connection = struct {
             .found => |f| f.handler == .complete,
             else => false,
         };
+        std.debug.assert(run_inline == complete_inline);
         if (run_inline) {
             // Run after this lock drops. sendCb takes session_mu itself, and
             // waitTicket must not hold it. A task handler that cannot spawn

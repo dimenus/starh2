@@ -187,8 +187,10 @@ pub const Limits = struct {
         if (self.max_connections == 0 or self.max_streams_per_connection == 0) return error.InvalidConfig;
         if (self.max_streams_per_server == 0) return error.InvalidConfig;
         if (self.cancellation_reaper_tasks == 0 or self.cancellation_reaper_jobs == 0) return error.InvalidConfig;
-        // Every live stream may need a reaper job at once, because a peer may
-        // reset all of them in one flight. A smaller reaper queue would reject a
+        // Every live *task* stream may need a reaper job at once, because a peer
+        // may reset all of them in one flight. Complete oneshots have no join
+        // handle and do not take a token; the bound is still max_streams because
+        // a config cannot promise the mix. A smaller reaper queue would reject a
         // job that the cancel path has no way to retry, which strands the
         // handler slot and its capacity token.
         if (self.cancellation_reaper_jobs < self.max_streams_per_server) return error.InvalidConfig;

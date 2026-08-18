@@ -177,6 +177,16 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   400k packed `--trace` (Darwin and Nachos): append 8 ns/req (16.3 B),
   compact 0 ns/req (leftover/record ≈ 0 — `firstRecord` consumes the
   whole chunk). Outside the decrypt clock, and two orders below 0.10 µs.
+- Treating complete-handler reaper reserve as a 0.10 µs chip. Sol Extra
+  High ranked that second (then leftover after #1 and #3). Complete
+  oneshots skip `tryReserveReaper`; 404/405 and task handlers still
+  take a token. Darwin ABA at `-n 100000 -c 50 -m 10 -t 4 --rounds 3`,
+  P-256, keep/skip/keep: TLS CPU/req 11.32 / 11.18 / 11.16 µs; h2c
+  11.18 / 11.04 / 11.10 µs. Skip sits inside keep-vs-keep. Nachos ABA
+  did not run (SSH agent empty). The skip stays as correctness:
+  complete must not consume the cancellation budget SSE needs. The
+  numeric `cancellation_reaper_jobs >= max_streams_per_server` bound
+  is unchanged; a config cannot promise the mix.
 
 ## What is left
 
@@ -228,13 +238,15 @@ starve stories: other connections, handler work vs actor, peer stops
 reading.
 
 Sol Extra High ranked legal chips inside that split: (1) gate test
-counters — measured, below the bar; (2) skip complete-handler reaper
-reserve; (3) clock inbound accumulator append/compaction — 8 ns/req
-append, compact never on packed oneshot. Wakes have no legal deletion.
-`session_mu` hold is uncontended on this complete-only load. Outbound
-ciphertext copy is already inside `sendAccountedWire` (~111 ns). Reaper
-reserve is the remaining unmeasured legal chip; one CAS pair is smaller
-than the five RMWs that did not move 0.10 µs.
+counters — measured, below the bar; (3) clock inbound accumulator
+append/compaction — 8 ns/req append, compact never on packed oneshot;
+(2) skip complete-handler reaper reserve — measured, below the bar,
+kept so complete oneshots do not take cancellation tokens. Wakes have
+no legal deletion. `session_mu` hold is uncontended on this
+complete-only load. Outbound ciphertext copy is already inside
+`sendAccountedWire` (~111 ns). Those legal chips are done. A oneshot
+bench cannot value the connection split (the three starve stories stay
+unexercised).
 
 Reopen HPACK/parse only if an on-CPU h2c profile shows
 ingest+HPACK+Session ≥ 1 µs/req or 15% CPU. Sol Extra High picked A on

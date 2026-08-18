@@ -135,6 +135,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
         };
     }
     try std.testing.expect(starh2.edge.connection.test_observed_inline_jobs.load(.acquire) >= 1);
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
 
     server.requestShutdown();
     try serve_future.await(io);
