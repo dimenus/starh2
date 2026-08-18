@@ -315,6 +315,8 @@ pub fn build(b: *std.Build) void {
     });
     linkBrotliDec(compression_tests.root_module, brotli_dep, brotli_dec);
     const run_compression_tests = b.addRunArtifact(compression_tests);
+    const compression_step = b.step("test-compression", "Run compression gates only");
+    compression_step.dependOn(&run_compression_tests.step);
 
     const lifecycle_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -387,6 +389,22 @@ pub fn build(b: *std.Build) void {
     });
     const run_scheduler_tests = b.addRunArtifact(scheduler_tests);
 
+    const deadline_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/deadlines.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_deadline_tests = b.addRunArtifact(deadline_tests);
+    const deadline_step = b.step("test-deadlines", "Run actor-deadline heap gates");
+    deadline_step.dependOn(&run_deadline_tests.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_protocol_tests.step);
@@ -401,6 +419,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_writer_tests.step);
     test_step.dependOn(&run_scheduler_tests.step);
     test_step.dependOn(&run_compression_tests.step);
+    test_step.dependOn(&run_deadline_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");
     test_exact_step.dependOn(&run_live_exact_tests.step);

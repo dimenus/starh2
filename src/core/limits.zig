@@ -66,7 +66,9 @@ pub const Terms = struct {
 
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
 pub const HANDLER_SLOT_SIZE: usize = 20;
-pub const HANDLER_JOB_SIZE: usize = 584;
+pub const HANDLER_JOB_SIZE: usize = 608;
+/// Must match `edge.connection.DeadlineEntry`.
+pub const DEADLINE_ENTRY_SIZE: usize = 16;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
 pub const REAPER_JOB_SIZE: usize = 40;
 
@@ -282,11 +284,15 @@ pub const Limits = struct {
             ),
         );
         const space_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
+        const deadline_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
+        const deadline_heap = try checkedMul(self.max_streams_per_connection, DEADLINE_ENTRY_SIZE);
+        const deadline_ready = try checkedMul(self.max_streams_per_connection, @sizeOf(std.atomic.Value(u8)));
+        const deadline_state = try checkedAdd(deadline_events, try checkedAdd(deadline_heap, deadline_ready));
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_recv_acc_bytes, try checkedAdd(header_maps, intents)))));
 
         const sid_and_inline = try checkedAdd(sid_scratch, try checkedAdd(inline_sids, complete_receipt_sids));
-        const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, sched_scratch)))))))))))))))))));
+        const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch))))))))))))))))))));
         const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, write_free)));
 
         terms.routes = try checkedAdd(

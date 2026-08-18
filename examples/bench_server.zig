@@ -365,14 +365,19 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
     const interval_ns: i128 = @as(i128, @intCast(g_sse_interval_ms)) * std.time.ns_per_ms;
     var prev_write: ?i128 = null;
     const t_start: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
-    var next: i128 = t_start + interval_ns;
+    // Schedule on Clock.awake: waitUntil fires against the actor's nowNs.
+    var next: i128 = std.Io.Clock.awake.now(g_io).nanoseconds + interval_ns;
     while (true) {
         _ = g_cadence.loops.fetchAdd(1, .monotonic);
-        const now_ns: i128 = zio.Timestamp.now(.realtime).toNanoseconds();
+        const now_ns: i128 = std.Io.Clock.awake.now(g_io).nanoseconds;
         const deadline = next;
         if (deadline > now_ns) {
             _ = g_cadence.sleeps.fetchAdd(1, .monotonic);
-            zio.sleep(.fromNanoseconds(@intCast(deadline - now_ns))) catch |err| {
+            // Cadence is a heap entry, not a handler timer. waitUntil parks
+            // on the actor-owned deadline heap; waitForActivity is the idle
+            // arm of the same heap.
+            const ts = std.Io.Timestamp.fromNanoseconds(@intCast(deadline));
+            body.waitUntil(ts) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 return err;
             };
@@ -382,8 +387,9 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
         }
         next += interval_ns;
         const t_write = zio.Timestamp.now(.realtime).toNanoseconds();
-        if (deadline < t_write) {
-            const late: u64 = @intCast(t_write - deadline);
+        const t_write_awake: i128 = std.Io.Clock.awake.now(g_io).nanoseconds;
+        if (deadline < t_write_awake) {
+            const late: u64 = @intCast(t_write_awake - deadline);
             _ = g_cadence.late_n.fetchAdd(1, .monotonic);
             _ = g_cadence.late_ns.fetchAdd(late, .monotonic);
             if (late >= std.time.ns_per_ms) _ = g_cadence.late_ge1ms.fetchAdd(1, .monotonic);

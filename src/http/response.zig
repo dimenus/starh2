@@ -133,6 +133,10 @@ pub const Body = struct {
     pub fn abort(self: *Body) ResponseError!void {
         return self.response.abortBody(self);
     }
+    pub fn waitUntil(self: *Body, deadline: std.Io.Timestamp) ResponseError!void {
+        try self.response.checkBody(self);
+        return self.response.waitUntil(deadline);
+    }
     pub fn terminalCause(self: *const Body) ?TerminalCause {
         return self.response.slotTerminal();
     }
@@ -149,11 +153,15 @@ pub const Response = struct {
     /// Stable actor-owned terminal/generation (HandlerSlot). Never handler-job memory.
     terminal: *SlotTerminal,
     ctx: *anyopaque,
+    /// Awake-clock Io, so a handler can build a `waitUntil` deadline on the
+    /// same clock the actor fires.
+    io: std.Io,
     sendFn: *const fn (*anyopaque, u31, u16, []const request.Header, []const u8) ResponseError!void,
     startFn: *const fn (*anyopaque, u31, u16, []const request.Header, bool) ResponseError!void,
     writeFn: *const fn (*anyopaque, u31, []const u8, bool, bool, bool) ResponseError!void,
     flushFn: *const fn (*anyopaque, u31) ResponseError!void,
     abortFn: *const fn (*anyopaque, u31) ResponseError!void,
+    waitUntilFn: *const fn (*anyopaque, u31, std.Io.Timestamp) ResponseError!void,
 
     pub fn slotTerminal(self: *const Response) ?TerminalCause {
         return self.terminal.getCause();
@@ -176,6 +184,14 @@ pub const Response = struct {
         self.body_open = true;
         try self.startFn(self.ctx, self.stream_id, status, headers, false);
         return .{ .response = self, .stream_id = self.stream_id, .generation = self.terminal.currentGeneration() };
+    }
+
+    /// Sleep to a deadline on the actor's heap, never for a duration. The
+    /// deadline is on `Clock.awake` (same clock `io` uses). A complete oneshot
+    /// must not call this.
+    pub fn waitUntil(self: *Response, deadline: std.Io.Timestamp) ResponseError!void {
+        if (self.slotTerminal()) |c| return causeToError(c);
+        try self.waitUntilFn(self.ctx, self.stream_id, deadline);
     }
 
     pub fn startSse(self: *Response, headers: []const request.Header) ResponseError!Body {
@@ -309,6 +325,7 @@ test "Body terminal cause precedes generation bump" {
         .generation = 0,
         .terminal = &slot,
         .ctx = undefined,
+        .io = std.testing.io,
         .sendFn = undefined,
         .startFn = undefined,
         .writeFn = struct {
@@ -318,6 +335,7 @@ test "Body terminal cause precedes generation bump" {
         }.f,
         .flushFn = undefined,
         .abortFn = undefined,
+        .waitUntilFn = undefined,
         .body_open = true,
         .committed = true,
     };
@@ -352,6 +370,7 @@ test "every terminal cause maps to exact Body error" {
             .generation = 0,
             .terminal = &slot,
             .ctx = undefined,
+            .io = std.testing.io,
             .sendFn = undefined,
             .startFn = undefined,
             .writeFn = struct {
@@ -365,6 +384,11 @@ test "every terminal cause maps to exact Body error" {
                 }
             }.f,
             .abortFn = undefined,
+            .waitUntilFn = struct {
+                fn f(_: *anyopaque, _: u31, _: std.Io.Timestamp) ResponseError!void {
+                    return;
+                }
+            }.f,
             .body_open = true,
             .committed = true,
         };

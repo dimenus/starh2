@@ -93,6 +93,9 @@ pub const ReadPump = struct {
     n_chunks: u32,
     /// Free pool indices (actor returns after consume).
     free_indices: *std.Io.Queue(u32),
+    /// Connection-owned count of spawned task handlers. Yield only while this
+    /// is non-zero — oneshot-only must not donate on every read.
+    live_task_handlers: *std.atomic.Value(usize),
     stopped: std.atomic.Value(bool) = .init(false),
 
     fn returnIndex(self: *ReadPump, idx: u32) void {
@@ -140,6 +143,9 @@ pub const ReadPump = struct {
                 return;
             };
             self.actor_wake.set(self.io);
+            if (self.live_task_handlers.load(.acquire) > 0) {
+                self.io.sleep(.zero, .awake) catch {};
+            }
         }
     }
 
