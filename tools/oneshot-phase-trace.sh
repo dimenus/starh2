@@ -9,6 +9,12 @@
 #   records/response = TLS records per h2load success. 1.00 means a second
 #   HEADERS flushed the batch again; the script exits 9 rather than reporting
 #   that as a result. Packed drain turns at -m 10 sit well below 0.4.
+#   inbound_records/req = TLS records decrypted (firstRecord loop). 1.00 means
+#   one inbound record per response, not packed the way outbound is.
+#   encrypt/decrypt/send ns/req = Clock.awake around connectionEncrypt,
+#   connectionDecrypt, and sendAccountedWire. Throughput-shaped; compare to
+#   isolated bench-pipeline cipher rows, not to overlapped queue_ns.
+#   decrypt_loop ns/req = whole driveDecrypt including ingest under session_mu.
 #   allocs/request   = counting-allocator calls on the server GPA (--trace only)
 #   alloc_ns/request = GPA rawAlloc wall time including two Clock.awake reads.
 #                      Overstates allocator cost; sample(1) is CPU-share authority.
@@ -131,6 +137,19 @@ if records / succeeded > 0.4:
     print("  PACKING REGRESSION: records/response is one-per-response again")
     print("  a second HEADERS is flushing the TLS batch; packed drain turns sit well below 0.4 at -m 10")
     raise SystemExit(9)
+inbound = d("inbound_records")
+decrypt_n = d("decrypt_n")
+encrypt_n = d("encrypt_n")
+send_n = d("send_n")
+loop_n = d("decrypt_loop_n")
+print("  TLS transform (clock around the live call; amortize vs succeeded):")
+print(f"    inbound_records={inbound}  records/req={inbound/succeeded:.2f}  cipher_in={d("decrypt_in")/max(inbound,1):.1f} B  plain={d("decrypt_plain")/max(inbound,1):.1f} B")
+print(f"    decrypt     {d("decrypt_ns")/succeeded:8.0f} ns/req  n={decrypt_n}  {d("decrypt_ns")/max(decrypt_n,1):.0f} ns/call")
+print(f"    encrypt     {d("encrypt_ns")/succeeded:8.0f} ns/req  n={encrypt_n}  {d("encrypt_ns")/max(encrypt_n,1):.0f} ns/call  plain={d("encrypt_bytes")/max(encrypt_n,1):.1f} B")
+print(f"    sendWire    {d("send_ns")/succeeded:8.0f} ns/req  n={send_n}  {d("send_ns")/max(send_n,1):.0f} ns/call  {d("send_bytes")/max(send_n,1):.1f} B")
+print(f"    decryptLoop {d("decrypt_loop_ns")/succeeded:8.0f} ns/req  n={loop_n}  {d("decrypt_loop_ns")/max(loop_n,1):.0f} ns/entry  [decrypt+ingest+intents under session_mu]")
+print(f"    ingest      {d("ingest_ns")/succeeded:8.0f} ns/req  n={d("ingest_n")}  {d("ingest_ns")/max(d("ingest_n"),1):.0f} ns/call")
+print(f"    intents     {d("intent_ns")/succeeded:8.0f} ns/req  n={d("intent_n")}  {d("intent_ns")/max(d("intent_n"),1):.0f} ns/call")
 emit_max = d("emit_max")
 print(f"    emit_turns={emit_turns}  mean tickets/turn={emit_tickets/max(emit_turns,1):.2f}  max={emit_max}")
 print(f"    allocs={allocs}  ({allocs/succeeded:.2f}/req)  bytes={alloc_bytes}  ({alloc_bytes/succeeded:.1f} B/req)")

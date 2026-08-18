@@ -254,6 +254,27 @@ pub const trace = struct {
     pub var batch_ge17: std.atomic.Value(u64) = .init(0);
     /// WritePump chunks (h2c frames or TLS records) actually queued.
     pub var records: std.atomic.Value(u64) = .init(0);
+    /// Live TLS transform, gated by `enabled`, every call (not sampled).
+    /// Amortize against h2load succeeded. `queue_ns` is a sampled wall wait
+    /// across one receipt; these are CPU-shaped clocks around the cipher and
+    /// the ciphertext enqueue.
+    pub var encrypt_ns: std.atomic.Value(u64) = .init(0);
+    pub var encrypt_n: std.atomic.Value(u64) = .init(0);
+    pub var encrypt_bytes: std.atomic.Value(u64) = .init(0);
+    pub var decrypt_ns: std.atomic.Value(u64) = .init(0);
+    pub var decrypt_n: std.atomic.Value(u64) = .init(0);
+    pub var decrypt_in: std.atomic.Value(u64) = .init(0);
+    pub var decrypt_plain: std.atomic.Value(u64) = .init(0);
+    pub var inbound_records: std.atomic.Value(u64) = .init(0);
+    pub var decrypt_loop_ns: std.atomic.Value(u64) = .init(0);
+    pub var decrypt_loop_n: std.atomic.Value(u64) = .init(0);
+    pub var ingest_ns: std.atomic.Value(u64) = .init(0);
+    pub var ingest_n: std.atomic.Value(u64) = .init(0);
+    pub var intent_ns: std.atomic.Value(u64) = .init(0);
+    pub var intent_n: std.atomic.Value(u64) = .init(0);
+    pub var send_ns: std.atomic.Value(u64) = .init(0);
+    pub var send_n: std.atomic.Value(u64) = .init(0);
+    pub var send_bytes: std.atomic.Value(u64) = .init(0);
     /// `drainEmit` turns that flushed at least one ticket, and tickets in those
     /// turns. Mean tickets/turn is a batching signal distinct from wall waits.
     pub var emit_turns: std.atomic.Value(u64) = .init(0);
@@ -1777,8 +1798,18 @@ const Connection = struct {
                     try self.appendTlsInput(chunk.bytes[0..chunk.len]);
                     try self.driveDecrypt();
                 } else {
+                    const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
                     try self.session.ingest(chunk.bytes[0..chunk.len]);
+                    if (trace.enabled) {
+                        _ = trace.ingest_ns.fetchAdd(nowNs(io) -% ingest_t0, .monotonic);
+                        _ = trace.ingest_n.fetchAdd(1, .monotonic);
+                    }
+                    const intent_t0 = if (trace.enabled) nowNs(io) else 0;
                     try self.processIntents();
+                    if (trace.enabled) {
+                        _ = trace.intent_ns.fetchAdd(nowNs(io) -% intent_t0, .monotonic);
+                        _ = trace.intent_n.fetchAdd(1, .monotonic);
+                    }
                 }
                 if (self.session.terminal != .none) break;
             }
@@ -2276,13 +2307,26 @@ const Connection = struct {
     /// Without it a record that can never make progress spins the actor.
     fn driveDecrypt(self: *Connection) !void {
         const tc = &(self.tls_conn orelse return);
+        const loop_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
+        defer if (trace.enabled) {
+            _ = trace.decrypt_loop_ns.fetchAdd(nowNs(self.config.io) -% loop_t0, .monotonic);
+            _ = trace.decrypt_loop_n.fetchAdd(1, .monotonic);
+        };
         while (self.tls_recv_acc.items.len > 0) {
+            const dec_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
             const res = tls_edge.connectionDecrypt(
                 tc,
                 tls_edge.firstRecord(self.tls_recv_acc.items),
                 self.plaintext_scratch,
                 self.ciphertext_scratch,
             );
+            if (trace.enabled) {
+                _ = trace.decrypt_ns.fetchAdd(nowNs(self.config.io) -% dec_t0, .monotonic);
+                _ = trace.decrypt_n.fetchAdd(1, .monotonic);
+                _ = trace.decrypt_in.fetchAdd(res.consumed, .monotonic);
+                _ = trace.decrypt_plain.fetchAdd(res.plaintext_len, .monotonic);
+                if (res.consumed > 0) _ = trace.inbound_records.fetchAdd(1, .monotonic);
+            }
             if (res.ciphertext_len > 0) {
                 // TLS close-notify is best-effort; the scratch stays connection-owned.
                 self.sendAccountedWire(self.ciphertext_scratch[0..res.ciphertext_len], true, 0, 0, 0, 0, 0) catch {};
@@ -2303,8 +2347,18 @@ const Connection = struct {
                 .need_input => return,
                 .complete => {
                     if (res.plaintext_len > 0) {
+                        const ingest_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
                         try self.session.ingest(self.plaintext_scratch[0..res.plaintext_len]);
+                        if (trace.enabled) {
+                            _ = trace.ingest_ns.fetchAdd(nowNs(self.config.io) -% ingest_t0, .monotonic);
+                            _ = trace.ingest_n.fetchAdd(1, .monotonic);
+                        }
+                        const intent_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
                         try self.processIntents();
+                        if (trace.enabled) {
+                            _ = trace.intent_ns.fetchAdd(nowNs(self.config.io) -% intent_t0, .monotonic);
+                            _ = trace.intent_n.fetchAdd(1, .monotonic);
+                        }
                     }
                 },
                 .peer_closed => return,
@@ -3146,6 +3200,12 @@ const Connection = struct {
         control_n: usize,
         control_entries: u32,
     ) anyerror!void {
+        const send_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
+        defer if (trace.enabled) {
+            _ = trace.send_ns.fetchAdd(nowNs(self.config.io) -% send_t0, .monotonic);
+            _ = trace.send_n.fetchAdd(1, .monotonic);
+            _ = trace.send_bytes.fetchAdd(src.len, .monotonic);
+        };
         if (!self.tryReserveOutboundBytes(src.len, .wire)) {
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return error.OutOfMemory;
@@ -3250,7 +3310,13 @@ const Connection = struct {
             errdefer self.applyOutboundRelease(reserved_plain, .wire);
             var off: usize = 0;
             while (off < plain.len) {
+                const enc_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
                 const res = tls_edge.connectionEncrypt(tc, plain[off..], self.ciphertext_scratch);
+                if (trace.enabled) {
+                    _ = trace.encrypt_ns.fetchAdd(nowNs(self.config.io) -% enc_t0, .monotonic);
+                    _ = trace.encrypt_n.fetchAdd(1, .monotonic);
+                    _ = trace.encrypt_bytes.fetchAdd(res.consumed, .monotonic);
+                }
                 // Same ABI contract. An over-large `consumed` would push `off`
                 // past the end and panic on the NEXT iteration's slice, which
                 // points at the loop rather than at the encrypt that caused it.

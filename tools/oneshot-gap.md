@@ -40,6 +40,16 @@ Throughput-shaped (use these for the remaining gap, not wall waits):
   at `-m 10` sit well below **0.4**. **1.00** means a second HEADERS
   flushed the batch again. The script **exits 9** rather than reporting
   that as a result.
+- `inbound_records/req` — TLS records decrypted (`firstRecord` loop).
+  Packed h2load at `-m 10` sits near **0.10**, same shape as outbound.
+  **1.00** would mean one inbound record per response.
+- `encrypt` / `decrypt` / `sendWire` ns/req — `Clock.awake` around
+  `connectionEncrypt`, `connectionDecrypt`, and `sendAccountedWire`.
+  Throughput-shaped; compare to isolated cipher rows, not to overlapped
+  `queue_ns`.
+- `ingest` / `intents` ns/req — `Session.ingest` then `processIntents`
+  under `session_mu` (TLS: inside `driveDecrypt`; h2c: the plaintext
+  chunk path).
 - `allocs/request` — counting-allocator calls on the server GPA (`--trace`)
 
 Latency-shaped (overlapped across many concurrent streams; not throughput):
@@ -128,7 +138,11 @@ coalescing is what paid SSE; do not undo it to buy one-shot.
   shape, and do not undo the batch wait.
 - More packing micros, or TLS encrypt 6×50 B vs 1×300 B: live already
   packed (oracle exits 9 at `records/response > 0.4`). Packed drain turns
-  at `-m 10` sit well below that.
+  at `-m 10` sit well below that. Inbound is packed the same way
+  (`inbound_records/req` ≈ 0.10); do not treat `firstRecord` as a 1:1 tax.
+- Treating `connectionEncrypt` / AES-GCM as the several-µs TLS tax.
+  Isolated and live clocks are tens of nanoseconds per request.
+  `sendAccountedWire` is ~0.2 µs/req on TLS and h2c.
 - Starting by changing zio.
 - View-decode Huffman plaintext or dynamic-table strings. Encoded bytes
   are not the string; a later block can evict a dynamic entry while a
@@ -171,9 +185,19 @@ AES-GCM of the same bytes; that cannot explain several microseconds per
 request. The live TLS tax is where the cipher runs (actor lock, extra
 ciphertext copy, `firstRecord` decrypt) versus BoringSSL on the socket
 adapter. Switching to BoringSSL would make a third owner of the socket
-unless it sits behind the same byte-transform ABI. Next isolate is
-`queueWire` wall time (encrypt + copy + push) and inbound TLS records
-per request, not another packing micro and not encrypt-on-WritePump.
+unless it sits behind the same byte-transform ABI.
+
+Live `--trace` 400k (re-derive; Darwin this round): inbound is packed
+(`inbound_records/req` ≈ `records/response` ≈ 0.10), so `firstRecord` is
+not a 1:1 tax. `connectionEncrypt` + `connectionDecrypt` are tens of
+nanoseconds per request. `sendAccountedWire` is ~0.2 µs/req on both TLS
+and h2c. `driveDecrypt` is ~2.4 µs/req, almost all `Session.ingest`
+(~2.1 µs) which h2c also pays (~1.6 µs). Clocked TLS-minus-h2c on that
+machine was ~0.7 µs/req (cipher ~0.12, extra ingest ~0.5) and matched
+wall. That cannot explain Nachos’ several-µs TLS CPU tax; re-run
+`tools/oneshot-phase-trace.sh` there before treating Darwin as the
+shape. Next isolate on Nachos is these same counters, not another
+packing micro and not encrypt-on-WritePump.
 
 Do not name the remaining HTTP/2 residue “one actor per connection” —
 http2.zig also has one connection task; theirs is a single

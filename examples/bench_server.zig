@@ -192,7 +192,7 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         sites_buf[sites_len] = ']';
         sites_len += 1;
     }
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.print(
         "{{\"samples\":{d},\"block_ns\":{d},\"hold_ns\":{d},\"ack_ns\":{d},\"resume_ns\":{d}," ++
@@ -233,6 +233,32 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             write_trace.calls.load(.acquire),
             write_trace.chunks.load(.acquire),
             write_trace.max_chunks.load(.acquire),
+        },
+    );
+    try w.print(
+        "\"encrypt_ns\":{d},\"encrypt_n\":{d},\"encrypt_bytes\":{d}," ++
+            "\"decrypt_ns\":{d},\"decrypt_n\":{d},\"decrypt_in\":{d},\"decrypt_plain\":{d}," ++
+            "\"inbound_records\":{d},\"decrypt_loop_ns\":{d},\"decrypt_loop_n\":{d}," ++
+            "\"ingest_ns\":{d},\"ingest_n\":{d},\"intent_ns\":{d},\"intent_n\":{d}," ++
+            "\"send_ns\":{d},\"send_n\":{d},\"send_bytes\":{d},",
+        .{
+            trace.encrypt_ns.load(.acquire),
+            trace.encrypt_n.load(.acquire),
+            trace.encrypt_bytes.load(.acquire),
+            trace.decrypt_ns.load(.acquire),
+            trace.decrypt_n.load(.acquire),
+            trace.decrypt_in.load(.acquire),
+            trace.decrypt_plain.load(.acquire),
+            trace.inbound_records.load(.acquire),
+            trace.decrypt_loop_ns.load(.acquire),
+            trace.decrypt_loop_n.load(.acquire),
+            trace.ingest_ns.load(.acquire),
+            trace.ingest_n.load(.acquire),
+            trace.intent_ns.load(.acquire),
+            trace.intent_n.load(.acquire),
+            trace.send_ns.load(.acquire),
+            trace.send_n.load(.acquire),
+            trace.send_bytes.load(.acquire),
         },
     );
     try w.print(
