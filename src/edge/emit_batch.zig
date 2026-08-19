@@ -2,19 +2,20 @@
 //!
 //! Connection copies every batchable frame from one FairScheduler drain into
 //! one scratch buffer and hands it to queueWire as one input. On TLS that
-//! input is encrypted as one record batch; on h2c it is one write chunk.
-//! The rules here are the ones that used to live only inside `drainEmit`'s
-//! nested sink, which is why a second HEADERS silently started a new TLS
-//! record: nothing could name the invariant without standing up a cipher.
+//! input is one SSL_write; on h2c it is one socket write. The rules here are
+//! the ones that used to live only inside `drainEmit`'s nested sink, which is
+//! why a second HEADERS silently started a new write: nothing could name the
+//! invariant without standing up a cipher.
 //!
 //! Occupancy of the control pool stays held until that write completes. The
 //! batch therefore counts entries, not a bool. Releasing 1 after N HEADERS
 //! leaks N-1 slots for the life of the connection.
 const std = @import("std");
+const wire_const = @import("../core/wire_const.zig");
 
-/// TLS 1.3 application plaintext cap. The extra scratch byte on the connection
-/// is decrypt's inner content type, not payload, and is not part of this buffer.
-pub const max_plaintext = 16 * 1024;
+/// TLS 1.3 application plaintext cap. HTTP/2 packing stops here; SSL_write is
+/// TlsPump's flush, not a second record loop on the actor.
+pub const max_plaintext = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
 
 pub const WireMeta = struct {
     ticket: u64 = 0,

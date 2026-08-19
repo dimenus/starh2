@@ -8,10 +8,12 @@
 //!
 //! | task           | count | owns                                          |
 //! |----------------|-------|-----------------------------------------------|
-//! | actor (`run`)  | 1     | `Session`, TLS cipher, `FairScheduler`, slots,|
-//! |                |       | `TicketTable` completions, byte releases      |
-//! | `ReadPump`     | 1     | the socket READ direction, the chunk pool     |
-//! | `WritePump`    | 1     | the socket WRITE direction, queued payloads   |
+//! | actor (`run`)  | 1     | `Session`, `FairScheduler`, slots, tickets    |
+//! |                |       | WritePump completions, byte releases          |
+//! | `ReadPump`     | 1     | h2c: socket READ. TLS: not spawned            |
+//! | `WritePump`    | 1     | h2c: socket WRITE. TLS: not spawned           |
+//! | `TlsPump`      | 0..1  | TLS: SSL_read/SSL_write of plaintext; owns    |
+//! |                |       | the cipher. Flush is SSL_write.               |
 //! | handler        | 0..N  | arena + request/response. Task handlers spawn; |
 //! |                |       | complete oneshots run on the actor, still     |
 //! |                |       | emit through WritePump. SSE always spawns.    |
@@ -23,21 +25,20 @@
 //! - A pump NEVER touches `Connection` state. A pump exchanges `WireChunk` and
 //!   `WriteCompletion` messages that carry integers only. That is why the pumps
 //!   need no lock.
-//! - Only the actor emits. Every production byte reaches the wire through
+//! - Only the actor emits. Every production byte reaches the writer through
 //!   `drainEmit` -> `FairScheduler` sink -> `queueWire`. The
 //!   `test_queue_wire_bypass` counter is the mutation canary for that rule and
-//!   must stay at zero.
-//! - Only ONE task may drive the TLS cipher at a time, and `session_mu` is what
-//!   guarantees it. An unlocked decrypt once let the read task and a handler
-//!   encrypt concurrently, which left `inner.output` undefined mid-write and
-//!   crashed the process (t-538).
+//!   must stay at zero. On TLS, `queueWire` hands plaintext to `TlsPump`;
+//!   SSL_write is the pump's flush, not the actor's.
+//! - One task drives the TLS cipher. That is `TlsPump`, not the actor. Sharing
+//!   an SSL object with a second task is a data race.
 //!
 //! # Lock discipline
 //!
-//! `session_mu` is the ONLY mutex. It covers `Session`, the `FairScheduler`,
-//! and the TLS connection together, because the three are one consistency
-//! domain: a frame is built from session state, debited against session flow
-//! control, and encrypted, and no other task may observe a partial step.
+//! `session_mu` is the ONLY mutex. It covers `Session` and the `FairScheduler`
+//! together, because a frame is built from session state and debited against
+//! session flow control. TLS is not in this domain: HTTP/2 writes plaintext
+//! and `TlsPump` flushes with SSL_write.
 //!
 //! There is exactly one place that releases the lock inside an operation:
 //! `waitForStreamSpace`. It must, because the capacity it waits for can only be
@@ -76,7 +77,6 @@
 //! pending body AND as framed wire. `deinit` asserts that the two parts sum to
 //! the total and that both reach zero, which is the leak check.
 const std = @import("std");
-const tls = @import("tls");
 const session_mod = @import("../core/session.zig");
 const hpack = @import("../core/hpack.zig");
 const limits_mod = @import("../core/limits.zig");
@@ -192,9 +192,8 @@ fn nowNs(io: std.Io) u64 {
 /// - `block`   before `lockSession` -> after acquire. Dominant means a convoy on
 ///             the mutex: tasks queue for the lock itself.
 /// - `hold`    after acquire -> after unlock. Dominant means the serial section
-///             is genuinely expensive: framing, flow-control debit, encryption,
-///             or the blocking `write_ch.putOne` that runs while the lock is
-///             held.
+///             is genuinely expensive: framing, flow-control debit, or the
+///             blocking `write_ch.putOne` that runs while the lock is held.
 /// - `ack`     unlock -> `tickets.complete` when the actor applies the write
 ///             ack. Dominant means the transport handoff, not the connection's
 ///             own work.
@@ -274,7 +273,7 @@ pub const trace = struct {
     pub var batch_le8: std.atomic.Value(u64) = .init(0);
     pub var batch_le16: std.atomic.Value(u64) = .init(0);
     pub var batch_ge17: std.atomic.Value(u64) = .init(0);
-    /// WritePump chunks (h2c frames or TLS records) actually queued.
+    /// WritePump chunks queued. Packing authority for records/response.
     pub var records: std.atomic.Value(u64) = .init(0);
     /// Live TLS transform, gated by `enabled`, every call (not sampled).
     /// Amortize against h2load succeeded. `queue_ns` is a sampled wall wait
@@ -297,10 +296,8 @@ pub const trace = struct {
     pub var send_ns: std.atomic.Value(u64) = .init(0);
     pub var send_n: std.atomic.Value(u64) = .init(0);
     pub var send_bytes: std.atomic.Value(u64) = .init(0);
-    /// TLS recv accumulator copies, gated by `enabled`, every call. Outside
-    /// the decrypt clock: append of a socket chunk, then memmove of leftover
-    /// ciphertext after `firstRecord` consumes one record. `compact_n` counts
-    /// only a nonzero leftover; compare to `inbound_records` for the skip rate.
+    /// Unused after TLS-as-stream (SSL_read lives in TlsPump). Kept so the
+    /// phase-trace printer does not grow a second schema.
     pub var acc_append_ns: std.atomic.Value(u64) = .init(0);
     pub var acc_append_n: std.atomic.Value(u64) = .init(0);
     pub var acc_append_bytes: std.atomic.Value(u64) = .init(0);
@@ -397,7 +394,7 @@ pub const ConnConfig = struct {
     mode: Mode,
     limits: limits_mod.Limits,
     router: router_mod.Router,
-    tls_auth: ?*tls.config.CertKeyPair = null,
+    tls_acceptor: ?*tls_edge.Acceptor = null,
     gpa: std.mem.Allocator,
     shutdown_flag: ?*std.atomic.Value(bool) = null,
     shutdown_event: ?*std.Io.Event = null,
@@ -751,12 +748,10 @@ const Connection = struct {
     read_ch: std.Io.Queue(wire_pump.WireChunk) = undefined,
     write_ch: std.Io.Queue(wire_pump.WireChunk) = undefined,
     actor_wake: std.Io.Event = .unset,
-    tls_server: ?tls.nonblock.Server = null,
-    tls_conn: ?tls.nonblock.Connection = null,
-    tls_prng: std.Random.DefaultPrng = undefined,
-    tls_recv_acc: std.ArrayList(u8) = .empty,
+    tls: ?*tls_edge.Conn = null,
+    /// Drain-turn packing buffer. HTTP/2 frames concat here before one
+    /// `queueWire`; on TLS that plaintext is what SSL_write flushes.
     plaintext_scratch: []u8 = &.{},
-    ciphertext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
     handler_jobs: []HandlerJob,
     /// Parallel to `handlers`. Non-zero means this job's arena holds decoded
@@ -975,10 +970,8 @@ const Connection = struct {
         errdefer gpa.free(write_ack_buf);
         const ticket_slots = try gpa.alloc(ticket_table.TicketWait, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
         errdefer gpa.free(ticket_slots);
-        const plaintext_scratch = try gpa.alloc(u8, limits_mod.TLS_PLAINTEXT_SCRATCH_SIZE);
+        const plaintext_scratch = try gpa.alloc(u8, emit_batch.max_plaintext);
         errdefer gpa.free(plaintext_scratch);
-        const ciphertext_scratch = try gpa.alloc(u8, limits_mod.WIRE_CHUNK_SIZE);
-        errdefer gpa.free(ciphertext_scratch);
         const n_chunks: u32 = @intCast(config.limits.inbound_wire_chunks_per_connection);
         const read_chunk_storage = try gpa.alloc(u8, @as(usize, n_chunks) * limits_mod.WIRE_CHUNK_SIZE);
         errdefer gpa.free(read_chunk_storage);
@@ -1017,14 +1010,9 @@ const Connection = struct {
         errdefer gpa.free(deadline_heap);
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
         errdefer gpa.free(intent_batch);
-        var tls_recv_acc: std.ArrayList(u8) = .empty;
-        errdefer tls_recv_acc.deinit(gpa);
-        if (config.mode == .tls_h2) {
-            try tls_recv_acc.ensureTotalCapacityPrecise(gpa, config.limits.tls_recv_acc_bytes);
-        }
 
         if (config.mode == .tls_h2) {
-            if (config.tls_auth == null) return error.InvalidConfig;
+            if (config.tls_acceptor == null) return error.InvalidConfig;
         }
 
         const term_cap = @max(config.limits.control_entries_per_connection / 8, 16);
@@ -1056,7 +1044,6 @@ const Connection = struct {
             .ticket_slots = ticket_slots,
             .reaper = config.reaper,
             .plaintext_scratch = plaintext_scratch,
-            .ciphertext_scratch = ciphertext_scratch,
             .sched = sched,
             .read_chunk_storage = read_chunk_storage,
             .read_free_buf = read_free_buf,
@@ -1081,7 +1068,6 @@ const Connection = struct {
             .deadline_ready = deadline_ready,
             .deadline_heap = deadline_heap,
             .intent_batch = intent_batch,
-            .tls_recv_acc = tls_recv_acc,
         };
         @memset(self.handlers, .{});
         @memset(self.handler_joins, null);
@@ -1211,7 +1197,11 @@ const Connection = struct {
         self.sched.forEachPending(@ptrCast(&rel), RelCtx.cb);
         self.sched.deinit();
         self.frame_pool.deinit(self.config.gpa);
-        self.tls_recv_acc.deinit(self.config.gpa);
+        if (self.tls) |tls_conn| {
+            tls_conn.deinit();
+            self.config.gpa.destroy(tls_conn);
+            self.tls = null;
+        }
 
         self.config.gpa.free(self.read_ch_buf);
         self.config.gpa.free(self.write_ch_buf);
@@ -1225,7 +1215,6 @@ const Connection = struct {
         if (self.write_ack_buf.len != 0) self.config.gpa.free(self.write_ack_buf);
         if (self.ticket_slots.len != 0) self.config.gpa.free(self.ticket_slots);
         if (self.plaintext_scratch.len != 0) self.config.gpa.free(self.plaintext_scratch);
-        if (self.ciphertext_scratch.len != 0) self.config.gpa.free(self.ciphertext_scratch);
         if (self.read_chunk_storage.len != 0) self.config.gpa.free(self.read_chunk_storage);
         if (self.read_free_buf.len != 0) self.config.gpa.free(self.read_free_buf);
         if (self.write_chunk_storage.len != 0) self.config.gpa.free(self.write_chunk_storage);
@@ -1840,12 +1829,7 @@ const Connection = struct {
         self.lockSessionUncancelable(io);
         defer self.unlockSession(io);
         self.session.edge_now_ns = nowNs(io);
-        if (self.config.mode == .tls_h2 and self.tls_conn == null) {
-            try self.appendTlsInput(chunk.bytes[0..chunk.len]);
-        } else if (self.tls_conn != null) {
-            try self.appendTlsInput(chunk.bytes[0..chunk.len]);
-            try self.driveDecrypt();
-        } else {
+        {
             const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
             try self.session.ingest(chunk.bytes[0..chunk.len]);
             if (trace.enabled) {
@@ -2026,8 +2010,8 @@ const Connection = struct {
     /// The caller is responsible for the reset-then-recheck sequence that makes
     /// this safe. See `run`.
     fn traceParkSnapshot(self: *Connection) void {
-        const acc = self.tls_recv_acc.items.len;
-        const complete = tls_edge.hasCompleteRecord(self.tls_recv_acc.items);
+        const acc: usize = 0;
+        const complete = false;
         const pending = self.sched.pendingCount();
         const ordinary = self.sched.ordinary_len;
         const framed = self.sched.framed_len;
@@ -2138,19 +2122,17 @@ const Connection = struct {
     /// The actor. One task, one connection, from first byte to close.
     ///
     /// ## Startup sequence
-    /// 1. Spawn ReadPump and WritePump. The pumps must exist before the TLS
-    ///    handshake, because the handshake itself exchanges bytes through
-    ///    them — there is no separate handshake I/O path. The actor applies
-    ///    WritePump completions; there is no AckDrainer task.
-    /// 2. TLS handshake, if the endpoint is TLS. It ends by draining any
-    ///    leftover bytes, and that drive holds `session_mu`. See
-    ///    `tlsHandshakeViaPumps`.
+    /// 1. TLS, if any: handshake on the actor with BoringSSL (blocking SSL_accept
+    ///    is fine — no HTTP/2 yet). Drain leftover plaintext (a pipelined
+    ///    preface) into Session, then spawn `TlsPump`. The pump is the sole
+    ///    SSL_read/SSL_write owner; flush is SSL_write.
+    /// 2. h2c: spawn ReadPump and WritePump on the raw socket.
     /// 3. Flush the server preface that `Session.init` already queued.
     /// 4. For h2c, wait for the client preface under the preface deadline.
     ///
     /// ## Steady-state iteration
     /// Each pass does the same five things, and the order is the contract:
-    /// 1. Clear `sched_refilled`, drain WritePump completions, then drain
+    /// 1. Clear `sched_refilled`, drain write completions, then drain
     ///    handler completions. Ack drain is first so a complete-batch can
     ///    publish credit and be consumed on this same turn. Clearing the
     ///    refill flag first means a refill that lands during this pass is
@@ -2161,22 +2143,22 @@ const Connection = struct {
     ///    add to what must be emitted.
     /// 3. Check for the graceful finish condition.
     /// 4. Try to take a read chunk without blocking. Then `tryGet` up to
-    ///    `inbound_chunk_batch - 1` more, decrypting each before the next
-    ///    take. One `runPendingInline` after the batch.
+    ///    `inbound_chunk_batch - 1` more, ingesting each (already plaintext)
+    ///    before the next take. One `runPendingInline` after the batch.
     /// 5. If there is none: RESET the wake event, re-check every producer-owned
     ///    source, and only then park. This reset-then-recheck order is what
     ///    makes a `set` that races the reset harmless — the flag or the queue
     ///    still holds the evidence.
     ///
     /// ## Teardown sequence (the `defer` block, then the tail)
-    /// 1. Tell both pumps to stop, and push a sentinel so a WritePump parked on
-    ///    an empty queue wakes.
+    /// 1. Tell the live pump(s) to stop, and push a sentinel so a writer parked
+    ///    on an empty queue wakes.
     /// 2. `shutdown` the socket. A read parked in the kernel does not observe a
     ///    flag, so this is what unblocks it; task cancellation is the
     ///    authoritative backstop.
-    /// 3. Cancel the write pump, then the read pump, then drain leftover
-    ///    write completions. The drain must be last, because it applies the
-    ///    releases the pumps emit while they stop.
+    /// 3. Cancel the pump(s), then drain leftover write completions. The drain
+    ///    must be last, because it applies the releases the pumps emit while
+    ///    they stop.
     /// 4. `shutdownHandlers` runs after the loop and returns only when every
     ///    slot has passed through `releaseSlot`.
     /// 5. Close the socket exactly once, guarded by `socket_closed`.
@@ -2184,43 +2166,30 @@ const Connection = struct {
         const gpa = self.config.gpa;
         const io = self.config.io;
 
-        var read_pump: wire_pump.ReadPump = .{
-            .io = io,
-            .stream = self.stream,
-            .to_actor = &self.read_ch,
-            .actor_wake = &self.actor_wake,
-            .chunk_storage = self.read_chunk_storage,
-            .n_chunks = self.read_pool_n,
-            .free_indices = &self.read_free_ch,
-            .live_task_handlers = &self.live_task_handlers,
-        };
-        var write_pump: wire_pump.WritePump = .{
-            .io = io,
-            .stream = self.stream,
-            .from_actor = &self.write_ch,
-            .completions = &self.write_ack_ch,
-            .actor_wake = &self.actor_wake,
-            .gpa = gpa,
-            .free_indices = &self.write_free_ch,
-            .test_delay_ms = test_write_delay_ms,
-            .test_fail_after = test_write_fail_after,
-        };
-        var read_handle = try io.concurrent(wire_pump.ReadPump.run, .{&read_pump});
-        errdefer read_handle.cancel(io);
-        var write_handle = try io.concurrent(wire_pump.WritePump.run, .{&write_pump});
-        errdefer write_handle.cancel(io);
+        var read_pump: wire_pump.ReadPump = undefined;
+        var write_pump: wire_pump.WritePump = undefined;
+        var tls_pump: tls_edge.Pump = undefined;
+        var read_handle: ?std.Io.Future(void) = null;
+        var write_handle: ?std.Io.Future(void) = null;
+        var tls_handle: ?std.Io.Future(void) = null;
+        var tls_started = false;
+        var h2c_started = false;
 
         defer {
-            read_pump.stop();
-            write_pump.stop();
+            if (tls_started) tls_pump.stop();
+            if (h2c_started) {
+                read_pump.stop();
+                write_pump.stop();
+            }
             _ = self.write_ch.putUncancelable(io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
                 // A closed writer queue already terminates the pump.
             };
             self.stream.shutdown(io, .both) catch {
                 // Shutdown is best-effort; task cancellation is the authoritative unblock.
             };
-            write_handle.cancel(io);
-            read_handle.cancel(io);
+            if (tls_handle) |*h| h.cancel(io);
+            if (write_handle) |*h| h.cancel(io);
+            if (read_handle) |*h| h.cancel(io);
             self.drainWriteAcksForced();
             if (!self.socket_closed.swap(true, .acq_rel)) {
                 self.stream.close(io);
@@ -2228,31 +2197,55 @@ const Connection = struct {
         }
 
         if (self.config.mode == .tls_h2) {
-            const auth = self.config.tls_auth orelse return error.InvalidConfig;
-            var seed: [8]u8 = undefined;
-            io.random(&seed);
-            self.tls_prng = std.Random.DefaultPrng.init(@as(u64, @bitCast(seed)));
-            self.tls_server = tls.nonblock.Server.init(.{
-                .auth = auth,
-                .alpn_protocols = &tls_edge.alpn_list,
-                .rng = self.tls_prng.random(),
-                .now = .zero,
-            });
-            self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
-                @as(i96, nowNs(io) +% 5 * std.time.ns_per_s),
-            );
-            try self.tlsHandshakeViaPumps();
-            if (self.handshake_held) {
-                if (self.config.accounting) |a| a.releaseHandshake();
-                self.handshake_held = false;
-            }
+            try self.handshakeTls();
+            tls_pump = .{
+                .io = io,
+                .conn = self.tls.?,
+                .to_actor = &self.read_ch,
+                .from_actor = &self.write_ch,
+                .completions = &self.write_ack_ch,
+                .actor_wake = &self.actor_wake,
+                .gpa = gpa,
+                .chunk_storage = self.read_chunk_storage,
+                .n_chunks = self.read_pool_n,
+                .read_free = &self.read_free_ch,
+                .write_free = &self.write_free_ch,
+                .live_task_handlers = &self.live_task_handlers,
+                .test_delay_ms = test_write_delay_ms,
+                .test_fail_after = test_write_fail_after,
+            };
+            tls_handle = try io.concurrent(tls_edge.Pump.run, .{&tls_pump});
+            tls_started = true;
+        } else {
+            read_pump = .{
+                .io = io,
+                .stream = self.stream,
+                .to_actor = &self.read_ch,
+                .actor_wake = &self.actor_wake,
+                .chunk_storage = self.read_chunk_storage,
+                .n_chunks = self.read_pool_n,
+                .free_indices = &self.read_free_ch,
+                .live_task_handlers = &self.live_task_handlers,
+            };
+            write_pump = .{
+                .io = io,
+                .stream = self.stream,
+                .from_actor = &self.write_ch,
+                .completions = &self.write_ack_ch,
+                .actor_wake = &self.actor_wake,
+                .gpa = gpa,
+                .free_indices = &self.write_free_ch,
+                .test_delay_ms = test_write_delay_ms,
+                .test_fail_after = test_write_fail_after,
+            };
+            read_handle = try io.concurrent(wire_pump.ReadPump.run, .{&read_pump});
+            write_handle = try io.concurrent(wire_pump.WritePump.run, .{&write_pump});
+            h2c_started = true;
         }
 
-        // Under the lock: the TLS leftover-decrypt path above can already have
-        // DISPATCHED a handler (see the comment at `driveDecrypt`'s call in the
-        // handshake), and that handler emits through `session_mu`. Draining
-        // intents here without the lock races it on Session, the scheduler and
-        // the TLS cipher at once.
+        // Leftover TLS plaintext (a pipelined preface) may already have
+        // DISPATCHED a handler. That handler emits through `session_mu`, so
+        // draining intents here holds the same lock.
         {
             self.lockSessionUncancelable(io);
             defer self.unlockSession(io);
@@ -2424,15 +2417,6 @@ const Connection = struct {
         // both counters have already been decremented for this connection. Storing 0
         // here would clobber connections still serving on the same process.
         try self.shutdownHandlers();
-
-        if (self.tls_conn) |*tc| {
-            const res = tls_edge.connectionClose(tc, self.ciphertext_scratch);
-            if (res.ciphertext_len > 0) {
-                self.sendAccountedWire(self.ciphertext_scratch[0..res.ciphertext_len], true, 0, 0, 0, 0, 0, false) catch {
-                    // The connection is already terminal; close-notify is best-effort.
-                };
-            }
-        }
     }
 
     const ReceiveResult = union(enum) {
@@ -2480,6 +2464,69 @@ const Connection = struct {
         };
     }
 
+    /// Handshake TLS on the actor, then ingest leftover plaintext (a client
+    /// that pipelines the h2 preface into the handshake flight). TlsPump is
+    /// not running yet, so this is the sole SSL_read.
+    fn handshakeTls(self: *Connection) !void {
+        const io = self.config.io;
+        const acceptor = self.config.tls_acceptor orelse return error.InvalidConfig;
+        const tls_conn = try self.config.gpa.create(tls_edge.Conn);
+        errdefer self.config.gpa.destroy(tls_conn);
+        tls_conn.initTcp(io, self.stream);
+        errdefer tls_conn.deinit();
+
+        self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
+            @as(i96, nowNs(io) +% 5 * std.time.ns_per_s),
+        );
+        const Hs = union(enum) {
+            hs: anyerror!void,
+            timer: std.Io.Cancelable!void,
+        };
+        const Handshake = struct {
+            fn run(conn: *tls_edge.Conn, acc: *tls_edge.Acceptor, inner_io: std.Io) anyerror!void {
+                try conn.handshake(acc, inner_io);
+            }
+        };
+        var result_buf: [2]Hs = undefined;
+        var select = std.Io.Select(Hs).init(io, &result_buf);
+        errdefer select.cancelDiscard();
+        try select.concurrent(.hs, Handshake.run, .{ tls_conn, acceptor, io });
+        const timeout: std.Io.Timeout = .{ .deadline = .{
+            .raw = self.handshake_deadline.?,
+            .clock = .awake,
+        } };
+        try select.concurrent(.timer, waitTimer, .{ timeout, io });
+        const selected = try select.await();
+        defer select.cancelDiscard();
+        switch (selected) {
+            .hs => |result| try result,
+            .timer => |result| {
+                try result;
+                return error.TlsHandshakeTimeout;
+            },
+        }
+        try self.drainTlsLeftover(tls_conn);
+        self.tls = tls_conn;
+        self.handshake_deadline = null;
+        if (self.handshake_held) {
+            if (self.config.accounting) |a| a.releaseHandshake();
+            self.handshake_held = false;
+        }
+    }
+
+    fn drainTlsLeftover(self: *Connection, tls_conn: *tls_edge.Conn) !void {
+        var buf: [limits_mod.WIRE_CHUNK_SIZE]u8 = undefined;
+        while (tls_conn.pendingPlaintext() > 0 or tls_conn.ciphertextBuffered() > 0) {
+            const n = tls_conn.tls_stream.read(&buf) catch break;
+            if (n == 0) break;
+            self.lockSessionUncancelable(self.config.io);
+            defer self.unlockSession(self.config.io);
+            try self.session.ingest(buf[0..n]);
+            try self.processIntents();
+            if (self.session.terminal != .none) return error.ConnectionClosed;
+        }
+    }
+
     fn recycleReadChunk(self: *Connection, chunk: wire_pump.WireChunk) void {
         if (chunk.pool_index) |idx| {
             self.read_free_ch.putOneUncancelable(self.config.io, idx) catch {
@@ -2488,33 +2535,6 @@ const Connection = struct {
             };
         } else if (chunk.bytes.len != 0) {
             self.config.gpa.free(chunk.bytes);
-        }
-    }
-
-    /// Append ciphertext to the boot-reserved accumulator.
-    ///
-    /// `appendSliceAssumeCapacity` is required here and not an optimization.
-    /// The accumulator is reserved once at connection boot and counted in
-    /// `resourceUpperBound`; a growing append would let a peer choose the
-    /// server's memory use by never completing a record. The explicit check
-    /// above turns that into a refused connection instead.
-    fn appendTlsInput(self: *Connection, bytes: []const u8) !void {
-        const limit = self.config.limits.tls_recv_acc_bytes;
-        const held = self.tls_recv_acc.items.len;
-        if (held > limit or bytes.len > limit - held) return error.TlsInputTooLarge;
-        // The guard above tests the CONFIGURED limit; the append below relies on
-        // the RESERVED capacity. Those are two different numbers that happen to
-        // be equal, because `init` reserves exactly `tls_recv_acc_bytes`. Assert
-        // the one that actually protects the write, so a future change that
-        // reserves less than it admits fails here by name instead of corrupting
-        // memory inside `appendSliceAssumeCapacity`.
-        std.debug.assert(held + bytes.len <= self.tls_recv_acc.capacity);
-        const t0 = if (trace.enabled) nowNs(self.config.io) else 0;
-        self.tls_recv_acc.appendSliceAssumeCapacity(bytes);
-        if (trace.enabled) {
-            _ = trace.acc_append_ns.fetchAdd(nowNs(self.config.io) -% t0, .monotonic);
-            _ = trace.acc_append_n.fetchAdd(1, .monotonic);
-            _ = trace.acc_append_bytes.fetchAdd(bytes.len, .monotonic);
         }
     }
 
@@ -2535,73 +2555,6 @@ const Connection = struct {
             }
         }
         self.handshake_deadline = null;
-    }
-
-    /// Drive the TLS handshake through the same pumps that carry application
-    /// data. There is no separate handshake socket path, so the read pump owns
-    /// the read direction from the very first byte.
-    ///
-    /// The loop is a state machine over `serverDrive`: emit whatever ciphertext
-    /// it produced, consume whatever input it accepted, then act on the status.
-    /// The accumulator is compacted with `memmove` rather than reallocated,
-    /// because it is reserved once at boot and must never grow.
-    ///
-    /// ALPN is checked before the connection is accepted. This stack serves
-    /// HTTP/2 only, so a peer that did not agree to `h2` is refused at the
-    /// handshake instead of at its first frame.
-    fn tlsHandshakeViaPumps(self: *Connection) !void {
-        const srv = &(self.tls_server orelse return error.InvalidConfig);
-        while (true) {
-            if (self.handshake_deadline) |dl| {
-                if (nowNs(self.config.io) >= @as(u64, @intCast(dl.nanoseconds))) {
-                    return error.TlsHandshakeTimeout;
-                }
-            }
-            const drive = tls_edge.serverDrive(srv, self.tls_recv_acc.items, self.ciphertext_scratch);
-            if (drive.ciphertext_len > 0) {
-                try self.sendAccountedWire(self.ciphertext_scratch[0..drive.ciphertext_len], true, 0, 0, 0, 0, 0, false);
-            }
-            // `consumed` crosses the boundary from the pinned tls.zig fork. A
-            // value larger than the input would underflow `rest` — a usize
-            // underflow reports as a slice panic several lines later, and the
-            // real cause (a fork or patch that no longer matches the ABI) would
-            // not appear anywhere in the message. Name the contract here.
-            std.debug.assert(drive.consumed <= self.tls_recv_acc.items.len);
-            std.debug.assert(drive.ciphertext_len <= self.ciphertext_scratch.len);
-            if (drive.consumed > 0) {
-                const rest = self.tls_recv_acc.items.len - drive.consumed;
-                if (rest > 0) {
-                    @memmove(self.tls_recv_acc.items[0..rest], self.tls_recv_acc.items[drive.consumed..][0..rest]);
-                }
-                self.tls_recv_acc.shrinkRetainingCapacity(rest);
-            }
-            switch (drive.status) {
-                .complete => break,
-                .need_input => {
-                    const chunk = try self.receiveUntilDeadline();
-                    defer self.recycleReadChunk(chunk);
-                    if (chunk.len == 0) return error.ConnectionClosed;
-                    try self.appendTlsInput(chunk.bytes[0..chunk.len]);
-                },
-                .peer_closed => return error.ConnectionClosed,
-                .tls_error => return error.TlsHandshakeFailed,
-            }
-        }
-        if (!tls_edge.requireH2(srv)) return error.TlsHandshakeFailed;
-        const cipher = try tls_edge.serverTakeCipher(srv);
-        self.tls_conn = tls.nonblock.Connection.init(cipher);
-        self.handshake_deadline = null;
-        if (self.tls_recv_acc.items.len > 0) {
-            // A client that pipelines its h2 preface and first request into the
-            // handshake flight (curl, every browser) gets its handler DISPATCHED
-            // by this decrypt. From that instant the handler encrypts its
-            // response under session_mu — so this drive must hold the same lock,
-            // or two tasks run the one TLS cipher concurrently and the response
-            // corrupts (t-538: undefined inner.output mid-encrypt, SIGSEGV).
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
-            try self.driveDecrypt();
-        }
     }
 
     /// Claim a handler slot. Actor-only, so the linear scan needs no lock and
@@ -2905,89 +2858,6 @@ const Connection = struct {
             self.wakeAllDeadlines();
             const sid = self.completion_ch.getOne(self.config.io) catch return error.Canceled;
             self.releaseSlot(sid);
-        }
-    }
-
-    /// Decrypt accumulated TLS input and feed the plaintext to `Session`.
-    ///
-    /// The CALLER must hold `session_mu`. Both call sites do. The lock is not
-    /// taken inside because the other caller already holds it, and a
-    /// locked/unlocked variant would hide one site's mistake behind a
-    /// parameter (t-538 was exactly that mistake).
-    ///
-    /// `firstRecord` feeds ONE TLS record per call on purpose. See the note on
-    /// that function: a coalesced small record followed by a maximum-size one
-    /// can advance the cipher sequence and only then fail for want of output
-    /// space, which is unrecoverable.
-    ///
-    /// The final guard exits when a pass consumed nothing and produced nothing.
-    /// Without it a record that can never make progress spins the actor.
-    fn driveDecrypt(self: *Connection) !void {
-        const tc = &(self.tls_conn orelse return);
-        const loop_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
-        defer if (trace.enabled) {
-            _ = trace.decrypt_loop_ns.fetchAdd(nowNs(self.config.io) -% loop_t0, .monotonic);
-            _ = trace.decrypt_loop_n.fetchAdd(1, .monotonic);
-        };
-        while (self.tls_recv_acc.items.len > 0) {
-            const dec_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
-            const res = tls_edge.connectionDecrypt(
-                tc,
-                tls_edge.firstRecord(self.tls_recv_acc.items),
-                self.plaintext_scratch,
-                self.ciphertext_scratch,
-            );
-            if (trace.enabled) {
-                _ = trace.decrypt_ns.fetchAdd(nowNs(self.config.io) -% dec_t0, .monotonic);
-                _ = trace.decrypt_n.fetchAdd(1, .monotonic);
-                _ = trace.decrypt_in.fetchAdd(res.consumed, .monotonic);
-                _ = trace.decrypt_plain.fetchAdd(res.plaintext_len, .monotonic);
-                if (res.consumed > 0) _ = trace.inbound_records.fetchAdd(1, .monotonic);
-            }
-            if (res.ciphertext_len > 0) {
-                // TLS close-notify is best-effort; the scratch stays connection-owned.
-                self.sendAccountedWire(self.ciphertext_scratch[0..res.ciphertext_len], true, 0, 0, 0, 0, 0, false) catch {};
-            }
-            // Same ABI contract as the handshake drive above, plus the two
-            // output lengths this path slices with.
-            std.debug.assert(res.consumed <= self.tls_recv_acc.items.len);
-            std.debug.assert(res.ciphertext_len <= self.ciphertext_scratch.len);
-            std.debug.assert(res.plaintext_len <= self.plaintext_scratch.len);
-            if (res.consumed > 0) {
-                const rest = self.tls_recv_acc.items.len - res.consumed;
-                if (rest > 0) {
-                    const t0 = if (trace.enabled) nowNs(self.config.io) else 0;
-                    @memmove(self.tls_recv_acc.items[0..rest], self.tls_recv_acc.items[res.consumed..][0..rest]);
-                    if (trace.enabled) {
-                        _ = trace.acc_compact_ns.fetchAdd(nowNs(self.config.io) -% t0, .monotonic);
-                        _ = trace.acc_compact_n.fetchAdd(1, .monotonic);
-                        _ = trace.acc_compact_bytes.fetchAdd(rest, .monotonic);
-                    }
-                }
-                self.tls_recv_acc.shrinkRetainingCapacity(rest);
-            }
-            switch (res.status) {
-                .need_input => return,
-                .complete => {
-                    if (res.plaintext_len > 0) {
-                        const ingest_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
-                        try self.session.ingest(self.plaintext_scratch[0..res.plaintext_len]);
-                        if (trace.enabled) {
-                            _ = trace.ingest_ns.fetchAdd(nowNs(self.config.io) -% ingest_t0, .monotonic);
-                            _ = trace.ingest_n.fetchAdd(1, .monotonic);
-                        }
-                        const intent_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
-                        try self.processIntents();
-                        if (trace.enabled) {
-                            _ = trace.intent_ns.fetchAdd(nowNs(self.config.io) -% intent_t0, .monotonic);
-                            _ = trace.intent_n.fetchAdd(1, .monotonic);
-                        }
-                    }
-                },
-                .peer_closed => return,
-                .tls_error => return error.TlsError,
-            }
-            if (res.consumed == 0 and res.plaintext_len == 0) return;
         }
     }
 
@@ -3325,10 +3195,10 @@ const Connection = struct {
                 return data_payload;
             }
         };
-        std.debug.assert(self.plaintext_scratch.len == emit_batch.max_plaintext + 1);
+        std.debug.assert(self.plaintext_scratch.len == emit_batch.max_plaintext);
         var sink_ctx: SinkCtx = .{
             .c = self,
-            .emit = .{ .buf = self.plaintext_scratch[0 .. self.plaintext_scratch.len - 1] },
+            .emit = .{ .buf = self.plaintext_scratch },
         };
         self.sched.drain(
             &sink_ctx,
@@ -3526,10 +3396,10 @@ const Connection = struct {
                 return data_payload;
             }
         };
-        std.debug.assert(self.plaintext_scratch.len == emit_batch.max_plaintext + 1);
+        std.debug.assert(self.plaintext_scratch.len == emit_batch.max_plaintext);
         var sink_ctx: ReceiptSink = .{
             .c = self,
-            .emit = .{ .buf = self.plaintext_scratch[0 .. self.plaintext_scratch.len - 1] },
+            .emit = .{ .buf = self.plaintext_scratch },
             .receipt_ticket = receipt_ticket,
             .receipt_slot = receipt_slot,
         };
@@ -3875,23 +3745,13 @@ const Connection = struct {
     /// The single exit from protocol bytes to transport bytes. Called ONLY by
     /// the `FairScheduler` sink; `test_queue_wire_bypass` proves it.
     ///
-    /// For h2c the on-wire prefix is copied into a write chunk — either one
-    /// owned frame or a drain-turn concat borrowed from scratch — and an owned
-    /// frame buffer is released here. For TLS it is encrypted on the actor, under
-    /// `session_mu` — the cipher is actor-owned, and two tasks driving it
-    /// concurrently is what crashed the process in t-538. Ciphertext is copied
-    /// from the boot-counted scratch; a frame slab is never handed to WritePump.
+    /// HTTP/2 bytes are always plaintext here. h2c copies them into a WritePump
+    /// chunk; TLS hands the same chunk to TlsPump, whose writer flush is
+    /// SSL_write. The cipher is not on this path and is not covered by
+    /// `session_mu`.
     ///
-    /// One plaintext input can hold one frame or a drain-turn batch and can
-    /// become several TLS records. The ticket chain, flush flag, and
-    /// control-pool release ride on the LAST record only. A receipt attached to
-    /// an earlier record would tell handlers their writes were delivered while
-    /// later bytes from the same input were still queued.
-    ///
-    /// Owned plaintext holds a wire reservation while it is encrypted, and each
-    /// ciphertext record takes its own. A coalesced batch instead borrows the
-    /// boot-counted plaintext scratch, so only its ciphertext needs a dynamic
-    /// reservation. Owned plaintext is released after the last record queues.
+    /// One input is one frame or a drain-turn concat. The ticket chain, flush
+    /// flag, and control-pool release ride with that one handoff.
     fn batchContainsTraceTicket(self: *Connection, ticket_slot: u32, ticket_count: u32) bool {
         const target = self.trace_ticket.load(.acquire);
         if (target == 0 or ticket_count == 0) return false;
@@ -3938,61 +3798,7 @@ const Connection = struct {
                 return error.WriteFailed;
             }
         }
-        if (self.tls_conn) |*tc| {
-            var reserved_plain: usize = 0;
-            if (owns_bytes) {
-                if (!self.tryReserveOutboundBytes(plain.len, .wire)) {
-                    if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
-                    return error.OutOfMemory;
-                }
-                reserved_plain = plain.len;
-            }
-            errdefer self.applyOutboundRelease(reserved_plain, .wire);
-            var off: usize = 0;
-            while (off < plain.len) {
-                const enc_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
-                const res = tls_edge.connectionEncrypt(tc, plain[off..], self.ciphertext_scratch);
-                if (trace.enabled) {
-                    _ = trace.encrypt_ns.fetchAdd(nowNs(self.config.io) -% enc_t0, .monotonic);
-                    _ = trace.encrypt_n.fetchAdd(1, .monotonic);
-                    _ = trace.encrypt_bytes.fetchAdd(res.consumed, .monotonic);
-                }
-                // Same ABI contract. An over-large `consumed` would push `off`
-                // past the end and panic on the NEXT iteration's slice, which
-                // points at the loop rather than at the encrypt that caused it.
-                std.debug.assert(res.consumed <= plain.len - off);
-                std.debug.assert(res.ciphertext_len <= self.ciphertext_scratch.len);
-                if (res.ciphertext_len > 0) {
-                    const next_off = off + res.consumed;
-                    const is_last = next_off >= plain.len;
-                    const meta = emit_batch.lastRecordMeta(is_last, .{
-                        .ticket = ticket,
-                        .ticket_slot = ticket_slot,
-                        .ticket_count = ticket_count,
-                        .control_n = control_n,
-                        .control_entries = control_entries,
-                    });
-                    self.sendAccountedWire(
-                        self.ciphertext_scratch[0..res.ciphertext_len],
-                        emit_batch.lastRecordFlush(is_last, flush),
-                        meta.ticket,
-                        meta.ticket_slot,
-                        meta.ticket_count,
-                        meta.control_n,
-                        meta.control_entries,
-                        is_last and complete_batch_receipt,
-                    ) catch {
-                        return error.WriteFailed;
-                    };
-                }
-                if (res.consumed == 0) break;
-                off += res.consumed;
-            }
-            self.applyOutboundRelease(reserved_plain, .wire);
-            reserved_plain = 0;
-        } else {
-            try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries, complete_batch_receipt);
-        }
+        try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries, complete_batch_receipt);
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
 

@@ -6,17 +6,13 @@
 #                      attach one receipt per packed write, so this sits near 1.
 #                      Packing authority is records/response.
 #   tickets/emit     = receipts flushed in one drainEmit turn
-#   records/response = TLS records per h2load success. 1.00 means a second
-#   HEADERS flushed the batch again; the script exits 9 rather than reporting
-#   that as a result. Packed drain turns at -m 10 sit well below 0.4.
-#   inbound_records/req = TLS records decrypted (firstRecord loop). 1.00 means
-#   one inbound record per response, not packed the way outbound is.
-#   encrypt/decrypt/send ns/req = Clock.awake around connectionEncrypt,
-#   connectionDecrypt, and sendAccountedWire. Throughput-shaped; compare to
-#   isolated bench-pipeline cipher rows, not to overlapped queue_ns.
-#   decrypt_loop ns/req = whole driveDecrypt including ingest under session_mu.
-#   accAppend/accCompact ns/req = tls_recv_acc memcpy and leftover memmove;
-#   outside the decrypt clock. compact_n/inbound_records is the leftover rate.
+#   records/response = write chunks queued per h2load success. 1.00 means a
+#   second HEADERS flushed the batch again; the script exits 9 rather than
+#   reporting that as a result. Packed drain turns at -m 10 sit well below 0.4.
+#   inbound_records/req = leftover counter from the old record loop (stays 0).
+#   encrypt/decrypt/send ns/req = Clock.awake around sendAccountedWire; encrypt
+#   and decrypt clocks stay 0 because SSL_write lives in TlsPump, not the actor.
+#   decrypt_loop / accAppend / accCompact = unused after TLS-as-stream.
 #   allocs/request   = counting-allocator calls on the server GPA (--trace only)
 #   alloc_ns/request = GPA rawAlloc wall time including two Clock.awake reads.
 #                      Overstates allocator cost; sample(1) is CPU-share authority.

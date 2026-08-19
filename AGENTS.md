@@ -64,11 +64,11 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ```
 
 **`zig build test` cannot reach the TLS edge at all.** No test binds a `tls_h2`
-endpoint, so `tlsHandshakeViaPumps`, `driveDecrypt`, and the TLS branch of
-`queueWire` never run under the suite. That is measured, not assumed: an
-always-false assert inside `driveDecrypt` leaves the suite green and aborts on
-the first curl request. `tls-smoke` is therefore the only gate that covers that
-code, and it is in `ci`.
+endpoint, so `handshakeTls`, `TlsPump`, and leftover-preface drain never run
+under the suite. That is measured, not assumed: an always-false assert inside
+the TLS handshake left the suite green and aborts on the first curl request.
+`tls-smoke` is therefore the only gate that covers that code, and it is in
+`ci`.
 
 It uses curl because the oracle must share no code with the stack under test;
 nghttp2 is strict about frame order and pipelines its preface, which is the
@@ -89,8 +89,10 @@ see `tools/README.md`.
 
 - `Session` is the deterministic protocol authority. `Connection` serializes
   Session access with `session_mu`; handlers communicate through commands.
-- ReadPump and WritePump are the sole owners of their socket directions. TLS
-  state remains actor-owned; never share a tls.zig Connection with a pump.
+- ReadPump and WritePump are the sole owners of their socket directions on h2c.
+  On TLS, `TlsPump` is the sole SSL_read/SSL_write owner; never share an SSL
+  object with a second task. `session_mu` covers Session and FairScheduler, not
+  the cipher.
 - All production wire output passes through `FairScheduler`'s sink. Preserve
   the `test_queue_wire_bypass == 0` mutation canary.
 - Outbound accounting distinguishes pending body bytes from framed wire bytes.
@@ -102,18 +104,26 @@ see `tools/README.md`.
 
 ## TLS and allocation traps
 
-TLS is pinned in `build.zig.zon` to the `starh2-nonblock-v1` archive of
-`dimenus/tls.zig` (URL + content hash; see `tools/lock.json`). The source-visible
-patch remains at `vendor/tls-zig-nonblock-v1.patch`. If the fork or patch
-changes, update the zon URL/hash, fork commit, and patch SHA-256 together.
+TLS is BoringSSL via `hendriknielaender/boring` v0.1.1 (`build.zig.zon`).
+HTTP/2 writes plaintext into a `std.Io.Writer`; flush is SSL_write. Pass
+`-Dboringssl-source-path`, or place a checkout at `vendor/boringssl`, or use
+the sibling `../../oss/http2-zig-hendrik/boringssl`. The expected BoringSSL
+revision is in `tools/lock.json`. `tools/build-boringssl.sh` overlays the
+fetched boring package so zig-cc glibc headers do not -Werror memchr on
+`aarch64-linux-gnu`. Do not wrap a record API beside this stream.
 
-- TLS 1.3 plaintext scratch is 16 KiB plus the inner content-type byte.
-- `tls_edge.firstRecord` deliberately feeds one record per decrypt call. Without
-  it, a coalesced small record followed by a maximum record can advance the
-  cipher sequence and then fail for insufficient remaining output space.
-- The TLS receive accumulator is reserved at connection boot and bounded by
-  `Limits.tls_recv_acc_bytes`; do not replace `appendSliceAssumeCapacity` with a
-  hot-path growing append.
+- `TlsPump` is the sole SSL_read/SSL_write owner. Concurrent ReadPump+WritePump
+  on one SSL object is a data race; h2c keeps the dual pumps. BIO_read must not
+  `peekGreedy`: an empty TCP buffer returns WANT_READ so the pump can SSL_write.
+  Handshake still waits in `tls_retry`. The adapter lives in `src/edge/tls_async.zig`
+  (forked from boring v0.1.1 `async.zig`); do not import `boring.async` for the
+  edge path.
+- Handshake runs on the actor (blocking SSL_accept) before `TlsPump` starts,
+  then leftover plaintext (a pipelined preface) is ingested.
+- Packing stays in `emit_batch` (16 KiB concat). Do not put a record loop back
+  on the actor.
+- Per-connection TLS Io buffers are bounded by `Limits.tls_stream_bytes`
+  (floor `TLS_CONN_BUFFER_BYTES` = four `BioStreamBufferSize` buffers).
 - Intent payloads, decoded headers, dispatch requests, scheduler leases, and
   tickets have explicit owners. Error paths must release exactly once.
 - `std.testing.FailingAllocator` is not thread-safe; fail-index/counting tests

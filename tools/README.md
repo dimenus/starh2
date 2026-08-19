@@ -69,9 +69,9 @@ Verified at `http2.zig` revision
   `SETTINGS_INITIAL_WINDOW_SIZE`, WU withheld on stream 1, 99 sibling `GET /`
   completed under their 100-stream cap). Protocol: `tools/oneshot-gap.md`.
 
-This is not an identical stack comparison: starh2 uses its pure-Zig TLS fork,
-while the opponent uses BoringSSL. The starh2 h2c arm remains in the same run so
-the result shows whether the gap survives after removing starh2's TLS cost.
+This is not an identical stack comparison: both arms here use BoringSSL
+(`http2-boring` vs starh2 `TlsPump`). The starh2 h2c arm remains in the same
+run so the result shows whether a gap survives after removing TLS cost.
 
 ## Concurrent SSE benchmark against Go
 
@@ -200,9 +200,9 @@ nghttp -nv "http://127.0.0.1:$PORT/hello" -H 'x-grader-nonce: ng1'
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
   -keyout testdata/key.pem -out testdata/cert.pem -days 365 -nodes -subj '/CN=localhost'
-# P-256, not rsa:2048. tls.zig's 2048-bit RSA handshake was ~17 ms user on
-# Nachos; a 100k-request official run then measured handshake amortization,
-# not the record layer.
+# P-256, not rsa:2048. A 2048-bit RSA handshake was ~17 ms user on
+# Nachos with the old tls.zig pin; a 100k-request official run then
+# measured handshake amortization, not the record layer.
 ./zig-out/bin/starh2-conformance-server --mode tls --bind 127.0.0.1:0 --cert testdata/cert.pem --key testdata/key.pem
 curl -vk --http2 -H 'x-grader-nonce: tls1' "https://127.0.0.1:$PORT/hello"
 # ALPN reject (expect TLS alert 120):

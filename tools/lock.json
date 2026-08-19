@@ -10,15 +10,12 @@
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"
   },
-  "tls.zig": {
-    "base_commit": "5452bafc98d23e304209cb24d81fd2d19434e52d",
-    "fork": "https://github.com/dimenus/tls.zig",
-    "fork_commit": "28a034bf16c04a62c15f93c6ace7b79a9cad5270",
-    "url": "https://github.com/dimenus/tls.zig/archive/28a034bf16c04a62c15f93c6ace7b79a9cad5270.tar.gz",
-    "hash": "tls-0.1.0-ER2e0pjZBQCvcNg41jjRJ7voWHGg8vp1RCqMxUaBIeT2",
-    "patch": "vendor/tls-zig-nonblock-v1.patch",
-    "patch_sha256": "d908349c4cc5d37f86a3c13481007c89fb965b024f8a635298555457d6299dd9",
-    "abi": "starh2-nonblock-v1",
-    "abi_version": 1
+  "boring": {
+    "tag": "v0.1.1",
+    "url": "https://github.com/hendriknielaender/boring/archive/refs/tags/v0.1.1.tar.gz",
+    "hash": "boring-0.1.0-K6muvtBGCQAHvnOGuLmCcLZn-WgZkddupoEFKwSKpL7U",
+    "boringssl_revision": "7a6e828dc53ba9a56bd49915f2a0780d63af97d2",
+    "source": "-Dboringssl-source-path, else vendor/boringssl, else ../../oss/http2-zig-hendrik/boringssl",
+    "build_script": "tools/build-boringssl.sh overlays zig-pkg/boring-*/tools/build-boringssl.sh (zig glibc memchr -Werror on aarch64-linux-gnu)"
   }
 }

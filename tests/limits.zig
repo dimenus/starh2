@@ -24,9 +24,9 @@ test "control capacity must leave ordinary space above terminal reserve" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
-test "tls receive accumulator fits one maximum wire chunk" {
+test "tls stream buffers cover one connection's Io scratch" {
     var lim = starh2.Limits.defaults;
-    lim.tls_recv_acc_bytes = starh2.core.limits.WIRE_CHUNK_SIZE - 1;
+    lim.tls_stream_bytes = starh2.core.limits.TLS_CONN_BUFFER_BYTES - 1;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 

@@ -11,30 +11,15 @@ test "h2c preface matcher" {
     try std.testing.expect(r2.done);
 }
 
-test "tls abi marker present" {
-    try std.testing.expectEqual(@as(u32, 1), starh2.edge.tls_edge.starh2_nonblock_abi);
-}
-
-test "tls plaintext scratch includes TLS 1.3 inner content type" {
+test "tls packing scratch is the 16 KiB application plaintext cap" {
     try std.testing.expectEqual(
-        @as(usize, 16 * 1024 + 1),
+        @as(usize, 16 * 1024),
         starh2.core.wire_const.TLS_PLAINTEXT_SCRATCH_SIZE,
     );
-    // Drain-turn packing uses every byte except that content-type slot.
     try std.testing.expectEqual(
-        starh2.core.wire_const.TLS_PLAINTEXT_SCRATCH_SIZE - 1,
+        starh2.core.wire_const.TLS_PLAINTEXT_SCRATCH_SIZE,
         starh2.edge.emit_batch.max_plaintext,
     );
-}
-
-test "tls decrypt drive presents at most one record" {
-    const records = [_]u8{
-        23, 3, 3, 0, 3, 1, 2, 3,
-        23, 3, 3, 0, 2, 4, 5,
-    };
-    try std.testing.expectEqualSlices(u8, records[0..8], starh2.edge.tls_edge.firstRecord(&records));
-    try std.testing.expectEqualSlices(u8, records[0..4], starh2.edge.tls_edge.firstRecord(records[0..4]));
-    try std.testing.expectEqualSlices(u8, records[0..6], starh2.edge.tls_edge.firstRecord(records[0..6]));
 }
 
 test "wire completion can release several control-pool entries" {

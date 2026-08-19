@@ -23,12 +23,12 @@
 //! in a `Select` where a flag alone would never be observed.
 const std = @import("std");
 const builtin = @import("builtin");
-const tls = @import("tls");
 const limits_mod = @import("../core/limits.zig");
 const router_mod = @import("../http/router.zig");
 const connection = @import("connection.zig");
 const slab_pool = @import("slab_pool.zig");
 const brotli = @import("../http/brotli.zig");
+const tls_edge = @import("tls.zig");
 pub const EndpointAddress = std.Io.net.IpAddress;
 
 pub const EndpointConfig = union(enum) {
@@ -48,7 +48,6 @@ pub const InitError = error{
     InvalidCertificate,
     CertificateTooLarge,
     PrivateKeyTooLarge,
-    TlsPatchMismatch,
 };
 
 pub const ServeError = error{
@@ -93,7 +92,7 @@ pub const Server = struct {
     endpoints: []EndpointConfig,
     listeners: []std.Io.net.Server,
     local_addrs: []EndpointAddress,
-    tls_auth: ?tls.config.CertKeyPair = null,
+    tls_acceptor: ?tls_edge.Acceptor = null,
     shutdown_flag: std.atomic.Value(bool) = .init(false),
     shutdown_event: std.Io.Event = .unset,
     active_connections: std.atomic.Value(usize) = .init(0),
@@ -132,10 +131,6 @@ pub const Server = struct {
         }
         if (need_tls and config.tls == null) return error.InvalidConfig;
 
-        if (@hasDecl(@import("tls"), "nonblock")) {
-            if (tls.nonblock.starh2_nonblock_abi != 1) return error.TlsPatchMismatch;
-        }
-
         var route_bytes: usize = 0;
         for (config.routes) |route| route_bytes += route.path.len;
         if (route_bytes > config.limits.max_route_path_bytes) return error.InvalidRoute;
@@ -160,14 +155,15 @@ pub const Server = struct {
         const endpoints = try gpa.dupe(EndpointConfig, config.endpoints);
         errdefer gpa.free(endpoints);
 
-        var tls_auth: ?tls.config.CertKeyPair = null;
-        errdefer if (tls_auth) |*auth| {
-            if (@hasDecl(@TypeOf(auth.*), "deinit")) auth.deinit(gpa);
-        };
+        var tls_acceptor: ?tls_edge.Acceptor = null;
+        errdefer if (tls_acceptor) |*auth| auth.deinit();
         if (config.tls) |tls_config| {
             if (tls_config.certificate_chain_pem.len > config.limits.certificate_chain_bytes) return error.CertificateTooLarge;
             if (tls_config.private_key_pem.len > config.limits.private_key_bytes) return error.PrivateKeyTooLarge;
-            tls_auth = loadCertKey(gpa, io, tls_config) catch return error.InvalidCertificate;
+            tls_acceptor = tls_edge.Acceptor.initFromPem(
+                tls_config.certificate_chain_pem,
+                tls_config.private_key_pem,
+            ) catch return error.InvalidCertificate;
         }
 
         const listeners = try gpa.alloc(std.Io.net.Server, config.endpoints.len);
@@ -205,7 +201,7 @@ pub const Server = struct {
             .endpoints = endpoints,
             .listeners = listeners,
             .local_addrs = local_addrs,
-            .tls_auth = tls_auth,
+            .tls_acceptor = tls_acceptor,
             .accounting = .{
                 .max_streams = config.limits.max_streams_per_server,
                 .reaper_capacity = config.limits.cancellation_reaper_jobs,
@@ -219,10 +215,6 @@ pub const Server = struct {
         };
         self.router = .{ .routes = self.routes };
         return self;
-    }
-
-    fn loadCertKey(gpa: std.mem.Allocator, io: std.Io, config: TlsConfig) !tls.config.CertKeyPair {
-        return tls.config.CertKeyPair.fromSlice(gpa, io, config.certificate_chain_pem, config.private_key_pem);
     }
 
     fn closeListeners(self: *Server) void {
@@ -394,7 +386,7 @@ pub const Server = struct {
                 .mode = mode,
                 .limits = self.limits,
                 .router = self.router,
-                .tls_auth = if (self.tls_auth) |*auth| auth else null,
+                .tls_acceptor = if (self.tls_acceptor) |*auth| auth else null,
                 .gpa = self.gpa,
                 .shutdown_flag = &self.shutdown_flag,
                 .shutdown_event = &self.shutdown_event,
@@ -477,9 +469,7 @@ pub const Server = struct {
         // Asserts every slab came home; a connection teardown that missed one
         // fails here rather than silently shrinking the pool.
         self.slabs.deinit(gpa);
-        if (self.tls_auth) |*auth| {
-            if (@hasDecl(@TypeOf(auth.*), "deinit")) auth.deinit(gpa);
-        }
+        if (self.tls_acceptor) |*auth| auth.deinit();
         self.* = undefined;
     }
 };

@@ -133,6 +133,60 @@ fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool) voi
     mod.addOptions("build_options", opts);
 }
 
+/// Copy `tools/build-boringssl.sh` over the fetched boring package *before*
+/// `b.dependency("boring")` hashes that script. Zig's glibc headers make
+/// memchr const-generic; without the wrapper flag, aarch64-linux-gnu -Werror
+/// fails BoringSSL.
+fn overlayBoringBuildScript(b: *std.Build) void {
+    const io = b.graph.io;
+    const root = b.build_root.handle;
+    root.access(io, "tools/build-boringssl.sh", .{}) catch return;
+    var pkg = root.openDir(io, "zig-pkg", .{ .iterate = true }) catch return;
+    defer pkg.close(io);
+    var it = pkg.iterate();
+    while (it.next(io) catch return) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!std.mem.startsWith(u8, entry.name, "boring-")) continue;
+        var dest = pkg.openDir(io, entry.name, .{}) catch continue;
+        defer dest.close(io);
+        _ = root.updateFile(io, "tools/build-boringssl.sh", dest, "tools/build-boringssl.sh", .{}) catch continue;
+    }
+}
+
+fn resolveBoringsslSource(b: *std.Build) []const u8 {
+    if (b.option([]const u8, "boringssl-source-path", "Path to a BoringSSL source checkout")) |path| {
+        return path;
+    }
+    const candidates = [_][]const u8{
+        "vendor/boringssl",
+        "../../oss/http2-zig-hendrik/boringssl",
+    };
+    for (candidates) |candidate| {
+        const cmake = b.pathJoin(&.{ candidate, "CMakeLists.txt" });
+        b.build_root.handle.access(b.graph.io, cmake, .{}) catch continue;
+        return candidate;
+    }
+    std.process.fatal(
+        "BoringSSL source not found. Pass -Dboringssl-source-path=... or place a checkout at vendor/boringssl",
+        .{},
+    );
+}
+
+fn boringModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    source_path: []const u8,
+) *std.Build.Module {
+    overlayBoringBuildScript(b);
+    const dep = b.dependency("boring", .{
+        .target = target,
+        .optimize = optimize,
+        .@"boringssl-source-path" = source_path,
+    });
+    return dep.module("boring");
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -145,6 +199,7 @@ pub fn build(b: *std.Build) void {
     // `-Dobserve=true`. Do not read `builtin.mode` inside connection.zig — an
     // imported module's mode is not the test artifact's mode.
     const observe_hot = observe or (optimize == .Debug);
+    const boringssl_source_path = resolveBoringsslSource(b);
 
     const zio_dep = b.dependency("zio", .{
         .target = target,
@@ -157,10 +212,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const tls_dep = b.dependency("tls", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const boring_mod = boringModule(b, target, optimize, boringssl_source_path);
     const brotli_dep = b.dependency("brotli", .{
         .target = target,
         .optimize = optimize,
@@ -172,7 +224,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "tls", .module = tls_dep.module("tls") },
+            .{ .name = "boring", .module = boring_mod },
         },
     });
     attachStarh2Options(b, starh2_mod, observe_hot);
@@ -215,7 +267,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "tls", .module = tls_dep.module("tls") },
+            .{ .name = "boring", .module = boring_mod },
         },
     });
     attachStarh2Options(b, lib_test_mod, true);
@@ -496,7 +548,7 @@ pub fn build(b: *std.Build) void {
         const rt = b.resolveTargetQuery(rq.query);
         const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .ReleaseSafe });
         const datastar_rt = b.lazyDependency("datastar", .{ .target = rt, .optimize = .ReleaseSafe });
-        const tls_rt = b.dependency("tls", .{ .target = rt, .optimize = .ReleaseSafe });
+        const boring_rt = boringModule(b, rt, .ReleaseSafe, boringssl_source_path);
         const brotli_rt = b.dependency("brotli", .{ .target = rt, .optimize = .ReleaseSafe });
         const starh2_rt = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
@@ -504,7 +556,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "tls", .module = tls_rt.module("tls") },
+                .{ .name = "boring", .module = boring_rt },
             },
         });
         attachStarh2Options(b, starh2_rt, false);
@@ -621,8 +673,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&bench_run.step);
 
     // Local pipeline costs without sockets, contention, or a client.
-    // TLS record encrypt/decrypt is isolated here; the live server still
-    // encrypts under session_mu. Deliberately ReleaseFast-only and not a CI gate.
+    // Deliberately ReleaseFast-only and not a CI gate.
     const pipeline_bench_exe = b.addExecutable(.{
         .name = "pipeline-bench",
         .root_module = b.createModule(.{
@@ -633,7 +684,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "starh2", .module = starh2_mod },
                 .{ .name = "zio", .module = zio_dep.module("zio") },
-                .{ .name = "tls", .module = tls_dep.module("tls") },
             },
         }),
     });

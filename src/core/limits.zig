@@ -74,6 +74,7 @@ pub const REAPER_JOB_SIZE: usize = 40;
 
 pub const WIRE_CHUNK_SIZE = wire_const.WIRE_CHUNK_SIZE;
 pub const TLS_PLAINTEXT_SCRATCH_SIZE = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
+pub const TLS_CONN_BUFFER_BYTES = wire_const.TLS_CONN_BUFFER_BYTES;
 pub const TERMINAL_CONTROL_RESERVE_BYTES: usize = 4 * 1024;
 pub const TERMINAL_CONTROL_RESERVE_ENTRIES: usize = 16;
 
@@ -115,8 +116,9 @@ pub const Limits = struct {
     certificate_chain_bytes: usize = 64 * 1024,
     private_key_bytes: usize = 16 * 1024,
     tls_handshake_scratch_bytes: usize = 256 * 1024,
-    /// TLS recv accumulator soft cap per connection (on-demand).
-    tls_recv_acc_bytes: usize = 256 * 1024,
+    /// Per-connection TLS stream buffers (tcp in/out + tls in/out). Floor is
+    /// `TLS_CONN_BUFFER_BYTES`; the default leaves headroom for the SSL object.
+    tls_stream_bytes: usize = 256 * 1024,
     cancellation_reaper_tasks: usize = 64,
     cancellation_reaper_jobs: usize = 4_096,
     decoded_header_bytes: usize = 32 * 1024,
@@ -211,7 +213,7 @@ pub const Limits = struct {
         if (self.control_bytes_per_connection <= TERMINAL_CONTROL_RESERVE_BYTES) return error.InvalidConfig;
         if (self.control_entries_per_connection <= TERMINAL_CONTROL_RESERVE_ENTRIES) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
-        if (self.tls_recv_acc_bytes < WIRE_CHUNK_SIZE) return error.InvalidConfig;
+        if (self.tls_stream_bytes < TLS_CONN_BUFFER_BYTES) return error.InvalidConfig;
         if (self.frame_slab_bytes < 9) return error.InvalidConfig;
         if (self.frame_slabs_per_connection == 0) return error.InvalidConfig;
         // A server with no slabs can never write DATA.
@@ -259,7 +261,6 @@ pub const Limits = struct {
         terms.write_acks = try checkedMul(ticket_n, bound.WRITE_COMPLETION_SIZE);
         terms.tickets = try checkedMul(ticket_n, bound.TICKET_WAIT_SIZE);
         const plain_scratch: usize = TLS_PLAINTEXT_SCRATCH_SIZE;
-        const cipher_scratch: usize = WIRE_CHUNK_SIZE;
         const sid_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const inline_sids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const complete_receipt_sids = try checkedMul(inline_sids, 4);
@@ -289,10 +290,10 @@ pub const Limits = struct {
         const deadline_ready = try checkedMul(self.max_streams_per_connection, @sizeOf(std.atomic.Value(u8)));
         const deadline_state = try checkedAdd(deadline_events, try checkedAdd(deadline_heap, deadline_ready));
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_recv_acc_bytes, try checkedAdd(header_maps, intents)))));
+        terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_stream_bytes, try checkedAdd(header_maps, intents)))));
 
         const sid_and_inline = try checkedAdd(sid_scratch, try checkedAdd(inline_sids, complete_receipt_sids));
-        const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(cipher_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch))))))))))))))))))));
+        const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
         const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, write_free)));
 
         terms.routes = try checkedAdd(

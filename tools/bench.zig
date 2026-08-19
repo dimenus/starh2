@@ -20,7 +20,8 @@
 //!
 //! - `starh2 tls` and `starh2 h2c` are the same binary and the same handler.
 //!   testdata must be ECDSA P-256 (`tools/README.md`). rsa:2048 made a 100k
-//!   run measure tls.zig's RSA handshake (~17 ms user), not the record layer.
+//!   run measure an RSA handshake (~17 ms user on the old tls.zig pin), not
+//!   the record layer.
 //!   The harness prints user vs sys CPU so that cannot hide in one number.
 //! - `--opponent <binary>` adds a third arm. It is optional, and its absence
 //!   is PRINTED rather than assumed, because a table with a missing row reads

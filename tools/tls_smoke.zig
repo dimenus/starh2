@@ -3,21 +3,21 @@
 //! # Why this exists, and why it is not a Zig test
 //!
 //! `zig build test` never executes the TLS edge. No test binds a `tls_h2`
-//! endpoint, so `tlsHandshakeViaPumps`, `driveDecrypt`, and the TLS branch of
-//! `queueWire` are unreachable from the suite. That was proven, not assumed: an
-//! always-false assert placed inside `driveDecrypt` left the suite at 126/126
-//! green, and aborted the process on the first curl request.
+//! endpoint, so `handshakeTls`, `TlsPump`, and leftover-preface drain are
+//! unreachable from the suite. That was proven, not assumed: an always-false
+//! assert placed inside the TLS handshake left the suite green, and aborted
+//! the process on the first curl request.
 //!
 //! # Why curl, and not a Zig client
 //!
 //! The oracle must share no code with the thing under test. A gate written
-//! against the pinned `tls.zig` fork would test that fork against itself, with
-//! the same assumptions and the same blind spots. curl brings nghttp2, an
-//! independent implementation that is strict about frame ORDER — which is what
-//! makes it able to see a defect like a SETTINGS ACK emitted before the server
-//! preface. It also pipelines its h2 preface into the TLS handshake flight,
-//! which is the client shape both t-538 defects required and no h2c gate could
-//! produce.
+//! against the same TLS library the server uses would test that library
+//! against itself, with the same assumptions and the same blind spots. curl
+//! brings nghttp2, an independent implementation that is strict about frame
+//! ORDER — which is what makes it able to see a defect like a SETTINGS ACK
+//! emitted before the server preface. It also pipelines its h2 preface into
+//! the TLS handshake flight, which is the client shape both t-538 defects
+//! required and no h2c gate could produce.
 //!
 //! # What each request proves
 //!

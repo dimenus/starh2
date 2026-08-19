@@ -15,22 +15,21 @@
             .hash = "datastar_sdk_zig-0.1.0-IRNEdq1bAABGAHWmZAq3JuU9B7N0G-XxrvvIka1X_sHN",
             .lazy = true,
         },
-        .tls = .{
-            .url = "https://github.com/dimenus/tls.zig/archive/28a034bf16c04a62c15f93c6ace7b79a9cad5270.tar.gz",
-            .hash = "tls-0.1.0-ER2e0pjZBQCvcNg41jjRJ7voWHGg8vp1RCqMxUaBIeT2",
-        },
         .brotli = .{
             .url = "https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz",
             .hash = "N-V-__8AAF_gIQDX2wVzXI-r96NyCgKuDj9W_Gab-TU7Qzoi",
+        },
+        .boring = .{
+            .url = "https://github.com/hendriknielaender/boring/archive/refs/tags/v0.1.1.tar.gz",
+            .hash = "boring-0.1.0-K6muvtBGCQAHvnOGuLmCcLZn-WgZkddupoEFKwSKpL7U",
         },
     },
     // brotli pin: google/brotli v1.1.0 release archive (raw C sources; no build.zig)
     // tag v1.1.0 / https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz
     // consumed via addCSourceFiles on c/common + c/enc (c/dec only on test artifacts)
-    // tls.zig pin: base 5452bafc98d23e304209cb24d81fd2d19434e52d
-    // fork https://github.com/dimenus/tls.zig @28a034bf16c04a62c15f93c6ace7b79a9cad5270
-    // patch vendor/tls-zig-nonblock-v1.patch
-    // patch_sha256 d908349c4cc5d37f86a3c13481007c89fb965b024f8a635298555457d6299dd9
+    // boring pin: hendriknielaender/boring v0.1.1
+    // BoringSSL source: -Dboringssl-source-path, else vendor/boringssl, else
+    // ../../oss/http2-zig-hendrik/boringssl (revision recorded in tools/lock.json)
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -38,7 +37,6 @@
         "examples",
         "tests",
         "fuzz",
-        "vendor",
         "tools",
         "AGENTS.md",
         "zb",

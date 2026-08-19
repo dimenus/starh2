@@ -167,7 +167,7 @@ pub const write_trace = struct {
     pub var chunks: std.atomic.Value(u64) = .init(0);
     pub var max_chunks: std.atomic.Value(u64) = .init(0);
 
-    fn note(count: usize) void {
+    pub fn note(count: usize) void {
         const count_u64: u64 = @intCast(count);
         _ = calls.fetchAdd(1, .monotonic);
         _ = chunks.fetchAdd(count_u64, .monotonic);

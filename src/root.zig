@@ -17,10 +17,10 @@
 //!
 //! # The shape of a request
 //!
-//! socket -> `ReadPump` -> actor -> `Session.ingest` -> `Intent.dispatch_request`
-//! -> `Router` -> complete handler on the actor, or a handler task ->
-//! `Response` -> `Session` command -> `Intent` -> `FairScheduler` ->
-//! `WritePump` -> socket.
+//! socket -> `ReadPump` (h2c) or `TlsPump` (TLS) -> actor -> `Session.ingest`
+//! -> `Intent.dispatch_request` -> `Router` -> complete handler on the actor,
+//! or a handler task -> `Response` -> `Session` command -> `Intent` ->
+//! `FairScheduler` -> `queueWire` -> WritePump (h2c) or TlsPump (TLS) -> socket.
 //!
 //! Start with `edge/connection.zig`. Its module header carries the task
 //! topology, the lock discipline, and the wake protocol, and nearly every
