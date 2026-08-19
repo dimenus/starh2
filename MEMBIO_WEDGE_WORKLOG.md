@@ -54,6 +54,30 @@ that cadence names the wait once identified.
 4. Do not fix with a timeout or poll; the actor deadline that made the old
    stall a 30 s park instead of forever is not a fix here either.
 
+## Second specimen: h2load triggers it too (2026-08-19 EOD)
+
+An EOD perf run at 302c0d7 wedged inside tools/oneshot-phase-trace.sh
+itself: h2load `-n 400000 -c 50 -m 10` parked in futex while ONE of its 50
+connections' server side sat in io_cqring_wait. Counters at the wedge
+(captures/membio-wedge/trace-h2load-wedge.json): jobs=391679
+writes=391678 of 400000 — one connection wedged holding its last ~8.3k
+requests; 49 connections completed. So the trigger is NOT the Go client
+shape specifically: any sufficiently hot pipelined connection can park,
+with per-connection probability low enough that a lucky phase-trace run
+passes. The fix session's "h2load shapes run fine" was a passing sample
+(the validity trap, again).
+
+COUNTER UNITS, now calibrated from this specimen: `jobs` counts REQUESTS;
+`ingest_n`/`read_take_n` count INGEST TURNS (~10 requests each at -m 10);
+`handoffs`/`tickets` count drain-turn receipts, not requests. The first
+specimen's "274 ingested-undispatched" therefore means ~274 ingest turns
+(~thousands of requests) held undispatched — direction unchanged, scale
+larger.
+
+CONSEQUENCE: no perf number from a 302c0d7-lineage arm is trustworthy on
+ANY axis until this closes — a run that completes may have been one lucky
+draw. The t-866 fix gates all further measurement of this arm.
+
 ## Do not
 
 - Re-litigate the pump wire path or reintroduce a Select; both are
