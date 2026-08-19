@@ -116,7 +116,12 @@ mkdir -p "$outdir"
 # ---------------------------------------------------------------- binaries
 
 sha_of() {
-  shasum -a 256 "$1" | awk '{print substr($1,1,16)}'
+  # sha256sum on Linux, shasum on Darwin.
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print substr($1,1,16)}'
+  else
+    shasum -a 256 "$1" | awk '{print substr($1,1,16)}'
+  fi
 }
 
 bin_sha=""
@@ -130,8 +135,10 @@ describe_bin() {
     exit 2
   fi
   bin_sha=$(sha_of "$_p")
-  _size=$(LC_ALL=C stat -f '%z' "$_p")
-  _mtime=$(LC_ALL=C stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%S' "$_p")
+  # GNU stat first (Linux), BSD stat as the fallback (Darwin).
+  _size=$(LC_ALL=C stat -c '%s' "$_p" 2>/dev/null || LC_ALL=C stat -f '%z' "$_p")
+  _mtime=$(LC_ALL=C stat -c '%y' "$_p" 2>/dev/null | cut -d. -f1 | tr ' ' 'T' \
+    || LC_ALL=C stat -f '%Sm' -t '%Y-%m-%dT%H:%M:%S' "$_p")
   _newer=$(find src examples build.zig build.zig.zon -type f -newer "$_p" -print 2>/dev/null | head -3 || true)
   if [ -n "$_newer" ]; then
     echo "BIN $_l sha=$bin_sha size=$_size mtime=$_mtime STALE"
