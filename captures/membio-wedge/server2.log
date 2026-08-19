@@ -1,0 +1,2 @@
+STARH2_PARK acc=0 complete=false pending=0 bytes=0 ordinary=0 framed=0 live=0 refilled=false conn_win=65535 eligible=0 missing=0 tomb_noerr=0 tomb_rst=0 pend_slots=0 rst0=0 intents=0 zero_win=0 min_swin=2147483647 active=0 rst_h=0 rst_c=0 ctrl_fail=0 rst_after_fail=0
+STARH2_PARK acc=0 complete=false pending=0 bytes=0 ordinary=0 framed=0 live=1 refilled=false conn_win=1073807255 eligible=0 missing=0 tomb_noerr=0 tomb_rst=0 pend_slots=0 rst0=0 intents=0 zero_win=0 min_swin=2147483647 active=0 rst_h=0 rst_c=0 ctrl_fail=0 rst_after_fail=0

@@ -1,0 +1,9 @@
+== ss at t8:
+State Recv-Q Send-Q Local Address:Port  Peer Address:Port
+ESTAB 0      0          127.0.0.1:19471    127.0.0.1:35780
+	 skmem:(r0,rb230247,t0,tb2626560,f0,w0,o0,bl0,d0) cubic wscale:10,10 rto:201 rtt:0.014/0.002 ato:40 mss:65483 pmtu:65535 rcvmss:1501 advmss:65483 cwnd:10 bytes_sent:2582069 bytes_acked:2582069 bytes_received:1432970 segs_out:38909 segs_in:38824 data_segs_out:38400 data_segs_in:38693 send 374188571429bps lastsnd:7273 lastrcv:7273 lastack:7273 pacing_rate 728854260864bps delivery_rate 261932000000bps delivered:38401 app_limited busy:461ms rcv_rtt:29.913 rcv_space:67016 rcv_ssthresh:78372 minrtt:0.002 snd_wnd:190464 rcv_wnd:78848
+== wchans:
+2096319 wchan=io_cqring_wait volctx=157974
+2096321 wchan=io_cqring_wait volctx=188322
+2096322 wchan=io_cqring_wait volctx=229
+2096323 wchan=io_wq_worker volctx=5

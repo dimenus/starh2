@@ -1,0 +1,3 @@
+main         oneshot-only conns=1 workers=8
+main         oneshot ok=0 err=0 rps=0 p50=0s p99=0s max=0s
+main         NO ONESHOTS — ingest did not complete a request while SSE was live

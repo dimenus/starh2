@@ -1,0 +1,2 @@
+probe        oneshot-only conns=1 workers=1
+probe        oneshot ok=52607 err=0 rps=52607 p50=17µs p99=38µs max=963µs
