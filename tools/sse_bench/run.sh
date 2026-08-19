@@ -35,6 +35,7 @@
 set -u
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
+. "$REPO/tools/bench_lock.sh"
 STREAMS=${STREAMS:-200}
 SECONDS_RUN=${SECONDS_RUN:-10}
 INTERVAL=${INTERVAL:-10}
@@ -64,6 +65,7 @@ cd "$REPO"
 ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 
+bench_lock
 if [ "$STARH2_EXECUTORS" = auto ]; then
   "$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" > "$OUT/starh2.log" 2>&1 &
 else
@@ -82,6 +84,7 @@ sleep 2
 cleanup() {
   kill ${S_RSS_PID:-} ${G_RSS_PID:-} $S_PID $G_PID 2>/dev/null
   wait 2>/dev/null
+  bench_unlock
 }
 trap cleanup EXIT INT TERM
 

@@ -35,12 +35,14 @@ set -eu
 OUT=${OUT:-/tmp/starh2-oneshot-trace}
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$REPO"
+. "$REPO/tools/bench_lock.sh"
 ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2"
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 PORT=19447
+bench_lock
 "$STARH2" --mode tls --port "$PORT" --trace --trace-every 64 > /tmp/oneshot-tr-server.log 2>&1 &
 S_PID=$!
-trap 'kill $S_PID 2>/dev/null; wait $S_PID 2>/dev/null || true' EXIT
+trap 'kill $S_PID 2>/dev/null; wait $S_PID 2>/dev/null || true; bench_unlock' EXIT
 sleep 2
 
 read_trace() {

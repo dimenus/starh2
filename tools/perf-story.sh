@@ -190,6 +190,11 @@ if [ -d "$NEW_ROOT/tools/sse_bench" ]; then
    go build -o "$OUT/sse-client" ./client.go)
 fi
 
+# One lock for the whole measurement phase: a matrix run owns the box.
+# Nested harnesses (mixed.sh, run.sh) see BENCH_LOCK_HELD and skip.
+. "$(cd "$(dirname "$0")" && pwd -P)/bench_lock.sh"
+bench_lock
+
 bench_row_status() {
   log=$1
   if grep -q 'CLIENT-LIMITED' "$log"; then
@@ -577,6 +582,7 @@ else
 fi
 
 cleanup_servers
+bench_unlock
 
 echo
 echo "== matrix $HOST_UNAME =="

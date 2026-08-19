@@ -22,4 +22,7 @@ echo "bench-hendrik-pipeline: http2.zig revision $REVISION"
   "-Mhttp2=$HENDRIK_ROOT/src/http2.zig" \
   "-femit-bin=$OUT"
 
+# Lock released by stale-reclaim: exec keeps this pid for the whole run.
+. "$ROOT/tools/bench_lock.sh"
+bench_lock
 exec "$OUT" "$@"

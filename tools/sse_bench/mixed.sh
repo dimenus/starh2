@@ -16,6 +16,7 @@
 set -u
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
+. "$REPO/tools/bench_lock.sh"
 STREAMS=${STREAMS:-32}
 SECONDS_RUN=${SECONDS_RUN:-5}
 INTERVAL=${INTERVAL:-10}
@@ -53,6 +54,7 @@ MIGRATION_ARGS=
 if [ "${STARH2_TASK_MIGRATION:-0}" != 0 ]; then
   MIGRATION_ARGS=--task-migration
 fi
+bench_lock
 "$STARH2" --mode tls --port 19450 --sse-interval-ms "$INTERVAL" \
   --executors "$STARH2_EXECUTORS" $MIGRATION_ARGS $TRACE_ARGS > "$OUT/starh2.log" 2>&1 &
 S_PID=$!
@@ -64,6 +66,7 @@ sleep 2
 cleanup() {
   kill $S_PID $G_PID 2>/dev/null
   wait 2>/dev/null
+  bench_unlock
 }
 trap cleanup EXIT INT TERM
 

@@ -14,6 +14,7 @@ OUT=${OUT:-/tmp/starh2-sse-bench}
 STARH2_EXECUTORS=${STARH2_EXECUTORS:-2}
 REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 cd "$REPO"
+. "$REPO/tools/bench_lock.sh"
 # Install to a known prefix and use THAT path. Picking the newest binary in
 # .zig-cache by mtime measures whatever the last build step happened to write:
 # after `zig build ci`, that is an example at a different optimize level, and
@@ -22,6 +23,7 @@ cd "$REPO"
 ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 [ -x "$OUT/sse-client" ] || { echo "run tools/sse_bench/run.sh first to build the client" >&2; exit 1; }
+bench_lock
 "$STARH2" --mode tls --port 19448 --sse-interval-ms 1 --executors "$STARH2_EXECUTORS" --trace --trace-every 256 > /tmp/tr-server.log 2>&1 &
 S_PID=$!
 sleep 2
@@ -95,3 +97,4 @@ run_phase "starh2 c8" 8
 
 kill $S_PID 2>/dev/null
 wait 2>/dev/null
+bench_unlock

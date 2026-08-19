@@ -37,6 +37,10 @@ if [ ! -x "$opponent" ]; then
   exit 1
 fi
 
+# The lock is released by stale-reclaim: exec keeps this pid alive for
+# the whole bench, and the next locker reclaims when it exits.
+. "$REPO/tools/bench_lock.sh"
+bench_lock
 exec "$REPO/zb" build bench -Doptimize=ReleaseFast -- \
   --opponent "$opponent" \
   --opponent-name "http2.zig tls" \
