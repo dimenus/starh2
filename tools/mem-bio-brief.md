@@ -11,8 +11,21 @@ The zio author reviewed the starh2 branch directly (zio#685 thread,
 that", and: with a libssl-compatible API, "you are best using memory BIO
 and then zio directly" — or move blocking socket reads to a separate task
 posting to a queue, with one task consuming a shared queue to decrypt/
-handle or encrypt/write. His nats.zig (github.com/lalinsky/nats.zig) runs
-TLS from two tasks; READ IT FIRST as prior art.
+handle or encrypt/write. His nats.zig runs TLS from two tasks; READ IT
+FIRST as prior art — a local clone is at ~/Source/oss/nats.zig
+(src/connection.zig, the TlsRuntime comment near line 268, readerLoop /
+flusherLoop near line 1675).
+
+Read it for the TASK TOPOLOGY and the test discipline, not as a template:
+nats.zig implements the OTHER alternative — it splits a tls.zig
+`tls.nonblock.Connection` into an encrypt copy and a decrypt copy, one per
+task, lock-free, because the two halves of that cipher are disjoint state
+(pinned by a KeyUpdate round-trip test). That split does not transfer to
+BoringSSL: an SSL object cannot be split. This brief builds design (a),
+memory BIOs with a single SSL owner; the split-cipher design is recorded
+on t-843 as the candidate NEXT step if grading shows crypto serialization
+on the pump is the remaining residue. KeyUpdate needs no cross-task signal
+in design (a) — the single owner handles it internally.
 
 Phase-0 evidence at 8ac7c94 (nachos, observe build, 800k requests,
 migration-on, /tmp/p0-trace.json): pump_select 0.5557/req,
