@@ -39,7 +39,8 @@ fi
 
 mkdir -p "$OUT/logs" "$OUT/bin"
 ROWS="$OUT/rows.tsv"
-: > "$ROWS"
+# Truncated under the bench lock below, not here: a second instance must
+# block on the lock BEFORE it can destroy an in-flight table.
 
 sha256_file() {
   f=$1
@@ -59,8 +60,20 @@ load1() {
 }
 
 darwin_loaded() {
+  # Bounded settle-wait, not a snapshot: a saturating row raises the 1-min
+  # load that the NEXT row's gate reads, so a snapshot gate blocks every row
+  # after the first on the matrix's own wake. Wait for the wake to decay
+  # (bounded by PERF_STORY_SETTLE_S) and only then call the box loaded.
   [ "$OS" = Darwin ] || return 1
-  awk -v l="$(load1)" -v m="${PERF_STORY_LOAD_MAX:-2.0}" 'BEGIN { exit (l + 0 > m + 0) ? 0 : 1 }'
+  settle_deadline=$(( $(date +%s) + ${PERF_STORY_SETTLE_S:-300} ))
+  while awk -v l="$(load1)" -v m="${PERF_STORY_LOAD_MAX:-2.0}" 'BEGIN { exit (l + 0 > m + 0) ? 0 : 1 }'; do
+    if [ "$(date +%s)" -ge "$settle_deadline" ]; then
+      return 0
+    fi
+    echo "settle: load $(load1) > ${PERF_STORY_LOAD_MAX:-2.0}, waiting" >&2
+    sleep 15
+  done
+  return 1
 }
 
 write_log_header() {
@@ -196,20 +209,7 @@ fi
 # Nested harnesses (mixed.sh, run.sh) see BENCH_LOCK_HELD and skip.
 . "$(cd "$(dirname "$0")" && pwd -P)/bench_lock.sh"
 bench_lock
-
-# The build phase raises the 1-min load the row gate then reads, so a matrix
-# on a borderline box blocks every row on its own wake. Wait for the load to
-# settle below the gate before the first row, bounded so a genuinely busy box
-# still reports BLOCKED-LOADED instead of parking forever.
-settle_deadline=$(( $(date +%s) + ${PERF_STORY_SETTLE_S:-300} ))
-while awk -v l="$(load1)" -v m="${PERF_STORY_LOAD_MAX:-2.0}" 'BEGIN { exit (l + 0 > m + 0) ? 0 : 1 }'; do
-  if [ "$(date +%s)" -ge "$settle_deadline" ]; then
-    echo "settle: gave up waiting for load <= ${PERF_STORY_LOAD_MAX:-2.0} (now $(load1))"
-    break
-  fi
-  echo "settle: load $(load1) > ${PERF_STORY_LOAD_MAX:-2.0}, waiting"
-  sleep 15
-done
+: > "$ROWS"
 
 bench_row_status() {
   log=$1
