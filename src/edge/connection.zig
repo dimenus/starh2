@@ -2339,9 +2339,9 @@ const Connection = struct {
             h2c_started = true;
         }
 
-        // Leftover TLS plaintext (a pipelined preface) may already have
-        // DISPATCHED a handler. That handler emits through `session_mu`, so
-        // draining intents here holds the same lock.
+        // Leftover TLS plaintext (a pipelined preface) was ingested during
+        // handshake. Emit after TlsPump is live so queueWire cannot park on
+        // a work queue CipherRead already filled.
         {
             self.lockSessionUncancelable(io);
             defer self.unlockSession(io);
@@ -2634,7 +2634,9 @@ const Connection = struct {
             self.lockSessionUncancelable(self.config.io);
             defer self.unlockSession(self.config.io);
             try self.session.ingest(buf[0..n]);
-            try self.processIntents();
+            // Do not processIntents/queueWire here: TlsPump is not running
+            // yet. CipherRead can fill tls_work_ch, and a blocking putOne
+            // would wait forever. Ingest only; emit after the pump starts.
             if (self.session.terminal != .none) return error.ConnectionClosed;
         }
     }
