@@ -47,6 +47,7 @@ tools/oneshot-phase-trace.sh    # packing + alloc oracle; exits 9 if records/res
 tools/sse_bench/run.sh          # concurrent SSE against Go net/http
 tools/sse_bench/mixed.sh        # SSE + oneshot on one TLS connection; STALL=0 skips the blocked reader
 tools/sse_bench/phase-trace.sh  # where one flushed event spends its time
+tools/perf-story.sh             # the whole two-OS characterization matrix in one run
 ```
 
 ## Gates
