@@ -47,8 +47,14 @@ TRACE_ARGS=
 if [ "${TRACE:-0}" != 0 ]; then
   TRACE_ARGS=--trace
 fi
+# STARH2_TASK_MIGRATION=1 turns zio task migration on. The server default is
+# off, so every historical row of this harness is a migration-off row.
+MIGRATION_ARGS=
+if [ "${STARH2_TASK_MIGRATION:-0}" != 0 ]; then
+  MIGRATION_ARGS=--task-migration
+fi
 "$STARH2" --mode tls --port 19450 --sse-interval-ms "$INTERVAL" \
-  --executors "$STARH2_EXECUTORS" $TRACE_ARGS > "$OUT/starh2.log" 2>&1 &
+  --executors "$STARH2_EXECUTORS" $MIGRATION_ARGS $TRACE_ARGS > "$OUT/starh2.log" 2>&1 &
 S_PID=$!
 "$OUT/sse-server" -port 19451 -sse-interval-ms "$INTERVAL" \
   -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
