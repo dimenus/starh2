@@ -512,32 +512,32 @@ pub const Pump = struct {
         return out;
     }
 
+    /// True when the kernel already has a TCP byte. ioctl FIONREAD is a
+    /// count, not posix.poll, and does not consume. The fill itself stays on
+    /// zio NetRecv (`peekGreedy`) so the EV_CLEAR drain-to-EAGAIN contract
+    /// holds. A MSG_DONTWAIT recvfrom beside that path consumed the edge and
+    /// hung tls-smoke `/big` (WINDOW_UPDATE parked waitPeek).
+    fn kernelHasTcpByte(fd: std.posix.fd_t) bool {
+        const req: c_int = switch (@import("builtin").os.tag) {
+            .linux => @intCast(std.os.linux.T.FIONREAD),
+            .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .dragonfly, .netbsd, .openbsd => 0x4004667f,
+            else => return false,
+        };
+        var avail: c_int = 0;
+        if (std.c.ioctl(fd, req, &avail) < 0) return false;
+        return avail > 0;
+    }
+
     /// Pull kernel bytes into the TCP reader without parking. `std.Io.Reader`
     /// has no try-fill and `netRead` waits, which is why a quiet turn used to
     /// Select just to discover a byte already in the kernel (phase 1: 98.5% of
     /// oneshot-only Selects were peek-wins). BIO_read only sees `buffered()`.
-    /// MSG_DONTWAIT keeps this off the wait path even if the fd is blocking.
     /// Parked wait stays a two-arm Select.
     fn tryFillTcp(self: *Pump) bool {
         const r = &self.conn.tcp_reader.interface;
         if (r.bufferedLen() > 0) return true;
-        r.rebase(1) catch return false;
-        const dest = r.buffer[r.end..];
-        if (dest.len == 0) return false;
-        const rc = std.posix.system.recvfrom(
-            self.conn.tcp_stream.socket.handle,
-            dest.ptr,
-            dest.len,
-            std.posix.MSG.DONTWAIT,
-            null,
-            null,
-        );
-        const n: usize = switch (std.posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            else => return false,
-        };
-        if (n == 0) return false;
-        r.end += n;
+        if (!kernelHasTcpByte(self.conn.tcp_stream.socket.handle)) return false;
+        _ = r.peekGreedy(1) catch return false;
         return true;
     }
 
