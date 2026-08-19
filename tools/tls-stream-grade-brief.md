@@ -13,7 +13,7 @@ Always prefix the remote shell with `export PATH=$HOME/.local/bin:$PATH`.
 
 ```sh
 ssh ryan@nachos.trex-elevator.ts.net 'export PATH=$HOME/.local/bin:$PATH
-hostname
+uname -n
 git -C ~/src/starh2-t843 rev-parse --short HEAD   # must be f7c41e2
 git -C ~/src/starh2-base rev-parse --short HEAD   # must be 55835a4
 ~/.zvm/bin/zig version                            # must be 0.16.0
@@ -58,28 +58,33 @@ Arm order is A-B-A so drift is visible: **t843, base, t843 again.**
 mkdir -p /tmp/t843-grade   # on nachos
 # run 1 (and run 3, with mixed-t843-2):
 ssh ryan@nachos.trex-elevator.ts.net 'export PATH=$HOME/.local/bin:$PATH
-hostname; uptime
-cd ~/src/starh2-t843 && STREAMS=32 INTERVAL=10 SECONDS_RUN=5 WARMUP=1 \
-  ONESHOT_WORKERS=8 STARH2_EXECUTORS=2 ROUNDS=3 OUT=/tmp/t843-grade/mixed-t843-1 \
-  tools/sse_bench/mixed.sh 2>&1 | tee /tmp/t843-grade/mixed-t843-1.log'
+{ uname -n; uptime
+  cd ~/src/starh2-t843 && STREAMS=32 INTERVAL=10 SECONDS_RUN=5 WARMUP=1 \
+    ONESHOT_WORKERS=8 STARH2_EXECUTORS=2 ROUNDS=3 OUT=/tmp/t843-grade/mixed-t843-1 \
+    tools/sse_bench/mixed.sh; } 2>&1 | tee /tmp/t843-grade/mixed-t843-1.log'
 # run 2:
 ssh ryan@nachos.trex-elevator.ts.net 'export PATH=$HOME/.local/bin:$PATH
-hostname; uptime
-cd ~/src/starh2-base && STREAMS=32 INTERVAL=10 SECONDS_RUN=5 WARMUP=1 \
-  ONESHOT_WORKERS=8 STARH2_EXECUTORS=2 ROUNDS=3 OUT=/tmp/t843-grade/mixed-base-1 \
-  tools/sse_bench/mixed.sh 2>&1 | tee /tmp/t843-grade/mixed-base-1.log'
+{ uname -n; uptime
+  cd ~/src/starh2-base && STREAMS=32 INTERVAL=10 SECONDS_RUN=5 WARMUP=1 \
+    ONESHOT_WORKERS=8 STARH2_EXECUTORS=2 ROUNDS=3 OUT=/tmp/t843-grade/mixed-base-1 \
+    tools/sse_bench/mixed.sh; } 2>&1 | tee /tmp/t843-grade/mixed-base-1.log'
 ```
 
-The first line of every log must be `nachos`. A log whose first line is not
-`nachos` is a run on the wrong machine and is discarded.
+The `{ ...; } 2>&1 | tee` wrap is deliberate: it puts `uname -n` INSIDE the
+logged stream. The first line of every log must be `nachos` (the box has no
+`hostname` binary). A log whose first line is not `nachos` is a run on the
+wrong machine and is discarded.
 
-Then the packing oracle, t843 arm only:
+Then the packing oracle, t843 arm only. No pipe here, on purpose: a pipe
+would make `$?` report `tee`'s exit instead of the gate's. The script's
+output goes to the log by redirect, and the exit code is read directly:
 
 ```sh
 ssh ryan@nachos.trex-elevator.ts.net 'export PATH=$HOME/.local/bin:$PATH
-hostname
-cd ~/src/starh2-t843 && tools/oneshot-phase-trace.sh 2>&1 | tee /tmp/t843-grade/phase-trace.log
-echo PHASE_TRACE_EXIT=$?'
+uname -n > /tmp/t843-grade/phase-trace.log
+cd ~/src/starh2-t843 && tools/oneshot-phase-trace.sh >> /tmp/t843-grade/phase-trace.log 2>&1
+echo PHASE_TRACE_EXIT=$?
+tail -20 /tmp/t843-grade/phase-trace.log'
 ```
 
 The exit code line is part of the report. Exit 9 means the packing gate
