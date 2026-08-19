@@ -3,9 +3,12 @@
 //! The SSL object has exactly one owner (`Pump`). Its BIOs are a bounded
 //! `BIO_new_bio_pair`, not socket-coupled callbacks: ciphertext bytes move
 //! through a queue, not through a readiness edge. A dedicated `CipherRead`
-//! task does blocking zio socket reads and posts chunks to that queue. The
-//! pump waits on that one queue (`getOne`) for both inbound ciphertext and
-//! outbound plaintext — no `std.Io.Select`.
+//! task does blocking zio socket reads and posts chunks to the cipher
+//! queue. Outbound frames use `write_ch`. The pump `tryGet`s both, then
+//! waits on `wake` — no `std.Io.Select`. It must service both sides every
+//! turn: writes-only would starve oneshot HEADERS under live SSE, and a
+//! `continue` past a blocked cipher ingest would skip SETTINGS still on
+//! `write_ch` while the actor is parked on `putOne`.
 //!
 //! Socket writes stay on the pump. A third write task would add a hop on the
 //! SSE event path (handler → scheduler → pump SSL_write → socket), which the
@@ -205,8 +208,10 @@ pub const CipherChunk = struct {
     pool_index: u32 = 0,
 };
 
-/// The pump's one queue. `CipherRead` posts `.cipher` / `.eof`; `queueWire`
-/// posts `.wire`. One `getOne` replaces the two-arm Select.
+/// Cipher-queue item. `CipherRead` posts `.cipher` / `.eof`. Outbound
+/// frames go on `write_ch`, not here: a unified FIFO HOL-blocked writes
+/// behind inbound (oneshot-only rps=0). `.wire` remains so fail-drain
+/// and tests can still name the variant.
 pub const PumpWork = union(enum) {
     cipher: CipherChunk,
     wire: wire_pump.WireChunk,
@@ -671,8 +676,10 @@ pub const Pump = struct {
     const Feed = enum { done, blocked, eof };
 
     /// Write ciphertext into the pair. `consumed` is updated on every path.
-    /// `.blocked` means inbound is full and `pending_read` already holds a
-    /// plaintext chunk the actor has not taken — caller must stash the rest.
+    /// `.blocked` means inbound cannot make progress (pending plaintext the
+    /// actor has not taken, or no read-pool index). Caller must stash the
+    /// rest and service `write_ch` — spinning here to MaxHandshakeIterations
+    /// failDrains the connection while SETTINGS still sit on the write queue.
     fn feedCipher(self: *Pump, bytes: []const u8, consumed: *usize) Feed {
         consumed.* = 0;
         var spins: u32 = 0;
@@ -691,6 +698,7 @@ pub const Pump = struct {
                         .ok => {
                             if (self.pending_read != null) return .blocked;
                         },
+                        .stuck => return .blocked,
                         .want => {},
                     }
                     if (!self.drainToSocket()) return .eof;
@@ -712,6 +720,13 @@ pub const Pump = struct {
         return .done;
     }
 
+    fn stealWrite(self: *Pump) void {
+        if (self.carried != null) return;
+        const chunk = io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io) orelse return;
+        pump_trace.bump(&pump_trace.tryget_write);
+        self.carried = chunk;
+    }
+
     fn sslWriteAll(self: *Pump, bytes: []const u8) bool {
         var off: usize = 0;
         var spins: u32 = 0;
@@ -728,8 +743,19 @@ pub const Pump = struct {
                     continue;
                 },
                 error.WantRead => {
-                    if (!self.consumeInbound()) return false;
-                    continue;
+                    switch (self.readOne()) {
+                        .eof => return false,
+                        .ok => continue,
+                        .stuck => {
+                            self.stealWrite();
+                            self.io.sleep(.zero, .awake) catch {};
+                            continue;
+                        },
+                        .want => {
+                            if (!self.consumeInbound()) return false;
+                            continue;
+                        },
+                    }
                 },
                 else => {
                     self.failDrain();
@@ -747,20 +773,27 @@ pub const Pump = struct {
         return true;
     }
 
-    /// SSL_write wanted inbound records. Only the cipher queue; a .wire
-    /// behind ciphertext on a unified FIFO was the oneshot-0 HOL.
+    /// SSL_write wanted inbound records. Cipher queue only. Never park on
+    /// `getOne`: the actor may be in `write_ch.putOne` and CipherRead may need
+    /// this executor. A miss yields; `sslWriteAll` retries until a chunk
+    /// arrives or MaxHandshakeIterations failDrains.
     fn consumeInbound(self: *Pump) bool {
         if (self.pending_cipher) |chunk| {
             self.pending_cipher = null;
             return self.ingestCipher(chunk);
         }
-        const item = io_queue.tryGet(PumpWork, self.work, self.io) orelse
-            self.work.getOne(self.io) catch {
-                self.failDrain();
-                self.post(.{ .shutdown = true });
-                return false;
-            };
-        pump_trace.bump(&pump_trace.work_get);
+        if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
+            pump_trace.bump(&pump_trace.work_get);
+            return self.ingestWork(item);
+        }
+        self.stealWrite();
+        self.io.sleep(.zero, .awake) catch {};
+        return true;
+    }
+
+    /// Cipher-queue item while SSL_write wants a record. Never SSL_write here
+    /// (OpenSSL rejects a different buffer until the current SSL_write retries).
+    fn ingestWork(self: *Pump, item: PumpWork) bool {
         switch (item) {
             .cipher => |chunk| return self.ingestCipher(chunk),
             .wire => |chunk| {
@@ -849,11 +882,11 @@ pub const Pump = struct {
         return true;
     }
 
-    const ReadOutcome = enum { ok, eof, want };
+    const ReadOutcome = enum { ok, eof, want, stuck };
 
     fn readOne(self: *Pump) ReadOutcome {
         pump_trace.bump(&pump_trace.read_one);
-        if (self.pending_read != null) return .ok;
+        if (self.pending_read != null) return .stuck;
         const chunk_size = limits_mod.WIRE_CHUNK_SIZE;
         // Never park on the actor's queues. TlsPump is the only writer, so a
         // blocking getOne(read_free) / putOne(read_ch) deadlocks mixed SSE:
@@ -861,7 +894,7 @@ pub const Pump = struct {
         const idx = io_queue.tryGet(u32, self.read_free, self.io) orelse {
             pump_trace.bump(&pump_trace.read_free_empty_yield);
             self.io.sleep(.zero, .awake) catch {};
-            return .ok;
+            return .stuck;
         };
         const off = @as(usize, idx) * chunk_size;
         const buf = self.chunk_storage[off..][0..chunk_size];
@@ -935,7 +968,7 @@ pub const Pump = struct {
         if (self.pending_read != null) return true;
         switch (self.readOne()) {
             .eof => return false,
-            .ok, .want => return true,
+            .ok, .want, .stuck => return true,
         }
     }
 
@@ -945,40 +978,54 @@ pub const Pump = struct {
         self.conn.bindWriter(self.io);
         while (!self.stopped.load(.acquire)) {
             pump_trace.bump(&pump_trace.turns);
+            var progress = false;
+
             if (self.carried) |chunk| {
                 self.carried = null;
                 if (!self.writeChunks(chunk)) return;
-                continue;
+                progress = true;
             }
+
             if (self.pending_read) |chunk| {
                 if (io_queue.tryPut(wire_pump.WireChunk, self.to_actor, self.io, chunk)) {
                     self.pending_read = null;
                     self.actor_wake.set(self.io);
+                    progress = true;
                 }
             }
-            if (self.pending_cipher) |chunk| {
+
+            // Ingest cipher only when SSL_read can store plaintext. Otherwise
+            // fall through and take writes: the actor may be parked on putOne
+            // of the SETTINGS that unstick the client.
+            if (self.pending_cipher != null and self.pending_read == null) {
+                const chunk = self.pending_cipher.?;
                 self.pending_cipher = null;
                 if (!self.ingestCipher(chunk)) return;
-                continue;
+                progress = true;
             }
+
             if (self.pending_read == null and self.conn.pendingPlaintext() > 0) {
                 switch (self.readOne()) {
                     .eof => return,
-                    .ok => continue,
-                    .want => {},
+                    .ok => progress = true,
+                    .want, .stuck => {},
                 }
             }
 
             if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
                 pump_trace.bump(&pump_trace.tryget_write);
                 if (!self.writeChunks(chunk)) return;
-                continue;
+                progress = true;
             }
-            if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
-                pump_trace.bump(&pump_trace.work_get);
-                if (!self.dispatch(item)) return;
-                continue;
+            if (self.pending_cipher == null) {
+                if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
+                    pump_trace.bump(&pump_trace.work_get);
+                    if (!self.dispatch(item)) return;
+                    progress = true;
+                }
             }
+
+            if (progress) continue;
 
             self.wake.reset();
             if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
@@ -986,12 +1033,14 @@ pub const Pump = struct {
                 if (!self.writeChunks(chunk)) return;
                 continue;
             }
-            if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
-                pump_trace.bump(&pump_trace.work_get);
-                if (!self.dispatch(item)) return;
-                continue;
+            if (self.pending_cipher == null) {
+                if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
+                    pump_trace.bump(&pump_trace.work_get);
+                    if (!self.dispatch(item)) return;
+                    continue;
+                }
             }
-            if (self.pending_read != null) {
+            if (self.pending_read != null or self.pending_cipher != null) {
                 pump_trace.bump(&pump_trace.pending_read_retry);
                 self.io.sleep(.zero, .awake) catch {};
                 continue;
@@ -1048,7 +1097,7 @@ test "pump_trace moves on read_free-empty yield" {
 
     const y0 = pump_trace.read_free_empty_yield.load(.acquire);
     const r0 = pump_trace.read_one.load(.acquire);
-    try std.testing.expectEqual(Pump.ReadOutcome.ok, pump.readOne());
+    try std.testing.expectEqual(Pump.ReadOutcome.stuck, pump.readOne());
     if (comptime observe) {
         try std.testing.expect(pump_trace.read_one.load(.acquire) >= r0 + 1);
         try std.testing.expect(pump_trace.read_free_empty_yield.load(.acquire) >= y0 + 1);

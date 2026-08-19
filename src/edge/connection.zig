@@ -15,8 +15,8 @@
 //! | `CipherRead`   | 0..1  | TLS: blocking socket READ of ciphertext.      |
 //! |                |       | Never touches the SSL object.                 |
 //! | `TlsPump`      | 0..1  | TLS: sole SSL_read/SSL_write owner; socket    |
-//! |                |       | WRITE of ciphertext. One work queue, no       |
-//! |                |       | Select. Flush is SSL_write + BIO_read.        |
+//! |                |       | WRITE of ciphertext. Cipher queue + write_ch, |
+//! |                |       | no Select. Flush is SSL_write + BIO_read.     |
 //! | handler        | 0..N  | arena + request/response. Task handlers spawn; |
 //! |                |       | complete oneshots run on the actor, still     |
 //! |                |       | emit through WritePump. SSE always spawns.    |
@@ -3755,6 +3755,7 @@ const Connection = struct {
             }
             return error.WriteFailed;
         }
+        if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
         self.write_ch.putOne(self.config.io, chunk) catch return error.WriteFailed;
         if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
     }
@@ -3871,7 +3872,7 @@ const Connection = struct {
     /// the `FairScheduler` sink; `test_queue_wire_bypass` proves it.
     ///
     /// HTTP/2 bytes are always plaintext here. h2c copies them into a WritePump
-    /// chunk; TLS hands the same chunk to TlsPump as a `.wire` work item, whose
+    /// chunk; TLS hands the same chunk to TlsPump on `write_ch`, whose
     /// SSL_write + BIO_read is the pump's flush. The cipher is not on this path
     /// and is not covered by `session_mu`.
     ///
