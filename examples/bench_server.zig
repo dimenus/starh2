@@ -192,7 +192,7 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         sites_buf[sites_len] = ']';
         sites_len += 1;
     }
-    var buf: [5120]u8 = undefined;
+    var buf: [6144]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.print(
         "{{\"samples\":{d},\"block_ns\":{d},\"hold_ns\":{d},\"ack_ns\":{d},\"resume_ns\":{d}," ++
@@ -309,9 +309,13 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
     try w.print(
         "\"allocs\":{d},\"alloc_bytes\":{d},\"alloc_ns\":{d}," ++
             "\"frees\":{d},\"free_bytes\":{d},\"free_ns\":{d}," ++
-            "\"alloc_overflow\":{d},\"sites\":{s}}}\n",
+            "\"alloc_overflow\":{d},\"sites\":{s}",
         .{ allocs, alloc_bytes, alloc_ns, frees, free_bytes, free_ns, overflow, sites_buf[0..sites_len] },
     );
+    if (comptime starh2.edge.tls_edge.observe) {
+        try starh2.edge.tls_edge.pump_trace.writeJson(&w);
+    }
+    try w.writeAll("}\n");
     try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
 }
 

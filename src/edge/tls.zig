@@ -14,6 +14,66 @@ const io_queue = @import("io_queue.zig");
 const tls_async = @import("tls_async.zig");
 const wire_pump = @import("wire_pump.zig");
 
+/// Same gate as `connection.test_observe`: Debug (the suite) and
+/// `-Dobserve=true` ReleaseFast. Plain ReleaseFast compiles the increments
+/// and the `STARH2_PUMPTRACE` print path out.
+pub const observe = @import("build_options").observe;
+
+/// Quiet-turn counters for TlsPump. Process-global like `test_observed_*`
+/// so `/trace` can read them without a pump pointer. One TLS connection is
+/// the bench shape; overlapping pumps would share the totals.
+pub const pump_trace = struct {
+    pub var turns: std.atomic.Value(u64) = .init(0);
+    pub var select: std.atomic.Value(u64) = .init(0);
+    pub var select_write: std.atomic.Value(u64) = .init(0);
+    pub var select_peek: std.atomic.Value(u64) = .init(0);
+    pub var tryget_write: std.atomic.Value(u64) = .init(0);
+    pub var read_one: std.atomic.Value(u64) = .init(0);
+    pub var want_read: std.atomic.Value(u64) = .init(0);
+    pub var read_free_empty_yield: std.atomic.Value(u64) = .init(0);
+    pub var live_handler_yield: std.atomic.Value(u64) = .init(0);
+    pub var pending_read_retry: std.atomic.Value(u64) = .init(0);
+    pub var write_chunks: std.atomic.Value(u64) = .init(0);
+    pub var write_chunk_sum: std.atomic.Value(u64) = .init(0);
+
+    inline fn bump(counter: *std.atomic.Value(u64)) void {
+        if (comptime observe) _ = counter.fetchAdd(1, .monotonic);
+    }
+
+    inline fn add(counter: *std.atomic.Value(u64), n: u64) void {
+        if (comptime observe) _ = counter.fetchAdd(n, .monotonic);
+    }
+
+    /// Extra `/trace` fields. The `STARH2_PUMPTRACE` token is the strings
+    /// canary: present in `-Dobserve=true`, absent from plain ReleaseFast.
+    pub fn writeJson(w: *std.Io.Writer) !void {
+        if (comptime !observe) return;
+        try w.print(
+            ",\"STARH2_PUMPTRACE\":1," ++
+                "\"pump_turns\":{d},\"pump_select\":{d}," ++
+                "\"pump_select_write\":{d},\"pump_select_peek\":{d}," ++
+                "\"pump_tryget_write\":{d},\"pump_read_one\":{d}," ++
+                "\"pump_want_read\":{d},\"pump_read_free_yield\":{d}," ++
+                "\"pump_live_handler_yield\":{d},\"pump_pending_read_retry\":{d}," ++
+                "\"pump_write_chunks\":{d},\"pump_write_chunk_sum\":{d}",
+            .{
+                turns.load(.acquire),
+                select.load(.acquire),
+                select_write.load(.acquire),
+                select_peek.load(.acquire),
+                tryget_write.load(.acquire),
+                read_one.load(.acquire),
+                want_read.load(.acquire),
+                read_free_empty_yield.load(.acquire),
+                live_handler_yield.load(.acquire),
+                pending_read_retry.load(.acquire),
+                write_chunks.load(.acquire),
+                write_chunk_sum.load(.acquire),
+            },
+        );
+    }
+};
+
 pub const alpn_h2 = "h2";
 pub const stream_buffer_size: usize = tls_async.BioStreamBufferSize;
 
@@ -268,6 +328,8 @@ pub const Pump = struct {
     fn writeChunks(self: *Pump, writer: *std.Io.Writer, first: wire_pump.WireChunk) bool {
         if (first.len == 0 and first.bytes.len == 0) {
             if (first.flush_barrier) {
+                pump_trace.bump(&pump_trace.write_chunks);
+                pump_trace.add(&pump_trace.write_chunk_sum, 1);
                 writer.flush() catch {
                     self.releaseChunk(first, false, false);
                     self.failDrain();
@@ -313,6 +375,8 @@ pub const Pump = struct {
             self.post(.{ .shutdown = true });
             return false;
         }
+        pump_trace.bump(&pump_trace.write_chunks);
+        pump_trace.add(&pump_trace.write_chunk_sum, count);
         for (chunks[0..count], 0..) |chunk, i| {
             slices[i] = chunk.bytes[0..chunk.len];
         }
@@ -341,18 +405,25 @@ pub const Pump = struct {
     const ReadOutcome = enum { ok, eof, want };
 
     fn readOne(self: *Pump) ReadOutcome {
+        pump_trace.bump(&pump_trace.read_one);
         const chunk_size = limits_mod.WIRE_CHUNK_SIZE;
         // Never park on the actor's queues. TlsPump is the only writer, so a
         // blocking getOne(read_free) / putOne(read_ch) deadlocks mixed SSE:
         // the actor fills write_ch while we wait here, then both sides wait.
         const idx = io_queue.tryGet(u32, self.read_free, self.io) orelse {
+            pump_trace.bump(&pump_trace.read_free_empty_yield);
             self.io.sleep(.zero, .awake) catch {};
             return .ok;
         };
         const off = @as(usize, idx) * chunk_size;
         const buf = self.chunk_storage[off..][0..chunk_size];
         const n = self.conn.tls_stream.read(buf) catch |err| switch (err) {
-            error.WantRead, error.WantWrite => {
+            error.WantRead => {
+                pump_trace.bump(&pump_trace.want_read);
+                self.returnReadIndex(idx);
+                return .want;
+            },
+            error.WantWrite => {
                 self.returnReadIndex(idx);
                 return .want;
             },
@@ -382,6 +453,7 @@ pub const Pump = struct {
         }
         self.actor_wake.set(self.io);
         if (self.live_task_handlers.load(.acquire) > 0) {
+            pump_trace.bump(&pump_trace.live_handler_yield);
             self.io.sleep(.zero, .awake) catch {};
         }
         return .ok;
@@ -441,6 +513,7 @@ pub const Pump = struct {
     pub fn run(self: *Pump) void {
         const writer = self.conn.writer();
         while (!self.stopped.load(.acquire)) {
+            pump_trace.bump(&pump_trace.turns);
             if (self.carried) |chunk| {
                 self.carried = null;
                 if (!self.writeChunks(writer, chunk)) return;
@@ -452,14 +525,17 @@ pub const Pump = struct {
                     self.actor_wake.set(self.io);
                 } else {
                     if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |w| {
+                        pump_trace.bump(&pump_trace.tryget_write);
                         if (!self.writeChunks(writer, w)) return;
                     } else {
+                        pump_trace.bump(&pump_trace.pending_read_retry);
                         self.io.sleep(.zero, .awake) catch {};
                     }
                     continue;
                 }
             }
             if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
+                pump_trace.bump(&pump_trace.tryget_write);
                 if (!self.writeChunks(writer, chunk)) return;
                 continue;
             }
@@ -473,6 +549,7 @@ pub const Pump = struct {
                 }
             }
 
+            pump_trace.bump(&pump_trace.select);
             var result_buf: [2]Wait = undefined;
             var select = std.Io.Select(Wait).init(self.io, &result_buf);
             select.concurrent(.write, waitWrite, .{ self.from_actor, self.io }) catch {
@@ -501,6 +578,7 @@ pub const Pump = struct {
             // chunk is still preferred so SSE is not parked behind SSL_read.
             switch (selected) {
                 .write => {
+                    pump_trace.bump(&pump_trace.select_write);
                     if (out.write_closed and out.write == null) {
                         self.failDrain();
                         self.post(.{ .fail_all = true, .shutdown = true });
@@ -511,6 +589,7 @@ pub const Pump = struct {
                     }
                 },
                 .peek => {
+                    pump_trace.bump(&pump_trace.select_peek);
                     if (out.write) |chunk| {
                         if (!self.writeChunks(writer, chunk)) return;
                     }
@@ -545,4 +624,20 @@ test "h2 ALPN matcher" {
     try std.testing.expect(isHttp2Alpn("h2"));
     try std.testing.expect(!isHttp2Alpn("http/1.1"));
     try std.testing.expect(!isHttp2Alpn(null));
+}
+
+test "pump_trace moves on read_free-empty yield" {
+    var free_storage: [1]u32 = undefined;
+    var read_free = std.Io.Queue(u32).init(&free_storage);
+    var pump: Pump = undefined;
+    pump.io = std.testing.io;
+    pump.read_free = &read_free;
+
+    const y0 = pump_trace.read_free_empty_yield.load(.acquire);
+    const r0 = pump_trace.read_one.load(.acquire);
+    try std.testing.expectEqual(Pump.ReadOutcome.ok, pump.readOne());
+    if (comptime observe) {
+        try std.testing.expect(pump_trace.read_one.load(.acquire) >= r0 + 1);
+        try std.testing.expect(pump_trace.read_free_empty_yield.load(.acquire) >= y0 + 1);
+    }
 }
