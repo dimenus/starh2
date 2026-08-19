@@ -190,6 +190,17 @@ if [ -d "$NEW_ROOT/tools/sse_bench" ]; then
    go build -o "$OUT/sse-client" ./client.go)
 fi
 
+bench_row_status() {
+  log=$1
+  if grep -q 'CLIENT-LIMITED' "$log"; then
+    echo CLIENT-LIMITED
+  elif grep -q '^exit: 0$' "$log"; then
+    echo ok
+  else
+    echo FAIL
+  fi
+}
+
 packed() {
   arm=$1
   root=$2
@@ -199,11 +210,9 @@ packed() {
   log="$OUT/logs/${name}-${arm}.log"
   cmd="cd $root && ./zb build bench -Doptimize=ReleaseFast -- -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS"
   if skip_or_run "$name" "$arm" "$sum" "$cmd" "$log"; then
-    if run_logged "$log" sh -c "CDPATH= cd -- \"$root\" && ./zb build bench -Doptimize=ReleaseFast -- -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS"; then
-      emit_row "$name" "$arm" "ok" "see log" "$log" "$sum"
-    else
-      emit_row "$name" "$arm" "FAIL" "bench exit non-zero" "$log" "$sum"
-    fi
+    run_logged "$log" sh -c "CDPATH= cd -- \"$root\" && ./zb build bench -Doptimize=ReleaseFast -- -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS" || true
+    st=$(bench_row_status "$log")
+    emit_row "$name" "$arm" "$st" "see log" "$log" "$sum"
   fi
 }
 
@@ -222,14 +231,12 @@ if [ -n "$HENDRIK_ROOT" ] && [ -f "$HENDRIK_ROOT/build.zig" ]; then
   log="$OUT/logs/${name}.log"
   cmd="HENDRIK_ROOT=$HENDRIK_ROOT $NEW_ROOT/tools/bench-hendrik.sh -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS"
   if skip_or_run "$name" "http2.zig" "pending" "$cmd" "$log"; then
-    if run_logged "$log" env HENDRIK_ROOT="$HENDRIK_ROOT" OUT="$OUT/hendrik" "$NEW_ROOT/tools/bench-hendrik.sh" -n "$N" -c "$H2LOAD_C" -m "$H2LOAD_M" -t "$H2LOAD_T" --rounds "$ROUNDS"; then
+    run_logged "$log" env HENDRIK_ROOT="$HENDRIK_ROOT" OUT="$OUT/hendrik" "$NEW_ROOT/tools/bench-hendrik.sh" -n "$N" -c "$H2LOAD_C" -m "$H2LOAD_M" -t "$H2LOAD_T" --rounds "$ROUNDS" || true
       hbin=$OUT/hendrik/http2-zig/bin/benchmark
       hsum=absent
       if [ -x "$hbin" ]; then hsum=$(sha256_file "$hbin"); fi
-      emit_row "$name" "http2.zig" "ok" "see log" "$log" "$hsum"
-    else
-      emit_row "$name" "http2.zig" "FAIL" "bench-hendrik exit non-zero" "$log" "absent"
-    fi
+    st=$(bench_row_status "$log")
+    emit_row "$name" "http2.zig" "$st" "see log" "$log" "$hsum"
   fi
 else
   log="$OUT/logs/packed-hendrik-missing.log"
