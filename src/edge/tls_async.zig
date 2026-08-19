@@ -170,6 +170,19 @@ pub const AsyncTlsStream = struct {
         return error.BoringSSL;
     }
 
+    /// SSL_read that waits, for a loopback client. TlsPump must keep using
+    /// `read` so a quiet peer cannot park a write.
+    pub fn readBlocking(self: *AsyncTlsStream, output: []u8) BoringError!usize {
+        var context = output;
+        return self.tls_retry(
+            []u8,
+            &context,
+            usize,
+            MaxHandshakeIterations,
+            tls_read_attempt,
+        );
+    }
+
     pub fn write(self: *AsyncTlsStream, input: []const u8) BoringError!usize {
         var context = input;
         return self.tls_retry(

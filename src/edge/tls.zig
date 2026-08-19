@@ -135,6 +135,20 @@ pub const Acceptor = struct {
     }
 };
 
+/// Bench-server `--self-drive-oneshots` client: verify none, ALPN `h2` only.
+/// A separate SSL_CTX from the acceptor, so TlsPump stays the sole owner of
+/// the server SSL object. Do not use this on a production connection.
+pub const ClientConnector = tls_async.AsyncTlsConnector;
+
+pub fn loopbackClientConnector() !ClientConnector {
+    boring.init();
+    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
+    errdefer builder.deinit();
+    builder.setVerify(boring.ssl.VerifyMode.none);
+    try builder.setClientAlpnProtocol(alpn_h2);
+    return .initWithBuilder(&builder);
+}
+
 fn loadCertificateChain(builder: *boring.ssl.ContextBuilder, pem: []const u8) !void {
     var stack = boring.x509.X509.stackFromPem(pem) catch return error.InvalidCertificate;
     defer stack.deinit();
@@ -193,6 +207,20 @@ pub const Conn = struct {
         if (!isHttp2Alpn(self.tls_stream.selectedAlpn())) return error.TlsHandshakeFailed;
     }
 
+    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        std.debug.assert(self.state == .tcp);
+        self.tls_stream = connector.connect(
+            io,
+            "localhost",
+            &self.tcp_reader.interface,
+            &self.tcp_writer.interface,
+        ) catch return error.TlsHandshakeFailed;
+        self.state = .tls;
+        self.tls_reader = self.tls_stream.reader(&self.tls_reader_buffer);
+        self.tls_writer = self.tls_stream.writer(&self.tls_writer_buffer);
+        if (!isHttp2Alpn(self.tls_stream.selectedAlpn())) return error.TlsHandshakeFailed;
+    }
+
     pub fn deinit(self: *Conn) void {
         switch (self.state) {
             .empty => {},
@@ -210,6 +238,24 @@ pub const Conn = struct {
     pub fn writer(self: *Conn) *std.Io.Writer {
         std.debug.assert(self.state == .tls);
         return &self.tls_writer.interface;
+    }
+
+    /// Blocking plaintext read for the bench-server loopback client. The
+    /// production pump uses non-blocking `tls_stream.read`.
+    pub fn readPlain(self: *Conn, output: []u8) !usize {
+        std.debug.assert(self.state == .tls);
+        if (output.len == 0) return 0;
+        return self.tls_stream.readBlocking(output) catch return error.TlsReadFailed;
+    }
+
+    pub fn writePlain(self: *Conn, input: []const u8) !void {
+        std.debug.assert(self.state == .tls);
+        var off: usize = 0;
+        while (off < input.len) {
+            const n = self.tls_stream.write(input[off..]) catch return error.TlsWriteFailed;
+            if (n == 0) return error.TlsWriteFailed;
+            off += n;
+        }
     }
 
     pub fn pendingPlaintext(self: *Conn) usize {

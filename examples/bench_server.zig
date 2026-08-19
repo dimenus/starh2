@@ -568,6 +568,10 @@ const Args = struct {
     executors: ?u8 = null,
     task_migration: bool = false,
     diag: bool = false,
+    /// When set, connect to this process's listener over real TCP, drive N
+    /// oneshots on one connection, then shut down. Hyperfine/poop measure the
+    /// whole program. Zero is refused: a no-op self-drive is not a result.
+    self_drive_oneshots: ?usize = null,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
@@ -596,6 +600,10 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.task_migration = true;
         } else if (std.mem.eql(u8, a, "--diag")) {
             out.diag = true;
+        } else if (std.mem.eql(u8, a, "--self-drive-oneshots")) {
+            const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+            if (n == 0) return error.InvalidSelfDriveCount;
+            out.self_drive_oneshots = n;
         } else {
             return error.UnknownArgument;
         }
@@ -623,6 +631,176 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
         }
     }
     return out;
+}
+
+const frame = starh2.core.frame;
+const hpack = starh2.core.hpack;
+const tls_edge = starh2.edge.tls_edge;
+
+const self_drive_in_flight: usize = 10;
+
+const BytePipe = union(enum) {
+    io: struct { reader: *std.Io.Reader, writer: *std.Io.Writer },
+    tls: *tls_edge.Conn,
+
+    fn readExact(self: BytePipe, buf: []u8) !void {
+        switch (self) {
+            .io => |p| {
+                var got: usize = 0;
+                while (got < buf.len) {
+                    var dest: [1][]u8 = .{buf[got..]};
+                    const n = try p.reader.readVec(&dest);
+                    if (n == 0) return error.ConnectionClosed;
+                    got += n;
+                }
+            },
+            .tls => |conn| {
+                var got: usize = 0;
+                while (got < buf.len) {
+                    const n = try conn.readPlain(buf[got..]);
+                    if (n == 0) return error.ConnectionClosed;
+                    got += n;
+                }
+            },
+        }
+    }
+
+    fn writeAll(self: BytePipe, buf: []const u8) !void {
+        switch (self) {
+            .io => |p| {
+                try p.writer.writeAll(buf);
+                try p.writer.flush();
+            },
+            .tls => |conn| try conn.writePlain(buf),
+        }
+    }
+};
+
+fn encodeGetSlash(gpa: std.mem.Allocator) ![]u8 {
+    const fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    return hpack.Encoder.encode(gpa, &fields);
+}
+
+fn appendHeadersFrame(out: *std.ArrayList(u8), gpa: std.mem.Allocator, stream_id: u31, block: []const u8) !void {
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    const fh = frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true, .end_stream = true },
+        .stream_id = stream_id,
+    };
+    fh.encode(&hdr_buf);
+    try out.appendSlice(gpa, &hdr_buf);
+    try out.appendSlice(gpa, block);
+}
+
+fn driveH2(gpa: std.mem.Allocator, pipe: BytePipe, n: usize) !void {
+    const block = try encodeGetSlash(gpa);
+    defer gpa.free(block);
+
+    var hello: std.ArrayList(u8) = .empty;
+    defer hello.deinit(gpa);
+    try hello.appendSlice(gpa, frame.CLIENT_PREFACE);
+    var sbuf: [64]u8 = undefined;
+    const settings = [_]frame.Setting{
+        .{ .id = .max_concurrent_streams, .value = 256 },
+        .{ .id = .initial_window_size, .value = 1 << 20 },
+    };
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &settings);
+    try hello.appendSlice(gpa, sbuf[0..sn]);
+    try pipe.writeAll(hello.items);
+
+    var sent: usize = 0;
+    var done: usize = 0;
+    var in_flight: usize = 0;
+    var next_sid: u31 = 1;
+    var conn_consumed: u32 = 0;
+    var payload_buf: [frame.DEFAULT_MAX_FRAME_SIZE]u8 = undefined;
+    var write_buf: std.ArrayList(u8) = .empty;
+    defer write_buf.deinit(gpa);
+
+    while (done < n) {
+        write_buf.clearRetainingCapacity();
+        while (in_flight < self_drive_in_flight and sent < n) {
+            try appendHeadersFrame(&write_buf, gpa, next_sid, block);
+            next_sid += 2;
+            sent += 1;
+            in_flight += 1;
+        }
+        if (write_buf.items.len != 0) try pipe.writeAll(write_buf.items);
+
+        try pipe.readExact(payload_buf[0..frame.FRAME_HEADER_LEN]);
+        const hdr = frame.FrameHeader.decode(payload_buf[0..frame.FRAME_HEADER_LEN]);
+        if (hdr.length > payload_buf.len) return error.FrameTooLarge;
+        if (hdr.length > 0) try pipe.readExact(payload_buf[0..hdr.length]);
+
+        switch (hdr.type) {
+            .settings => {
+                if (!hdr.flags.ack()) {
+                    const an = try frame.Serializer.settingsFrame(&sbuf, true, &.{});
+                    try pipe.writeAll(sbuf[0..an]);
+                }
+            },
+            .ping => {
+                if (!hdr.flags.ack()) {
+                    var ping_opaque: [8]u8 = undefined;
+                    if (hdr.length != 8) return error.Protocol;
+                    @memcpy(&ping_opaque, payload_buf[0..8]);
+                    var ping_buf: [17]u8 = undefined;
+                    const pn = try frame.Serializer.ping(&ping_buf, true, &ping_opaque);
+                    try pipe.writeAll(ping_buf[0..pn]);
+                }
+            },
+            .window_update => {},
+            .headers, .data => {
+                if (hdr.type == .data and hdr.length > 0) {
+                    conn_consumed += hdr.length;
+                    if (conn_consumed >= 16 * 1024) {
+                        var wu: [13]u8 = undefined;
+                        const wn = try frame.Serializer.windowUpdate(&wu, 0, @intCast(conn_consumed));
+                        try pipe.writeAll(wu[0..wn]);
+                        conn_consumed = 0;
+                    }
+                }
+                if (hdr.flags.end_stream) {
+                    if (in_flight == 0) return error.SelfDriveUnexpectedEnd;
+                    in_flight -= 1;
+                    done += 1;
+                }
+            },
+            .goaway => return error.SelfDriveGoaway,
+            .rst_stream => return error.SelfDriveRst,
+            else => {},
+        }
+    }
+}
+
+fn driveOneshots(gpa: std.mem.Allocator, io: std.Io, tls: bool, peer: starh2.EndpointAddress, n: usize) !void {
+    const stream = try peer.connect(io, .{ .mode = .stream });
+    if (tls) {
+        var conn: tls_edge.Conn = undefined;
+        conn.initTcp(io, stream);
+        defer {
+            conn.deinit();
+            stream.close(io);
+        }
+        var connector = try tls_edge.loopbackClientConnector();
+        defer connector.deinit();
+        try conn.handshakeClient(&connector, io);
+        try driveH2(gpa, .{ .tls = &conn }, n);
+    } else {
+        var read_buf: [tls_edge.stream_buffer_size]u8 = undefined;
+        var write_buf: [tls_edge.stream_buffer_size]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var writer = stream.writer(io, &write_buf);
+        defer stream.close(io);
+        try driveH2(gpa, .{ .io = .{ .reader = &reader.interface, .writer = &writer.interface } }, n);
+    }
 }
 
 fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process.Args, io: std.Io) !void {
@@ -686,6 +864,13 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     var out = zio.stdout().writer(&.{});
     try out.interface.writeAll(ready);
     try out.interface.flush();
+
+    if (args.self_drive_oneshots) |n| {
+        // The listener lives on rt.io(); init.io would block this task
+        // and starve accept.
+        try driveOneshots(gpa, rt.io(), args.tls, server.localAddress(0), n);
+        server.requestShutdown();
+    }
 
     try serve_handle.join();
 }
