@@ -231,10 +231,10 @@ pub const Conn = struct {
 /// SSL_read itself does not wait. When both sides are idle the pump Selects
 /// the write queue against a socket peek — never against SSL_read — so
 /// cancelling the wait cannot leave the cipher mid-record. A nonblocking
-/// `posix.read` fills the TCP reader first so a byte that is already in the
-/// kernel does not pay a two-arm Select. The write waiter returns a
-/// WireChunk; leftover results are recovered with `Select.cancel`, never
-/// `cancelDiscard`.
+/// `posix.recvfrom` with MSG_DONTWAIT fills the TCP reader first so a byte
+/// that is already in the kernel does not pay a two-arm Select. The write
+/// waiter returns a WireChunk; leftover results are recovered with
+/// `Select.cancel`, never `cancelDiscard`.
 pub const Pump = struct {
     io: std.Io,
     conn: *Conn,
@@ -512,20 +512,28 @@ pub const Pump = struct {
         return out;
     }
 
-    /// Pull kernel bytes into the TCP reader without parking. zio sockets are
-    /// already nonblocking; `std.Io.Reader` has no try-fill, and `netRead`
-    /// waits, which is why a quiet turn used to Select just to discover a
-    /// byte that was already readable (phase 1: 98.5% of oneshot-only Selects
-    /// were peek-wins). BIO_read only sees `buffered()`, so this is the fill
-    /// that lets SSL_read proceed. Parked wait stays a two-arm Select.
+    /// Pull kernel bytes into the TCP reader without parking. `std.Io.Reader`
+    /// has no try-fill and `netRead` waits, which is why a quiet turn used to
+    /// Select just to discover a byte already in the kernel (phase 1: 98.5% of
+    /// oneshot-only Selects were peek-wins). BIO_read only sees `buffered()`.
+    /// MSG_DONTWAIT keeps this off the wait path even if the fd is blocking.
+    /// Parked wait stays a two-arm Select.
     fn tryFillTcp(self: *Pump) bool {
         const r = &self.conn.tcp_reader.interface;
         if (r.bufferedLen() > 0) return true;
         r.rebase(1) catch return false;
         const dest = r.buffer[r.end..];
         if (dest.len == 0) return false;
-        const n = std.posix.read(self.conn.tcp_stream.socket.handle, dest) catch |err| switch (err) {
-            error.WouldBlock => return false,
+        const rc = std.posix.system.recvfrom(
+            self.conn.tcp_stream.socket.handle,
+            dest.ptr,
+            dest.len,
+            std.posix.MSG.DONTWAIT,
+            null,
+            null,
+        );
+        const n: usize = switch (std.posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
             else => return false,
         };
         if (n == 0) return false;
