@@ -230,10 +230,11 @@ pub const Conn = struct {
 /// SSL_read. BIO_read returns WANT_READ when the TCP buffer is empty, so
 /// SSL_read itself does not wait. When both sides are idle the pump Selects
 /// the write queue against a socket peek — never against SSL_read — so
-/// cancelling the wait cannot leave the cipher mid-record. The Select is
-/// reused across peek-win turns (`concurrent` after `await`); write-win
-/// still `cancel`s the peek loser. Leftover results are recovered with
-/// `Select.cancel`, never `cancelDiscard`.
+/// cancelling the wait cannot leave the cipher mid-record. A nonblocking
+/// `posix.read` fills the TCP reader first so a byte that is already in the
+/// kernel does not pay a two-arm Select. The write waiter returns a
+/// WireChunk; leftover results are recovered with `Select.cancel`, never
+/// `cancelDiscard`.
 pub const Pump = struct {
     io: std.Io,
     conn: *Conn,
@@ -511,35 +512,29 @@ pub const Pump = struct {
         return out;
     }
 
-    /// Results already in the Select queue, without canceling live waiters.
-    /// After peek-win the write arm stays parked; a write that completed in
-    /// the same turn is recovered here instead of tearing the Select down.
-    fn drainSelectQueue(select: *std.Io.Select(Wait), io: std.Io) SelectOutcome {
-        var out: SelectOutcome = .{};
-        while (io_queue.tryGet(Wait, &select.queue, io)) |wait| applyWait(&out, wait);
-        return out;
+    /// Pull kernel bytes into the TCP reader without parking. zio sockets are
+    /// already nonblocking; `std.Io.Reader` has no try-fill, and `netRead`
+    /// waits, which is why a quiet turn used to Select just to discover a
+    /// byte that was already readable (phase 1: 98.5% of oneshot-only Selects
+    /// were peek-wins). BIO_read only sees `buffered()`, so this is the fill
+    /// that lets SSL_read proceed. Parked wait stays a two-arm Select.
+    fn tryFillTcp(self: *Pump) bool {
+        const r = &self.conn.tcp_reader.interface;
+        if (r.bufferedLen() > 0) return true;
+        r.rebase(1) catch return false;
+        const dest = r.buffer[r.end..];
+        if (dest.len == 0) return false;
+        const n = std.posix.read(self.conn.tcp_stream.socket.handle, dest) catch |err| switch (err) {
+            error.WouldBlock => return false,
+            else => return false,
+        };
+        if (n == 0) return false;
+        r.end += n;
+        return true;
     }
 
     pub fn run(self: *Pump) void {
         const writer = self.conn.writer();
-        // Select lives across peek-win turns. Phase 1 on nachos
-        // (/tmp/t844-grade/phase1.log): oneshot-only built a two-arm Select
-        // on 0.45 of turns / 0.54 per request, and 98.5% of those were
-        // peek-wins — the next TCP byte was already readable. std.Io allows
-        // concurrent() after await; cancel() closes the queue, so peek-win
-        // must not cancel. Write-win still cancels the peek loser.
-        var result_buf: [2]Wait = undefined;
-        var select: std.Io.Select(Wait) = undefined;
-        var select_live = false;
-        var write_armed = false;
-
-        defer {
-            if (select_live) {
-                const lost = collectSelect(&select, null);
-                if (lost.write) |chunk| self.releaseChunk(chunk, false, false);
-            }
-        }
-
         while (!self.stopped.load(.acquire)) {
             pump_trace.bump(&pump_trace.turns);
             if (self.carried) |chunk| {
@@ -567,23 +562,7 @@ pub const Pump = struct {
                 if (!self.writeChunks(writer, chunk)) return;
                 continue;
             }
-            if (write_armed) {
-                const stolen = drainSelectQueue(&select, self.io);
-                if (stolen.write_closed and stolen.write == null) {
-                    select_live = false;
-                    write_armed = false;
-                    self.failDrain();
-                    self.post(.{ .fail_all = true, .shutdown = true });
-                    return;
-                }
-                if (stolen.write) |chunk| {
-                    write_armed = false;
-                    pump_trace.bump(&pump_trace.select_write);
-                    if (!self.writeChunks(writer, chunk)) return;
-                    continue;
-                }
-            }
-            if (self.conn.pendingPlaintext() > 0 or self.conn.ciphertextBuffered() > 0) {
+            if (self.conn.pendingPlaintext() > 0 or self.conn.ciphertextBuffered() > 0 or self.tryFillTcp()) {
                 switch (self.readOne()) {
                     .eof => return,
                     .ok => continue,
@@ -598,27 +577,17 @@ pub const Pump = struct {
                 continue;
             }
 
-            if (!select_live) {
-                pump_trace.bump(&pump_trace.select);
-                select = std.Io.Select(Wait).init(self.io, &result_buf);
-                select_live = true;
-            }
-            if (!write_armed) {
-                select.concurrent(.write, waitWrite, .{ self.from_actor, self.io }) catch {
-                    const lost = collectSelect(&select, null);
-                    select_live = false;
-                    write_armed = false;
-                    if (lost.write) |chunk| self.releaseChunk(chunk, false, false);
-                    self.failDrain();
-                    self.post(.{ .fail_all = true, .shutdown = true });
-                    return;
-                };
-                write_armed = true;
-            }
+            pump_trace.bump(&pump_trace.select);
+            var result_buf: [2]Wait = undefined;
+            var select = std.Io.Select(Wait).init(self.io, &result_buf);
+            select.concurrent(.write, waitWrite, .{ self.from_actor, self.io }) catch {
+                _ = collectSelect(&select, null);
+                self.failDrain();
+                self.post(.{ .fail_all = true, .shutdown = true });
+                return;
+            };
             select.concurrent(.peek, waitPeek, .{&self.conn.tcp_reader.interface}) catch {
                 const lost = collectSelect(&select, null);
-                select_live = false;
-                write_armed = false;
                 if (lost.write) |chunk| self.releaseChunk(chunk, false, false);
                 self.failDrain();
                 self.post(.{ .fail_all = true, .shutdown = true });
@@ -626,31 +595,18 @@ pub const Pump = struct {
             };
             const selected = select.await() catch {
                 const lost = collectSelect(&select, null);
-                select_live = false;
-                write_armed = false;
                 if (lost.write) |chunk| self.releaseChunk(chunk, false, false);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return;
             };
-            var out: SelectOutcome = .{};
-            applyWait(&out, selected);
-            const extra = drainSelectQueue(&select, self.io);
-            if (extra.write != null) out.write = extra.write;
-            if (extra.write_closed) out.write_closed = true;
-            if (extra.peek_err) out.peek_err = true;
+            const out = collectSelect(&select, selected);
             // A cancelled peek returns ReadFailed. That is not peer EOF when
             // write won — ignore the loser. When peek won, a recovered write
             // chunk is still preferred so SSE is not parked behind SSL_read.
             switch (selected) {
                 .write => {
                     pump_trace.bump(&pump_trace.select_write);
-                    write_armed = false;
-                    const lost = collectSelect(&select, null);
-                    select_live = false;
-                    if (lost.peek_err) out.peek_err = true;
-                    if (lost.write != null and out.write == null) out.write = lost.write;
-                    if (lost.write_closed) out.write_closed = true;
                     if (out.write_closed and out.write == null) {
                         self.failDrain();
                         self.post(.{ .fail_all = true, .shutdown = true });
@@ -663,16 +619,9 @@ pub const Pump = struct {
                 .peek => {
                     pump_trace.bump(&pump_trace.select_peek);
                     if (out.write) |chunk| {
-                        write_armed = false;
                         if (!self.writeChunks(writer, chunk)) return;
                     }
                     if (out.peek_err) {
-                        if (select_live) {
-                            const lost = collectSelect(&select, null);
-                            select_live = false;
-                            write_armed = false;
-                            if (lost.write) |chunk| self.releaseChunk(chunk, false, false);
-                        }
                         self.failDrain();
                         self.postEof();
                         self.post(.{ .shutdown = true });
