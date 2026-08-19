@@ -1,17 +1,21 @@
-//! TLS as a `std.Io` stream (BoringSSL SSL_read / SSL_write).
+//! TLS via memory BIOs. HTTP/2 never sees ciphertext.
 //!
-//! HTTP/2 never sees ciphertext. The acceptor owns the SSL_CTX and key
-//! material; each connection owns one `Conn` whose reader and writer are
-//! plaintext. `Pump` is the sole task that calls SSL_read/SSL_write, so the
-//! cipher is not shared with the actor and is not covered by `session_mu`.
+//! The SSL object has exactly one owner (`Pump`). Its BIOs are a bounded
+//! `BIO_new_bio_pair`, not socket-coupled callbacks: ciphertext bytes move
+//! through a queue, not through a readiness edge. A dedicated `CipherRead`
+//! task does blocking zio socket reads and posts chunks to that queue. The
+//! pump waits on that one queue (`getOne`) for both inbound ciphertext and
+//! outbound plaintext — no `std.Io.Select`.
 //!
-//! A transforming writer whose `flush` is SSL_write is the grain. Do not put
-//! a record loop back on the actor.
+//! Socket writes stay on the pump. A third write task would add a hop on the
+//! SSE event path (handler → scheduler → pump SSL_write → socket), which the
+//! brief forbids. nats.zig's two-task count is the reference; BoringSSL cannot
+//! split the cipher, so the pump owns both directions of SSL and the socket
+//! write, matching h2c's task count (read + write).
 const std = @import("std");
 const boring = @import("boring");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
-const tls_async = @import("tls_async.zig");
 const wire_pump = @import("wire_pump.zig");
 
 /// Same gate as `connection.test_observe`: Debug (the suite) and
@@ -22,6 +26,10 @@ pub const observe = @import("build_options").observe;
 /// Quiet-turn counters for TlsPump. Process-global like `test_observed_*`
 /// so `/trace` can read them without a pump pointer. One TLS connection is
 /// the bench shape; overlapping pumps would share the totals.
+///
+/// `select` / `select_write` / `select_peek` stay in the schema so a
+/// memory-BIO build that still Selects is visible: they must collapse to
+/// zero. Bump sites for those three are gone.
 pub const pump_trace = struct {
     pub var turns: std.atomic.Value(u64) = .init(0);
     pub var select: std.atomic.Value(u64) = .init(0);
@@ -35,6 +43,8 @@ pub const pump_trace = struct {
     pub var pending_read_retry: std.atomic.Value(u64) = .init(0);
     pub var write_chunks: std.atomic.Value(u64) = .init(0);
     pub var write_chunk_sum: std.atomic.Value(u64) = .init(0);
+    pub var work_get: std.atomic.Value(u64) = .init(0);
+    pub var cipher_chunks: std.atomic.Value(u64) = .init(0);
 
     inline fn bump(counter: *std.atomic.Value(u64)) void {
         if (comptime observe) _ = counter.fetchAdd(1, .monotonic);
@@ -55,7 +65,8 @@ pub const pump_trace = struct {
                 "\"pump_tryget_write\":{d},\"pump_read_one\":{d}," ++
                 "\"pump_want_read\":{d},\"pump_read_free_yield\":{d}," ++
                 "\"pump_live_handler_yield\":{d},\"pump_pending_read_retry\":{d}," ++
-                "\"pump_write_chunks\":{d},\"pump_write_chunk_sum\":{d}",
+                "\"pump_write_chunks\":{d},\"pump_write_chunk_sum\":{d}," ++
+                "\"pump_work_get\":{d},\"pump_cipher_chunks\":{d}",
             .{
                 turns.load(.acquire),
                 select.load(.acquire),
@@ -69,23 +80,28 @@ pub const pump_trace = struct {
                 pending_read_retry.load(.acquire),
                 write_chunks.load(.acquire),
                 write_chunk_sum.load(.acquire),
+                work_get.load(.acquire),
+                cipher_chunks.load(.acquire),
             },
         );
     }
 };
 
 pub const alpn_h2 = "h2";
-pub const stream_buffer_size: usize = tls_async.BioStreamBufferSize;
+pub const stream_buffer_size: usize = limits_mod.TLS_STREAM_BUFFER_SIZE;
+pub const cipher_chunk_size: usize = limits_mod.TLS_CIPHER_CHUNK_SIZE;
+pub const MaxHandshakeIterations: u32 = 4096;
 
 comptime {
     std.debug.assert(stream_buffer_size >= 16 * 1024);
     std.debug.assert(stream_buffer_size == limits_mod.TLS_STREAM_BUFFER_SIZE);
     std.debug.assert(conn_buffer_bytes == limits_mod.TLS_CONN_BUFFER_BYTES);
+    std.debug.assert(cipher_chunk_size == stream_buffer_size);
 }
 
 var alpn_select_ctx: AlpnCtx = .{};
 
-/// Four std.Io buffers on the TLS connection (tcp in/out + tls in/out).
+/// tcp in + tcp out + BioPair (ssl write buf + transport write buf).
 pub const conn_buffer_bytes: usize = stream_buffer_size * 4;
 
 pub fn isHttp2Alpn(selected: ?[]const u8) bool {
@@ -111,7 +127,7 @@ fn selectH2Only(_: *AlpnCtx, _: *boring.ssl.SslRef, input: []const u8) boring.ss
 
 /// Server-wide SSL_CTX plus certificate. Borrowed by every TLS connection.
 pub const Acceptor = struct {
-    inner: tls_async.AsyncTlsAcceptor,
+    tls_context: boring.ssl.Context,
 
     pub fn initFromPem(certificate_chain_pem: []const u8, private_key_pem: []const u8) !Acceptor {
         boring.init();
@@ -127,18 +143,28 @@ pub const Acceptor = struct {
         builder.setAlpnSelectCallback(AlpnCtx, &alpn_select_ctx, selectH2Only) catch
             return error.InvalidCertificate;
 
-        return .{ .inner = tls_async.AsyncTlsAcceptor.initWithBuilder(&builder) };
+        return .{ .tls_context = builder.build() };
     }
 
     pub fn deinit(self: *Acceptor) void {
-        self.inner.deinit();
+        self.tls_context.deinit();
     }
 };
 
 /// Bench-server `--self-drive-oneshots` client: verify none, ALPN `h2` only.
 /// A separate SSL_CTX from the acceptor, so TlsPump stays the sole owner of
 /// the server SSL object. Do not use this on a production connection.
-pub const ClientConnector = tls_async.AsyncTlsConnector;
+pub const ClientConnector = struct {
+    tls_context: boring.ssl.Context,
+
+    pub fn initWithBuilder(builder: *boring.ssl.ContextBuilder) ClientConnector {
+        return .{ .tls_context = builder.build() };
+    }
+
+    pub fn deinit(self: *ClientConnector) void {
+        self.tls_context.deinit();
+    }
+};
 
 pub fn loopbackClientConnector() !ClientConnector {
     boring.init();
@@ -171,121 +197,357 @@ fn loadCertificateChain(builder: *boring.ssl.ContextBuilder, pem: []const u8) !v
     }
 }
 
-/// Per-connection TLS stream. Heap-allocated and never moved: BIO callbacks
-/// hold pointers into `tcp_reader` / `tcp_writer`.
+/// Ciphertext chunk posted by `CipherRead`. The slice is a view into the
+/// connection's cipher pool; ownership of `pool_index` moves with the item.
+pub const CipherChunk = struct {
+    bytes: []u8 = &.{},
+    len: usize = 0,
+    pool_index: u32 = 0,
+};
+
+/// The pump's one queue. `CipherRead` posts `.cipher` / `.eof`; `queueWire`
+/// posts `.wire`. One `getOne` replaces the two-arm Select.
+pub const PumpWork = union(enum) {
+    cipher: CipherChunk,
+    wire: wire_pump.WireChunk,
+    eof,
+};
+
+/// Per-connection TLS stream. Heap-allocated and never moved.
+///
+/// Production: `CipherRead` is the sole socket reader; `Pump` is the sole
+/// SSL owner and the sole socket writer. The client loopback path uses both
+/// directions on one task.
+///
+/// Do not build a `Reader` on the actor. A Reader constructed there
+/// registers EVFILT_READ on the actor's wait context; Darwin kqueue EV_CLEAR
+/// then starves `CipherRead` (the ClientHello never arrives, handshake
+/// times out). Bind reader/writer on the task that will park on them.
 pub const Conn = struct {
     tcp_stream: std.Io.net.Stream = undefined,
     tcp_reader: std.Io.net.Stream.Reader = undefined,
     tcp_writer: std.Io.net.Stream.Writer = undefined,
-    tls_stream: tls_async.AsyncTlsStream = undefined,
-    tls_reader: tls_async.AsyncTlsStream.Reader = undefined,
-    tls_writer: tls_async.AsyncTlsStream.Writer = undefined,
     tcp_reader_buffer: [stream_buffer_size]u8 = undefined,
     tcp_writer_buffer: [stream_buffer_size]u8 = undefined,
-    tls_reader_buffer: [stream_buffer_size]u8 = undefined,
-    tls_writer_buffer: [stream_buffer_size]u8 = undefined,
+    ssl: boring.ssl.Ssl = .{ .ptr = null },
+    pair: boring.ssl.BioPair = .{ .ssl_bio = null, .transport_bio = null },
     state: enum { empty, tcp, tls } = .empty,
 
-    pub fn initTcp(self: *Conn, io: std.Io, stream: std.Io.net.Stream) void {
+    pub fn initTcp(self: *Conn, stream: std.Io.net.Stream) void {
         self.* = .{};
         self.tcp_stream = stream;
-        self.tcp_reader = stream.reader(io, &self.tcp_reader_buffer);
-        self.tcp_writer = stream.writer(io, &self.tcp_writer_buffer);
         self.state = .tcp;
     }
 
-    pub fn handshake(self: *Conn, acceptor: *Acceptor, io: std.Io) !void {
-        std.debug.assert(self.state == .tcp);
-        self.tls_stream = acceptor.inner.accept(
-            io,
-            &self.tcp_reader.interface,
-            &self.tcp_writer.interface,
-        ) catch return error.TlsHandshakeFailed;
-        self.state = .tls;
-        self.tls_reader = self.tls_stream.reader(&self.tls_reader_buffer);
-        self.tls_writer = self.tls_stream.writer(&self.tls_writer_buffer);
-        if (!isHttp2Alpn(self.tls_stream.selectedAlpn())) return error.TlsHandshakeFailed;
+    /// Client loopback: this task is the ciphertext source. Production
+    /// never calls this — `CipherRead` owns the reader.
+    pub fn bindIo(self: *Conn, io: std.Io) void {
+        self.bindReader(io);
+        self.bindWriter(io);
     }
 
-    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
-        std.debug.assert(self.state == .tcp);
-        self.tls_stream = connector.connect(
-            io,
-            "localhost",
-            &self.tcp_reader.interface,
-            &self.tcp_writer.interface,
-        ) catch return error.TlsHandshakeFailed;
+    pub fn bindReader(self: *Conn, io: std.Io) void {
+        self.tcp_reader = self.tcp_stream.reader(io, &self.tcp_reader_buffer);
+    }
+
+    pub fn bindWriter(self: *Conn, io: std.Io) void {
+        self.tcp_writer = self.tcp_stream.writer(io, &self.tcp_writer_buffer);
+    }
+
+    fn attachSsl(self: *Conn, ssl: boring.ssl.Ssl) !void {
+        var owned = ssl;
+        errdefer owned.deinit();
+        var pair = try boring.ssl.BioPair.init(stream_buffer_size);
+        errdefer pair.deinit();
+        const ssl_bio = pair.ssl_bio orelse return error.TlsHandshakeFailed;
+        owned.setBio(ssl_bio);
+        pair.ssl_bio = null;
+        self.ssl = owned;
+        self.pair = pair;
         self.state = .tls;
-        self.tls_reader = self.tls_stream.reader(&self.tls_reader_buffer);
-        self.tls_writer = self.tls_stream.writer(&self.tls_writer_buffer);
-        if (!isHttp2Alpn(self.tls_stream.selectedAlpn())) return error.TlsHandshakeFailed;
+    }
+
+    pub fn setupAccept(self: *Conn, acceptor: *Acceptor) !void {
+        std.debug.assert(self.state == .tcp);
+        var ssl = try acceptor.tls_context.createSsl();
+        ssl.setAcceptState();
+        try self.attachSsl(ssl);
+    }
+
+    pub fn setupConnect(self: *Conn, connector: *ClientConnector) !void {
+        std.debug.assert(self.state == .tcp);
+        var ssl = try connector.tls_context.createSsl();
+        try ssl.setConnectHostname("localhost");
+        ssl.setConnectState();
+        try self.attachSsl(ssl);
+    }
+
+    /// Server handshake. Ciphertext comes from `work` (the read task is
+    /// already running). Recycles cipher indices onto `cipher_free`.
+    pub fn handshake(
+        self: *Conn,
+        io: std.Io,
+        work: *std.Io.Queue(PumpWork),
+        cipher_free: *std.Io.Queue(u32),
+    ) !void {
+        std.debug.assert(self.state == .tls);
+        self.bindWriter(io);
+        var iterations: u32 = 0;
+        while (!self.ssl.isHandshakeComplete()) {
+            iterations += 1;
+            if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
+            self.drainToSocket() catch return error.TlsHandshakeFailed;
+            self.ssl.doHandshake() catch |err| switch (err) {
+                error.WantRead => {
+                    // doHandshake may have produced a flight (ServerHello).
+                    // Drain it before parking or the peer never replies.
+                    self.drainToSocket() catch return error.TlsHandshakeFailed;
+                    if (self.ssl.isHandshakeComplete()) break;
+                    const item = work.getOne(io) catch return error.TlsHandshakeFailed;
+                    switch (item) {
+                        .cipher => |chunk| {
+                            defer recycleCipher(io, cipher_free, chunk.pool_index);
+                            self.feedCipher(chunk.bytes[0..chunk.len]) catch
+                                return error.TlsHandshakeFailed;
+                        },
+                        .eof, .wire => return error.TlsHandshakeFailed,
+                    }
+                },
+                error.WantWrite => {},
+                else => return error.TlsHandshakeFailed,
+            };
+        }
+        self.drainToSocket() catch return error.TlsHandshakeFailed;
+        if (!isHttp2Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
+    }
+
+    /// Single-task client handshake: this task is the ciphertext source.
+    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        self.bindIo(io);
+        try self.setupConnect(connector);
+        var iterations: u32 = 0;
+        while (!self.ssl.isHandshakeComplete()) {
+            iterations += 1;
+            if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
+            self.drainToSocket() catch return error.TlsHandshakeFailed;
+            self.ssl.doHandshake() catch |err| switch (err) {
+                error.WantRead => {
+                    self.drainToSocket() catch return error.TlsHandshakeFailed;
+                    if (self.ssl.isHandshakeComplete()) break;
+                    self.feedFromSocket() catch return error.TlsHandshakeFailed;
+                },
+                error.WantWrite => {},
+                else => return error.TlsHandshakeFailed,
+            };
+        }
+        self.drainToSocket() catch return error.TlsHandshakeFailed;
+        if (!isHttp2Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
     }
 
     pub fn deinit(self: *Conn) void {
         switch (self.state) {
-            .empty => {},
-            .tcp => {},
-            .tls => self.tls_stream.deinit(),
+            .empty, .tcp => {},
+            .tls => {
+                self.ssl.deinit();
+                self.pair.deinit();
+            },
         }
         self.state = .empty;
     }
 
-    pub fn reader(self: *Conn) *std.Io.Reader {
-        std.debug.assert(self.state == .tls);
-        return &self.tls_reader.interface;
-    }
-
-    pub fn writer(self: *Conn) *std.Io.Writer {
-        std.debug.assert(self.state == .tls);
-        return &self.tls_writer.interface;
-    }
-
-    /// Blocking plaintext read for the bench-server loopback client. The
-    /// production pump uses non-blocking `tls_stream.read`.
+    /// Blocking plaintext read for the bench-server loopback client.
     pub fn readPlain(self: *Conn, output: []u8) !usize {
         std.debug.assert(self.state == .tls);
         if (output.len == 0) return 0;
-        return self.tls_stream.readBlocking(output) catch return error.TlsReadFailed;
+        var iterations: u32 = 0;
+        while (true) {
+            iterations += 1;
+            if (iterations > MaxHandshakeIterations) return error.TlsReadFailed;
+            const n = self.ssl.read(output) catch |err| switch (err) {
+                error.WantRead => {
+                    self.drainToSocket() catch return error.TlsReadFailed;
+                    self.feedFromSocket() catch |feed_err| switch (feed_err) {
+                        error.TlsReadFailed => return 0,
+                        else => return error.TlsReadFailed,
+                    };
+                    continue;
+                },
+                error.WantWrite => {
+                    self.drainToSocket() catch return error.TlsReadFailed;
+                    continue;
+                },
+                error.ZeroReturn => return 0,
+                else => return error.TlsReadFailed,
+            };
+            return n;
+        }
     }
 
     pub fn writePlain(self: *Conn, input: []const u8) !void {
         std.debug.assert(self.state == .tls);
         var off: usize = 0;
+        var iterations: u32 = 0;
         while (off < input.len) {
-            const n = self.tls_stream.write(input[off..]) catch return error.TlsWriteFailed;
+            iterations += 1;
+            if (iterations > MaxHandshakeIterations) return error.TlsWriteFailed;
+            const n = self.ssl.write(input[off..]) catch |err| switch (err) {
+                error.WantRead => {
+                    self.drainToSocket() catch return error.TlsWriteFailed;
+                    self.feedFromSocket() catch return error.TlsWriteFailed;
+                    continue;
+                },
+                error.WantWrite => {
+                    self.drainToSocket() catch return error.TlsWriteFailed;
+                    continue;
+                },
+                else => return error.TlsWriteFailed,
+            };
             if (n == 0) return error.TlsWriteFailed;
             off += n;
         }
+        self.drainToSocket() catch return error.TlsWriteFailed;
     }
 
     pub fn pendingPlaintext(self: *Conn) usize {
         std.debug.assert(self.state == .tls);
-        const ref = self.tls_stream.sslRef() catch return 0;
+        const ref = self.ssl.ref() catch return 0;
         return ref.pending();
     }
 
-    pub fn ciphertextBuffered(self: *const Conn) usize {
-        return self.tcp_reader.interface.bufferedLen();
+    pub fn drainToSocket(self: *Conn) !void {
+        var buf: [stream_buffer_size]u8 = undefined;
+        while (true) {
+            const n = self.pair.readEncrypted(&buf) catch |err| switch (err) {
+                error.WantRead => break,
+                else => return error.TlsWriteFailed,
+            };
+            if (n == 0) break;
+            self.tcp_writer.interface.writeAll(buf[0..n]) catch return error.TlsWriteFailed;
+        }
+        self.tcp_writer.interface.flush() catch return error.TlsWriteFailed;
+    }
+
+    fn feedCipher(self: *Conn, bytes: []const u8) !void {
+        var off: usize = 0;
+        var spins: u32 = 0;
+        while (off < bytes.len) {
+            spins += 1;
+            if (spins > MaxHandshakeIterations) return error.TlsHandshakeFailed;
+            const n = self.pair.writeEncrypted(bytes[off..]) catch |err| switch (err) {
+                error.WantWrite => {
+                    // Pair full of inbound ciphertext SSL has not consumed.
+                    self.ssl.doHandshake() catch |hs_err| switch (hs_err) {
+                        error.WantRead, error.WantWrite => {},
+                        else => return error.TlsHandshakeFailed,
+                    };
+                    self.drainToSocket() catch return error.TlsHandshakeFailed;
+                    continue;
+                },
+                else => return error.TlsHandshakeFailed,
+            };
+            if (n == 0) return error.TlsHandshakeFailed;
+            off += n;
+        }
+    }
+
+    fn feedFromSocket(self: *Conn) !void {
+        var dest_buf: [stream_buffer_size]u8 = undefined;
+        var dest: [1][]u8 = .{&dest_buf};
+        const n = self.tcp_reader.interface.readVec(&dest) catch return error.TlsReadFailed;
+        if (n == 0) return error.TlsReadFailed;
+        var off: usize = 0;
+        while (off < n) {
+            const w = self.pair.writeEncrypted(dest_buf[off..n]) catch |err| switch (err) {
+                error.WantWrite => {
+                    self.drainToSocket() catch return error.TlsWriteFailed;
+                    continue;
+                },
+                else => return error.TlsReadFailed,
+            };
+            if (w == 0) return error.TlsReadFailed;
+            off += w;
+        }
+    }
+};
+
+fn recycleCipher(io: std.Io, free: *std.Io.Queue(u32), idx: u32) void {
+    free.putOneUncancelable(io, idx) catch {
+        // Queue closure means connection teardown owns the backing pool.
+    };
+}
+
+/// Blocking socket reader. Never touches the SSL object.
+///
+/// Parks on the cipher free list, then on a zio stream read, then on the
+/// work queue put. Backpressure is the free list emptying — same shape as
+/// h2c `ReadPump`. The stream reader is created on this task: a Reader
+/// built on the actor is not the read-task's wait context.
+pub const CipherRead = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    work: *std.Io.Queue(PumpWork),
+    chunk_storage: []u8,
+    n_chunks: u32,
+    free_indices: *std.Io.Queue(u32),
+    stopped: std.atomic.Value(bool) = .init(false),
+
+    fn returnIndex(self: *CipherRead, idx: u32) void {
+        recycleCipher(self.io, self.free_indices, idx);
+    }
+
+    fn postEof(self: *CipherRead) void {
+        self.work.putOneUncancelable(self.io, .eof) catch {
+            // A closed work queue means the connection is already tearing down.
+        };
+    }
+
+    pub fn run(self: *CipherRead) void {
+        var reader = self.stream.reader(self.io, &.{});
+        while (!self.stopped.load(.acquire)) {
+            const idx = self.free_indices.getOne(self.io) catch return;
+            const off = @as(usize, idx) * cipher_chunk_size;
+            const buf = self.chunk_storage[off..][0..cipher_chunk_size];
+            var dest: [1][]u8 = .{buf};
+            const n = reader.interface.readVec(&dest) catch {
+                self.returnIndex(idx);
+                self.stream.shutdown(self.io, .send) catch {};
+                self.postEof();
+                return;
+            };
+            if (n == 0) {
+                self.returnIndex(idx);
+                self.stream.shutdown(self.io, .send) catch {};
+                self.postEof();
+                return;
+            }
+            self.work.putOne(self.io, .{ .cipher = .{
+                .bytes = buf,
+                .len = n,
+                .pool_index = idx,
+            } }) catch {
+                self.returnIndex(idx);
+                return;
+            };
+        }
+    }
+
+    pub fn stop(self: *CipherRead) void {
+        self.stopped.store(true, .release);
     }
 };
 
 /// One task owns SSL_read and SSL_write. Concurrent pumps on one SSL object
 /// are a data race; this is the share-nothing owner.
 ///
-/// Writes are preferred so a quiet peer cannot park SSE behind a blocked
-/// SSL_read. BIO_read returns WANT_READ when the TCP buffer is empty, so
-/// SSL_read itself does not wait. When both sides are idle the pump Selects
-/// the write queue against a socket peek — never against SSL_read — so
-/// cancelling the wait cannot leave the cipher mid-record. A nonblocking
-/// `posix.recvfrom` with MSG_DONTWAIT fills the TCP reader first so a byte
-/// that is already in the kernel does not pay a two-arm Select. The write
-/// waiter returns a WireChunk; leftover results are recovered with
-/// `Select.cancel`, never `cancelDiscard`.
+/// The wait is `work.getOne`. Inbound ciphertext is `BIO_write` (via the
+/// pair) + `SSL_read` to the actor. Outbound WireChunks are `SSL_write` +
+/// `BIO_read` + socket write. Writes do not go through a third task: that
+/// would add a hop on the SSE event path.
 pub const Pump = struct {
     io: std.Io,
     conn: *Conn,
     to_actor: *std.Io.Queue(wire_pump.WireChunk),
-    from_actor: *std.Io.Queue(wire_pump.WireChunk),
+    work: *std.Io.Queue(PumpWork),
     completions: *std.Io.Queue(wire_pump.WriteCompletion),
     actor_wake: *std.Io.Event,
     gpa: std.mem.Allocator,
@@ -293,6 +555,7 @@ pub const Pump = struct {
     n_chunks: u32,
     read_free: *std.Io.Queue(u32),
     write_free: ?*std.Io.Queue(u32) = null,
+    cipher_free: *std.Io.Queue(u32),
     live_task_handlers: *std.atomic.Value(usize),
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
@@ -366,24 +629,147 @@ pub const Pump = struct {
             self.pending_read = null;
             if (chunk.pool_index) |idx| self.returnReadIndex(idx);
         }
-        while (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
-            if (isSentinel(chunk)) continue;
-            self.releaseChunk(chunk, false, false);
+        while (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
+            switch (item) {
+                .wire => |chunk| {
+                    if (isSentinel(chunk)) continue;
+                    self.releaseChunk(chunk, false, false);
+                },
+                .cipher => |chunk| recycleCipher(self.io, self.cipher_free, chunk.pool_index),
+                .eof => {},
+            }
         }
         self.post(.{ .fail_all = true });
     }
 
-    fn writeChunks(self: *Pump, writer: *std.Io.Writer, first: wire_pump.WireChunk) bool {
+    fn drainToSocket(self: *Pump) bool {
+        self.conn.drainToSocket() catch {
+            self.failDrain();
+            self.post(.{ .shutdown = true });
+            return false;
+        };
+        return true;
+    }
+
+    fn feedCipher(self: *Pump, bytes: []const u8) bool {
+        var off: usize = 0;
+        var spins: u32 = 0;
+        while (off < bytes.len) {
+            spins += 1;
+            if (spins > MaxHandshakeIterations) {
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return false;
+            }
+            const n = self.conn.pair.writeEncrypted(bytes[off..]) catch |err| switch (err) {
+                error.WantWrite => {
+                    // Pair full: SSL has not consumed inbound. Drain plaintext
+                    // out of SSL (which reads the pair) and outbound ciphertext
+                    // to the socket, then retry.
+                    switch (self.readOne()) {
+                        .eof => return false,
+                        .ok, .want => {},
+                    }
+                    if (!self.drainToSocket()) return false;
+                    continue;
+                },
+                else => {
+                    self.failDrain();
+                    self.post(.{ .shutdown = true });
+                    return false;
+                },
+            };
+            if (n == 0) {
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return false;
+            }
+            off += n;
+        }
+        return true;
+    }
+
+    fn sslWriteAll(self: *Pump, bytes: []const u8) bool {
+        var off: usize = 0;
+        var spins: u32 = 0;
+        while (off < bytes.len) {
+            spins += 1;
+            if (spins > MaxHandshakeIterations) {
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return false;
+            }
+            const n = self.conn.ssl.write(bytes[off..]) catch |err| switch (err) {
+                error.WantWrite => {
+                    if (!self.drainToSocket()) return false;
+                    continue;
+                },
+                error.WantRead => {
+                    if (!self.consumeInbound()) return false;
+                    continue;
+                },
+                else => {
+                    self.failDrain();
+                    self.post(.{ .shutdown = true });
+                    return false;
+                },
+            };
+            if (n == 0) {
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return false;
+            }
+            off += n;
+        }
+        return true;
+    }
+
+    /// SSL_write wanted ciphertext. Take the next work item without going
+    /// back to the main loop (the write is mid-record). Nested `getOne` is
+    /// still the one queue.
+    fn consumeInbound(self: *Pump) bool {
+        const item = io_queue.tryGet(PumpWork, self.work, self.io) orelse
+            self.work.getOne(self.io) catch {
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return false;
+            };
+        pump_trace.bump(&pump_trace.work_get);
+        switch (item) {
+            .cipher => |chunk| {
+                pump_trace.bump(&pump_trace.cipher_chunks);
+                defer recycleCipher(self.io, self.cipher_free, chunk.pool_index);
+                return self.feedCipher(chunk.bytes[0..chunk.len]);
+            },
+            .wire => |chunk| {
+                pump_trace.bump(&pump_trace.tryget_write);
+                if (self.carried == null) {
+                    self.carried = chunk;
+                    return true;
+                }
+                self.releaseChunk(chunk, false, false);
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return false;
+            },
+            .eof => {
+                self.failDrain();
+                self.postEof();
+                self.post(.{ .shutdown = true });
+                return false;
+            },
+        }
+    }
+
+    fn writeChunks(self: *Pump, first: wire_pump.WireChunk) bool {
         if (first.len == 0 and first.bytes.len == 0) {
             if (first.flush_barrier) {
                 pump_trace.bump(&pump_trace.write_chunks);
                 pump_trace.add(&pump_trace.write_chunk_sum, 1);
-                writer.flush() catch {
+                if (!self.drainToSocket()) {
                     self.releaseChunk(first, false, false);
-                    self.failDrain();
-                    self.post(.{ .shutdown = true });
                     return false;
-                };
+                }
                 self.releaseChunk(first, true, false);
                 return true;
             }
@@ -394,18 +780,37 @@ pub const Pump = struct {
 
         const max_batch = 16;
         var chunks: [max_batch]wire_pump.WireChunk = undefined;
-        var slices: [max_batch][]const u8 = undefined;
         chunks[0] = first;
         var count: usize = 1;
         if (self.test_delay_ms == 0 and self.test_fail_after == 0) {
             while (count < max_batch) {
-                const next = io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io) orelse break;
-                if (next.len == 0 and next.bytes.len == 0) {
-                    self.carried = next;
-                    break;
+                const next_item = io_queue.tryGet(PumpWork, self.work, self.io) orelse break;
+                switch (next_item) {
+                    .wire => |next| {
+                        if (next.len == 0 and next.bytes.len == 0) {
+                            self.carried = next;
+                            break;
+                        }
+                        chunks[count] = next;
+                        count += 1;
+                    },
+                    .cipher => |chunk| {
+                        pump_trace.bump(&pump_trace.cipher_chunks);
+                        const ok = self.feedCipher(chunk.bytes[0..chunk.len]);
+                        recycleCipher(self.io, self.cipher_free, chunk.pool_index);
+                        if (!ok) {
+                            for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
+                            return false;
+                        }
+                    },
+                    .eof => {
+                        for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
+                        self.failDrain();
+                        self.postEof();
+                        self.post(.{ .shutdown = true });
+                        return false;
+                    },
                 }
-                chunks[count] = next;
-                count += 1;
             }
         }
         if (self.test_delay_ms > 0) {
@@ -425,26 +830,17 @@ pub const Pump = struct {
         }
         pump_trace.bump(&pump_trace.write_chunks);
         pump_trace.add(&pump_trace.write_chunk_sum, count);
-        for (chunks[0..count], 0..) |chunk, i| {
-            slices[i] = chunk.bytes[0..chunk.len];
-        }
         if (wire_pump.write_trace.enabled) wire_pump.write_trace.note(count);
-        const write_result = if (count == 1)
-            writer.writeAll(slices[0])
-        else
-            writer.writeVecAll(slices[0..count]);
-        write_result catch {
-            for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
-            self.failDrain();
-            self.post(.{ .shutdown = true });
+        for (chunks[0..count]) |chunk| {
+            if (!self.sslWriteAll(chunk.bytes[0..chunk.len])) {
+                for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
+                return false;
+            }
+        }
+        if (!self.drainToSocket()) {
+            for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
             return false;
-        };
-        writer.flush() catch {
-            for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
-            self.failDrain();
-            self.post(.{ .shutdown = true });
-            return false;
-        };
+        }
         self.writes_done += count;
         for (chunks[0..count]) |chunk| self.releaseChunk(chunk, true, false);
         return true;
@@ -457,7 +853,7 @@ pub const Pump = struct {
         const chunk_size = limits_mod.WIRE_CHUNK_SIZE;
         // Never park on the actor's queues. TlsPump is the only writer, so a
         // blocking getOne(read_free) / putOne(read_ch) deadlocks mixed SSE:
-        // the actor fills write_ch while we wait here, then both sides wait.
+        // the actor fills the work queue while we wait here, then both sides wait.
         const idx = io_queue.tryGet(u32, self.read_free, self.io) orelse {
             pump_trace.bump(&pump_trace.read_free_empty_yield);
             self.io.sleep(.zero, .awake) catch {};
@@ -465,7 +861,7 @@ pub const Pump = struct {
         };
         const off = @as(usize, idx) * chunk_size;
         const buf = self.chunk_storage[off..][0..chunk_size];
-        const n = self.conn.tls_stream.read(buf) catch |err| switch (err) {
+        const n = self.conn.ssl.read(buf) catch |err| switch (err) {
             error.WantRead => {
                 pump_trace.bump(&pump_trace.want_read);
                 self.returnReadIndex(idx);
@@ -473,6 +869,7 @@ pub const Pump = struct {
             },
             error.WantWrite => {
                 self.returnReadIndex(idx);
+                if (!self.drainToSocket()) return .eof;
                 return .want;
             },
             else => {
@@ -507,93 +904,25 @@ pub const Pump = struct {
         return .ok;
     }
 
-    const Wait = union(enum) {
-        write: (std.Io.QueueClosedError || std.Io.Cancelable)!wire_pump.WireChunk,
-        peek: std.Io.Reader.Error![]u8,
-    };
-
-    fn waitWrite(queue: *std.Io.Queue(wire_pump.WireChunk), io: std.Io) (std.Io.QueueClosedError || std.Io.Cancelable)!wire_pump.WireChunk {
-        return queue.getOne(io);
-    }
-
-    fn waitPeek(reader: *std.Io.Reader) std.Io.Reader.Error![]u8 {
-        return reader.peekGreedy(1);
-    }
-
-    const SelectOutcome = struct {
-        write: ?wire_pump.WireChunk = null,
-        write_closed: bool = false,
-        peek_err: bool = false,
-    };
-
-    /// `Select.cancelDiscard` closes the result queue *before* joining the
-    /// waiters. A completed `waitWrite` then hits `error.Closed` and the
-    /// WireChunk is dropped — outbound_held stays reserved until deinit
-    /// panics. `cancel` joins first, then returns the leftover result.
-    fn applyWait(out: *SelectOutcome, wait: Wait) void {
-        switch (wait) {
-            .write => |result| {
-                const chunk = result catch |err| switch (err) {
-                    error.Canceled => return,
-                    error.Closed => {
-                        out.write_closed = true;
-                        return;
-                    },
-                };
-                std.debug.assert(out.write == null);
-                out.write = chunk;
-            },
-            .peek => |result| {
-                if (result) |_| {} else |_| {
-                    out.peek_err = true;
-                }
-            },
+    fn ingestCipher(self: *Pump, chunk: CipherChunk) bool {
+        pump_trace.bump(&pump_trace.cipher_chunks);
+        defer recycleCipher(self.io, self.cipher_free, chunk.pool_index);
+        if (!self.feedCipher(chunk.bytes[0..chunk.len])) return false;
+        switch (self.readOne()) {
+            .eof => return false,
+            .ok, .want => return true,
         }
     }
 
-    fn collectSelect(select: *std.Io.Select(Wait), first: ?Wait) SelectOutcome {
-        var out: SelectOutcome = .{};
-        if (first) |wait| applyWait(&out, wait);
-        while (select.cancel()) |wait| applyWait(&out, wait);
-        return out;
-    }
-
-    /// True when the kernel already has a TCP byte. ioctl FIONREAD is a
-    /// count, not posix.poll, and does not consume. The fill itself stays on
-    /// zio NetRecv (`peekGreedy`) so the EV_CLEAR drain-to-EAGAIN contract
-    /// holds. A MSG_DONTWAIT recvfrom beside that path consumed the edge and
-    /// hung tls-smoke `/big` (WINDOW_UPDATE parked waitPeek).
-    fn kernelHasTcpByte(fd: std.posix.fd_t) bool {
-        const req: c_int = switch (@import("builtin").os.tag) {
-            .linux => @intCast(std.os.linux.T.FIONREAD),
-            .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .dragonfly, .netbsd, .openbsd => 0x4004667f,
-            else => return false,
-        };
-        var avail: c_int = 0;
-        if (std.c.ioctl(fd, req, &avail) < 0) return false;
-        return avail > 0;
-    }
-
-    /// Pull kernel bytes into the TCP reader without parking. `std.Io.Reader`
-    /// has no try-fill and `netRead` waits, which is why a quiet turn used to
-    /// Select just to discover a byte already in the kernel (phase 1: 98.5% of
-    /// oneshot-only Selects were peek-wins). BIO_read only sees `buffered()`.
-    /// Parked wait stays a two-arm Select.
-    fn tryFillTcp(self: *Pump) bool {
-        const r = &self.conn.tcp_reader.interface;
-        if (r.bufferedLen() > 0) return true;
-        if (!kernelHasTcpByte(self.conn.tcp_stream.socket.handle)) return false;
-        _ = r.peekGreedy(1) catch return false;
-        return true;
-    }
-
     pub fn run(self: *Pump) void {
-        const writer = self.conn.writer();
+        // Recreate the writer on this task. Handshake bound one on the
+        // handshake Select arm; that wait context is gone.
+        self.conn.bindWriter(self.io);
         while (!self.stopped.load(.acquire)) {
             pump_trace.bump(&pump_trace.turns);
             if (self.carried) |chunk| {
                 self.carried = null;
-                if (!self.writeChunks(writer, chunk)) return;
+                if (!self.writeChunks(chunk)) return;
                 continue;
             }
             if (self.pending_read) |chunk| {
@@ -601,9 +930,10 @@ pub const Pump = struct {
                     self.pending_read = null;
                     self.actor_wake.set(self.io);
                 } else {
-                    if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |w| {
-                        pump_trace.bump(&pump_trace.tryget_write);
-                        if (!self.writeChunks(writer, w)) return;
+                    const item = io_queue.tryGet(PumpWork, self.work, self.io);
+                    if (item) |found| {
+                        pump_trace.bump(&pump_trace.work_get);
+                        if (!self.dispatch(found)) return;
                     } else {
                         pump_trace.bump(&pump_trace.pending_read_retry);
                         self.io.sleep(.zero, .awake) catch {};
@@ -611,86 +941,43 @@ pub const Pump = struct {
                     continue;
                 }
             }
-            if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
-                pump_trace.bump(&pump_trace.tryget_write);
-                if (!self.writeChunks(writer, chunk)) return;
-                continue;
-            }
-            if (self.conn.pendingPlaintext() > 0 or self.conn.ciphertextBuffered() > 0 or self.tryFillTcp()) {
+            if (self.conn.pendingPlaintext() > 0) {
                 switch (self.readOne()) {
                     .eof => return,
                     .ok => continue,
-                    // BIO had no byte. Do not retry SSL_read; Select so a
-                    // write can run while we wait for the next TCP byte.
                     .want => {},
                 }
             }
-            if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
-                pump_trace.bump(&pump_trace.tryget_write);
-                if (!self.writeChunks(writer, chunk)) return;
-                continue;
-            }
 
-            pump_trace.bump(&pump_trace.select);
-            var result_buf: [2]Wait = undefined;
-            var select = std.Io.Select(Wait).init(self.io, &result_buf);
-            select.concurrent(.write, waitWrite, .{ self.from_actor, self.io }) catch {
-                _ = collectSelect(&select, null);
-                self.failDrain();
-                self.post(.{ .fail_all = true, .shutdown = true });
-                return;
-            };
-            select.concurrent(.peek, waitPeek, .{&self.conn.tcp_reader.interface}) catch {
-                const lost = collectSelect(&select, null);
-                if (lost.write) |chunk| self.releaseChunk(chunk, false, false);
-                self.failDrain();
-                self.post(.{ .fail_all = true, .shutdown = true });
-                return;
-            };
-            const selected = select.await() catch {
-                const lost = collectSelect(&select, null);
-                if (lost.write) |chunk| self.releaseChunk(chunk, false, false);
-                self.failDrain();
-                self.post(.{ .shutdown = true });
-                return;
-            };
-            const out = collectSelect(&select, selected);
-            // A cancelled peek returns ReadFailed. That is not peer EOF when
-            // write won — ignore the loser. When peek won, a recovered write
-            // chunk is still preferred so SSE is not parked behind SSL_read.
-            switch (selected) {
-                .write => {
-                    pump_trace.bump(&pump_trace.select_write);
-                    if (out.write_closed and out.write == null) {
-                        self.failDrain();
-                        self.post(.{ .fail_all = true, .shutdown = true });
-                        return;
-                    }
-                    if (out.write) |chunk| {
-                        if (!self.writeChunks(writer, chunk)) return;
-                    }
-                },
-                .peek => {
-                    pump_trace.bump(&pump_trace.select_peek);
-                    if (out.write) |chunk| {
-                        if (!self.writeChunks(writer, chunk)) return;
-                    }
-                    if (out.peek_err) {
-                        self.failDrain();
-                        self.postEof();
-                        self.post(.{ .shutdown = true });
-                        return;
-                    }
-                    switch (self.readOne()) {
-                        .eof => return,
-                        .ok, .want => {},
-                    }
-                },
-            }
+            // The only wait: one queue, no Select.
+            const item = io_queue.tryGet(PumpWork, self.work, self.io) orelse
+                self.work.getOne(self.io) catch {
+                    self.failDrain();
+                    self.post(.{ .fail_all = true, .shutdown = true });
+                    return;
+                };
+            pump_trace.bump(&pump_trace.work_get);
+            if (!self.dispatch(item)) return;
         }
-        writer.flush() catch {};
+        _ = self.drainToSocket();
         self.failDrain();
         self.post(.{ .shutdown = true });
+    }
+
+    fn dispatch(self: *Pump, item: PumpWork) bool {
+        switch (item) {
+            .cipher => |chunk| return self.ingestCipher(chunk),
+            .wire => |chunk| {
+                pump_trace.bump(&pump_trace.tryget_write);
+                return self.writeChunks(chunk);
+            },
+            .eof => {
+                self.failDrain();
+                self.postEof();
+                self.post(.{ .shutdown = true });
+                return false;
+            },
+        }
     }
 
     pub fn stop(self: *Pump) void {
@@ -722,4 +1009,19 @@ test "pump_trace moves on read_free-empty yield" {
         try std.testing.expect(pump_trace.read_one.load(.acquire) >= r0 + 1);
         try std.testing.expect(pump_trace.read_free_empty_yield.load(.acquire) >= y0 + 1);
     }
+}
+
+test "memory BIO pair is bounded and opposite directions do not mix" {
+    var pair = try boring.ssl.BioPair.init(256);
+    defer pair.deinit();
+    const wrote = try pair.writeEncrypted("hello");
+    try std.testing.expectEqual(@as(usize, 5), wrote);
+    // writeEncrypted feeds the SSL half; readEncrypted is the SSL-outbound
+    // half and stays empty until SSL_write.
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.WantRead, pair.readEncrypted(&buf));
+}
+
+test "PumpWork fits a queue slot and is not smaller than a WireChunk" {
+    try std.testing.expect(@sizeOf(PumpWork) >= @sizeOf(wire_pump.WireChunk));
 }

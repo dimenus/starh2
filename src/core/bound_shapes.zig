@@ -23,6 +23,7 @@ const hpack = @import("hpack.zig");
 const session_mod = @import("session.zig");
 const fair_scheduler = @import("../edge/fair_scheduler.zig");
 const router_mod = @import("../http/router.zig");
+const tls_edge = @import("../edge/tls.zig");
 
 /// Zig `default_max_load_percentage` — must match std.hash_map.
 pub const HASH_MAP_MAX_LOAD_PERCENTAGE: u32 = 80;
@@ -78,6 +79,7 @@ pub fn hashMapBytes(comptime K: type, comptime V: type, n: usize) error{Overflow
 
 pub const JOIN_HANDLE_SIZE: usize = @sizeOf(std.Io.Future(void));
 pub const WIRE_CHUNK_DESC_SIZE: usize = @sizeOf(wire_pump.WireChunk);
+pub const PUMP_WORK_SIZE: usize = @sizeOf(tls_edge.PumpWork);
 pub const WRITE_COMPLETION_SIZE: usize = @sizeOf(wire_pump.WriteCompletion);
 pub const TICKET_WAIT_SIZE: usize = @sizeOf(ticket_table.TicketWait);
 pub const STREAM_SIZE: usize = @sizeOf(stream_mod.Stream);
@@ -134,6 +136,7 @@ test "hash map bytes never undercount alignment" {
 test "concrete sizes nonzero" {
     try std.testing.expect(JOIN_HANDLE_SIZE > 0);
     try std.testing.expect(WIRE_CHUNK_DESC_SIZE >= @sizeOf(usize));
+    try std.testing.expect(PUMP_WORK_SIZE >= WIRE_CHUNK_DESC_SIZE);
     try std.testing.expect(WRITE_COMPLETION_SIZE <= 64);
     try std.testing.expect(STREAM_SIZE > 0);
     try std.testing.expect(INTENT_SIZE > 0);

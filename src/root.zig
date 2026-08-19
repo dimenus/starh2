@@ -17,7 +17,7 @@
 //!
 //! # The shape of a request
 //!
-//! socket -> `ReadPump` (h2c) or `TlsPump` (TLS) -> actor -> `Session.ingest`
+//! socket -> `ReadPump` (h2c) or `CipherRead`+`TlsPump` (TLS) -> actor -> `Session.ingest`
 //! -> `Intent.dispatch_request` -> `Router` -> complete handler on the actor,
 //! or a handler task -> `Response` -> `Session` command -> `Intent` ->
 //! `FairScheduler` -> `queueWire` -> WritePump (h2c) or TlsPump (TLS) -> socket.

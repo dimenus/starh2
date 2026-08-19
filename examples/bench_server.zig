@@ -791,7 +791,8 @@ fn driveOneshots(gpa: std.mem.Allocator, io: std.Io, tls: bool, peer: starh2.End
     const stream = try peer.connect(io, .{ .mode = .stream });
     if (tls) {
         var conn: tls_edge.Conn = undefined;
-        conn.initTcp(io, stream);
+        conn.initTcp(stream);
+        conn.bindIo(io);
         defer {
             conn.deinit();
             stream.close(io);

@@ -92,8 +92,8 @@ see `tools/README.md`.
   Session access with `session_mu`; handlers communicate through commands.
 - ReadPump and WritePump are the sole owners of their socket directions on h2c.
   On TLS, `TlsPump` is the sole SSL_read/SSL_write owner; never share an SSL
-  object with a second task. `session_mu` covers Session and FairScheduler, not
-  the cipher.
+  object with a second task. `CipherRead` posts ciphertext and never touches
+  SSL. `session_mu` covers Session and FairScheduler, not the cipher.
 - All production wire output passes through `FairScheduler`'s sink. Preserve
   the `test_queue_wire_bypass == 0` mutation canary.
 - Outbound accounting distinguishes pending body bytes from framed wire bytes.
@@ -114,17 +114,20 @@ fetched boring package so zig-cc glibc headers do not -Werror memchr on
 `aarch64-linux-gnu`. Do not wrap a record API beside this stream.
 
 - `TlsPump` is the sole SSL_read/SSL_write owner. Concurrent ReadPump+WritePump
-  on one SSL object is a data race; h2c keeps the dual pumps. BIO_read must not
-  `peekGreedy`: an empty TCP buffer returns WANT_READ so the pump can SSL_write.
-  Handshake still waits in `tls_retry`. The adapter lives in `src/edge/tls_async.zig`
-  (forked from boring v0.1.1 `async.zig`); do not import `boring.async` for the
-  edge path.
-- Handshake runs on the actor (blocking SSL_accept) before `TlsPump` starts,
-  then leftover plaintext (a pipelined preface) is ingested.
+  on one SSL object is a data race; h2c keeps the dual pumps. TLS ciphertext
+  arrives through a dedicated read task posting to the pump's one work queue
+  (`queue.get`, no Select). The SSL object's BIOs are a bounded memory pair
+  (`BIO_new_bio_pair` in `src/edge/tls.zig`); do not restore socket-coupled
+  BIO callbacks. Handshake still runs on the actor (blocking SSL_accept over
+  the same memory BIOs) with the read task already the ciphertext source.
+- Handshake leftover plaintext (a pipelined preface) is ingested on the actor
+  before `TlsPump` starts.
 - Packing stays in `emit_batch` (16 KiB concat). Do not put a record loop back
   on the actor.
 - Per-connection TLS Io buffers are bounded by `Limits.tls_stream_bytes`
-  (floor `TLS_CONN_BUFFER_BYTES` = four `BioStreamBufferSize` buffers).
+  (floor `TLS_CONN_BUFFER_BYTES` = tcp in/out + BioPair). The ciphertext
+  chunk pool and work queue are separate declared terms
+  (`tls_cipher_chunks_per_connection`).
 - Intent payloads, decoded headers, dispatch requests, scheduler leases, and
   tickets have explicit owners. Error paths must release exactly once.
 - `std.testing.FailingAllocator` is not thread-safe; fail-index/counting tests
