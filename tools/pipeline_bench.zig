@@ -336,6 +336,104 @@ fn sessionOp(ctx: *SessionCtx) !usize {
     return mixed_request_block.len + "Hello, World!".len;
 }
 
+fn hopHello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, "Hello, World!");
+}
+
+const hop_routes = [_]starh2.Route{.{
+    .method = .GET,
+    .path = "/",
+    .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHello } },
+}};
+
+fn openLoopbackPair(io: std.Io) !struct { accepted: std.Io.net.Stream, peer: std.Io.net.Stream } {
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try bind.listen(io, .{ .reuse_address = true });
+    const dest = listener.socket.address;
+    const peer = dest.connect(io, .{ .mode = .stream }) catch |err| {
+        listener.socket.close(io);
+        return err;
+    };
+    const accepted = listener.accept(io) catch |err| {
+        peer.close(io);
+        listener.socket.close(io);
+        return err;
+    };
+    listener.socket.close(io);
+    return .{ .accepted = accepted, .peer = peer };
+}
+
+/// Session + scheduler + inline complete-handler encode + local receipt.
+/// No WritePump, no socket write. The hop Go inlines when the write fits.
+const ConnHopCtx = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    peer: std.Io.net.Stream,
+    slabs: starh2.edge.slab_pool.SlabPool,
+    hop: starh2.edge.connection.BenchHop,
+    wire: [frame.FRAME_HEADER_LEN + seed_request_block.len]u8 = undefined,
+    next_stream_id: u31,
+
+    fn init(self: *ConnHopCtx, io: std.Io, gpa: std.mem.Allocator) !void {
+        self.io = io;
+        self.gpa = gpa;
+        self.slabs = try starh2.edge.slab_pool.SlabPool.init(
+            gpa,
+            io,
+            starh2.Limits.defaults.outbound_bytes_per_stream,
+            8,
+        );
+        errdefer self.slabs.deinit(gpa);
+
+        const pair = try openLoopbackPair(io);
+        errdefer pair.peer.close(io);
+        self.peer = pair.peer;
+        try self.hop.open(pair.accepted, .{
+            .io = io,
+            .mode = .h2c,
+            .limits = starh2.Limits.defaults,
+            .router = .{ .routes = &hop_routes },
+            .gpa = gpa,
+            .slab_pool = &self.slabs,
+        });
+        errdefer self.hop.deinit();
+
+        self.next_stream_id = 1;
+        try self.hop.preparePreface();
+        try self.request(&seed_request_block);
+    }
+
+    fn deinit(self: *ConnHopCtx) void {
+        self.hop.deinit();
+        self.peer.close(self.io);
+        self.slabs.deinit(self.gpa);
+    }
+
+    fn setWire(self: *ConnHopCtx, block: []const u8, stream_id: u31) []const u8 {
+        var header: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        (frame.FrameHeader{
+            .length = @intCast(block.len),
+            .type = .headers,
+            .flags = .{ .end_stream = true, .end_headers = true },
+            .stream_id = stream_id,
+        }).encode(&header);
+        @memcpy(self.wire[0..frame.FRAME_HEADER_LEN], &header);
+        @memcpy(self.wire[frame.FRAME_HEADER_LEN..][0..block.len], block);
+        return self.wire[0 .. frame.FRAME_HEADER_LEN + block.len];
+    }
+
+    fn request(self: *ConnHopCtx, block: []const u8) !void {
+        const stream_id = self.next_stream_id;
+        self.next_stream_id += 2;
+        _ = try self.hop.completeOneshot(self.setWire(block, stream_id));
+    }
+};
+
+fn connHopOp(ctx: *ConnHopCtx) !usize {
+    try ctx.request(&mixed_request_block);
+    return mixed_request_block.len + "Hello, World!".len;
+}
+
 const SessionPhases = struct {
     ingress: Stats,
     headers: Stats,
@@ -730,6 +828,19 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     printRow("  Session HEADERS phase*", phase_iterations, phases.headers, 1, 23);
     printRow("  Session DATA phase*", phase_iterations, phases.data, 1, 22);
 
+    var conn_hop: ConnHopCtx = undefined;
+    try conn_hop.init(io, gpa);
+    defer conn_hop.deinit();
+    const hop_stats = try benchmark(io, cfg.iterations, cfg.rounds, &conn_hop, connHopOp);
+    var hop_counter: AllocCounter = .{ .parent = gpa };
+    var counted_hop: ConnHopCtx = undefined;
+    try counted_hop.init(io, hop_counter.allocator());
+    defer counted_hop.deinit();
+    hop_counter.reset();
+    for (0..count_n) |_| _ = try connHopOp(&counted_hop);
+    const hop_rate = allocationRate(&hop_counter, count_n);
+    printRow("Connection complete oneshot", cfg.iterations, hop_stats, hop_rate.allocs, hop_rate.bytes);
+
     var pack: PackCtx = .{};
     const pack_stats = try benchmark(io, cfg.iterations, cfg.rounds, &pack, packSixOp);
     printRow("TLS pack 6 HEADERS+DATA", cfg.iterations, pack_stats, 0, 0);
@@ -775,7 +886,9 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
             "ticket parked wake includes a concurrent complete; compare to empty task spawn.\n" ++
             "AES-GCM is std.crypto; tls.zig encrypt is one TLS 1.3 record via connectionEncrypt.\n" ++
             "enc+dec 64B is peer encrypt plus our decrypt (inbound oneshot-sized record).\n" ++
-            "encrypt 300B / 6 is packed outbound per response; do not cite as the live TLS tax.\n",
+            "encrypt 300B / 6 is packed outbound per response; do not cite as the live TLS tax.\n" ++
+            "Connection complete oneshot is Session + scheduler + inline encode + local ack;\n" ++
+            "still no socket. Compare it to http2.zig's inline request core, not to Session alone.\n",
         .{},
     );
 }

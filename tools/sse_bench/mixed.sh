@@ -43,8 +43,12 @@ cd "$REPO/tools/sse_bench"
 go build -o "$OUT/sse-server" ./server.go || exit 1
 cd "$REPO"
 
+TRACE_ARGS=
+if [ "${TRACE:-0}" != 0 ]; then
+  TRACE_ARGS=--trace
+fi
 "$STARH2" --mode tls --port 19450 --sse-interval-ms "$INTERVAL" \
-  --executors "$STARH2_EXECUTORS" > "$OUT/starh2.log" 2>&1 &
+  --executors "$STARH2_EXECUTORS" $TRACE_ARGS > "$OUT/starh2.log" 2>&1 &
 S_PID=$!
 "$OUT/sse-server" -port 19451 -sse-interval-ms "$INTERVAL" \
   -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
@@ -125,6 +129,33 @@ if [ "${STALL:-1}" != 0 ]; then
   "$OUT/sse-client" -url "https://127.0.0.1:19451/sse" -streams "$STREAMS" -stall \
     -oneshot-url "https://127.0.0.1:19451/" -oneshot-workers "$ONESHOT_WORKERS" \
     -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label go-net/http | sed 's/^/  /'
+fi
+
+if [ "${TRACE:-0}" != 0 ]; then
+  echo "== /trace inbound leftover (after oneshot-only + mixed + stall)"
+  curl -sk --http2 "https://127.0.0.1:19450/trace" > "$OUT/trace.json"
+  python3 - "$OUT/trace.json" <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))
+def d(k):
+    return b.get(k, 0)
+take = d("read_take_n")
+left0 = d("read_left_0")
+print(
+    "  takes=%d  leftover: 0=%d 1=%d 2=%d 3=%d >=4=%d"
+    % (take, left0, d("read_left_1"), d("read_left_2"), d("read_left_3"), d("read_left_ge4"))
+)
+print(
+    "  mean leftover=%.2f  max=%d  backlog_rate=%.2f%%"
+    % (d("read_left_sum") / max(take, 1), b.get("read_left_max", 0), 100.0 * (take - left0) / max(take, 1))
+)
+b1 = d("inbound_batch_1"); b2 = d("inbound_batch_2"); b3 = d("inbound_batch_3"); b4 = d("inbound_batch_4")
+turns = b1 + b2 + b3 + b4
+print(
+    "  ingest turns: 1=%d 2=%d 3=%d 4=%d  mean chunks/turn=%.2f"
+    % (b1, b2, b3, b4, (b1 + 2 * b2 + 3 * b3 + 4 * b4) / max(turns, 1))
+)
+PY
 fi
 
 cleanup

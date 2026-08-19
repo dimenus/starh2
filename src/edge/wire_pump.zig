@@ -13,7 +13,7 @@
 //! slice, so a pump can be canceled at any point without leaving shared state
 //! half-written. Every consequence of a write — released bytes, a completed
 //! ticket, a control-pool entry — travels back as data in a `WriteCompletion`
-//! and is applied by the AckDrainer.
+//! and is applied by the actor.
 //!
 //! ## The WritePump exit contract
 //!
@@ -33,19 +33,19 @@ pub const WriteCompletion = struct {
     /// Number of ticket slots linked from `ticket_slot` for this one write.
     ticket_count: u32 = 0,
     ok: bool = true,
-    /// Connection-local outbound bytes to release (AckDrainer applies).
+    /// Connection-local outbound bytes to release (actor applies).
     outbound_release: usize = 0,
     /// Successful socket-write completion time for trace attribution.
     written_ns: u64 = 0,
-    /// Control-pool bytes and entry count to release (AckDrainer applies).
+    /// Control-pool bytes and entry count to release (actor applies).
     control_release: usize = 0,
     control_entries: u32 = 0,
     /// Fail every in-flight ticket (write pump transport failure).
     fail_all: bool = false,
-    /// Shut down AckDrainer.
+    /// Last completion the WritePump posts; actor treats remaining acks as done.
     shutdown: bool = false,
-    /// This write carries a complete-handler drain-turn receipt. AckDrainer
-    /// wakes the actor only for these, not for ordinary/SSE tickets.
+    /// This write carries a complete-handler drain-turn receipt. The actor
+    /// publishes credit only for these, not for ordinary/SSE tickets.
     complete_batch_receipt: bool = false,
 };
 
@@ -183,6 +183,10 @@ pub const WritePump = struct {
     stream: std.Io.net.Stream,
     from_actor: *std.Io.Queue(WireChunk),
     completions: *std.Io.Queue(WriteCompletion),
+    /// Set after each completion post so a parked actor can `tryGet` without
+    /// Selecting on this queue. A cancelled Select `getOne` can drop the
+    /// completion; the queue itself is the durable flag.
+    actor_wake: *std.Io.Event,
     gpa: std.mem.Allocator,
     /// When set, `WireChunk.pool_index` is returned here instead of `gpa.free`.
     /// Tests that feed GPA-owned chunks leave this null.
@@ -196,6 +200,7 @@ pub const WritePump = struct {
         self.completions.putOneUncancelable(self.io, c) catch {
             // Ack queue closure means connection teardown will release queued ownership.
         };
+        self.actor_wake.set(self.io);
     }
 
     fn releaseChunk(self: *WritePump, chunk: WireChunk, ok: bool, fail_all: bool) void {
@@ -255,20 +260,17 @@ pub const WritePump = struct {
         self.post(.{ .fail_all = true });
     }
 
-    /// Write chunks in FIFO order, gathering already-queued chunks into one
-    /// vectored socket write. Each chunk still receives its own ordered
-    /// completion after the whole vector succeeds.
-    ///
-    /// Serial writes are what make a flush barrier meaningful: a completion for
-    /// chunk N proves that chunks 1..N-1 were written first. Frame ORDER is
-    /// decided upstream by the `FairScheduler`; this task only preserves it.
+    /// Write chunks in FIFO order, gathering already-queued chunks into the
+    /// buffered writer. Completions fire only after an explicit flush, so a
+    /// ticket still means the bytes reached the socket — not merely this
+    /// buffer. Frame ORDER is decided upstream by the `FairScheduler`.
     ///
     /// Two zero-length chunks mean different things, and the flag tells them
-    /// apart. With `flush_barrier` it is a flush that had no bytes of its own,
-    /// and it completes successfully because everything before it was written.
-    /// Without it, it is the shutdown sentinel.
+    /// apart. With `flush_barrier` it is a flush that had no bytes of its own:
+    /// drain the buffer, then complete. Without it, it is the shutdown sentinel.
     pub fn run(self: *WritePump) void {
-        var writer = self.stream.writer(self.io, &.{});
+        var write_buf: [limits_mod.WIRE_CHUNK_SIZE]u8 = undefined;
+        var writer = self.stream.writer(self.io, &write_buf);
         var carried: ?WireChunk = null;
         while (!self.stopped.load(.acquire)) {
             const first = if (carried) |chunk| blk: {
@@ -281,7 +283,13 @@ pub const WritePump = struct {
             };
             if (first.len == 0 and first.bytes.len == 0) {
                 if (first.flush_barrier) {
-                    // Empty flush barrier: success after prior writes already completed.
+                    // Empty flush barrier: drain the buffer, then complete.
+                    writer.interface.flush() catch {
+                        self.releaseChunk(first, false, false);
+                        self.failDrain();
+                        self.post(.{ .shutdown = true });
+                        return;
+                    };
                     self.releaseChunk(first, true, false);
                     continue;
                 }
@@ -340,9 +348,19 @@ pub const WritePump = struct {
                 self.post(.{ .shutdown = true });
                 return;
             };
+            // Ticket completions stay behind this flush. writeAll into the
+            // buffer is not delivery; a cancelled pump must not ack a receipt
+            // whose bytes are still sitting here.
+            writer.interface.flush() catch {
+                for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return;
+            };
             self.writes_done += count;
             for (chunks[0..count]) |chunk| self.releaseChunk(chunk, true, false);
         }
+        writer.interface.flush() catch {};
         self.post(.{ .shutdown = true });
     }
 

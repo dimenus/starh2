@@ -95,9 +95,12 @@ tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
 ```
 
 `TLS pack 6 HEADERS+DATA` is a few nanoseconds and zero allocs. Do not
-spend another round on the memcpy. Isolated Session request+response now
-sits close to http2.zig's inline core (~630 ns vs ~567); empty zio
-spawn+await is what complete handlers no longer pay.
+spend another round on the memcpy. Isolated Session request+response is
+~640 ns (7 allocs). `Connection complete oneshot` — Session + scheduler +
+inline encode + local already-signaled receipt, still no socket — is
+~1680 ns and 0 allocs. http2.zig's comparable `inline request core` is
+~334 ns. The hop above Session is ~1 µs; it is not the live ~60 µs p50
+gap. Empty zio spawn+await is what complete handlers no longer pay.
 
 The TLS cipher is not the live tax. `bench-pipeline` now times
 `std.crypto` AES-GCM and `connectionEncrypt` of a 64-byte inbound record
@@ -196,7 +199,8 @@ Live one-shot is no longer an alloc, spawn, HPACK, Huffman, parse, or
 h2c-unpacked-write story. Complete oneshots share one drain-turn receipt
 (`tickets/handoff` near 1; packing is `records/response`). The actor no
 longer `waitTicket`s that receipt: pending complete-batch receipts are
-depth 2, AckDrainer reports, the actor consumes already-complete tickets.
+depth 4, the actor applies WritePump completions and consumes already-complete
+tickets.
 Re-run `tools/oneshot-phase-trace.sh` and the official bench; they move
 with the machine.
 
@@ -238,8 +242,8 @@ Do not name the remaining HTTP/2 residue “one actor per connection”.
 http2.zig also has one connection task. The oneshot p50 vs Go was **who
 waits the write**: keep (`67c96ab`) encoded complete oneshots on the
 actor and `waitTicket`ed, so ingest of the next HEADERS waited on
-WritePump. That wait moved off the actor (receipt kept; AckDrainer still
-only reports). AES, packing, HPACK, and handshake are not that gap.
+WritePump. That wait moved off the actor (receipt kept; the actor applies
+the write completion). AES, packing, HPACK, and handshake are not that gap.
 
 Darwin, 2026-08-18, interleaved 8 workers / 1 TLS connection /
 `STARH2_EXECUTORS=2` / same Go client as `mixed.sh` oneshot-only,
@@ -254,8 +258,110 @@ this working tree. Keep-vs-keep p50 spread was 1 µs.
 
 `complete_receipt_depth_max` reached **2** on that 8-worker load
 (`--trace` `/trace`) and on `tools/oneshot-phase-trace.sh` (h2load
-`-n 400000 -c 50 -m 10 -t 4`). Packing: `records/response = 0.10`.
+`-n 400000 -c 50 -m 10 -t 4`) at capacity 2. Packing: `records/response = 0.10`.
 Do not retry a 50 µs actor sleep to buy SSE cadence.
+
+Receipt-depth occupancy (`--trace` fields `receipt_depth_*`,
+`receipt_full_*`, `inline_full_*`, `credit_reuse_*`, `read_left_*`;
+printed by `oneshot-phase-trace.sh`). Darwin 2026-08-18.
+
+Inbound leftover (`read_left_*`): after each actor take, how many
+`read_ch` chunks still sit. `0` means a bounded inbound batch would have
+found nothing. Packed h2load `-c 50 -m 10` 400k: takes=40160, leftover
+0=40097 1=50 2=13, mean 0.00, max 2, **backlog 0.16%**. Mixed-shape
+`TRACE=1` (8 workers, 1 TLS conn, oneshot-only + mixed + stall, 5s+1s):
+takes=539384, leftover 0=202331 1=138954 2=91523 3=49730 >=4=56846,
+mean **1.42**, max **7** (queue cap 8), **backlog 62%**. That row is why
+`inbound_chunk_batch = 4` landed. Do not size the batch with
+`io_queue.queued`. Do not widen the credit window past 4.
+
+Capacity 2:
+
+| load | entered full | time/enter | inline skipped while full | ack→credit reuse |
+|---|---|---|---|---|
+| packed h2load `-c 50 -m 10` 400k | 469 | 349 µs | **13** (mean inline_n 10) | 397 µs |
+| 8 workers, 1 TLS conn, oneshot-only + mixed 5s+1s | 104671 | 99 µs | **590664** (mean 2.3, max 8) | 47 µs |
+
+Capacity 4 ABA (same machine). Packed h2load: max depth 3, `inline_full_n=0`,
+`records/response=0.10`. Mixed-shape `--trace`: max depth 4, entered full
+52110, 93 µs/enter, **inline_full_n=220866** (mean 1.9, max 7), credit reuse
+44 µs. Skips dropped ~63% and did not vanish.
+
+Inspect without `--trace` (`STREAMS=32 INTERVAL=10 SECONDS_RUN=5 WARMUP=1
+ONESHOT_WORKERS=8 STARH2_EXECUTORS=2 ROUNDS=3`):
+
+| arm | oneshot-only | mixed oneshot | mixed SSE | stall oneshot |
+|---|---|---|---|---|
+| starh2 cap 2 | 35k / 220 µs | 36k / 216–218 µs | 16000 | 36k |
+| starh2 cap 4 | 40k / 186 µs | 40k / 199–200 µs | 16000 | 40k |
+| Go net/http | 48k / 159–160 µs | 47k / 164–165 µs | 16000 | 47k |
+
+Cap 4 bought ~5k rps and ~35 µs oneshot-only p50; mixed SSE stayed at par;
+stall stayed 31/32. Remaining gap vs Go is ~8k rps / ~26 µs oneshot-only
+and ~7k / ~35 µs mixed. Do not widen to 8 from this row: depth 4 is still
+full and skips are still huge, so the window is no longer the first
+suspect. Do not undo cap 4 — the inspect moved.
+
+Pin actor vs WritePump on different executors is dead: zio has no
+placement / `spawnOn` / affinity API. Do not change zio for a home.
+
+Actor-owned write acks (no AckDrainer task). WritePump stays a pure byte
+owner and sets `actor_wake` after each completion post — Selecting
+`write_ack_ch` dropped a SETTINGS ack when another arm cancelled
+`getOne` (lifecycle leaked `outbound=9`). Same mixed inspect, Darwin
+2026-08-18:
+
+| arm | oneshot-only | mixed oneshot | mixed SSE | stall oneshot |
+|---|---|---|---|---|
+| starh2 actor acks | 42k / 186–187 µs | 38–41k / 195–204 µs | 16000 | 39k / 199 µs |
+| Go net/http | 40–48k / 159–193 µs | 39–47k / 164–197 µs | 16000 | 39k / 197 µs |
+
+Go round 3 dipped (40k / 193 µs); rounds 1–2 stayed 47–48k / 159–161 µs.
+starh2 oneshot-only +2k rps vs cap 4, p50 unchanged. Mixed SSE stayed at
+par (16009–16017). Stall 31/32, 15507 events. Packed
+`oneshot-phase-trace.sh`: `records/response=0.10`, credit reuse 3.5 µs,
+`inline_full_n=0`. This is not the remaining gap vs Go (~6k rps / ~27 µs
+oneshot-only on the stable Go rounds). Keep the ownership change; do not
+undo it to chase those microseconds.
+
+Buffered WritePump + explicit flush (std.Io grain; tickets still complete
+only after `flush`, not after `writeAll` into the buffer). Same mixed
+inspect, Darwin 2026-08-18:
+
+| arm | oneshot-only | mixed oneshot | mixed SSE | stall oneshot |
+|---|---|---|---|---|
+| starh2 buffered write | 42k / 185–187 µs | 41k / 195–196 µs | 16000 | 41k / 196 µs |
+| Go net/http | 48k / 158 µs | 47k / 164–165 µs | 16000 | 47k / 164 µs |
+
+Oneshot-only p50/rps did not move toward Go. Mixed oneshot is steadier
+than the actor-ack row (no 38k dip). SSE stayed at par (16004–16014).
+Stall 31/32, 15503 events. Packed `oneshot-phase-trace.sh`:
+`records/response=0.10`, credit reuse 6.2 µs, `write_chunks/call=1.00`.
+Syscall coalescing was already the gather-16 path; the buffer is the
+`std.Io` shape, not the remaining ~6k rps / ~27 µs. Keep it. Do not
+complete receipts before flush. Do not widen the credit window and do
+not encrypt-on-WritePump.
+
+Bounded inbound `read_ch` batch (`inbound_chunk_batch = 4`). After the
+first take, `tryGet` up to 3 more; decrypt each chunk; drain write acks
+and complete receipts between extras; one `runPendingInline` after the
+batch. Extra EOF is remembered and tears down only after the next
+loop-top emit, so a hello+EOF batch cannot skip `drainEmit`. Same mixed
+inspect, Darwin 2026-08-18:
+
+| arm | oneshot-only | mixed oneshot | mixed SSE | stall oneshot |
+|---|---|---|---|---|
+| starh2 inbound batch | 36–41k / 192–203 µs | 39–41k / 194–197 µs | 16000 | 39k / 201 µs |
+| Go net/http (stable rounds) | 47–48k / 158–162 µs | 47k / 164–165 µs | 16000 | 43k / 175 µs |
+
+SSE stayed at par (16004–16009). Stall 31/32, 15512 events. Packed
+`oneshot-phase-trace.sh`: `records/response=0.10`, ingest turns mean
+1.00 (40049 ones, 23 twos). Mixed-shape `TRACE=1`: ingest turns
+1=48663 2=56628 3=53686 4=45871, **mean 2.47 chunks/turn**. The batch
+fires on mixed and is a no-op on packed. Oneshot-only p50 did not move
+toward Go (192–193 µs on the stable rounds vs 185–187 µs buffered
+write; round 2 dipped 36k / 203 µs). Keep the batch as the std.Io
+shape for a live backlog; it is not the remaining ~6–8k rps / ~27–34 µs.
 
 Go `net/http` h2 (`h2_bundle.go` `serverConn.serve`) is the same three-way
 split we keep for Datastar, cheaper: `readFrames` only reads; `serve`
@@ -294,6 +400,8 @@ Mixed oneshot held the band: 36618 / 36161 / 36310 rps (p50 216 / 218 /
 218 µs). Mixed delivering 32/32. Mixed SSE: 15999 / 16004 / 16008. Go
 mixed was 16000 every round. Stall: starh2 31/32 delivering, 15507
 events, oneshot 36338 rps; Go 31/32, 15500 events, oneshot 48048 rps.
+Those oneshot numbers are the capacity-2 baseline; cap 4 is the table
+above (40k / 186 µs oneshot-only, SSE still 16000).
 The earlier ~10–11k mixed count was a HEADERS lifetime pot GOAWAY
 (`ENHANCE_YOUR_CALM` at ~4.2 s), not a `waitUntil` miss. Rapid-reset
 still hits `rst` + `non_data`. Do not put HEADERS on `non_data` (t-761)

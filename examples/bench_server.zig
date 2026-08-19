@@ -192,7 +192,7 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         sites_buf[sites_len] = ']';
         sites_len += 1;
     }
-    var buf: [4096]u8 = undefined;
+    var buf: [5120]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.print(
         "{{\"samples\":{d},\"block_ns\":{d},\"hold_ns\":{d},\"ack_ns\":{d},\"resume_ns\":{d}," ++
@@ -214,7 +214,11 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             "\"batch_1\":{d},\"batch_2\":{d},\"batch_le4\":{d},\"batch_le8\":{d}," ++
             "\"batch_le16\":{d},\"batch_ge17\":{d},\"records\":{d}," ++
             "\"emit_turns\":{d},\"emit_tickets\":{d},\"emit_max\":{d},\"complete_receipt_depth_max\":{d}," ++
-            "\"write_calls\":{d},\"write_chunks\":{d},\"write_max\":{d},",
+            "\"receipt_depth_0\":{d},\"receipt_depth_1\":{d},\"receipt_depth_2\":{d}," ++
+            "\"receipt_depth_3\":{d},\"receipt_depth_4\":{d}," ++
+            "\"receipt_full_ns\":{d},\"receipt_full_enter\":{d}," ++
+            "\"inline_full_n\":{d},\"inline_full_sids\":{d},\"inline_full_max\":{d}," ++
+            "\"credit_reuse_ns\":{d},\"credit_reuse_n\":{d},",
         .{
             trace.handoffs.load(.acquire),
             trace.tickets.load(.acquire),
@@ -231,6 +235,38 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             trace.emit_tickets.load(.acquire),
             trace.emit_max.load(.acquire),
             trace.complete_receipt_depth_max.load(.acquire),
+            trace.receipt_depth_0.load(.acquire),
+            trace.receipt_depth_1.load(.acquire),
+            trace.receipt_depth_2.load(.acquire),
+            trace.receipt_depth_3.load(.acquire),
+            trace.receipt_depth_4.load(.acquire),
+            trace.receipt_full_ns.load(.acquire),
+            trace.receipt_full_enter.load(.acquire),
+            trace.inline_full_n.load(.acquire),
+            trace.inline_full_sids.load(.acquire),
+            trace.inline_full_max.load(.acquire),
+            trace.credit_reuse_ns.load(.acquire),
+            trace.credit_reuse_n.load(.acquire),
+        },
+    );
+    try w.print(
+        "\"read_take_n\":{d},\"read_left_0\":{d},\"read_left_1\":{d},\"read_left_2\":{d}," ++
+            "\"read_left_3\":{d},\"read_left_ge4\":{d},\"read_left_sum\":{d},\"read_left_max\":{d}," ++
+            "\"inbound_batch_1\":{d},\"inbound_batch_2\":{d},\"inbound_batch_3\":{d},\"inbound_batch_4\":{d}," ++
+            "\"write_calls\":{d},\"write_chunks\":{d},\"write_max\":{d},",
+        .{
+            trace.read_take_n.load(.acquire),
+            trace.read_left_0.load(.acquire),
+            trace.read_left_1.load(.acquire),
+            trace.read_left_2.load(.acquire),
+            trace.read_left_3.load(.acquire),
+            trace.read_left_ge4.load(.acquire),
+            trace.read_left_sum.load(.acquire),
+            trace.read_left_max.load(.acquire),
+            trace.inbound_batch_1.load(.acquire),
+            trace.inbound_batch_2.load(.acquire),
+            trace.inbound_batch_3.load(.acquire),
+            trace.inbound_batch_4.load(.acquire),
             write_trace.calls.load(.acquire),
             write_trace.chunks.load(.acquire),
             write_trace.max_chunks.load(.acquire),

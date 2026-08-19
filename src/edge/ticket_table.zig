@@ -1,22 +1,22 @@
-//! Ticket wait table owned exclusively by AckDrainer for completion posts.
-//! Handlers reserve a slot (CAS), wait on its semaphore, then clear the slot.
-//! Handlers reserve/release, the actor links receipts that share one wire
-//! chunk, and the AckDrainer completes/fails. Cross-task link fields are atomic.
+//! Ticket wait table: handlers reserve a slot (CAS), wait on its event, then
+//! clear the slot. The actor links receipts that share one wire chunk and
+//! completes/fails them when it applies a WritePump completion. Cross-task
+//! link fields are atomic.
 //!
 //! # What a ticket is for
 //!
 //! A handler needs to know that its bytes REACHED THE WIRE, not merely that
 //! they were queued. Streaming needs it for backpressure, and `resp.send` needs
 //! it to return an honest result. The write happens on another task, so a
-//! ticket is the rendezvous between the handler that waits and the AckDrainer
-//! that learns the outcome.
+//! ticket is the rendezvous between the handler that waits and the actor
+//! that applies the WritePump outcome.
 //!
 //! # Lifecycle
 //!
 //! 1. `reserve` — the HANDLER claims a slot by CAS and gets a unique id.
 //! 2. The id rides on a `WireChunk`, or on a pending scheduler entry.
 //! 3. The WritePump writes, then posts a `WriteCompletion` carrying the id.
-//! 4. `complete` — the ACK DRAINER sets `ok` and signals the event.
+//! 4. `complete` — the actor sets `ok` and signals the event.
 //! 5. `wait` — the handler wakes, reads the result, and frees the slot.
 //!
 //! The slot index accompanies the id everywhere, so a completion is an O(1)
@@ -43,7 +43,7 @@ pub const TicketWait = struct {
     ok: bool = false,
     in_use: std.atomic.Value(bool) = .init(false),
     ticket: std.atomic.Value(u64) = .init(0),
-    /// Actor-written, AckDrainer-read link for tickets sharing one wire chunk.
+    /// Actor-written, actor-read link for tickets sharing one wire chunk.
     completion_next: std.atomic.Value(u32) = .init(no_completion_slot),
 };
 
@@ -115,9 +115,9 @@ pub const TicketTable = struct {
 
     /// Link two reserved tickets that will complete on the same wire write.
     ///
-    /// The actor publishes the link before queueing the chunk. The AckDrainer
-    /// reads it before waking the current slot, because that wake lets the
-    /// handler release and immediately reuse the slot.
+    /// The actor publishes the link before queueing the chunk, then reads it
+    /// before waking the current slot, because that wake lets the handler
+    /// release and immediately reuse the slot.
     pub fn linkCompletion(self: *TicketTable, from_slot: u32, to_slot: u32) error{InvalidSlot}!void {
         if (from_slot >= self.slots.len or to_slot >= self.slots.len) return error.InvalidSlot;
         const from = &self.slots[from_slot];
@@ -126,8 +126,8 @@ pub const TicketTable = struct {
         from.completion_next.store(to_slot, .release);
     }
 
-    /// AckDrainer-only snapshot. Call before `complete`, whose event wake lets
-    /// the handler release and reuse this slot.
+    /// Actor-only snapshot while applying a write ack. Call before `complete`,
+    /// whose event wake lets the handler release and reuse this slot.
     pub fn completion(self: *TicketTable, slot_i: u32) ?struct { ticket: u64, next: u32 } {
         if (slot_i >= self.slots.len) return null;
         const slot = &self.slots[slot_i];
@@ -148,9 +148,10 @@ pub const TicketTable = struct {
         slot.in_use.store(false, .release);
     }
 
-    /// AckDrainer-only. Both guards reject a STALE completion for a slot that
-    /// has already been released and reused: a completion applied to the new
-    /// owner would wake a handler whose write is still in flight.
+    /// Actor-only while applying a write ack. Both guards reject a STALE
+    /// completion for a slot that has already been released and reused: a
+    /// completion applied to the new owner would wake a handler whose write
+    /// is still in flight.
     pub fn complete(self: *TicketTable, slot_i: u32, ticket: u64, ok: bool) void {
         if (slot_i >= self.slots.len) return;
         const slot = &self.slots[slot_i];

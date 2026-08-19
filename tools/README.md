@@ -108,9 +108,11 @@ Oneshot-only is the control. `STALL=0` skips the blocked-reader pass.
 `bench-pipeline` removes the socket, TLS, client, and lock-contention variables
 from the one-shot path. It times response HPACK encoding, static and
 dynamic-indexed request HPACK decoding, frame parsing, frame-plus-HPACK inbound
-work, the deterministic `Session` request/response path, packed ticket
-bookkeeping (already-signaled one, packed-6 handoff, parked wake), and an empty
-task spawn/join using the same zio runtime shape as the bench server.
+work, the deterministic `Session` request/response path, the Connection
+complete-oneshot hop (Session + scheduler + inline encode + local ticket
+complete; still no socket write), packed ticket bookkeeping (already-signaled
+one, packed-6 handoff, parked wake), and an empty task spawn/join using the
+same zio runtime shape as the bench server.
 
 ```sh
 ./zb build bench-pipeline -Doptimize=ReleaseFast -- -n 1000000 --rounds 5
@@ -122,7 +124,8 @@ the checkout selected by `HENDRIK_ROOT` (the same default as
 `bench-hendrik.sh`). It prints the opponent revision and leaves that checkout
 unmodified. Its `inline request core` starts from a parsed HEADERS frame and
 includes stream lookup/lifecycle, HPACK decode and validation, direct handler
-dispatch, response HPACK/framing, and fixed-buffer output.
+dispatch, response HPACK/framing, and fixed-buffer output. Starh2's comparable
+hop is `Connection complete oneshot`.
 
 Each row reports median ns/op, the full round range, successful allocator calls
 per operation, and requested bytes per operation. Setup, dynamic-table seeding,
@@ -132,11 +135,12 @@ runtime allocator is internal, so those allocation columns are `n/a`.
 
 These numbers explain local CPU demand, not whole-server throughput. Starh2's
 `Session request + response` includes frame parsing but stops at outbound
-intents; the opponent's inline core starts after frame parsing but continues
-through fixed-buffer framing. That asymmetry slightly favors starh2 in a direct
-comparison. Neither row contains starh2's scheduler handoff, mutex contention,
-TLS record work, or socket I/O, and concurrently overlapped phases must not be
-added as though they were serial.
+intents. `Connection complete oneshot` continues through FairScheduler, inline
+complete-handler encode, and a local already-signaled receipt — the hop Go
+inlines when the write fits the bufio buffer — still without a socket write.
+The opponent's inline core starts after frame parsing and writes to a fixed
+buffer. Neither row contains mutex contention, TLS record work, or socket I/O,
+and concurrently overlapped phases must not be added as though they were serial.
 
 ## One-shot packing and the remaining gap
 
@@ -153,7 +157,7 @@ script exits 9 if that ratio exceeds 0.4 (one record per response again).
 h2c concatenates the same drain-turn into one write chunk. Concat itself is
 a few nanoseconds. HPACK, Huffman, and frame parse are not the live ~5× vs
 http2.zig; the TLS residue is Connection lifecycle (actor + pumps +
-AckDrainer + receipts). Protocol: `tools/oneshot-gap.md`.
+receipts). Protocol: `tools/oneshot-gap.md`.
 
 The 30s TLS stall (DATA left in FairScheduler after a RST tombstone) is a
 different defect. Method: `TLS_STALL_BRIEF.md`. It landed in `57359b7`.

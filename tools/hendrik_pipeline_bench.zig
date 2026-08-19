@@ -418,7 +418,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         "\nhendrik-pipeline-bench: inline request core starts from a parsed HEADERS frame\n" ++
             "and includes stream lookup/lifecycle, HPACK decode and validation, direct\n" ++
-            "handler dispatch, response HPACK/framing, and writes to a fixed buffer.\n",
+            "handler dispatch, response HPACK/framing, and writes to a fixed buffer.\n" ++
+            "starh2's comparable hop is pipeline-bench 'Connection complete oneshot'\n" ++
+            "(Session + scheduler + inline encode + local ack; still no socket).\n",
         .{},
     );
 }

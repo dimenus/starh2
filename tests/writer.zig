@@ -46,8 +46,13 @@ test "WriteCompletion is integer-only payload" {
     try std.testing.expectEqual(usize, @TypeOf(@as(W, undefined).outbound_release));
 }
 
-test "complete receipt pipeline is bounded at two drain turns" {
-    try std.testing.expectEqual(@as(usize, 2), starh2.edge.connection.complete_receipt_capacity);
+test "complete receipt pipeline is bounded at four drain turns" {
+    try std.testing.expectEqual(@as(usize, 4), starh2.edge.connection.complete_receipt_capacity);
+}
+
+test "inbound chunk batch is bounded at four and cannot exceed the receipt window" {
+    try std.testing.expectEqual(@as(usize, 4), starh2.edge.connection.inbound_chunk_batch);
+    try std.testing.expect(starh2.edge.connection.inbound_chunk_batch <= starh2.edge.connection.complete_receipt_capacity);
 }
 
 test "100x failAll vs reserve never hangs" {

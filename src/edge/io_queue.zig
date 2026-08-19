@@ -20,6 +20,15 @@ pub fn tryGet(comptime T: type, queue: *std.Io.Queue(T), io: std.Io) ?T {
     return if (n == 1) one[0] else null;
 }
 
+/// Occupancy of a typed queue, in elements. Locks the same mutex as get/put.
+/// Trace-only: do not use this to decide a hot-path batch size.
+pub fn queued(comptime T: type, queue: *std.Io.Queue(T), io: std.Io) usize {
+    queue.type_erased.mutex.lockUncancelable(io);
+    defer queue.type_erased.mutex.unlock(io);
+    std.debug.assert(queue.type_erased.len % @sizeOf(T) == 0);
+    return queue.type_erased.len / @sizeOf(T);
+}
+
 pub fn tryPut(comptime T: type, queue: *std.Io.Queue(T), io: std.Io, value: T) bool {
     return queue.putUncancelable(io, &.{value}, 0) catch {
         // A closed queue rejects ownership without blocking.
