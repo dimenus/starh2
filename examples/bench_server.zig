@@ -566,7 +566,10 @@ const Args = struct {
     trace: bool = false,
     trace_every: u64 = 1024,
     executors: ?u8 = null,
-    task_migration: bool = false,
+    // Default ON since the two-OS t-853 gate: both 60-round stall runs were
+    // clean with migration on, and migration off is the home of the bimodal
+    // placement bands. --no-task-migration keeps the A/B arm reachable.
+    task_migration: bool = true,
     diag: bool = false,
     /// When set, connect to this process's listener over real TCP, drive N
     /// oneshots on one connection, then shut down. Hyperfine/poop measure the
@@ -598,6 +601,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.executors = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--task-migration")) {
             out.task_migration = true;
+        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
+            out.task_migration = false;
         } else if (std.mem.eql(u8, a, "--diag")) {
             out.diag = true;
         } else if (std.mem.eql(u8, a, "--self-drive-oneshots")) {
@@ -613,7 +618,7 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 
 const RuntimeArgs = struct {
     executors: ?u8 = null,
-    task_migration: bool = false,
+    task_migration: bool = true,
 };
 
 fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !RuntimeArgs {
@@ -628,6 +633,8 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
             out.executors = n;
         } else if (std.mem.eql(u8, a, "--task-migration")) {
             out.task_migration = true;
+        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
+            out.task_migration = false;
         }
     }
     return out;

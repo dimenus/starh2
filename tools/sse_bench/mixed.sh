@@ -48,11 +48,11 @@ TRACE_ARGS=
 if [ "${TRACE:-0}" != 0 ]; then
   TRACE_ARGS=--trace
 fi
-# STARH2_TASK_MIGRATION=1 turns zio task migration on. The server default is
-# off, so every historical row of this harness is a migration-off row.
+# The server default is migration ON since the t-853 gate. Rows before that
+# flip are migration-off rows; STARH2_TASK_MIGRATION=0 rebuilds that arm.
 MIGRATION_ARGS=
-if [ "${STARH2_TASK_MIGRATION:-0}" != 0 ]; then
-  MIGRATION_ARGS=--task-migration
+if [ "${STARH2_TASK_MIGRATION:-1}" = 0 ]; then
+  MIGRATION_ARGS=--no-task-migration
 fi
 bench_lock
 "$STARH2" --mode tls --port 19450 --sse-interval-ms "$INTERVAL" \
