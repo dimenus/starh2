@@ -568,6 +568,10 @@ pub const Pump = struct {
     /// Plaintext already SSL_read, waiting for a read_ch slot. Must not drop:
     /// the cipher has advanced.
     pending_read: ?wire_pump.WireChunk = null,
+    /// Ciphertext dequeued but not fully BIO_write'd, because inbound was
+    /// full and `pending_read` blocked SSL_read. Off the work queue so a
+    /// `.wire` behind it can unblock the actor.
+    pending_cipher: ?CipherChunk = null,
 
     fn post(self: *Pump, c: wire_pump.WriteCompletion) void {
         self.completions.putOneUncancelable(self.io, c) catch {};
@@ -629,6 +633,10 @@ pub const Pump = struct {
             self.pending_read = null;
             if (chunk.pool_index) |idx| self.returnReadIndex(idx);
         }
+        if (self.pending_cipher) |chunk| {
+            self.pending_cipher = null;
+            recycleCipher(self.io, self.cipher_free, chunk.pool_index);
+        }
         while (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
             switch (item) {
                 .wire => |chunk| {
@@ -651,42 +659,48 @@ pub const Pump = struct {
         return true;
     }
 
-    fn feedCipher(self: *Pump, bytes: []const u8) bool {
-        var off: usize = 0;
+    const Feed = enum { done, blocked, eof };
+
+    /// Write ciphertext into the pair. `consumed` is updated on every path.
+    /// `.blocked` means inbound is full and `pending_read` already holds a
+    /// plaintext chunk the actor has not taken — caller must stash the rest.
+    fn feedCipher(self: *Pump, bytes: []const u8, consumed: *usize) Feed {
+        consumed.* = 0;
         var spins: u32 = 0;
-        while (off < bytes.len) {
+        while (consumed.* < bytes.len) {
             spins += 1;
             if (spins > MaxHandshakeIterations) {
                 self.failDrain();
                 self.post(.{ .shutdown = true });
-                return false;
+                return .eof;
             }
-            const n = self.conn.pair.writeEncrypted(bytes[off..]) catch |err| switch (err) {
+            const n = self.conn.pair.writeEncrypted(bytes[consumed.*..]) catch |err| switch (err) {
                 error.WantWrite => {
-                    // Pair full: SSL has not consumed inbound. Drain plaintext
-                    // out of SSL (which reads the pair) and outbound ciphertext
-                    // to the socket, then retry.
+                    if (self.pending_read != null) return .blocked;
                     switch (self.readOne()) {
-                        .eof => return false,
-                        .ok, .want => {},
+                        .eof => return .eof,
+                        .ok => {
+                            if (self.pending_read != null) return .blocked;
+                        },
+                        .want => {},
                     }
-                    if (!self.drainToSocket()) return false;
+                    if (!self.drainToSocket()) return .eof;
                     continue;
                 },
                 else => {
                     self.failDrain();
                     self.post(.{ .shutdown = true });
-                    return false;
+                    return .eof;
                 },
             };
             if (n == 0) {
                 self.failDrain();
                 self.post(.{ .shutdown = true });
-                return false;
+                return .eof;
             }
-            off += n;
+            consumed.* += n;
         }
-        return true;
+        return .done;
     }
 
     fn sslWriteAll(self: *Pump, bytes: []const u8) bool {
@@ -736,11 +750,7 @@ pub const Pump = struct {
             };
         pump_trace.bump(&pump_trace.work_get);
         switch (item) {
-            .cipher => |chunk| {
-                pump_trace.bump(&pump_trace.cipher_chunks);
-                defer recycleCipher(self.io, self.cipher_free, chunk.pool_index);
-                return self.feedCipher(chunk.bytes[0..chunk.len]);
-            },
+            .cipher => |chunk| return self.ingestCipher(chunk),
             .wire => |chunk| {
                 pump_trace.bump(&pump_trace.tryget_write);
                 if (self.carried == null) {
@@ -784,6 +794,7 @@ pub const Pump = struct {
         var count: usize = 1;
         if (self.test_delay_ms == 0 and self.test_fail_after == 0) {
             while (count < max_batch) {
+                if (self.pending_cipher != null) break;
                 const next_item = io_queue.tryGet(PumpWork, self.work, self.io) orelse break;
                 switch (next_item) {
                     .wire => |next| {
@@ -795,10 +806,7 @@ pub const Pump = struct {
                         count += 1;
                     },
                     .cipher => |chunk| {
-                        pump_trace.bump(&pump_trace.cipher_chunks);
-                        const ok = self.feedCipher(chunk.bytes[0..chunk.len]);
-                        recycleCipher(self.io, self.cipher_free, chunk.pool_index);
-                        if (!ok) {
+                        if (!self.ingestCipher(chunk)) {
                             for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
                             return false;
                         }
@@ -850,6 +858,7 @@ pub const Pump = struct {
 
     fn readOne(self: *Pump) ReadOutcome {
         pump_trace.bump(&pump_trace.read_one);
+        if (self.pending_read != null) return .ok;
         const chunk_size = limits_mod.WIRE_CHUNK_SIZE;
         // Never park on the actor's queues. TlsPump is the only writer, so a
         // blocking getOne(read_free) / putOne(read_ch) deadlocks mixed SSE:
@@ -906,8 +915,29 @@ pub const Pump = struct {
 
     fn ingestCipher(self: *Pump, chunk: CipherChunk) bool {
         pump_trace.bump(&pump_trace.cipher_chunks);
-        defer recycleCipher(self.io, self.cipher_free, chunk.pool_index);
-        if (!self.feedCipher(chunk.bytes[0..chunk.len])) return false;
+        const all = chunk.bytes[0..chunk.len];
+        var consumed: usize = 0;
+        switch (self.feedCipher(all, &consumed)) {
+            .eof => {
+                recycleCipher(self.io, self.cipher_free, chunk.pool_index);
+                return false;
+            },
+            .blocked => {
+                if (consumed == all.len) {
+                    recycleCipher(self.io, self.cipher_free, chunk.pool_index);
+                    return true;
+                }
+                std.debug.assert(self.pending_cipher == null);
+                self.pending_cipher = .{
+                    .bytes = chunk.bytes[consumed..],
+                    .len = all.len - consumed,
+                    .pool_index = chunk.pool_index,
+                };
+                return true;
+            },
+            .done => recycleCipher(self.io, self.cipher_free, chunk.pool_index),
+        }
+        if (self.pending_read != null) return true;
         switch (self.readOne()) {
             .eof => return false,
             .ok, .want => return true,
@@ -929,19 +959,14 @@ pub const Pump = struct {
                 if (io_queue.tryPut(wire_pump.WireChunk, self.to_actor, self.io, chunk)) {
                     self.pending_read = null;
                     self.actor_wake.set(self.io);
-                } else {
-                    const item = io_queue.tryGet(PumpWork, self.work, self.io);
-                    if (item) |found| {
-                        pump_trace.bump(&pump_trace.work_get);
-                        if (!self.dispatch(found)) return;
-                    } else {
-                        pump_trace.bump(&pump_trace.pending_read_retry);
-                        self.io.sleep(.zero, .awake) catch {};
-                    }
-                    continue;
                 }
             }
-            if (self.conn.pendingPlaintext() > 0) {
+            if (self.pending_cipher) |chunk| {
+                self.pending_cipher = null;
+                if (!self.ingestCipher(chunk)) return;
+                continue;
+            }
+            if (self.pending_read == null and self.conn.pendingPlaintext() > 0) {
                 switch (self.readOne()) {
                     .eof => return,
                     .ok => continue,
@@ -949,13 +974,21 @@ pub const Pump = struct {
                 }
             }
 
-            // The only wait: one queue, no Select.
-            const item = io_queue.tryGet(PumpWork, self.work, self.io) orelse
-                self.work.getOne(self.io) catch {
+            // Blocking getOne only when we can still SSL_read. Otherwise a
+            // full work queue of .cipher plus a blocking actor putOne(.wire)
+            // deadlocks: drainEmit holds session_mu in that put.
+            const item = io_queue.tryGet(PumpWork, self.work, self.io) orelse blk: {
+                if (self.pending_read != null) {
+                    pump_trace.bump(&pump_trace.pending_read_retry);
+                    self.io.sleep(.zero, .awake) catch {};
+                    continue;
+                }
+                break :blk self.work.getOne(self.io) catch {
                     self.failDrain();
                     self.post(.{ .fail_all = true, .shutdown = true });
                     return;
                 };
+            };
             pump_trace.bump(&pump_trace.work_get);
             if (!self.dispatch(item)) return;
         }
@@ -1001,6 +1034,7 @@ test "pump_trace moves on read_free-empty yield" {
     var pump: Pump = undefined;
     pump.io = std.testing.io;
     pump.read_free = &read_free;
+    pump.pending_read = null;
 
     const y0 = pump_trace.read_free_empty_yield.load(.acquire);
     const r0 = pump_trace.read_one.load(.acquire);
