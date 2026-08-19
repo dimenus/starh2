@@ -687,6 +687,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    b.installArtifact(pipeline_bench_exe);
     const pipeline_bench_run = b.addRunArtifact(pipeline_bench_exe);
     if (b.args) |extra| pipeline_bench_run.addArgs(extra);
     pipeline_bench_run.setCwd(b.path("."));
