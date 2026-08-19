@@ -197,6 +197,20 @@ fi
 . "$(cd "$(dirname "$0")" && pwd -P)/bench_lock.sh"
 bench_lock
 
+# The build phase raises the 1-min load the row gate then reads, so a matrix
+# on a borderline box blocks every row on its own wake. Wait for the load to
+# settle below the gate before the first row, bounded so a genuinely busy box
+# still reports BLOCKED-LOADED instead of parking forever.
+settle_deadline=$(( $(date +%s) + ${PERF_STORY_SETTLE_S:-300} ))
+while awk -v l="$(load1)" -v m="${PERF_STORY_LOAD_MAX:-2.0}" 'BEGIN { exit (l + 0 > m + 0) ? 0 : 1 }'; do
+  if [ "$(date +%s)" -ge "$settle_deadline" ]; then
+    echo "settle: gave up waiting for load <= ${PERF_STORY_LOAD_MAX:-2.0} (now $(load1))"
+    break
+  fi
+  echo "settle: load $(load1) > ${PERF_STORY_LOAD_MAX:-2.0}, waiting"
+  sleep 15
+done
+
 bench_row_status() {
   log=$1
   if grep -q 'CLIENT-LIMITED' "$log"; then
