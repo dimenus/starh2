@@ -641,7 +641,11 @@ pub const Pump = struct {
         }
         if (self.pending_read) |chunk| {
             self.pending_read = null;
-            if (chunk.pool_index) |idx| self.returnReadIndex(idx);
+            if (chunk.pool_index) |idx| {
+                self.returnReadIndex(idx);
+            } else if (chunk.bytes.len != 0) {
+                self.gpa.free(chunk.bytes);
+            }
         }
         if (self.pending_cipher) |chunk| {
             self.pending_cipher = null;
@@ -891,26 +895,40 @@ pub const Pump = struct {
         // Never park on the actor's queues. TlsPump is the only writer, so a
         // blocking getOne(read_free) / putOne(read_ch) deadlocks mixed SSE:
         // the actor fills the work queue while we wait here, then both sides wait.
-        const idx = io_queue.tryGet(u32, self.read_free, self.io) orelse {
+        const pooled = io_queue.tryGet(u32, self.read_free, self.io);
+        const idx: ?u32 = pooled;
+        const buf: []u8 = if (pooled) |i| blk: {
+            const off = @as(usize, i) * chunk_size;
+            break :blk self.chunk_storage[off..][0..chunk_size];
+        } else blk: {
             pump_trace.bump(&pump_trace.read_free_empty_yield);
-            self.io.sleep(.zero, .awake) catch {};
-            return .stuck;
+            if (self.n_chunks == 0) {
+                self.io.sleep(.zero, .awake) catch {};
+                return .stuck;
+            }
+            // read_ch capacity equals the pool, so a full queue means no
+            // index. SSL_write of SETTINGS still needs SSL_read (TLS 1.3
+            // tickets; pipelined HEADERS) to drain the inbound BIO. One
+            // GPA chunk, actor-recycled like any non-pooled read. At most
+            // one lives in pending_read.
+            break :blk self.gpa.alloc(u8, chunk_size) catch {
+                self.io.sleep(.zero, .awake) catch {};
+                return .stuck;
+            };
         };
-        const off = @as(usize, idx) * chunk_size;
-        const buf = self.chunk_storage[off..][0..chunk_size];
         const n = self.conn.ssl.read(buf) catch |err| switch (err) {
             error.WantRead => {
                 pump_trace.bump(&pump_trace.want_read);
-                self.returnReadIndex(idx);
+                if (idx) |i| self.returnReadIndex(i) else self.gpa.free(buf);
                 return .want;
             },
             error.WantWrite => {
-                self.returnReadIndex(idx);
+                if (idx) |i| self.returnReadIndex(i) else self.gpa.free(buf);
                 if (!self.drainToSocket()) return .eof;
                 return .want;
             },
             else => {
-                self.returnReadIndex(idx);
+                if (idx) |i| self.returnReadIndex(i) else self.gpa.free(buf);
                 self.conn.tcp_stream.shutdown(self.io, .send) catch {};
                 self.failDrain();
                 self.postEof();
@@ -918,7 +936,7 @@ pub const Pump = struct {
             },
         };
         if (n == 0) {
-            self.returnReadIndex(idx);
+            if (idx) |i| self.returnReadIndex(i) else self.gpa.free(buf);
             self.conn.tcp_stream.shutdown(self.io, .send) catch {};
             self.failDrain();
             self.postEof();
@@ -1094,6 +1112,7 @@ test "pump_trace moves on read_free-empty yield" {
     pump.io = std.testing.io;
     pump.read_free = &read_free;
     pump.pending_read = null;
+    pump.n_chunks = 0;
 
     const y0 = pump_trace.read_free_empty_yield.load(.acquire);
     const r0 = pump_trace.read_one.load(.acquire);
