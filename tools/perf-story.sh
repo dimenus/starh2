@@ -6,7 +6,9 @@
 # command. A scan that produces zero rows exits non-zero instead of printing
 # an empty table.
 #
-# Darwin: 1-min load > 2.0 marks the row BLOCKED-LOADED and skips the run.
+# Darwin: 1-min load > PERF_STORY_LOAD_MAX (default 2.0) marks the row
+# BLOCKED-LOADED and skips the run. Every log records the actual load line,
+# so a raised gate is visible in the evidence, never silent.
 # Linux: pgrep must show no leftover bench/sse servers before a row; pkill
 # uses a bracket pattern so ssh's own argv is not matched.
 set -eu
@@ -58,7 +60,7 @@ load1() {
 
 darwin_loaded() {
   [ "$OS" = Darwin ] || return 1
-  awk -v l="$(load1)" 'BEGIN { exit (l + 0 > 2.0) ? 0 : 1 }'
+  awk -v l="$(load1)" -v m="${PERF_STORY_LOAD_MAX:-2.0}" 'BEGIN { exit (l + 0 > m + 0) ? 0 : 1 }'
 }
 
 write_log_header() {
