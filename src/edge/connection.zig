@@ -839,13 +839,15 @@ const Connection = struct {
     write_chunk_storage: []u8 = &.{},
     write_free_buf: []u32 = &.{},
     write_free_ch: std.Io.Queue(u32) = undefined,
-    /// TLS-only: ciphertext pool + the pump's unified work queue.
+    /// TLS-only: ciphertext pool + CipherRead→pump queue (cipher/eof only).
+    /// Outbound WireChunks use `write_ch` so inbound cannot HOL-block a write.
     tls_cipher_storage: []u8 = &.{},
     tls_cipher_free_buf: []u32 = &.{},
     tls_cipher_free_ch: std.Io.Queue(u32) = undefined,
     tls_cipher_n: u32 = 0,
     tls_work_buf: []tls_edge.PumpWork = &.{},
     tls_work_ch: std.Io.Queue(tls_edge.PumpWork) = undefined,
+    tls_pump_wake: std.Io.Event = .unset,
     frame_pool: slab_pool.SlabPool = undefined,
     read_pool_n: u32 = 0,
     /// Preallocated scratch for stream-id sweeps (no hot-path ArrayList).
@@ -1004,10 +1006,7 @@ const Connection = struct {
             errdefer gpa.free(tls_cipher_storage);
             tls_cipher_free_buf = try gpa.alloc(u32, tls_cipher_n);
             errdefer gpa.free(tls_cipher_free_buf);
-            tls_work_buf = try gpa.alloc(
-                tls_edge.PumpWork,
-                @as(usize, tls_cipher_n) + config.limits.inbound_wire_chunks_per_connection,
-            );
+            tls_work_buf = try gpa.alloc(tls_edge.PumpWork, tls_cipher_n);
             errdefer gpa.free(tls_work_buf);
         }
         var frame_pool = try slab_pool.SlabPool.init(
@@ -1751,6 +1750,7 @@ const Connection = struct {
         if (self.tls_work_buf.len != 0) {
             _ = io_queue.tryPut(tls_edge.PumpWork, &self.tls_work_ch, self.config.io, .eof);
             self.tls_work_ch.close(self.config.io);
+            self.tls_pump_wake.set(self.config.io);
         }
 
         self.wakeAllSpace();
@@ -2266,6 +2266,7 @@ const Connection = struct {
             };
             if (self.tls_work_buf.len != 0) {
                 _ = self.tls_work_ch.putUncancelable(io, &.{.eof}, 0) catch {};
+                self.tls_pump_wake.set(io);
             }
             self.stream.shutdown(io, .both) catch {
                 // Shutdown is best-effort; task cancellation is the authoritative unblock.
@@ -2286,6 +2287,7 @@ const Connection = struct {
                 .io = io,
                 .stream = self.stream,
                 .work = &self.tls_work_ch,
+                .wake = &self.tls_pump_wake,
                 .chunk_storage = self.tls_cipher_storage,
                 .n_chunks = self.tls_cipher_n,
                 .free_indices = &self.tls_cipher_free_ch,
@@ -2297,7 +2299,9 @@ const Connection = struct {
                 .io = io,
                 .conn = self.tls.?,
                 .to_actor = &self.read_ch,
+                .from_actor = &self.write_ch,
                 .work = &self.tls_work_ch,
+                .wake = &self.tls_pump_wake,
                 .completions = &self.write_ack_ch,
                 .actor_wake = &self.actor_wake,
                 .gpa = gpa,
@@ -3739,24 +3743,20 @@ const Connection = struct {
     /// going away: tryPut, shut the socket to unstick a blocked write, retry
     /// once, then fail. A healthy connection still `putOne`s for backpressure.
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
-        if (self.config.mode == .tls_h2) {
-            const item: tls_edge.PumpWork = .{ .wire = chunk };
-            if (self.writeGoingAway()) {
-                if (io_queue.tryPut(tls_edge.PumpWork, &self.tls_work_ch, self.config.io, item)) return;
-                self.stream.shutdown(self.config.io, .both) catch {};
-                if (io_queue.tryPut(tls_edge.PumpWork, &self.tls_work_ch, self.config.io, item)) return;
-                return error.WriteFailed;
-            }
-            self.tls_work_ch.putOne(self.config.io, item) catch return error.WriteFailed;
-            return;
-        }
         if (self.writeGoingAway()) {
-            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) return;
+            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
+                if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
+                return;
+            }
             self.stream.shutdown(self.config.io, .both) catch {};
-            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) return;
+            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
+                if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
+                return;
+            }
             return error.WriteFailed;
         }
         self.write_ch.putOne(self.config.io, chunk) catch return error.WriteFailed;
+        if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
     }
 
     fn rentFrame(self: *Connection, n: usize) ?[]u8 {

@@ -486,6 +486,7 @@ pub const CipherRead = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     work: *std.Io.Queue(PumpWork),
+    wake: *std.Io.Event,
     chunk_storage: []u8,
     n_chunks: u32,
     free_indices: *std.Io.Queue(u32),
@@ -499,6 +500,7 @@ pub const CipherRead = struct {
         self.work.putOneUncancelable(self.io, .eof) catch {
             // A closed work queue means the connection is already tearing down.
         };
+        self.wake.set(self.io);
     }
 
     pub fn run(self: *CipherRead) void {
@@ -528,6 +530,7 @@ pub const CipherRead = struct {
                 self.returnIndex(idx);
                 return;
             };
+            self.wake.set(self.io);
         }
     }
 
@@ -539,15 +542,17 @@ pub const CipherRead = struct {
 /// One task owns SSL_read and SSL_write. Concurrent pumps on one SSL object
 /// are a data race; this is the share-nothing owner.
 ///
-/// The wait is `work.getOne`. Inbound ciphertext is `BIO_write` (via the
-/// pair) + `SSL_read` to the actor. Outbound WireChunks are `SSL_write` +
-/// `BIO_read` + socket write. Writes do not go through a third task: that
-/// would add a hop on the SSE event path.
+/// Ciphertext and wire use separate queues so inbound cannot HOL-block a
+/// complete-handler write. The wait is `wake.wait` after tryGet on both
+/// (no Select). Socket writes stay on the pump so the SSE event path does
+/// not gain a hop.
 pub const Pump = struct {
     io: std.Io,
     conn: *Conn,
     to_actor: *std.Io.Queue(wire_pump.WireChunk),
+    from_actor: *std.Io.Queue(wire_pump.WireChunk),
     work: *std.Io.Queue(PumpWork),
+    wake: *std.Io.Event,
     completions: *std.Io.Queue(wire_pump.WriteCompletion),
     actor_wake: *std.Io.Event,
     gpa: std.mem.Allocator,
@@ -647,6 +652,10 @@ pub const Pump = struct {
                 .eof => {},
             }
         }
+        while (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
+            if (isSentinel(chunk)) continue;
+            self.releaseChunk(chunk, false, false);
+        }
         self.post(.{ .fail_all = true });
     }
 
@@ -738,10 +747,13 @@ pub const Pump = struct {
         return true;
     }
 
-    /// SSL_write wanted ciphertext. Take the next work item without going
-    /// back to the main loop (the write is mid-record). Nested `getOne` is
-    /// still the one queue.
+    /// SSL_write wanted inbound records. Only the cipher queue; a .wire
+    /// behind ciphertext on a unified FIFO was the oneshot-0 HOL.
     fn consumeInbound(self: *Pump) bool {
+        if (self.pending_cipher) |chunk| {
+            self.pending_cipher = null;
+            return self.ingestCipher(chunk);
+        }
         const item = io_queue.tryGet(PumpWork, self.work, self.io) orelse
             self.work.getOne(self.io) catch {
                 self.failDrain();
@@ -795,30 +807,13 @@ pub const Pump = struct {
         if (self.test_delay_ms == 0 and self.test_fail_after == 0) {
             while (count < max_batch) {
                 if (self.pending_cipher != null) break;
-                const next_item = io_queue.tryGet(PumpWork, self.work, self.io) orelse break;
-                switch (next_item) {
-                    .wire => |next| {
-                        if (next.len == 0 and next.bytes.len == 0) {
-                            self.carried = next;
-                            break;
-                        }
-                        chunks[count] = next;
-                        count += 1;
-                    },
-                    .cipher => |chunk| {
-                        if (!self.ingestCipher(chunk)) {
-                            for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
-                            return false;
-                        }
-                    },
-                    .eof => {
-                        for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
-                        self.failDrain();
-                        self.postEof();
-                        self.post(.{ .shutdown = true });
-                        return false;
-                    },
+                const next = io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io) orelse break;
+                if (next.len == 0 and next.bytes.len == 0) {
+                    self.carried = next;
+                    break;
                 }
+                chunks[count] = next;
+                count += 1;
             }
         }
         if (self.test_delay_ms > 0) {
@@ -974,23 +969,38 @@ pub const Pump = struct {
                 }
             }
 
-            // Blocking getOne only when we can still SSL_read. Otherwise a
-            // full work queue of .cipher plus a blocking actor putOne(.wire)
-            // deadlocks: drainEmit holds session_mu in that put.
-            const item = io_queue.tryGet(PumpWork, self.work, self.io) orelse blk: {
-                if (self.pending_read != null) {
-                    pump_trace.bump(&pump_trace.pending_read_retry);
-                    self.io.sleep(.zero, .awake) catch {};
-                    continue;
-                }
-                break :blk self.work.getOne(self.io) catch {
-                    self.failDrain();
-                    self.post(.{ .fail_all = true, .shutdown = true });
-                    return;
-                };
+            if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
+                pump_trace.bump(&pump_trace.tryget_write);
+                if (!self.writeChunks(chunk)) return;
+                continue;
+            }
+            if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
+                pump_trace.bump(&pump_trace.work_get);
+                if (!self.dispatch(item)) return;
+                continue;
+            }
+
+            self.wake.reset();
+            if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
+                pump_trace.bump(&pump_trace.tryget_write);
+                if (!self.writeChunks(chunk)) return;
+                continue;
+            }
+            if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
+                pump_trace.bump(&pump_trace.work_get);
+                if (!self.dispatch(item)) return;
+                continue;
+            }
+            if (self.pending_read != null) {
+                pump_trace.bump(&pump_trace.pending_read_retry);
+                self.io.sleep(.zero, .awake) catch {};
+                continue;
+            }
+            self.wake.wait(self.io) catch {
+                self.failDrain();
+                self.post(.{ .fail_all = true, .shutdown = true });
+                return;
             };
-            pump_trace.bump(&pump_trace.work_get);
-            if (!self.dispatch(item)) return;
         }
         _ = self.drainToSocket();
         self.failDrain();

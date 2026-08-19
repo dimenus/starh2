@@ -106,8 +106,8 @@ pub const Limits = struct {
     max_streams_per_server: usize = 4_096,
     inbound_wire_chunks_per_connection: usize = 8,
     /// Ciphertext chunks the TLS read task may have in flight per connection.
-    /// The work queue is sized to this plus `inbound_wire_chunks_per_connection`
-    /// so cipher and wire items cannot starve each other.
+    /// Outbound frames use `write_ch` so cipher and wire cannot HOL-block
+    /// each other.
     tls_cipher_chunks_per_connection: usize = 8,
     /// Boot-reserved outbound HEADERS/DATA frame slabs per connection. A frame
     /// larger than `frame_slab_bytes` falls back to the GPA.
@@ -265,7 +265,7 @@ pub const Limits = struct {
         terms.write_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
         const n_cipher = self.tls_cipher_chunks_per_connection;
         terms.tls_cipher_payload = try checkedMul(n_cipher, wire_const.TLS_CIPHER_CHUNK_SIZE);
-        terms.tls_work_descs = try checkedMul(try checkedAdd(n_cipher, n_chunks), bound.PUMP_WORK_SIZE);
+        terms.tls_work_descs = try checkedMul(n_cipher, bound.PUMP_WORK_SIZE);
         terms.frame_slabs = try checkedMul(self.frame_slabs_per_connection, self.frame_slab_bytes);
         terms.wire_descs = try checkedMul(try checkedMul(n_chunks, 2), bound.WIRE_CHUNK_DESC_SIZE); // read+write ch
         terms.handlers = try checkedMul(self.max_streams_per_connection, HANDLER_SLOT_SIZE);

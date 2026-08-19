@@ -115,8 +115,9 @@ fetched boring package so zig-cc glibc headers do not -Werror memchr on
 
 - `TlsPump` is the sole SSL_read/SSL_write owner. Concurrent ReadPump+WritePump
   on one SSL object is a data race; h2c keeps the dual pumps. TLS ciphertext
-  arrives through a dedicated read task posting to the pump's one work queue
-  (`queue.get`, no Select). The SSL object's BIOs are a bounded memory pair
+  arrives through a dedicated read task posting to a cipher queue; outbound
+  frames use `write_ch`. The pump waits on an Event after tryGet of both
+  (no Select). The SSL object's BIOs are a bounded memory pair
   (`BIO_new_bio_pair` in `src/edge/tls.zig`); do not restore socket-coupled
   BIO callbacks. Handshake still runs on the actor (blocking SSL_accept over
   the same memory BIOs) with the read task already the ciphertext source.
