@@ -5,7 +5,9 @@
 //! through a queue, not through a readiness edge. A dedicated `CipherRead`
 //! task does blocking zio socket reads and posts chunks to the cipher
 //! queue. Outbound frames use `write_ch`. The pump `tryGet`s both, then
-//! waits on `wake` — no `std.Io.Select`. It must service both sides every
+//! waits on `wake` — no `std.Io.Select`. CipherRead and the actor store a
+//! dirty flag before `wake.set`; the pump swaps it after `reset`. An event
+//! edge does not survive reset; the flag does. It must service both sides every
 //! turn: writes-only would starve oneshot HEADERS under live SSE, and a
 //! `continue` past a blocked cipher ingest would skip SETTINGS still on
 //! `write_ch` while the actor is parked on `putOne`.
@@ -48,6 +50,7 @@ pub const pump_trace = struct {
     pub var write_chunk_sum: std.atomic.Value(u64) = .init(0);
     pub var work_get: std.atomic.Value(u64) = .init(0);
     pub var cipher_chunks: std.atomic.Value(u64) = .init(0);
+    pub var dirty_skip_wait: std.atomic.Value(u64) = .init(0);
 
     inline fn bump(counter: *std.atomic.Value(u64)) void {
         if (comptime observe) _ = counter.fetchAdd(1, .monotonic);
@@ -69,7 +72,8 @@ pub const pump_trace = struct {
                 "\"pump_want_read\":{d},\"pump_read_free_yield\":{d}," ++
                 "\"pump_live_handler_yield\":{d},\"pump_pending_read_retry\":{d}," ++
                 "\"pump_write_chunks\":{d},\"pump_write_chunk_sum\":{d}," ++
-                "\"pump_work_get\":{d},\"pump_cipher_chunks\":{d}",
+                "\"pump_work_get\":{d},\"pump_cipher_chunks\":{d}," ++
+                "\"pump_dirty_skip_wait\":{d}",
             .{
                 turns.load(.acquire),
                 select.load(.acquire),
@@ -85,10 +89,29 @@ pub const pump_trace = struct {
                 write_chunk_sum.load(.acquire),
                 work_get.load(.acquire),
                 cipher_chunks.load(.acquire),
+                dirty_skip_wait.load(.acquire),
             },
         );
     }
 };
+
+/// Bench `--diag`: print one line when the pump parks. Off unless the
+/// benchmark server sets it. Independent of `observe` so a ReleaseFast
+/// capture binary can dump queue occupancy without `-Dobserve=true`.
+pub var diag_wait: bool = false;
+var diag_last_wait_ns: u64 = 0;
+
+/// Same raw timestamped fd-2 write as `connection.diagRawPrint`; kept local
+/// because tls.zig does not import connection.zig. File order is time order
+/// only for lines written this way.
+fn rawPrint(comptime fmt: []const u8, args: anytype) void {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    const ms: u64 = @as(u64, @intCast(ts.sec)) *% 1000 +% @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "[{d}] " ++ fmt, .{ms % 1_000_000} ++ args) catch return;
+    _ = std.c.write(2, line.ptr, line.len);
+}
 
 pub const alpn_h2 = "h2";
 pub const stream_buffer_size: usize = limits_mod.TLS_STREAM_BUFFER_SIZE;
@@ -492,10 +515,24 @@ pub const CipherRead = struct {
     stream: std.Io.net.Stream,
     work: *std.Io.Queue(PumpWork),
     wake: *std.Io.Event,
+    /// Survives `wake.reset()`. CipherRead and the actor store true after
+    /// publishing to `work` / `write_ch`, then `set`. The pump swaps it after
+    /// reset; a true skip-wait is the lost-wakeup that mixed oneshot hit
+    /// when the event edge was eaten with a chunk already queued.
+    dirty: *std.atomic.Value(bool),
     chunk_storage: []u8,
     n_chunks: u32,
     free_indices: *std.Io.Queue(u32),
     stopped: std.atomic.Value(bool) = .init(false),
+    /// Diag: 0=not started, 1=running, 2=waiting for a free index,
+    /// 3=in the socket read, 4=posting to the work queue, 5=exited.
+    site: ?*std.atomic.Value(u8) = null,
+    task_h: ?*std.atomic.Value(usize) = null,
+    task_handle_fn: ?*const fn () usize = null,
+
+    fn diagSite(self: *CipherRead, v: u8) void {
+        if (self.site) |a| a.store(v, .release);
+    }
 
     fn returnIndex(self: *CipherRead, idx: u32) void {
         recycleCipher(self.io, self.free_indices, idx);
@@ -505,16 +542,23 @@ pub const CipherRead = struct {
         self.work.putOneUncancelable(self.io, .eof) catch {
             // A closed work queue means the connection is already tearing down.
         };
+        self.dirty.store(true, .release);
         self.wake.set(self.io);
     }
 
     pub fn run(self: *CipherRead) void {
+        if (self.task_handle_fn) |f| {
+            if (self.task_h) |h| h.store(f(), .release);
+        }
+        defer self.diagSite(5);
         var reader = self.stream.reader(self.io, &.{});
         while (!self.stopped.load(.acquire)) {
+            self.diagSite(2);
             const idx = self.free_indices.getOne(self.io) catch return;
             const off = @as(usize, idx) * cipher_chunk_size;
             const buf = self.chunk_storage[off..][0..cipher_chunk_size];
             var dest: [1][]u8 = .{buf};
+            self.diagSite(3);
             const n = reader.interface.readVec(&dest) catch {
                 self.returnIndex(idx);
                 self.stream.shutdown(self.io, .send) catch {};
@@ -527,6 +571,7 @@ pub const CipherRead = struct {
                 self.postEof();
                 return;
             }
+            self.diagSite(4);
             self.work.putOne(self.io, .{ .cipher = .{
                 .bytes = buf,
                 .len = n,
@@ -535,7 +580,9 @@ pub const CipherRead = struct {
                 self.returnIndex(idx);
                 return;
             };
+            self.dirty.store(true, .release);
             self.wake.set(self.io);
+            self.diagSite(1);
         }
     }
 
@@ -558,6 +605,19 @@ pub const Pump = struct {
     from_actor: *std.Io.Queue(wire_pump.WireChunk),
     work: *std.Io.Queue(PumpWork),
     wake: *std.Io.Event,
+    /// Same cell CipherRead and `pushWriteChunk` store. Swap after `wake.reset`.
+    dirty: *std.atomic.Value(bool),
+    /// Diag: where this pump currently is. 0=not started, 1=running,
+    /// 2=wake.wait, 3=writeChunks, 4=cipher ingest, 5=exited. The actor's
+    /// park snapshot prints it, so a wedge names the pump's blocking site
+    /// without a coroutine stack.
+    site: *std.atomic.Value(u8),
+    /// Diag: this pump's opaque zio task handle, published at run() start.
+    task_h: ?*std.atomic.Value(usize) = null,
+    task_handle_fn: ?*const fn () usize = null,
+    /// Pump stores true after a successful `read_ch` post; the actor swaps
+    /// after `actor_wake.reset` so a read chunk cannot sit while the actor waits.
+    read_dirty: *std.atomic.Value(bool),
     completions: *std.Io.Queue(wire_pump.WriteCompletion),
     actor_wake: *std.Io.Event,
     gpa: std.mem.Allocator,
@@ -585,6 +645,11 @@ pub const Pump = struct {
 
     fn post(self: *Pump, c: wire_pump.WriteCompletion) void {
         self.completions.putOneUncancelable(self.io, c) catch {};
+        self.notifyActor();
+    }
+
+    fn notifyActor(self: *Pump) void {
+        self.read_dirty.store(true, .release);
         self.actor_wake.set(self.io);
     }
 
@@ -594,7 +659,7 @@ pub const Pump = struct {
 
     fn postEof(self: *Pump) void {
         self.to_actor.putOneUncancelable(self.io, .{ .bytes = &.{}, .len = 0 }) catch {};
-        self.actor_wake.set(self.io);
+        self.notifyActor();
     }
 
     fn releaseChunk(self: *Pump, chunk: wire_pump.WireChunk, ok: bool, fail_all: bool) void {
@@ -752,7 +817,9 @@ pub const Pump = struct {
                         .ok => continue,
                         .stuck => {
                             self.stealWrite();
+                            self.site.store(9, .release);
                             self.io.sleep(.zero, .awake) catch {};
+                            self.site.store(3, .release);
                             continue;
                         },
                         .want => {
@@ -951,10 +1018,12 @@ pub const Pump = struct {
             self.pending_read = .{ .bytes = buf, .len = n, .pool_index = idx };
             return .ok;
         }
-        self.actor_wake.set(self.io);
+        self.notifyActor();
         if (self.live_task_handlers.load(.acquire) > 0) {
             pump_trace.bump(&pump_trace.live_handler_yield);
+            self.site.store(11, .release);
             self.io.sleep(.zero, .awake) catch {};
+            self.site.store(1, .release);
         }
         return .ok;
     }
@@ -994,20 +1063,27 @@ pub const Pump = struct {
         // Recreate the writer on this task. Handshake bound one on the
         // handshake Select arm; that wait context is gone.
         self.conn.bindWriter(self.io);
+        if (self.task_handle_fn) |f| {
+            if (self.task_h) |h| h.store(f(), .release);
+        }
+        defer self.site.store(5, .release);
         while (!self.stopped.load(.acquire)) {
+            self.site.store(1, .release);
             pump_trace.bump(&pump_trace.turns);
             var progress = false;
 
             if (self.carried) |chunk| {
                 self.carried = null;
+                self.site.store(3, .release);
                 if (!self.writeChunks(chunk)) return;
+                self.site.store(1, .release);
                 progress = true;
             }
 
             if (self.pending_read) |chunk| {
                 if (io_queue.tryPut(wire_pump.WireChunk, self.to_actor, self.io, chunk)) {
                     self.pending_read = null;
-                    self.actor_wake.set(self.io);
+                    self.notifyActor();
                     progress = true;
                 }
             }
@@ -1018,7 +1094,9 @@ pub const Pump = struct {
             if (self.pending_cipher != null and self.pending_read == null) {
                 const chunk = self.pending_cipher.?;
                 self.pending_cipher = null;
+                self.site.store(4, .release);
                 if (!self.ingestCipher(chunk)) return;
+                self.site.store(1, .release);
                 progress = true;
             }
 
@@ -1032,13 +1110,17 @@ pub const Pump = struct {
 
             if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
                 pump_trace.bump(&pump_trace.tryget_write);
+                self.site.store(3, .release);
                 if (!self.writeChunks(chunk)) return;
+                self.site.store(1, .release);
                 progress = true;
             }
             if (self.pending_cipher == null) {
                 if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
                     pump_trace.bump(&pump_trace.work_get);
+                    self.site.store(4, .release);
                     if (!self.dispatch(item)) return;
+                    self.site.store(1, .release);
                     progress = true;
                 }
             }
@@ -1048,21 +1130,31 @@ pub const Pump = struct {
             self.wake.reset();
             if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
                 pump_trace.bump(&pump_trace.tryget_write);
+                self.site.store(3, .release);
                 if (!self.writeChunks(chunk)) return;
                 continue;
             }
             if (self.pending_cipher == null) {
                 if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
                     pump_trace.bump(&pump_trace.work_get);
+                    self.site.store(4, .release);
                     if (!self.dispatch(item)) return;
+                    self.site.store(1, .release);
                     continue;
                 }
             }
             if (self.pending_read != null or self.pending_cipher != null) {
                 pump_trace.bump(&pump_trace.pending_read_retry);
+                self.site.store(10, .release);
                 self.io.sleep(.zero, .awake) catch {};
+                self.site.store(1, .release);
                 continue;
             }
+            if (self.pending_read == null and self.conn.pendingPlaintext() > 0) continue;
+            if (self.dirtyForbidsWait()) continue;
+            if (diag_wait) self.traceWaitSnapshot();
+            self.site.store(2, .release);
+            defer self.site.store(1, .release);
             self.wake.wait(self.io) catch {
                 self.failDrain();
                 self.post(.{ .fail_all = true, .shutdown = true });
@@ -1093,10 +1185,63 @@ pub const Pump = struct {
     pub fn stop(self: *Pump) void {
         self.stopped.store(true, .release);
     }
+
+    /// After `wake.reset` and empty tryGets. A producer stores this before
+    /// `set`; the event edge does not survive reset, the flag does.
+    fn dirtyForbidsWait(self: *Pump) bool {
+        if (self.dirty.swap(false, .acq_rel)) {
+            pump_trace.bump(&pump_trace.dirty_skip_wait);
+            return true;
+        }
+        return false;
+    }
+
+    fn traceWaitSnapshot(self: *Pump) void {
+        const now = nowNs(self.io);
+        if (now -% diag_last_wait_ns < std.time.ns_per_s) return;
+        diag_last_wait_ns = now;
+        const write_q = io_queue.queued(wire_pump.WireChunk, self.from_actor, self.io);
+        const work_q = io_queue.queued(PumpWork, self.work, self.io);
+        const read_q = io_queue.queued(wire_pump.WireChunk, self.to_actor, self.io);
+        const read_free_q = io_queue.queued(u32, self.read_free, self.io);
+        const cipher_free_q = io_queue.queued(u32, self.cipher_free, self.io);
+        const write_free_q: usize = if (self.write_free) |q| io_queue.queued(u32, q, self.io) else 0;
+        rawPrint(
+            "STARH2_PUMPWAIT write_q={d} work_q={d} read_q={d} read_free={d} write_free={d} cipher_free={d} carried={} pending_read={} pending_cipher={} plaintext={d} wake={s}\n",
+            .{
+                write_q,
+                work_q,
+                read_q,
+                read_free_q,
+                write_free_q,
+                cipher_free_q,
+                self.carried != null,
+                self.pending_read != null,
+                self.pending_cipher != null,
+                self.conn.pendingPlaintext(),
+                @tagName(self.wake.*),
+            },
+        );
+    }
 };
 
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
+
+test "TlsPump dirty flag survives Event.reset and forbids wait" {
+    var dirty = std.atomic.Value(bool).init(false);
+    var wake: std.Io.Event = .unset;
+    const io = std.testing.io;
+    dirty.store(true, .release);
+    wake.set(io);
+    wake.reset();
+    try std.testing.expect(!wake.isSet());
+
+    var pump: Pump = undefined;
+    pump.dirty = &dirty;
+    try std.testing.expect(pump.dirtyForbidsWait());
+    try std.testing.expect(!pump.dirtyForbidsWait());
 }
 
 test "h2 ALPN matcher" {

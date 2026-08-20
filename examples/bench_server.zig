@@ -811,10 +811,42 @@ fn driveOneshots(gpa: std.mem.Allocator, io: std.Io, tls: bool, peer: starh2.End
     }
 }
 
+extern "c" fn nanosleep(req: *const std.c.timespec, rem: ?*std.c.timespec) c_int;
+
+fn diagSweeperMain() void {
+    starh2.edge.connection.diagRawPrint("STARH2_SWEEPER up\n", .{});
+    var sweeps: u64 = 0;
+    while (true) {
+        var req = std.c.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
+        _ = nanosleep(&req, null);
+        sweeps += 1;
+        const kicked = starh2.edge.connection.diagRekickSweep();
+        if (kicked != 0 or sweeps % 20 == 0) {
+            starh2.edge.connection.diagRawPrint("STARH2_SWEEPER sweeps={d} kicked={d}\n", .{ sweeps, kicked });
+        }
+    }
+}
+
 fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process.Args, io: std.Io) !void {
     const args = try parseArgs(gpa, process_args);
     g_sse_interval_ms = args.sse_interval_ms;
     starh2.edge.connection.diag_park = args.diag;
+    starh2.edge.tls_edge.diag_wait = args.diag;
+    if (args.diag) {
+        // These exports exist only in a locally patched zio (zig-pkg is
+        // machine-local and gitignored); a pristine pin builds without them
+        // and the sweep prints 0xff-derived task tags instead.
+        if (comptime @hasDecl(zio, "debugCurrentTaskHandle")) {
+            starh2.edge.connection.diag_task_handle_fn = &zio.debugCurrentTaskHandle;
+            starh2.edge.connection.diag_task_state_fn = &zio.debugTaskStateByte;
+        }
+        // OS thread, outside the zio scheduler on purpose: near the wedge the
+        // scheduler stops delivering wakes, so an in-runtime watchdog task is
+        // itself a victim. This sweep re-drives a wedged pump futex directly.
+        starh2.edge.connection.diagRawPrint("STARH2_DIAG armed\n", .{});
+        const sweeper = try std.Thread.spawn(.{}, diagSweeperMain, .{});
+        sweeper.detach();
+    }
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;

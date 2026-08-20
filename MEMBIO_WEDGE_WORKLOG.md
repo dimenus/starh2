@@ -78,6 +78,92 @@ CONSEQUENCE: no perf number from a 302c0d7-lineage arm is trustworthy on
 ANY axis until this closes — a run that completes may have been one lucky
 draw. The t-866 fix gates all further measurement of this arm.
 
+## Third round: rates, falsifications, and live wedge timelines (2026-08-19, verifier session)
+
+Quantification (Darwin, M3 Pro, sha 806137a unless noted):
+
+- h2load specimen rate: 5/30 rounds wedge under a 60 s watchdog (healthy
+  round: ~0.9 s). Tool: `tools/h2load-wedge-rate.sh`. Evidence bundles under
+  `/tmp/starh2-h2load-wedge-rate*/wedge-*/`.
+- Go-client probe (WORKERS=2): baseline 2/4 wedges; `--no-task-migration`
+  1/6; `--executors 1` 2/6 (instrumented tree). The wedge SURVIVES all three.
+
+FALSIFIED as sole mechanisms, by A/B or by direct state capture:
+
+1. zio task migration / searcher / steal protocol (survives migration off).
+2. `sleep(.zero)` arming loop timers at this pin (patched the vendored zio
+   with upstream f5f5d28, zero-sleep = yield: wedge persists).
+3. Multi-executor announce races (survives `--executors 1`).
+4. A pump-only lost event edge: dirty flags + put-then-set are in place in
+   the instrumented tree, and the wedge persists with the flags CONSUMED.
+5. A hard resource cycle: external `futexWake` re-kicks (OS-thread sweeper)
+   and any periodic scheduler activity advance the system by roughly one
+   stage per tick, so the state is re-drivable, not a cycle.
+
+DIRECTLY OBSERVED, with `--diag` timelines (raw timestamped stderr, task
+state tags from a locally patched zio; see `scratchpad diag-run` captures):
+
+- A parked task with its wake already published: pump task tag=waiting with
+  `tls_pump_wake=is_set` and `pump_dirty=true` for many seconds (twice), and
+  the actor parked with `actor_wake=is_set` once. One lost `futexWake` is
+  then self-sealing on that event: `Event.set` on an `.is_set` event skips
+  the wake syscall, so every later producer notify is a silent no-op.
+- The 6 s quiet stretch of one wedge showed CipherRead parked INSIDE the
+  socket read (ciph_site=3, tag=waiting) while the client had pipelined
+  requests outstanding; the client's FIN at teardown delivered everything
+  at once. That implicates loop completion delivery (kqueue backend), not
+  the futex layer. Upstream zio d0c4d79 ("non-parking tryRead that keeps
+  kqueue edge accounting") touches this exact area one commit after the pin.
+- A trickle mode is real and reproduces: with a 500 ms in-runtime watchdog
+  task present, the wedged connection advances ~one stage per tick. Any
+  periodic task nudges the scheduler into delivering one more stranded
+  wake. This is the 630 ms trickle of the first specimen, generalized: the
+  cadence is whatever periodic task happens to exist.
+
+WORKING MODEL (hypothesis, one level down from the previous round): a wake
+delivery in zio is lost between `Waiter.signal`/loop completion and the
+task actually running - the victim is arbitrary (pump event, actor event,
+CipherRead socket read, watchdog timer), it reproduces on kqueue and
+io_uring, with 1 or 2 executors, with and without migration. The two
+sharpest single observations for a zio-level minimal repro are (a) a task
+parked in `futexWait` while its Event is `.is_set`, and (b) a socket read
+never completing while bytes are queued and the loop is in `kevent`.
+
+Instrumentation added (all `--diag`-gated, committed on this branch):
+
+- `STARH2_TLSQ`/`STARH2_PARK` raw timestamped snapshots with conn id, pump
+  site (1 run, 2 wake.wait, 3 writeChunks, 4 ingest, 9-11 yield sites),
+  CipherRead site (2 index, 3 socket read, 4 post), both Event states, and
+  (with the local zio patch) task state tags.
+- An OS-thread sweeper in the bench server (`STARH2_SWEEP` every 500 ms)
+  that also re-fires `futexWake` on the wedge signatures (`STARH2_REKICK*`).
+  It must be an OS thread: near the wedge, in-runtime watchdog tasks are
+  themselves victims. `std.debug.print` cannot be used off-runtime (stderr
+  lock) and interleaves non-chronologically (positional writes); use the
+  raw writers in this instrumentation only.
+- `tools/h2load-wedge-rate.sh` and a SERVER_ARGS passthrough in
+  `tools/wedge-probe.sh` for A/B arms.
+
+Machine-local (NOT committed; zig-pkg is gitignored): the vendored zio at
+`zig-pkg/zio-0.17.0-xHbVVMdhJwAj...` carries (a) upstream f5f5d28
+(zero-sleep = yield) and (b) `debugCurrentTaskHandle`/`debugTaskStateByte`
+diag exports. `bench_server` guards the hook with `@hasDecl`, so a
+pristine pin still builds. Re-apply by hand when reproducing task tags.
+
+## Next (fourth round)
+
+1. Minimal zio-level repro of (a) or (b) above, outside starh2: one Event
+   ping-pong plus one socket read under load, 1-2 executors, assert
+   progress with a watchdog. The existing `tools/zio-migration-repro` shape
+   plus the Event reset/tryGet/dirty protocol it lacks.
+2. Read upstream zio d0c4d79 and the kqueue completion path for a lost
+   readiness edge; compare against the io_uring backend for the shared
+   shape (nachos wedges too, so a kqueue-only theory is wrong unless both
+   backends share the defect in loop.zig, e.g. drainDispatched or the
+   wake_requested swap).
+3. If a zio fix lands, grade with: probe 3/3 at WORKERS=2 and 8,
+   `h2load-wedge-rate.sh` 0/30, then the full t-843 grading lines.
+
 ## Do not
 
 - Re-litigate the pump wire path or reintroduce a Select; both are

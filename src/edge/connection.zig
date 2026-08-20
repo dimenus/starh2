@@ -170,6 +170,120 @@ pub var test_polling_canary_tick_ns: std.atomic.Value(u64) = .init(0);
 /// Bench `--diag`: print one line when the actor parks with scheduler or TLS
 /// work still sitting in userspace. Off unless the benchmark server sets it.
 pub var diag_park: bool = false;
+
+/// Diag hooks the bench server installs (they need zio, which this module
+/// must not import). Handle = opaque task pointer; state byte = packed
+/// (tag:u3 | awaken:u1) from zio's AnyTask.
+pub var diag_task_handle_fn: ?*const fn () usize = null;
+pub var diag_task_state_fn: ?*const fn (usize) u8 = null;
+
+/// Diag-only registry of live TLS connections, so an OS thread (spawned by
+/// the bench server, outside the zio scheduler) can sweep for the lost-wake
+/// wedge signature and re-drive the pump futex. An in-runtime watchdog task
+/// cannot serve here: near the wedge its own timer wakes are not delivered.
+var diag_reg_lock: std.atomic.Value(bool) = .init(false);
+var diag_reg: [64]?*Connection = @splat(null);
+
+fn diagRegLock() void {
+    while (diag_reg_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+}
+
+fn diagRegUnlock() void {
+    diag_reg_lock.store(false, .release);
+}
+
+fn diagRegister(conn: *Connection) void {
+    diagRegLock();
+    defer diagRegUnlock();
+    for (&diag_reg) |*slot| {
+        if (slot.* == null) {
+            slot.* = conn;
+            return;
+        }
+    }
+}
+
+fn diagDeregister(conn: *Connection) void {
+    diagRegLock();
+    defer diagRegUnlock();
+    for (&diag_reg) |*slot| {
+        if (slot.* == conn) slot.* = null;
+    }
+}
+
+/// Raw fd-2 write for diag lines, from tasks and OS threads alike.
+/// `std.debug.print` buffers and writes positionally, so its lines do not
+/// interleave chronologically with plain writes; every diag line goes
+/// through here so the file order is the time order. The prefix is
+/// CLOCK_MONOTONIC milliseconds.
+pub fn diagRawPrint(comptime fmt: []const u8, args: anytype) void {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    const ms: u64 = @as(u64, @intCast(ts.sec)) *% 1000 +% @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "[{d}] " ++ fmt, .{ms % 1_000_000} ++ args) catch return;
+    _ = std.c.write(2, line.ptr, line.len);
+}
+
+/// Sweep every registered connection for the wedge signature (pump inside
+/// `wake.wait` with the dirty flag still set) and re-fire the futex wake on
+/// the pump event. Returns how many pumps were re-kicked. Called from an OS
+/// thread; everything touched here is atomic or the futex bucket table.
+pub fn diagRekickSweep() u32 {
+    diagRegLock();
+    defer diagRegUnlock();
+    var kicked: u32 = 0;
+    for (diag_reg) |maybe_conn| {
+        const conn = maybe_conn orelse continue;
+        const site = conn.tls_pump_site.load(.acquire);
+        const dirty = conn.tls_pump_dirty.load(.acquire);
+        // No queue reads here: io_queue locks a std.Io.Mutex, which an OS
+        // thread outside the runtime must never take.
+        const pump_state: u8 = if (diag_task_state_fn) |f| f(conn.tls_pump_task_h.load(.acquire)) else 0xff;
+        const actor_state: u8 = if (diag_task_state_fn) |f| f(conn.actor_task_h.load(.acquire)) else 0xff;
+        const cipher_state: u8 = if (diag_task_state_fn) |f| f(conn.cipher_task_h.load(.acquire)) else 0xff;
+        diagRawPrint(
+            "STARH2_SWEEP conn={x} site={d} dirty={} wake={s} ack_wake={s} read_dirty={} pump_tag={d} pump_awaken={d} actor_tag={d} actor_awaken={d} ciph_site={d} ciph_tag={d} ciph_awaken={d}\n",
+            .{
+                @intFromPtr(conn) & 0xffff,
+                site,
+                dirty,
+                @tagName(@atomicLoad(std.Io.Event, &conn.tls_pump_wake, .acquire)),
+                @tagName(@atomicLoad(std.Io.Event, &conn.actor_wake, .acquire)),
+                conn.tls_read_dirty.load(.acquire),
+                pump_state & 0x7,
+                (pump_state >> 3) & 1,
+                actor_state & 0x7,
+                (actor_state >> 3) & 1,
+                conn.cipher_site.load(.acquire),
+                cipher_state & 0x7,
+                (cipher_state >> 3) & 1,
+            },
+        );
+        if (site == 2 and dirty) {
+            kicked += 1;
+            diagRawPrint(
+                "STARH2_REKICK conn={x} pump_wake={s}\n",
+                .{
+                    @intFromPtr(conn) & 0xffff,
+                    @tagName(@atomicLoad(std.Io.Event, &conn.tls_pump_wake, .acquire)),
+                },
+            );
+            conn.config.io.futexWake(std.Io.Event, &conn.tls_pump_wake, std.math.maxInt(u32));
+        }
+        // A set actor event observed by a 500 ms sweep means the actor sat
+        // parked across the whole interval with its wake already published.
+        // Re-fire the futex: if the actor revives, its select subtask was
+        // parked in futexWait and the wake was lost; if nothing changes, the
+        // subtask was never scheduled at all.
+        if (@atomicLoad(std.Io.Event, &conn.actor_wake, .acquire) == .is_set) {
+            kicked += 1;
+            diagRawPrint("STARH2_REKICK_ACTOR conn={x}\n", .{@intFromPtr(conn) & 0xffff});
+            conn.config.io.futexWake(std.Io.Event, &conn.actor_wake, std.math.maxInt(u32));
+        }
+    }
+    return kicked;
+}
 pub var diag_rst_handler: std.atomic.Value(u32) = .init(0);
 pub var diag_rst_compress: std.atomic.Value(u32) = .init(0);
 pub var diag_ctrl_fail: std.atomic.Value(u32) = .init(0);
@@ -848,6 +962,20 @@ const Connection = struct {
     tls_work_buf: []tls_edge.PumpWork = &.{},
     tls_work_ch: std.Io.Queue(tls_edge.PumpWork) = undefined,
     tls_pump_wake: std.Io.Event = .unset,
+    /// Survives `tls_pump_wake.reset`. CipherRead and `pushWriteChunk` store
+    /// true after publishing, then set the event. TlsPump swaps after reset.
+    tls_pump_dirty: std.atomic.Value(bool) = .init(false),
+    /// Survives `actor_wake.reset`. TlsPump stores true after a `read_ch` post.
+    tls_read_dirty: std.atomic.Value(bool) = .init(false),
+    /// Diag: the pump's current blocking site (see `tls_edge.Pump.site`).
+    tls_pump_site: std.atomic.Value(u8) = .init(0),
+    /// Diag: this connection is in `diag_reg` and must deregister on teardown.
+    diag_registered: bool = false,
+    /// Diag: opaque zio task handles for the actor and the pump.
+    actor_task_h: std.atomic.Value(usize) = .init(0),
+    tls_pump_task_h: std.atomic.Value(usize) = .init(0),
+    cipher_site: std.atomic.Value(u8) = .init(0),
+    cipher_task_h: std.atomic.Value(usize) = .init(0),
     frame_pool: slab_pool.SlabPool = undefined,
     read_pool_n: u32 = 0,
     /// Preallocated scratch for stream-id sweeps (no hot-path ArrayList).
@@ -1750,6 +1878,7 @@ const Connection = struct {
         if (self.tls_work_buf.len != 0) {
             _ = io_queue.tryPut(tls_edge.PumpWork, &self.tls_work_ch, self.config.io, .eof);
             self.tls_work_ch.close(self.config.io);
+            self.tls_pump_dirty.store(true, .release);
             self.tls_pump_wake.set(self.config.io);
         }
 
@@ -2124,7 +2253,19 @@ const Connection = struct {
             }
             if (sw < min_win) min_win = sw;
         }
-        std.debug.print(
+        const write_q = io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io);
+        const read_q = io_queue.queued(wire_pump.WireChunk, &self.read_ch, self.config.io);
+        const work_q: usize = if (self.tls_work_buf.len != 0)
+            io_queue.queued(tls_edge.PumpWork, &self.tls_work_ch, self.config.io)
+        else
+            0;
+        const read_free_q = io_queue.queued(u32, &self.read_free_ch, self.config.io);
+        const write_free_q = io_queue.queued(u32, &self.write_free_ch, self.config.io);
+        const cipher_free_q: usize = if (self.tls_cipher_free_buf.len != 0)
+            io_queue.queued(u32, &self.tls_cipher_free_ch, self.config.io)
+        else
+            0;
+        diagRawPrint(
             "STARH2_PARK acc={d} complete={} pending={d} bytes={d} ordinary={d} framed={d} live={d} refilled={} conn_win={d} eligible={d} missing={d} tomb_noerr={d} tomb_rst={d} pend_slots={d} rst0={d} intents={d} zero_win={d} min_swin={d} active={d} rst_h={d} rst_c={d} ctrl_fail={d} rst_after_fail={d}\n",
             .{
                 acc,
@@ -2152,6 +2293,54 @@ const Connection = struct {
                 diag_reset_after_ctrl_fail.load(.monotonic),
             },
         );
+        diagRawPrint(
+            "STARH2_TLSQ conn={x} write_q={d} read_q={d} work_q={d} read_free={d} write_free={d} cipher_free={d} inline={d} receipts={d} receipts_ready={d} ack_wake={s} pump_dirty={} read_dirty={} pump_site={d} pump_wake={s} live_h={d}\n",
+            .{
+                @intFromPtr(self) & 0xffff,
+                write_q,
+                read_q,
+                work_q,
+                read_free_q,
+                write_free_q,
+                cipher_free_q,
+                self.inline_n,
+                self.pending_complete_receipt_n,
+                self.complete_receipts_ready.load(.acquire),
+                @tagName(self.actor_wake),
+                self.tls_pump_dirty.load(.acquire),
+                self.tls_read_dirty.load(.acquire),
+                self.tls_pump_site.load(.acquire),
+                @tagName(@atomicLoad(std.Io.Event, &self.tls_pump_wake, .acquire)),
+                self.live_handlers.load(.acquire),
+            },
+        );
+    }
+
+    /// Diag-only (`--diag`): every 500 ms, when the pump reports site 2
+    /// (inside `wake.wait`) while `tls_pump_dirty` is still true, re-fire
+    /// the futex wake on the pump event and report it. The event is
+    /// already `.is_set` in the wedge, so `set` would be a no-op; the raw
+    /// `futexWake` is the only way to re-drive the parked waiter.
+    fn diagRekickWatchdog(self: *Connection) void {
+        const io = self.config.io;
+        var fired: u64 = 0;
+        while (true) {
+            io.sleep(.fromMilliseconds(500), .awake) catch return;
+            if (self.tls_pump_site.load(.acquire) == 2 and
+                self.tls_pump_dirty.load(.acquire))
+            {
+                fired += 1;
+                diagRawPrint(
+                    "STARH2_WATCHDOG n={d} pump_wake={s} write_q={d}\n",
+                    .{
+                        fired,
+                        @tagName(@atomicLoad(std.Io.Event, &self.tls_pump_wake, .acquire)),
+                        io_queue.queued(wire_pump.WireChunk, &self.write_ch, io),
+                    },
+                );
+                io.futexWake(std.Io.Event, &self.tls_pump_wake, std.math.maxInt(u32));
+            }
+        }
     }
 
     fn waitForActivity(self: *Connection) !void {
@@ -2241,6 +2430,7 @@ const Connection = struct {
     fn run(self: *Connection) !void {
         const gpa = self.config.gpa;
         const io = self.config.io;
+        if (diag_task_handle_fn) |f| self.actor_task_h.store(f(), .release);
 
         var read_pump: wire_pump.ReadPump = undefined;
         var write_pump: wire_pump.WritePump = undefined;
@@ -2253,8 +2443,11 @@ const Connection = struct {
         var tls_started = false;
         var cipher_started = false;
         var h2c_started = false;
+        var rekick_handle: ?std.Io.Future(void) = null;
 
         defer {
+            if (self.diag_registered) diagDeregister(self);
+            if (rekick_handle) |*h| h.cancel(io);
             if (tls_started) tls_pump.stop();
             if (cipher_started) cipher_read.stop();
             if (h2c_started) {
@@ -2266,6 +2459,7 @@ const Connection = struct {
             };
             if (self.tls_work_buf.len != 0) {
                 _ = self.tls_work_ch.putUncancelable(io, &.{.eof}, 0) catch {};
+                self.tls_pump_dirty.store(true, .release);
                 self.tls_pump_wake.set(io);
             }
             self.stream.shutdown(io, .both) catch {
@@ -2288,9 +2482,13 @@ const Connection = struct {
                 .stream = self.stream,
                 .work = &self.tls_work_ch,
                 .wake = &self.tls_pump_wake,
+                .dirty = &self.tls_pump_dirty,
                 .chunk_storage = self.tls_cipher_storage,
                 .n_chunks = self.tls_cipher_n,
                 .free_indices = &self.tls_cipher_free_ch,
+                .site = &self.cipher_site,
+                .task_h = &self.cipher_task_h,
+                .task_handle_fn = diag_task_handle_fn,
             };
             cipher_handle = try io.concurrent(tls_edge.CipherRead.run, .{&cipher_read});
             cipher_started = true;
@@ -2302,6 +2500,11 @@ const Connection = struct {
                 .from_actor = &self.write_ch,
                 .work = &self.tls_work_ch,
                 .wake = &self.tls_pump_wake,
+                .dirty = &self.tls_pump_dirty,
+                .read_dirty = &self.tls_read_dirty,
+                .site = &self.tls_pump_site,
+                .task_h = &self.tls_pump_task_h,
+                .task_handle_fn = diag_task_handle_fn,
                 .completions = &self.write_ack_ch,
                 .actor_wake = &self.actor_wake,
                 .gpa = gpa,
@@ -2316,6 +2519,15 @@ const Connection = struct {
             };
             tls_handle = try io.concurrent(tls_edge.Pump.run, .{&tls_pump});
             tls_started = true;
+            // Diag-only lost-wake discriminators. The in-runtime watchdog
+            // probes whether zio timer wakes still arrive near the wedge;
+            // the OS-thread sweep (diagRekickSweep) re-drives the pump
+            // futex from outside the scheduler. Instrumentation, not a fix.
+            if (diag_park) {
+                self.diag_registered = true;
+                diagRegister(self);
+                rekick_handle = try io.concurrent(diagRekickWatchdog, .{self});
+            }
         } else {
             read_pump = .{
                 .io = io,
@@ -2446,7 +2658,8 @@ const Connection = struct {
                 // The recheck list below must name EVERY producer: write acks,
                 // read chunks, handler completions, complete-receipt readiness,
                 // scheduler refills, writer failure, queued complete handlers,
-                // a newly armed handler deadline, and the shutdown flag. A
+                // a newly armed handler deadline, TLS read posts (`tls_read_dirty`),
+                // and the shutdown flag. A source left out of this list is a hang,
                 // source left out of this list is a hang, not a slow path,
                 // because the actor then parks with work already waiting for it.
                 self.actor_wake.reset();
@@ -2461,6 +2674,7 @@ const Connection = struct {
                     !self.sched_refilled.load(.acquire) and
                     !self.writer_failed.load(.acquire) and
                     !self.deadline_armed.load(.acquire) and
+                    !self.tls_read_dirty.swap(false, .acq_rel) and
                     !(self.config.shutdown_flag != null and self.config.shutdown_flag.?.load(.acquire)))
                 {
                     try self.waitForActivity();
@@ -3742,22 +3956,27 @@ const Connection = struct {
     /// Hand a chunk to WritePump. Never parks the actor once the connection is
     /// going away: tryPut, shut the socket to unstick a blocked write, retry
     /// once, then fail. A healthy connection still `putOne`s for backpressure.
+    fn notifyTlsPump(self: *Connection) void {
+        if (self.config.mode != .tls_h2) return;
+        self.tls_pump_dirty.store(true, .release);
+        self.tls_pump_wake.set(self.config.io);
+    }
+
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
         if (self.writeGoingAway()) {
             if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
-                if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
+                self.notifyTlsPump();
                 return;
             }
             self.stream.shutdown(self.config.io, .both) catch {};
             if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
-                if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
+                self.notifyTlsPump();
                 return;
             }
             return error.WriteFailed;
         }
-        if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
         self.write_ch.putOne(self.config.io, chunk) catch return error.WriteFailed;
-        if (self.config.mode == .tls_h2) self.tls_pump_wake.set(self.config.io);
+        self.notifyTlsPump();
     }
 
     fn rentFrame(self: *Connection, n: usize) ?[]u8 {

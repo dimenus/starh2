@@ -70,8 +70,11 @@ trap cleanup EXIT INT TERM
 
 bench_lock
 : >"$OUT/server.log"
+# SERVER_ARGS holds extra bench-server flags for A/B arms
+# (for example: SERVER_ARGS="--no-task-migration"). Word splitting is intended.
 "$STARH2" --mode tls --port 0 --executors "$STARH2_EXECUTORS" \
   --cert "$REPO/testdata/cert.pem" --key "$REPO/testdata/key.pem" \
+  ${SERVER_ARGS:-} \
   >"$OUT/server.log" 2>&1 &
 S_PID=$!
 
@@ -99,7 +102,7 @@ if [ -z "$PORT" ] || [ "$PORT" -le 0 ]; then
 fi
 
 SHA=$(git -C "$REPO" rev-parse --short HEAD)
-echo "wedge-probe: sha=$SHA host=$(uname -s) workers=$WORKERS seconds=$SECONDS_RUN warmup=$WARMUP threshold=$THRESHOLD executors=$STARH2_EXECUTORS port=$PORT"
+echo "wedge-probe: sha=$SHA host=$(uname -s) workers=$WORKERS seconds=$SECONDS_RUN warmup=$WARMUP threshold=$THRESHOLD executors=$STARH2_EXECUTORS port=$PORT server_args='${SERVER_ARGS:-}'"
 echo "wedge-probe: bin=$STARH2 out=$OUT"
 
 set +e
