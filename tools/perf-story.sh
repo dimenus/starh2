@@ -417,7 +417,23 @@ peak_rss() {
     done
     set +e
     "$OUT/sse-client" -url "https://127.0.0.1:${port}/sse" -streams 200 -seconds 10 -warmup 1 -label "peak-$arm" >> "$log" 2>&1
-    kill -TERM "$spid" 2>/dev/null
+    # $spid is the /usr/bin/time WRAPPER. TERM must go to its child (the
+    # server): BSD time dies on TERM without printing stats, which produced
+    # the "no peak line" FAILs on both OSes AND orphaned the server on the
+    # fixed port. time prints its stats only after the child exits.
+    server_pid=$(pgrep -P "$spid" 2>/dev/null | head -1)
+    kill -TERM "${server_pid:-$spid}" 2>/dev/null
+    i=0
+    while [ "$i" -lt 100 ] && kill -0 "$spid" 2>/dev/null; do
+      i=$((i + 1))
+      sleep 0.1
+    done
+    server_exit=ok
+    if kill -0 "$spid" 2>/dev/null; then
+      server_exit=hung
+      [ -n "${server_pid:-}" ] && kill -KILL "$server_pid" 2>/dev/null
+      kill -KILL "$spid" 2>/dev/null
+    fi
     wait "$spid" 2>/dev/null
     set -e
     {
@@ -428,7 +444,9 @@ peak_rss() {
       /maximum resident set size/ { print $1; exit }
       /Maximum resident set size/ { print $6; exit }
     ' "$time_log")
-    if [ -n "$peak" ]; then
+    if [ "$server_exit" = hung ]; then
+      emit_row "$name" "$arm" "FAIL" "server did not exit on TERM" "$log" "$sum"
+    elif [ -n "$peak" ]; then
       emit_row "$name" "$arm" "ok" "peak=$peak" "$log" "$sum"
     else
       emit_row "$name" "$arm" "FAIL" "no peak line" "$log" "$sum"
