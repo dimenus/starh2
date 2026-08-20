@@ -1148,25 +1148,18 @@ pub const Pump = struct {
             self.site.store(1, .release);
             switch (winner) {
                 .io => |r| {
-                    // A STALE CQ WAKE, not a drain. zio's CompletionQueue
-                    // bumps `signal` and issues the futex wake in two steps
-                    // (ownerCallback); a completion popped via `next()` in
-                    // between leaves that wake to claim the NEXT select
-                    // registration, and `getResult` then reports
-                    // error.Closed on an open queue (in Debug, zio's
-                    // `assert(drained)` panics first — this catch cannot
-                    // help there; the real fix is a fork patch, t-878
-                    // stop report). Only `shutdownCq` closes this queue,
-                    // and only after the loop exits, so Closed here is
-                    // always the stale wake: re-run the turn. Measured
-                    // live: ~1/3 of WORKERS=2 wedge-probe runs wedged on
-                    // the silent-exit predecessor of this branch.
+                    // The zio pin (845276b) hands completions to a
+                    // registered select waiter directly, so a wake is
+                    // one-to-one with a takeable completion or the drained
+                    // close. Only `shutdownCq` closes this queue, so Closed
+                    // here means teardown raced the loop: exit cleanly. The
+                    // stale-wake tolerance that stood here against the old
+                    // pin is retired with the fork fix; a Closed must never
+                    // again be swallowed, or a real teardown spins.
                     const c = r catch {
-                        pump_trace.bump(&pump_trace.cq_spurious_wake);
-                        if (diag_wait) {
-                            rawPrint("STARH2_CQSPUR select-io stale wake pending={} signal={d}\n", .{ self.cq.hasPending(), self.cq.signal.load(.acquire) });
-                        }
-                        continue;
+                        self.failDrain();
+                        self.post(.{ .fail_all = true, .shutdown = true });
+                        return;
                     };
                     std.debug.assert(c == &self.recv_op.c);
                     if (self.onRecvComplete() == .exit) return;

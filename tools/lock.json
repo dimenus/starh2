@@ -3,8 +3,8 @@
   "zio": {
     "tag": "v0.17.0",
     "fork": "https://github.com/dimenus/zio",
-    "commit": "489f31f85c134a1a2b587d46729a9fe258f7f890",
-    "hash": "zio-0.17.0-xHbVVMdhJwAj5AjSKXkFUbvCvzcXXe8mLImv3NXBxVAv",
+    "commit": "845276be5c9b1c79df0d60a8318f8cb30c32b414",
+    "hash": "zio-0.17.0-xHbVVGFyJwDZLeX9tKcLWeZchnhtthdv0cBQLaKYtGcP",
     "upstream_pr": "https://github.com/lalinsky/zio/pull/686"
   },
   "datastar-sdk.zig": {
