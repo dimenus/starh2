@@ -10,6 +10,14 @@ Server-side HTTP/2 stack shaped around Datastar. Rationale lives in the git log
   design that may already be decided, before filing a task, and when a constraint
   here has no stated reason.
 - Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib lookups. Do not guess 0.16 APIs.
+- **Never guess a dependency's contract; read its source.** Every dependency
+  is vendored at `zig-pkg/<name>/src` precisely so its implementation is one
+  `Read` away. Before calling an API, read the function body and its callers
+  in the dependency's own tests, not just the doc comment — the t-878 cut
+  found a wake race in `zio.CompletionQueue`'s future protocol that the doc
+  comment does not mention and only the implementation shows. A delegation
+  brief must name the exact dependency files to read, and a delegate that
+  used an API it did not read has not finished its brief.
 
 ## Premises — treat these as settled, and say so when you delegate
 
