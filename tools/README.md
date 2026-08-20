@@ -163,6 +163,18 @@ The 30s TLS stall (DATA left in FairScheduler after a RST tombstone) is a
 different defect. Method: `TLS_STALL_BRIEF.md`. It landed in `57359b7`.
 `not-started` (`started < total`) is t-761.
 
+## Linux host builds: pass an explicit -Dtarget
+
+On a Linux host, always build with an explicit target, for example
+`-Dtarget=x86_64-linux-gnu` or `-Dtarget=x86_64-linux-musl`. A native build
+(no `-Dtarget`) links the system `crt1.o`. A gcc-16 `crt1.o` carries a
+`.sframe` section with `R_X86_64_PC64` relocations, and the zig 0.16 linker
+rejects them (`fatal linker error: unhandled relocation type R_X86_64_PC64`).
+An explicit target makes zig use its bundled CRT, so the link works. When a
+newer zig links the native target on a gcc-16 host, remove this section
+(t-885 tracks that check). BoringSSL itself builds with `zig cc` for every
+Linux target, native hosts included (`tools/build-boringssl.sh`).
+
 ## Linux musl RUN (container)
 
 `x86_64-linux-musl` and `aarch64-linux-musl` ReleaseSafe binaries are compile-gated

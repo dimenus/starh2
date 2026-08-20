@@ -60,7 +60,11 @@ if [ "$fips" = true ]; then
         -DCMAKE_ASM_COMPILER=clang \
         -DCMAKE_C_FLAGS=-Wno-unused-command-line-argument \
         -DFIPS=1
-elif [ "$target_os" = linux ] && { [ "$(uname -s)" != Linux ] || [ "$target_arch" != "$(uname -m)" ]; }; then
+# Every Linux target uses the zig toolchain, native hosts included. A native
+# Linux host must not fall through to the system compiler: a system toolchain
+# newer than zig's linker (gcc-16 SFRAME relocations, libstdc++-16 headers)
+# breaks the build, and zig cc is the one compiler every host already has.
+elif [ "$target_os" = linux ]; then
     mkdir -p "$build_dir/zig-toolchain"
 
     cat >"$build_dir/zig-toolchain/cc" <<EOF
@@ -99,7 +103,7 @@ EOF
         -DCMAKE_AR="$build_dir/zig-toolchain/ar" \
         -DCMAKE_RANLIB="$build_dir/zig-toolchain/ranlib" \
         -DCMAKE_SYSTEM_NAME=Linux \
-        -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+        -DCMAKE_SYSTEM_PROCESSOR="$target_arch" \
         -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
 else
     cmake \
