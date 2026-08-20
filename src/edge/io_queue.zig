@@ -10,6 +10,21 @@
 //! "nothing available" rather than as an error, because to a poller the two are
 //! the same fact.
 const std = @import("std");
+const zio = @import("zio");
+
+/// Nonblocking take from a zio channel. Empty and closed-and-drained report
+/// the same fact to a poller: nothing available.
+pub fn tryRecv(comptime T: type, ch: *zio.Channel(T)) ?T {
+    return ch.tryReceive() catch null;
+}
+
+/// Occupancy of a zio channel, in elements. Locks the channel mutex.
+/// Trace-only: do not use this to decide a hot-path batch size.
+pub fn chanLen(comptime T: type, ch: *zio.Channel(T)) usize {
+    ch.impl.mutex.lockUncancelable();
+    defer ch.impl.mutex.unlock();
+    return ch.impl.count;
+}
 
 pub fn tryGet(comptime T: type, queue: *std.Io.Queue(T), io: std.Io) ?T {
     var one: [1]T = undefined;

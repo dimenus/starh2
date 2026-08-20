@@ -23,9 +23,10 @@
 //! |                |       | emit through WritePump. SSE always spawns.    |
 //! | reaper worker  | pool  | canceling a handler future (server-wide)      |
 //!
-//! TLS mode takes a DIRECT zio dependency (channel + CompletionQueue). The
-//! h2c pumps stay std.Io-pure; `tests/backend_parity.zig` keeps its
-//! std.Io.Threaded arm for those paths only.
+//! The edge takes a DIRECT zio dependency, openly: the actor parks in one
+//! `zio.select`, its inbound/ack/completion channels are zio channels, and
+//! TLS adds the CompletionQueue driver. Nothing in the edge is std.Io-pure
+//! any more; a connection requires the zio runtime behind `std.Io`.
 //!
 //! Rules that follow from the table, all of which have been violated at least
 //! once:
@@ -63,15 +64,18 @@
 //! # The wake protocol
 //!
 //! The actor is event-driven and parks with no timer when nothing is armed, so
-//! a lost wakeup is a hang and not a delay. Two mechanisms close the race:
+//! a lost wakeup is a hang and not a delay. The park is one `zio.select` over
+//! sources that all hold PERSISTENT evidence, so there is no reset and no
+//! recheck list:
 //!
-//! 1. The actor RESETS `actor_wake` first, then re-checks every
-//!    producer-owned source, and only then waits. A `set` that lands between
-//!    the check and the reset would otherwise be erased.
-//! 2. A producer that frees a resource sets a FLAG before it sets the event
-//!    (`sched_refilled` is the example). A flag survives a reset; an event
-//!    edge does not. This is what closes the refill race by construction
-//!    rather than by timing.
+//! 1. Read chunks, write acks, and handler completions are zio channels; a
+//!    buffered item survives until the actor takes it, and the select's fast
+//!    path observes it before parking.
+//! 2. Every other producer sets its flag and then RINGS the doorbell (`ring`,
+//!    a capacity-1 channel; a full doorbell means a ring is already pending).
+//!    The ring is the producer's LAST act, and `ring` is the only writer of
+//!    that channel. A producer that neither sends on a selected channel nor
+//!    rings is a hang — which is why no such producer may exist.
 //!
 //! # Byte accounting: two kinds, released at different moments
 //!
@@ -126,7 +130,14 @@ pub var test_hold_complete_receipt_ack: std.atomic.Value(bool) = .init(false);
 /// Test-only: true while a complete-batch write ack is stashed unapplied.
 pub var test_complete_receipt_ack_held: std.atomic.Value(bool) = .init(false);
 /// Test-only: wakes a parked actor that has a live complete-batch stash.
-pub var test_release_complete_receipt_ack: std.Io.Event = .unset;
+/// A zio.ResetEvent so the actor's select can wait on it directly.
+pub var test_release_complete_receipt_ack: zio.ResetEvent = .init;
+/// Never set / never sent-to: the select branches point here when their
+/// real source is absent or gated, so the select keeps one comptime shape.
+var no_shutdown_event: zio.ResetEvent = .init;
+var no_ack_hold_event: zio.ResetEvent = .init;
+var hold_dummy_completion_buf: [1]u31 = undefined;
+var hold_dummy_completion_ch: zio.Channel(u31) = .init(&hold_dummy_completion_buf);
 /// Test-only: delay write pump by N ms.
 pub var test_write_delay_ms: u64 = 0;
 /// Test-only: fail write pump after N successful writes (0 = never).
@@ -245,7 +256,7 @@ pub fn diagRawPrint(comptime fmt: []const u8, args: anytype) void {
 pub fn diagRekickSweep() u32 {
     diagRegLock();
     defer diagRegUnlock();
-    var kicked: u32 = 0;
+    const kicked: u32 = 0;
     for (diag_reg) |maybe_conn| {
         const conn = maybe_conn orelse continue;
         const site = conn.tls_pump_site.load(.acquire);
@@ -257,12 +268,10 @@ pub fn diagRekickSweep() u32 {
         const actor_mark: u64 = if (diag_task_mark_fn) |f| f(conn.actor_task_h.load(.acquire)) else 0;
         const stamp_now: u64 = if (diag_stamp_now_fn) |f| f() else 0;
         diagRawPrint(
-            "STARH2_SWEEP conn={x} site={d} ack_wake={s} read_dirty={} pump_tag={d} pump_awaken={d} actor_tag={d} actor_awaken={d} pump_hop={d}@{d} actor_hop={d}@{d} now={d} actor_site={d} mu_held={}\n",
+            "STARH2_SWEEP conn={x} site={d} pump_tag={d} pump_awaken={d} actor_tag={d} actor_awaken={d} pump_hop={d}@{d} actor_hop={d}@{d} now={d} actor_site={d} mu_held={}\n",
             .{
                 @intFromPtr(conn) & 0xffff,
                 site,
-                @tagName(@atomicLoad(std.Io.Event, &conn.actor_wake, .acquire)),
-                conn.tls_read_dirty.load(.acquire),
                 pump_state & 0x7,
                 (pump_state >> 3) & 1,
                 actor_state & 0x7,
@@ -293,16 +302,9 @@ pub fn diagRekickSweep() u32 {
                 if (conn.tls) |t| t.pendingPlaintext() else 0,
             },
         );
-        // A set actor event observed by a 500 ms sweep means the actor sat
-        // parked across the whole interval with its wake already published.
-        // Re-fire the futex: if the actor revives, its select subtask was
-        // parked in futexWait and the wake was lost; if nothing changes, the
-        // subtask was never scheduled at all.
-        if (@atomicLoad(std.Io.Event, &conn.actor_wake, .acquire) == .is_set) {
-            kicked += 1;
-            diagRawPrint("STARH2_REKICK_ACTOR conn={x}\n", .{@intFromPtr(conn) & 0xffff});
-            conn.config.io.futexWake(std.Io.Event, &conn.actor_wake, std.math.maxInt(u32));
-        }
+        // The Event-era re-kick probe is gone with the Event: a published
+        // wake now lives in a channel until the actor takes it, so there is
+        // no futex edge to re-fire.
     }
     return kicked;
 }
@@ -544,7 +546,9 @@ pub const ConnConfig = struct {
     tls_acceptor: ?*tls_edge.Acceptor = null,
     gpa: std.mem.Allocator,
     shutdown_flag: ?*std.atomic.Value(bool) = null,
-    shutdown_event: ?*std.Io.Event = null,
+    /// One-shot: set once at server shutdown, never reset, so selecting on it
+    /// is race-free (persistent set, no edge to lose).
+    shutdown_event: ?*zio.ResetEvent = null,
     reaper: ?*ReaperPool = null,
     /// Server-wide stream + reaper reservation (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
@@ -777,8 +781,8 @@ comptime {
 pub const ReaperJob = struct {
     handle: std.Io.Future(void),
     owner: *std.atomic.Value(u8),
-    completion: *std.Io.Queue(u31),
-    actor_wake: *std.Io.Event,
+    /// The actor selects on this channel; the post IS the wake.
+    completion: *zio.Channel(u31),
     stream_id: u31,
 };
 
@@ -840,8 +844,8 @@ pub const ReaperPool = struct {
     /// 2. `swap(reported)` — claim the right to report. If the handler returned
     ///    naturally in the meantime it already reported, and the previous value
     ///    is not `reaper_owned`; this worker then stays silent.
-    /// 3. post the completion, then WAKE the actor. A post without a wake is a
-    ///    slot that sits until an unrelated event happens to arrive.
+    /// 3. post the completion. The actor selects on the channel, so the post
+    ///    IS the wake.
     pub fn worker(self: *ReaperPool) std.Io.Cancelable!void {
         while (true) {
             var job = self.jobs.getOne(self.io) catch |err| switch (err) {
@@ -851,10 +855,14 @@ pub const ReaperPool = struct {
             job.handle.cancel(self.io);
             const prev = job.owner.swap(reported, .acq_rel);
             if (prev == reaper_owned) {
-                job.completion.putOneUncancelable(self.io, job.stream_id) catch {
-                    // Connection teardown has already closed completion delivery.
+                job.completion.trySend(job.stream_id) catch |err| switch (err) {
+                    // One completion per slot, capacity max_streams: full is a
+                    // broken invariant, never a wait.
+                    error.WouldBlock => @panic("completion channel over proven capacity"),
+                    error.Closed => {
+                        // Connection teardown has already closed completion delivery.
+                    },
                 };
-                job.actor_wake.set(self.io);
             }
         }
     }
@@ -892,9 +900,16 @@ const Connection = struct {
     session: session_mod.Session,
     read_ch_buf: []wire_pump.WireChunk,
     write_ch_buf: []wire_pump.WireChunk,
-    read_ch: std.Io.Queue(wire_pump.WireChunk) = undefined,
+    /// Inbound chunks from the pump. A zio channel the actor selects on;
+    /// capacity is the pool size + 1 so the EOF sentinel always fits.
+    read_ch: zio.Channel(wire_pump.WireChunk) = undefined,
     write_ch: std.Io.Queue(wire_pump.WireChunk) = undefined,
-    actor_wake: std.Io.Event = .unset,
+    /// The flag-producers' wake: capacity 1, `ring` is the only writer.
+    /// `error.WouldBlock` on the ring means a wake is already pending. A
+    /// buffered ring survives until the actor takes it, so there is no
+    /// reset and no set-before-park race.
+    doorbell_buf: [1]u8 = undefined,
+    doorbell: zio.Channel(u8) = undefined,
     tls: ?*tls_edge.Conn = null,
     /// Drain-turn packing buffer. HTTP/2 frames concat here before one
     /// `queueWire`; on TLS that plaintext is what SSL_write flushes.
@@ -910,10 +925,9 @@ const Connection = struct {
     shutting_down: bool = false,
     /// Set by a handler after it refills scheduler slab space; cleared by the
     /// actor at the top of each iteration. Emission happens only in the
-    /// actor's drainEmit, so a refill that lands between the actor's drain and
-    /// its actor_wake.reset() would otherwise be a lost wakeup: the handler
-    /// then waits on space that only emission can free, and the actor sleeps
-    /// until an unrelated read or a protocol deadline.
+    /// actor's drainEmit. The handler rings the doorbell after the store, and
+    /// the ring persists until the actor takes it, so the refill cannot be a
+    /// lost wakeup.
     sched_refilled: std.atomic.Value(bool) = .init(false),
     grace_deadline: ?std.Io.Timestamp = null,
     /// Production fair scheduler — sole emit path for controls + DATA.
@@ -943,9 +957,9 @@ const Connection = struct {
     live_task_handlers: std.atomic.Value(usize) = .init(0),
     reaper: ?*ReaperPool = null,
     completion_ch_buf: []u31 = &.{},
-    completion_ch: std.Io.Queue(u31) = undefined,
+    completion_ch: zio.Channel(u31) = undefined,
     write_ack_buf: []wire_pump.WriteCompletion = &.{},
-    write_ack_ch: std.Io.Queue(wire_pump.WriteCompletion) = undefined,
+    write_ack_ch: zio.Channel(wire_pump.WriteCompletion) = undefined,
     ticket_slots: []ticket_table.TicketWait = &.{},
     tickets: ticket_table.TicketTable = undefined,
     /// Indexed parallel to handlers; only valid while slot.in_use.
@@ -969,7 +983,7 @@ const Connection = struct {
     deadline_ready: []std.atomic.Value(u8) = &.{},
     deadline_heap: []DeadlineEntry = &.{},
     deadline_len: usize = 0,
-    /// Flag-before-wake: a handler insert that races `actor_wake.reset`.
+    /// Flag-before-ring: set by a handler insert, drained by the actor turn.
     deadline_armed: std.atomic.Value(bool) = .init(false),
     /// Actor-owned intent batch — filled by drainIntentsInto (no nested Session drain).
     intent_batch: []session_mod.Intent = &.{},
@@ -988,8 +1002,6 @@ const Connection = struct {
     tls_read_buf: []u8 = &.{},
     tls_write_buf: []wire_pump.WireChunk = &.{},
     tls_write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
-    /// Survives `actor_wake.reset`. TlsPump stores true after a `read_ch` post.
-    tls_read_dirty: std.atomic.Value(bool) = .init(false),
     /// Diag: the pump's current blocking site (see `tls_edge.Pump.site`).
     tls_pump_site: std.atomic.Value(u8) = .init(0),
     /// Diag: where the ACTOR currently is. 1 loop, 2 waitForActivity,
@@ -1118,7 +1130,8 @@ const Connection = struct {
             }.f;
         }
 
-        const read_ch_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
+        // + 1: the EOF sentinel must fit even with every pool chunk queued.
+        const read_ch_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + 1);
         errdefer gpa.free(read_ch_buf);
         const write_ch_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
         errdefer gpa.free(write_ch_buf);
@@ -1276,6 +1289,9 @@ const Connection = struct {
     /// Hook wiring and free-list seed that `serveAccepted` and `BenchHop.open`
     /// both need after `init`. Channels only have their final address here.
     fn finishBoot(self: *Connection) void {
+        // The doorbell buffer is an inline field, so the channel must bind it
+        // here, at the struct's final address (init returns by value).
+        self.doorbell = .init(&self.doorbell_buf);
         if (self.session.stream_hooks != null) {
             self.session.stream_hooks.?.ctx = self;
         }
@@ -1339,7 +1355,7 @@ const Connection = struct {
             self.applyOutboundRelease(chunk.outbound_release, .wire);
             if (chunk.control_entries != 0) self.applyControlRelease(chunk.control_release, chunk.control_entries);
         }
-        while (io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io)) |chunk| {
+        while (io_queue.tryRecv(wire_pump.WireChunk, &self.read_ch)) |chunk| {
             if (chunk.pool_index) |idx| {
                 self.read_free_ch.putOneUncancelable(io, idx) catch {
                     // Every queued read chunk owns one removed pool index.
@@ -1368,18 +1384,20 @@ const Connection = struct {
             }
         }
         // Late reaper posts can arrive after shutdownHandlers; never discard without releaseSlot.
-        while (io_queue.tryGet(u31, &self.completion_ch, io)) |sid| {
+        while (io_queue.tryRecv(u31, &self.completion_ch)) |sid| {
             self.releaseSlot(sid);
         }
         for (self.handlers) |s| std.debug.assert(!s.in_use);
         var held_i: usize = 0;
         while (held_i < self.held_ack_n) : (held_i += 1) {
             const ack = self.held_acks[held_i];
+            _ = wire_pump.diag_acks.applied_release.fetchAdd(ack.outbound_release, .monotonic);
             self.applyOutboundRelease(ack.outbound_release, .wire);
             if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
         }
         self.held_ack_n = 0;
-        while (io_queue.tryGet(wire_pump.WriteCompletion, &self.write_ack_ch, io)) |ack| {
+        while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
+            _ = wire_pump.diag_acks.applied_release.fetchAdd(ack.outbound_release, .monotonic);
             self.applyOutboundRelease(ack.outbound_release, .wire);
             if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
         }
@@ -1431,8 +1449,32 @@ const Connection = struct {
         const held = self.outbound_held.load(.acquire);
         const pending_held = self.pending_outbound_held.load(.acquire);
         const wire_held = self.wire_outbound_held.load(.acquire);
-        std.debug.assert(held == pending_held + wire_held);
-        std.debug.assert(held == 0);
+        if (held != pending_held + wire_held or held != 0) {
+            // The ledger, before dying: which side leaked and how much.
+            var slot_bytes: usize = 0;
+            var slot_n: usize = 0;
+            for (self.sched.pending_slots) |ps| {
+                if (ps.stream_id == 0) continue;
+                slot_bytes += ps.len;
+                slot_n += 1;
+            }
+            std.debug.panic(
+                "outbound leak at deinit: held={d} pending={d} wire={d} sched_slots={d} sched_bytes={d} rel_posted={d} rel_applied={d} ack_q={d} held_acks={d} write_q={d} read_q={d}",
+                .{
+                    held,
+                    pending_held,
+                    wire_held,
+                    slot_n,
+                    slot_bytes,
+                    wire_pump.diag_acks.posted_release.load(.acquire),
+                    wire_pump.diag_acks.applied_release.load(.acquire),
+                    io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch),
+                    self.held_ack_n,
+                    io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io),
+                    io_queue.chanLen(wire_pump.WireChunk, &self.read_ch),
+                },
+            );
+        }
         if (!self.socket_closed.load(.acquire)) {
             self.stream.close(io);
             self.socket_closed.store(true, .release);
@@ -1553,6 +1595,7 @@ const Connection = struct {
     }
 
     fn applyWriteAck(self: *Connection, ack: wire_pump.WriteCompletion) bool {
+        _ = wire_pump.diag_acks.applied_release.fetchAdd(ack.outbound_release, .monotonic);
         self.applyOutboundRelease(ack.outbound_release, .wire);
         if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
         if (ack.fail_all) {
@@ -1628,13 +1671,22 @@ const Connection = struct {
         }
     }
 
+    /// The flag-producers' wake. Set the flag FIRST, then ring; the channel
+    /// mutex publishes the store. A full doorbell means a wake is already
+    /// pending, and the actor drains every flag on every turn, so coalescing
+    /// cannot lose work. This is the ONLY writer of `doorbell`.
+    fn ring(self: *Connection) void {
+        self.doorbell.trySend(0) catch |err| switch (err) {
+            error.WouldBlock, error.Closed => {},
+        };
+    }
+
     /// Apply every posted WritePump completion without parking. Called at the
-    /// top of every actor turn and in the reset-then-recheck list so a complete
-    /// batch can publish credit and be consumed on the same turn.
+    /// top of every actor turn so a complete batch can publish credit and be
+    /// consumed on the same turn.
     fn drainWriteAcks(self: *Connection) void {
         self.flushHeldWriteAcks();
-        const io = self.config.io;
-        while (io_queue.tryGet(wire_pump.WriteCompletion, &self.write_ack_ch, io)) |ack| {
+        while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
             self.takeWriteAck(ack);
         }
     }
@@ -1648,8 +1700,7 @@ const Connection = struct {
         }
         self.held_ack_n = 0;
         test_complete_receipt_ack_held.store(false, .release);
-        const io = self.config.io;
-        while (io_queue.tryGet(wire_pump.WriteCompletion, &self.write_ack_ch, io)) |ack| {
+        while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
             _ = self.applyWriteAck(ack);
         }
     }
@@ -1984,15 +2035,15 @@ const Connection = struct {
 
     fn drainCompletions(self: *Connection) void {
         if (test_hold_completion_drain.load(.acquire)) return;
-        while (io_queue.tryGet(u31, &self.completion_ch, self.config.io)) |sid| {
+        while (io_queue.tryRecv(u31, &self.completion_ch)) |sid| {
             self.releaseSlot(sid);
         }
     }
 
-    /// Trace-only: leftover `read_ch` after this take. Locks the queue mutex;
-    /// do not use the count to size the hot-path batch.
+    /// Trace-only: leftover `read_ch` after this take. Locks the channel
+    /// mutex; do not use the count to size the hot-path batch.
     fn noteReadBacklog(self: *Connection) void {
-        const left = io_queue.queued(wire_pump.WireChunk, &self.read_ch, self.config.io);
+        const left = io_queue.chanLen(wire_pump.WireChunk, &self.read_ch);
         _ = trace.read_take_n.fetchAdd(1, .monotonic);
         _ = trace.read_left_sum.fetchAdd(left, .monotonic);
         trace.bumpMax(&trace.read_left_max, left);
@@ -2187,37 +2238,10 @@ const Connection = struct {
         return next;
     }
 
-    const Activity = union(enum) {
-        actor: std.Io.Cancelable!void,
-        shutdown: std.Io.Cancelable!void,
-        timer: std.Io.Cancelable!void,
-        ack_hold: std.Io.Cancelable!void,
-    };
-
-    fn waitEvent(event: *std.Io.Event, io: std.Io) std.Io.Cancelable!void {
-        return event.wait(io);
-    }
-
     fn waitTimer(timeout: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
         return timeout.sleep(io);
     }
 
-    /// Park until something the actor cares about happens.
-    ///
-    /// Sources race here: the actor event that every producer sets (including
-    /// WritePump after each completion post), the server shutdown event, a
-    /// live complete-batch test stash, and the earliest armed protocol
-    /// deadline — idle, slow-consumer, grace, and the handler-deadline heap
-    /// min. This is the idle arm of the same heap fire-due consults on every
-    /// hot turn. The timer branch is added ONLY when a deadline exists, so an
-    /// idle connection with no armed timer costs no periodic wakeup at all.
-    ///
-    /// Write completions are not selected on `write_ack_ch`. A cancelled
-    /// Select `getOne` can drop the completion; WritePump sets `actor_wake`
-    /// after the post and the actor `tryGet`s on the next turn.
-    ///
-    /// The caller is responsible for the reset-then-recheck sequence that makes
-    /// this safe. See `run`.
     fn traceParkSnapshot(self: *Connection) void {
         const acc: usize = 0;
         const complete = false;
@@ -2259,7 +2283,7 @@ const Connection = struct {
             if (sw < min_win) min_win = sw;
         }
         const write_q = io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io);
-        const read_q = io_queue.queued(wire_pump.WireChunk, &self.read_ch, self.config.io);
+        const read_q = io_queue.chanLen(wire_pump.WireChunk, &self.read_ch);
         const read_free_q = io_queue.queued(u32, &self.read_free_ch, self.config.io);
         const write_free_q = io_queue.queued(u32, &self.write_free_ch, self.config.io);
         const tls_write_empty = if (self.tls_write_buf.len != 0) self.tls_write_ch.isEmpty() else true;
@@ -2292,7 +2316,7 @@ const Connection = struct {
             },
         );
         diagRawPrint(
-            "STARH2_TLSQ conn={x} write_q={d} read_q={d} tls_write_empty={} read_free={d} write_free={d} inline={d} receipts={d} receipts_ready={d} ack_wake={s} read_dirty={} pump_site={d} live_h={d}\n",
+            "STARH2_TLSQ conn={x} write_q={d} read_q={d} tls_write_empty={} read_free={d} write_free={d} inline={d} receipts={d} receipts_ready={d} bell={d} acks={d} pump_site={d} live_h={d}\n",
             .{
                 @intFromPtr(self) & 0xffff,
                 write_q,
@@ -2303,15 +2327,30 @@ const Connection = struct {
                 self.inline_n,
                 self.pending_complete_receipt_n,
                 self.complete_receipts_ready.load(.acquire),
-                @tagName(self.actor_wake),
-                self.tls_read_dirty.load(.acquire),
+                io_queue.chanLen(u8, &self.doorbell),
+                io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch),
                 self.tls_pump_site.load(.acquire),
                 self.live_handlers.load(.acquire),
             },
         );
     }
 
-    fn waitForActivity(self: *Connection) !void {
+    /// Park in ONE `zio.select` until something the actor cares about
+    /// happens. Every branch holds persistent evidence (a buffered channel
+    /// item, a set ResetEvent), so there is no reset and no recheck list.
+    ///
+    /// Declaration order is the tie-break when several branches are ready:
+    /// reads first (matches the hot turn's take order), then acks and
+    /// completions, then the doorbell, then the control branches.
+    ///
+    /// The timer branch is `.none` when no deadline is armed, which
+    /// registers nothing, so an idle connection costs no periodic wakeup.
+    /// Test-gated branches point at never-fired dummies when inactive, so
+    /// the select keeps one comptime shape.
+    ///
+    /// Returns the chunk when the reads branch won; null on any other wake
+    /// (the loop top re-drains every source each turn).
+    fn waitForActivity(self: *Connection) !?wire_pump.WireChunk {
         const io = self.config.io;
         self.actor_site.store(2, .release);
         defer self.actor_site.store(1, .release);
@@ -2320,37 +2359,54 @@ const Connection = struct {
             test_actor_waiting.set(io);
             try test_release_actor_wait.wait(io);
         }
-        var result_buf: [4]Activity = undefined;
-        var select = std.Io.Select(Activity).init(io, &result_buf);
-        errdefer select.cancelDiscard();
-        try select.concurrent(.actor, waitEvent, .{ &self.actor_wake, io });
-        if (self.config.shutdown_event) |event| {
-            try select.concurrent(.shutdown, waitEvent, .{ event, io });
-        }
-        if (self.nextDeadlineNs()) |deadline_ns| {
+        const timeout: zio.Timeout = if (self.nextDeadlineNs()) |deadline_ns| blk: {
             const now = nowNs(io);
-            if (deadline_ns <= now) {
-                select.cancelDiscard();
-                return;
-            }
-            const timeout: std.Io.Timeout = .{ .deadline = .{
-                .raw = .fromNanoseconds(@intCast(deadline_ns)),
-                .clock = .awake,
-            } };
-            try select.concurrent(.timer, waitTimer, .{ timeout, io });
-        }
-        if (self.held_ack_n > 0) {
-            try select.concurrent(.ack_hold, waitEvent, .{ &test_release_complete_receipt_ack, io });
-        }
-        const selected = try select.await();
-        defer select.cancelDiscard();
-        switch (selected) {
-            .actor, .shutdown, .timer => |result| try result,
-            .ack_hold => |result| {
-                try result;
-                self.drainWriteAcks();
+            if (deadline_ns <= now) return null;
+            break :blk .{ .duration = .fromNanoseconds(deadline_ns - now) };
+        } else .none;
+        const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
+        // The hold leaves completions buffered in the channel, exactly as the
+        // gated drain leaves them queued.
+        const comps_ch = if (test_hold_completion_drain.load(.acquire))
+            &hold_dummy_completion_ch
+        else
+            &self.completion_ch;
+        const ack_hold_ev = if (self.held_ack_n > 0)
+            &test_release_complete_receipt_ack
+        else
+            &no_ack_hold_event;
+        const winner = try zio.select(.{
+            .reads = self.read_ch.asyncReceive(),
+            .acks = self.write_ack_ch.asyncReceive(),
+            .comps = comps_ch.asyncReceive(),
+            .bell = self.doorbell.asyncReceive(),
+            .ack_hold = ack_hold_ev,
+            .shutdown = shutdown_ev,
+            .timer = timeout,
+        });
+        switch (winner) {
+            .reads => |r| {
+                const chunk = r catch return null;
+                return chunk;
             },
+            .acks => |r| {
+                const ack = r catch return null;
+                self.takeWriteAck(ack);
+            },
+            .comps => |r| {
+                const sid = r catch return null;
+                self.releaseSlot(sid);
+            },
+            .bell => |r| {
+                // The token is the consumed wake; the flags it covered are
+                // drained at the loop top.
+                _ = r catch return null;
+            },
+            .ack_hold => self.drainWriteAcks(),
+            .shutdown => {},
+            .timer => {},
         }
+        return null;
     }
 
     /// The actor. One task, one connection, from first byte to close.
@@ -2381,10 +2437,9 @@ const Connection = struct {
     /// 4. Try to take a read chunk without blocking. Then `tryGet` up to
     ///    `inbound_chunk_batch - 1` more, ingesting each (already plaintext)
     ///    before the next take. One `runPendingInline` after the batch.
-    /// 5. If there is none: RESET the wake event, re-check every producer-owned
-    ///    source, and only then park. This reset-then-recheck order is what
-    ///    makes a `set` that races the reset harmless — the flag or the queue
-    ///    still holds the evidence.
+    /// 5. If there is none: park in `waitForActivity`'s single select. Every
+    ///    source holds persistent evidence, so a publish that races the park
+    ///    is observed by the select's fast path — no reset, no recheck list.
     ///
     /// ## Teardown sequence (the `defer` block, then the tail)
     /// 1. Tell the live pump(s) to stop. h2c: push a sentinel so a writer
@@ -2457,12 +2512,10 @@ const Connection = struct {
                 .write_ch = &self.tls_write_ch,
                 .sock = tlsNetHandle(self.stream.socket.handle),
                 .recv_buf = self.tls_read_buf,
-                .read_dirty = &self.tls_read_dirty,
                 .site = &self.tls_pump_site,
                 .task_h = &self.tls_pump_task_h,
                 .task_handle_fn = diag_task_handle_fn,
                 .completions = &self.write_ack_ch,
-                .actor_wake = &self.actor_wake,
                 .gpa = gpa,
                 .chunk_storage = self.read_chunk_storage,
                 .n_chunks = self.read_pool_n,
@@ -2483,7 +2536,6 @@ const Connection = struct {
                 .io = io,
                 .stream = self.stream,
                 .to_actor = &self.read_ch,
-                .actor_wake = &self.actor_wake,
                 .chunk_storage = self.read_chunk_storage,
                 .n_chunks = self.read_pool_n,
                 .free_indices = &self.read_free_ch,
@@ -2494,7 +2546,6 @@ const Connection = struct {
                 .stream = self.stream,
                 .from_actor = &self.write_ch,
                 .completions = &self.write_ack_ch,
-                .actor_wake = &self.actor_wake,
                 .gpa = gpa,
                 .free_indices = &self.write_free_ch,
                 .test_delay_ms = test_write_delay_ms,
@@ -2601,34 +2652,13 @@ const Connection = struct {
             // two-turn shape as taking EOF as the only chunk on the next wait.
             if (inbound_eof) break;
 
-            var maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
+            var maybe_chunk = io_queue.tryRecv(wire_pump.WireChunk, &self.read_ch);
             if (maybe_chunk == null) {
-                // Reset before rechecking every producer-owned source; this closes
-                // the set-before-reset lost-wakeup race.
-                // The recheck list below must name EVERY producer: write acks,
-                // read chunks, handler completions, complete-receipt readiness,
-                // scheduler refills, writer failure, queued complete handlers,
-                // a newly armed handler deadline, TLS read posts (`tls_read_dirty`),
-                // and the shutdown flag. A source left out of this list is a hang,
-                // source left out of this list is a hang, not a slow path,
-                // because the actor then parks with work already waiting for it.
-                self.actor_wake.reset();
-                self.drainWriteAcks();
-                self.drainCompletions();
-                self.drainPendingCompleteReceipts(false);
-                maybe_chunk = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io);
-                if (maybe_chunk == null and
-                    (self.inline_n == 0 or self.pending_complete_receipt_n == complete_receipt_capacity) and
-                    self.complete_receipts_ready.load(.acquire) == 0 and
-                    !self.complete_receipts_fail_all.load(.acquire) and
-                    !self.sched_refilled.load(.acquire) and
-                    !self.writer_failed.load(.acquire) and
-                    !self.deadline_armed.load(.acquire) and
-                    !self.tls_read_dirty.swap(false, .acq_rel) and
-                    !(self.config.shutdown_flag != null and self.config.shutdown_flag.?.load(.acquire)))
-                {
-                    try self.waitForActivity();
-                }
+                // Park directly: every producer either sends on a selected
+                // channel or rings the doorbell, and both survive until
+                // taken, so the select's fast path sees any work that
+                // arrived since the drains above.
+                maybe_chunk = try self.waitForActivity();
                 if (maybe_chunk == null) continue;
             }
             const chunk = maybe_chunk.?;
@@ -2648,7 +2678,7 @@ const Connection = struct {
             if (!leave) {
                 var extra_i: usize = 1;
                 while (extra_i < inbound_chunk_batch) : (extra_i += 1) {
-                    const extra = io_queue.tryGet(wire_pump.WireChunk, &self.read_ch, io) orelse break;
+                    const extra = io_queue.tryRecv(wire_pump.WireChunk, &self.read_ch) orelse break;
                     if (extra.len == 0 and extra.bytes.len == 0) {
                         self.recycleReadChunk(extra);
                         inbound_eof = true;
@@ -2683,48 +2713,24 @@ const Connection = struct {
         try self.shutdownHandlers();
     }
 
-    const ReceiveResult = union(enum) {
-        read: (std.Io.QueueClosedError || std.Io.Cancelable)!wire_pump.WireChunk,
-        shutdown: std.Io.Cancelable!void,
-        timer: std.Io.Cancelable!void,
-    };
-
-    fn receiveRead(queue: *std.Io.Queue(wire_pump.WireChunk), io: std.Io) (std.Io.QueueClosedError || std.Io.Cancelable)!wire_pump.WireChunk {
-        return queue.getOne(io);
-    }
-
     fn receiveUntilDeadline(self: *Connection) !wire_pump.WireChunk {
         const io = self.config.io;
-        var result_buf: [3]ReceiveResult = undefined;
-        var select = std.Io.Select(ReceiveResult).init(io, &result_buf);
-        errdefer select.cancelDiscard();
-        try select.concurrent(.read, receiveRead, .{ &self.read_ch, io });
-        if (self.config.shutdown_event) |event| {
-            try select.concurrent(.shutdown, waitEvent, .{ event, io });
-        }
-        if (self.handshake_deadline) |deadline| {
-            if (nowNs(io) >= @as(u64, @intCast(deadline.nanoseconds))) {
-                select.cancelDiscard();
-                return error.TlsHandshakeTimeout;
-            }
-            const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = deadline, .clock = .awake } };
-            try select.concurrent(.timer, waitTimer, .{ timeout, io });
-        }
-        const selected = try select.await();
-        defer select.cancelDiscard();
-        return switch (selected) {
-            .read => |result| result catch |err| switch (err) {
-                error.Closed => error.ConnectionClosed,
-                error.Canceled => error.Canceled,
-            },
-            .shutdown => |result| blk: {
-                try result;
-                break :blk error.ConnectionClosed;
-            },
-            .timer => |result| blk: {
-                try result;
-                break :blk error.TlsHandshakeTimeout;
-            },
+        const timeout: zio.Timeout = if (self.handshake_deadline) |deadline| blk: {
+            const deadline_ns: u64 = @intCast(deadline.nanoseconds);
+            const now = nowNs(io);
+            if (now >= deadline_ns) return error.TlsHandshakeTimeout;
+            break :blk .{ .duration = .fromNanoseconds(deadline_ns - now) };
+        } else .none;
+        const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
+        const winner = try zio.select(.{
+            .read = self.read_ch.asyncReceive(),
+            .shutdown = shutdown_ev,
+            .timer = timeout,
+        });
+        return switch (winner) {
+            .read => |result| result catch error.ConnectionClosed,
+            .shutdown => error.ConnectionClosed,
+            .timer => error.TlsHandshakeTimeout,
         };
     }
 
@@ -2956,7 +2962,6 @@ const Connection = struct {
                 .handle = owned_handle,
                 .owner = &slot.completion_owner,
                 .completion = &self.completion_ch,
-                .actor_wake = &self.actor_wake,
                 .stream_id = stream_id,
             });
             if (!queued) {
@@ -3136,7 +3141,7 @@ const Connection = struct {
             self.tickets.failAll();
             self.wakeAllSpace();
             self.wakeAllDeadlines();
-            const sid = self.completion_ch.getOne(self.config.io) catch return error.Canceled;
+            const sid = self.completion_ch.receive() catch return error.Canceled;
             self.releaseSlot(sid);
         }
     }
@@ -3304,7 +3309,7 @@ const Connection = struct {
             };
             off += take;
             self.sched_refilled.store(true, .release);
-            self.actor_wake.set(self.config.io);
+            self.ring();
         }
         if (bytes.len == 0 or end or flush_ticket != 0) {
             self.sched.enqueueDataBytes(stream_id, &.{}, end, flush_ticket, flush_slot) catch {
@@ -3312,7 +3317,7 @@ const Connection = struct {
                 return error.OutOfMemory;
             };
             self.sched_refilled.store(true, .release);
-            self.actor_wake.set(self.config.io);
+            self.ring();
         }
     }
 
@@ -4316,9 +4321,9 @@ const Connection = struct {
             self.inline_sids[self.inline_n] = d.stream_id;
             self.inline_n += 1;
             // A task handler's processIntents can queue a complete job while
-            // the actor is parked. The flag-before-wake rule: inline_n is the
-            // flag that survives actor_wake.reset.
-            self.actor_wake.set(self.config.io);
+            // the actor is parked. Flag-before-ring: inline_n is the state,
+            // the ring is the persistent wake.
+            self.ring();
             return;
         }
         // Count before spawn so a handler that finishes before this function
@@ -4376,10 +4381,14 @@ const Connection = struct {
         }
         const prev = job.slot.completion_owner.cmpxchgStrong(live, reported, .acq_rel, .acquire);
         if (prev == null) {
-            self.completion_ch.putOneUncancelable(self.config.io, job.stream_id) catch {
-                // Connection teardown has already assumed completion ownership.
+            self.completion_ch.trySend(job.stream_id) catch |err| switch (err) {
+                // One completion per slot, capacity max_streams: full is a
+                // broken invariant, never a wait.
+                error.WouldBlock => @panic("completion channel over proven capacity"),
+                error.Closed => {
+                    // Connection teardown has already assumed completion ownership.
+                },
             };
-            self.actor_wake.set(self.config.io);
         }
         _ = self.live_handlers.fetchSub(1, .acq_rel);
         if (job.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
@@ -5125,7 +5134,7 @@ const Connection = struct {
         }
         self.deadlineHeapInsert(.{ .deadline_ns = deadline_ns, .stream_id = stream_id });
         self.deadline_armed.store(true, .release);
-        self.actor_wake.set(io);
+        self.ring();
 
         const slot_i = self.slotIndex(stream_id);
         while (true) {

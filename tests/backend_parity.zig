@@ -142,25 +142,23 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
     serving = false;
 }
 
-fn runZio(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    try runRealH2(rt.io(), gpa, false);
+fn runZio(rt: *zio.Runtime, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
+    try runRealH2(rt.io(), gpa, wakeup_gate);
 }
 
 test "backend parity: real h2 request over zio std.Io" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator, false });
     try handle.join();
 }
 
-test "backend parity: real h2 request over std.Io.Threaded" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    try runRealH2(threaded.io(), std.testing.allocator, false);
-}
-
+// The std.Io.Threaded arm is gone: the actor parks in a zio.select, so a
+// connection requires the zio runtime. The wakeup-gate property it proved
+// (an inbound request beats the polling canary) survives on the zio arm.
 test "wakeup gate: inbound request beats one second polling canary" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    try runRealH2(threaded.io(), std.testing.allocator, true);
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator, true });
+    try handle.join();
 }

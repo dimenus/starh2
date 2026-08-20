@@ -23,6 +23,7 @@
 //! teardown may leave a waiting handler alone instead of canceling it. If a
 //! future change adds an exit path that skips `failDrain`, handlers will hang.
 const std = @import("std");
+const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
 
@@ -86,8 +87,8 @@ pub const WireChunk = struct {
 pub const ReadPump = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
-    to_actor: *std.Io.Queue(WireChunk),
-    actor_wake: *std.Io.Event,
+    /// A zio channel: the actor selects on it, so a post IS the wake.
+    to_actor: *zio.Channel(WireChunk),
     /// Contiguous storage: n_chunks * WIRE_CHUNK_SIZE.
     chunk_storage: []u8,
     n_chunks: u32,
@@ -105,10 +106,11 @@ pub const ReadPump = struct {
     }
 
     fn postEof(self: *ReadPump) void {
-        self.to_actor.putOneUncancelable(self.io, .{ .bytes = &.{}, .len = 0 }) catch {
-            // A closed actor queue means the connection is already tearing down.
+        // The channel holds capacity n_chunks + 1: the extra slot is this
+        // sentinel, so the post cannot find the channel full.
+        self.to_actor.trySend(.{ .bytes = &.{}, .len = 0 }) catch {
+            // A closed actor channel means the connection is already tearing down.
         };
-        self.actor_wake.set(self.io);
     }
 
     pub fn run(self: *ReadPump) void {
@@ -134,15 +136,19 @@ pub const ReadPump = struct {
                 self.postEof();
                 return;
             }
-            self.to_actor.putOne(self.io, .{
+            self.to_actor.trySend(.{
                 .bytes = buf,
                 .len = n,
                 .pool_index = idx,
-            }) catch {
-                self.returnIndex(idx);
-                return;
+            }) catch |err| switch (err) {
+                // The leased index is the capacity proof: at most n_chunks
+                // pooled chunks exist, and the channel holds n_chunks + 1.
+                error.WouldBlock => unreachable,
+                error.Closed => {
+                    self.returnIndex(idx);
+                    return;
+                },
             };
-            self.actor_wake.set(self.io);
             if (self.live_task_handlers.load(.acquire) > 0) {
                 self.io.sleep(.zero, .awake) catch {};
             }
@@ -174,6 +180,10 @@ pub const diag_acks = struct {
     /// Tickets reserved / completed / failed in ticket tables.
     pub var reserved: std.atomic.Value(u64) = .init(0);
     pub var completed: std.atomic.Value(u64) = .init(0);
+    /// Outbound-release BYTES posted by pumps / applied by actors — the
+    /// conservation ledger for the wire-held accounting.
+    pub var posted_release: std.atomic.Value(u64) = .init(0);
+    pub var applied_release: std.atomic.Value(u64) = .init(0);
 };
 
 pub const write_trace = struct {
@@ -197,11 +207,9 @@ pub const WritePump = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     from_actor: *std.Io.Queue(WireChunk),
-    completions: *std.Io.Queue(WriteCompletion),
-    /// Set after each completion post so a parked actor can `tryGet` without
-    /// Selecting on this queue. A cancelled Select `getOne` can drop the
-    /// completion; the queue itself is the durable flag.
-    actor_wake: *std.Io.Event,
+    /// A zio channel: the actor selects on it, so a post IS the wake. The
+    /// capacity is the proven outstanding-ack bound; `post` never parks.
+    completions: *zio.Channel(WriteCompletion),
     gpa: std.mem.Allocator,
     /// When set, `WireChunk.pool_index` is returned here instead of `gpa.free`.
     /// Tests that feed GPA-owned chunks leave this null.
@@ -212,10 +220,15 @@ pub const WritePump = struct {
     writes_done: u64 = 0,
 
     fn post(self: *WritePump, c: WriteCompletion) void {
-        self.completions.putOneUncancelable(self.io, c) catch {
-            // Ack queue closure means connection teardown will release queued ownership.
+        _ = diag_acks.posted_release.fetchAdd(c.outbound_release, .monotonic);
+        self.completions.trySend(c) catch |err| switch (err) {
+            // A dropped completion is a hung handler; a full channel means the
+            // capacity proof is wrong. Fail loudly, never silently.
+            error.WouldBlock => @panic("write ack channel over proven capacity"),
+            error.Closed => {
+                // Ack channel closure means connection teardown will release queued ownership.
+            },
         };
-        self.actor_wake.set(self.io);
     }
 
     fn releaseChunk(self: *WritePump, chunk: WireChunk, ok: bool, fail_all: bool) void {

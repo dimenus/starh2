@@ -1,0 +1,83 @@
+You are reviewing a concurrency-protocol design decision in zio, a Zig async
+runtime (source at ~/Source/oss/zio). You are the independent reviewer; the
+implementing agent (a different vendor) wants your verdict BEFORE it starts.
+Do not trust its framing; verify every claim against the source.
+
+## The system
+
+zio's select() (src/select.zig) waits on N "futures" via a small protocol:
+asyncWait(waiter) returns false when the operation is already complete (fast
+path; result available via getResult) or true after registering the waiter.
+Waiters made by Waiter.initSelect share one atomic "winner" slot; a queuing
+producer (e.g. a channel sender in src/sync/channel.zig) that finds a parked
+select waiter claims it with tryClaim (CAS winner NO_WINNER -> index), copies
+the item into the waiter's stack context, and signals. src/common.zig has
+Waiter/tryClaim; src/sync/channel.zig has the sender/receiver transfer logic.
+
+## The two bugs found (both reproduced)
+
+1. CANCEL-PATH DROP (already fixed on the fork, commit 84bb04c, branch
+   cq-direct-transfer): a task canceled while parked in select returned
+   error.Canceled even when a sender's claim had already committed an item
+   into the select's context. Fixed by an epilogue: cancel every branch,
+   absorb in-flight signals, then deliver a claimed winner's result instead
+   of the cancel error. Mirrors what Channel.receive() already did.
+
+2. FAST-PATH CLOBBER (diagnosed, unfixed; the review subject): the
+   registration loop in select() does, per branch i:
+       if asyncWait(i) returns false: winner.store(i, .release); return result_i;
+   The store is blind. Branches 0..i-1 are already registered, and a
+   concurrent producer can tryClaim one of them (CAS succeeds while winner
+   is still NO_WINNER), copy its item, and signal. The store then overwrites
+   the claim: select returns branch i, the claimed item dies on the dead
+   stack frame, and the cleanup's signal accounting undercounts (a signal
+   can arrive for a dead stack waiter). Proven in situ: a diagnostic CAS
+   panic in the fast path fires in 8 of 30 full test-suite runs of the
+   consuming application (starh2, ~/Source/mine/starh2, an HTTP/2 server
+   whose per-connection actor parks in one select over: inbound-chunk
+   channel, write-ack channel, handler-completion channel, a capacity-1
+   doorbell channel, a ResetEvent, a timer future).
+
+## The proposed fix (the thing to review)
+
+Change the future protocol: a select waiter must WIN the select before any
+consuming fast path. Concretely, in each future's asyncWait, before
+consuming (dequeuing an item, taking a completion), do waiter.tryClaim();
+only on success consume and return false; on claim failure return true
+(pending) WITHOUT registering and WITHOUT consuming - some other branch
+already won and its signal will wake the select. Touches: channel
+asyncReceive/asyncSend fast paths, CompletionQueue, ResetEvent, task join
+(awaitable), plus the protocol doc comment in select.zig. Non-select
+(direct) waiters have tryClaim() == always-true, so single-future wait()
+paths are unchanged.
+
+## Your task
+
+1. Read the actual source first: src/select.zig, src/common.zig,
+   src/sync/channel.zig, src/completion_queue.zig, src/sync/ResetEvent.zig,
+   src/awaitable.zig. Verify the clobber exists as described (the blind
+   store, the tryClaim CAS, the signal-accounting undercount).
+2. Judge the proposed claim-before-consume fix: is it sound? Is it an
+   anti-pattern? What are its failure modes (e.g. a fast path that claims
+   and then finds the operation NOT actually completable; ordering/fairness
+   effects; ABA on the winner slot; interaction with the cancel-path
+   epilogue from bug 1)?
+3. Compare against prior art you know: how Go's runtime select solves this
+   class (lock ordering + two-phase poll/commit), how Rust futures/tokio
+   select semantics avoid it (poll-based, no direct handoff), and whether a
+   two-phase design (poll-without-consume, then commit) would fit zio's
+   protocol better than claim-before-consume.
+4. Name any alternative you would prefer, with the concrete zio shape it
+   would take, and say what it costs.
+5. Verdict: implement claim-before-consume as proposed / implement a
+   variant (say exactly what changes) / different design (say exactly
+   which). Be specific enough that an implementer can start.
+
+Constraints: zio is a fork the team controls; breaking internal protocol is
+acceptable. Performance matters (this select is on an HTTP/2 server's
+per-connection hot path) but correctness dominates: the conservation law is
+"an item committed to a select is either delivered by that select or stays
+in its source"; nothing may be silently dropped.
+
+Write your analysis to a file: the answer, then the evidence per claim with
+file:line references into the zio source you actually read.

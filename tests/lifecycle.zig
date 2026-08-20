@@ -313,13 +313,12 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const port = server.localAddress(0).getPort();
 
     const c = starh2.edge.connection;
-    const io = rt.io();
     c.test_release_complete_receipt_ack.reset();
     c.test_complete_receipt_ack_held.store(false, .release);
     c.test_hold_complete_receipt_ack.store(true, .release);
     defer {
         c.test_hold_complete_receipt_ack.store(false, .release);
-        c.test_release_complete_receipt_ack.set(io);
+        c.test_release_complete_receipt_ack.set();
         c.test_complete_receipt_ack_held.store(false, .release);
     }
 
@@ -365,7 +364,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     }
 
     c.test_hold_complete_receipt_ack.store(false, .release);
-    c.test_release_complete_receipt_ack.set(io);
+    c.test_release_complete_receipt_ack.set();
     try waitAccountingZeroAt(&server, 2_000, @src().line);
     stream.close();
     stream_open = false;

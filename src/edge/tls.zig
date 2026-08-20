@@ -513,7 +513,8 @@ pub const Conn = struct {
 pub const Pump = struct {
     io: std.Io,
     conn: *Conn,
-    to_actor: *std.Io.Queue(wire_pump.WireChunk),
+    /// A zio channel: the actor selects on it, so a post IS the wake.
+    to_actor: *zio.Channel(wire_pump.WireChunk),
     /// Outbound frames from the actor. The channel wakes the driver's
     /// select by itself; there is no side-band wake protocol.
     write_ch: *zio.Channel(wire_pump.WireChunk),
@@ -531,11 +532,9 @@ pub const Pump = struct {
     /// Diag: this pump's opaque zio task handle, published at run() start.
     task_h: ?*std.atomic.Value(usize) = null,
     task_handle_fn: ?*const fn () usize = null,
-    /// Pump stores true after a successful `read_ch` post; the actor swaps
-    /// after `actor_wake.reset` so a read chunk cannot sit while the actor waits.
-    read_dirty: *std.atomic.Value(bool),
-    completions: *std.Io.Queue(wire_pump.WriteCompletion),
-    actor_wake: *std.Io.Event,
+    /// A zio channel: the actor selects on it. The capacity is the proven
+    /// outstanding-ack bound; `post` never parks.
+    completions: *zio.Channel(wire_pump.WriteCompletion),
     gpa: std.mem.Allocator,
     chunk_storage: []u8,
     n_chunks: u32,
@@ -566,13 +565,13 @@ pub const Pump = struct {
     recv_armed: bool = false,
 
     fn post(self: *Pump, c: wire_pump.WriteCompletion) void {
-        self.completions.putOneUncancelable(self.io, c) catch {};
-        self.notifyActor();
-    }
-
-    fn notifyActor(self: *Pump) void {
-        self.read_dirty.store(true, .release);
-        self.actor_wake.set(self.io);
+        _ = wire_pump.diag_acks.posted_release.fetchAdd(c.outbound_release, .monotonic);
+        self.completions.trySend(c) catch |err| switch (err) {
+            // A dropped completion is a hung handler; a full channel means
+            // the capacity proof is wrong. Fail loudly, never silently.
+            error.WouldBlock => @panic("write ack channel over proven capacity"),
+            error.Closed => {},
+        };
     }
 
     fn returnReadIndex(self: *Pump, idx: u32) void {
@@ -580,8 +579,9 @@ pub const Pump = struct {
     }
 
     fn postEof(self: *Pump) void {
-        self.to_actor.putOneUncancelable(self.io, .{ .bytes = &.{}, .len = 0 }) catch {};
-        self.notifyActor();
+        // The channel holds capacity n_chunks + 1: the extra slot is this
+        // sentinel, so the post cannot find the channel full.
+        self.to_actor.trySend(.{ .bytes = &.{}, .len = 0 }) catch {};
     }
 
     fn releaseChunk(self: *Pump, chunk: wire_pump.WireChunk, ok: bool, fail_all: bool) void {
@@ -909,16 +909,16 @@ pub const Pump = struct {
             self.postEof();
             return .eof;
         }
-        if (!io_queue.tryPut(wire_pump.WireChunk, self.to_actor, self.io, .{
+        self.to_actor.trySend(.{
             .bytes = buf,
             .len = n,
             .pool_index = idx,
-        })) {
+        }) catch {
+            // Full or closed: stash and retry next turn, as before.
             std.debug.assert(self.pending_read == null);
             self.pending_read = .{ .bytes = buf, .len = n, .pool_index = idx };
             return .ok;
-        }
-        self.notifyActor();
+        };
         if (self.live_task_handlers.load(.acquire) > 0) {
             pump_trace.bump(&pump_trace.live_handler_yield);
             self.site.store(11, .release);
@@ -1052,11 +1052,10 @@ pub const Pump = struct {
             }
 
             if (self.pending_read) |chunk| {
-                if (io_queue.tryPut(wire_pump.WireChunk, self.to_actor, self.io, chunk)) {
+                if (self.to_actor.trySend(chunk)) {
                     self.pending_read = null;
-                    self.notifyActor();
                     progress = true;
-                }
+                } else |_| {}
             }
 
             // Ingest cipher only when SSL_read can store plaintext. Otherwise
@@ -1190,7 +1189,7 @@ pub const Pump = struct {
         const now = nowNs(self.io);
         if (now -% diag_last_wait_ns < std.time.ns_per_s) return;
         diag_last_wait_ns = now;
-        const read_q = io_queue.queued(wire_pump.WireChunk, self.to_actor, self.io);
+        const read_q = io_queue.chanLen(wire_pump.WireChunk, self.to_actor);
         const read_free_q = io_queue.queued(u32, self.read_free, self.io);
         const write_free_q: usize = if (self.write_free) |q| io_queue.queued(u32, q, self.io) else 0;
         rawPrint(

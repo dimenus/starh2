@@ -19,10 +19,12 @@
 //! # Two shutdown signals, not one
 //!
 //! `shutdown_flag` is what a loop polls; `shutdown_event` is what a parked task
-//! waits on. Both are set together, because a connection actor may be blocked
-//! in a `Select` where a flag alone would never be observed.
+//! waits on (a zio.ResetEvent: set once, never reset, so the actor's select
+//! observes it race-free). Both are set together, because a connection actor
+//! may be parked in a select where a flag alone would never be observed.
 const std = @import("std");
 const builtin = @import("builtin");
+const zio = @import("zio");
 const limits_mod = @import("../core/limits.zig");
 const router_mod = @import("../http/router.zig");
 const connection = @import("connection.zig");
@@ -94,7 +96,7 @@ pub const Server = struct {
     local_addrs: []EndpointAddress,
     tls_acceptor: ?tls_edge.Acceptor = null,
     shutdown_flag: std.atomic.Value(bool) = .init(false),
-    shutdown_event: std.Io.Event = .unset,
+    shutdown_event: zio.ResetEvent = .init,
     active_connections: std.atomic.Value(usize) = .init(0),
     accounting: connection.GlobalAccounting,
     router: router_mod.Router = undefined,
@@ -291,11 +293,11 @@ pub const Server = struct {
         self.bind_event.set(self.io);
 
         const canceled = blk: {
-            self.shutdown_event.wait(self.io) catch break :blk true;
+            self.shutdown_event.wait() catch break :blk true;
             break :blk false;
         };
         self.shutdown_flag.store(true, .release);
-        self.shutdown_event.set(self.io);
+        self.shutdown_event.set();
         accept_group.cancel(self.io);
         accepts_live = false;
         self.closeListeners();
@@ -407,7 +409,7 @@ pub const Server = struct {
 
     pub fn requestShutdown(self: *Server) void {
         self.shutdown_flag.store(true, .release);
-        self.shutdown_event.set(self.io);
+        self.shutdown_event.set();
     }
 
     pub const WaitListeningError = error{

@@ -74,7 +74,7 @@ pub const HANDLER_JOB_SIZE: usize = 608;
 /// Must match `edge.connection.DeadlineEntry`.
 pub const DEADLINE_ENTRY_SIZE: usize = 16;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
-pub const REAPER_JOB_SIZE: usize = 40;
+pub const REAPER_JOB_SIZE: usize = 32;
 
 pub const WIRE_CHUNK_SIZE = wire_const.WIRE_CHUNK_SIZE;
 pub const TLS_PLAINTEXT_SCRATCH_SIZE = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;

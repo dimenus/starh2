@@ -1,0 +1,14 @@
+.{
+    .name = .select_cancel_repro,
+    .version = "0.0.0",
+    .fingerprint = 0x7fb22eb47f3ba4fd,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Path dep into the repo's machine-local vendored zio (gitignored),
+        // so the reproducer sees the same bits starh2 builds against.
+        .zio = .{
+            .path = "../../../../oss/zio",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

@@ -1,0 +1,83 @@
+Verdict
+
+- [LOGIC] Implement a variant, not the literal claim-before-consume proposal.
+- [LOGIC] The clobber is real in the current design, and the uncommitted CAS diagnostic in `select()` is detecting the right race.
+- [LOGIC] Claim-before-ready is sound for unilateral ready states, but the exact "return true without registering" rule is unsound under the current boolean protocol, and channel rendezvous cannot be repaired with only a second irreversible `tryClaim()`.
+
+1. Clobber verification
+
+- [LOGIC] `select()` still assumes that a false return means it may immediately name the current arm as winner. In the checked-out tree that blind store is already replaced by a diagnostic CAS; the old blind overwrite is exactly the race under review.
+- [LOGIC] Earlier registered arms really can commit independently before that point. A select waiter woken by a producer does a CAS on the shared winner and then always signals the parent, so an earlier arm can already have committed a result while a later arm is still in the registration loop.
+- [LOGIC] The signal-accounting undercount follows from cleanup shape, not just from the reproducer. Cleanup seeds `expected` from `registered_count` and decrements it whenever `asyncCancelWait` says "removed, no signal coming". Channel cancel returns `!waiter.didWin()` once the node is no longer in the queue. After a blind overwrite, the already-claimed earlier waiter no longer `didWin()`, so cleanup subtracts a signal that is still in flight.
+
+2. Judgement on the proposed fix
+
+- [LOGIC] For `Awaitable`, `ResetEvent`, and the ready/drained `CompletionQueue` case, "win before report-ready" is the right local invariant: those states are self-contained, so a losing current arm can leave the source untouched and let the already-won arm's signal drive the select.
+- [LOGIC] The exact "return true without registering" proposal is not sound under the present protocol. `select.zig` documents `true` as "added to an internal wait queue" and "will be woken exactly once", and cleanup/cancel is written to that contract. `ResetEvent.asyncCancelWait`, `Awaitable.asyncCancelWait`, and `CompletionQueue.asyncCancelWait` have no way today to distinguish "not registered because another branch had already won" from "completion claimed me and a signal is in flight".
+- [LOGIC] A scalar `registered_count` is no longer enough once a branch can return "lost but not registered". The current cleanup uses `i < registered_count` as a prefix test. If branch 1 is lost/unregistered and branch 2 really queues, that prefix assumption is false and cleanup/cancel will touch the wrong set.
+- [LOGIC] The exact proposal is also incomplete for channel direct handoff. In `AsyncSendImpl.asyncWait` and `AsyncReceiveImpl.asyncWait`, the ready path with a queued peer depends on claiming that peer waiter and committing the copy/success bit under the channel mutex. If you claim the peer first and self second, a self-claim failure recreates the consumed-loser problem. If you claim self first and peer second, a peer-claim failure can leave `winner` set with no committed result.
+- [LOGIC] That second ordering is especially incompatible with bug 1's cancel epilogue. The committed fix in `select()` assumes that after canceling branches and absorbing in-flight signals, `winner != NO_WINNER` means `getResult` is valid and should be delivered. A design that lets an arm win before its result is committed breaks that invariant and reopens cancel-path ambiguity.
+- [LOGIC] So the blanket proposal is an anti-pattern only in the strong sense that it tries to smuggle a third async-wait state and a two-party commit through a boolean API. The core idea is fine for unilateral ready states; it is not a complete select-wide rule.
+- [LOGIC] There is no ABA problem on the current `winner` slot as long as it remains single-assignment `NO_WINNER -> index`. `Waiter.tryClaim()` and `didWin()` are written for that one-shot model. Do not make `winner` rollback/reusable; put any reversibility in per-future reservation state instead.
+
+3. Prior art
+
+- [LOGIC] Go's runtime solves the analogous channel-select class with an explicit two-phase protocol: it locks all channels in a stable order, polls for immediately-ready cases under those locks, and only then commits one case or enqueues wait records for the slow path. zio currently has no equivalent cross-future lock discipline, so copying Go literally would be invasive; the useful lesson is the separation of poll from commit for rendezvous cases.
+- [LOGIC] Rust futures/Tokio `select!` avoids this exact failure mode because branches are polled futures, not producer-driven stack handoffs. A losing branch is dropped/canceled before a select arm's stack-owned result has been irrevocably consumed; the burden is cancellation safety of the future, not recovery from a consumed-loser inside `select`. zio's direct channel handoff is therefore much closer to Go channels than to Tokio polling.
+
+4. Alternative I would prefer
+
+- [LOGIC] My preferred near-term fix is: keep the existing winner slot single-assignment meaning "result committed to this select", but change the select-only wait result from boolean to an explicit tri-state, e.g. `.ready`, `.queued`, `.lost`. `select()` and `selectAwaitables()` should track per-branch state (bitset/enum array), not just a prefix count.
+- [LOGIC] With that tri-state in place, apply claim-before-ready only to unilateral ready states: `Awaitable`, `ResetEvent`, `CompletionQueue` ready/drained, and channel fast paths that only touch channel-owned state (`closed`, buffered receive, buffered send). For those cases, `waiter.tryClaim()` on the current arm before consuming/reporting ready is sound.
+- [LOGIC] Do not apply the same literal pattern to channel peer-queue rendezvous. For `sender_queue`/`receiver_queue` direct handoff, introduce a reversible reservation/commit subprotocol or a small select-specific poll/commit API. Concrete zio shape: under the channel mutex, reserve a peer waiter in per-wait or channel-owned state without signaling or finalizing success; then either commit (publish `result_set`/`succeeded`, dequeue definitively, signal peer) only after the current arm has won, or abort the reservation without changing `winner`. If that feels too invasive, stop and do a true poll/commit redesign for select rather than shipping the blanket rule.
+- [LOGIC] `CompletionQueue` is already close to the right model on its queued path: `ownerCallback` pushes the completion, `claimRegisteredLocked` tries to win under `mutex`, and only a successful claim is signaled. Its remaining work is the ready fast path plus the new lost/queued distinction.
+- [LOGIC] `selectAwaitables()` must be updated alongside `select()`. It still has the old blind-store/prefix-count shape, so leaving it alone would preserve the same class of bug for the type-erased path.
+- [LOGIC] Non-select `wait()` paths stay semantically simple: for direct waiters, `tryClaim()` is always true, so the new `.lost` outcome is a select-only concern even though the protocol surface changes.
+- [PREMISE] Because this is a controlled fork, protocol breaks are acceptable, and correctness dominates the hot-path cost, I would take the protocol break to add a select-only tri-state outcome and per-branch bookkeeping rather than trying to preserve the current boolean contract.
+- [PREMISE] On the stated HTTP/2 hot path, the likely cost of one extra ready-arm CAS and a small stack bitset/enum array is a better trade than either silent item loss or a full Go-style cross-future locking rewrite.
+
+5. Concrete verdict
+
+- [LOGIC] Verdict: implement a variant, not the proposal exactly as written.
+- [LOGIC] Required minimum changes for a sound variant:
+  1. [LOGIC] change the select-only async-wait return to carry `lost/not_registered` separately from `queued`;
+  2. [LOGIC] change `select()` and `selectAwaitables()` to track branch state per arm instead of by contiguous `registered_count`;
+  3. [LOGIC] keep `winner` meaning "committed result exists for this arm";
+  4. [LOGIC] use claim-before-ready only for unilateral ready states;
+  5. [LOGIC] give channel rendezvous a reversible reservation/commit path instead of a second irreversible `tryClaim()`.
+
+Evidence per claim
+
+- [LOGIC] Blind-store/clobber surface:
+  - `src/select.zig:311-317` — `if (winner.cmpxchgStrong(NO_WINNER, i, .acq_rel, .acquire)) |_| { std.debug.panic("select fast-path clobber: branch {d} ready while an earlier branch was claimed", .{i}); }`
+  - `src/common.zig:151-156` — `// Try to claim winner slot with our index (may already be claimed)` and `// Always signal parent - needed for both winner notification and cleanup synchronization`
+  - `src/common.zig:164-170` — `A successful claim commits the caller to exactly one later signal; a failed claim must not be signaled.`
+
+- [LOGIC] Protocol/cleanup contract that makes "true without registration" invalid as-is:
+  - `src/select.zig:36-45` — `true: Operation pending... The waiter was added to an internal wait queue and will be woken ... exactly once`
+  - `src/select.zig:52-58` — `Must be called if asyncWait() returned true...`
+  - `src/select.zig:280-300` — `var expected: u32 = @intCast(registered_count); ... if (was_removed) { expected -= 1; } ... waiter.wait(expected, .no_cancel);`
+  - `src/sync/ResetEvent.zig:209-218` — `asyncWait` is just `pushUnlessFlag`, and `asyncCancelWait` is just `remove(&waiter.node)`
+  - `src/awaitable.zig:55-68` — `if (self.waiting_list.isFlagSet()) { return false; } ... return self.waiting_list.remove(&waiter.node);`
+  - `src/completion_queue.zig:335-363` — ready returns `false`, otherwise `self.reg = ctx`; cancellation only distinguishes `self.reg == ctx` from "claimed, signal in flight"
+
+- [LOGIC] Concrete undercount path through channel cancellation:
+  - `src/sync/channel.zig:265-276` — after removal fails, send cancel does `return !waiter.didWin();`
+  - `src/sync/channel.zig:333-343` — receive cancel has the same `return !waiter.didWin();`
+  - `src/common.zig:176-180` — `didWin()` is `winner.load(.acquire) == s.index`, so a blind overwrite changes the cancel result without changing the already-in-flight signal.
+
+- [LOGIC] Channel rendezvous is a two-party commit, not a one-sided ready check:
+  - `src/sync/channel.zig:238-246` — send direct handoff claims a receiver, copies into the receiver context, sets `ctx.succeeded = true`, unlocks, and signals.
+  - `src/sync/channel.zig:310-318` — receive direct handoff claims a sender, copies from the sender context, sets `send_ctx.succeeded = true`, unlocks, and signals.
+
+- [LOGIC] Cancel-path fix relies on `winner == committed result`:
+  - `src/select.zig:329-367` — after cancellation, select cancels every registered branch, absorbs every in-flight signal, then returns the claimed winner's `getResult` instead of `error.Canceled`.
+
+- [LOGIC] `CompletionQueue` already shows the safer queued-path shape:
+  - `src/completion_queue.zig:335-350` — ready returns false, otherwise a single registered waiter is stored under `mutex`
+  - `src/completion_queue.zig:545-553` — `claimRegisteredLocked` only removes/signals the waiter when `ctx.waiter.tryClaim()` succeeds
+  - `src/completion_queue.zig:547-549` — `A failed claim leaves the registration in place ... and a claim that was never made must never be signaled.`
+
+- [LOGIC] `selectAwaitables()` still needs the same treatment:
+  - `src/select.zig:417-423` — cleanup still uses a prefix slice of `registered_count`
+  - `src/select.zig:432-439` — on `!waiting`, it still does `winner.store(w.mode.select.index, .release)` and otherwise increments `registered_count`
