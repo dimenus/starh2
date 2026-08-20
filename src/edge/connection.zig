@@ -1840,6 +1840,36 @@ const Connection = struct {
     ///
     /// The lock is uncancelable: a cancelable acquire can turn the RST into
     /// `Canceled` (I8 code 5) in the same gap this mapping exists to close.
+    /// ACTOR-side ticket wait (t-899). The actor is the sole consumer of
+    /// `write_ack_ch`, so it must never park on a bare ticket event: the
+    /// completion that would set the event can only be applied BY the actor.
+    /// The 2026-08-20 live wedge read exactly that state off the process —
+    /// actor in `waitTicket`, four acks queued (the ticket's failed ack, a
+    /// fail_all, and the pump's shutdown) with nothing left to apply them.
+    /// This loop feeds the wait: drain acks, and park only on a select that
+    /// includes the ack channel. The final `waitTicket` then returns without
+    /// parking and keeps the terminal/cause mapping in one place.
+    fn waitTicketDraining(self: *Connection, stream_id: u31, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
+        while (!self.tickets.isSignaled(slot_i)) {
+            self.drainWriteAcks();
+            if (self.tickets.isSignaled(slot_i)) break;
+            const winner = zio.select(.{
+                .acks = self.write_ack_ch.asyncReceive(),
+                .bell = self.doorbell.asyncReceive(),
+            }) catch break; // Canceled: waitTicket below maps it without parking.
+            switch (winner) {
+                .acks => |r| {
+                    const ack = r catch break;
+                    self.takeWriteAck(ack);
+                },
+                .bell => |r| {
+                    _ = r catch break;
+                },
+            }
+        }
+        return self.waitTicket(stream_id, slot_i, terminal);
+    }
+
     fn waitTicket(self: *Connection, stream_id: u31, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
         self.tickets.wait(slot_i, terminal) catch |err| {
             if (terminal.getCause()) |c| return response.causeToError(c);
@@ -2024,9 +2054,12 @@ const Connection = struct {
     }
 
     /// Reclaim complete-handler drain-turn receipts whose write acks this actor
-    /// has already applied. `ready` is the proof that `waitTicket` below cannot
-    /// block. Write-ack apply never finishes jobs; it only completes tickets
-    /// and publishes the ready count.
+    /// has already applied. `ready` is the fast-path count; it is NOT a proof
+    /// (the 2026-08-20 live wedge caught the actor parked here with the
+    /// ticket's completion queued in `write_ack_ch`). `waitTicketDraining`
+    /// makes the wait self-feeding, so a stale or miscounted `ready` costs a
+    /// drain turn instead of a permanent park. Write-ack apply never finishes
+    /// jobs; it only completes tickets and publishes the ready count.
     fn drainPendingCompleteReceipts(self: *Connection, finalize_all: bool) void {
         const failed = finalize_all or self.complete_receipts_fail_all.swap(false, .acq_rel);
         var ready = self.complete_receipts_ready.swap(0, .acq_rel);
@@ -2051,7 +2084,7 @@ const Connection = struct {
 
             var receipt_ok = true;
             if (wait_job) |job| {
-                self.waitTicket(job.stream_id, receipt.ticket_slot, job.hctx.terminal) catch {
+                self.waitTicketDraining(job.stream_id, receipt.ticket_slot, job.hctx.terminal) catch {
                     receipt_ok = false;
                 };
             } else {

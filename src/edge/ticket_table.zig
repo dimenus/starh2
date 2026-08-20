@@ -155,6 +155,16 @@ pub const TicketTable = struct {
         };
     }
 
+    /// Nonblocking probe: has this slot's event been signaled (completion,
+    /// wake, or failAll)? The ACTOR's receipt wait uses it to feed itself
+    /// from the ack channel instead of parking blind (t-899): the actor is
+    /// the only task that applies write acks, so an actor parked on a bare
+    /// ticket event while completions sit queued is a self-deadlock.
+    pub fn isSignaled(self: *TicketTable, slot_i: u32) bool {
+        if (slot_i >= self.slots.len) return false;
+        return @atomicLoad(std.Io.Event, &self.slots[slot_i].event, .acquire) == .is_set;
+    }
+
     pub fn releaseReserved(self: *TicketTable, slot_i: u32) void {
         if (slot_i >= self.slots.len) return;
         const slot = &self.slots[slot_i];
