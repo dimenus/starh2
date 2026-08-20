@@ -38,3 +38,18 @@ show its snapshot ruling out the receipt-capacity cycle.
    cannot see parked coroutine stacks, so this does not discriminate
    between those two. The discriminator remains a queue/flag occupancy
    snapshot at the wedge.
+
+## Morning checklist (for whoever reads the post-fix matrix, 2026-08-20)
+
+- Nachos matrix: /tmp/perf-story-post-fix (7235fa7 vs 55835a4). Darwin
+  runner armed, writes /tmp/perf-story (progress in
+  /tmp/perf-story-darwin-progress.txt).
+- REQUIRED when quoting probe rows: name the THRESHOLD each arm ran with.
+  The wedge-probe floors (15000 under 8 workers / 25000 at 8+) are
+  Darwin-calibrated; rows are only comparable when every one names its
+  gate. Verifier's closing request, binding on the write-up.
+- Headline question: mem-BIO (7235fa7) vs record path (55835a4) at
+  WORKERS=8 — independent verification saw 51.4k vs the ~46k control band
+  on Darwin pre-landing.
+- Then: 9d0621e ordinary review; t-875 deterministic regression test;
+  t-843 plan-of-record rev 7 from the fresh numbers.
