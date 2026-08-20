@@ -1248,14 +1248,34 @@ fn stepHandshake(ssl: *boring.ssl.Ssl) !void {
 // must report work, or the pump parks on top of a buried request and the
 // connection wedges for good. Removing the ciphertext term from
 // pendingInbound fails this test.
+// In-source loopback fixture pair for the record tests. Deliberately NOT
+// testdata/*.pem: those are machine-local by convention (gitignored), and a
+// unit test must build on a fresh checkout. Throwaway self-signed
+// CN=localhost material, public by nature.
+const fixture_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBfDCCASOgAwIBAgIUNrYfW/94JO0I8Ly5JLgu+e2Z+vcwCgYIKoZIzj0EAwIw
+    \\FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgyMDEzNTIyNloXDTM2MDgxNzEz
+    \\NTIyNlowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+    \\AQcDQgAEP4wKMqBqZx54+J7kJy9dMcm+Lsx6cit54Sd4eCAzr6uxolWi8M1p3OpO
+    \\m7OKRMunkzOTYbPCQjT9NBR0sW89EKNTMFEwHQYDVR0OBBYEFPgT4WNVaveWv1TV
+    \\YxhSBrSNhzXfMB8GA1UdIwQYMBaAFPgT4WNVaveWv1TVYxhSBrSNhzXfMA8GA1Ud
+    \\EwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgdLWKYMUmeqYLwrVPIgJGLxQZ
+    \\p0uJdNZ1LnWS2JPowPwCIEGkXAU3QDok+T9Sj0GOGEq6Nhnv3nchWxg24ZqUJ6CR
+    \\-----END CERTIFICATE-----
+;
+const fixture_key_pem =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgjpKRKa9ZDVtHcAgb
+    \\EwexTKPP66fnsfBsAyqcQoT4aKmhRANCAAQ/jAoyoGpnHnj4nuQnL10xyb4uzHpy
+    \\K3nhJ3h4IDOvq7GiVaLwzWnc6k6bs4pEy6eTM5Nhs8JCNP00FHSxbz0Q
+    \\-----END PRIVATE KEY-----
+;
+
 test "a second record in one chunk is invisible to SSL_pending but pendingInbound sees it" {
-    const build_options = @import("build_options");
     boring.init();
 
-    var acceptor = try Acceptor.initFromPem(
-        build_options.test_cert_pem,
-        build_options.test_key_pem,
-    );
+    var acceptor = try Acceptor.initFromPem(fixture_cert_pem, fixture_key_pem);
     defer acceptor.deinit();
     var connector = try loopbackClientConnector();
     defer connector.deinit();
