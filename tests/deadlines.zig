@@ -253,7 +253,7 @@ test "T2: two deadlines keep order; RST of one does not strand the other" {
 
 test "T3: terminal during waitUntil returns exact error and frees the heap" {
     t3_err.store(0, .release);
-    starh2.edge.connection.test_deadline_heap_len.store(0, .release);
+    starh2.edge.connection.test_deadline_waits.store(0, .release);
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{
         .executors = .exact(2),
@@ -299,7 +299,7 @@ test "T3: terminal during waitUntil returns exact error and frees the heap" {
                     while (waited < 3000) : (waited += 10) {
                         if (t3_err.load(.acquire) != 0 and
                             starh2.edge.connection.test_observed_live_handlers.load(.acquire) == 0 and
-                            starh2.edge.connection.test_deadline_heap_len.load(.acquire) == 0)
+                            starh2.edge.connection.test_deadline_waits.load(.acquire) == 0)
                             break;
                         const n = stream.read(&buf, .{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
                             error.Timeout => 0,
@@ -309,7 +309,7 @@ test "T3: terminal during waitUntil returns exact error and frees the heap" {
                     }
                     try std.testing.expectEqual(@as(u8, 3), t3_err.load(.acquire));
                     try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_observed_live_handlers.load(.acquire));
-                    try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_deadline_heap_len.load(.acquire));
+                    try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_deadline_waits.load(.acquire));
                     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
                 }
             }.go);

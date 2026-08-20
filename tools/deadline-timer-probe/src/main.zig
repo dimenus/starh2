@@ -69,6 +69,53 @@ fn run(rt: *zio.Runtime) !void {
     try h.join();
 }
 
+// Second scenario: the same shape through std.Io.Event.waitTimeout (the
+// futex path), because 53504b4 names sleep/select/AutoCancel and the
+// per-slot deadline events are std.Io.Event today.
+var std_event: std.Io.Event = .unset;
+var fired2_at_ns = std.atomic.Value(u64).init(0);
+var waiter2_armed = std.atomic.Value(bool).init(false);
+var hog2_running = std.atomic.Value(bool).init(false);
+
+fn hog2() !void {
+    hog2_running.store(true, .release);
+    while (!waiter2_armed.load(.acquire)) {
+        try zio.yield();
+    }
+    const until = nowNs() + hog_ms * std.time.ns_per_ms;
+    var x: u64 = 0;
+    while (nowNs() < until) {
+        x +%= 1;
+        std.atomic.spinLoopHint();
+    }
+    std.mem.doNotOptimizeAway(&x);
+}
+
+fn waiter2(io: std.Io) !void {
+    while (!hog2_running.load(.acquire)) {
+        try zio.yield();
+    }
+    const armed = nowNs();
+    waiter2_armed.store(true, .release);
+    std_event.waitTimeout(io, .{ .duration = .{
+        .raw = .fromNanoseconds(wait_ms * std.time.ns_per_ms),
+        .clock = .awake,
+    } }) catch |err| switch (err) {
+        error.Timeout => {
+            fired2_at_ns.store(nowNs() - armed, .release);
+            return;
+        },
+        else => return err,
+    };
+}
+
+fn run2(rt: *zio.Runtime) !void {
+    var w = try rt.spawn(waiter2, .{rt.io()});
+    var h = try rt.spawn(hog2, .{});
+    try w.join();
+    try h.join();
+}
+
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
@@ -85,15 +132,27 @@ pub fn main() !void {
     const fired = fired_at_ns.load(.acquire);
     const fired_ms = fired / std.time.ns_per_ms;
     std.debug.print(
-        "timed wait armed at {d} ms fired after {d} ms (hog {d} ms, 1 executor, migration off)\n",
+        "zio.ResetEvent.timedWait: armed {d} ms fired after {d} ms (hog {d} ms, 1 executor, migration off)\n",
         .{ wait_ms, fired_ms, hog_ms },
     );
-    if (fired == 0) {
-        std.debug.print("FAIL: the wait never timed out\n", .{});
-        std.process.exit(1);
+
+    var handle2 = try rt.spawn(run2, .{rt});
+    try handle2.join();
+    const fired2 = fired2_at_ns.load(.acquire);
+    const fired2_ms = fired2 / std.time.ns_per_ms;
+    std.debug.print(
+        "std.Io.Event.waitTimeout:   armed {d} ms fired after {d} ms (same shape)\n",
+        .{ wait_ms, fired2_ms },
+    );
+
+    var bad = false;
+    if (fired == 0 or fired_ms > wait_ms * 4) {
+        std.debug.print("FAIL: zio.ResetEvent timer starved behind the hog\n", .{});
+        bad = true;
     }
-    if (fired_ms > wait_ms * 4) {
-        std.debug.print("FAIL: timer starved behind the hog\n", .{});
-        std.process.exit(1);
+    if (fired2 == 0 or fired2_ms > wait_ms * 4) {
+        std.debug.print("FAIL: std.Io.Event timer starved behind the hog\n", .{});
+        bad = true;
     }
+    if (bad) std.process.exit(1);
 }

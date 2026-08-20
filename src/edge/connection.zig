@@ -177,7 +177,7 @@ pub var test_last_peer_reset_code: std.atomic.Value(u32) = .init(0);
 /// Test-only: stream_id currently blocked in waitForStreamSpace (0 = none).
 pub var test_waiting_for_space: std.atomic.Value(u32) = .init(0);
 /// Test-only: actor-owned handler-deadline heap occupancy (one connection at a time).
-pub var test_deadline_heap_len: std.atomic.Value(usize) = .init(0);
+pub var test_deadline_waits: std.atomic.Value(usize) = .init(0);
 /// Test-only: Connection finished boot allocations (pools, sched slabs, session maps).
 pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
 /// Test-only gate that parks the actor immediately before its event-driven wait.
@@ -732,11 +732,6 @@ const HandlerJob = struct {
 
 /// One optional deadline per live task-handler slot. Actor is the only mutator
 /// of the heap (handlers insert under `session_mu`, same shape as `writeFn`).
-pub const DeadlineEntry = struct {
-    deadline_ns: u64,
-    stream_id: u31,
-};
-
 const live: u8 = 0;
 const reaper_owned: u8 = 1;
 const reported: u8 = 2;
@@ -798,12 +793,6 @@ comptime {
     }
     if (@sizeOf(ReaperJob) != limits_mod.REAPER_JOB_SIZE) {
         @compileError("REAPER_JOB_SIZE must match @sizeOf(ReaperJob)");
-    }
-    if (@sizeOf(DeadlineEntry) != limits_mod.DEADLINE_ENTRY_SIZE) {
-        @compileError(std.fmt.comptimePrint(
-            "DEADLINE_ENTRY_SIZE must match @sizeOf(DeadlineEntry) (got {d})",
-            .{@sizeOf(DeadlineEntry)},
-        ));
     }
 }
 
@@ -980,11 +969,6 @@ const Connection = struct {
     /// Time waiters. Occupancy and time are different waits; do not overload
     /// `space_events`. Cadence is a heap entry, not a handler timer.
     deadline_events: []std.Io.Event = &.{},
-    deadline_ready: []std.atomic.Value(u8) = &.{},
-    deadline_heap: []DeadlineEntry = &.{},
-    deadline_len: usize = 0,
-    /// Flag-before-ring: set by a handler insert, drained by the actor turn.
-    deadline_armed: std.atomic.Value(bool) = .init(false),
     /// Actor-owned intent batch — filled by drainIntentsInto (no nested Session drain).
     intent_batch: []session_mod.Intent = &.{},
     rates: rates_mod.RateLimiter = .{},
@@ -1192,11 +1176,6 @@ const Connection = struct {
         const deadline_events = try gpa.alloc(std.Io.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(deadline_events);
         @memset(deadline_events, .unset);
-        const deadline_ready = try gpa.alloc(std.atomic.Value(u8), config.limits.max_streams_per_connection);
-        errdefer gpa.free(deadline_ready);
-        @memset(deadline_ready, .init(0));
-        const deadline_heap = try gpa.alloc(DeadlineEntry, config.limits.max_streams_per_connection);
-        errdefer gpa.free(deadline_heap);
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
         errdefer gpa.free(intent_batch);
 
@@ -1256,8 +1235,6 @@ const Connection = struct {
             },
             .space_events = space_events,
             .deadline_events = deadline_events,
-            .deadline_ready = deadline_ready,
-            .deadline_heap = deadline_heap,
             .intent_batch = intent_batch,
         };
         @memset(self.handlers, .{});
@@ -1337,7 +1314,6 @@ const Connection = struct {
         // Must not free while handlers still live.
         std.debug.assert(self.live_handlers.load(.acquire) == 0);
         std.debug.assert(self.live_task_handlers.load(.acquire) == 0);
-        std.debug.assert(self.deadline_len == 0);
         if (self.handshake_held) {
             if (self.config.accounting) |a| a.releaseHandshake();
             self.handshake_held = false;
@@ -1443,8 +1419,6 @@ const Connection = struct {
         if (self.complete_receipt_sid_storage.len != 0) self.config.gpa.free(self.complete_receipt_sid_storage);
         if (self.space_events.len != 0) self.config.gpa.free(self.space_events);
         if (self.deadline_events.len != 0) self.config.gpa.free(self.deadline_events);
-        if (self.deadline_ready.len != 0) self.config.gpa.free(self.deadline_ready);
-        if (self.deadline_heap.len != 0) self.config.gpa.free(self.deadline_heap);
         if (self.intent_batch.len != 0) self.config.gpa.free(self.intent_batch);
         const held = self.outbound_held.load(.acquire);
         const pending_held = self.pending_outbound_held.load(.acquire);
@@ -1722,103 +1696,11 @@ const Connection = struct {
 
     fn wakeHandlerDeadline(self: *Connection, stream_id: u31) void {
         const i = self.slotIndex(stream_id) orelse return;
-        if (i < self.deadline_ready.len) self.deadline_ready[i].store(1, .release);
         if (i < self.deadline_events.len) self.deadline_events[i].set(self.config.io);
     }
 
     fn wakeAllDeadlines(self: *Connection) void {
-        for (self.deadline_ready) |*flag| flag.store(1, .release);
         for (self.deadline_events) |*event| event.set(self.config.io);
-    }
-
-    fn publishDeadlineLen(self: *Connection) void {
-        test_deadline_heap_len.store(self.deadline_len, .release);
-    }
-
-    fn deadlineHeapPeek(self: *const Connection) ?DeadlineEntry {
-        if (self.deadline_len == 0) return null;
-        return self.deadline_heap[0];
-    }
-
-    fn deadlineHeapFind(self: *const Connection, stream_id: u31) ?usize {
-        var i: usize = 0;
-        while (i < self.deadline_len) : (i += 1) {
-            if (self.deadline_heap[i].stream_id == stream_id) return i;
-        }
-        return null;
-    }
-
-    fn deadlineHeapSiftUp(self: *Connection, start: usize) void {
-        var i = start;
-        while (i > 0) {
-            const parent = (i - 1) / 2;
-            if (self.deadline_heap[i].deadline_ns >= self.deadline_heap[parent].deadline_ns) break;
-            const tmp = self.deadline_heap[i];
-            self.deadline_heap[i] = self.deadline_heap[parent];
-            self.deadline_heap[parent] = tmp;
-            i = parent;
-        }
-    }
-
-    fn deadlineHeapSiftDown(self: *Connection, start: usize) void {
-        var i = start;
-        while (true) {
-            const left = i * 2 + 1;
-            const right = left + 1;
-            var smallest = i;
-            if (left < self.deadline_len and self.deadline_heap[left].deadline_ns < self.deadline_heap[smallest].deadline_ns)
-                smallest = left;
-            if (right < self.deadline_len and self.deadline_heap[right].deadline_ns < self.deadline_heap[smallest].deadline_ns)
-                smallest = right;
-            if (smallest == i) break;
-            const tmp = self.deadline_heap[i];
-            self.deadline_heap[i] = self.deadline_heap[smallest];
-            self.deadline_heap[smallest] = tmp;
-            i = smallest;
-        }
-    }
-
-    fn deadlineHeapRemoveAt(self: *Connection, idx: usize) void {
-        std.debug.assert(idx < self.deadline_len);
-        self.deadline_len -= 1;
-        if (idx != self.deadline_len) {
-            self.deadline_heap[idx] = self.deadline_heap[self.deadline_len];
-            self.deadlineHeapSiftUp(idx);
-            self.deadlineHeapSiftDown(idx);
-        }
-        self.publishDeadlineLen();
-    }
-
-    fn deadlineHeapInsert(self: *Connection, entry: DeadlineEntry) void {
-        if (self.deadlineHeapFind(entry.stream_id)) |i| {
-            self.deadline_heap[i] = entry;
-            self.deadlineHeapSiftUp(i);
-            self.deadlineHeapSiftDown(i);
-            return;
-        }
-        std.debug.assert(self.deadline_len < self.deadline_heap.len);
-        self.deadline_heap[self.deadline_len] = entry;
-        self.deadline_len += 1;
-        self.deadlineHeapSiftUp(self.deadline_len - 1);
-        self.publishDeadlineLen();
-    }
-
-    fn deadlineHeapRemove(self: *Connection, stream_id: u31) void {
-        const i = self.deadlineHeapFind(stream_id) orelse return;
-        self.deadlineHeapRemoveAt(i);
-    }
-
-    /// Pop and wake every heap entry with `deadline <= now`. Actor-only, under
-    /// `session_mu`. Called on every turn — including when ingest stays ready.
-    fn fireDueHandlerDeadlines(self: *Connection, now: u64) usize {
-        var fired: usize = 0;
-        while (self.deadlineHeapPeek()) |entry| {
-            if (entry.deadline_ns > now) break;
-            self.deadlineHeapRemoveAt(0);
-            self.wakeHandlerDeadline(entry.stream_id);
-            fired += 1;
-        }
-        return fired;
     }
 
     /// Write-ack-signaled writer failure: terminate connection, reset every stream,
@@ -1939,7 +1821,6 @@ const Connection = struct {
         }
 
         self.wakeAllSpace();
-        while (self.deadline_len > 0) self.deadlineHeapRemoveAt(0);
         self.wakeAllDeadlines();
         self.session.terminal = .transport;
     }
@@ -2218,11 +2099,11 @@ const Connection = struct {
         }
     }
 
+    /// Protocol deadlines only (idle, slow-consumer, grace, test canary).
+    /// Handler deadlines are handler-owned zio timed waits and never appear
+    /// in the actor's park timer.
     fn nextDeadlineNs(self: *Connection) ?u64 {
         var next = self.session.nextIdleDeadlineNs();
-        if (self.deadlineHeapPeek()) |entry| {
-            if (next == null or entry.deadline_ns < next.?) next = entry.deadline_ns;
-        }
         if (self.sched.nextSlowDeadlineNs(self.config.limits.slow_consumer_timeout_ns)) |deadline| {
             if (next == null or deadline < next.?) next = deadline;
         }
@@ -2577,22 +2458,17 @@ const Connection = struct {
         var inbound_eof = false;
         while (true) {
             _ = self.sched_refilled.swap(false, .acq_rel);
-            _ = self.deadline_armed.swap(false, .acq_rel);
             self.drainWriteAcks();
             self.drainCompletions();
             self.drainPendingCompleteReceipts(false);
             self.runPendingInline();
 
-            var fired: usize = 0;
             {
                 self.lockSessionUncancelable(io);
                 defer self.unlockSession(io);
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
                 if (self.session.terminal != .none) break;
                 const now = nowNs(io);
-                // Fire-due on every turn, including when read_ch is ready.
-                // waitForActivity only sees the heap while the actor parks.
-                fired = self.fireDueHandlerDeadlines(now);
                 self.session.edge_now_ns = now;
                 try self.session.checkIdleDeadlines(now);
                 if (try self.maybeBeginGraceful()) break;
@@ -2640,12 +2516,9 @@ const Connection = struct {
                     break;
                 }
             }
-            // Donate once per fire so a same-home ready handler can writeAll
-            // before the next oneshot chunk is ingested. Not once per loop
-            // while handlers exist — that loses to ingest on oneshot-only.
-            if (fired > 0) {
-                self.config.io.sleep(.zero, .awake) catch {};
-            }
+            // The donate-yield that followed fire-due is gone with the heap:
+            // a handler deadline now wakes its waiter on the dedicated timer
+            // executor, so it is runnable without the actor's help.
             self.runPendingInline();
             // An extra-batch EOF was consumed last turn after its siblings
             // ingested. Emit once (the loop top above) then tear down — same
@@ -2873,7 +2746,6 @@ const Connection = struct {
         self.handler_joins[i] = null;
         if (i < self.space_events.len) self.space_events[i].reset();
         if (i < self.deadline_events.len) self.deadline_events[i].reset();
-        if (i < self.deadline_ready.len) self.deadline_ready[i].store(0, .release);
         return slot;
     }
 
@@ -2949,7 +2821,6 @@ const Connection = struct {
             if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
             slot.terminal.clear();
             slot.completion_owner.store(reported, .release);
-            self.deadlineHeapRemove(stream_id);
             // Event state is reset only when this slot is admitted again; every
             // waiter rechecks capacity and terminal state under session_mu.
         }
@@ -3049,7 +2920,6 @@ const Connection = struct {
             self.applyOutboundRelease(pending_len, .pending);
         }
         self.wakeStreamSpace(stream_id);
-        self.deadlineHeapRemove(stream_id);
         self.wakeHandlerDeadline(stream_id);
     }
 
@@ -5109,82 +4979,49 @@ const Connection = struct {
     ///
     /// Register `{stream_id, deadline}` on the actor heap and park on the
     /// per-slot deadline Event. Not `space_events`, and not `Io.sleep`.
+    /// Streaming body cadence wait (`Body.waitUntil`), handler-owned.
+    ///
+    /// One per-slot Event with a timed wait: `error.Timeout` IS the deadline
+    /// (the fork's dedicated timer executor fires it even while every worker
+    /// is hogged — measured in `tools/deadline-timer-probe`, 51-52 ms under a
+    /// 500 ms one-executor hog). A normal return is an early wake from
+    /// `wakeHandlerDeadline` (RST, terminal, writer failure, teardown); the
+    /// loop then rechecks the cause. The actor plays no role in handler
+    /// timing: no heap, no fire-due turn work, no park-timer contribution.
+    ///
+    /// Ordering discipline with the waker: the waker sets the terminal cause
+    /// (or writer_failed) BEFORE it sets the event; the waiter resets the
+    /// event BEFORE it rechecks those conditions. A wake that races the
+    /// reset therefore always leaves its evidence visible to the recheck.
     fn waitUntilCb(ctx: *anyopaque, stream_id: u31, deadline: std.Io.Timestamp) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         const io = self.config.io;
         const deadline_ns: u64 = @intCast(deadline.nanoseconds);
-        if (hctx.terminal.getCause()) |c| return response.causeToError(c);
-        if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
-        if (self.writer_failed.load(.acquire)) return error.WriteFailed;
-        if (nowNs(io) >= deadline_ns) return;
 
-        try self.lockSession();
-        if (hctx.terminal.getCause()) |c| {
-            self.unlockSession(io);
-            return response.causeToError(c);
-        }
-        if (self.writer_failed.load(.acquire)) {
-            self.unlockSession(io);
-            return error.WriteFailed;
-        }
-        if (nowNs(io) >= deadline_ns) {
-            self.unlockSession(io);
-            return;
-        }
-        self.deadlineHeapInsert(.{ .deadline_ns = deadline_ns, .stream_id = stream_id });
-        self.deadline_armed.store(true, .release);
-        self.ring();
+        _ = test_deadline_waits.fetchAdd(1, .acq_rel);
+        defer _ = test_deadline_waits.fetchSub(1, .acq_rel);
 
-        const slot_i = self.slotIndex(stream_id);
         while (true) {
-            if (hctx.terminal.getCause()) |c| {
-                self.deadlineHeapRemove(stream_id);
-                self.unlockSession(io);
-                return response.causeToError(c);
-            }
-            if (self.writer_failed.load(.acquire)) {
-                self.deadlineHeapRemove(stream_id);
-                self.unlockSession(io);
-                return error.WriteFailed;
-            }
-            if (nowNs(io) >= deadline_ns) {
-                self.deadlineHeapRemove(stream_id);
-                self.unlockSession(io);
-                return;
-            }
-            const event = if (slot_i) |i| &self.deadline_events[i] else {
-                self.deadlineHeapRemove(stream_id);
-                self.unlockSession(io);
-                return error.Canceled;
+            const slot_i = self.slotIndex(stream_id) orelse return error.Canceled;
+            const event = &self.deadline_events[slot_i];
+            event.reset();
+            if (hctx.terminal.getCause()) |c| return response.causeToError(c);
+            if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
+            if (self.writer_failed.load(.acquire)) return error.WriteFailed;
+            if (nowNs(io) >= deadline_ns) return;
+            event.waitTimeout(io, .{ .deadline = .{
+                .raw = deadline,
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                // The deadline itself; the contract's normal completion.
+                error.Timeout => return,
+                error.Canceled => {
+                    if (hctx.terminal.getCause()) |c| return response.causeToError(c);
+                    return error.Canceled;
+                },
             };
-            if (slot_i) |i| {
-                event.reset();
-                self.deadline_ready[i].store(0, .release);
-            }
-            if (hctx.terminal.getCause()) |c| {
-                self.deadlineHeapRemove(stream_id);
-                self.unlockSession(io);
-                return response.causeToError(c);
-            }
-            if (nowNs(io) >= deadline_ns or (slot_i != null and self.deadline_ready[slot_i.?].load(.acquire) != 0)) {
-                self.deadlineHeapRemove(stream_id);
-                self.unlockSession(io);
-                return;
-            }
-            self.unlockSession(io);
-            const wait_res: anyerror!void = event.wait(io);
-            self.lockSessionUncancelable(io);
-            wait_res catch {
-                if (hctx.terminal.getCause()) |c| {
-                    self.deadlineHeapRemove(stream_id);
-                    self.unlockSession(io);
-                    return response.causeToError(c);
-                }
-                self.deadlineHeapRemove(stream_id);
-                self.unlockSession(io);
-                return error.Canceled;
-            };
+            // Early wake: loop, recheck cause, re-arm the remaining time.
         }
     }
 

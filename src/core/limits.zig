@@ -71,8 +71,6 @@ pub const Terms = struct {
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
 pub const HANDLER_SLOT_SIZE: usize = 20;
 pub const HANDLER_JOB_SIZE: usize = 608;
-/// Must match `edge.connection.DeadlineEntry`.
-pub const DEADLINE_ENTRY_SIZE: usize = 16;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
 pub const REAPER_JOB_SIZE: usize = 32;
 
@@ -292,9 +290,7 @@ pub const Limits = struct {
         );
         const space_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
         const deadline_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
-        const deadline_heap = try checkedMul(self.max_streams_per_connection, DEADLINE_ENTRY_SIZE);
-        const deadline_ready = try checkedMul(self.max_streams_per_connection, @sizeOf(std.atomic.Value(u8)));
-        const deadline_state = try checkedAdd(deadline_events, try checkedAdd(deadline_heap, deadline_ready));
+        const deadline_state = deadline_events;
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_stream_bytes, try checkedAdd(header_maps, intents)))));
 
