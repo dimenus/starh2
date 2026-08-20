@@ -25,6 +25,8 @@ lost-wake class UNSAYABLE: there is no reset, no flag, no recheck list.
 
 ## Premises (state these when delegating; they are settled)
 
+Ryan confirmed the boundary decision 2026-08-20: edge takes zio directly.
+
 - starh2 is malleable, no external consumers; breaking internal APIs is
   free. Do not build compatibility shims.
 - `src/edge` TAKES A DIRECT zio DEPENDENCY, openly. No interface hiding
