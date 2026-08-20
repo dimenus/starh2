@@ -45,10 +45,10 @@ pub const Terms = struct {
     wire_descs: usize = 0,
     read_payload: usize = 0,
     write_payload: usize = 0,
-    /// TLS ciphertext chunk pool (read-task payload). Counted per connection.
+    /// TLS: the CQ driver's single ciphertext read buffer. One fixed
+    /// `TLS_CIPHER_CHUNK_SIZE` buffer per connection; the chunk pool and the
+    /// work queue it fed are gone with the CompletionQueue driver.
     tls_cipher_payload: usize = 0,
-    /// TLS work-queue descriptors (cipher + wire). Counted per connection.
-    tls_work_descs: usize = 0,
     frame_slabs: usize = 0,
     stream_maps: usize = 0,
     pending_maps: usize = 0,
@@ -105,10 +105,6 @@ pub const Limits = struct {
     max_streams_per_connection: usize = 256,
     max_streams_per_server: usize = 4_096,
     inbound_wire_chunks_per_connection: usize = 8,
-    /// Ciphertext chunks the TLS read task may have in flight per connection.
-    /// Outbound frames use `write_ch` so cipher and wire cannot HOL-block
-    /// each other.
-    tls_cipher_chunks_per_connection: usize = 8,
     /// Boot-reserved outbound HEADERS/DATA frame slabs per connection. A frame
     /// larger than `frame_slab_bytes` falls back to the GPA.
     frame_slab_bytes: usize = 512,
@@ -208,7 +204,6 @@ pub const Limits = struct {
         // handler slot and its capacity token.
         if (self.cancellation_reaper_jobs < self.max_streams_per_server) return error.InvalidConfig;
         if (self.inbound_wire_chunks_per_connection == 0) return error.InvalidConfig;
-        if (self.tls_cipher_chunks_per_connection == 0) return error.InvalidConfig;
         if (self.outbound_bytes_per_stream == 0 or self.outbound_bytes_per_connection == 0) return error.InvalidConfig;
         // The three ceilings must nest: stream <= connection <= server. An
         // inverted pair makes the inner limit unreachable, so a handler would
@@ -254,7 +249,6 @@ pub const Limits = struct {
             if (@sizeOf(ticket_table.TicketWait) != bound.TICKET_WAIT_SIZE) @compileError("TicketWait size drift");
             if (@sizeOf(wire_pump.WriteCompletion) != bound.WRITE_COMPLETION_SIZE) @compileError("WriteCompletion size drift");
             if (@sizeOf(wire_pump.WireChunk) != bound.WIRE_CHUNK_DESC_SIZE) @compileError("WireChunk size drift");
-            if (@sizeOf(@import("../edge/tls.zig").PumpWork) != bound.PUMP_WORK_SIZE) @compileError("PumpWork size drift");
         }
 
         var terms: Terms = .{};
@@ -263,9 +257,7 @@ pub const Limits = struct {
 
         terms.read_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
         terms.write_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
-        const n_cipher = self.tls_cipher_chunks_per_connection;
-        terms.tls_cipher_payload = try checkedMul(n_cipher, wire_const.TLS_CIPHER_CHUNK_SIZE);
-        terms.tls_work_descs = try checkedMul(n_cipher, bound.PUMP_WORK_SIZE);
+        terms.tls_cipher_payload = wire_const.TLS_CIPHER_CHUNK_SIZE;
         terms.frame_slabs = try checkedMul(self.frame_slabs_per_connection, self.frame_slab_bytes);
         terms.wire_descs = try checkedMul(try checkedMul(n_chunks, 2), bound.WIRE_CHUNK_DESC_SIZE); // read+write ch
         terms.handlers = try checkedMul(self.max_streams_per_connection, HANDLER_SLOT_SIZE);
@@ -281,7 +273,6 @@ pub const Limits = struct {
         const header_leases = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
         const write_free = try checkedMul(n_chunks, @sizeOf(u32));
-        const cipher_free = try checkedMul(n_cipher, @sizeOf(u32));
         terms.stream_maps = bound.streamMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
         const pending_slots = bound.pendingWriteMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
         // Slabs are server-wide now, so they are NOT part of the per-connection
@@ -309,7 +300,9 @@ pub const Limits = struct {
 
         const sid_and_inline = try checkedAdd(sid_scratch, try checkedAdd(inline_sids, complete_receipt_sids));
         const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
-        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, try checkedAdd(terms.tls_cipher_payload, try checkedAdd(terms.tls_work_descs, cipher_free))))));
+        // wire_descs already counts read+write channel descriptors; TLS
+        // reuses the write capacity for its channel, so no extra desc term.
+        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, terms.tls_cipher_payload))));
 
         terms.routes = try checkedAdd(
             self.max_route_path_bytes,
@@ -475,17 +468,10 @@ test "rejects response_compression with zero contexts" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
-test "mutation canary: tls cipher pool term moves with the limit" {
+test "the tls cipher term is exactly the driver's single read buffer" {
+    // The chunk pool is gone; a term that silently kept counting it would
+    // overstate the bound by (n-1) buffers per connection. Pin the exact
+    // value so a resurrected pool moves this test.
     const base = try Limits.defaults.resourceUpperBound();
-    try std.testing.expect(base.terms.tls_cipher_payload > 0);
-    try std.testing.expect(base.terms.tls_work_descs > 0);
-    var more = Limits.defaults;
-    more.tls_cipher_chunks_per_connection = Limits.defaults.tls_cipher_chunks_per_connection * 2;
-    const bigger = try more.resourceUpperBound();
-    try std.testing.expect(bigger.terms.tls_cipher_payload > base.terms.tls_cipher_payload);
-    try std.testing.expect(bigger.terms.tls_work_descs > base.terms.tls_work_descs);
-    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
-    var zero = Limits.defaults;
-    zero.tls_cipher_chunks_per_connection = 0;
-    try std.testing.expectError(error.InvalidConfig, zero.resourceUpperBound());
+    try std.testing.expectEqual(wire_const.TLS_CIPHER_CHUNK_SIZE, base.terms.tls_cipher_payload);
 }

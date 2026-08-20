@@ -235,6 +235,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "boring", .module = boring_mod },
+            // src/edge/tls.zig is a zio.CompletionQueue driver; the core
+            // module carries the zio dependency openly (t-878).
+            .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
     attachStarh2Options(b, starh2_mod, observe_hot);
@@ -278,6 +281,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "boring", .module = boring_mod },
+            .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
     attachStarh2Options(b, lib_test_mod, true);
@@ -567,6 +571,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "boring", .module = boring_rt },
+                .{ .name = "zio", .module = zio_rt.module("zio") },
             },
         });
         attachStarh2Options(b, starh2_rt, false);

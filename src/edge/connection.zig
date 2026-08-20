@@ -12,15 +12,20 @@
 //! |                |       | WritePump completions, byte releases          |
 //! | `ReadPump`     | 1     | h2c: socket READ. TLS: not spawned            |
 //! | `WritePump`    | 1     | h2c: socket WRITE. TLS: not spawned           |
-//! | `CipherRead`   | 0..1  | TLS: blocking socket READ of ciphertext.      |
-//! |                |       | Never touches the SSL object.                 |
-//! | `TlsPump`      | 0..1  | TLS: sole SSL_read/SSL_write owner; socket    |
-//! |                |       | WRITE of ciphertext. Cipher queue + write_ch, |
-//! |                |       | no Select. Flush is SSL_write + BIO_read.     |
+//! | `TlsPump`      | 0..1  | TLS: the zio.CompletionQueue driver. Sole     |
+//! |                |       | SSL_read/SSL_write owner, sole socket reader  |
+//! |                |       | (raw NetRecv completion) and socket writer.   |
+//! |                |       | Outbound arrives on `tls_write_ch` (a zio     |
+//! |                |       | Channel); the idle wait is one select over    |
+//! |                |       | CQ + channel. Flush is SSL_write + BIO_read.  |
 //! | handler        | 0..N  | arena + request/response. Task handlers spawn; |
 //! |                |       | complete oneshots run on the actor, still     |
 //! |                |       | emit through WritePump. SSE always spawns.    |
 //! | reaper worker  | pool  | canceling a handler future (server-wide)      |
+//!
+//! TLS mode takes a DIRECT zio dependency (channel + CompletionQueue). The
+//! h2c pumps stay std.Io-pure; `tests/backend_parity.zig` keeps its
+//! std.Io.Threaded arm for those paths only.
 //!
 //! Rules that follow from the table, all of which have been violated at least
 //! once:
@@ -34,8 +39,7 @@
 //!   must stay at zero. On TLS, `queueWire` hands plaintext to `TlsPump`;
 //!   SSL_write is the pump's flush, not the actor's.
 //! - One task drives the TLS cipher. That is `TlsPump`, not the actor. Sharing
-//!   an SSL object with a second task is a data race. `CipherRead` posts
-//!   ciphertext bytes; it never calls SSL_*.
+//!   an SSL object with a second task is a data race.
 //!
 //! # Lock discipline
 //!
@@ -82,6 +86,10 @@
 //! pending body AND as framed wire. `deinit` asserts that the two parts sum to
 //! the total and that both reach zero, which is the leak check.
 const std = @import("std");
+// Direct zio dependency, TLS mode only: the outbound frame channel the CQ
+// driver selects on. Stated in the landing commit; the h2c paths do not
+// touch it.
+const zio = @import("zio");
 const session_mod = @import("../core/session.zig");
 const hpack = @import("../core/hpack.zig");
 const limits_mod = @import("../core/limits.zig");
@@ -229,10 +237,11 @@ pub fn diagRawPrint(comptime fmt: []const u8, args: anytype) void {
     _ = std.c.write(2, line.ptr, line.len);
 }
 
-/// Sweep every registered connection for the wedge signature (pump inside
-/// `wake.wait` with the dirty flag still set) and re-fire the futex wake on
-/// the pump event. Returns how many pumps were re-kicked. Called from an OS
-/// thread; everything touched here is atomic or the futex bucket table.
+/// Sweep every registered connection: print the park snapshot and re-fire
+/// the ACTOR futex when its event sat set across a whole interval. The old
+/// pump-event rekick is gone with the wake protocol: the CQ driver has no
+/// Event to re-drive. Called from an OS thread; everything touched here is
+/// atomic or the futex bucket table.
 pub fn diagRekickSweep() u32 {
     diagRegLock();
     defer diagRegUnlock();
@@ -240,38 +249,28 @@ pub fn diagRekickSweep() u32 {
     for (diag_reg) |maybe_conn| {
         const conn = maybe_conn orelse continue;
         const site = conn.tls_pump_site.load(.acquire);
-        const dirty = conn.tls_pump_dirty.load(.acquire);
         // No queue reads here: io_queue locks a std.Io.Mutex, which an OS
         // thread outside the runtime must never take.
         const pump_state: u8 = if (diag_task_state_fn) |f| f(conn.tls_pump_task_h.load(.acquire)) else 0xff;
         const actor_state: u8 = if (diag_task_state_fn) |f| f(conn.actor_task_h.load(.acquire)) else 0xff;
-        const cipher_state: u8 = if (diag_task_state_fn) |f| f(conn.cipher_task_h.load(.acquire)) else 0xff;
         const pump_mark: u64 = if (diag_task_mark_fn) |f| f(conn.tls_pump_task_h.load(.acquire)) else 0;
         const actor_mark: u64 = if (diag_task_mark_fn) |f| f(conn.actor_task_h.load(.acquire)) else 0;
-        const cipher_mark: u64 = if (diag_task_mark_fn) |f| f(conn.cipher_task_h.load(.acquire)) else 0;
         const stamp_now: u64 = if (diag_stamp_now_fn) |f| f() else 0;
         diagRawPrint(
-            "STARH2_SWEEP conn={x} site={d} dirty={} wake={s} ack_wake={s} read_dirty={} pump_tag={d} pump_awaken={d} actor_tag={d} actor_awaken={d} ciph_site={d} ciph_tag={d} ciph_awaken={d} pump_hop={d}@{d} actor_hop={d}@{d} ciph_hop={d}@{d} now={d} actor_site={d} mu_held={}\n",
+            "STARH2_SWEEP conn={x} site={d} ack_wake={s} read_dirty={} pump_tag={d} pump_awaken={d} actor_tag={d} actor_awaken={d} pump_hop={d}@{d} actor_hop={d}@{d} now={d} actor_site={d} mu_held={}\n",
             .{
                 @intFromPtr(conn) & 0xffff,
                 site,
-                dirty,
-                @tagName(@atomicLoad(std.Io.Event, &conn.tls_pump_wake, .acquire)),
                 @tagName(@atomicLoad(std.Io.Event, &conn.actor_wake, .acquire)),
                 conn.tls_read_dirty.load(.acquire),
                 pump_state & 0x7,
                 (pump_state >> 3) & 1,
                 actor_state & 0x7,
                 (actor_state >> 3) & 1,
-                conn.cipher_site.load(.acquire),
-                cipher_state & 0x7,
-                (cipher_state >> 3) & 1,
                 pump_mark & 0xff,
                 pump_mark >> 8,
                 actor_mark & 0xff,
                 actor_mark >> 8,
-                cipher_mark & 0xff,
-                cipher_mark >> 8,
                 stamp_now,
                 conn.actor_site.load(.acquire),
                 @atomicLoad(bool, &conn.session_held, .monotonic),
@@ -294,17 +293,6 @@ pub fn diagRekickSweep() u32 {
                 if (conn.tls) |t| t.pendingPlaintext() else 0,
             },
         );
-        if (site == 2 and dirty) {
-            kicked += 1;
-            diagRawPrint(
-                "STARH2_REKICK conn={x} pump_wake={s}\n",
-                .{
-                    @intFromPtr(conn) & 0xffff,
-                    @tagName(@atomicLoad(std.Io.Event, &conn.tls_pump_wake, .acquire)),
-                },
-            );
-            conn.config.io.futexWake(std.Io.Event, &conn.tls_pump_wake, std.math.maxInt(u32));
-        }
         // A set actor event observed by a 500 ms sweep means the actor sat
         // parked across the whole interval with its wake already published.
         // Re-fire the futex: if the actor revives, its select subtask was
@@ -326,6 +314,12 @@ var diag_last_empty_park_ns: u64 = 0;
 
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
+
+/// std.Io socket handle to zio's ev handle (same fd; Windows would need the
+/// pointer cast). Mirrors zio's private `stdIoHandleToZio`.
+fn tlsNetHandle(h: std.Io.net.Socket.Handle) zio.ev.Backend.NetHandle {
+    return if (@typeInfo(zio.ev.Backend.NetHandle) == .pointer) @ptrCast(h) else h;
 }
 
 /// Phase trace for one flushed write, off unless a benchmark turns it on.
@@ -987,18 +981,13 @@ const Connection = struct {
     write_chunk_storage: []u8 = &.{},
     write_free_buf: []u32 = &.{},
     write_free_ch: std.Io.Queue(u32) = undefined,
-    /// TLS-only: ciphertext pool + CipherRead→pump queue (cipher/eof only).
-    /// Outbound WireChunks use `write_ch` so inbound cannot HOL-block a write.
-    tls_cipher_storage: []u8 = &.{},
-    tls_cipher_free_buf: []u32 = &.{},
-    tls_cipher_free_ch: std.Io.Queue(u32) = undefined,
-    tls_cipher_n: u32 = 0,
-    tls_work_buf: []tls_edge.PumpWork = &.{},
-    tls_work_ch: std.Io.Queue(tls_edge.PumpWork) = undefined,
-    tls_pump_wake: std.Io.Event = .unset,
-    /// Survives `tls_pump_wake.reset`. CipherRead and `pushWriteChunk` store
-    /// true after publishing, then set the event. TlsPump swaps after reset.
-    tls_pump_dirty: std.atomic.Value(bool) = .init(false),
+    /// TLS-only: the CQ driver's single ciphertext read buffer (replaces the
+    /// cipher chunk pool), and the outbound frame channel the driver selects
+    /// on. `tls_write_ch` shares the write_ch capacity; only one of the two
+    /// carries traffic per mode.
+    tls_read_buf: []u8 = &.{},
+    tls_write_buf: []wire_pump.WireChunk = &.{},
+    tls_write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
     /// Survives `actor_wake.reset`. TlsPump stores true after a `read_ch` post.
     tls_read_dirty: std.atomic.Value(bool) = .init(false),
     /// Diag: the pump's current blocking site (see `tls_edge.Pump.site`).
@@ -1012,8 +1001,6 @@ const Connection = struct {
     /// Diag: opaque zio task handles for the actor and the pump.
     actor_task_h: std.atomic.Value(usize) = .init(0),
     tls_pump_task_h: std.atomic.Value(usize) = .init(0),
-    cipher_site: std.atomic.Value(u8) = .init(0),
-    cipher_task_h: std.atomic.Value(usize) = .init(0),
     frame_pool: slab_pool.SlabPool = undefined,
     read_pool_n: u32 = 0,
     /// Preallocated scratch for stream-id sweeps (no hot-path ArrayList).
@@ -1162,18 +1149,13 @@ const Connection = struct {
         const write_free_buf = try gpa.alloc(u32, n_chunks);
         errdefer gpa.free(write_free_buf);
 
-        var tls_cipher_storage: []u8 = &.{};
-        var tls_cipher_free_buf: []u32 = &.{};
-        var tls_work_buf: []tls_edge.PumpWork = &.{};
-        var tls_cipher_n: u32 = 0;
+        var tls_read_buf: []u8 = &.{};
+        var tls_write_buf: []wire_pump.WireChunk = &.{};
         if (config.mode == .tls_h2) {
-            tls_cipher_n = @intCast(config.limits.tls_cipher_chunks_per_connection);
-            tls_cipher_storage = try gpa.alloc(u8, @as(usize, tls_cipher_n) * limits_mod.TLS_CIPHER_CHUNK_SIZE);
-            errdefer gpa.free(tls_cipher_storage);
-            tls_cipher_free_buf = try gpa.alloc(u32, tls_cipher_n);
-            errdefer gpa.free(tls_cipher_free_buf);
-            tls_work_buf = try gpa.alloc(tls_edge.PumpWork, tls_cipher_n);
-            errdefer gpa.free(tls_work_buf);
+            tls_read_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
+            errdefer gpa.free(tls_read_buf);
+            tls_write_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
+            errdefer gpa.free(tls_write_buf);
         }
         var frame_pool = try slab_pool.SlabPool.init(
             gpa,
@@ -1243,10 +1225,8 @@ const Connection = struct {
             .read_free_buf = read_free_buf,
             .write_chunk_storage = write_chunk_storage,
             .write_free_buf = write_free_buf,
-            .tls_cipher_storage = tls_cipher_storage,
-            .tls_cipher_free_buf = tls_cipher_free_buf,
-            .tls_cipher_n = tls_cipher_n,
-            .tls_work_buf = tls_work_buf,
+            .tls_read_buf = tls_read_buf,
+            .tls_write_buf = tls_write_buf,
             .frame_pool = frame_pool,
             .read_pool_n = n_chunks,
             .sid_scratch = sid_scratch,
@@ -1287,9 +1267,8 @@ const Connection = struct {
         self.write_ack_ch = .init(self.write_ack_buf);
         self.read_free_ch = .init(self.read_free_buf);
         self.write_free_ch = .init(self.write_free_buf);
-        if (self.tls_work_buf.len != 0) {
-            self.tls_work_ch = .init(self.tls_work_buf);
-            self.tls_cipher_free_ch = .init(self.tls_cipher_free_buf);
+        if (self.tls_write_buf.len != 0) {
+            self.tls_write_ch = .init(self.tls_write_buf);
         }
         return self;
     }
@@ -1317,12 +1296,6 @@ const Connection = struct {
                 unreachable;
             };
             self.write_free_ch.putOneUncancelable(self.config.io, i) catch {
-                unreachable;
-            };
-        }
-        var ci: u32 = 0;
-        while (ci < self.tls_cipher_n) : (ci += 1) {
-            self.tls_cipher_free_ch.putOneUncancelable(self.config.io, ci) catch {
                 unreachable;
             };
         }
@@ -1376,28 +1349,21 @@ const Connection = struct {
                 self.config.gpa.free(chunk.bytes);
             }
         }
-        if (self.tls_work_buf.len != 0) {
-            while (io_queue.tryGet(tls_edge.PumpWork, &self.tls_work_ch, io)) |item| {
-                switch (item) {
-                    .wire => |chunk| {
-                        if (chunk.pool_index) |idx| {
-                            self.write_free_ch.putOneUncancelable(io, idx) catch {
-                                unreachable;
-                            };
-                        } else if (chunk.bytes.len != 0) {
-                            self.config.gpa.free(chunk.bytes);
-                        }
-                        self.applyOutboundRelease(chunk.outbound_release, .wire);
-                        if (chunk.control_entries != 0) {
-                            self.applyControlRelease(chunk.control_release, chunk.control_entries);
-                        }
-                    },
-                    .cipher => |chunk| {
-                        self.tls_cipher_free_ch.putOneUncancelable(io, chunk.pool_index) catch {
-                            unreachable;
-                        };
-                    },
-                    .eof => {},
+        if (self.tls_write_buf.len != 0) {
+            // Chunks the driver never took out of the channel. Same
+            // releases as the write_ch drain above.
+            while (true) {
+                const chunk = self.tls_write_ch.tryReceive() catch break;
+                if (chunk.pool_index) |idx| {
+                    self.write_free_ch.putOneUncancelable(io, idx) catch {
+                        unreachable;
+                    };
+                } else if (chunk.bytes.len != 0) {
+                    self.config.gpa.free(chunk.bytes);
+                }
+                self.applyOutboundRelease(chunk.outbound_release, .wire);
+                if (chunk.control_entries != 0) {
+                    self.applyControlRelease(chunk.control_release, chunk.control_entries);
                 }
             }
         }
@@ -1452,9 +1418,8 @@ const Connection = struct {
         if (self.read_free_buf.len != 0) self.config.gpa.free(self.read_free_buf);
         if (self.write_chunk_storage.len != 0) self.config.gpa.free(self.write_chunk_storage);
         if (self.write_free_buf.len != 0) self.config.gpa.free(self.write_free_buf);
-        if (self.tls_cipher_storage.len != 0) self.config.gpa.free(self.tls_cipher_storage);
-        if (self.tls_cipher_free_buf.len != 0) self.config.gpa.free(self.tls_cipher_free_buf);
-        if (self.tls_work_buf.len != 0) self.config.gpa.free(self.tls_work_buf);
+        if (self.tls_read_buf.len != 0) self.config.gpa.free(self.tls_read_buf);
+        if (self.tls_write_buf.len != 0) self.config.gpa.free(self.tls_write_buf);
         if (self.sid_scratch.len != 0) self.config.gpa.free(self.sid_scratch);
         if (self.inline_sids.len != 0) self.config.gpa.free(self.inline_sids);
         if (self.complete_receipt_sid_storage.len != 0) self.config.gpa.free(self.complete_receipt_sid_storage);
@@ -1915,11 +1880,11 @@ const Connection = struct {
             .len = 0,
         });
         self.write_ch.close(self.config.io);
-        if (self.tls_work_buf.len != 0) {
-            _ = io_queue.tryPut(tls_edge.PumpWork, &self.tls_work_ch, self.config.io, .eof);
-            self.tls_work_ch.close(self.config.io);
-            self.tls_pump_dirty.store(true, .release);
-            self.tls_pump_wake.set(self.config.io);
+        if (self.tls_write_buf.len != 0) {
+            // Graceful: buffered chunks carry pool indices and accounting
+            // that the driver's failDrain (or deinit) must release exactly
+            // once. An immediate close would drop them with no destructor.
+            self.tls_write_ch.close(.graceful);
         }
 
         self.wakeAllSpace();
@@ -2295,16 +2260,9 @@ const Connection = struct {
         }
         const write_q = io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io);
         const read_q = io_queue.queued(wire_pump.WireChunk, &self.read_ch, self.config.io);
-        const work_q: usize = if (self.tls_work_buf.len != 0)
-            io_queue.queued(tls_edge.PumpWork, &self.tls_work_ch, self.config.io)
-        else
-            0;
         const read_free_q = io_queue.queued(u32, &self.read_free_ch, self.config.io);
         const write_free_q = io_queue.queued(u32, &self.write_free_ch, self.config.io);
-        const cipher_free_q: usize = if (self.tls_cipher_free_buf.len != 0)
-            io_queue.queued(u32, &self.tls_cipher_free_ch, self.config.io)
-        else
-            0;
+        const tls_write_empty = if (self.tls_write_buf.len != 0) self.tls_write_ch.isEmpty() else true;
         diagRawPrint(
             "STARH2_PARK acc={d} complete={} pending={d} bytes={d} ordinary={d} framed={d} live={d} refilled={} conn_win={d} eligible={d} missing={d} tomb_noerr={d} tomb_rst={d} pend_slots={d} rst0={d} intents={d} zero_win={d} min_swin={d} active={d} rst_h={d} rst_c={d} ctrl_fail={d} rst_after_fail={d}\n",
             .{
@@ -2334,53 +2292,23 @@ const Connection = struct {
             },
         );
         diagRawPrint(
-            "STARH2_TLSQ conn={x} write_q={d} read_q={d} work_q={d} read_free={d} write_free={d} cipher_free={d} inline={d} receipts={d} receipts_ready={d} ack_wake={s} pump_dirty={} read_dirty={} pump_site={d} pump_wake={s} live_h={d}\n",
+            "STARH2_TLSQ conn={x} write_q={d} read_q={d} tls_write_empty={} read_free={d} write_free={d} inline={d} receipts={d} receipts_ready={d} ack_wake={s} read_dirty={} pump_site={d} live_h={d}\n",
             .{
                 @intFromPtr(self) & 0xffff,
                 write_q,
                 read_q,
-                work_q,
+                tls_write_empty,
                 read_free_q,
                 write_free_q,
-                cipher_free_q,
                 self.inline_n,
                 self.pending_complete_receipt_n,
                 self.complete_receipts_ready.load(.acquire),
                 @tagName(self.actor_wake),
-                self.tls_pump_dirty.load(.acquire),
                 self.tls_read_dirty.load(.acquire),
                 self.tls_pump_site.load(.acquire),
-                @tagName(@atomicLoad(std.Io.Event, &self.tls_pump_wake, .acquire)),
                 self.live_handlers.load(.acquire),
             },
         );
-    }
-
-    /// Diag-only (`--diag`): every 500 ms, when the pump reports site 2
-    /// (inside `wake.wait`) while `tls_pump_dirty` is still true, re-fire
-    /// the futex wake on the pump event and report it. The event is
-    /// already `.is_set` in the wedge, so `set` would be a no-op; the raw
-    /// `futexWake` is the only way to re-drive the parked waiter.
-    fn diagRekickWatchdog(self: *Connection) void {
-        const io = self.config.io;
-        var fired: u64 = 0;
-        while (true) {
-            io.sleep(.fromMilliseconds(500), .awake) catch return;
-            if (self.tls_pump_site.load(.acquire) == 2 and
-                self.tls_pump_dirty.load(.acquire))
-            {
-                fired += 1;
-                diagRawPrint(
-                    "STARH2_WATCHDOG n={d} pump_wake={s} write_q={d}\n",
-                    .{
-                        fired,
-                        @tagName(@atomicLoad(std.Io.Event, &self.tls_pump_wake, .acquire)),
-                        io_queue.queued(wire_pump.WireChunk, &self.write_ch, io),
-                    },
-                );
-                io.futexWake(std.Io.Event, &self.tls_pump_wake, std.math.maxInt(u32));
-            }
-        }
     }
 
     fn waitForActivity(self: *Connection) !void {
@@ -2428,11 +2356,12 @@ const Connection = struct {
     /// The actor. One task, one connection, from first byte to close.
     ///
     /// ## Startup sequence
-    /// 1. TLS, if any: spawn `CipherRead` (ciphertext source), handshake on
-    ///    the actor with BoringSSL over memory BIOs (blocking SSL_accept is
-    ///    fine — no HTTP/2 yet). Drain leftover plaintext (a pipelined
-    ///    preface) into Session, then spawn `TlsPump`. The pump is the sole
-    ///    SSL_read/SSL_write owner; flush is SSL_write + BIO_read.
+    /// 1. TLS, if any: handshake on the actor's handshake subtask, which
+    ///    reads the socket itself (BoringSSL over memory BIOs; no HTTP/2
+    ///    yet). Drain leftover plaintext (a pipelined preface) into Session,
+    ///    then spawn `TlsPump`, the CQ driver: sole SSL_read/SSL_write
+    ///    owner and sole socket reader from here on; flush is SSL_write +
+    ///    BIO_read.
     /// 2. h2c: spawn ReadPump and WritePump on the raw socket.
     /// 3. Flush the server preface that `Session.init` already queued.
     /// 4. For h2c, wait for the client preface under the preface deadline.
@@ -2458,8 +2387,9 @@ const Connection = struct {
     ///    still holds the evidence.
     ///
     /// ## Teardown sequence (the `defer` block, then the tail)
-    /// 1. Tell the live pump(s) to stop, and push a sentinel so a writer parked
-    ///    on an empty queue wakes.
+    /// 1. Tell the live pump(s) to stop. h2c: push a sentinel so a writer
+    ///    parked on an empty queue wakes. TLS: close `tls_write_ch`
+    ///    (graceful) — the driver's parked select reports `error.Closed`.
     /// 2. `shutdown` the socket. A read parked in the kernel does not observe a
     ///    flag, so this is what unblocks it; task cancellation is the
     ///    authoritative backstop.
@@ -2477,38 +2407,36 @@ const Connection = struct {
         var read_pump: wire_pump.ReadPump = undefined;
         var write_pump: wire_pump.WritePump = undefined;
         var tls_pump: tls_edge.Pump = undefined;
-        var cipher_read: tls_edge.CipherRead = undefined;
         var read_handle: ?std.Io.Future(void) = null;
         var write_handle: ?std.Io.Future(void) = null;
         var tls_handle: ?std.Io.Future(void) = null;
-        var cipher_handle: ?std.Io.Future(void) = null;
         var tls_started = false;
-        var cipher_started = false;
         var h2c_started = false;
-        var rekick_handle: ?std.Io.Future(void) = null;
 
         defer {
             if (self.diag_registered) diagDeregister(self);
-            if (rekick_handle) |*h| h.cancel(io);
             if (tls_started) tls_pump.stop();
-            if (cipher_started) cipher_read.stop();
             if (h2c_started) {
                 read_pump.stop();
                 write_pump.stop();
             }
-            _ = self.write_ch.putUncancelable(io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
-                // A closed writer queue already terminates the pump.
-            };
-            if (self.tls_work_buf.len != 0) {
-                _ = self.tls_work_ch.putUncancelable(io, &.{.eof}, 0) catch {};
-                self.tls_pump_dirty.store(true, .release);
-                self.tls_pump_wake.set(io);
+            if (self.config.mode == .tls_h2) {
+                // Closing the channel is the driver's wake: its parked
+                // select reports error.Closed once the buffer drains.
+                // Graceful, because buffered chunks carry pool indices and
+                // accounting the driver's failDrain must release once.
+                self.tls_write_ch.close(.graceful);
+            } else {
+                _ = self.write_ch.putUncancelable(io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
+                    // A closed writer queue already terminates the pump.
+                };
             }
             self.stream.shutdown(io, .both) catch {
                 // Shutdown is best-effort; task cancellation is the authoritative unblock.
             };
+            // Cancel is the backstop for a driver stuck outside the select
+            // (an SSL_write retry loop, a socket write).
             if (tls_handle) |*h| h.cancel(io);
-            if (cipher_handle) |*h| h.cancel(io);
             if (write_handle) |*h| h.cancel(io);
             if (read_handle) |*h| h.cancel(io);
             self.drainWriteAcksForced();
@@ -2519,30 +2447,16 @@ const Connection = struct {
 
         if (self.config.mode == .tls_h2) {
             try self.prepareTls();
-            cipher_read = .{
-                .io = io,
-                .stream = self.stream,
-                .work = &self.tls_work_ch,
-                .wake = &self.tls_pump_wake,
-                .dirty = &self.tls_pump_dirty,
-                .chunk_storage = self.tls_cipher_storage,
-                .n_chunks = self.tls_cipher_n,
-                .free_indices = &self.tls_cipher_free_ch,
-                .site = &self.cipher_site,
-                .task_h = &self.cipher_task_h,
-                .task_handle_fn = diag_task_handle_fn,
-            };
-            cipher_handle = try io.concurrent(tls_edge.CipherRead.run, .{&cipher_read});
-            cipher_started = true;
+            // Handshake first: the actor-side handshake subtask reads the
+            // socket itself now; no read task exists before the driver.
             try self.handshakeTls();
             tls_pump = .{
                 .io = io,
                 .conn = self.tls.?,
                 .to_actor = &self.read_ch,
-                .from_actor = &self.write_ch,
-                .work = &self.tls_work_ch,
-                .wake = &self.tls_pump_wake,
-                .dirty = &self.tls_pump_dirty,
+                .write_ch = &self.tls_write_ch,
+                .sock = tlsNetHandle(self.stream.socket.handle),
+                .recv_buf = self.tls_read_buf,
                 .read_dirty = &self.tls_read_dirty,
                 .site = &self.tls_pump_site,
                 .task_h = &self.tls_pump_task_h,
@@ -2554,21 +2468,15 @@ const Connection = struct {
                 .n_chunks = self.read_pool_n,
                 .read_free = &self.read_free_ch,
                 .write_free = &self.write_free_ch,
-                .cipher_free = &self.tls_cipher_free_ch,
                 .live_task_handlers = &self.live_task_handlers,
                 .test_delay_ms = test_write_delay_ms,
                 .test_fail_after = test_write_fail_after,
             };
             tls_handle = try io.concurrent(tls_edge.Pump.run, .{&tls_pump});
             tls_started = true;
-            // Diag-only lost-wake discriminators. The in-runtime watchdog
-            // probes whether zio timer wakes still arrive near the wedge;
-            // the OS-thread sweep (diagRekickSweep) re-drives the pump
-            // futex from outside the scheduler. Instrumentation, not a fix.
             if (diag_park) {
                 self.diag_registered = true;
                 diagRegister(self);
-                rekick_handle = try io.concurrent(diagRekickWatchdog, .{self});
             }
         } else {
             read_pump = .{
@@ -2598,8 +2506,8 @@ const Connection = struct {
         }
 
         // Leftover TLS plaintext (a pipelined preface) was ingested during
-        // handshake. Emit after TlsPump is live so queueWire cannot park on
-        // a work queue CipherRead already filled.
+        // handshake. Emit after TlsPump is live so queueWire has a consumer
+        // for the channel.
         {
             self.lockSessionUncancelable(io);
             defer self.unlockSession(io);
@@ -2822,8 +2730,8 @@ const Connection = struct {
 
     /// Handshake TLS on the actor, then ingest leftover plaintext (a client
     /// that pipelines the h2 preface into the handshake flight). TlsPump is
-    /// not running yet, so this is the sole SSL_read. `CipherRead` is already
-    /// the ciphertext source.
+    /// not running yet, so this is the sole SSL_read; the handshake subtask
+    /// is the sole socket reader for its lifetime.
     fn handshakeTls(self: *Connection) !void {
         const io = self.config.io;
         const tls_conn = self.tls orelse return error.InvalidConfig;
@@ -2836,24 +2744,17 @@ const Connection = struct {
             timer: std.Io.Cancelable!void,
         };
         const Handshake = struct {
-            fn run(
-                conn: *tls_edge.Conn,
-                inner_io: std.Io,
-                work: *std.Io.Queue(tls_edge.PumpWork),
-                cipher_free: *std.Io.Queue(u32),
-            ) anyerror!void {
-                try conn.handshake(inner_io, work, cipher_free);
+            fn run(conn: *tls_edge.Conn, inner_io: std.Io) anyerror!void {
+                // The subtask reads the socket itself (feedFromSocket); the
+                // reader is bound on the subtask so the wait context is its
+                // own.
+                try conn.handshake(inner_io);
             }
         };
         var result_buf: [2]Hs = undefined;
         var select = std.Io.Select(Hs).init(io, &result_buf);
         errdefer select.cancelDiscard();
-        try select.concurrent(.hs, Handshake.run, .{
-            tls_conn,
-            io,
-            &self.tls_work_ch,
-            &self.tls_cipher_free_ch,
-        });
+        try select.concurrent(.hs, Handshake.run, .{ tls_conn, io });
         const timeout: std.Io.Timeout = .{ .deadline = .{
             .raw = self.handshake_deadline.?,
             .clock = .awake,
@@ -2895,8 +2796,8 @@ const Connection = struct {
             defer self.unlockSession(self.config.io);
             try self.session.ingest(buf[0..n]);
             // Do not processIntents/queueWire here: TlsPump is not running
-            // yet. CipherRead can fill tls_work_ch, and a blocking putOne
-            // would wait forever. Ingest only; emit after the pump starts.
+            // yet, so a blocking channel send has no consumer and would
+            // wait forever. Ingest only; emit after the driver starts.
             if (self.session.terminal != .none) return error.ConnectionClosed;
         }
     }
@@ -3177,6 +3078,11 @@ const Connection = struct {
         // write_ch after WritePump has already exited. Cancel does not always
         // reach that wait; close does.
         self.write_ch.close(self.config.io);
+        if (self.tls_write_buf.len != 0) {
+            // Same for a handler parked in a channel send. Graceful: the
+            // driver (or deinit) releases buffered chunks exactly once.
+            self.tls_write_ch.close(.graceful);
+        }
 
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) continue;
@@ -3998,21 +3904,29 @@ const Connection = struct {
     /// Hand a chunk to WritePump. Never parks the actor once the connection is
     /// going away: tryPut, shut the socket to unstick a blocked write, retry
     /// once, then fail. A healthy connection still `putOne`s for backpressure.
-    fn notifyTlsPump(self: *Connection) void {
-        if (self.config.mode != .tls_h2) return;
-        self.tls_pump_dirty.store(true, .release);
-        self.tls_pump_wake.set(self.config.io);
-    }
-
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
+        if (self.config.mode == .tls_h2) {
+            // The channel wakes the CQ driver's select by itself; there is
+            // no side-band notify. Same going-away semantics as h2c: never
+            // park once the connection is going away.
+            if (self.writeGoingAway()) {
+                self.tls_write_ch.trySend(chunk) catch {
+                    self.stream.shutdown(self.config.io, .both) catch {};
+                    self.tls_write_ch.trySend(chunk) catch return error.WriteFailed;
+                };
+                return;
+            }
+            self.actor_site.store(4, .release);
+            self.tls_write_ch.send(chunk) catch return error.WriteFailed;
+            self.actor_site.store(1, .release);
+            return;
+        }
         if (self.writeGoingAway()) {
             if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
-                self.notifyTlsPump();
                 return;
             }
             self.stream.shutdown(self.config.io, .both) catch {};
             if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
-                self.notifyTlsPump();
                 return;
             }
             return error.WriteFailed;
@@ -4020,7 +3934,6 @@ const Connection = struct {
         self.actor_site.store(4, .release);
         self.write_ch.putOne(self.config.io, chunk) catch return error.WriteFailed;
         self.actor_site.store(1, .release);
-        self.notifyTlsPump();
     }
 
     fn rentFrame(self: *Connection, n: usize) ?[]u8 {

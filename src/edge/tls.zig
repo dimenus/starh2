@@ -1,24 +1,33 @@
 //! TLS via memory BIOs. HTTP/2 never sees ciphertext.
 //!
-//! The SSL object has exactly one owner (`Pump`). Its BIOs are a bounded
-//! `BIO_new_bio_pair`, not socket-coupled callbacks: ciphertext bytes move
-//! through a queue, not through a readiness edge. A dedicated `CipherRead`
-//! task does blocking zio socket reads and posts chunks to the cipher
-//! queue. Outbound frames use `write_ch`. The pump `tryGet`s both, then
-//! waits on `wake` — no `std.Io.Select`. CipherRead and the actor store a
-//! dirty flag before `wake.set`; the pump swaps it after `reset`. An event
-//! edge does not survive reset; the flag does. It must service both sides every
-//! turn: writes-only would starve oneshot HEADERS under live SSE, and a
-//! `continue` past a blocked cipher ingest would skip SETTINGS still on
-//! `write_ch` while the actor is parked on `putOne`.
+//! The SSL object has exactly one owner (`Pump`, the CQ driver). Its BIOs are
+//! a bounded `BIO_new_bio_pair`, not socket-coupled callbacks.
 //!
-//! Socket writes stay on the pump. A third write task would add a hop on the
-//! SSE event path (handler → scheduler → pump SSL_write → socket), which the
-//! brief forbids. nats.zig's two-task count is the reference; BoringSSL cannot
-//! split the cipher, so the pump owns both directions of SSL and the socket
-//! write, matching h2c's task count (read + write).
+//! The pump is a `zio.CompletionQueue` driver. The socket read is a raw
+//! `ev.NetRecv` completion the driver submits and re-submits after each
+//! arrival; there is no separate read task. Outbound frames arrive on a
+//! `zio.Channel(WireChunk)`. The idle wait is one
+//! `select(.{ .io = &cq, .write = write_ch.asyncReceive() })` — the CQ
+//! implements the future protocol. There is no wake Event, no dirty flag, no
+//! reset-then-recheck list: the lost-wake class of the old protocol is
+//! unsayable here, because nothing is ever reset.
+//!
+//! The driver must service both directions every turn: writes-only would
+//! starve oneshot HEADERS under live SSE, and skipping a blocked cipher
+//! ingest must not skip SETTINGS still on the write channel.
+//!
+//! Socket writes stay on the driver. A third write task would add a hop on
+//! the SSE event path (handler → scheduler → driver SSL_write → socket).
+//! BoringSSL cannot split the cipher, so the driver owns both directions of
+//! SSL and the socket write.
+//!
+//! This file takes a DIRECT zio dependency (the CQ, the channel, the raw
+//! completion). That is deliberate and open: an interface over the CQ would
+//! be two implementations of one contract. The std.Io purity of src/edge
+//! ends here; the h2c pumps remain std.Io-pure.
 const std = @import("std");
 const boring = @import("boring");
+const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
 const wire_pump = @import("wire_pump.zig");
@@ -34,7 +43,9 @@ pub const observe = @import("build_options").observe;
 ///
 /// `select` / `select_write` / `select_peek` stay in the schema so a
 /// memory-BIO build that still Selects is visible: they must collapse to
-/// zero. Bump sites for those three are gone.
+/// zero. Bump sites for those three are gone. `dirty_skip_wait` joins them
+/// with the CQ driver: the dirty-flag protocol is deleted, so a non-zero
+/// value would mean the old wake machinery came back.
 pub const pump_trace = struct {
     pub var turns: std.atomic.Value(u64) = .init(0);
     pub var select: std.atomic.Value(u64) = .init(0);
@@ -223,34 +234,16 @@ fn loadCertificateChain(builder: *boring.ssl.ContextBuilder, pem: []const u8) !v
     }
 }
 
-/// Ciphertext chunk posted by `CipherRead`. The slice is a view into the
-/// connection's cipher pool; ownership of `pool_index` moves with the item.
-pub const CipherChunk = struct {
-    bytes: []u8 = &.{},
-    len: usize = 0,
-    pool_index: u32 = 0,
-};
-
-/// Cipher-queue item. `CipherRead` posts `.cipher` / `.eof`. Outbound
-/// frames go on `write_ch`, not here: a unified FIFO HOL-blocked writes
-/// behind inbound (oneshot-only rps=0). `.wire` remains so fail-drain
-/// and tests can still name the variant.
-pub const PumpWork = union(enum) {
-    cipher: CipherChunk,
-    wire: wire_pump.WireChunk,
-    eof,
-};
-
 /// Per-connection TLS stream. Heap-allocated and never moved.
 ///
-/// Production: `CipherRead` is the sole socket reader; `Pump` is the sole
-/// SSL owner and the sole socket writer. The client loopback path uses both
-/// directions on one task.
+/// Production: the server handshake reads the socket on the handshake
+/// subtask (`feedFromSocket`); after it, `Pump` (the CQ driver) is the sole
+/// socket reader (via its `ev.NetRecv` completion), the sole SSL owner, and
+/// the sole socket writer. The client loopback path uses both directions on
+/// one task.
 ///
-/// Do not build a `Reader` on the actor. A Reader constructed there
-/// registers EVFILT_READ on the actor's wait context; Darwin kqueue EV_CLEAR
-/// then starves `CipherRead` (the ClientHello never arrives, handshake
-/// times out). Bind reader/writer on the task that will park on them.
+/// Bind reader/writer on the task that will park on them: a Reader built on
+/// one task is not another task's wait context.
 pub const Conn = struct {
     tcp_stream: std.Io.net.Stream = undefined,
     tcp_reader: std.Io.net.Stream.Reader = undefined,
@@ -273,7 +266,7 @@ pub const Conn = struct {
     }
 
     /// Client loopback: this task is the ciphertext source. Production
-    /// never calls this — `CipherRead` owns the reader.
+    /// never calls this — the CQ driver reads the raw socket.
     pub fn bindIo(self: *Conn, io: std.Io) void {
         self.bindReader(io);
         self.bindWriter(io);
@@ -316,15 +309,16 @@ pub const Conn = struct {
         try self.attachSsl(ssl);
     }
 
-    /// Server handshake. Ciphertext comes from `work` (the read task is
-    /// already running). Recycles cipher indices onto `cipher_free`.
-    pub fn handshake(
-        self: *Conn,
-        io: std.Io,
-        work: *std.Io.Queue(PumpWork),
-        cipher_free: *std.Io.Queue(u32),
-    ) !void {
+    /// Server handshake. This task reads the socket directly
+    /// (`feedFromSocket`); no read task exists yet. The reader is UNBUFFERED
+    /// on purpose: after the handshake the CQ driver reads the raw socket,
+    /// so a buffered Reader here could strand prefetched ciphertext in a
+    /// buffer nothing drains again. Ciphertext beyond the handshake (a
+    /// pipelined preface) lands in the BIO pair and is SSL_read by
+    /// `drainTlsLeftover` on the actor, as before.
+    pub fn handshake(self: *Conn, io: std.Io) !void {
         std.debug.assert(self.state == .tls);
+        self.tcp_reader = self.tcp_stream.reader(io, &.{});
         self.bindWriter(io);
         var iterations: u32 = 0;
         while (!self.ssl.isHandshakeComplete()) {
@@ -337,15 +331,7 @@ pub const Conn = struct {
                     // Drain it before parking or the peer never replies.
                     self.drainToSocket() catch return error.TlsHandshakeFailed;
                     if (self.ssl.isHandshakeComplete()) break;
-                    const item = work.getOne(io) catch return error.TlsHandshakeFailed;
-                    switch (item) {
-                        .cipher => |chunk| {
-                            defer recycleCipher(io, cipher_free, chunk.pool_index);
-                            self.feedCipher(chunk.bytes[0..chunk.len]) catch
-                                return error.TlsHandshakeFailed;
-                        },
-                        .eof, .wire => return error.TlsHandshakeFailed,
-                    }
+                    self.feedFromSocket() catch return error.TlsHandshakeFailed;
                 },
                 error.WantWrite => {},
                 else => return error.TlsHandshakeFailed,
@@ -485,29 +471,6 @@ pub const Conn = struct {
         self.tcp_writer.interface.flush() catch return error.TlsWriteFailed;
     }
 
-    fn feedCipher(self: *Conn, bytes: []const u8) !void {
-        var off: usize = 0;
-        var spins: u32 = 0;
-        while (off < bytes.len) {
-            spins += 1;
-            if (spins > MaxHandshakeIterations) return error.TlsHandshakeFailed;
-            const n = self.pair.writeEncrypted(bytes[off..]) catch |err| switch (err) {
-                error.WantWrite => {
-                    // Pair full of inbound ciphertext SSL has not consumed.
-                    self.ssl.doHandshake() catch |hs_err| switch (hs_err) {
-                        error.WantRead, error.WantWrite => {},
-                        else => return error.TlsHandshakeFailed,
-                    };
-                    self.drainToSocket() catch return error.TlsHandshakeFailed;
-                    continue;
-                },
-                else => return error.TlsHandshakeFailed,
-            };
-            if (n == 0) return error.TlsHandshakeFailed;
-            off += n;
-        }
-    }
-
     fn feedFromSocket(self: *Conn) !void {
         var dest_buf: [stream_buffer_size]u8 = undefined;
         var dest: [1][]u8 = .{&dest_buf};
@@ -528,117 +491,36 @@ pub const Conn = struct {
     }
 };
 
-fn recycleCipher(io: std.Io, free: *std.Io.Queue(u32), idx: u32) void {
-    free.putOneUncancelable(io, idx) catch {
-        // Queue closure means connection teardown owns the backing pool.
-    };
-}
-
-/// Blocking socket reader. Never touches the SSL object.
-///
-/// Parks on the cipher free list, then on a zio stream read, then on the
-/// work queue put. Backpressure is the free list emptying — same shape as
-/// h2c `ReadPump`. The stream reader is created on this task: a Reader
-/// built on the actor is not the read-task's wait context.
-pub const CipherRead = struct {
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    work: *std.Io.Queue(PumpWork),
-    wake: *std.Io.Event,
-    /// Survives `wake.reset()`. CipherRead and the actor store true after
-    /// publishing to `work` / `write_ch`, then `set`. The pump swaps it after
-    /// reset; a true skip-wait is the lost-wakeup that mixed oneshot hit
-    /// when the event edge was eaten with a chunk already queued.
-    dirty: *std.atomic.Value(bool),
-    chunk_storage: []u8,
-    n_chunks: u32,
-    free_indices: *std.Io.Queue(u32),
-    stopped: std.atomic.Value(bool) = .init(false),
-    /// Diag: 0=not started, 1=running, 2=waiting for a free index,
-    /// 3=in the socket read, 4=posting to the work queue, 5=exited.
-    site: ?*std.atomic.Value(u8) = null,
-    task_h: ?*std.atomic.Value(usize) = null,
-    task_handle_fn: ?*const fn () usize = null,
-
-    fn diagSite(self: *CipherRead, v: u8) void {
-        if (self.site) |a| a.store(v, .release);
-    }
-
-    fn returnIndex(self: *CipherRead, idx: u32) void {
-        recycleCipher(self.io, self.free_indices, idx);
-    }
-
-    fn postEof(self: *CipherRead) void {
-        self.work.putOneUncancelable(self.io, .eof) catch {
-            // A closed work queue means the connection is already tearing down.
-        };
-        self.dirty.store(true, .release);
-        self.wake.set(self.io);
-    }
-
-    pub fn run(self: *CipherRead) void {
-        if (self.task_handle_fn) |f| {
-            if (self.task_h) |h| h.store(f(), .release);
-        }
-        defer self.diagSite(5);
-        var reader = self.stream.reader(self.io, &.{});
-        while (!self.stopped.load(.acquire)) {
-            self.diagSite(2);
-            const idx = self.free_indices.getOne(self.io) catch return;
-            const off = @as(usize, idx) * cipher_chunk_size;
-            const buf = self.chunk_storage[off..][0..cipher_chunk_size];
-            var dest: [1][]u8 = .{buf};
-            self.diagSite(3);
-            const n = reader.interface.readVec(&dest) catch {
-                self.returnIndex(idx);
-                self.stream.shutdown(self.io, .send) catch {};
-                self.postEof();
-                return;
-            };
-            if (n == 0) {
-                self.returnIndex(idx);
-                self.stream.shutdown(self.io, .send) catch {};
-                self.postEof();
-                return;
-            }
-            self.diagSite(4);
-            self.work.putOne(self.io, .{ .cipher = .{
-                .bytes = buf,
-                .len = n,
-                .pool_index = idx,
-            } }) catch {
-                self.returnIndex(idx);
-                return;
-            };
-            self.dirty.store(true, .release);
-            self.wake.set(self.io);
-            self.diagSite(1);
-        }
-    }
-
-    pub fn stop(self: *CipherRead) void {
-        self.stopped.store(true, .release);
-    }
-};
-
 /// One task owns SSL_read and SSL_write. Concurrent pumps on one SSL object
 /// are a data race; this is the share-nothing owner.
 ///
-/// Ciphertext and wire use separate queues so inbound cannot HOL-block a
-/// complete-handler write. The wait is `wake.wait` after tryGet on both
-/// (no Select). Socket writes stay on the pump so the SSE event path does
-/// not gain a hop.
+/// The pump is a `zio.CompletionQueue` driver. Inbound ciphertext is a raw
+/// `ev.NetRecv` completion into ONE read buffer, re-submitted only when the
+/// buffer is fully fed into the BIO pair (the pair's bound plus this buffer
+/// is the inbound backpressure). Outbound frames arrive on a
+/// `zio.Channel(WireChunk)`. The idle wait is one select over both; nothing
+/// is reset, so no publish can be missed. Socket writes stay on the driver
+/// so the SSE event path does not gain a hop.
+///
+/// Ownership: the recv completion lives in this struct and is submitted
+/// only by the driver itself, so it never needs the heap. No other task
+/// submits to the CQ (the actor uses the channel), which is what makes
+/// shutdown a local `close` + `cancelAll(.keep)` + drain in `shutdownCq`.
 pub const Pump = struct {
     io: std.Io,
     conn: *Conn,
     to_actor: *std.Io.Queue(wire_pump.WireChunk),
-    from_actor: *std.Io.Queue(wire_pump.WireChunk),
-    work: *std.Io.Queue(PumpWork),
-    wake: *std.Io.Event,
-    /// Same cell CipherRead and `pushWriteChunk` store. Swap after `wake.reset`.
-    dirty: *std.atomic.Value(bool),
+    /// Outbound frames from the actor. The channel wakes the driver's
+    /// select by itself; there is no side-band wake protocol.
+    write_ch: *zio.Channel(wire_pump.WireChunk),
+    /// Raw socket handle for the driver's `ev.NetRecv` completion.
+    sock: zio.ev.Backend.NetHandle,
+    /// The driver's single ciphertext read buffer (replaces the cipher
+    /// chunk pool). `pending_cipher` aliases its tail while a suffix is
+    /// still unconsumed, and the recv op is only re-armed once it is free.
+    recv_buf: []u8,
     /// Diag: where this pump currently is. 0=not started, 1=running,
-    /// 2=wake.wait, 3=writeChunks, 4=cipher ingest, 5=exited. The actor's
+    /// 2=select wait, 3=writeChunks, 4=cipher ingest, 5=exited. The actor's
     /// park snapshot prints it, so a wedge names the pump's blocking site
     /// without a coroutine stack.
     site: *std.atomic.Value(u8),
@@ -655,7 +537,6 @@ pub const Pump = struct {
     n_chunks: u32,
     read_free: *std.Io.Queue(u32),
     write_free: ?*std.Io.Queue(u32) = null,
-    cipher_free: *std.Io.Queue(u32),
     live_task_handlers: *std.atomic.Value(usize),
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
@@ -668,10 +549,17 @@ pub const Pump = struct {
     /// Plaintext already SSL_read, waiting for a read_ch slot. Must not drop:
     /// the cipher has advanced.
     pending_read: ?wire_pump.WireChunk = null,
-    /// Ciphertext dequeued but not fully BIO_write'd, because inbound was
-    /// full and `pending_read` blocked SSL_read. Off the work queue so a
-    /// `.wire` behind it can unblock the actor.
-    pending_cipher: ?CipherChunk = null,
+    /// Unconsumed suffix of `recv_buf`, stashed when the BIO pair was full
+    /// and `pending_read` blocked SSL_read. The recv op is not re-armed
+    /// while this is set, so the bytes cannot be overwritten.
+    pending_cipher: ?[]const u8 = null,
+    /// Driver-owned CQ state. Wired in `run()` at the struct's final
+    /// address, never in an init that returns by value (init-move hazard:
+    /// the ReadBuf points into `recv_iov`).
+    cq: zio.CompletionQueue = undefined,
+    recv_op: zio.ev.NetRecv = undefined,
+    recv_iov: [1]zio.os.iovec = undefined,
+    recv_armed: bool = false,
 
     fn post(self: *Pump, c: wire_pump.WriteCompletion) void {
         self.completions.putOneUncancelable(self.io, c) catch {};
@@ -750,21 +638,10 @@ pub const Pump = struct {
                 self.gpa.free(chunk.bytes);
             }
         }
-        if (self.pending_cipher) |chunk| {
-            self.pending_cipher = null;
-            recycleCipher(self.io, self.cipher_free, chunk.pool_index);
-        }
-        while (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
-            switch (item) {
-                .wire => |chunk| {
-                    if (isSentinel(chunk)) continue;
-                    self.releaseChunk(chunk, false, false);
-                },
-                .cipher => |chunk| recycleCipher(self.io, self.cipher_free, chunk.pool_index),
-                .eof => {},
-            }
-        }
-        while (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
+        // The stashed suffix aliases recv_buf; nothing to release.
+        self.pending_cipher = null;
+        while (true) {
+            const chunk = self.write_ch.tryReceive() catch break;
             if (isSentinel(chunk)) continue;
             self.releaseChunk(chunk, false, false);
         }
@@ -827,11 +704,15 @@ pub const Pump = struct {
         return .done;
     }
 
+    fn tryTakeWrite(self: *Pump) ?wire_pump.WireChunk {
+        const chunk = self.write_ch.tryReceive() catch return null;
+        pump_trace.bump(&pump_trace.tryget_write);
+        return chunk;
+    }
+
     fn stealWrite(self: *Pump) void {
         if (self.carried != null) return;
-        const chunk = io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io) orelse return;
-        pump_trace.bump(&pump_trace.tryget_write);
-        self.carried = chunk;
+        self.carried = self.tryTakeWrite();
     }
 
     fn sslWriteAll(self: *Pump, bytes: []const u8) bool {
@@ -882,47 +763,24 @@ pub const Pump = struct {
         return true;
     }
 
-    /// SSL_write wanted inbound records. Cipher queue only. Never park on
-    /// `getOne`: the actor may be in `write_ch.putOne` and CipherRead may need
-    /// this executor. A miss yields; `sslWriteAll` retries until a chunk
-    /// arrives or MaxHandshakeIterations failDrains.
+    /// SSL_write wanted inbound records. Never park here: the actor may be
+    /// in a channel send. A miss yields; `sslWriteAll` retries until bytes
+    /// arrive or MaxHandshakeIterations failDrains. Never SSL_write here
+    /// (OpenSSL rejects a different buffer until the current SSL_write
+    /// retries) — ingest only.
     fn consumeInbound(self: *Pump) bool {
-        if (self.pending_cipher) |chunk| {
+        if (self.pending_cipher) |bytes| {
             self.pending_cipher = null;
-            return self.ingestCipher(chunk);
+            return self.ingestCipher(bytes);
         }
-        if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
-            pump_trace.bump(&pump_trace.work_get);
-            return self.ingestWork(item);
+        switch (self.pollRecv()) {
+            .progress => return true,
+            .exit => return false,
+            .none => {},
         }
         self.stealWrite();
         self.io.sleep(.zero, .awake) catch {};
         return true;
-    }
-
-    /// Cipher-queue item while SSL_write wants a record. Never SSL_write here
-    /// (OpenSSL rejects a different buffer until the current SSL_write retries).
-    fn ingestWork(self: *Pump, item: PumpWork) bool {
-        switch (item) {
-            .cipher => |chunk| return self.ingestCipher(chunk),
-            .wire => |chunk| {
-                pump_trace.bump(&pump_trace.tryget_write);
-                if (self.carried == null) {
-                    self.carried = chunk;
-                    return true;
-                }
-                self.releaseChunk(chunk, false, false);
-                self.failDrain();
-                self.post(.{ .shutdown = true });
-                return false;
-            },
-            .eof => {
-                self.failDrain();
-                self.postEof();
-                self.post(.{ .shutdown = true });
-                return false;
-            },
-        }
     }
 
     fn writeChunks(self: *Pump, first: wire_pump.WireChunk) bool {
@@ -949,7 +807,7 @@ pub const Pump = struct {
         if (self.test_delay_ms == 0 and self.test_fail_after == 0) {
             while (count < max_batch) {
                 if (self.pending_cipher != null) break;
-                const next = io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io) orelse break;
+                const next = self.tryTakeWrite() orelse break;
                 if (next.len == 0 and next.bytes.len == 0) {
                     self.carried = next;
                     break;
@@ -1066,35 +924,93 @@ pub const Pump = struct {
         return .ok;
     }
 
-    fn ingestCipher(self: *Pump, chunk: CipherChunk) bool {
+    fn ingestCipher(self: *Pump, bytes: []const u8) bool {
         pump_trace.bump(&pump_trace.cipher_chunks);
-        const all = chunk.bytes[0..chunk.len];
         var consumed: usize = 0;
-        switch (self.feedCipher(all, &consumed)) {
-            .eof => {
-                recycleCipher(self.io, self.cipher_free, chunk.pool_index);
-                return false;
-            },
+        switch (self.feedCipher(bytes, &consumed)) {
+            .eof => return false,
             .blocked => {
-                if (consumed == all.len) {
-                    recycleCipher(self.io, self.cipher_free, chunk.pool_index);
+                if (consumed < bytes.len) {
+                    std.debug.assert(self.pending_cipher == null);
+                    self.pending_cipher = bytes[consumed..];
                     return true;
                 }
-                std.debug.assert(self.pending_cipher == null);
-                self.pending_cipher = .{
-                    .bytes = chunk.bytes[consumed..],
-                    .len = all.len - consumed,
-                    .pool_index = chunk.pool_index,
-                };
-                return true;
+                // Fully in the pair; the read buffer is free again, but
+                // inbound cannot advance right now — re-arm only.
+                return self.rearmRecv();
             },
-            .done => recycleCipher(self.io, self.cipher_free, chunk.pool_index),
+            .done => {},
         }
+        if (!self.rearmRecv()) return false;
         if (self.pending_read != null) return true;
         switch (self.readOne()) {
             .eof => return false,
             .ok, .want, .stuck => return true,
         }
+    }
+
+    /// (Re)submit the socket read once `recv_buf` is free. False only when
+    /// the CQ is already closed (local shutdown owns the exit).
+    fn rearmRecv(self: *Pump) bool {
+        if (self.recv_armed) return true;
+        std.debug.assert(self.pending_cipher == null);
+        self.cq.submit(&self.recv_op.c) catch |err| switch (err) {
+            error.Closed => return false,
+            // The op is ours alone: never grouped, never rearm-flagged.
+            error.InvalidCompletion => unreachable,
+        };
+        self.recv_armed = true;
+        return true;
+    }
+
+    const RecvPoll = enum { none, progress, exit };
+
+    /// Take one completed recv off the CQ without blocking.
+    fn pollRecv(self: *Pump) RecvPoll {
+        const c = self.cq.next() orelse return .none;
+        std.debug.assert(c == &self.recv_op.c);
+        return switch (self.onRecvComplete()) {
+            .ok => .progress,
+            .exit => .exit,
+        };
+    }
+
+    const RecvOutcome = enum { ok, exit };
+
+    /// The recv completion fired: ingest the bytes and re-arm, or report
+    /// EOF / error to the actor exactly like the old read task did.
+    fn onRecvComplete(self: *Pump) RecvOutcome {
+        self.recv_armed = false;
+        pump_trace.bump(&pump_trace.work_get);
+        const n = self.recv_op.getResult() catch |err| switch (err) {
+            // Only shutdownCq cancels the op; teardown owns the exit.
+            error.Canceled => return .exit,
+            else => {
+                self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+                self.failDrain();
+                self.postEof();
+                self.post(.{ .shutdown = true });
+                return .exit;
+            },
+        };
+        if (n == 0) {
+            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            self.failDrain();
+            self.postEof();
+            self.post(.{ .shutdown = true });
+            return .exit;
+        }
+        if (!self.ingestCipher(self.recv_buf[0..n])) return .exit;
+        return .ok;
+    }
+
+    /// Local CQ shutdown: close, cancel the recv op with its result kept,
+    /// and drain. The op lives in this struct, so there is nothing to free;
+    /// the drain is what guarantees the loop no longer touches it.
+    fn shutdownCq(self: *Pump) void {
+        self.cq.close();
+        self.cq.cancelAll(.keep);
+        while (self.cq.next()) |_| {}
     }
 
     pub fn run(self: *Pump) void {
@@ -1105,6 +1021,19 @@ pub const Pump = struct {
             if (self.task_h) |h| h.store(f(), .release);
         }
         defer self.site.store(5, .release);
+        // The CQ and the recv op are wired HERE, at the struct's final
+        // address. The recv ReadBuf points into `recv_iov`, so building it
+        // in an init that returns by value would dangle (init-move hazard).
+        self.cq = zio.CompletionQueue.init();
+        defer self.shutdownCq();
+        self.recv_op = zio.ev.NetRecv.init(
+            self.sock,
+            zio.ev.ReadBuf.fromSlice(self.recv_buf, &self.recv_iov),
+            .{},
+        );
+        self.recv_armed = false;
+        if (!self.rearmRecv()) return;
+
         while (!self.stopped.load(.acquire)) {
             self.site.store(1, .release);
             pump_trace.bump(&pump_trace.turns);
@@ -1127,13 +1056,13 @@ pub const Pump = struct {
             }
 
             // Ingest cipher only when SSL_read can store plaintext. Otherwise
-            // fall through and take writes: the actor may be parked on putOne
-            // of the SETTINGS that unstick the client.
+            // fall through and take writes: the actor may be parked on the
+            // channel send of the SETTINGS that unstick the client.
             if (self.pending_cipher != null and self.pending_read == null) {
-                const chunk = self.pending_cipher.?;
+                const bytes = self.pending_cipher.?;
                 self.pending_cipher = null;
                 self.site.store(4, .release);
-                if (!self.ingestCipher(chunk)) return;
+                if (!self.ingestCipher(bytes)) return;
                 self.site.store(1, .release);
                 progress = true;
             }
@@ -1151,41 +1080,28 @@ pub const Pump = struct {
                 }
             }
 
-            if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
-                pump_trace.bump(&pump_trace.tryget_write);
+            if (self.tryTakeWrite()) |chunk| {
                 self.site.store(3, .release);
                 if (!self.writeChunks(chunk)) return;
                 self.site.store(1, .release);
                 progress = true;
             }
             if (self.pending_cipher == null) {
-                if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
-                    pump_trace.bump(&pump_trace.work_get);
-                    self.site.store(4, .release);
-                    if (!self.dispatch(item)) return;
-                    self.site.store(1, .release);
-                    progress = true;
+                switch (self.pollRecv()) {
+                    .progress => {
+                        self.site.store(1, .release);
+                        progress = true;
+                    },
+                    .exit => return,
+                    .none => {},
                 }
             }
 
             if (progress) continue;
 
-            self.wake.reset();
-            if (io_queue.tryGet(wire_pump.WireChunk, self.from_actor, self.io)) |chunk| {
-                pump_trace.bump(&pump_trace.tryget_write);
-                self.site.store(3, .release);
-                if (!self.writeChunks(chunk)) return;
-                continue;
-            }
-            if (self.pending_cipher == null) {
-                if (io_queue.tryGet(PumpWork, self.work, self.io)) |item| {
-                    pump_trace.bump(&pump_trace.work_get);
-                    self.site.store(4, .release);
-                    if (!self.dispatch(item)) return;
-                    self.site.store(1, .release);
-                    continue;
-                }
-            }
+            // No reset, no dirty flag, no recheck list: the CQ and the
+            // channel are the only producers, and both implement the future
+            // protocol, so the select below cannot miss a publish.
             if (self.pending_read != null or self.pending_cipher != null) {
                 pump_trace.bump(&pump_trace.pending_read_retry);
                 self.site.store(10, .release);
@@ -1193,7 +1109,8 @@ pub const Pump = struct {
                 self.site.store(1, .release);
                 continue;
             }
-            if (self.pending_read == null and self.conn.pendingInbound()) {
+            // The park invariant (t-866): never wait while pendingInbound().
+            if (self.conn.pendingInbound()) {
                 switch (self.readOne()) {
                     .eof => return,
                     .ok => continue,
@@ -1204,82 +1121,77 @@ pub const Pump = struct {
                         continue;
                     },
                     // A partial record: only new socket bytes can complete
-                    // it, and CipherRead wakes this pump when they arrive.
+                    // it, and the armed recv completion delivers them.
                     // Parking here is correct and cannot strand a request.
                     .want => {},
                 }
             }
-            if (self.dirtyForbidsWait()) continue;
+            // A parked select must have the recv in flight, or the channel
+            // would be the only wake source and inbound would strand.
+            std.debug.assert(self.recv_armed);
             if (diag_wait) self.traceWaitSnapshot();
             self.site.store(2, .release);
-            defer self.site.store(1, .release);
-            self.wake.wait(self.io) catch {
+            const winner = zio.select(.{
+                .io = &self.cq,
+                .write = self.write_ch.asyncReceive(),
+            }) catch {
+                // Canceled while parked: the actor's backstop cancel.
+                self.site.store(1, .release);
                 self.failDrain();
                 self.post(.{ .fail_all = true, .shutdown = true });
                 return;
             };
+            self.site.store(1, .release);
+            switch (winner) {
+                .io => |r| {
+                    // error.Closed only after shutdownCq closed it locally.
+                    const c = r catch return;
+                    std.debug.assert(c == &self.recv_op.c);
+                    if (self.onRecvComplete() == .exit) return;
+                },
+                .write => |r| {
+                    const chunk = r catch {
+                        // The actor closed the channel: teardown.
+                        self.failDrain();
+                        self.post(.{ .shutdown = true });
+                        return;
+                    };
+                    pump_trace.bump(&pump_trace.tryget_write);
+                    self.site.store(3, .release);
+                    if (!self.writeChunks(chunk)) return;
+                },
+            }
         }
         _ = self.drainToSocket();
         self.failDrain();
         self.post(.{ .shutdown = true });
     }
 
-    fn dispatch(self: *Pump, item: PumpWork) bool {
-        switch (item) {
-            .cipher => |chunk| return self.ingestCipher(chunk),
-            .wire => |chunk| {
-                pump_trace.bump(&pump_trace.tryget_write);
-                return self.writeChunks(chunk);
-            },
-            .eof => {
-                self.failDrain();
-                self.postEof();
-                self.post(.{ .shutdown = true });
-                return false;
-            },
-        }
-    }
-
     pub fn stop(self: *Pump) void {
         self.stopped.store(true, .release);
-    }
-
-    /// After `wake.reset` and empty tryGets. A producer stores this before
-    /// `set`; the event edge does not survive reset, the flag does.
-    fn dirtyForbidsWait(self: *Pump) bool {
-        if (self.dirty.swap(false, .acq_rel)) {
-            pump_trace.bump(&pump_trace.dirty_skip_wait);
-            return true;
-        }
-        return false;
     }
 
     fn traceWaitSnapshot(self: *Pump) void {
         const now = nowNs(self.io);
         if (now -% diag_last_wait_ns < std.time.ns_per_s) return;
         diag_last_wait_ns = now;
-        const write_q = io_queue.queued(wire_pump.WireChunk, self.from_actor, self.io);
-        const work_q = io_queue.queued(PumpWork, self.work, self.io);
         const read_q = io_queue.queued(wire_pump.WireChunk, self.to_actor, self.io);
         const read_free_q = io_queue.queued(u32, self.read_free, self.io);
-        const cipher_free_q = io_queue.queued(u32, self.cipher_free, self.io);
         const write_free_q: usize = if (self.write_free) |q| io_queue.queued(u32, q, self.io) else 0;
         rawPrint(
-            "STARH2_PUMPWAIT write_q={d} work_q={d} read_q={d} read_free={d} write_free={d} cipher_free={d} carried={} pending_read={} pending_cipher={} plaintext={d} bio_in={d} bio_out={d} wake={s}\n",
+            "STARH2_PUMPWAIT write_empty={} read_q={d} read_free={d} write_free={d} carried={} pending_read={} pending_cipher={} recv_armed={} plaintext={d} bio_in={d} bio_out={d}\n",
             .{
-                write_q,
-                work_q,
+                self.write_ch.isEmpty(),
                 read_q,
                 read_free_q,
                 write_free_q,
-                cipher_free_q,
                 self.carried != null,
                 self.pending_read != null,
                 self.pending_cipher != null,
+                self.recv_armed,
                 self.conn.pendingPlaintext(),
                 self.conn.pendingInboundCiphertext(),
                 self.conn.pendingOutboundCiphertext(),
-                @tagName(self.wake.*),
             },
         );
     }
@@ -1287,21 +1199,6 @@ pub const Pump = struct {
 
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
-}
-
-test "TlsPump dirty flag survives Event.reset and forbids wait" {
-    var dirty = std.atomic.Value(bool).init(false);
-    var wake: std.Io.Event = .unset;
-    const io = std.testing.io;
-    dirty.store(true, .release);
-    wake.set(io);
-    wake.reset();
-    try std.testing.expect(!wake.isSet());
-
-    var pump: Pump = undefined;
-    pump.dirty = &dirty;
-    try std.testing.expect(pump.dirtyForbidsWait());
-    try std.testing.expect(!pump.dirtyForbidsWait());
 }
 
 /// Move ciphertext `from` one pair `to` the other until the source is dry
@@ -1434,6 +1331,3 @@ test "memory BIO pair is bounded and opposite directions do not mix" {
     try std.testing.expectError(error.WantRead, pair.readEncrypted(&buf));
 }
 
-test "PumpWork fits a queue slot and is not smaller than a WireChunk" {
-    try std.testing.expect(@sizeOf(PumpWork) >= @sizeOf(wire_pump.WireChunk));
-}

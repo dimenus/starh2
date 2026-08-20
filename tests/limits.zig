@@ -49,7 +49,6 @@ test "bound terms use concrete sizes and capacities" {
     try std.testing.expect(b.terms.certs > 0);
     try std.testing.expect(b.terms.tls_scratch > 0);
     try std.testing.expect(b.terms.tls_cipher_payload > 0);
-    try std.testing.expect(b.terms.tls_work_descs > 0);
     try std.testing.expect(b.terms.endpoints_listeners > 0);
     try std.testing.expect(b.terms.tasks > 0);
 
