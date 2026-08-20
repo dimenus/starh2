@@ -840,6 +840,10 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             starh2.edge.connection.diag_task_handle_fn = &zio.debugCurrentTaskHandle;
             starh2.edge.connection.diag_task_state_fn = &zio.debugTaskStateByte;
         }
+        if (comptime @hasDecl(zio, "debugTaskMark")) {
+            starh2.edge.connection.diag_task_mark_fn = &zio.debugTaskMark;
+            starh2.edge.connection.diag_stamp_now_fn = &zio.debugStampNow;
+        }
         // OS thread, outside the zio scheduler on purpose: near the wedge the
         // scheduler stops delivering wakes, so an in-runtime watchdog task is
         // itself a victim. This sweep re-drives a wedged pump futex directly.

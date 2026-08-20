@@ -259,6 +259,11 @@ pub const Conn = struct {
     tcp_writer_buffer: [stream_buffer_size]u8 = undefined,
     ssl: boring.ssl.Ssl = .{ .ptr = null },
     pair: boring.ssl.BioPair = .{ .ssl_bio = null, .transport_bio = null },
+    /// Alias of the SSL-side BIO so unread INBOUND ciphertext is countable
+    /// (BIO_ctrl_pending). Load-bearing: the pump's park condition depends
+    /// on it, because SSL_pending counts processed-record plaintext only and
+    /// is blind to whole unread records in the pair. Not owned; never deinit.
+    ssl_in_bio: boring.ssl.BioPair = .{ .ssl_bio = null, .transport_bio = null },
     state: enum { empty, tcp, tls } = .empty,
 
     pub fn initTcp(self: *Conn, stream: std.Io.net.Stream) void {
@@ -289,6 +294,7 @@ pub const Conn = struct {
         errdefer pair.deinit();
         const ssl_bio = pair.ssl_bio orelse return error.TlsHandshakeFailed;
         owned.setBio(ssl_bio);
+        self.ssl_in_bio = .{ .ssl_bio = null, .transport_bio = ssl_bio };
         pair.ssl_bio = null;
         self.ssl = owned;
         self.pair = pair;
@@ -434,6 +440,22 @@ pub const Conn = struct {
             off += n;
         }
         self.drainToSocket() catch return error.TlsWriteFailed;
+    }
+
+    /// Inbound ciphertext written into the pair that SSL has not consumed
+    /// yet. Invisible to `pendingPlaintext` (SSL_pending counts
+    /// processed-record plaintext only). The t-866 wedge was the pump
+    /// parking while this was non-zero: the client's next pipelined
+    /// requests sat as unread records in the pair, nothing ever re-woke the
+    /// pump for them, and the connection stopped for good.
+    pub fn pendingInboundCiphertext(self: *Conn) usize {
+        return self.ssl_in_bio.pending() catch 0;
+    }
+
+    /// Diag: outbound ciphertext SSL wrote that has not been drained to the
+    /// socket.
+    pub fn pendingOutboundCiphertext(self: *Conn) usize {
+        return self.pair.pending() catch 0;
     }
 
     pub fn pendingPlaintext(self: *Conn) usize {
@@ -674,6 +696,14 @@ pub const Pump = struct {
         const has_ticket = chunk.ticket_count != 0 or chunk.ticket != 0;
         const has_acct = chunk.outbound_release != 0 or chunk.control_entries != 0;
         if (has_ticket or has_acct or fail_all) {
+            if (comptime observe) {
+                if (chunk.ticket != 0) {
+                    _ = wire_pump.diag_acks.posted_ticket.fetchAdd(1, .monotonic);
+                    if (chunk.complete_batch_receipt) {
+                        _ = wire_pump.diag_acks.posted_receipt.fetchAdd(1, .monotonic);
+                    }
+                }
+            }
             var written_ns: u64 = 0;
             if (ok and chunk.ticket != 0) {
                 written_ns = nowNs(self.io);
@@ -1100,7 +1130,13 @@ pub const Pump = struct {
                 progress = true;
             }
 
-            if (self.pending_read == null and self.conn.pendingPlaintext() > 0) {
+            // BOTH terms matter: SSL_pending sees processed-record plaintext
+            // only, and BIO_ctrl_pending sees unread records still in the
+            // pair. Parking with either non-zero strands the client's next
+            // pipelined requests forever (the t-866 wedge).
+            if (self.pending_read == null and
+                (self.conn.pendingPlaintext() > 0 or self.conn.pendingInboundCiphertext() > 0))
+            {
                 switch (self.readOne()) {
                     .eof => return,
                     .ok => progress = true,
@@ -1150,7 +1186,24 @@ pub const Pump = struct {
                 self.site.store(1, .release);
                 continue;
             }
-            if (self.pending_read == null and self.conn.pendingPlaintext() > 0) continue;
+            if (self.pending_read == null and
+                (self.conn.pendingPlaintext() > 0 or self.conn.pendingInboundCiphertext() > 0))
+            {
+                switch (self.readOne()) {
+                    .eof => return,
+                    .ok => continue,
+                    .stuck => {
+                        // No read chunk free; the actor recycles one soon.
+                        pump_trace.bump(&pump_trace.pending_read_retry);
+                        self.io.sleep(.zero, .awake) catch {};
+                        continue;
+                    },
+                    // A partial record: only new socket bytes can complete
+                    // it, and CipherRead wakes this pump when they arrive.
+                    // Parking here is correct and cannot strand a request.
+                    .want => {},
+                }
+            }
             if (self.dirtyForbidsWait()) continue;
             if (diag_wait) self.traceWaitSnapshot();
             self.site.store(2, .release);
@@ -1207,7 +1260,7 @@ pub const Pump = struct {
         const cipher_free_q = io_queue.queued(u32, self.cipher_free, self.io);
         const write_free_q: usize = if (self.write_free) |q| io_queue.queued(u32, q, self.io) else 0;
         rawPrint(
-            "STARH2_PUMPWAIT write_q={d} work_q={d} read_q={d} read_free={d} write_free={d} cipher_free={d} carried={} pending_read={} pending_cipher={} plaintext={d} wake={s}\n",
+            "STARH2_PUMPWAIT write_q={d} work_q={d} read_q={d} read_free={d} write_free={d} cipher_free={d} carried={} pending_read={} pending_cipher={} plaintext={d} bio_in={d} bio_out={d} wake={s}\n",
             .{
                 write_q,
                 work_q,
@@ -1219,6 +1272,8 @@ pub const Pump = struct {
                 self.pending_read != null,
                 self.pending_cipher != null,
                 self.conn.pendingPlaintext(),
+                self.conn.pendingInboundCiphertext(),
+                self.conn.pendingOutboundCiphertext(),
                 @tagName(self.wake.*),
             },
         );

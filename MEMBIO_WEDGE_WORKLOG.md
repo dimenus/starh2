@@ -212,6 +212,68 @@ unexplained; it is no longer reproduced standalone.
 This is the #446 precedent caught on our own instrument before filing.
 Nothing goes upstream until a mechanism is named in a clean harness.
 
+## ROOT CAUSE FOUND AND FIXED (2026-08-20): ciphertext stranded in BIO-in
+
+zio is INNOCENT. The wedge was starh2's: the pump's read gates used
+`pendingPlaintext()` (SSL_pending), which counts processed-record
+PLAINTEXT only and is blind to whole unread ciphertext records still
+sitting in the BIO pair's inbound side. Under a pipelined burst, a cipher
+chunk feeds several TLS records into BIO-in, the read loop stops at a
+record boundary when SSL_pending hits zero, and the pump parks on top of
+the client's next requests. Nothing re-wakes it for them: CipherRead only
+posts NEW socket bytes, and the client sends nothing more until answered.
+Permanent, per-connection, probabilistic on record-vs-chunk boundaries.
+
+The confirming instrument (ledgers, all balanced, then the tell):
+
+    STARH2_SWEEP2 ... tres=323 tcomp=323 tdrop_free=0 tdrop_mm=0
+                      bio_in=296 bio_out=0 ssl_pend=0
+
+296 bytes of unread inbound ciphertext with every task ledger balanced
+and every task parked clean. `BIO_ctrl_pending(ssl_bio)` sees what
+SSL_pending cannot.
+
+THE FIX (src/edge/tls.zig): keep an alias of the SSL-side BIO
+(`Conn.ssl_in_bio`), expose `pendingInboundCiphertext()`, and include it
+in BOTH pump read gates (the mid-loop gate and the pre-park gate). The
+pre-park gate attempts `readOne` and parks only on `.want` (a partial
+record - only new socket bytes can finish it, and CipherRead wakes the
+pump when they arrive), so the widened condition cannot spin.
+
+Why every earlier theory died on this bug:
+
+- It survives every scheduler A/B (migration, executors=1, zero-sleep,
+  timer executor removed at the zio merge-base) because it is not a
+  scheduler bug.
+- The "task parked with its Event .is_set" observations were transient
+  sweep-read races, never a sustained state - the wake-ledger (hop
+  stamps in a patched zio) showed all tasks parking cleanly with no wake
+  owed at the terminal state.
+- The trickle: any later inbound byte or write path re-runs SSL_read and
+  releases a few more buried records. Cadence = whatever periodic
+  traffic exists.
+- h2c never wedges: no BIO pair.
+
+GRADED (Darwin, M3 Pro, pristine fork-pin zio restored for grading):
+
+- wedge-probe WORKERS=2: 9/9 PASS at ~20.9k rps (band was 8-14k with
+  intermittent 0s before the fix).
+- wedge-probe WORKERS=8: 6/6 PASS at ~42.8k rps (was ~14k and 1/3 red).
+- tools/h2load-wedge-rate.sh: 0/30 (was 5/30).
+- zig build test green; tls-smoke PASS.
+- MUTATION-PROVEN: reverting both gate terms brings the wedge back
+  (2/6 red, band collapses to 8-14k); reverting only the pre-park term
+  stays green (the mid-loop gate is the load-bearing one; the pre-park
+  term is defense in depth).
+
+The fix also RECOVERS THROUGHPUT: the "healthy" pre-fix band was partly
+made of sub-second stalls that the averages hid.
+
+Deferred: a deterministic unit test that feeds two application records
+in one cipher chunk and asserts the pump does not park with BIO-in
+occupancy (filed in the task store). The probe and the h2load rate gate
+cover the behavior until then.
+
 ## Prior art in the zio tracker (searched 2026-08-19, before any filing)
 
 The bug is NOT already reported. Upstream is lalinsky/zio (the dimenus fork

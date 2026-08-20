@@ -161,6 +161,21 @@ pub var test_last_ticket_ok_ns: std.atomic.Value(u64) = .init(0);
 /// Test-only: ticket id of that completion (0 = none).
 pub var test_last_ticket_ok_id: std.atomic.Value(u64) = .init(0);
 
+/// t-866 ticket-ledger diagnostics (process-global, diag reads only).
+pub const diag_acks = struct {
+    /// WriteCompletions posted by pumps with ticket != 0.
+    pub var posted_ticket: std.atomic.Value(u64) = .init(0);
+    /// Of those, carrying complete_batch_receipt.
+    pub var posted_receipt: std.atomic.Value(u64) = .init(0);
+    /// Acks with ticket != 0 applied by actors.
+    pub var applied_ticket: std.atomic.Value(u64) = .init(0);
+    /// Of those, credited as complete-batch receipts.
+    pub var applied_receipt: std.atomic.Value(u64) = .init(0);
+    /// Tickets reserved / completed / failed in ticket tables.
+    pub var reserved: std.atomic.Value(u64) = .init(0);
+    pub var completed: std.atomic.Value(u64) = .init(0);
+};
+
 pub const write_trace = struct {
     pub var enabled: bool = false;
     pub var calls: std.atomic.Value(u64) = .init(0);

@@ -176,6 +176,10 @@ pub var diag_park: bool = false;
 /// (tag:u3 | awaken:u1) from zio's AnyTask.
 pub var diag_task_handle_fn: ?*const fn () usize = null;
 pub var diag_task_state_fn: ?*const fn (usize) u8 = null;
+/// Wake-ledger reads: (seq << 8 | branch) of a task's last scheduling hop,
+/// and the global sequence counter, from the locally patched zio.
+pub var diag_task_mark_fn: ?*const fn (usize) u64 = null;
+pub var diag_stamp_now_fn: ?*const fn () u64 = null;
 
 /// Diag-only registry of live TLS connections, so an OS thread (spawned by
 /// the bench server, outside the zio scheduler) can sweep for the lost-wake
@@ -242,8 +246,12 @@ pub fn diagRekickSweep() u32 {
         const pump_state: u8 = if (diag_task_state_fn) |f| f(conn.tls_pump_task_h.load(.acquire)) else 0xff;
         const actor_state: u8 = if (diag_task_state_fn) |f| f(conn.actor_task_h.load(.acquire)) else 0xff;
         const cipher_state: u8 = if (diag_task_state_fn) |f| f(conn.cipher_task_h.load(.acquire)) else 0xff;
+        const pump_mark: u64 = if (diag_task_mark_fn) |f| f(conn.tls_pump_task_h.load(.acquire)) else 0;
+        const actor_mark: u64 = if (diag_task_mark_fn) |f| f(conn.actor_task_h.load(.acquire)) else 0;
+        const cipher_mark: u64 = if (diag_task_mark_fn) |f| f(conn.cipher_task_h.load(.acquire)) else 0;
+        const stamp_now: u64 = if (diag_stamp_now_fn) |f| f() else 0;
         diagRawPrint(
-            "STARH2_SWEEP conn={x} site={d} dirty={} wake={s} ack_wake={s} read_dirty={} pump_tag={d} pump_awaken={d} actor_tag={d} actor_awaken={d} ciph_site={d} ciph_tag={d} ciph_awaken={d}\n",
+            "STARH2_SWEEP conn={x} site={d} dirty={} wake={s} ack_wake={s} read_dirty={} pump_tag={d} pump_awaken={d} actor_tag={d} actor_awaken={d} ciph_site={d} ciph_tag={d} ciph_awaken={d} pump_hop={d}@{d} actor_hop={d}@{d} ciph_hop={d}@{d} now={d} actor_site={d} mu_held={}\n",
             .{
                 @intFromPtr(conn) & 0xffff,
                 site,
@@ -258,6 +266,32 @@ pub fn diagRekickSweep() u32 {
                 conn.cipher_site.load(.acquire),
                 cipher_state & 0x7,
                 (cipher_state >> 3) & 1,
+                pump_mark & 0xff,
+                pump_mark >> 8,
+                actor_mark & 0xff,
+                actor_mark >> 8,
+                cipher_mark & 0xff,
+                cipher_mark >> 8,
+                stamp_now,
+                conn.actor_site.load(.acquire),
+                @atomicLoad(bool, &conn.session_held, .monotonic),
+            },
+        );
+        diagRawPrint(
+            "STARH2_SWEEP2 conn={x} ackp={d} ackr={d} aapp={d} arec={d} tres={d} tcomp={d} tdrop_free={d} tdrop_mm={d} bio_in={d} bio_out={d} ssl_pend={d}\n",
+            .{
+                @intFromPtr(conn) & 0xffff,
+                wire_pump.diag_acks.posted_ticket.load(.acquire),
+                wire_pump.diag_acks.posted_receipt.load(.acquire),
+                wire_pump.diag_acks.applied_ticket.load(.acquire),
+                wire_pump.diag_acks.applied_receipt.load(.acquire),
+                ticket_table.diag_reserved.load(.acquire),
+                ticket_table.diag_completed.load(.acquire),
+                ticket_table.diag_dropped_not_in_use.load(.acquire),
+                ticket_table.diag_dropped_mismatch.load(.acquire),
+                if (conn.tls) |t| t.pendingInboundCiphertext() else 0,
+                if (conn.tls) |t| t.pendingOutboundCiphertext() else 0,
+                if (conn.tls) |t| t.pendingPlaintext() else 0,
             },
         );
         if (site == 2 and dirty) {
@@ -969,6 +1003,10 @@ const Connection = struct {
     tls_read_dirty: std.atomic.Value(bool) = .init(false),
     /// Diag: the pump's current blocking site (see `tls_edge.Pump.site`).
     tls_pump_site: std.atomic.Value(u8) = .init(0),
+    /// Diag: where the ACTOR currently is. 1 loop, 2 waitForActivity,
+    /// 3 acquiring session_mu, 4 putOne(write_ch), 5 waitH2cPreface,
+    /// 6 shutdownHandlers.
+    actor_site: std.atomic.Value(u8) = .init(0),
     /// Diag: this connection is in `diag_reg` and must deregister on teardown.
     diag_registered: bool = false,
     /// Diag: opaque zio task handles for the actor and the pump.
@@ -1562,6 +1600,7 @@ const Connection = struct {
             self.wakeAllSpace();
             self.wakeAllDeadlines();
         } else if (ack.ticket != 0) {
+            if (comptime test_observe) _ = wire_pump.diag_acks.applied_ticket.fetchAdd(1, .monotonic);
             if (!self.completeAckTickets(ack)) {
                 // A malformed chain would strand at least one synchronous
                 // write forever. Fail every waiter instead of converting
@@ -1580,6 +1619,7 @@ const Connection = struct {
                     );
                 }
                 _ = self.complete_receipts_ready.fetchAdd(1, .acq_rel);
+                if (comptime test_observe) _ = wire_pump.diag_acks.applied_receipt.fetchAdd(1, .monotonic);
             }
         }
         // A successful WIRE release cannot unblock waitForStreamSpace:
@@ -2345,6 +2385,8 @@ const Connection = struct {
 
     fn waitForActivity(self: *Connection) !void {
         const io = self.config.io;
+        self.actor_site.store(2, .release);
+        defer self.actor_site.store(1, .release);
         if (diag_park) self.traceParkSnapshot();
         if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
             test_actor_waiting.set(io);
@@ -3975,7 +4017,9 @@ const Connection = struct {
             }
             return error.WriteFailed;
         }
+        self.actor_site.store(4, .release);
         self.write_ch.putOne(self.config.io, chunk) catch return error.WriteFailed;
+        self.actor_site.store(1, .release);
         self.notifyTlsPump();
     }
 
@@ -4701,7 +4745,13 @@ const Connection = struct {
     /// `session_held` cannot drift from the mutex. Do not call the mutex
     /// directly.
     fn lockSessionUncancelable(self: *Connection, io: std.Io) void {
-        self.session_mu.lockUncancelable(io);
+        if (diag_park) {
+            self.actor_site.store(3, .release);
+            self.session_mu.lockUncancelable(io);
+            self.actor_site.store(1, .release);
+        } else {
+            self.session_mu.lockUncancelable(io);
+        }
         self.session_held = true;
     }
 

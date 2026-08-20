@@ -61,6 +61,20 @@ pub const TestReserveBarrier = struct {
 
 pub var test_reserve_barrier: ?*TestReserveBarrier = null;
 
+/// t-866 ticket-ledger diagnostics: every completion outcome is counted, so
+/// a silently dropped completion (the two staleness guards) is visible.
+/// Gated on `observe` like every other hot-path counter; the official bench
+/// path pays no atomic increments.
+pub const observe = @import("build_options").observe;
+pub var diag_reserved: std.atomic.Value(u64) = .init(0);
+pub var diag_completed: std.atomic.Value(u64) = .init(0);
+pub var diag_dropped_not_in_use: std.atomic.Value(u64) = .init(0);
+pub var diag_dropped_mismatch: std.atomic.Value(u64) = .init(0);
+
+inline fn bump(counter: *std.atomic.Value(u64)) void {
+    if (comptime observe) _ = counter.fetchAdd(1, .monotonic);
+}
+
 pub const TicketTable = struct {
     io: std.Io,
     slots: []TicketWait,
@@ -80,6 +94,7 @@ pub const TicketTable = struct {
             b.go_claim.wait(self.io) catch return error.WriteFailed;
         }
         if (self.write_failed.load(.acquire)) return error.WriteFailed;
+        bump(&diag_reserved);
         const ticket = self.next_ticket.fetchAdd(1, .acq_rel);
         if (ticket == 0) return error.OutOfMemory;
         for (self.slots, 0..) |*slot, i| {
@@ -155,10 +170,17 @@ pub const TicketTable = struct {
     pub fn complete(self: *TicketTable, slot_i: u32, ticket: u64, ok: bool) void {
         if (slot_i >= self.slots.len) return;
         const slot = &self.slots[slot_i];
-        if (!slot.in_use.load(.acquire)) return;
-        if (slot.ticket.load(.acquire) != ticket) return;
+        if (!slot.in_use.load(.acquire)) {
+            bump(&diag_dropped_not_in_use);
+            return;
+        }
+        if (slot.ticket.load(.acquire) != ticket) {
+            bump(&diag_dropped_mismatch);
+            return;
+        }
         slot.ok = ok;
         slot.event.set(self.io);
+        bump(&diag_completed);
     }
 
     /// Wake a reserved waiter without matching ticket (pending removed / terminal cause set).
