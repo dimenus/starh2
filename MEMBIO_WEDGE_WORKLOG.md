@@ -181,6 +181,30 @@ stranded task, which is why the in-app rate is low and why any periodic
 task produced the trickle. The upstream report should come from Ryan and
 can ship `tools/zio-wedge-repro` verbatim with the rates table.
 
+## Prior art in the zio tracker (searched 2026-08-19, before any filing)
+
+The bug is NOT already reported. Upstream is lalinsky/zio (the dimenus fork
+has issues disabled). All ~100 issues scanned plus keyword searches; the
+neighbors, each checked and distinct:
+
+- #446 (closed 2026-07-09): "cross-executor cancel of fibers parked in
+  std.Io.Select" - same symptom family (all executors parked in kevent,
+  runnable fiber lost) but the mechanism was a Zig STDLIB Condition.wait
+  swallowing error.Canceled plus one-shot Future.cancel misuse. Our repro
+  has no cancellation in the hot path and the accept shape has no Select.
+- #530 (closed): "IOCP: intermittent lost wakeup" - root-caused to a
+  Windows-only accept-completion use-after-free (one AcceptEx, two
+  completion packets). Different backend, different mechanism.
+- #347, #340, #384: closed long before our pin; config error and old
+  RwLock hangs respectively.
+- #685 (Ryan's, closed): timer starvation when workers never wait -
+  different mechanism (no parked executors).
+- #582/#574 (closed): spawn delivery and stealing churn - performance
+  shape, not correctness; useful background for the report.
+
+The report should cite #446 and #530 as checked-and-distinct so the
+maintainer does not close it as a duplicate on the symptom alone.
+
 ## Next (fifth round)
 
 1. Bisect INSIDE zio with the red repro (delegated): the kqueue backend's
