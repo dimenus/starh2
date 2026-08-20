@@ -458,6 +458,14 @@ pub const Conn = struct {
         return self.pair.pending() catch 0;
     }
 
+    /// The pump's park predicate for the inbound direction: work exists if
+    /// SSL holds decrypted bytes OR the pair holds unread records. One
+    /// implementation for both pump gate sites, so the two cannot drift;
+    /// the in-process record test pins this exact function.
+    pub fn pendingInbound(self: *Conn) bool {
+        return self.pendingPlaintext() > 0 or self.pendingInboundCiphertext() > 0;
+    }
+
     pub fn pendingPlaintext(self: *Conn) usize {
         std.debug.assert(self.state == .tls);
         const ref = self.ssl.ref() catch return 0;
@@ -1130,13 +1138,12 @@ pub const Pump = struct {
                 progress = true;
             }
 
-            // BOTH terms matter: SSL_pending sees processed-record plaintext
-            // only, and BIO_ctrl_pending sees unread records still in the
-            // pair. Parking with either non-zero strands the client's next
-            // pipelined requests forever (the t-866 wedge).
-            if (self.pending_read == null and
-                (self.conn.pendingPlaintext() > 0 or self.conn.pendingInboundCiphertext() > 0))
-            {
+            // BOTH terms of pendingInbound matter: SSL_pending sees
+            // processed-record plaintext only, and BIO_ctrl_pending sees
+            // unread records still in the pair. Parking with either non-zero
+            // strands the client's next pipelined requests forever (the
+            // t-866 wedge).
+            if (self.pending_read == null and self.conn.pendingInbound()) {
                 switch (self.readOne()) {
                     .eof => return,
                     .ok => progress = true,
@@ -1186,9 +1193,7 @@ pub const Pump = struct {
                 self.site.store(1, .release);
                 continue;
             }
-            if (self.pending_read == null and
-                (self.conn.pendingPlaintext() > 0 or self.conn.pendingInboundCiphertext() > 0))
-            {
+            if (self.pending_read == null and self.conn.pendingInbound()) {
                 switch (self.readOne()) {
                     .eof => return,
                     .ok => continue,
@@ -1297,6 +1302,101 @@ test "TlsPump dirty flag survives Event.reset and forbids wait" {
     pump.dirty = &dirty;
     try std.testing.expect(pump.dirtyForbidsWait());
     try std.testing.expect(!pump.dirtyForbidsWait());
+}
+
+/// Move ciphertext `from` one pair `to` the other until the source is dry
+/// or the destination is full. Returns bytes moved.
+fn shuttle(from: *boring.ssl.BioPair, to: *boring.ssl.BioPair) usize {
+    var moved: usize = 0;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = from.readEncrypted(&buf) catch break;
+        if (n == 0) break;
+        var off: usize = 0;
+        while (off < n) {
+            const w = to.writeEncrypted(buf[off..n]) catch return moved;
+            if (w == 0) return moved;
+            off += w;
+        }
+        moved += n;
+    }
+    return moved;
+}
+
+fn stepHandshake(ssl: *boring.ssl.Ssl) !void {
+    ssl.doHandshake() catch |err| switch (err) {
+        error.WantRead, error.WantWrite => {},
+        else => return err,
+    };
+}
+
+// The t-866 regression test: two application records fed in ONE chunk.
+// SSL_pending is blind to the second record after the first read - only
+// BIO_ctrl_pending sees it. The pump's park predicate (pendingInbound)
+// must report work, or the pump parks on top of a buried request and the
+// connection wedges for good. Removing the ciphertext term from
+// pendingInbound fails this test.
+test "a second record in one chunk is invisible to SSL_pending but pendingInbound sees it" {
+    const build_options = @import("build_options");
+    boring.init();
+
+    var acceptor = try Acceptor.initFromPem(
+        build_options.test_cert_pem,
+        build_options.test_key_pem,
+    );
+    defer acceptor.deinit();
+    var connector = try loopbackClientConnector();
+    defer connector.deinit();
+
+    var server: Conn = .{};
+    server.state = .tcp;
+    try server.setupAccept(&acceptor);
+    defer server.ssl.deinit();
+    defer server.pair.deinit();
+
+    var client: Conn = .{};
+    client.state = .tcp;
+    try client.setupConnect(&connector);
+    defer client.ssl.deinit();
+    defer client.pair.deinit();
+
+    // In-memory handshake: alternate handshake steps and ciphertext
+    // shuttling between the two pairs. No sockets anywhere.
+    var iterations: u32 = 0;
+    while (!(server.ssl.isHandshakeComplete() and client.ssl.isHandshakeComplete())) {
+        iterations += 1;
+        try std.testing.expect(iterations <= MaxHandshakeIterations);
+        try stepHandshake(&client.ssl);
+        _ = shuttle(&client.pair, &server.pair);
+        try stepHandshake(&server.ssl);
+        _ = shuttle(&server.pair, &client.pair);
+    }
+    try std.testing.expect(isHttp2Alpn(server.ssl.selectedAlpn()));
+
+    // The client writes TWO application records; their ciphertext arrives
+    // at the server as ONE chunk, like a burst read off the socket.
+    const record_a = "first-record-payload";
+    const record_b = "second-record-payload";
+    try std.testing.expectEqual(record_a.len, try client.ssl.write(record_a));
+    try std.testing.expectEqual(record_b.len, try client.ssl.write(record_b));
+    try std.testing.expect(shuttle(&client.pair, &server.pair) > 0);
+
+    // One read consumes record A only.
+    var plain: [256]u8 = undefined;
+    const got_a = try server.ssl.read(&plain);
+    try std.testing.expectEqualStrings(record_a, plain[0..got_a]);
+
+    // The wedge's exact state: SSL_pending reports nothing at the record
+    // boundary while a whole unread record sits in the pair. The park
+    // predicate must still report inbound work.
+    try std.testing.expectEqual(@as(usize, 0), server.pendingPlaintext());
+    try std.testing.expect(server.pendingInboundCiphertext() > 0);
+    try std.testing.expect(server.pendingInbound());
+
+    // The second read drains it; only then may the pump park.
+    const got_b = try server.ssl.read(&plain);
+    try std.testing.expectEqualStrings(record_b, plain[0..got_b]);
+    try std.testing.expect(!server.pendingInbound());
 }
 
 test "h2 ALPN matcher" {

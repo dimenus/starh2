@@ -130,7 +130,17 @@ fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *st
 fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool) void {
     const opts = b.addOptions();
     opts.addOption(bool, "observe", observe);
+    // The committed loopback test certificate, for the in-process TLS
+    // record tests (t-875). Only test code references these decls, so
+    // non-test binaries elide them; the pair is public test material.
+    opts.addOption([]const u8, "test_cert_pem", readTestPem(b, "testdata/cert.pem"));
+    opts.addOption([]const u8, "test_key_pem", readTestPem(b, "testdata/key.pem"));
     mod.addOptions("build_options", opts);
+}
+
+fn readTestPem(b: *std.Build, sub_path: []const u8) []const u8 {
+    return b.build_root.handle.readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(64 * 1024)) catch
+        std.process.fatal("cannot read {s}; the loopback test certificate is committed and required", .{sub_path});
 }
 
 /// Copy `tools/build-boringssl.sh` over the fetched boring package *before*
