@@ -62,6 +62,8 @@ pub const pump_trace = struct {
     pub var work_get: std.atomic.Value(u64) = .init(0);
     pub var cipher_chunks: std.atomic.Value(u64) = .init(0);
     pub var dirty_skip_wait: std.atomic.Value(u64) = .init(0);
+    /// Stale CQ wakes absorbed at the select (see the .io arm comment).
+    pub var cq_spurious_wake: std.atomic.Value(u64) = .init(0);
 
     inline fn bump(counter: *std.atomic.Value(u64)) void {
         if (comptime observe) _ = counter.fetchAdd(1, .monotonic);
@@ -84,7 +86,8 @@ pub const pump_trace = struct {
                 "\"pump_live_handler_yield\":{d},\"pump_pending_read_retry\":{d}," ++
                 "\"pump_write_chunks\":{d},\"pump_write_chunk_sum\":{d}," ++
                 "\"pump_work_get\":{d},\"pump_cipher_chunks\":{d}," ++
-                "\"pump_dirty_skip_wait\":{d}",
+                "\"pump_dirty_skip_wait\":{d}," ++
+                "\"pump_cq_spurious_wake\":{d}",
             .{
                 turns.load(.acquire),
                 select.load(.acquire),
@@ -101,6 +104,7 @@ pub const pump_trace = struct {
                 work_get.load(.acquire),
                 cipher_chunks.load(.acquire),
                 dirty_skip_wait.load(.acquire),
+                cq_spurious_wake.load(.acquire),
             },
         );
     }
@@ -1144,8 +1148,26 @@ pub const Pump = struct {
             self.site.store(1, .release);
             switch (winner) {
                 .io => |r| {
-                    // error.Closed only after shutdownCq closed it locally.
-                    const c = r catch return;
+                    // A STALE CQ WAKE, not a drain. zio's CompletionQueue
+                    // bumps `signal` and issues the futex wake in two steps
+                    // (ownerCallback); a completion popped via `next()` in
+                    // between leaves that wake to claim the NEXT select
+                    // registration, and `getResult` then reports
+                    // error.Closed on an open queue (in Debug, zio's
+                    // `assert(drained)` panics first — this catch cannot
+                    // help there; the real fix is a fork patch, t-878
+                    // stop report). Only `shutdownCq` closes this queue,
+                    // and only after the loop exits, so Closed here is
+                    // always the stale wake: re-run the turn. Measured
+                    // live: ~1/3 of WORKERS=2 wedge-probe runs wedged on
+                    // the silent-exit predecessor of this branch.
+                    const c = r catch {
+                        pump_trace.bump(&pump_trace.cq_spurious_wake);
+                        if (diag_wait) {
+                            rawPrint("STARH2_CQSPUR select-io stale wake pending={} signal={d}\n", .{ self.cq.hasPending(), self.cq.signal.load(.acquire) });
+                        }
+                        continue;
+                    };
                     std.debug.assert(c == &self.recv_op.c);
                     if (self.onRecvComplete() == .exit) return;
                 },
