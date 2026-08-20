@@ -150,17 +150,46 @@ Machine-local (NOT committed; zig-pkg is gitignored): the vendored zio at
 diag exports. `bench_server` guards the hook with `@hasDecl`, so a
 pristine pin still builds. Re-apply by hand when reproducing task tags.
 
-## Next (fourth round)
+## Fourth round: the standalone repro is RED (same day, later)
 
-1. Minimal zio-level repro of (a) or (b) above, outside starh2: one Event
-   ping-pong plus one socket read under load, 1-2 executors, assert
-   progress with a watchdog. The existing `tools/zio-migration-repro` shape
-   plus the Event reset/tryGet/dirty protocol it lacks.
-2. Read upstream zio d0c4d79 and the kqueue completion path for a lost
-   readiness edge; compare against the io_uring backend for the shared
-   shape (nachos wedges too, so a kqueue-only theory is wrong unless both
-   backends share the defect in loop.zig, e.g. drainDispatched or the
-   wake_requested swap).
+`tools/zio-wedge-repro` (37c79cc) reproduces the defect class with no
+starh2 code, seconds per run. The unlock: clients must be RAW OS THREADS;
+in-runtime zio clients keep the executors busy and mask the window. The
+window is an idle runtime with executors parked in kevent.
+
+Shape `--connections 1 --pipeline 2 --requests 30000 --rounds 40`, Darwin:
+
+- default (2 exec, migration on): 7/9 stall - listening=true,
+  client_connects=1, accepts=0. The kernel completed the TCP handshake;
+  zio's accept never returns.
+- --no-migration: 6/6 - accepts=1 but the spawned connection task never
+  ran (zero registrations).
+- --executors 1: 6/6.
+- PRISTINE UPSTREAM zio HEAD d0c4d79 (path dep at ~/Source/oss/zio,
+  task_tags=false in the banner proves the unpatched build): 5/6. The bug
+  is live upstream, not an artifact of our pin or local patches.
+
+Oracle (b) is retired: live netstat sampling during a starh2 wedge shows
+Recv-Q/Send-Q zero on both sides throughout (matching the nachos capture),
+so nothing ever sat in the kernel; the CipherRead quiet stretch was
+innocent (nothing to read - the responses were the missing side).
+
+CONSEQUENCE: this is an upstream zio scheduling/wake-delivery bug. A task
+made runnable (an accept completion, a fresh spawn, a futexWake) is never
+run while the executors sit parked. starh2's own churn usually rescues the
+stranded task, which is why the in-app rate is low and why any periodic
+task produced the trickle. The upstream report should come from Ryan and
+can ship `tools/zio-wedge-repro` verbatim with the rates table.
+
+## Next (fifth round)
+
+1. Bisect INSIDE zio with the red repro (delegated): the kqueue backend's
+   completion delivery and the park protocol in runtime.zig - the
+   wake_requested swap in Loop.poll, drainDispatched, processCleanup, the
+   idle_mask/searcher fences. State which zio the bisect ran against (the
+   local vendored copy carries an f5f5d28 backport and two debug exports).
+2. Confirm the same red shape on nachos/io_uring to decide backend-shared
+   vs backend-specific before the upstream report.
 3. If a zio fix lands, grade with: probe 3/3 at WORKERS=2 and 8,
    `h2load-wedge-rate.sh` 0/30, then the full t-843 grading lines.
 
