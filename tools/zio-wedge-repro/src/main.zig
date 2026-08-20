@@ -381,7 +381,22 @@ fn serverTask(io: std.Io, port_out: *zio.Channel(u16), total_connections: usize)
 /// window opens when an executor parks in kevent; an out-of-process-style
 /// client is what lets the server runtime go idle between bursts, which is
 /// the starh2 shape (Go client / h2load).
-fn clientThread(port: u16, cfg: Config) void {
+var g_port: std.atomic.Value(u16) = .init(0);
+
+/// One OS thread per connection slot; runs all its rounds sequentially.
+fn clientThread(cfg: Config) void {
+    var port: u16 = 0;
+    while (port == 0) {
+        var req = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = nanosleep(&req, null);
+        port = g_port.load(.acquire);
+    }
+    for (0..cfg.rounds) |_| {
+        clientRound(port, cfg);
+    }
+}
+
+fn clientRound(port: u16, cfg: Config) void {
     clientThreadInner(port, cfg) catch |err| {
         rawPrint("client: {s}\n", .{@errorName(err)});
         std.process.exit(3);
@@ -433,25 +448,14 @@ fn run(io: std.Io, cfg: Config) !void {
     var server = try zio.spawn(serverTask, .{ io, &port_out, total_connections });
     defer server.cancel();
 
+    // No client orchestration here: a zio task must never call
+    // std.Thread.spawn/join. A join blocks the executor thread outright,
+    // the loop that owns the listen socket stops polling, and the harness
+    // deadlocks itself - a false positive this repro produced once.
+    // Clients are spawned from main(), outside the runtime.
     const port = try port_out.receive();
-    for (0..cfg.rounds) |round| {
-        var threads: [64]?std.Thread = @splat(null);
-        for (0..@min(cfg.connections, threads.len)) |i| {
-            threads[i] = std.Thread.spawn(.{}, clientThread, .{ port, cfg }) catch null;
-        }
-        for (&threads) |*t| {
-            if (t.*) |th| th.join();
-            t.* = null;
-        }
-        rawPrint(".", .{});
-        if ((round + 1) % 20 == 0) rawPrint(" {d} rounds\n", .{round + 1});
-    }
+    g_port.store(port, .release);
     try server.join();
-    g_progress.done.store(true, .release);
-    rawPrint(
-        "\nPASS: {d} replies, migration={any}\n",
-        .{ g_progress.replies.load(.acquire), cfg.migration },
-    );
 }
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Config {
@@ -505,5 +509,18 @@ pub fn main(init: std.process.Init) !void {
     const watchdog = try std.Thread.spawn(.{}, watchdogMain, .{});
     watchdog.detach();
     var main_task = try runtime.spawn(run, .{ runtime.io(), cfg });
+    // Client threads are spawned and joined HERE, never from a zio task:
+    // an OS join inside a task blocks its executor thread and the loop
+    // that owns the listen socket stops polling - a self-made deadlock.
+    var clients: [64]?std.Thread = @splat(null);
+    for (0..@min(cfg.connections, clients.len)) |i| {
+        clients[i] = std.Thread.spawn(.{}, clientThread, .{cfg}) catch null;
+    }
     try main_task.join();
+    for (&clients) |*t| {
+        if (t.*) |th| th.join();
+        t.* = null;
+    }
+    g_progress.done.store(true, .release);
+    rawPrint("\nPASS: {d} replies, migration={any}\n", .{ g_progress.replies.load(.acquire), cfg.migration });
 }

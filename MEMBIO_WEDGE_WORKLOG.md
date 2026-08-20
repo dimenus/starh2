@@ -181,6 +181,37 @@ stranded task, which is why the in-app rate is low and why any periodic
 task produced the trickle. The upstream report should come from Ryan and
 can ship `tools/zio-wedge-repro` verbatim with the rates table.
 
+## RETRACTION of the fourth round's standalone-repro claims (2026-08-19, later)
+
+The red repro was a HARNESS ANTI-PATTERN, not a zio bug. zio-wedge-repro
+called std.Thread.spawn/join per round from inside a zio task. An OS join
+blocks the executor thread outright; a socket is pinned to the loop that
+registered it (zio #582 documents the placement rule), so the listen
+socket's completions starve behind the blocked loop and the harness
+deadlocks itself: client waits on server, accept waits on the blocked
+loop, the joining task waits on the client. Stall probability was
+placement luck.
+
+Proof both ways: a minimal accept repro (clients spawned/joined only from
+main, outside the runtime) passes 6/6 x 200 rounds; the same red shape
+goes 6/6 GREEN after moving client thread management out of the zio task.
+
+RETRACTED: the repro's 5/6-6/6 red rates, the accept/spawn victim shapes,
+the pristine-upstream-HEAD confirmation, and the "OS-thread clients
+unlock / rescue-by-churn masks the repro" framing. The rule that survives:
+NEVER call a blocking OS primitive (Thread.join, nanosleep, blocking
+reads) from inside a zio task; the loop that owns your sockets stops.
+
+STILL STANDING, independent of the repro: every in-app starh2 capture
+(rounds 1-3), including the pump parked in futexWait with its Event
+.is_set, and the starh2-side A/B falsifications. The starh2 wedge shows
+all executors PARKED IN KEVENT at 0% CPU, which is not the blocked-thread
+shape, and starh2 has no OS joins in tasks. The wedge is real and remains
+unexplained; it is no longer reproduced standalone.
+
+This is the #446 precedent caught on our own instrument before filing.
+Nothing goes upstream until a mechanism is named in a clean harness.
+
 ## Prior art in the zio tracker (searched 2026-08-19, before any filing)
 
 The bug is NOT already reported. Upstream is lalinsky/zio (the dimenus fork
