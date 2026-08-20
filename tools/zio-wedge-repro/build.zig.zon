@@ -1,0 +1,17 @@
+.{
+    .name = .zio_wedge_repro,
+    .version = "0.0.0",
+    .fingerprint = 0xf7588d7fd8cc69ef,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Path dep into the repo's machine-local vendored zio (gitignored),
+        // so the reproducer sees the same bits starh2 builds against,
+        // including any local diag patches (debugTaskStateByte). If the dir
+        // is absent, re-vendor it: `zig fetch git+https://github.com/dimenus/zio#489f31f85c134a1a2b587d46729a9fe258f7f890`
+        // and copy the cache entry to zig-pkg/.
+        .zio = .{
+            .path = "../../zig-pkg/zio-0.17.0-xHbVVMdhJwAj5AjSKXkFUbvCvzcXXe8mLImv3NXBxVAv",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
