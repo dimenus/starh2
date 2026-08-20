@@ -247,6 +247,9 @@ var g_conns_lock: std.atomic.Value(bool) = .init(false);
 var g_conns: [64]?*Conn = @splat(null);
 var g_progress: Progress = .{};
 var g_stall_ticks: u32 = 6;
+var g_listening: std.atomic.Value(bool) = .init(false);
+var g_accepts: std.atomic.Value(u64) = .init(0);
+var g_client_connects: std.atomic.Value(u64) = .init(0);
 
 fn connsLock() void {
     while (g_conns_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
@@ -295,7 +298,16 @@ fn watchdogMain() void {
         }
         quiet += 1;
         if (quiet < g_stall_ticks) continue;
-        rawPrint("\nSTALL: no replies for {d} ticks (completed={d})\n", .{ quiet, now });
+        rawPrint(
+            "\nSTALL: no replies for {d} ticks (completed={d} listening={} accepts={d} client_connects={d})\n",
+            .{
+                quiet,
+                now,
+                g_listening.load(.acquire),
+                g_accepts.load(.acquire),
+                g_client_connects.load(.acquire),
+            },
+        );
         connsLock();
         for (g_conns) |maybe| {
             const c = maybe orelse continue;
@@ -352,35 +364,62 @@ fn serverTask(io: std.Io, port_out: *zio.Channel(u16), total_connections: usize)
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
     try port_out.send(server.socket.address.getPort());
+    g_listening.store(true, .release);
 
     var connections: std.Io.Group = .init;
     defer connections.cancel(io);
     for (0..total_connections) |_| {
         const stream = try server.accept(io);
+        _ = g_accepts.fetchAdd(1, .monotonic);
         try connections.concurrent(io, serveConnectionEntry, .{ io, stream });
     }
     try connections.await(io);
 }
 
-fn clientTask(io: std.Io, port: u16, cfg: Config) !void {
-    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
-    const stream = try address.connect(io, .{ .mode = .stream });
-    defer stream.close(io);
+/// Clients run on RAW OS THREADS with blocking BSD sockets, never as zio
+/// tasks. In-process zio clients keep the executors busy, and the lost-wake
+/// window opens when an executor parks in kevent; an out-of-process-style
+/// client is what lets the server runtime go idle between bursts, which is
+/// the starh2 shape (Go client / h2load).
+fn clientThread(port: u16, cfg: Config) void {
+    clientThreadInner(port, cfg) catch |err| {
+        rawPrint("client: {s}\n", .{@errorName(err)});
+        std.process.exit(3);
+    };
+}
+
+fn clientThreadInner(port: u16, cfg: Config) !void {
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    defer _ = std.c.close(fd);
+    var addr: std.c.sockaddr.in = .{
+        .family = std.c.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero = @splat(0),
+    };
+    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.ConnectFailed;
+    _ = g_client_connects.fetchAdd(1, .monotonic);
 
     var request: [256]u8 = undefined;
     var response: [256]u8 = undefined;
-    var read_buffer: [4096]u8 = undefined;
-    var write_buffer: [4096]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    var writer = stream.writer(io, &write_buffer);
     @memset(&request, request_byte);
 
     var remaining = cfg.requests_per_connection;
     while (remaining != 0) {
         const n = @min(remaining, cfg.pipeline);
-        try writer.interface.writeAll(request[0..n]);
-        try writer.interface.flush();
-        try reader.interface.readSliceAll(response[0..n]);
+        var sent: usize = 0;
+        while (sent < n) {
+            const w = std.c.write(fd, request[sent..].ptr, n - sent);
+            if (w <= 0) return error.WriteFailed;
+            sent += @intCast(w);
+        }
+        var got: usize = 0;
+        while (got < n) {
+            const r = std.c.read(fd, response[got..].ptr, n - got);
+            if (r <= 0) return error.ReadFailed;
+            got += @intCast(r);
+        }
         _ = g_progress.replies.fetchAdd(n, .monotonic);
         remaining -= n;
     }
@@ -396,12 +435,14 @@ fn run(io: std.Io, cfg: Config) !void {
 
     const port = try port_out.receive();
     for (0..cfg.rounds) |round| {
-        var clients: zio.Group = .init;
-        defer clients.cancel();
-        for (0..cfg.connections) |_| {
-            try clients.spawn(clientTask, .{ io, port, cfg });
+        var threads: [64]?std.Thread = @splat(null);
+        for (0..@min(cfg.connections, threads.len)) |i| {
+            threads[i] = std.Thread.spawn(.{}, clientThread, .{ port, cfg }) catch null;
         }
-        try clients.wait();
+        for (&threads) |*t| {
+            if (t.*) |th| th.join();
+            t.* = null;
+        }
         rawPrint(".", .{});
         if ((round + 1) % 20 == 0) rawPrint(" {d} rounds\n", .{round + 1});
     }
