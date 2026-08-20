@@ -1,0 +1,14 @@
+.{
+    .name = .deadline_timer_probe,
+    .version = "0.0.0",
+    .fingerprint = 0x4269c695fad7ffce,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Path dep into the repo's machine-local vendored zio (gitignored),
+        // so the reproducer sees the same bits starh2 builds against.
+        .zio = .{
+            .path = "../../../../oss/zio",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
