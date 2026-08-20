@@ -27,6 +27,11 @@ cd "$REPO"
 OUT=${OUT:-/tmp/starh2-h2load-wedge-rate}
 ROUNDS=${ROUNDS:-10}
 WATCHDOG=${WATCHDOG:-60}
+# A round that finishes but takes over ROUND_SLOW_SECONDS is a failure of
+# its own class (SLOW): healthy is ~0.9 s on the M3 Pro, so a finished
+# 10 s round means stalls the watchdog cannot see. Without this guard a
+# partial regression reads as PASS.
+ROUND_SLOW_SECONDS=${ROUND_SLOW_SECONDS:-10}
 REQUESTS=${REQUESTS:-400000}
 CLIENTS=${CLIENTS:-50}
 MAXCONC=${MAXCONC:-10}
@@ -58,6 +63,7 @@ SHA=$(git -C "$REPO" rev-parse --short HEAD)
 echo "h2load-wedge-rate: sha=$SHA host=$(uname -s) rounds=$ROUNDS watchdog=${WATCHDOG}s n=$REQUESTS c=$CLIENTS m=$MAXCONC t=$THREADS executors=$STARH2_EXECUTORS server_args='${SERVER_ARGS:-}'"
 
 wedges=0
+slow=0
 ran=0
 round=1
 while [ "$round" -le "$ROUNDS" ]; do
@@ -92,6 +98,7 @@ while [ "$round" -le "$ROUNDS" ]; do
     exit 2
   }
 
+  ROUND_T0=$(date +%s)
   h2load -n "$REQUESTS" -c "$CLIENTS" -m "$MAXCONC" -t "$THREADS" \
     "https://127.0.0.1:${PORT}/" >"$OUT/h2load-$round.txt" 2>&1 &
   H_PID=$!
@@ -130,7 +137,13 @@ while [ "$round" -le "$ROUNDS" ]; do
       grep -E 'finished in|requests:' "$OUT/h2load-$round.txt" >&2 || true
       exit 2
     fi
-    echo "h2load-wedge-rate: round $round PASS ($(grep -o 'finished in [^,]*' "$OUT/h2load-$round.txt" | head -1))"
+    ROUND_SECS=$(( $(date +%s) - ROUND_T0 ))
+    if [ "$ROUND_SECS" -gt "$ROUND_SLOW_SECONDS" ]; then
+      slow=$((slow + 1))
+      echo "h2load-wedge-rate: round $round SLOW (${ROUND_SECS}s > ${ROUND_SLOW_SECONDS}s)"
+    else
+      echo "h2load-wedge-rate: round $round PASS ($(grep -o 'finished in [^,]*' "$OUT/h2load-$round.txt" | head -1))"
+    fi
   fi
   H_PID=
 
@@ -143,10 +156,10 @@ while [ "$round" -le "$ROUNDS" ]; do
   round=$((round + 1))
 done
 
-echo "h2load-wedge-rate: rounds_run=$ran wedges=$wedges"
+echo "h2load-wedge-rate: rounds_run=$ran wedges=$wedges slow=$slow"
 [ "$ran" -gt 0 ] || { echo "h2load-wedge-rate: zero rounds ran" >&2; exit 2; }
-if [ "$wedges" -gt 0 ]; then
-  echo "h2load-wedge-rate: WEDGED $wedges/$ran"
+if [ "$wedges" -gt 0 ] || [ "$slow" -gt 0 ]; then
+  echo "h2load-wedge-rate: FAILED wedges=$wedges slow=$slow of $ran"
   exit 1
 fi
 echo "h2load-wedge-rate: CLEAN 0/$ran"

@@ -26,7 +26,21 @@ OUT=${OUT:-/tmp/starh2-wedge-probe}
 SECONDS_RUN=${SECONDS_RUN:-5}
 WARMUP=${WARMUP:-1}
 WORKERS=${WORKERS:-8}
-THRESHOLD=${THRESHOLD:-5000}
+# Default thresholds sit between the post-7eb6c5e healthy bands on the M3
+# Pro (~21k rps at 2 workers, ~43k at 8) and the recorded regression bands
+# of the reverted fix (up to ~14k at 2 workers): 15000 fails every recorded
+# regression run and keeps ~28% margin under the healthy band. The old 5000
+# floor was calibrated against the stall-polluted bands and passed
+# regressions that cost half the throughput. nachos runs faster than the
+# M3, so these floors are safe there; override THRESHOLD for a slower
+# machine.
+if [ -z "${THRESHOLD:-}" ]; then
+  if [ "$WORKERS" -ge 8 ]; then
+    THRESHOLD=25000
+  else
+    THRESHOLD=15000
+  fi
+fi
 STARH2_EXECUTORS=${STARH2_EXECUTORS:-2}
 LABEL=${LABEL:-wedge}
 
