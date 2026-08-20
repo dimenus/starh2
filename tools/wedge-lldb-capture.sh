@@ -82,26 +82,64 @@ for i in range(regions.GetSize()):
         continue
     if info.GetName():
         continue
-    # Probe candidate frame pointers near the region top (stacks grow down;
-    # a parked coroutine's frames sit just under its saved context).
+    # Scan the WHOLE region for the longest valid chain. The deepest frames
+    # (the park site) sit at the saved SP, which can be anywhere in the
+    # region; probing only the top finds the entry tail and truncates the
+    # story at connEntry. Freed stacks keep old bytes (the pool does not
+    # zero), so a chain here may be a GHOST of a finished task — the
+    # analysis must cross-check liveness (e.g. group counters below).
     base, end = info.GetRegionBase(), info.GetRegionEnd()
     best = []
-    for off in range(0x80, 0x2000, 8):
-        ca = end - off
-        d = process.ReadMemory(ca, 8, err)
-        if err.Fail():
-            continue
-        v = struct.unpack('<Q', d)[0]
+    best_addr = 0
+    buf = process.ReadMemory(base, end - base, err)
+    if err.Fail():
+        continue
+    n = len(buf) // 8
+    words = struct.unpack('<%dQ' % n, buf)
+    for wi in range(n):
+        v = words[wi]
+        ca = base + wi * 8
         if base < v < end and v > ca:
             fr = unwind(ca)
             if len(fr) > len(best):
                 best = fr
+                best_addr = ca
     if len(best) >= 3:
         seen += 1
-        print('=== live coroutine stack region 0x%x-0x%x ===' % (base, end))
-        for f in best[:16]:
+        print('=== coroutine stack region 0x%x-0x%x chain@0x%x (GHOSTS POSSIBLE) ===' % (base, end, best_addr))
+        for f in best[:20]:
             print('   ', f)
-print('live parked coroutine stacks found:', seen)
+print('coroutine stack chains found:', seen)
+
+# Futex waiters with the VALUE at each waited address: a group-await
+# waiter's address is the group state word, whose low 24 bits are the
+# live member counter — it says how many tasks the group still counts.
+gb = target.FindGlobalVariables('sync.Futex.global_buckets', 1)
+if gb and gb[0].IsValid():
+    gbase = gb[0].GetLoadAddress()
+    bsize = gb[0].GetByteSize() // gb[0].GetNumChildren()
+    for i in range(gb[0].GetNumChildren()):
+        baddr = gbase + i * bsize
+        head = struct.unpack('<Q', process.ReadMemory(baddr, 8, err))[0]
+        node = head & ~7
+        hops = 0
+        fw_type = target.FindFirstType('sync.Futex.FutexWaiter')
+        while node and hops < 100:
+            fw = target.CreateValueFromAddress('fw', lldb.SBAddress(node, target), fw_type)
+            addr_field = 0
+            av = fw.GetChildMemberWithName('address')
+            if av.IsValid() and av.GetValue():
+                addr_field = int(av.GetValue())
+            val = None
+            if addr_field:
+                vd = process.ReadMemory(addr_field, 4, err)
+                if not err.Fail():
+                    val = struct.unpack('<I', vd)[0]
+            print('futex waiter node 0x%x waits on 0x%x value=%s' % (node, addr_field, hex(val) if val is not None else '?'))
+            nv = fw.GetChildMemberWithName('next')
+            node = int(nv.GetValue(), 0) if (nv.IsValid() and nv.GetValue() and nv.GetValue() != '0x0000000000000000') else 0
+            node &= ~7
+            hops += 1
 PYEOF
 
 lldb -b -p "$PID" \
