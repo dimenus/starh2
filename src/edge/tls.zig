@@ -8,8 +8,9 @@
 //!
 //! The pump is a `zio.CompletionQueue` driver owned by the actor. The socket
 //! read is a raw `ev.NetRecv` completion the actor submits and re-submits
-//! after each arrival. Outbound frames SSL_write on the same task
-//! (`queueWire` → `writeChunks`); ciphertext stages into the handshake
+//! after each arrival. Outbound frames stash on `queueWire` and SSL_write
+//! on `driveTlsTurn` via `writeChunks` (not on the `drainEmit` stack: that
+//! overflowed the coroutine). Ciphertext stages into the handshake
 //! writer's buffer and arms `ev.NetSend`. Acks apply locally in `post`.
 //! The actor's idle wait is one `select` that includes `.io = &cq` and
 //! loses `.reads` and `.acks`. There is no wake Event, no dirty flag, no
@@ -17,9 +18,12 @@
 //! unsayable here, because nothing is ever reset.
 //!
 //! A peer that stops reading must not stop the actor: `pending_n > 0`
-//! pauses FairScheduler drain, and `waitForActivity` still serves handler
-//! completions, deadlines, the doorbell and the slow-consumer kill. The
-//! actor parks on the CQ, never the socket.
+//! pauses FairScheduler DATA drain only, so WINDOW_UPDATE still emits into
+//! the stash. A full stash (`carried` plus `write_ch`) pauses controls too:
+//! that is the 200-HEADERS burst bound, and it is not the same as pausing
+//! every tier on `pending_n` (that blew stall p99 to 11 ms). The actor's
+//! `waitForActivity` still serves handler completions, deadlines, the
+//! doorbell and the slow-consumer kill. It parks on the CQ, never the socket.
 //!
 //! This file takes a DIRECT zio dependency (the CQ, the channel, the raw
 //! completion). That is deliberate and open: an interface over the CQ would
@@ -111,6 +115,21 @@ pub const pump_trace = struct {
         );
     }
 };
+
+/// Always-on TLS write-fail counters for `/trace`. Not gated on `observe` or
+/// `trace.enabled`: a ReleaseFast bench server must name a silent fail-close.
+pub var tls_write_overflow: std.atomic.Value(u64) = .init(0);
+pub var tls_stage_failed: std.atomic.Value(u64) = .init(0);
+
+pub fn writeFailJson(w: *std.Io.Writer) !void {
+    try w.print(
+        ",\"tls_write_overflow\":{d},\"tls_stage_failed\":{d}",
+        .{
+            tls_write_overflow.load(.acquire),
+            tls_stage_failed.load(.acquire),
+        },
+    );
+}
 
 /// Bench `--diag`: print one line when the pump parks. Off unless the
 /// benchmark server sets it. Independent of `observe` so a ReleaseFast
@@ -713,6 +732,7 @@ pub const Pump = struct {
             const n = self.conn.pair.readEncrypted(self.send_buf[self.send_fill..]) catch |err| switch (err) {
                 error.WantRead => break,
                 else => {
+                    _ = tls_stage_failed.fetchAdd(1, .monotonic);
                     self.failDrain();
                     self.post(.{ .shutdown = true });
                     return .exit;
@@ -766,6 +786,7 @@ pub const Pump = struct {
             // Only shutdownCq cancels the op; teardown owns the exit.
             error.Canceled => return .exit,
             else => {
+                _ = tls_stage_failed.fetchAdd(1, .monotonic);
                 self.failDrain();
                 self.post(.{ .fail_all = true, .shutdown = true });
                 return .exit;
@@ -839,6 +860,12 @@ pub const Pump = struct {
         return chunk;
     }
 
+    /// True when one more `pushWriteChunk` would return WriteFailed.
+    /// `carried` holds the first overflow chunk; `write_ch` holds the rest.
+    pub fn stashFull(self: *Pump) bool {
+        return self.carried != null and self.write_ch.isFull();
+    }
+
     fn stealWrite(self: *Pump) void {
         if (self.carried != null) return;
         self.carried = self.tryTakeWrite();
@@ -854,6 +881,7 @@ pub const Pump = struct {
         while (self.partial_off < bytes.len) {
             spins += 1;
             if (spins > MaxHandshakeIterations) {
+                _ = tls_stage_failed.fetchAdd(1, .monotonic);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return .exit;
@@ -885,6 +913,7 @@ pub const Pump = struct {
                     }
                 },
                 else => {
+                    _ = tls_stage_failed.fetchAdd(1, .monotonic);
                     self.failDrain();
                     self.post(.{ .shutdown = true });
                     return .exit;
@@ -915,6 +944,7 @@ pub const Pump = struct {
     pub fn writeChunks(self: *Pump, first: wire_pump.WireChunk) bool {
         std.debug.assert(self.pending_n == 0);
         if (first.len == 0 and first.bytes.len == 0 and !first.flush_barrier) {
+            _ = tls_stage_failed.fetchAdd(1, .monotonic);
             self.failDrain();
             self.post(.{ .shutdown = true });
             return false;
@@ -944,6 +974,7 @@ pub const Pump = struct {
         }
         const fail_next = wire_pump.test_fail_next_write.swap(false, .acq_rel);
         if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
+            _ = tls_stage_failed.fetchAdd(1, .monotonic);
             self.failPending();
             self.failDrain();
             self.post(.{ .shutdown = true });

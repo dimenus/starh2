@@ -2608,7 +2608,15 @@ const Connection = struct {
                 fn f(ctx: *anyopaque) bool {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     const p = c.tls_driver orelse return false;
-                    return p.pending_n > 0 or (p.carried != null and p.write_ch.isFull());
+                    return p.pending_n > 0 or p.stashFull();
+                }
+            }.f;
+            // Stash-full only. pending_n must not pause WINDOW_UPDATE (stall p99).
+            self.sched.pause_control = struct {
+                fn f(ctx: *anyopaque) bool {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    const p = c.tls_driver orelse return false;
+                    return p.stashFull();
                 }
             }.f;
             self.sched.pause_ctx = self;
@@ -3989,10 +3997,13 @@ const Connection = struct {
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
         if (self.config.mode == .tls_h2) {
             // SSL_write + stage + arm on this task. Acks apply in `post` via
-            // `ack_apply` (no write_ack_ch hop). Drain pause (`pending_n > 0`)
-            // is the backpressure: this must not be called then, and must
-            // never park on a channel the actor itself consumes.
-            const pump = self.tls_driver orelse return error.WriteFailed;
+            // `ack_apply` (no write_ack_ch hop). `pause` (DATA) and
+            // `pause_control` (HEADERS/WINDOW_UPDATE) stop drain before this
+            // stash fills, so trySend is the last-resort fail-close.
+            const pump = self.tls_driver orelse {
+                _ = tls_edge.tls_stage_failed.fetchAdd(1, .monotonic);
+                return error.WriteFailed;
+            };
             // Stash only. SSL_write on this stack under session_mu overflowed
             // the coroutine (BoringSSL's frame plus drainEmit). driveTlsTurn
             // writes after the lock drops.
@@ -4000,7 +4011,10 @@ const Connection = struct {
                 pump.carried = chunk;
                 return;
             }
-            pump.write_ch.trySend(chunk) catch return error.WriteFailed;
+            pump.write_ch.trySend(chunk) catch {
+                _ = tls_edge.tls_write_overflow.fetchAdd(1, .monotonic);
+                return error.WriteFailed;
+            };
             return;
         }
         if (self.writeGoingAway()) {
@@ -5172,10 +5186,18 @@ const Connection = struct {
             } }) catch return error.WriteFailed;
             self.next_wire_ticket = ticket;
             self.next_wire_slot = slot_i;
-            self.processIntents() catch {
+            // Enqueue and leave. Do NOT drain. writeCb already learned this:
+            // 200 task handlers each processIntents/drainEmit is one HEADERS
+            // chunk apiece into carried+tls_write_ch (cap 8). The tenth
+            // trySend is WriteFailed and fail-closes the connection. The actor
+            // packs those HEADERS in one drainEmit (emit_batch) and the
+            // stash-full pause_control bound keeps a leftover processIntents
+            // path from overflowing.
+            self.emitQueuedResponse() catch {
                 self.failClosedOnIntentError();
                 return error.WriteFailed;
             };
+            self.ring();
         }
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);

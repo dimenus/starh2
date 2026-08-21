@@ -522,3 +522,49 @@ test "drain does not emit pending DATA after a RST tombstone" {
     try std.testing.expectEqual(@as(usize, 0), ctx.data_frames);
     try std.testing.expectEqual(@as(usize, 1), sched.pendingCount());
 }
+
+test "pause_control leaves ordinary frames queued" {
+    const gpa = std.testing.allocator;
+    const fs = starh2.edge.fair_scheduler;
+    var pool = try testPool(gpa, 1024, 4);
+    defer pool.deinit(gpa);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 4, &pool);
+    defer sched.deinit();
+
+    try sched.enqueueControl(try gpa.dupe(u8, "hdr1"), .ordinary, 0, 0);
+    try sched.enqueueControl(try gpa.dupe(u8, "hdr2"), .ordinary, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), sched.ordinary_len);
+
+    var paused: bool = true;
+    sched.pause_control = struct {
+        fn f(ctx: *anyopaque) bool {
+            return @as(*bool, @ptrCast(@alignCast(ctx))).*;
+        }
+    }.f;
+    sched.pause_ctx = &paused;
+
+    var sink_state: SinkState = .{ .gpa = gpa };
+    defer sink_state.emitted.deinit(gpa);
+    const win = struct {
+        fn stream(_: *anyopaque, _: u31) i32 {
+            return 1 << 30;
+        }
+        fn conn(_: *anyopaque) i32 {
+            return 1 << 30;
+        }
+        fn build(ctx: *anyopaque, _: u31, bytes: []const u8, end: bool) anyerror![]u8 {
+            _ = end;
+            const self: *SinkState = @ptrCast(@alignCast(ctx));
+            return try self.gpa.dupe(u8, bytes);
+        }
+    };
+
+    try sched.drain(selfPtr(&sink_state), SinkState.sink, selfPtr(&sink_state), win.stream, win.conn, win.build, selfPtr(&sink_state));
+    try std.testing.expectEqual(@as(usize, 2), sched.ordinary_len);
+    try std.testing.expectEqual(@as(usize, 0), sink_state.emitted.items.len);
+
+    paused = false;
+    try sched.drain(selfPtr(&sink_state), SinkState.sink, selfPtr(&sink_state), win.stream, win.conn, win.build, selfPtr(&sink_state));
+    try std.testing.expectEqual(@as(usize, 0), sched.ordinary_len);
+    try std.testing.expectEqual(@as(usize, 2), sink_state.emitted.items.len);
+}

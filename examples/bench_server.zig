@@ -312,6 +312,7 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             "\"alloc_overflow\":{d},\"sites\":{s}",
         .{ allocs, alloc_bytes, alloc_ns, frees, free_bytes, free_ns, overflow, sites_buf[0..sites_len] },
     );
+    try starh2.edge.tls_edge.writeFailJson(&w);
     if (comptime starh2.edge.tls_edge.observe) {
         try starh2.edge.tls_edge.pump_trace.writeJson(&w);
     }

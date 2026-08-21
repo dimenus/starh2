@@ -152,13 +152,24 @@ pub const FairScheduler = struct {
     emit_kinds: [512]EmitKind = undefined,
     emit_kinds_n: usize = 0,
     sink_origin_emits: usize = 0,
-    /// When this returns true, `drain` stops before popping the next frame so
-    /// the TLS actor can wait on a send completion without fail-closing.
+    /// When this returns true, `drain` stops before popping the next DATA
+    /// frame so the TLS actor can wait on a send completion without fail-closing.
+    /// Fires while an in-flight send holds `pending_n` OR the TLS stash is full.
     pause: ?*const fn (*anyopaque) bool = null,
     pause_ctx: *anyopaque = undefined,
+    /// When this returns true, `drain` stops before popping the next control
+    /// (terminal or ordinary) so a full TLS stash cannot fail-close. Distinct
+    /// from `pause`: a slow peer (`pending_n > 0` with stash room) must still
+    /// emit WINDOW_UPDATE. Only stash-full should set this.
+    pause_control: ?*const fn (*anyopaque) bool = null,
 
     fn isPaused(self: *FairScheduler) bool {
         const f = self.pause orelse return false;
+        return f(self.pause_ctx);
+    }
+
+    fn isControlPaused(self: *FairScheduler) bool {
+        const f = self.pause_control orelse return false;
         return f(self.pause_ctx);
     }
 
@@ -508,13 +519,16 @@ pub const FairScheduler = struct {
         build_data_frame: BuildDataFrame,
         build_ctx: *anyopaque,
     ) anyerror!void {
-        while (self.popTerminal()) |e| {
+        while (self.terminal_len > 0) {
+            if (self.isControlPaused()) break;
+            const e = self.popTerminal() orelse break;
             self.emits_total += 1;
             self.sink_origin_emits += 1;
             self.recordEmitKind(.terminal_control);
             try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
         }
         while (self.ordinary_len > 0) {
+            if (self.isControlPaused()) break;
             if (!self.isPaused() and self.shouldForceDataNow() and self.dataEligible(win_ctx, stream_win, conn_win)) {
                 if (try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) {
                     continue;
