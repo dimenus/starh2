@@ -57,6 +57,16 @@ command -v go >/dev/null 2>&1 || {
   exit 1
 }
 
+# A fresh clone has no testdata/*.pem (gitignored, generated). Without it
+# every TLS arm dies before its ready line and the harness would only say
+# "no ready line", so check first and print the command that creates it.
+for f in testdata/cert.pem testdata/key.pem; do
+  [ -f "$REPO/$f" ] || {
+    echo "$f is missing; create it with:" >&2
+    echo "  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -keyout testdata/key.pem -out testdata/cert.pem -days 365 -nodes -subj '/CN=localhost'" >&2
+    exit 1
+  }
+done
 mkdir -p "$OUT"
 cd "$REPO/tools/sse_bench"
 [ -f go.mod ] || printf 'module ssebench\n\ngo 1.26\n' > go.mod

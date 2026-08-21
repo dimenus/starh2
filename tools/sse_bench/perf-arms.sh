@@ -34,6 +34,16 @@ command -v perf >/dev/null 2>&1 || { echo "perf is required; it is not installed
 sudo -n true 2>/dev/null || { echo "sudo without a password is required for perf kernel samples" >&2; exit 1; }
 command -v go >/dev/null 2>&1 || { echo "go is required for the client" >&2; exit 1; }
 
+# A fresh clone has no testdata/*.pem (gitignored, generated). Without it
+# every TLS arm dies before its ready line and the harness would only say
+# "no ready line", so check first and print the command that creates it.
+for f in testdata/cert.pem testdata/key.pem; do
+  [ -f "$REPO/$f" ] || {
+    echo "$f is missing; create it with:" >&2
+    echo "  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -keyout testdata/key.pem -out testdata/cert.pem -days 365 -nodes -subj '/CN=localhost'" >&2
+    exit 1
+  }
+done
 mkdir -p "$OUT"
 cd "$REPO/tools/sse_bench"
 go build -o "$OUT/sse-client" ./client.go || exit 1
