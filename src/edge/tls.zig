@@ -52,6 +52,8 @@ pub const pump_trace = struct {
     pub var select_write: std.atomic.Value(u64) = .init(0);
     pub var select_peek: std.atomic.Value(u64) = .init(0);
     pub var tryget_write: std.atomic.Value(u64) = .init(0);
+    /// Send completions the driver handled (one per armed send).
+    pub var send_complete: std.atomic.Value(u64) = .init(0);
     pub var read_one: std.atomic.Value(u64) = .init(0);
     pub var want_read: std.atomic.Value(u64) = .init(0);
     pub var read_free_empty_yield: std.atomic.Value(u64) = .init(0);
@@ -506,6 +508,18 @@ pub const Conn = struct {
 /// is reset, so no publish can be missed. Socket writes stay on the driver
 /// so the SSE event path does not gain a hop.
 ///
+/// The socket write is a raw `ev.NetSend` completion on the SAME queue, not
+/// a blocking writer: the driver stages ciphertext from the BIO pair into
+/// `send_buf` and submits it; the completion is one more CQ wake. The driver
+/// therefore never parks on the socket. When the staging buffer is full
+/// behind an in-flight send, the unfinished write batch stays in
+/// `pending_writes` (with the SSL_write offset of the partial chunk) and the
+/// driver waits on the CQ only; the send completion compacts, re-arms, and
+/// the batch resumes. That is the backpressure path, exactly where the old
+/// `writeAll` used to block. A chunk is acked once its record is written
+/// (in the pair or the staging buffer): the same hand-off semantics as
+/// before, one 16 KB buffer earlier.
+///
 /// Ownership: the recv completion lives in this struct and is submitted
 /// only by the driver itself, so it never needs the heap. No other task
 /// submits to the CQ (the actor uses the channel), which is what makes
@@ -563,6 +577,28 @@ pub const Pump = struct {
     recv_op: zio.ev.NetRecv = undefined,
     recv_iov: [1]zio.os.iovec = undefined,
     recv_armed: bool = false,
+    /// Outbound ciphertext staging for the driver's raw `ev.NetSend`. Aliases
+    /// `conn.tcp_writer_buffer`: the blocking writer is handshake-only once
+    /// `run()` starts, so the buffer costs nothing new and the memory ceiling
+    /// is unchanged. `[send_head..send_fill)` is staged; the in-flight send
+    /// covers a prefix of it. `send_op` is rebuilt per submit (the slice
+    /// changes); it is only touched after the CQ handed it back.
+    send_op: zio.ev.NetSend = undefined,
+    send_iov: [1]zio.os.iovec_const = undefined,
+    send_buf: []u8 = &.{},
+    send_head: usize = 0,
+    send_fill: usize = 0,
+    send_armed: bool = false,
+    /// A write batch that could not finish because the staging buffer is full
+    /// behind an in-flight send. `partial_off` is the plaintext offset SSL_write
+    /// already accepted for `pending_writes[0]` (SSL_write retries must pass the
+    /// same buffer, and they do: the chunk bytes do not move). Nothing new is
+    /// taken from `write_ch` while this is non-empty.
+    pending_writes: [max_write_batch]wire_pump.WireChunk = undefined,
+    pending_n: usize = 0,
+    partial_off: usize = 0,
+
+    pub const max_write_batch = 16;
 
     fn post(self: *Pump, c: wire_pump.WriteCompletion) void {
         _ = wire_pump.diag_acks.posted_release.fetchAdd(c.outbound_release, .monotonic);
@@ -644,6 +680,11 @@ pub const Pump = struct {
         }
         // The stashed suffix aliases recv_buf; nothing to release.
         self.pending_cipher = null;
+        for (self.pending_writes[0..self.pending_n]) |chunk| {
+            if (!isSentinel(chunk)) self.releaseChunk(chunk, false, false);
+        }
+        self.pending_n = 0;
+        self.partial_off = 0;
         while (true) {
             const chunk = self.write_ch.tryReceive() catch break;
             if (isSentinel(chunk)) continue;
@@ -652,13 +693,93 @@ pub const Pump = struct {
         self.post(.{ .fail_all = true });
     }
 
-    fn drainToSocket(self: *Pump) bool {
-        self.conn.drainToSocket() catch {
-            self.failDrain();
-            self.post(.{ .shutdown = true });
-            return false;
+    const Stage = enum { ok, full, exit };
+
+    /// Move ciphertext from the BIO pair into the staging buffer and (re)arm
+    /// the send completion. `.full`: the pair still holds records and the
+    /// buffer cannot take them until the in-flight send completes; the caller
+    /// parks on the CQ, never on the socket. `.exit`: CQ closed (teardown).
+    fn stageOutbound(self: *Pump) Stage {
+        while (self.conn.pendingOutboundCiphertext() > 0) {
+            if (self.send_fill == self.send_buf.len) {
+                if (self.send_head > 0 and !self.send_armed) {
+                    self.compactSend();
+                } else break;
+            }
+            const n = self.conn.pair.readEncrypted(self.send_buf[self.send_fill..]) catch |err| switch (err) {
+                error.WantRead => break,
+                else => {
+                    self.failDrain();
+                    self.post(.{ .shutdown = true });
+                    return .exit;
+                },
+            };
+            if (n == 0) break;
+            self.send_fill += n;
+        }
+        if (!self.armSend()) return .exit;
+        if (self.conn.pendingOutboundCiphertext() > 0 and self.send_fill == self.send_buf.len) return .full;
+        return .ok;
+    }
+
+    /// Like `stageOutbound` for callers that only need to know whether the
+    /// connection is still alive; `.full` is tolerated (the records stay in
+    /// the pair and the next send completion stages them).
+    fn stageOrExit(self: *Pump) bool {
+        return self.stageOutbound() != .exit;
+    }
+
+    fn compactSend(self: *Pump) void {
+        std.debug.assert(!self.send_armed);
+        const len = self.send_fill - self.send_head;
+        std.mem.copyForwards(u8, self.send_buf[0..len], self.send_buf[self.send_head..self.send_fill]);
+        self.send_head = 0;
+        self.send_fill = len;
+    }
+
+    /// Submit the staged-but-unsent bytes as one send completion. False only
+    /// when the CQ is already closed (local shutdown owns the exit).
+    fn armSend(self: *Pump) bool {
+        if (self.send_armed or self.send_fill == self.send_head) return true;
+        self.send_op = zio.ev.NetSend.init(
+            self.sock,
+            zio.ev.WriteBuf.fromSlice(self.send_buf[self.send_head..self.send_fill], &self.send_iov),
+            .{},
+        );
+        self.cq.submit(&self.send_op.c) catch |err| switch (err) {
+            error.Closed => return false,
+            error.InvalidCompletion => unreachable,
         };
+        self.send_armed = true;
         return true;
+    }
+
+    /// The send completion fired: advance, compact, stage what the pair still
+    /// holds, re-arm. A short send is just a smaller advance.
+    fn onSendComplete(self: *Pump) RecvOutcome {
+        self.send_armed = false;
+        const n = self.send_op.getResult() catch |err| switch (err) {
+            // Only shutdownCq cancels the op; teardown owns the exit.
+            error.Canceled => return .exit,
+            else => {
+                self.failDrain();
+                self.post(.{ .fail_all = true, .shutdown = true });
+                return .exit;
+            },
+        };
+        pump_trace.bump(&pump_trace.send_complete);
+        self.send_head += n;
+        std.debug.assert(self.send_head <= self.send_fill);
+        if (self.send_head == self.send_fill) {
+            self.send_head = 0;
+            self.send_fill = 0;
+        } else {
+            self.compactSend();
+        }
+        return switch (self.stageOutbound()) {
+            .exit => .exit,
+            .ok, .full => .ok,
+        };
     }
 
     const Feed = enum { done, blocked, eof };
@@ -689,7 +810,7 @@ pub const Pump = struct {
                         .stuck => return .blocked,
                         .want => {},
                     }
-                    if (!self.drainToSocket()) return .eof;
+                    if (!self.stageOrExit()) return .eof;
                     continue;
                 },
                 else => {
@@ -719,24 +840,31 @@ pub const Pump = struct {
         self.carried = self.tryTakeWrite();
     }
 
-    fn sslWriteAll(self: *Pump, bytes: []const u8) bool {
-        var off: usize = 0;
+    const WriteSome = enum { done, full, exit };
+
+    /// SSL_write `bytes` from `self.partial_off` on. `.full`: the staging
+    /// buffer is full behind an in-flight send and `partial_off` holds the
+    /// progress; the caller keeps the chunk pending and parks on the CQ.
+    fn sslWriteSome(self: *Pump, bytes: []const u8) WriteSome {
         var spins: u32 = 0;
-        while (off < bytes.len) {
+        while (self.partial_off < bytes.len) {
             spins += 1;
             if (spins > MaxHandshakeIterations) {
                 self.failDrain();
                 self.post(.{ .shutdown = true });
-                return false;
+                return .exit;
             }
-            const n = self.conn.ssl.write(bytes[off..]) catch |err| switch (err) {
+            const n = self.conn.ssl.write(bytes[self.partial_off..]) catch |err| switch (err) {
                 error.WantWrite => {
-                    if (!self.drainToSocket()) return false;
-                    continue;
+                    switch (self.stageOutbound()) {
+                        .exit => return .exit,
+                        .full => return .full,
+                        .ok => continue,
+                    }
                 },
                 error.WantRead => {
                     switch (self.readOne()) {
-                        .eof => return false,
+                        .eof => return .exit,
                         .ok => continue,
                         .stuck => {
                             self.stealWrite();
@@ -746,7 +874,7 @@ pub const Pump = struct {
                             continue;
                         },
                         .want => {
-                            if (!self.consumeInbound()) return false;
+                            if (!self.consumeInbound()) return .exit;
                             continue;
                         },
                     }
@@ -754,24 +882,15 @@ pub const Pump = struct {
                 else => {
                     self.failDrain();
                     self.post(.{ .shutdown = true });
-                    return false;
+                    return .exit;
                 },
             };
-            if (n == 0) {
-                self.failDrain();
-                self.post(.{ .shutdown = true });
-                return false;
-            }
-            off += n;
+            self.partial_off += n;
         }
-        return true;
+        self.partial_off = 0;
+        return .done;
     }
 
-    /// SSL_write wanted inbound records. Never park here: the actor may be
-    /// in a channel send. A miss yields; `sslWriteAll` retries until bytes
-    /// arrive or MaxHandshakeIterations failDrains. Never SSL_write here
-    /// (OpenSSL rejects a different buffer until the current SSL_write
-    /// retries) — ingest only.
     fn consumeInbound(self: *Pump) bool {
         if (self.pending_cipher) |bytes| {
             self.pending_cipher = null;
@@ -787,42 +906,34 @@ pub const Pump = struct {
         return true;
     }
 
+    /// Take a batch off `write_ch` (first already taken) into `pending_writes`
+    /// and drive it. Returns false on exit; true otherwise, including the
+    /// parked case (`pending_n > 0`, waiting for a send completion).
     fn writeChunks(self: *Pump, first: wire_pump.WireChunk) bool {
-        if (first.len == 0 and first.bytes.len == 0) {
-            if (first.flush_barrier) {
-                pump_trace.bump(&pump_trace.write_chunks);
-                pump_trace.add(&pump_trace.write_chunk_sum, 1);
-                if (!self.drainToSocket()) {
-                    self.releaseChunk(first, false, false);
-                    return false;
-                }
-                self.releaseChunk(first, true, false);
-                return true;
-            }
+        std.debug.assert(self.pending_n == 0);
+        if (first.len == 0 and first.bytes.len == 0 and !first.flush_barrier) {
             self.failDrain();
             self.post(.{ .shutdown = true });
             return false;
         }
-
-        const max_batch = 16;
-        var chunks: [max_batch]wire_pump.WireChunk = undefined;
-        chunks[0] = first;
-        var count: usize = 1;
-        if (self.test_delay_ms == 0 and self.test_fail_after == 0) {
-            while (count < max_batch) {
+        self.pending_writes[0] = first;
+        self.pending_n = 1;
+        self.partial_off = 0;
+        if (!first.flush_barrier and self.test_delay_ms == 0 and self.test_fail_after == 0) {
+            while (self.pending_n < max_write_batch) {
                 if (self.pending_cipher != null) break;
                 const next = self.tryTakeWrite() orelse break;
                 if (next.len == 0 and next.bytes.len == 0) {
                     self.carried = next;
                     break;
                 }
-                chunks[count] = next;
-                count += 1;
+                self.pending_writes[self.pending_n] = next;
+                self.pending_n += 1;
             }
         }
         if (self.test_delay_ms > 0) {
             self.io.sleep(.fromMilliseconds(@intCast(self.test_delay_ms)), .awake) catch {
-                self.releaseChunk(first, false, false);
+                self.failPending();
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return false;
@@ -830,27 +941,71 @@ pub const Pump = struct {
         }
         const fail_next = wire_pump.test_fail_next_write.swap(false, .acq_rel);
         if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
-            for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
+            self.failPending();
             self.failDrain();
             self.post(.{ .shutdown = true });
             return false;
         }
         pump_trace.bump(&pump_trace.write_chunks);
-        pump_trace.add(&pump_trace.write_chunk_sum, count);
-        if (wire_pump.write_trace.enabled) wire_pump.write_trace.note(count);
-        for (chunks[0..count]) |chunk| {
-            if (!self.sslWriteAll(chunk.bytes[0..chunk.len])) {
-                for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
-                return false;
+        pump_trace.add(&pump_trace.write_chunk_sum, self.pending_n);
+        if (wire_pump.write_trace.enabled) wire_pump.write_trace.note(self.pending_n);
+        return self.drivePending();
+    }
+
+    fn failPending(self: *Pump) void {
+        for (self.pending_writes[0..self.pending_n]) |c| self.releaseChunk(c, false, false);
+        self.pending_n = 0;
+        self.partial_off = 0;
+    }
+
+    fn popPending(self: *Pump) void {
+        std.debug.assert(self.pending_n > 0);
+        std.mem.copyForwards(
+            wire_pump.WireChunk,
+            self.pending_writes[0 .. self.pending_n - 1],
+            self.pending_writes[1..self.pending_n],
+        );
+        self.pending_n -= 1;
+        self.partial_off = 0;
+    }
+
+    /// SSL_write the pending batch in order; ack each chunk as its record is
+    /// written; stop (keep the rest pending) when the staging buffer is full
+    /// behind an in-flight send. Returns false on exit.
+    fn drivePending(self: *Pump) bool {
+        while (self.pending_n > 0) {
+            const chunk = self.pending_writes[0];
+            if (chunk.len == 0 and chunk.bytes.len == 0) {
+                // A flush barrier: everything before it must be staged.
+                std.debug.assert(chunk.flush_barrier);
+                switch (self.stageOutbound()) {
+                    .exit => {
+                        self.failPending();
+                        return false;
+                    },
+                    .full => return true,
+                    .ok => {},
+                }
+                self.popPending();
+                self.releaseChunk(chunk, true, false);
+                continue;
+            }
+            switch (self.sslWriteSome(chunk.bytes[0..chunk.len])) {
+                .exit => {
+                    self.failPending();
+                    return false;
+                },
+                .full => return true,
+                .done => {
+                    self.popPending();
+                    self.writes_done += 1;
+                    self.releaseChunk(chunk, true, false);
+                },
             }
         }
-        if (!self.drainToSocket()) {
-            for (chunks[0..count]) |c| self.releaseChunk(c, false, false);
-            return false;
-        }
-        self.writes_done += count;
-        for (chunks[0..count]) |chunk| self.releaseChunk(chunk, true, false);
-        return true;
+        // Batch end: move the records into the staging buffer and arm the
+        // send. `.full` here is fine: the rest stages on the next completion.
+        return self.stageOutbound() != .exit;
     }
 
     const ReadOutcome = enum { ok, eof, want, stuck };
@@ -891,7 +1046,7 @@ pub const Pump = struct {
             },
             error.WantWrite => {
                 if (idx) |i| self.returnReadIndex(i) else self.gpa.free(buf);
-                if (!self.drainToSocket()) return .eof;
+                if (!self.stageOrExit()) return .eof;
                 return .want;
             },
             else => {
@@ -969,14 +1124,21 @@ pub const Pump = struct {
 
     const RecvPoll = enum { none, progress, exit };
 
-    /// Take one completed recv off the CQ without blocking.
+    /// Take one completion (recv or send) off the CQ without blocking.
     fn pollRecv(self: *Pump) RecvPoll {
         const c = self.cq.next() orelse return .none;
-        std.debug.assert(c == &self.recv_op.c);
-        return switch (self.onRecvComplete()) {
+        return switch (self.onCqComplete(c)) {
             .ok => .progress,
             .exit => .exit,
         };
+    }
+
+    /// Dispatch one CQ completion: the recv op or the send op, nothing else
+    /// is ever submitted to this queue.
+    fn onCqComplete(self: *Pump, c: *zio.ev.Completion) RecvOutcome {
+        if (c == &self.recv_op.c) return self.onRecvComplete();
+        std.debug.assert(c == &self.send_op.c);
+        return self.onSendComplete();
     }
 
     const RecvOutcome = enum { ok, exit };
@@ -1018,9 +1180,15 @@ pub const Pump = struct {
     }
 
     pub fn run(self: *Pump) void {
-        // Recreate the writer on this task. Handshake bound one on the
-        // handshake Select arm; that wait context is gone.
-        self.conn.bindWriter(self.io);
+        // The handshake's buffered writer is not used past this point: its
+        // buffer becomes the send staging area (see `send_buf`), and every
+        // socket write from here on is a CQ completion.
+        self.send_buf = self.conn.tcp_writer_buffer[0..];
+        self.send_head = 0;
+        self.send_fill = 0;
+        self.send_armed = false;
+        self.pending_n = 0;
+        self.partial_off = 0;
         if (self.task_handle_fn) |f| {
             if (self.task_h) |h| h.store(f(), .release);
         }
@@ -1043,12 +1211,24 @@ pub const Pump = struct {
             pump_trace.bump(&pump_trace.turns);
             var progress = false;
 
-            if (self.carried) |chunk| {
-                self.carried = null;
+            // A batch parked behind a full staging buffer resumes first; the
+            // send completion that made room already staged and re-armed.
+            if (self.pending_n > 0) {
+                const before = self.pending_n;
                 self.site.store(3, .release);
-                if (!self.writeChunks(chunk)) return;
+                if (!self.drivePending()) return;
                 self.site.store(1, .release);
-                progress = true;
+                if (self.pending_n < before) progress = true;
+            }
+
+            if (self.pending_n == 0) {
+                if (self.carried) |chunk| {
+                    self.carried = null;
+                    self.site.store(3, .release);
+                    if (!self.writeChunks(chunk)) return;
+                    self.site.store(1, .release);
+                    progress = true;
+                }
             }
 
             if (self.pending_read) |chunk| {
@@ -1083,11 +1263,13 @@ pub const Pump = struct {
                 }
             }
 
-            if (self.tryTakeWrite()) |chunk| {
-                self.site.store(3, .release);
-                if (!self.writeChunks(chunk)) return;
-                self.site.store(1, .release);
-                progress = true;
+            if (self.pending_n == 0) {
+                if (self.tryTakeWrite()) |chunk| {
+                    self.site.store(3, .release);
+                    if (!self.writeChunks(chunk)) return;
+                    self.site.store(1, .release);
+                    progress = true;
+                }
             }
             if (self.pending_cipher == null) {
                 switch (self.pollRecv()) {
@@ -1101,6 +1283,34 @@ pub const Pump = struct {
             }
 
             if (progress) continue;
+
+            // A write batch parked behind a full staging buffer: the only
+            // event that can move it is the in-flight send completing, so
+            // wait on the CQ alone (recv or send) and take nothing new from
+            // write_ch. Never spin here: with inbound blocked at the same
+            // time the retry loop below would burn a core until the peer
+            // reads. The t-866 invariant still holds: drain inbound first.
+            if (self.pending_n > 0) {
+                if (self.pending_read == null and self.conn.pendingInbound()) {
+                    switch (self.readOne()) {
+                        .eof => return,
+                        .ok => continue,
+                        .want, .stuck => {},
+                    }
+                }
+                std.debug.assert(self.send_armed);
+                if (diag_wait) self.traceWaitSnapshot();
+                self.site.store(2, .release);
+                const c = self.cq.wait() catch {
+                    self.site.store(1, .release);
+                    self.failDrain();
+                    self.post(.{ .fail_all = true, .shutdown = true });
+                    return;
+                };
+                self.site.store(1, .release);
+                if (self.onCqComplete(c) == .exit) return;
+                continue;
+            }
 
             // No reset, no dirty flag, no recheck list: the CQ and the
             // channel are the only producers, and both implement the future
@@ -1160,8 +1370,7 @@ pub const Pump = struct {
                         self.post(.{ .fail_all = true, .shutdown = true });
                         return;
                     };
-                    std.debug.assert(c == &self.recv_op.c);
-                    if (self.onRecvComplete() == .exit) return;
+                    if (self.onCqComplete(c) == .exit) return;
                 },
                 .write => |r| {
                     const chunk = r catch {
@@ -1176,7 +1385,9 @@ pub const Pump = struct {
                 },
             }
         }
-        _ = self.drainToSocket();
+        // Best effort: stage what the pair holds and let the in-flight send
+        // finish or be canceled by shutdownCq; the socket is shut down next.
+        _ = self.stageOutbound();
         self.failDrain();
         self.post(.{ .shutdown = true });
     }
@@ -1193,7 +1404,7 @@ pub const Pump = struct {
         const read_free_q = io_queue.queued(u32, self.read_free, self.io);
         const write_free_q: usize = if (self.write_free) |q| io_queue.queued(u32, q, self.io) else 0;
         rawPrint(
-            "STARH2_PUMPWAIT write_empty={} read_q={d} read_free={d} write_free={d} carried={} pending_read={} pending_cipher={} recv_armed={} plaintext={d} bio_in={d} bio_out={d}\n",
+            "STARH2_PUMPWAIT write_empty={} read_q={d} read_free={d} write_free={d} carried={} pending_read={} pending_cipher={} recv_armed={} send_armed={} send_staged={d} pending_writes={d} plaintext={d} bio_in={d} bio_out={d}\n",
             .{
                 self.write_ch.isEmpty(),
                 read_q,
@@ -1203,6 +1414,9 @@ pub const Pump = struct {
                 self.pending_read != null,
                 self.pending_cipher != null,
                 self.recv_armed,
+                self.send_armed,
+                self.send_fill - self.send_head,
+                self.pending_n,
                 self.conn.pendingPlaintext(),
                 self.conn.pendingInboundCiphertext(),
                 self.conn.pendingOutboundCiphertext(),
@@ -1364,4 +1578,3 @@ test "memory BIO pair is bounded and opposite directions do not mix" {
     var buf: [8]u8 = undefined;
     try std.testing.expectError(error.WantRead, pair.readEncrypted(&buf));
 }
-
