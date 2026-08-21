@@ -73,7 +73,7 @@ This is not an identical stack comparison: both arms here use BoringSSL
 (`http2-boring` vs starh2 `TlsPump`). The starh2 h2c arm remains in the same
 run so the result shows whether a gap survives after removing TLS cost.
 
-## Concurrent SSE benchmark against Go
+## Concurrent SSE benchmark against Go and Kestrel
 
 ```sh
 STREAMS=200 SECONDS_RUN=10 INTERVAL=1 ROUNDS=3 tools/sse_bench/run.sh
@@ -90,18 +90,30 @@ and warm-up because it is sampled around the complete client invocation.
 
 The script defaults Starh2 to two zio executors for this connection-heavy
 streaming shape; override with `STARH2_EXECUTORS=N`. The benchmark server itself
-keeps `.auto` when `--executors` is omitted, so the one-shot harness is not
-silently constrained by the SSE-specific runtime topology. Set
-`STARH2_EXECUTORS=auto` to restore that default here. Go uses its default
-`GOMAXPROCS` unless `GO_MAX_PROCS=N` is set; setting both values to the same
-number compares equal scheduler widths. Starh2 keeps zio task migration off:
-repeated TLS connection churn can otherwise strand a socket task. Pass
-`--task-migration` directly to `starh2-bench-server` only when reproducing that
-upstream runtime failure.
+uses physical cores (not SMT siblings) when `--executors` is omitted, so the
+one-shot harness is not silently constrained by the SSE-specific runtime
+topology and does not double-book hyperthreads. Set `STARH2_EXECUTORS=auto` to
+get that physical count from the harness; `STARH2_EXECUTORS=N` pins exactly N.
+Every opponent is pinned to the same scheduler width as starh2 by default:
+`OPPONENT_WIDTH=match` reads the executor count from the starh2 ready line
+and sets `GOMAXPROCS` and `DOTNET_PROCESSOR_COUNT` to it; `OPPONENT_WIDTH=N` pins exactly N; `OPPONENT_WIDTH=default` leaves
+the runtime defaults (every logical CPU), which is what rows before this
+normalization measured. Each arm prints the width it runs with in its ready
+line and the harness refuses to measure when a pinned arm differs
+(`tools/sse_bench/arm_width.sh`). Starh2 keeps zio
+task migration off: repeated TLS connection churn can otherwise strand a
+socket task. Pass `--task-migration` directly to `starh2-bench-server` only
+when reproducing that upstream runtime failure.
 
 `tools/sse_bench/mixed.sh` keeps SSE streams live on one TLS connection and
-fires oneshots on the same socket (Go opponent; http2.zig cannot stream).
-Oneshot-only is the control. `STALL=0` skips the blocked-reader pass.
+fires oneshots on the same socket (Go net/http and Kestrel opponents;
+http2.zig cannot stream). Oneshot-only is the control. `STALL=0` skips the
+blocked-reader pass. `CONNS=N` spreads the Go client over N TLS connections
+(default 1, the Datastar socket). `CONNS=50 ONESHOT_WORKERS=500 STREAMS=0`
+is the official h2load shape (`-c 50 -m 10`); use `STARH2_EXECUTORS=auto`
+there so starh2 is not pinned to the two-executor SSE topology. Kestrel
+listens on :19452 (mixed) / :19449 (run.sh); `dotnet` 10 is required for
+that arm.
 
 ## Isolated pipeline benchmark
 

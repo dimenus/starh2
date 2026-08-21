@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"time"
 )
 
@@ -57,6 +58,8 @@ func main() {
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	srv := &http.Server{Addr: addr, Handler: mux}
 	// ListenAndServeTLS negotiates h2 through ALPN automatically.
-	fmt.Printf("{\"ready\":true,\"port\":%d}\n", *port)
+	// width is the scheduler width this arm actually runs with, so the
+	// harness can check that every arm is pinned the same (GOMAXPROCS).
+	fmt.Printf("{\"ready\":true,\"port\":%d,\"width\":%d}\n", *port, runtime.GOMAXPROCS(0))
 	log.Fatal(srv.ListenAndServeTLS(*cert, *key))
 }

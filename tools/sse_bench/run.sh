@@ -1,5 +1,6 @@
 #!/bin/sh
-# Concurrent long-lived SSE: starh2 against Go's net/http, over TLS h2.
+# Concurrent long-lived SSE: starh2 against Go net/http and Kestrel, over
+# TLS h2.
 #
 # # Why Go is the opponent
 #
@@ -7,7 +8,9 @@
 # on 0.16 (hendriknielaender/http2.zig) has a one-shot handler API — fn(ctx)
 # !Response with setBody — no flush, no event-stream. So the SSE arm has no Zig
 # opponent, and Go's net/http is used instead: a mature h2 server that shares no
-# code with anything here.
+# code with anything here. Kestrel is the second such opponent; it speaks
+# HTTP/2 TLS with the same `data: <unix-nanos>` contract as server.go, not the
+# Datastar SDK.
 #
 # # Why this is not h2load
 #
@@ -36,17 +39,19 @@ set -u
 
 REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 . "$REPO/tools/bench_lock.sh"
+. "$REPO/tools/sse_bench/kestrel_publish.sh"
+. "$REPO/tools/sse_bench/arm_width.sh"
 STREAMS=${STREAMS:-200}
 SECONDS_RUN=${SECONDS_RUN:-10}
 INTERVAL=${INTERVAL:-10}
 ROUNDS=${ROUNDS:-4}
 WARMUP=${WARMUP:-1}
 STARH2_EXECUTORS=${STARH2_EXECUTORS:-2}
-GO_MAX_PROCS=${GO_MAX_PROCS:-auto}
+CONNS=${CONNS:-1}
 OUT=${OUT:-/tmp/starh2-sse-bench}
 
 command -v go >/dev/null 2>&1 || {
-  echo "go is required for the opponent arm; it is not installed" >&2
+  echo "go is required for the go-net/http arm; it is not installed" >&2
   exit 1
 }
 
@@ -55,8 +60,10 @@ cd "$REPO/tools/sse_bench"
 [ -f go.mod ] || printf 'module ssebench\n\ngo 1.26\n' > go.mod
 go build -o "$OUT/sse-server" ./server.go || exit 1
 go build -o "$OUT/sse-client" ./client.go || exit 1
-
 cd "$REPO"
+publish_kestrel || exit 1
+KESTREL="$OUT/kestrel/sse-kestrel"
+
 # Install to a known prefix and use THAT path. Picking the newest binary in
 # .zig-cache by mtime measures whatever the last build step happened to write:
 # after `zig build ci`, that is an example at a different optimize level, and
@@ -73,26 +80,29 @@ else
     --executors "$STARH2_EXECUTORS" > "$OUT/starh2.log" 2>&1 &
 fi
 S_PID=$!
-if [ "$GO_MAX_PROCS" = auto ]; then
-  "$OUT/sse-server" -port 19447 -sse-interval-ms "$INTERVAL" -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
-else
-  GOMAXPROCS="$GO_MAX_PROCS" "$OUT/sse-server" -port 19447 -sse-interval-ms "$INTERVAL" -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
-fi
+STARH2_WIDTH=$(starh2_width "$OUT/starh2.log") || { kill $S_PID; bench_unlock; exit 1; }
+WIDTH=$(opponent_width "$STARH2_WIDTH")
+PIN=$(width_env "$WIDTH")
+$PIN "$OUT/sse-server" -port 19447 -sse-interval-ms "$INTERVAL" -cert testdata/cert.pem -key testdata/key.pem > "$OUT/go.log" 2>&1 &
 G_PID=$!
-sleep 2
+$PIN "$KESTREL" -port 19449 -sse-interval-ms "$INTERVAL" \
+  -cert testdata/cert.pem -key testdata/key.pem > "$OUT/kestrel.log" 2>&1 &
+K_PID=$!
 
 cleanup() {
-  kill ${S_RSS_PID:-} ${G_RSS_PID:-} $S_PID $G_PID 2>/dev/null
+  kill ${S_RSS_PID:-} ${G_RSS_PID:-} ${K_RSS_PID:-} $S_PID $G_PID $K_PID 2>/dev/null
   wait 2>/dev/null
   bench_unlock
 }
 trap cleanup EXIT INT TERM
 
+check_widths "$WIDTH" "$OUT/go.log" "$OUT/kestrel.log" || exit 1
+
 # An arm that never answered must not be reported as a slow arm.
-for port in 19446 19447; do
+for port in 19446 19447 19449; do
   if ! "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams 1 -seconds 2 -warmup "$WARMUP" -label probe >/dev/null 2>&1; then
     echo "the server on port $port did not deliver an event — refusing to report" >&2
-    kill $S_PID $G_PID 2>/dev/null
+    kill $S_PID $G_PID $K_PID 2>/dev/null
     exit 1
   fi
 done
@@ -111,6 +121,8 @@ sample_rss "$S_PID" "$OUT/starh2-rss.txt" &
 S_RSS_PID=$!
 sample_rss "$G_PID" "$OUT/go-rss.txt" &
 G_RSS_PID=$!
+sample_rss "$K_PID" "$OUT/kestrel-rss.txt" &
+K_RSS_PID=$!
 
 cpu_seconds() {
   ps -o time= -p "$1" | awk '{
@@ -125,23 +137,29 @@ cpu_seconds() {
 }
 
 target=$(( SECONDS_RUN * 1000 / INTERVAL * STREAMS ))
-echo "== $STREAMS streams, ${SECONDS_RUN}s + ${WARMUP}s warmup, one event per ${INTERVAL}ms, $ROUNDS rounds"
-echo "== runtime: starh2 executors=$STARH2_EXECUTORS  go GOMAXPROCS=$GO_MAX_PROCS"
+echo "== $STREAMS streams, $CONNS conns, ${SECONDS_RUN}s + ${WARMUP}s warmup, one event per ${INTERVAL}ms, $ROUNDS rounds"
+echo "== runtime: starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH)  opponents width=$WIDTH  kestrel :19449"
 echo "== target $target events per arm per round ($(( STREAMS * 1000 / INTERVAL )) events/s)"
 
 i=1
 while [ "$i" -le "$ROUNDS" ]; do
   echo "round $i"
-  if [ $(( i % 2 )) -eq 1 ]; then
-    order="starh2:19446 go-net/http:19447"
-  else
-    order="go-net/http:19447 starh2:19446"
-  fi
+  # Cyclic shift: over three rounds every arm runs once in every position.
+  case $(( (i - 1) % 3 )) in
+    0) order="starh2:19446 go-net/http:19447 kestrel:19449" ;;
+    1) order="go-net/http:19447 kestrel:19449 starh2:19446" ;;
+    2) order="kestrel:19449 starh2:19446 go-net/http:19447" ;;
+  esac
   for arm in $order; do
     name=${arm%%:*}; port=${arm##*:}
-    if [ "$name" = starh2 ]; then pid=$S_PID; else pid=$G_PID; fi
+    case $name in
+      starh2) pid=$S_PID ;;
+      go-net/http) pid=$G_PID ;;
+      kestrel) pid=$K_PID ;;
+    esac
     cpu_before=$(cpu_seconds "$pid")
     "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams "$STREAMS" \
+      -conns "$CONNS" \
       -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$name" | sed 's/^/  /'
     cpu_after=$(cpu_seconds "$pid")
     cpu_used=$(awk -v before="$cpu_before" -v after="$cpu_after" 'BEGIN { printf "%.2f", after - before }')
@@ -152,12 +170,14 @@ done
 
 starh2_retained=$(ps -o rss= -p $S_PID)
 go_retained=$(ps -o rss= -p $G_PID)
-kill $S_RSS_PID $G_RSS_PID 2>/dev/null
-wait $S_RSS_PID $G_RSS_PID 2>/dev/null
+kestrel_retained=$(ps -o rss= -p $K_PID)
+kill $S_RSS_PID $G_RSS_PID $K_RSS_PID 2>/dev/null
+wait $S_RSS_PID $G_RSS_PID $K_RSS_PID 2>/dev/null
 starh2_peak=$(awk 'BEGIN { m=0 } $1 > m { m=$1 } END { print m }' "$OUT/starh2-rss.txt")
 go_peak=$(awk 'BEGIN { m=0 } $1 > m { m=$1 } END { print m }' "$OUT/go-rss.txt")
+kestrel_peak=$(awk 'BEGIN { m=0 } $1 > m { m=$1 } END { print m }' "$OUT/kestrel-rss.txt")
 echo "== RSS sampled during benchmark rounds"
-echo "  peak:     starh2=${starh2_peak}KB  go=${go_peak}KB"
-echo "  retained: starh2=${starh2_retained}KB  go=${go_retained}KB"
+echo "  peak:     starh2=${starh2_peak}KB  go=${go_peak}KB  kestrel=${kestrel_peak}KB"
+echo "  retained: starh2=${starh2_retained}KB  go=${go_retained}KB  kestrel=${kestrel_retained}KB"
 cleanup
 trap - EXIT INT TERM
