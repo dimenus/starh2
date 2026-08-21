@@ -1295,11 +1295,11 @@ const Connection = struct {
 
     /// Release everything, in an order that cannot double-free.
     ///
-    /// Every channel is drained BEFORE its backing buffer is freed, and each
-    /// drain applies the accounting a live write-ack would have applied — the
-    /// actor has already stopped by now. Queued read chunks return their pool
-    /// index; queued write chunks return a write-pool index or free a GPA
-    /// fallback, then release wire bytes.
+    /// Every channel is drained BEFORE its backing buffer is freed. Queued
+    /// read chunks return their pool index; queued write chunks return a
+    /// write-pool index or free a GPA fallback, then release wire bytes.
+    /// Write-ack leftovers are NOT drained here: `drainWriteAcksForced` is
+    /// the sole owner (t-894). A second drain absorbed skipping that one.
     ///
     /// The completion drain uses `releaseSlot` and never discards. A reaper can
     /// post after `shutdownHandlers` returned, and a discarded completion would
@@ -1363,19 +1363,7 @@ const Connection = struct {
             self.releaseSlot(sid);
         }
         for (self.handlers) |s| std.debug.assert(!s.in_use);
-        var held_i: usize = 0;
-        while (held_i < self.held_ack_n) : (held_i += 1) {
-            const ack = self.held_acks[held_i];
-            _ = wire_pump.diag_acks.applied_release.fetchAdd(ack.outbound_release, .monotonic);
-            self.applyOutboundRelease(ack.outbound_release, .wire);
-            if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
-        }
-        self.held_ack_n = 0;
-        while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
-            _ = wire_pump.diag_acks.applied_release.fetchAdd(ack.outbound_release, .monotonic);
-            self.applyOutboundRelease(ack.outbound_release, .wire);
-            if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
-        }
+        self.assertWriteAcksDrained();
 
         self.session.deinit();
         const RelCtx = struct {
@@ -1666,8 +1654,26 @@ const Connection = struct {
         }
     }
 
-    /// Teardown: apply a leftover stash and every remaining completion,
-    /// ignoring the test hold so occupancy cannot leak past `deinit`.
+    /// Occupancy Forced has not yet applied. `deinit` panics when this is
+    /// nonzero: a second drain here used to absorb skipping Forced (t-894).
+    fn leftoverWriteAckCount(self: *Connection) usize {
+        return self.held_ack_n + io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch);
+    }
+
+    fn assertWriteAcksDrained(self: *Connection) void {
+        const leftover_acks = io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch);
+        if (self.held_ack_n == 0 and leftover_acks == 0) return;
+        std.debug.panic(
+            "deinit: leftover write acks (ack_q={d} held_acks={d}); drainWriteAcksForced is the sole owner",
+            .{ leftover_acks, self.held_ack_n },
+        );
+    }
+
+    /// Sole owner of leftover write-ack apply on teardown. `run`'s defer
+    /// calls this after `Future.cancel`, which waits until the pump has
+    /// exited, so every completion the pump posted is already in the channel.
+    /// `deinit` asserts the channel is then empty (t-894); a second drain
+    /// there absorbed skipping this one.
     fn drainWriteAcksForced(self: *Connection) void {
         var i: usize = 0;
         while (i < self.held_ack_n) : (i += 1) {
@@ -2374,9 +2380,9 @@ const Connection = struct {
     /// 2. `shutdown` the socket. A read parked in the kernel does not observe a
     ///    flag, so this is what unblocks it; task cancellation is the
     ///    authoritative backstop.
-    /// 3. Cancel the pump(s), then drain leftover write completions. The drain
-    ///    must be last, because it applies the releases the pumps emit while
-    ///    they stop.
+    /// 3. Cancel the pump(s) — `Future.cancel` waits until they have exited —
+    ///    then `drainWriteAcksForced` applies every leftover completion. That
+    ///    drain is the sole owner; `deinit` asserts the channel is empty.
     /// 4. `shutdownHandlers` runs after the loop and returns only when every
     ///    slot has passed through `releaseSlot`.
     /// 5. Close the socket exactly once, guarded by `socket_closed`.
@@ -5426,3 +5432,56 @@ pub const BenchHop = struct {
         }
     }
 };
+
+test "t-894 leftover write acks: skip Forced is visible, Forced then deinit is quiet" {
+    // Mutation-c (t-882) skipped only drainWriteAcksForced and deinit's
+    // second drain absorbed it. This test is that mutation: leftovers in
+    // BOTH the held stash and the channel make leftoverWriteAckCount != 0
+    // (the deinit panic arm). Forced applies them; deinit then stays quiet.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const limits = limits_mod.Limits.defaults;
+    var slabs = try slab_pool.SlabPool.init(gpa, io, limits.outbound_bytes_per_stream, 8);
+    defer slabs.deinit(gpa);
+
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try bind.listen(io, .{ .reuse_address = true });
+    const dest = listener.socket.address;
+    const peer = dest.connect(io, .{ .mode = .stream }) catch |err| {
+        listener.socket.close(io);
+        return err;
+    };
+    const accepted = listener.accept(io) catch |err| {
+        peer.close(io);
+        listener.socket.close(io);
+        return err;
+    };
+    listener.socket.close(io);
+
+    var hop: BenchHop = undefined;
+    hop.open(accepted, .{
+        .io = io,
+        .mode = .h2c,
+        .limits = limits,
+        .router = .{ .routes = &.{} },
+        .gpa = gpa,
+        .slab_pool = &slabs,
+    }) catch |err| {
+        peer.close(io);
+        return err;
+    };
+    defer {
+        hop.conn.drainWriteAcksForced();
+        hop.deinit();
+        peer.close(io);
+    }
+
+    hop.conn.held_acks[0] = .{};
+    hop.conn.held_ack_n = 1;
+    hop.conn.write_ack_ch.trySend(.{}) catch unreachable;
+    try std.testing.expect(hop.conn.leftoverWriteAckCount() != 0);
+
+    hop.conn.drainWriteAcksForced();
+    try std.testing.expectEqual(@as(usize, 0), hop.conn.leftoverWriteAckCount());
+    hop.conn.assertWriteAcksDrained();
+}
