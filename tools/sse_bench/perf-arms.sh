@@ -27,6 +27,9 @@ WARMUP=${WARMUP:-1}
 STARH2_EXECUTORS=${STARH2_EXECUTORS:-auto}
 ARMS=${ARMS:-"starh2 hyper"}
 PERF_HZ=${PERF_HZ:-999}
+# Tracepoints counted over the client window (see the syscalls-per-request
+# lines). Parks end in io_uring_enter (zio), epoll_wait (tokio) or futex.
+SYSCALL_EVENTS=${SYSCALL_EVENTS:-syscalls:sys_enter_io_uring_enter,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_epoll_pwait,syscalls:sys_enter_futex,syscalls:sys_enter_sendmsg,syscalls:sys_enter_sendto,syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_recvfrom,syscalls:sys_enter_recvmsg,syscalls:sys_enter_read,syscalls:sys_enter_readv}
 OUT=${OUT:-/tmp/starh2-perf-arms}
 
 [ "$(uname -s)" = Linux ] || { echo "perf-arms.sh is Linux-only (perf)" >&2; exit 1; }
@@ -87,11 +90,18 @@ measure() {
   cpu0=$(proc_cpu "$pid"); ctx0=$(proc_ctxt "$pid")
   sudo perf record -F "$PERF_HZ" -g -p "$pid" -o "$OUT/$arm.perf.data" >"$OUT/$arm.perf.log" 2>&1 &
   perf_pid=$!
+  # Syscall counts over the same window: how a voluntary context switch
+  # ends (io_uring_enter vs epoll vs futex) and how many socket syscalls a
+  # request costs. Tracepoints need root, hence sudo.
+  sudo perf stat -x, -e "$SYSCALL_EVENTS" -p "$pid" -o "$OUT/$arm.stat.csv" >/dev/null 2>&1 &
+  stat_pid=$!
   sleep 0.5
   "$OUT/sse-client" -streams 0 -conns "$CONNS" -oneshot-url "https://127.0.0.1:$port/" \
-    -oneshot-workers "$ONESHOT_WORKERS" -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$arm" | sed 's/^/  /'
+    -oneshot-workers "$ONESHOT_WORKERS" -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$arm" | tee "$OUT/$arm.client.txt" | sed 's/^/  /'
   sudo kill -INT "$perf_pid" 2>/dev/null
+  sudo kill -INT "$stat_pid" 2>/dev/null
   wait "$perf_pid" 2>/dev/null
+  wait "$stat_pid" 2>/dev/null
   cpu1=$(proc_cpu "$pid"); ctx1=$(proc_ctxt "$pid")
   # Fields: utime0 stime0 utime1 stime1 vol0 nonvol0 vol1 nonvol1 (ticks / counts).
   echo "$cpu0 $cpu1 $ctx0 $ctx1" | tee "$OUT/$arm.raw.txt" | awk -v hz="$hz" -v arm="$arm" '{
@@ -109,6 +119,13 @@ measure() {
   echo "  $arm by dso:"; sed 's/^/    /' "$OUT/$arm.dso.txt"
   echo "  $arm top symbols (self):"; head -30 "$OUT/$arm.report.txt" | cut -c1-160 | sed 's/^/    /'
   echo "  $arm top kernel symbols:"; head -15 "$OUT/$arm.kernel.txt" | cut -c1-120 | sed 's/^/    /'
+  # perf stat -x, rows: count,unit,event,...; requests = the client's ok count.
+  reqs=$(grep -m1 'oneshot ok=' "$OUT/$arm.client.txt" 2>/dev/null | sed 's/.*ok=\([0-9]*\).*/\1/')
+  echo "  $arm syscalls per request (window, ok=$reqs):"
+  sudo chown "$(id -u)" "$OUT/$arm.stat.csv" 2>/dev/null
+  awk -F, -v reqs="${reqs:-0}" '$1 ~ /^[0-9]+$/ && reqs > 0 {
+    name = $3; sub(/^syscalls:sys_enter_/, "", name)
+    printf "    %-16s %10d  %6.3f/req\n", name, $1, $1 / reqs }' "$OUT/$arm.stat.csv"
 }
 
 bench_lock
