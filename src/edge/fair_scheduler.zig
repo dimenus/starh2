@@ -513,13 +513,10 @@ pub const FairScheduler = struct {
             self.sink_origin_emits += 1;
             self.recordEmitKind(.terminal_control);
             try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
-            if (self.isPaused()) return;
         }
         while (self.ordinary_len > 0) {
-            if (self.isPaused()) return;
-            if (self.shouldForceDataNow() and self.dataEligible(win_ctx, stream_win, conn_win)) {
+            if (!self.isPaused() and self.shouldForceDataNow() and self.dataEligible(win_ctx, stream_win, conn_win)) {
                 if (try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) {
-                    if (self.isPaused()) return;
                     continue;
                 }
             }
@@ -530,7 +527,6 @@ pub const FairScheduler = struct {
             self.emitted_controls_since_data += 1;
             self.ctrl.noteControl();
             try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
-            if (self.isPaused()) return;
         }
         while (true) {
             if (self.isPaused()) return;

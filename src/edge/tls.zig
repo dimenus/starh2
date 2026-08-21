@@ -8,22 +8,18 @@
 //!
 //! The pump is a `zio.CompletionQueue` driver owned by the actor. The socket
 //! read is a raw `ev.NetRecv` completion the actor submits and re-submits
-//! after each arrival. Outbound frames still arrive on a
-//! `zio.Channel(WireChunk)` in M2 (the actor is the consumer too, so
-//! `pushWriteChunk` never parks on send). The actor's idle wait is one
-//! `select` that includes `.io = &cq` — the CQ implements the future
-//! protocol. There is no wake Event, no dirty flag, no reset-then-recheck
-//! list: the lost-wake class of the old protocol is unsayable here, because
-//! nothing is ever reset.
+//! after each arrival. Outbound frames SSL_write on the same task
+//! (`queueWire` → `writeChunks`); ciphertext stages into the handshake
+//! writer's buffer and arms `ev.NetSend`. Acks apply locally in `post`.
+//! The actor's idle wait is one `select` that includes `.io = &cq` and
+//! loses `.reads` and `.acks`. There is no wake Event, no dirty flag, no
+//! reset-then-recheck list: the lost-wake class of the old protocol is
+//! unsayable here, because nothing is ever reset.
 //!
-//! The driver must service both directions every turn: writes-only would
-//! starve oneshot HEADERS under live SSE, and skipping a blocked cipher
-//! ingest must not skip SETTINGS still on the write channel.
-//!
-//! Socket writes stay on the driver. A third write task would add a hop on
-//! the SSE event path (handler → scheduler → driver SSL_write → socket).
-//! BoringSSL cannot split the cipher, so the driver owns both directions of
-//! SSL and the socket write.
+//! A peer that stops reading must not stop the actor: `pending_n > 0`
+//! pauses FairScheduler drain, and `waitForActivity` still serves handler
+//! completions, deadlines, the doorbell and the slow-consumer kill. The
+//! actor parks on the CQ, never the socket.
 //!
 //! This file takes a DIRECT zio dependency (the CQ, the channel, the raw
 //! completion). That is deliberate and open: an interface over the CQ would
@@ -531,10 +527,11 @@ pub const Conn = struct {
 pub const Pump = struct {
     io: std.Io,
     conn: *Conn,
-    /// A zio channel: the actor selects on it, so a post IS the wake.
+    /// Unused for TLS inbound after M2: plaintext stashes in `pending_read`.
+    /// Kept so construction and failDrain stay one shape.
     to_actor: *zio.Channel(wire_pump.WireChunk),
-    /// Outbound frames from the actor. The channel wakes the driver's
-    /// select by itself; there is no side-band wake protocol.
+    /// Unused as the TLS write path after M3. failDrain still drains it
+    /// so a leftover overflow chunk is not dropped.
     write_ch: *zio.Channel(wire_pump.WireChunk),
     /// Raw socket handle for the driver's `ev.NetRecv` completion.
     sock: zio.ev.Backend.NetHandle,
@@ -550,9 +547,12 @@ pub const Pump = struct {
     /// Diag: this pump's opaque zio task handle, published at run() start.
     task_h: ?*std.atomic.Value(usize) = null,
     task_handle_fn: ?*const fn () usize = null,
-    /// A zio channel: the actor selects on it. The capacity is the proven
-    /// outstanding-ack bound; `post` never parks.
+    /// A zio channel: unused for TLS acks after M3 (acks apply locally).
+    /// Kept so `failDrain` can still drain a closed overflow channel.
     completions: *zio.Channel(wire_pump.WriteCompletion),
+    /// When set, `post` applies the ack on this task instead of a channel hop.
+    ack_apply: ?*const fn (*anyopaque, wire_pump.WriteCompletion) void = null,
+    ack_ctx: *anyopaque = undefined,
     gpa: std.mem.Allocator,
     chunk_storage: []u8,
     n_chunks: u32,
@@ -612,9 +612,11 @@ pub const Pump = struct {
 
     fn post(self: *Pump, c: wire_pump.WriteCompletion) void {
         _ = wire_pump.diag_acks.posted_release.fetchAdd(c.outbound_release, .monotonic);
+        if (self.ack_apply) |f| {
+            f(self.ack_ctx, c);
+            return;
+        }
         self.completions.trySend(c) catch |err| switch (err) {
-            // A dropped completion is a hung handler; a full channel means
-            // the capacity proof is wrong. Fail loudly, never silently.
             error.WouldBlock => @panic("write ack channel over proven capacity"),
             error.Closed => {},
         };
@@ -868,16 +870,17 @@ pub const Pump = struct {
                     switch (self.readOne()) {
                         .eof => return .exit,
                         .ok => continue,
-                        .stuck => {
-                            self.stealWrite();
-                            self.site.store(9, .release);
-                            self.io.sleep(.zero, .awake) catch {};
-                            self.site.store(3, .release);
-                            continue;
-                        },
+                        .stuck => return .full,
                         .want => {
-                            if (!self.consumeInbound()) return .exit;
-                            continue;
+                            if (self.pending_cipher != null) {
+                                if (!self.consumeInbound()) return .exit;
+                                continue;
+                            }
+                            switch (self.pollRecv()) {
+                                .progress => continue,
+                                .exit => return .exit,
+                                .none => return .full,
+                            }
                         },
                     }
                 },
@@ -903,8 +906,6 @@ pub const Pump = struct {
             .exit => return false,
             .none => {},
         }
-        self.stealWrite();
-        self.io.sleep(.zero, .awake) catch {};
         return true;
     }
 
@@ -1169,233 +1170,6 @@ pub const Pump = struct {
         while (self.cq.next()) |_| {}
     }
 
-    /// Unused after M2: the actor drives `start` + the CQ/read/write methods
-    /// on its own task. Kept so a revert-to-two-task experiment can call it.
-    pub fn run(self: *Pump) void {
-        if (self.task_handle_fn) |f| {
-            if (self.task_h) |h| h.store(f(), .release);
-        }
-        defer self.site.store(5, .release);
-        if (!self.start()) return;
-        defer self.shutdownCq();
-
-        while (!self.stopped.load(.acquire)) {
-            self.site.store(1, .release);
-            pump_trace.bump(&pump_trace.turns);
-            var progress = false;
-
-            // A batch parked behind a full staging buffer resumes first; the
-            // send completion that made room already staged and re-armed.
-            if (self.pending_n > 0) {
-                const before = self.pending_n;
-                self.site.store(3, .release);
-                if (!self.drivePending()) return;
-                self.site.store(1, .release);
-                if (self.pending_n < before) progress = true;
-            }
-
-            if (self.pending_n == 0) {
-                if (self.carried) |chunk| {
-                    self.carried = null;
-                    self.site.store(3, .release);
-                    if (!self.writeChunks(chunk)) return;
-                    self.site.store(1, .release);
-                    progress = true;
-                }
-            }
-
-            if (self.pending_read) |chunk| {
-                if (self.to_actor.trySend(chunk)) {
-                    self.pending_read = null;
-                    progress = true;
-                } else |_| {}
-            }
-
-            // Ingest cipher only when SSL_read can store plaintext. Otherwise
-            // fall through and take writes: the actor may be parked on the
-            // channel send of the SETTINGS that unstick the client.
-            if (self.pending_cipher != null and self.pending_read == null) {
-                const bytes = self.pending_cipher.?;
-                self.pending_cipher = null;
-                self.site.store(4, .release);
-                if (!self.ingestCipher(bytes)) return;
-                self.site.store(1, .release);
-                progress = true;
-            }
-
-            // BOTH terms of pendingInbound matter: SSL_pending sees
-            // processed-record plaintext only, and BIO_ctrl_pending sees
-            // unread records still in the pair. Parking with either non-zero
-            // strands the client's next pipelined requests forever (the
-            // t-866 wedge).
-            if (self.pending_read == null and self.conn.pendingInbound()) {
-                switch (self.readOne()) {
-                    .eof => return,
-                    .ok => progress = true,
-                    .want, .stuck => {},
-                }
-            }
-
-            if (self.pending_n == 0) {
-                if (self.tryTakeWrite()) |chunk| {
-                    self.site.store(3, .release);
-                    if (!self.writeChunks(chunk)) return;
-                    self.site.store(1, .release);
-                    progress = true;
-                }
-            }
-            if (self.pending_cipher == null) {
-                switch (self.pollRecv()) {
-                    .progress => {
-                        self.site.store(1, .release);
-                        progress = true;
-                    },
-                    .exit => return,
-                    .none => {},
-                }
-            }
-
-            if (progress) continue;
-
-            // A write batch parked behind a full staging buffer: the only
-            // event that can move it is the in-flight send completing, so
-            // wait on the CQ alone (recv or send) and take nothing new from
-            // write_ch. Never spin here: with inbound blocked at the same
-            // time the retry loop below would burn a core until the peer
-            // reads. The t-866 invariant still holds: drain inbound first.
-            if (self.pending_n > 0) {
-                if (self.pending_read == null and self.conn.pendingInbound()) {
-                    switch (self.readOne()) {
-                        .eof => return,
-                        .ok => continue,
-                        .want, .stuck => {},
-                    }
-                }
-                std.debug.assert(self.send_armed);
-                if (diag_wait) self.traceWaitSnapshot();
-                self.site.store(2, .release);
-                const c = self.cq.wait() catch {
-                    self.site.store(1, .release);
-                    self.failDrain();
-                    self.post(.{ .fail_all = true, .shutdown = true });
-                    return;
-                };
-                self.site.store(1, .release);
-                if (self.onCqComplete(c) == .exit) return;
-                continue;
-            }
-
-            // No reset, no dirty flag, no recheck list: the CQ and the
-            // channel are the only producers, and both implement the future
-            // protocol, so the select below cannot miss a publish.
-            if (self.pending_read != null or self.pending_cipher != null) {
-                pump_trace.bump(&pump_trace.pending_read_retry);
-                self.site.store(10, .release);
-                self.io.sleep(.zero, .awake) catch {};
-                self.site.store(1, .release);
-                continue;
-            }
-            // The park invariant (t-866): never wait while pendingInbound().
-            if (self.conn.pendingInbound()) {
-                switch (self.readOne()) {
-                    .eof => return,
-                    .ok => continue,
-                    .stuck => {
-                        // No read chunk free; the actor recycles one soon.
-                        pump_trace.bump(&pump_trace.pending_read_retry);
-                        self.io.sleep(.zero, .awake) catch {};
-                        continue;
-                    },
-                    // A partial record: only new socket bytes can complete
-                    // it, and the armed recv completion delivers them.
-                    // Parking here is correct and cannot strand a request.
-                    .want => {},
-                }
-            }
-            // A parked select must have the recv in flight, or the channel
-            // would be the only wake source and inbound would strand.
-            std.debug.assert(self.recv_armed);
-            if (diag_wait) self.traceWaitSnapshot();
-            self.site.store(2, .release);
-            const winner = zio.select(.{
-                .io = &self.cq,
-                .write = self.write_ch.asyncReceive(),
-            }) catch {
-                // Canceled while parked: the actor's backstop cancel.
-                self.site.store(1, .release);
-                self.failDrain();
-                self.post(.{ .fail_all = true, .shutdown = true });
-                return;
-            };
-            self.site.store(1, .release);
-            switch (winner) {
-                .io => |r| {
-                    // The zio pin (845276b) hands completions to a
-                    // registered select waiter directly, so a wake is
-                    // one-to-one with a takeable completion or the drained
-                    // close. Only `shutdownCq` closes this queue, so Closed
-                    // here means teardown raced the loop: exit cleanly. The
-                    // stale-wake tolerance that stood here against the old
-                    // pin is retired with the fork fix; a Closed must never
-                    // again be swallowed, or a real teardown spins.
-                    const c = r catch {
-                        self.failDrain();
-                        self.post(.{ .fail_all = true, .shutdown = true });
-                        return;
-                    };
-                    if (self.onCqComplete(c) == .exit) return;
-                },
-                .write => |r| {
-                    const chunk = r catch {
-                        // The actor closed the channel: teardown.
-                        self.failDrain();
-                        self.post(.{ .shutdown = true });
-                        return;
-                    };
-                    pump_trace.bump(&pump_trace.tryget_write);
-                    self.site.store(3, .release);
-                    if (!self.writeChunks(chunk)) return;
-                },
-            }
-        }
-        // Best effort: stage what the pair holds and let the in-flight send
-        // finish or be canceled by shutdownCq; the socket is shut down next.
-        _ = self.stageOutbound();
-        self.failDrain();
-        self.post(.{ .shutdown = true });
-    }
-
-    pub fn stop(self: *Pump) void {
-        self.stopped.store(true, .release);
-    }
-
-    fn traceWaitSnapshot(self: *Pump) void {
-        const now = nowNs(self.io);
-        if (now -% diag_last_wait_ns < std.time.ns_per_s) return;
-        diag_last_wait_ns = now;
-        const read_q = io_queue.chanLen(wire_pump.WireChunk, self.to_actor);
-        const read_free_q = io_queue.queued(u32, self.read_free, self.io);
-        const write_free_q: usize = if (self.write_free) |q| io_queue.queued(u32, q, self.io) else 0;
-        rawPrint(
-            "STARH2_PUMPWAIT write_empty={} read_q={d} read_free={d} write_free={d} carried={} pending_read={} pending_cipher={} recv_armed={} send_armed={} send_staged={d} pending_writes={d} plaintext={d} bio_in={d} bio_out={d}\n",
-            .{
-                self.write_ch.isEmpty(),
-                read_q,
-                read_free_q,
-                write_free_q,
-                self.carried != null,
-                self.pending_read != null,
-                self.pending_cipher != null,
-                self.recv_armed,
-                self.send_armed,
-                self.send_fill - self.send_head,
-                self.pending_n,
-                self.conn.pendingPlaintext(),
-                self.conn.pendingInboundCiphertext(),
-                self.conn.pendingOutboundCiphertext(),
-            },
-        );
-    }
 };
 
 fn nowNs(io: std.Io) u64 {

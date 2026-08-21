@@ -13,8 +13,8 @@
 const std = @import("std");
 const wire_const = @import("../core/wire_const.zig");
 
-/// TLS 1.3 application plaintext cap. HTTP/2 packing stops here; SSL_write is
-/// TlsPump's flush, not a second record loop on the actor.
+/// TLS 1.3 application plaintext cap. HTTP/2 packing stops here; SSL_write
+/// is one flush of this buffer on the actor, not a record loop.
 pub const max_plaintext = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
 
 pub const WireMeta = struct {
