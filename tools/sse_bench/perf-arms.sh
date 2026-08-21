@@ -116,13 +116,15 @@ PIDS=
 cleanup() { kill $PIDS 2>/dev/null; wait 2>/dev/null; bench_unlock; }
 trap cleanup EXIT INT TERM
 
-"$STARH2" --mode tls --port 19460 --sse-interval-ms 10 $EXECUTOR_ARGS $MIGRATION_ARGS > "$OUT/starh2.log" 2>&1 &
+# STARH2_EXTRA_ARGS passes any further bench-server flags (A/B knobs).
+"$STARH2" --mode tls --port 19460 --sse-interval-ms 10 $EXECUTOR_ARGS $MIGRATION_ARGS ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
 S_PID=$!; PIDS="$S_PID"
 STARH2_WIDTH=$(starh2_width "$OUT/starh2.log") || exit 1
 WIDTH=$(opponent_width "$STARH2_WIDTH")
 PIN=$(width_env "$WIDTH")
 echo "== perf-arms: $CONNS conns, $ONESHOT_WORKERS workers, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g"
-echo "== starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH) migration=${STARH2_TASK_MIGRATION:-1}  opponents width=$WIDTH  arms: $ARMS"
+echo "== starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH) migration=${STARH2_TASK_MIGRATION:-1} extra=[${STARH2_EXTRA_ARGS:-}]  opponents width=$WIDTH  arms: $ARMS"
+echo "== starh2 ready: $(grep -m1 ready "$OUT/starh2.log")"
 
 for arm in $ARMS; do
   echo "--- $arm ---"

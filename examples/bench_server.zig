@@ -367,13 +367,13 @@ const Cadence = struct {
 
     fn reset(self: *Cadence) void {
         inline for (.{
-            &self.loops,         &self.sleeps,      &self.skipped,
-            &self.writes,        &self.first_n,     &self.inter_n,
-            &self.late_n,        &self.late_ge1ms,
-            &self.sleep_req_ns,  &self.sleep_ns,    &self.late_ns,
-            &self.write_ns,      &self.yield_ns,    &self.skip_behind_ns,
-            &self.first_ns,      &self.inter_ns,
-            &self.start_sse_n,   &self.start_sse_ns, &self.start_sse_max,
+            &self.loops,         &self.sleeps,         &self.skipped,
+            &self.writes,        &self.first_n,        &self.inter_n,
+            &self.late_n,        &self.late_ge1ms,     &self.sleep_req_ns,
+            &self.sleep_ns,      &self.late_ns,        &self.write_ns,
+            &self.yield_ns,      &self.skip_behind_ns, &self.first_ns,
+            &self.inter_ns,      &self.start_sse_n,    &self.start_sse_ns,
+            &self.start_sse_max,
         }) |f| f.store(0, .release);
     }
 };
@@ -570,6 +570,11 @@ const Args = struct {
     // clean with migration on, and migration off is the home of the bimodal
     // placement bands. --no-task-migration keeps the A/B arm reachable.
     task_migration: bool = true,
+    // A/B knob (zio fork announce-ab): whether a wake from a running task
+    // onto an empty ring wakes a parked executor. Needs a zio pin that
+    // exports `setAnnounceRunningWakes`; the flag fails loud otherwise.
+    announce_running_wakes: bool = true,
+    batch_wake_sleepers: bool = true,
     diag: bool = false,
     /// When set, connect to this process's listener over real TCP, drive N
     /// oneshots on one connection, then shut down. Hyperfine/poop measure the
@@ -603,6 +608,14 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.task_migration = true;
         } else if (std.mem.eql(u8, a, "--no-task-migration")) {
             out.task_migration = false;
+        } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
+            out.announce_running_wakes = true;
+        } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
+            out.announce_running_wakes = false;
+        } else if (std.mem.eql(u8, a, "--batch-wake-sleepers")) {
+            out.batch_wake_sleepers = true;
+        } else if (std.mem.eql(u8, a, "--no-batch-wake-sleepers")) {
+            out.batch_wake_sleepers = false;
         } else if (std.mem.eql(u8, a, "--diag")) {
             out.diag = true;
         } else if (std.mem.eql(u8, a, "--self-drive-oneshots")) {
@@ -619,6 +632,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 const RuntimeArgs = struct {
     executors: ?u8 = null,
     task_migration: bool = true,
+    announce_running_wakes: bool = true,
+    batch_wake_sleepers: bool = true,
 };
 
 fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !RuntimeArgs {
@@ -635,6 +650,14 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
             out.task_migration = true;
         } else if (std.mem.eql(u8, a, "--no-task-migration")) {
             out.task_migration = false;
+        } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
+            out.announce_running_wakes = true;
+        } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
+            out.announce_running_wakes = false;
+        } else if (std.mem.eql(u8, a, "--batch-wake-sleepers")) {
+            out.batch_wake_sleepers = true;
+        } else if (std.mem.eql(u8, a, "--no-batch-wake-sleepers")) {
+            out.batch_wake_sleepers = false;
         }
     }
     return out;
@@ -902,8 +925,8 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d}}}\n",
-        .{ if (args.tls) "tls" else "h2c", port, exec_n },
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d}}}\n",
+        .{ if (args.tls) "tls" else "h2c", port, exec_n, @as(u8, @intFromBool(args.announce_running_wakes)), @as(u8, @intFromBool(args.batch_wake_sleepers)) },
     );
     defer gpa.free(ready);
     var out = zio.stdout().writer(&.{});
@@ -938,6 +961,20 @@ pub fn main(init: std.process.Init) !void {
         .enable_task_migration = runtime_args.task_migration,
     });
     defer rt.deinit();
+    // The knob is a process-wide switch in the zio fork (announce-ab); a pin
+    // without it can run the default only. Set it before any task runs.
+    if (@hasDecl(zio, "setAnnounceRunningWakes")) {
+        zio.setAnnounceRunningWakes(runtime_args.announce_running_wakes);
+    } else if (!runtime_args.announce_running_wakes) {
+        std.debug.print("--no-announce-running-wakes needs a zio pin with setAnnounceRunningWakes\n", .{});
+        return error.UnsupportedByZioPin;
+    }
+    if (@hasDecl(zio, "setBatchWakeSleepers")) {
+        zio.setBatchWakeSleepers(runtime_args.batch_wake_sleepers);
+    } else if (!runtime_args.batch_wake_sleepers) {
+        std.debug.print("--no-batch-wake-sleepers needs a zio pin with setBatchWakeSleepers\n", .{});
+        return error.UnsupportedByZioPin;
+    }
 
     var handle = try rt.spawn(serveMain, .{ rt, gpa, init.minimal.args, init.io });
     try handle.join();
