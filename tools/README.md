@@ -131,6 +131,13 @@ it the Linux delayed-ACK timer put a 40ms ceiling on the SSE events.
 default 200 to 1024 for the same reason Kestrel raises its 100: run.sh opens
 200 streams and then probes on the same socket.
 
+`tools/sse_bench/burst-probe.sh` opens `STREAMS` (200) SSE streams at once on
+one TLS connection, `ROUNDS` (10) times, and fails unless every stream opens
+and delivers and the bench server's `/trace` fail-close counters
+(`tls_write_overflow`, `tls_stage_failed`) stay zero. It exists because the
+actor/driver merge fail-closed that burst silently and neither the unit
+suite (no TLS) nor `tls-smoke` (one curl request at a time) could see it.
+
 ## Isolated pipeline benchmark
 
 `bench-pipeline` removes the socket, TLS, client, and lock-contention variables
