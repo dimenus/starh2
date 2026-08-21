@@ -212,3 +212,63 @@ out buying the enters with SSE latency or the stall property.
 - Zig 0.16: build with `./zb`; look up std APIs with `zigstd`; never guess.
 - The owner grades by rerunning the gates, not from your numbers. Paste raw
   tool output, not summaries.
+
+## Round 2 addendum (owner's grade of M1-M3, 2026-08-21)
+
+Graded on nachos (Linux, the bars that matter) and reproduced locally:
+
+- Width 12, n=3: CPU/req 14.1-14.2 µs (bar 14), io_uring_enter/req 2.30
+  (bar 2.0), voluntary ctxt/req 1.17, eventfd wakes 0.22/req. Width 2:
+  5.8 µs. Mixed (width 2): oneshot 187k rps while 32 SSE streams live
+  (was 165k), SSE p50 26-27 µs, p99 99-118 µs (was 76-103), stall row
+  clean (31/32, p99 91 µs), 16000/16000 events in 3 of 3 rounds.
+  wedge-probe PASS at 2 and 8 workers. These hold; do not lose them.
+- **Correctness defect, reproduced 4 of 5 on macOS and 1 of 2 on nachos:**
+  200 SSE streams opened at once on ONE TLS connection fail-close the
+  connection part way: `opened=146..175 delivering=0..140 failed=25..54`,
+  against `opened=200 delivering=200 failed=0` on master 5 of 5. Nothing is
+  logged. Exact repro (run from the worktree root; `sse-client` is
+  `go build -o <out> ./client.go` in `tools/sse_bench`):
+
+      ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix /tmp/bs
+      /tmp/bs/bin/starh2-bench-server --mode tls --port 19470 --sse-interval-ms 10 --executors 2 &
+      for i in 1 2 3 4 5 6 7 8 9 10; do <sse-client> -url https://127.0.0.1:19470/sse -streams 200 -seconds 2 -warmup 0 -label cut | grep streams=; done
+
+  Owner's hypothesis (unproven; prove or refute it from the code and the
+  trace, do not adopt it blind): `pushWriteChunk` for TLS stashes one chunk
+  in `carried` and overflows into `tls_write_ch` (capacity
+  `inbound_wire_chunks_per_connection` = 8); one `drainEmit` turn that
+  emits more than nine wire chunks (200 HEADERS responses before the TLS
+  turn drains) returns `error.WriteFailed`, which fail-closes the
+  connection. The `FairScheduler` pause hook covers DATA only, so it does
+  not bound this.
+
+Round-2 bars, added to bars 1-8 (all still required):
+
+9. The repro above passes 10 of 10 on your machine (`opened=200
+   delivering=200 failed=0` every line), pasted raw. The owner repeats it
+   on nachos and in `run.sh` (sse200, 4 rounds) and `mixed.sh` (3 rounds,
+   16000/16000 each).
+10. **No silent fail-close.** Every path that sets `writer_failed` or
+    returns `error.WriteFailed` from the TLS write path must bump a named
+    counter visible in the bench server's `/trace` JSON (e.g.
+    `tls_write_overflow`, `tls_stage_failed`), so a failed round names its
+    cause. Paste `/trace` after the repro showing the counters at zero.
+11. Whatever bounds the per-turn outbound chunk count must be a declared
+    term: if you raise the overflow capacity, it is a new `Limits` field
+    or a derivation from existing ones (e.g.
+    `control_entries_per_connection`), entered into
+    `resourceUpperBound()` with the reason in the commit; if you pause the
+    scheduler for all frame kinds, show the stall row still holds (the
+    earlier attempt blew the stall p99 to 11 ms: say what is different).
+12. Rule 9 of the spec-hardening skill: assume your own M2/M3 fixes broke
+    something else. Before the fix, re-read `pending_writes`/`carried`/
+    `write_ch`/the pause hook/`driveTlsTurn` for a second path that can
+    drop, double-ack or fail-close a chunk, and list what you checked.
+
+Delegation mechanics for round 2: you continue in the SAME worktree at
+`f29bd1e`. The tripwire changes: `git rev-list --count HEAD..master` must
+print exactly 1, and that commit must be the one that added this addendum
+(`git log --oneline HEAD..master` shows it); `git cherry-pick` it first,
+then work. Commit the fix as M5 with the problem, the proven cause, the
+change, and the raw evidence for bars 9-11; M6 is the updated report.
