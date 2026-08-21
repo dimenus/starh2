@@ -75,6 +75,7 @@ pub const http = struct {
 
 pub const Limits = core.limits.Limits;
 pub const ResourceUpperBound = core.limits.ResourceUpperBound;
+pub const physical_cpus = @import("physical_cpus.zig");
 pub const Server = edge.server.Server;
 pub const ServerConfig = edge.server.ServerConfig;
 pub const EndpointConfig = edge.server.EndpointConfig;
@@ -118,6 +119,7 @@ test {
     _ = edge.fair_scheduler;
     _ = edge.slab_pool;
     _ = core.bound_shapes;
+    _ = physical_cpus;
     _ = http.request;
     _ = http.response;
     _ = http.router;

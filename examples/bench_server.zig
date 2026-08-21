@@ -899,10 +899,11 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     // the moment it reads this, so it must never be printed on a timer. Port 0
     // binds a free port, and this line is how the harness learns which.
     const port = server.localAddress(0).getPort();
+    const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d}}}\n",
-        .{ if (args.tls) "tls" else "h2c", port },
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d}}}\n",
+        .{ if (args.tls) "tls" else "h2c", port, exec_n },
     );
     defer gpa.free(ready);
     var out = zio.stdout().writer(&.{});
@@ -930,7 +931,7 @@ pub fn main(init: std.process.Init) !void {
             .slab_slots = 256,
             .prewarm = 256,
         },
-        .executors = if (runtime_args.executors) |n| .exact(n) else .auto,
+        .executors = .exact(if (runtime_args.executors) |n| n else starh2.physical_cpus.executorCount()),
         // zio a2b134a can strand a migrated socket task while both directions
         // have queued kernel data. Keep I/O tasks on their home executor; the
         // opt-in flag exists only to preserve the upstream reproducer.
