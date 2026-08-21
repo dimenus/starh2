@@ -10,5 +10,6 @@ tools/h2spec/h2spec
 *.a
 .DS_Store
 zig-out-musl-debug/
+tools/sse_bench/hyper/target/
 tools/sse_bench/kestrel/bin/
 tools/sse_bench/kestrel/obj/

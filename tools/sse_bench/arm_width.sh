@@ -5,12 +5,12 @@
 # logical CPU: on a 12-core/24-thread box that is 2 (or 12) executors against
 # 24 threads, and the comparison is then about width, not about the stack.
 #
-# OPPONENT_WIDTH=match (default) pins Go (GOMAXPROCS) and Kestrel
-# (DOTNET_PROCESSOR_COUNT) to the executor count that starh2 reports in its
-# ready line. OPPONENT_WIDTH=N pins exactly N. OPPONENT_WIDTH=default leaves
-# the runtime defaults (the pre-normalized rows). Every arm prints the width
-# it actually runs with in its ready line, and check_widths refuses to
-# measure when they differ under match/N.
+# OPPONENT_WIDTH=match (default) pins Go (GOMAXPROCS), Kestrel
+# (DOTNET_PROCESSOR_COUNT) and hyper (TOKIO_WORKER_THREADS) to the executor
+# count that starh2 reports in its ready line. OPPONENT_WIDTH=N pins exactly
+# N. OPPONENT_WIDTH=default leaves the runtime defaults (the pre-normalized
+# rows). Every arm prints the width it actually runs with in its ready line,
+# and check_widths refuses to measure when they differ under match/N.
 OPPONENT_WIDTH=${OPPONENT_WIDTH:-match}
 
 # wait_ready LOG: print the ready line of a server, or fail after 15s.
@@ -53,24 +53,25 @@ opponent_width() {
   esac
 }
 
-# width_env W: the env assignments that pin the opponents to W.
+# width_env W: the env assignments that pin the three opponents to W.
 width_env() {
   if [ "$1" = default ]; then
     echo "env"
   else
-    echo "env GOMAXPROCS=$1 DOTNET_PROCESSOR_COUNT=$1"
+    echo "env GOMAXPROCS=$1 DOTNET_PROCESSOR_COUNT=$1 TOKIO_WORKER_THREADS=$1"
   fi
 }
 
-# check_widths W GO_LOG KESTREL_LOG: read each arm's width and
+# check_widths W GO_LOG KESTREL_LOG HYPER_LOG: read each arm's width and
 # print the line; exit 1 when a pinned arm does not run at W.
 check_widths() {
   want=$1
   go_w=$(json_int "$(wait_ready "$2")" width)
   kestrel_w=$(json_int "$(wait_ready "$3")" width)
-  echo "== width: starh2=$STARH2_WIDTH  go=$go_w  kestrel=$kestrel_w  (OPPONENT_WIDTH=$OPPONENT_WIDTH)"
+  hyper_w=$(json_int "$(wait_ready "$4")" width)
+  echo "== width: starh2=$STARH2_WIDTH  go=$go_w  kestrel=$kestrel_w  hyper=$hyper_w  (OPPONENT_WIDTH=$OPPONENT_WIDTH)"
   if [ "$want" != default ]; then
-    for pair in "go=$go_w" "kestrel=$kestrel_w"; do
+    for pair in "go=$go_w" "kestrel=$kestrel_w" "hyper=$hyper_w"; do
       if [ "${pair#*=}" != "$want" ]; then
         echo "arm $pair did not pin to width $want — refusing to report" >&2
         return 1

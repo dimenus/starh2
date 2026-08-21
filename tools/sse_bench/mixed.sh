@@ -1,6 +1,6 @@
 #!/bin/sh
-# Mixed SSE + oneshot on ONE TLS connection, starh2 against Go net/http
-# and Kestrel (HTTP/2 TLS).
+# Mixed SSE + oneshot on ONE TLS connection, starh2 against Go net/http,
+# Kestrel, and hyper (HTTP/2 TLS).
 #
 # A oneshot bench cannot value the connection split: complete handlers never
 # occupy a task, so ingest is never at risk of parking. This run keeps SSE
@@ -10,7 +10,7 @@
 #
 # http2.zig is not an arm. Its handler API is one-shot (`setBody`, no flush),
 # so it cannot occupy the socket the way this measurement needs. That absence
-# is printed rather than omitted. Kestrel is an arm: it streams.
+# is printed rather than omitted. Kestrel and hyper are arms: they stream.
 # The event contract matches server.go (`data: <unix-nanos>`), not the
 # Datastar SDK.
 #
@@ -21,6 +21,7 @@ set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 . "$REPO/tools/bench_lock.sh"
 . "$REPO/tools/sse_bench/kestrel_publish.sh"
+. "$REPO/tools/sse_bench/hyper_build.sh"
 . "$REPO/tools/sse_bench/arm_width.sh"
 STREAMS=${STREAMS:-32}
 SECONDS_RUN=${SECONDS_RUN:-5}
@@ -54,6 +55,8 @@ go build -o "$OUT/sse-server" ./server.go || exit 1
 cd "$REPO"
 publish_kestrel || exit 1
 KESTREL="$OUT/kestrel/sse-kestrel"
+build_hyper || exit 1
+HYPER="$OUT/hyper/sse-hyper"
 
 TRACE_ARGS=
 if [ "${TRACE:-0}" != 0 ]; then
@@ -82,17 +85,20 @@ G_PID=$!
 $PIN "$KESTREL" -port 19452 -sse-interval-ms "$INTERVAL" \
   -cert testdata/cert.pem -key testdata/key.pem > "$OUT/kestrel.log" 2>&1 &
 K_PID=$!
+$PIN "$HYPER" -port 19454 -sse-interval-ms "$INTERVAL" \
+  -cert testdata/cert.pem -key testdata/key.pem > "$OUT/hyper.log" 2>&1 &
+H_PID=$!
 
 cleanup() {
-  kill $S_PID $G_PID $K_PID 2>/dev/null
+  kill $S_PID $G_PID $K_PID $H_PID 2>/dev/null
   wait 2>/dev/null
   bench_unlock
 }
 trap cleanup EXIT INT TERM
 
-check_widths "$WIDTH" "$OUT/go.log" "$OUT/kestrel.log" || exit 1
+check_widths "$WIDTH" "$OUT/go.log" "$OUT/kestrel.log" "$OUT/hyper.log" || exit 1
 
-for port in 19450 19451 19452; do
+for port in 19450 19451 19452 19454; do
   if ! "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams 1 -seconds 1 -warmup 0 -label probe >/dev/null 2>&1; then
     echo "the server on port $port did not deliver an SSE event — refusing to report" >&2
     exit 1
@@ -119,17 +125,18 @@ sse_target=$(( SECONDS_RUN * 1000 / INTERVAL * STREAMS ))
 echo "== mixed SSE + oneshot, one TLS connection per arm"
 echo "== $STREAMS SSE streams, ${SECONDS_RUN}s + ${WARMUP}s warmup, one event per ${INTERVAL}ms, $ONESHOT_WORKERS oneshot workers, $CONNS conns, $ROUNDS rounds"
 echo "== starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH)  opponents width=$WIDTH  SSE target $sse_target events/arm/round"
-echo "== arms: starh2 :19450  go-net/http :19451  kestrel :19452"
+echo "== arms: starh2 :19450  go-net/http :19451  kestrel :19452  hyper :19454"
 echo "== http2.zig is not an arm: one-shot handler API, no flush"
 
 i=1
 while [ "$i" -le "$ROUNDS" ]; do
   echo "round $i"
-  # Cyclic shift: over three rounds every arm runs once in every position.
-  case $(( (i - 1) % 3 )) in
-    0) order="starh2:19450 go-net/http:19451 kestrel:19452" ;;
-    1) order="go-net/http:19451 kestrel:19452 starh2:19450" ;;
-    2) order="kestrel:19452 starh2:19450 go-net/http:19451" ;;
+  # Cyclic shift: over four rounds every arm runs once in every position.
+  case $(( (i - 1) % 4 )) in
+    0) order="starh2:19450 go-net/http:19451 kestrel:19452 hyper:19454" ;;
+    1) order="go-net/http:19451 kestrel:19452 hyper:19454 starh2:19450" ;;
+    2) order="kestrel:19452 hyper:19454 starh2:19450 go-net/http:19451" ;;
+    3) order="hyper:19454 starh2:19450 go-net/http:19451 kestrel:19452" ;;
   esac
   for arm in $order; do
     name=${arm%%:*}; port=${arm##*:}
@@ -137,6 +144,7 @@ while [ "$i" -le "$ROUNDS" ]; do
       starh2) pid=$S_PID ;;
       go-net/http) pid=$G_PID ;;
       kestrel) pid=$K_PID ;;
+      hyper) pid=$H_PID ;;
     esac
     echo "  --- $name oneshot-only ---"
     cpu_before=$(cpu_seconds "$pid")
@@ -173,6 +181,10 @@ if [ "${STALL:-1}" != 0 ] && [ "$STREAMS" -ge 2 ]; then
   "$OUT/sse-client" -url "https://127.0.0.1:19452/sse" -streams "$STREAMS" -conns "$CONNS" -stall \
     -oneshot-url "https://127.0.0.1:19452/" -oneshot-workers "$ONESHOT_WORKERS" \
     -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label kestrel | sed 's/^/  /'
+  echo "  --- hyper mixed + stall ---"
+  "$OUT/sse-client" -url "https://127.0.0.1:19454/sse" -streams "$STREAMS" -conns "$CONNS" -stall \
+    -oneshot-url "https://127.0.0.1:19454/" -oneshot-workers "$ONESHOT_WORKERS" \
+    -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label hyper | sed 's/^/  /'
 fi
 
 if [ "${TRACE:-0}" != 0 ]; then

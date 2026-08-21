@@ -73,7 +73,7 @@ This is not an identical stack comparison: both arms here use BoringSSL
 (`http2-boring` vs starh2 `TlsPump`). The starh2 h2c arm remains in the same
 run so the result shows whether a gap survives after removing TLS cost.
 
-## Concurrent SSE benchmark against Go and Kestrel
+## Concurrent SSE benchmark against Go, Kestrel, and hyper
 
 ```sh
 STREAMS=200 SECONDS_RUN=10 INTERVAL=1 ROUNDS=3 tools/sse_bench/run.sh
@@ -96,7 +96,8 @@ topology and does not double-book hyperthreads. Set `STARH2_EXECUTORS=auto` to
 get that physical count from the harness; `STARH2_EXECUTORS=N` pins exactly N.
 Every opponent is pinned to the same scheduler width as starh2 by default:
 `OPPONENT_WIDTH=match` reads the executor count from the starh2 ready line
-and sets `GOMAXPROCS` and `DOTNET_PROCESSOR_COUNT` to it; `OPPONENT_WIDTH=N` pins exactly N; `OPPONENT_WIDTH=default` leaves
+and sets `GOMAXPROCS`, `DOTNET_PROCESSOR_COUNT`, and `TOKIO_WORKER_THREADS`
+to it; `OPPONENT_WIDTH=N` pins exactly N; `OPPONENT_WIDTH=default` leaves
 the runtime defaults (every logical CPU), which is what rows before this
 normalization measured. Each arm prints the width it runs with in its ready
 line and the harness refuses to measure when a pinned arm differs
@@ -106,14 +107,29 @@ socket task. Pass `--task-migration` directly to `starh2-bench-server` only
 when reproducing that upstream runtime failure.
 
 `tools/sse_bench/mixed.sh` keeps SSE streams live on one TLS connection and
-fires oneshots on the same socket (Go net/http and Kestrel opponents;
+fires oneshots on the same socket (Go net/http, Kestrel, and hyper opponents;
 http2.zig cannot stream). Oneshot-only is the control. `STALL=0` skips the
 blocked-reader pass. `CONNS=N` spreads the Go client over N TLS connections
 (default 1, the Datastar socket). `CONNS=50 ONESHOT_WORKERS=500 STREAMS=0`
 is the official h2load shape (`-c 50 -m 10`); use `STARH2_EXECUTORS=auto`
 there so starh2 is not pinned to the two-executor SSE topology. Kestrel
 listens on :19452 (mixed) / :19449 (run.sh); `dotnet` 10 is required for
-that arm.
+that arm. hyper listens on :19454 (mixed) / :19453 (run.sh); `cargo` is
+required for that arm.
+
+The hyper arm (`tools/sse_bench/hyper/`) is the Rust opponent: hyper 1 on
+tokio with rustls (ring), HTTP/2 only, ALPN `h2`. hyper is the h2 engine
+under axum, tonic, and reqwest, so a router on top would add no HTTP/2 work;
+actix-web fronts the same `h2` crate. The arm is built with `--locked`
+against the committed `Cargo.lock` into `$OUT/hyper-target`, so the pin is
+the lock file and a stale tree binary is never the one measured. tokio uses
+one worker per logical CPU unless `TOKIO_WORKER_THREADS=N` is set, the same
+lever as `GOMAXPROCS`; `OPPONENT_WIDTH` sets both. `TCP_NODELAY` is set
+on every accepted socket because tokio does not (Go and Kestrel do); without
+it the Linux delayed-ACK timer put a 40ms ceiling on the SSE events.
+`max_concurrent_streams` is raised from hyper's
+default 200 to 1024 for the same reason Kestrel raises its 100: run.sh opens
+200 streams and then probes on the same socket.
 
 ## Isolated pipeline benchmark
 

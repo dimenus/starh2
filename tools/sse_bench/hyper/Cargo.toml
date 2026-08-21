@@ -1,0 +1,29 @@
+[package]
+name = "sse-hyper"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The Rust arm of tools/sse_bench. hyper is the HTTP/2 implementation under
+# axum, tonic, and reqwest; a router on top would add no HTTP/2 work, so the
+# arm is plain hyper. rustls uses the ring provider so that the build needs
+# no cmake (aws-lc-rs does). Cargo.lock is committed: it is the pin.
+
+[[bin]]
+name = "sse-hyper"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
