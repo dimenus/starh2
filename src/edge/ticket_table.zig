@@ -156,10 +156,15 @@ pub const TicketTable = struct {
     }
 
     /// Nonblocking probe: has this slot's event been signaled (completion,
-    /// wake, or failAll)? The ACTOR's receipt wait uses it to feed itself
-    /// from the ack channel instead of parking blind (t-899): the actor is
-    /// the only task that applies write acks, so an actor parked on a bare
-    /// ticket event while completions sit queued is a self-deadlock.
+    /// wake, or failAll)? Two actor sites depend on this:
+    ///
+    /// - `waitTicketDraining` (t-899): the actor is the only task that applies
+    ///   write acks, so an actor parked on a bare ticket event while
+    ///   completions sit queued is a self-deadlock. Probe, drain, then park
+    ///   only on a select that includes the ack channel.
+    /// - `drainPendingCompleteReceipts` (t-900): the front receipt's event is
+    ///   the sole ready proof. A side-channel count can exceed truly-applied
+    ///   acks and then pop the wrong receipt.
     pub fn isSignaled(self: *TicketTable, slot_i: u32) bool {
         if (slot_i >= self.slots.len) return false;
         return @atomicLoad(std.Io.Event, &self.slots[slot_i].event, .acquire) == .is_set;
@@ -247,6 +252,20 @@ test "ticket reserve wait complete reuse" {
     _ = c;
     table.complete(b[1], b[0], false);
     try std.testing.expectError(error.WriteFailed, table.wait(b[1], null));
+}
+
+test "isSignaled is per-slot: completing B does not make A look ready (t-900)" {
+    var storage: [2]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    const a = try table.reserve();
+    const b = try table.reserve();
+    try std.testing.expect(!table.isSignaled(a[1]));
+    try std.testing.expect(!table.isSignaled(b[1]));
+    table.complete(b[1], b[0], true);
+    try std.testing.expect(!table.isSignaled(a[1]));
+    try std.testing.expect(table.isSignaled(b[1]));
+    table.complete(a[1], a[0], true);
+    try std.testing.expect(table.isSignaled(a[1]));
 }
 
 test "completion links survive until every batched ticket is snapped" {

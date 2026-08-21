@@ -1016,11 +1016,10 @@ const Connection = struct {
     /// of B proceeds while A's credit stays unpublished.
     held_acks: [complete_receipt_capacity]wire_pump.WriteCompletion = .{ .{}, .{}, .{}, .{} },
     held_ack_n: usize = 0,
-    /// Incremented only after completing a complete-batch ticket. The count
-    /// coalesces same-turn consumes without losing receipts.
-    complete_receipts_ready: std.atomic.Value(usize) = .init(0),
     /// Set after `tickets.failAll`; actor may then consume every pending
-    /// receipt without blocking.
+    /// receipt, waiting via `waitTicketDraining` for any still-unsignaled
+    /// slot. Ordinary reclaim does not use a ready-count: the front receipt's
+    /// ticket event is the proof (t-900).
     complete_receipts_fail_all: std.atomic.Value(bool) = .init(false),
     /// Actor-only: when depth last reached capacity. Used for `receipt_full_ns`.
     receipt_depth_entered_ns: u64 = 0,
@@ -1535,8 +1534,11 @@ const Connection = struct {
     ///    Note what it does NOT do: it never touches `handlers[]`. Terminal
     ///    causes stay under `session_mu` on a later step of this same turn.
     /// 3. Otherwise complete every linked ticket the chunk carried.
-    /// 4. On a complete-batch receipt, publish `complete_receipts_ready` so
-    ///    `drainPendingCompleteReceipts` can consume on this same turn.
+    /// 4. Completing a complete-batch ticket sets its event. That event IS
+    ///    the ready signal: `drainPendingCompleteReceipts` probes
+    ///    `tickets.isSignaled` on the front pending receipt. There is no
+    ///    side-channel count (t-900: a count can exceed truly-applied acks
+    ///    and then steer which receipts get popped).
     fn completeAckTickets(self: *Connection, ack: wire_pump.WriteCompletion) bool {
         var remaining = ack.ticket_count;
         if (remaining == 0 and ack.ticket != 0) remaining = 1;
@@ -1575,8 +1577,8 @@ const Connection = struct {
         if (ack.fail_all) {
             self.writer_failed.store(true, .release);
             self.tickets.failAll();
-            // Ticket events are set before this flag; the actor may now
-            // reclaim every pending complete-batch receipt without blocking.
+            // Ticket events are set before this flag; drainPendingCompleteReceipts
+            // then consumes every pending receipt (wait_unsignaled).
             self.complete_receipts_fail_all.store(true, .release);
             // Do NOT touch handlers[] — handleWriterFailed applies terminals.
             self.wakeAllSpace();
@@ -1600,7 +1602,6 @@ const Connection = struct {
                         .release,
                     );
                 }
-                _ = self.complete_receipts_ready.fetchAdd(1, .acq_rel);
                 if (comptime test_observe) _ = wire_pump.diag_acks.applied_receipt.fetchAdd(1, .monotonic);
             }
         }
@@ -2053,23 +2054,30 @@ const Connection = struct {
         }
     }
 
-    /// Reclaim complete-handler drain-turn receipts whose write acks this actor
-    /// has already applied. `ready` is the fast-path count; it is NOT a proof
-    /// (the 2026-08-20 live wedge caught the actor parked here with the
-    /// ticket's completion queued in `write_ack_ch`). `waitTicketDraining`
-    /// makes the wait self-feeding, so a stale or miscounted `ready` costs a
-    /// drain turn instead of a permanent park. Write-ack apply never finishes
-    /// jobs; it only completes tickets and publishes the ready count.
-    fn drainPendingCompleteReceipts(self: *Connection, finalize_all: bool) void {
-        const failed = finalize_all or self.complete_receipts_fail_all.swap(false, .acq_rel);
-        var ready = self.complete_receipts_ready.swap(0, .acq_rel);
-        if (failed) ready = self.pending_complete_receipt_n;
-        std.debug.assert(ready <= self.pending_complete_receipt_n);
+    /// True when the front pending receipt's ticket event is set. That event
+    /// is the only ready proof: `complete` / `failAll` set it, and only after
+    /// the matching ack is applied. A side-channel count can exceed
+    /// truly-applied acks and then pop the wrong receipt (t-900).
+    fn frontCompleteReceiptReady(self: *Connection) bool {
+        if (self.pending_complete_receipt_n == 0) return false;
+        return self.tickets.isSignaled(self.pending_complete_receipts[0].ticket_slot);
+    }
 
-        while (ready > 0) : (ready -= 1) {
+    /// Reclaim complete-handler drain-turn receipts whose tickets this actor
+    /// has already completed. Walk from the front while `isSignaled`; stop at
+    /// the first unsignaled receipt so a later ack cannot steer which jobs
+    /// get stamped. Writer-failure and shutdown (`finalize_all`) still wait
+    /// via `waitTicketDraining` so in-flight acks can land. The ordinary path
+    /// never starts that wait for an unsignaled front receipt — the loop top
+    /// applies acks first, then this drain sees the event.
+    fn drainPendingCompleteReceipts(self: *Connection, finalize_all: bool) void {
+        const wait_unsignaled = finalize_all or self.complete_receipts_fail_all.swap(false, .acq_rel);
+
+        while (self.pending_complete_receipt_n > 0) {
             const receipt = self.pending_complete_receipts[0];
             std.debug.assert(receipt.stream_count > 0);
             std.debug.assert(receipt.stream_count <= receipt.stream_ids.len);
+            if (!wait_unsignaled and !self.tickets.isSignaled(receipt.ticket_slot)) break;
             if (std.debug.runtime_safety) {
                 const meta = self.tickets.completion(receipt.ticket_slot) orelse
                     std.debug.panic("pending complete receipt lost ticket slot {d}", .{receipt.ticket_slot});
@@ -2201,6 +2209,10 @@ const Connection = struct {
         const read_free_q = io_queue.queued(u32, &self.read_free_ch, self.config.io);
         const write_free_q = io_queue.queued(u32, &self.write_free_ch, self.config.io);
         const tls_write_empty = if (self.tls_write_buf.len != 0) self.tls_write_ch.isEmpty() else true;
+        var receipts_ready: usize = 0;
+        while (receipts_ready < self.pending_complete_receipt_n) : (receipts_ready += 1) {
+            if (!self.tickets.isSignaled(self.pending_complete_receipts[receipts_ready].ticket_slot)) break;
+        }
         diagRawPrint(
             "STARH2_PARK acc={d} complete={} pending={d} bytes={d} ordinary={d} framed={d} live={d} refilled={} conn_win={d} eligible={d} missing={d} tomb_noerr={d} tomb_rst={d} pend_slots={d} rst0={d} intents={d} zero_win={d} min_swin={d} active={d} rst_h={d} rst_c={d} ctrl_fail={d} rst_after_fail={d}\n",
             .{
@@ -2240,7 +2252,7 @@ const Connection = struct {
                 write_free_q,
                 self.inline_n,
                 self.pending_complete_receipt_n,
-                self.complete_receipts_ready.load(.acquire),
+                receipts_ready,
                 io_queue.chanLen(u8, &self.doorbell),
                 io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch),
                 self.tls_pump_site.load(.acquire),
@@ -5371,9 +5383,8 @@ pub const BenchHop = struct {
         }
         self.drainLocalWrites();
         self.conn.runPendingInline();
-        const ready_before = self.conn.complete_receipts_ready.load(.acquire);
         self.drainLocalWrites();
-        if (self.conn.complete_receipts_ready.load(.acquire) <= ready_before) return error.HopNoReceipt;
+        if (!self.conn.frontCompleteReceiptReady()) return error.HopNoReceipt;
         self.conn.drainPendingCompleteReceipts(false);
         if (self.conn.writer_failed.load(.acquire)) return error.HopWriterFailed;
         if (self.conn.pending_complete_receipt_n != 0) return error.HopReceiptStuck;
@@ -5381,9 +5392,9 @@ pub const BenchHop = struct {
         return headers_frame.len;
     }
 
-    /// AckDrainer's job without a WritePump: release wire/control occupancy,
-    /// complete tickets, and publish a complete-batch receipt so the actor
-    /// path can `waitTicket` on an already-signaled slot.
+    /// AckDrainer's job without a WritePump: release wire/control occupancy
+    /// and complete tickets so the actor path can `waitTicket` on an
+    /// already-signaled slot. Readiness is the ticket event, not a count.
     fn drainLocalWrites(self: *BenchHop) void {
         const io = self.conn.config.io;
         while (io_queue.tryGet(wire_pump.WireChunk, &self.conn.write_ch, io)) |chunk| {
@@ -5410,8 +5421,6 @@ pub const BenchHop = struct {
                     self.conn.writer_failed.store(true, .release);
                     self.conn.tickets.failAll();
                     self.conn.complete_receipts_fail_all.store(true, .release);
-                } else if (chunk.complete_batch_receipt) {
-                    _ = self.conn.complete_receipts_ready.fetchAdd(1, .acq_rel);
                 }
             }
         }
