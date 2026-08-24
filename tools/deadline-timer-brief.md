@@ -93,6 +93,8 @@ level, so the actor no longer needs to be the handlers' clock.
 - If zio needs a patch, fork first with Ryan's sign-off, and stop until
   it lands (house rule; it fired twice in t-882 and both were real).
 - Stale-constraint note: t-824's brief pinned zio at 489f31f and forbade
-  zio changes. Both are superseded — the pin is 3025548 (which contains
-  53504b4 and the select conservation fixes), and the fork process
-  exists. Do not re-import those constraints from the old brief.
+  zio changes. Both are superseded — the pin is e84742f (upstream main
+  after the PR #709 merge, plus 53504b4), and the fork process exists.
+  The select conservation fixes are upstream now; 53504b4 is the only
+  patch the fork still carries. Do not re-import those constraints from
+  the old brief.
