@@ -136,7 +136,7 @@ fn encodeDataFrameInto(out: []u8, stream_id: u31, data: []const u8, end_stream: 
 /// here. Fired on the HEADERS-on-closed-stream branches and on
 /// `failConnectionWith`, so a full-suite h2spec run shows whether the Session
 /// DECIDED to close, separately from whether the edge materialized the close.
-pub const CloseProbeSite = enum { headers_on_tombstone, headers_on_closed, fail_connection, data_on_closed_ignored };
+pub const CloseProbeSite = enum { headers_on_tombstone, headers_on_closed, fail_connection, data_on_closed_ignored, headers_seen, hpack_decode_fail };
 pub const CloseProbeEvent = struct {
     session: usize,
     site: CloseProbeSite,
@@ -1170,6 +1170,7 @@ pub const Session = struct {
     }
 
     fn onHeaders(self: *Session, hdr: frame.FrameHeader, payload: []const u8) !void {
+        if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .headers_seen, .code = .no_error, .stream_id = hdr.stream_id });
         if (hdr.stream_id == 0 or hdr.stream_id % 2 == 0) {
             try self.failConnection(.protocol_error);
             return;
@@ -1296,6 +1297,7 @@ pub const Session = struct {
             self.limits.regular_field_value_bytes,
         ) catch |err| {
             self.discardHeaderList(stream_id);
+            if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .hpack_decode_fail, .code = if (err == error.OutOfMemory) .internal_error else .compression_error, .stream_id = stream_id });
             if (err == error.OutOfMemory) {
                 try self.failConnection(.internal_error);
             } else {

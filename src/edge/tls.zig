@@ -732,6 +732,7 @@ pub const Pump = struct {
             const n = self.conn.pair.readEncrypted(self.send_buf[self.send_fill..]) catch |err| switch (err) {
                 error.WantRead => break,
                 else => {
+                    if (diag_wait) rawPrint("TLSERR ssl_write {s}\n", .{@errorName(err)});
                     _ = tls_stage_failed.fetchAdd(1, .monotonic);
                     self.failDrain();
                     self.post(.{ .shutdown = true });
@@ -786,6 +787,7 @@ pub const Pump = struct {
             // Only shutdownCq cancels the op; teardown owns the exit.
             error.Canceled => return .exit,
             else => {
+                if (diag_wait) rawPrint("TLSERR send_complete {s}\n", .{@errorName(err)});
                 _ = tls_stage_failed.fetchAdd(1, .monotonic);
                 self.failDrain();
                 self.post(.{ .fail_all = true, .shutdown = true });
@@ -820,6 +822,7 @@ pub const Pump = struct {
         while (consumed.* < bytes.len) {
             spins += 1;
             if (spins > MaxHandshakeIterations) {
+                if (diag_wait) rawPrint("TLSERR feedcipher_spins\n", .{});
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return .eof;
@@ -839,12 +842,14 @@ pub const Pump = struct {
                     continue;
                 },
                 else => {
+                    if (diag_wait) rawPrint("TLSERR recv {s}\n", .{@errorName(err)});
                     self.failDrain();
                     self.post(.{ .shutdown = true });
                     return .eof;
                 },
             };
             if (n == 0) {
+                if (diag_wait) rawPrint("TLSERR recv_eof\n", .{});
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return .eof;
@@ -882,6 +887,7 @@ pub const Pump = struct {
             spins += 1;
             if (spins > MaxHandshakeIterations) {
                 _ = tls_stage_failed.fetchAdd(1, .monotonic);
+                if (diag_wait) rawPrint("TLSERR sslwrite_spins\n", .{});
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return .exit;
@@ -913,6 +919,7 @@ pub const Pump = struct {
                     }
                 },
                 else => {
+                    if (diag_wait) rawPrint("TLSERR stage {s}\n", .{@errorName(err)});
                     _ = tls_stage_failed.fetchAdd(1, .monotonic);
                     self.failDrain();
                     self.post(.{ .shutdown = true });
@@ -945,6 +952,7 @@ pub const Pump = struct {
         std.debug.assert(self.pending_n == 0);
         if (first.len == 0 and first.bytes.len == 0 and !first.flush_barrier) {
             _ = tls_stage_failed.fetchAdd(1, .monotonic);
+            if (diag_wait) rawPrint("TLSERR sentinel\n", .{});
             self.failDrain();
             self.post(.{ .shutdown = true });
             return false;
@@ -1063,6 +1071,7 @@ pub const Pump = struct {
             },
             else => {
                 self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+                if (diag_wait) rawPrint("TLSERR recv2 {s}\n", .{@errorName(err)});
                 self.failDrain();
                 self.postEof();
                 return .eof;
@@ -1070,6 +1079,7 @@ pub const Pump = struct {
         };
         if (n == 0) {
             self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            if (diag_wait) rawPrint("TLSERR recv2_eof\n", .{});
             self.failDrain();
             self.postEof();
             return .eof;
@@ -1148,6 +1158,7 @@ pub const Pump = struct {
             error.Canceled => return .exit,
             else => {
                 self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+                if (diag_wait) rawPrint("TLSERR cqrecv {s}\n", .{@errorName(err)});
                 self.failDrain();
                 self.postEof();
                 self.post(.{ .shutdown = true });
@@ -1156,6 +1167,7 @@ pub const Pump = struct {
         };
         if (n == 0) {
             self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            if (diag_wait) rawPrint("TLSERR cqrecv_eof\n", .{});
             self.failDrain();
             self.postEof();
             self.post(.{ .shutdown = true });

@@ -856,6 +856,14 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     g_sse_interval_ms = args.sse_interval_ms;
     starh2.edge.connection.diag_park = args.diag;
     starh2.edge.tls_edge.diag_wait = args.diag;
+    // t-1022: the close-path probe names the error a dying actor exits with
+    // (`run_err <name>`); the silent serveAccepted catch was the last blind
+    // spot in the collapse rounds.
+    starh2.edge.connection.close_probe = args.diag;
+    starh2.edge.wire_pump.close_probe = args.diag;
+    if (args.diag) {
+        starh2.core.session.close_probe_fn = &starh2.edge.connection.closeProbeSessionPrint;
+    }
     if (args.diag) {
         // These exports exist only in a locally patched zio (zig-pkg is
         // machine-local and gitignored); a pristine pin builds without them

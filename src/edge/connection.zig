@@ -347,6 +347,11 @@ pub var diag_rst_compress: std.atomic.Value(u32) = .init(0);
 pub var diag_ctrl_fail: std.atomic.Value(u32) = .init(0);
 pub var diag_reset_after_ctrl_fail: std.atomic.Value(u32) = .init(0);
 var diag_last_empty_park_ns: u64 = 0;
+/// t-1022 probe: stamp of the last drainEmit entry, so the overflow print
+/// can show the gap that let the backlog build. One connection at a time in
+/// the probe, so a plain var is enough.
+var diag_last_drain_ns: u64 = 0;
+var diag_prev_drain_gap_ns: u64 = 0;
 
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
@@ -1610,6 +1615,7 @@ const Connection = struct {
         self.applyOutboundRelease(ack.outbound_release, .wire);
         if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
         if (ack.fail_all) {
+            if (diag_park) diagRawPrint("WFSET ack_fail_all conn={x}\n", .{ @intFromPtr(self) & 0xffff });
             self.writer_failed.store(true, .release);
             self.tickets.failAll();
             // Ticket events are set before this flag; drainPendingCompleteReceipts
@@ -1624,6 +1630,7 @@ const Connection = struct {
                 // A malformed chain would strand at least one synchronous
                 // write forever. Fail every waiter instead of converting
                 // internal metadata corruption into a silent hang.
+                if (diag_park) diagRawPrint("WFSET ack_fail_all2 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                 self.writer_failed.store(true, .release);
                 self.tickets.failAll();
                 self.complete_receipts_fail_all.store(true, .release);
@@ -2174,6 +2181,7 @@ const Connection = struct {
                 // complete response. Preserve ticket ownership if corruption
                 // violates that invariant, then fail the connection loudly.
                 self.tickets.releaseReserved(receipt.ticket_slot);
+                if (diag_park) diagRawPrint("WFSET receipts_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                 self.writer_failed.store(true, .release);
                 receipt_ok = false;
             }
@@ -2332,6 +2340,23 @@ const Connection = struct {
                 self.live_handlers.load(.acquire),
             },
         );
+        // t-1022: the scheduler-pause inputs. An eligible pending chunk that
+        // never emits while `pause` reads true names the TLS driver state
+        // that pinned it; none of the lines above carry these.
+        if (self.tls_driver) |p| {
+            diagRawPrint(
+                "STARH2_TLSP conn={x} pending_n={d} stash_full={} pending_read={} pending_cipher={} recv_armed={} send_armed={}\n",
+                .{
+                    @intFromPtr(self) & 0xffff,
+                    p.pending_n,
+                    p.stashFull(),
+                    p.pending_read != null,
+                    p.pending_cipher != null,
+                    p.recv_armed,
+                    p.send_armed,
+                },
+            );
+        }
     }
 
     /// Park in ONE `zio.select` until something the actor cares about
@@ -2480,7 +2505,27 @@ const Connection = struct {
             });
             switch (winner) {
                 .io => |r| {
-                    const c = r catch {
+                    const c = r catch |err| {
+                        // Under select, `error.Closed` is not proof of the
+                        // drained state: a stale futex signal from an arm a
+                        // concurrent winner canceled can outlive the select's
+                        // signal accounting and win a later select with the
+                        // queue empty and open (zio, #709 protocol lineage).
+                        // Tearing the connection down on it killed all live
+                        // streams silently (t-1022). `isDrained()` is the
+                        // CQ's own classifier: false means keep driving (one
+                        // wasted turn); true is the terminal state the error
+                        // names, and only that falls through to failDrain.
+                        // Gating on the predicate rather than on the "actor
+                        // never closes mid-loop" invariant keeps a REAL
+                        // drained queue loud: without it, a genuine close
+                        // would re-poll a permanently-ready arm in a silent
+                        // hot spin.
+                        if (err == error.Closed and !pump.cq.isDrained()) {
+                            if (diag_park) diagRawPrint("spurious cq Closed ignored conn={x}\n", .{@intFromPtr(self) & 0xffff});
+                            return null;
+                        }
+                        if (diag_park) diagRawPrint("TLSERR cq_receive {s} conn={x}\n", .{ @errorName(err), @intFromPtr(self) & 0xffff });
                         pump.failDrain();
                         return .{ .bytes = &.{}, .len = 0 };
                     };
@@ -2755,6 +2800,7 @@ const Connection = struct {
                     // be retried and cannot be un-debited, so the connection's
                     // window state no longer matches the peer's. The only
                     // correct move left is to close.
+                    if (diag_park) diagRawPrint("WFSET loop_drain_catch conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                 };
@@ -3227,6 +3273,7 @@ const Connection = struct {
             diagRawPrint("t1002 conn={x} shutdownHandlers_enter unflushed_chunks={d} parked={d}\n", .{ @intFromPtr(self), queued, close_probe_parked.load(.acquire) });
         }
         self.stream.shutdown(self.config.io, .both) catch {};
+        if (diag_park) diagRawPrint("WFSET shutdown_handlers conn={x}\n", .{ @intFromPtr(self) & 0xffff });
         self.writer_failed.store(true, .release);
         // Wake any handler (or the actor's last emit) parked on a full
         // write_ch after WritePump has already exited. Cancel does not always
@@ -3450,7 +3497,10 @@ const Connection = struct {
     ) response.ResponseError!void {
         const cap = self.config.limits.outbound_bytes_per_stream;
         if (self.sched.pendingCount() >= self.config.limits.max_streams_per_connection) {
-            if (!self.sched.contains(stream_id)) return error.OutOfMemory;
+            if (!self.sched.contains(stream_id)) {
+                if (diag_park) diagRawPrint("WFAIL pendcap sid={d} sched_pending={d}\n", .{ stream_id, self.sched.pendingCount() });
+                return error.OutOfMemory;
+            }
         }
         var off: usize = 0;
         while (off < bytes.len) {
@@ -3458,8 +3508,14 @@ const Connection = struct {
             const room = cap - self.sched.pendingByteLen(stream_id);
             if (room == 0) continue;
             const take = @min(bytes.len - off, room);
-            if (!self.tryReserveOutboundBytes(take, .pending)) return error.OutOfMemory;
+            if (!self.tryReserveOutboundBytes(take, .pending)) {
+                // t-1022 probe: name the site that turns a write into a
+                // per-stream abort, with the budget state at that moment.
+                if (diag_park) diagRawPrint("WFAIL budget sid={d} held={d} pend_held={d} wire_held={d} lim={d} sched_pending={d}\n", .{ stream_id, self.outbound_held.load(.acquire), self.pending_outbound_held.load(.acquire), self.wire_outbound_held.load(.acquire), self.config.limits.outbound_bytes_per_connection, self.sched.pendingCount() });
+                return error.OutOfMemory;
+            }
             self.sched.enqueueDataBytes(stream_id, bytes[off..][0..take], false, 0, 0) catch {
+                if (diag_park) diagRawPrint("WFAIL slab sid={d} sched_pending={d}\n", .{ stream_id, self.sched.pendingCount() });
                 self.applyOutboundRelease(take, .pending);
                 return error.OutOfMemory;
             };
@@ -3501,6 +3557,11 @@ const Connection = struct {
     /// window state the peer does not share.
     fn drainEmit(self: *Connection) !void {
         self.assertSessionHeld("drainEmit");
+        if (diag_park) {
+            const now = nowNs(self.config.io);
+            if (diag_last_drain_ns != 0) diag_prev_drain_gap_ns = now -% diag_last_drain_ns;
+            diag_last_drain_ns = now;
+        }
         const SinkCtx = struct {
             c: *Connection,
             emit: emit_batch.EmitBatch,
@@ -3655,11 +3716,13 @@ const Connection = struct {
                 self.pending_data_outbound_release = 0;
                 self.pending_data_wake_sid = 0;
             }
+            if (diag_park) diagRawPrint("WFSET data_sink_catch conn={x}\n", .{ @intFromPtr(self) & 0xffff });
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
             return err;
         };
         sink_ctx.flushBatch() catch |err| {
+            if (diag_park) diagRawPrint("WFSET data_sink_catch2 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
             return err;
@@ -3859,6 +3922,7 @@ const Connection = struct {
                 self.pending_data_outbound_release = 0;
                 self.pending_data_wake_sid = 0;
             }
+            if (diag_park) diagRawPrint("WFSET emit_fail1 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
             return err;
@@ -3867,6 +3931,7 @@ const Connection = struct {
             if (!sink_ctx.emit.empty()) {
                 if (sink_ctx.emit.ticket_count != 0) {
                     self.tickets.linkCompletion(sink_ctx.emit.last_ticket_slot, sink_ctx.receipt_slot) catch {
+                        if (diag_park) diagRawPrint("WFSET emit_fail2 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                         self.writer_failed.store(true, .release);
                         self.handleWriterFailed();
                         return error.WriteFailed;
@@ -3874,6 +3939,7 @@ const Connection = struct {
                 }
                 sink_ctx.emit.noteTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot);
                 sink_ctx.flushBatch(true) catch |err| {
+                    if (diag_park) diagRawPrint("WFSET emit_fail3 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                     return err;
@@ -3881,6 +3947,7 @@ const Connection = struct {
                 sink_ctx.receipt_attached = true;
             } else if (sink_ctx.queued_any) {
                 self.sendFlushTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot, true) catch |err| {
+                    if (diag_park) diagRawPrint("WFSET emit_fail4 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                     return err;
@@ -3890,6 +3957,7 @@ const Connection = struct {
             }
         } else {
             sink_ctx.flushBatch(false) catch |err| {
+                if (diag_park) diagRawPrint("WFSET emit_fail5 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                 self.writer_failed.store(true, .release);
                 self.handleWriterFailed();
                 return err;
@@ -4002,6 +4070,7 @@ const Connection = struct {
                                 if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
                                 self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
                                 consumed = n;
+                                if (diag_park) diagRawPrint("WFSET ctrl_terminal_full conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                                 if (class == .terminal) self.writer_failed.store(true, .release);
                                 return error.OutOfMemory;
                             },
@@ -4017,6 +4086,7 @@ const Connection = struct {
                         if (!slot.in_use) continue;
                         slot.terminal.setCause(.connection_closed);
                     }
+                    if (diag_park) diagRawPrint("WFSET intent_conn_err conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.writer_failed.store(true, .release);
                 },
                 .connection_closed => {
@@ -4085,6 +4155,13 @@ const Connection = struct {
             }
             pump.write_ch.trySend(chunk) catch {
                 _ = tls_edge.tls_write_overflow.fetchAdd(1, .monotonic);
+                // t-1022 probe: the fail-close moment, with the backlog this
+                // drain turn is trying to move and the gap that built it.
+                if (diag_park) {
+                    var backlog: usize = 0;
+                    for (self.sched.pending_slots) |s| backlog += s.len;
+                    diagRawPrint("OVERFLOW backlog_bytes={d} sched_pending={d} prev_drain_gap_us={d} chunk_len={d}\n", .{ backlog, self.sched.pendingCount(), diag_prev_drain_gap_ns / 1000, chunk.len });
+                }
                 return error.WriteFailed;
             };
             return;
@@ -4750,6 +4827,7 @@ const Connection = struct {
                     // intents. Emitting it without a receipt would skip the
                     // lifecycle boundary, so fail this connection closed.
                     reservation_failed = true;
+                    if (diag_park) diagRawPrint("WFSET inline_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                 }
@@ -5691,6 +5769,7 @@ pub const BenchHop = struct {
                     .complete_batch_receipt = chunk.complete_batch_receipt,
                 };
                 if (!self.conn.completeAckTickets(ack)) {
+                    if (diag_park) diagRawPrint("WFSET local_writes_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.conn.writer_failed.store(true, .release);
                     self.conn.tickets.failAll();
                     self.conn.complete_receipts_fail_all.store(true, .release);

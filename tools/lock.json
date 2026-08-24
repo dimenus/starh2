@@ -3,9 +3,9 @@
   "zio": {
     "tag": "v0.17.0",
     "repo": "https://github.com/dimenus/zio",
-    "commit": "f1681a4dc16840489ae7a9ba1d37cc09ba2700a6",
-    "hash": "zio-0.17.0-xHbVVGmFKADJXPqHKkh20hJCCU2lInWOgxw8LY8D1e6S",
-    "fork_patches": "one: refresh the cached awake snapshot after a backend poll that waited (upstream PR lalinsky/zio#711 on 4f831ea)."
+    "commit": "a237dd02a528e61e84470b7bbf2cff02c38dab84",
+    "hash": "zio-0.17.0-xHbVVMePKABUH2T1flR2GHJHzVj4X7kj_Nj3IYISoZiD",
+    "fork_patches": "three commits on 4f831ea: post-backend-poll snapshot refresh (upstream PR lalinsky/zio#711), CompletionQueue spurious-win tolerance + isDrained (upstream PR lalinsky/zio#712)."
   },
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"
