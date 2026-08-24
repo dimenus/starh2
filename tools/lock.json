@@ -2,13 +2,10 @@
   "zig": "0.16.0",
   "zio": {
     "tag": "v0.17.0",
-    "fork": "https://github.com/dimenus/zio",
-    "branch": "timer-executor",
-    "commit": "e84742f734e46ff5fc202c53c0691af962b91e1e",
-    "hash": "zio-0.17.0-xHbVVIqTKADk4B_SfRDWU_wmw5teyX6Db8CthL2XfY4w",
-    "base": "lalinsky/zio main 4f831ea (merge of PR #709)",
-    "fork_patches": "one: runtime: poll timeouts on a dedicated executor. It is in no upstream PR.",
-    "upstream_pr": "https://github.com/lalinsky/zio/pull/709 (merged; supersedes #702, #686)"
+    "repo": "https://github.com/lalinsky/zio",
+    "commit": "4f831ea9f635574195e5a842225baf68e1bb6fac",
+    "hash": "zio-0.17.0-xHbVVPl1KADG9IPAuydj7uq_0zcqPvj7x2AIWPVgxTqD",
+    "fork_patches": "none. starh2 tracks upstream directly."
   },
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"

@@ -93,8 +93,7 @@ level, so the actor no longer needs to be the handlers' clock.
 - If zio needs a patch, fork first with Ryan's sign-off, and stop until
   it lands (house rule; it fired twice in t-882 and both were real).
 - Stale-constraint note: t-824's brief pinned zio at 489f31f and forbade
-  zio changes. Both are superseded — the pin is e84742f (upstream main
-  after the PR #709 merge, plus 53504b4), and the fork process exists.
-  The select conservation fixes are upstream now; 53504b4 is the only
-  patch the fork still carries. Do not re-import those constraints from
-  the old brief.
+  zio changes. The pin is now upstream 4f831ea with NO fork patches. The
+  select conservation fixes landed upstream. The dedicated timer executor
+  is gone: it was rejected upstream twice, and measurement showed it cost
+  750 us of SSE p50 for no gain. Do not re-open it.

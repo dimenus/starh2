@@ -2728,8 +2728,8 @@ const Connection = struct {
                 }
             }
             // The donate-yield that followed fire-due is gone with the heap:
-            // a handler deadline now wakes its waiter on the dedicated timer
-            // executor, so it is runnable without the actor's help.
+            // a handler deadline parks on its own timed wait, so zio makes
+            // the waiter runnable without the actor's help.
             self.runPendingInline();
             // An extra-batch EOF was consumed last turn after its siblings
             // ingested. Emit once (the loop top above) then tear down — same
@@ -5210,10 +5210,16 @@ const Connection = struct {
     /// per-slot deadline Event. Not `space_events`, and not `Io.sleep`.
     /// Streaming body cadence wait (`Body.waitUntil`), handler-owned.
     ///
-    /// One per-slot Event with a timed wait: `error.Timeout` IS the deadline
-    /// (the fork's dedicated timer executor fires it even while every worker
-    /// is hogged — measured in `tools/deadline-timer-probe`, 51-52 ms under a
-    /// 500 ms one-executor hog). A normal return is an early wake from
+    /// One per-slot Event with a timed wait: `error.Timeout` IS the deadline.
+    /// zio arms it on the waiter's home executor, so it fires when that
+    /// executor next polls. This is a cooperative scheduler: the actor must
+    /// reach a suspension point for the timer to fire, and it does, because
+    /// every turn parks in `zio.select`. `T1` in `tests/deadlines.zig` is the
+    /// gate — a 20 ms deadline while the client floods one-shots on ONE
+    /// executor with migration off. Do NOT move timers to a thread of their
+    /// own to make a non-yielding actor work: measured on 500 concurrent SSE
+    /// streams, that costs 750 us of p50 (21 us against 775 us) for the same
+    /// delivered count. A normal return is an early wake from
     /// `wakeHandlerDeadline` (RST, terminal, writer failure, teardown); the
     /// loop then rechecks the cause. The actor plays no role in handler
     /// timing: no heap, no fire-due turn work, no park-timer contribution.
