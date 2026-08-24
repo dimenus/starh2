@@ -5216,10 +5216,21 @@ const Connection = struct {
     /// reach a suspension point for the timer to fire, and it does, because
     /// every turn parks in `zio.select`. `T1` in `tests/deadlines.zig` is the
     /// gate — a 20 ms deadline while the client floods one-shots on ONE
-    /// executor with migration off. Do NOT move timers to a thread of their
-    /// own to make a non-yielding actor work: measured on 500 concurrent SSE
-    /// streams, that costs 750 us of p50 (21 us against 775 us) for the same
-    /// delivered count. A normal return is an early wake from
+    /// executor with migration off.
+    ///
+    /// Do NOT move timers to a thread of their own to make a non-yielding
+    /// actor work. That was tried, upstream refused it twice, and it costs
+    /// 750 us of p50 on 500 concurrent SSE streams (21 us against 775 us) at
+    /// the SAME delivered count and the same CPU per event. The mechanism:
+    /// such a patch does not only ARM the timer elsewhere, it runs the woken
+    /// waiter there too (`wakeFromTimer` marks the wake, and `scheduleTask`
+    /// then forces local scheduling on the timer executor). Every expired
+    /// deadline therefore runs on ONE thread and then contends for
+    /// `session_mu` in `writeCb`. One thread absorbs 200 wakes per
+    /// millisecond and saturates before 500, which is why the penalty is a
+    /// knee rather than a slope: 200 streams cost nothing and 500 cost 35x.
+    ///
+    /// A normal return is an early wake from
     /// `wakeHandlerDeadline` (RST, terminal, writer failure, teardown); the
     /// loop then rechecks the cause. The actor plays no role in handler
     /// timing: no heap, no fire-due turn work, no park-timer contribution.
