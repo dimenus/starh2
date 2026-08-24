@@ -27,6 +27,27 @@ const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
 
+/// t-1002 probe: log every WritePump batch outcome, so a lost GOAWAY shows
+/// WHERE it died: never taken, taken and write-failed, or written and then
+/// destroyed below the socket API. Set by the conformance server beside
+/// `connection.close_probe`. Raw fd-2 write, same reason as `diagRawPrint`.
+pub var close_probe: bool = false;
+fn probePrint(comptime fmt: []const u8, args: anytype) void {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    const ms: u64 = @as(u64, @intCast(ts.sec)) *% 1000 +% @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "[{d}] " ++ fmt, .{ms % 1_000_000} ++ args) catch return;
+    _ = std.c.write(2, line.ptr, line.len);
+}
+/// First frame type byte of a chunk, or 0xff when the chunk is too short to
+/// carry a frame header. GOAWAY is 0x7. Only the FIRST frame of the chunk is
+/// visible this way; the byte count still identifies the batch.
+fn firstFrameType(chunk: WireChunk) u8 {
+    if (chunk.len < 9) return 0xff;
+    return chunk.bytes[3];
+}
+
 pub const WriteCompletion = struct {
     /// Nonzero: complete this ticket wait slot.
     ticket: u64 = 0,
@@ -283,6 +304,7 @@ pub const WritePump = struct {
                 self.post(.{ .fail_all = true, .shutdown = false });
                 return;
             }
+            if (close_probe and chunk.len >= 9) probePrint("t1002 pump={x} fail_drain t={x} l={d}\n", .{ @intFromPtr(self), firstFrameType(chunk), chunk.len });
             self.releaseChunk(chunk, false, false);
         }
         self.post(.{ .fail_all = true });
@@ -365,12 +387,26 @@ pub const WritePump = struct {
             for (chunks[0..count], 0..) |chunk, i| {
                 slices[i] = chunk.bytes[0..chunk.len];
             }
+            if (close_probe) {
+                var types: [max_batch]u8 = undefined;
+                var lens: [max_batch]usize = undefined;
+                for (chunks[0..count], 0..) |chunk, i| {
+                    types[i] = firstFrameType(chunk);
+                    lens[i] = chunk.len;
+                }
+                probePrint("t1002 pump={x} take n={d} t0={x} l0={d} t1={x} l1={d}\n", .{
+                    @intFromPtr(self),          count,
+                    types[0],                   lens[0],
+                    if (count > 1) types[1] else 0xee, if (count > 1) lens[1] else 0,
+                });
+            }
             if (write_trace.enabled) write_trace.note(count);
             const write_result = if (count == 1)
                 writer.interface.writeAll(slices[0])
             else
                 writer.interface.writeVecAll(slices[0..count]);
-            write_result catch {
+            write_result catch |err| {
+                if (close_probe) probePrint("t1002 pump={x} write_err {s}\n", .{ @intFromPtr(self), @errorName(err) });
                 for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
@@ -379,12 +415,14 @@ pub const WritePump = struct {
             // Ticket completions stay behind this flush. writeAll into the
             // buffer is not delivery; a cancelled pump must not ack a receipt
             // whose bytes are still sitting here.
-            writer.interface.flush() catch {
+            writer.interface.flush() catch |err| {
+                if (close_probe) probePrint("t1002 pump={x} flush_err {s}\n", .{ @intFromPtr(self), @errorName(err) });
                 for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return;
             };
+            if (close_probe) probePrint("t1002 pump={x} wrote n={d}\n", .{ @intFromPtr(self), count });
             self.writes_done += count;
             for (chunks[0..count]) |chunk| self.releaseChunk(chunk, true, false);
         }

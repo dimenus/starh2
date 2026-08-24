@@ -131,6 +131,20 @@ fn encodeDataFrameInto(out: []u8, stream_id: u31, data: []const u8, end_stream: 
     return total;
 }
 
+/// t-1002 probe hook. Core stays clock-free and I/O-free, so the print body
+/// lives at the edge; a binary installs `edge.connection.closeProbeSessionPrint`
+/// here. Fired on the HEADERS-on-closed-stream branches and on
+/// `failConnectionWith`, so a full-suite h2spec run shows whether the Session
+/// DECIDED to close, separately from whether the edge materialized the close.
+pub const CloseProbeSite = enum { headers_on_tombstone, headers_on_closed, fail_connection, data_on_closed_ignored };
+pub const CloseProbeEvent = struct {
+    session: usize,
+    site: CloseProbeSite,
+    code: frame.ErrorCode,
+    stream_id: u32,
+};
+pub var close_probe_fn: ?*const fn (ev: CloseProbeEvent) void = null;
+
 pub const Session = struct {
     /// Heap that outlives any one ingest or command.
     gpa: std.mem.Allocator,
@@ -622,6 +636,7 @@ pub const Session = struct {
     }
 
     fn failConnectionWith(self: *Session, code: frame.ErrorCode, last: u31) !void {
+        if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .fail_connection, .code = code, .stream_id = last });
         var buf: [32]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, code, &.{});
         const p = try self.gpa.dupe(u8, buf[0..n]);
@@ -1024,6 +1039,7 @@ pub const Session = struct {
                 // the accounting would desynchronize credit for the rest of the
                 // connection. Replenish at the usual threshold so a large body
                 // sent into a dead stream cannot strand the whole window.
+                if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .data_on_closed_ignored, .code = .no_error, .stream_id = hdr.stream_id });
                 if (self.windows.needsConnWindowUpdate()) {
                     const inc = self.windows.connWindowUpdateIncrement();
                     if (inc > 0) {
@@ -1163,11 +1179,13 @@ pub const Session = struct {
         // path does not scan the bounded tombstone ring.
         if (hdr.stream_id <= self.highest_peer_stream and self.isTombstoned(hdr.stream_id)) {
             // HEADERS on a closed stream: connection STREAM_CLOSED (RFC 9113 §5.1 / h2spec 5.1/12).
+            if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .headers_on_tombstone, .code = .stream_closed, .stream_id = hdr.stream_id });
             try self.failConnection(.stream_closed);
             return;
         }
         if (self.streams.getPtr(hdr.stream_id)) |existing| {
             if (existing.state == .closed) {
+                if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .headers_on_closed, .code = .stream_closed, .stream_id = hdr.stream_id });
                 try self.failConnection(.stream_closed);
                 return;
             }

@@ -188,6 +188,42 @@ pub var test_polling_canary_tick_ns: std.atomic.Value(u64) = .init(0);
 /// work still sitting in userspace. Off unless the benchmark server sets it.
 pub var diag_park: bool = false;
 
+/// t-1002 probe: trace the connection-close path of every connection under a
+/// full h2spec run. Off unless the conformance server sets it (from
+/// `STARH2_CLOSE_PROBE=1`). Prints go through `diagRawPrint`, so the file
+/// order is the time order.
+pub var close_probe: bool = false;
+/// Gauge: connections parked RIGHT NOW in `waitForActivity` with a protocol
+/// deadline armed. Every close-probe line prints it, so a slow close
+/// correlates (or does not) with parked-on-deadline neighbours. Only
+/// maintained while `close_probe` is set.
+pub var close_probe_parked: std.atomic.Value(u32) = .init(0);
+
+/// Diag-only peer port, so a probe line maps to the exact h2spec case: the
+/// harness prints `using source address 127.0.0.1:PORT` per case. Returns 0
+/// when the socket cannot answer; 0 never matches a real ephemeral port.
+fn closeProbePeerPort(handle: std.posix.socket_t) u16 {
+    var addr: std.posix.sockaddr = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    std.posix.getpeername(handle, &addr, &len) catch return 0;
+    if (addr.family != std.posix.AF.INET) return 0;
+    const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&addr));
+    return std.mem.bigToNative(u16, in.port);
+}
+
+/// The print body for `session.close_probe_fn`. Lives here because core is
+/// clock-free and I/O-free by contract; the binary wires the two together.
+pub fn closeProbeSessionPrint(ev: session_mod.CloseProbeEvent) void {
+    // `ErrorCode` is non-exhaustive, so print the wire integer, not a tag name.
+    diagRawPrint("t1002 sess={x} {s} code={d} sid={d} parked={d}\n", .{
+        ev.session,
+        @tagName(ev.site),
+        @intFromEnum(ev.code),
+        ev.stream_id,
+        close_probe_parked.load(.acquire),
+    });
+}
+
 /// Diag hooks the bench server installs (they need zio, which this module
 /// must not import). Handle = opaque task pointer; state byte = packed
 /// (tag:u3 | awaken:u1) from zio's AnyTask.
@@ -863,7 +899,8 @@ pub const ReaperPool = struct {
 /// runs. The read-chunk free list is seeded here rather than in `init` for the
 /// same reason: the queues are only live once the struct has its final address.
 pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cancelable!void {
-    var conn = Connection.init(stream, config) catch {
+    var conn = Connection.init(stream, config) catch |err| {
+        if (close_probe) diagRawPrint("t1002 init_fail {s}\n", .{@errorName(err)});
         if (config.handshake_held) {
             if (config.accounting) |a| a.releaseHandshake();
         }
@@ -877,6 +914,14 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cance
         error.Canceled => return error.Canceled,
         else => {
             // Transport/protocol failure is connection-local and closes below.
+            // Raw writes, no std.fmt: this path crashed once through
+            // Writer.printValue in ReleaseSafe (unreproduced; diag-only).
+            if (close_probe) {
+                const name = @errorName(err);
+                _ = std.c.write(2, "t1002 run_err ", 14);
+                _ = std.c.write(2, name.ptr, name.len);
+                _ = std.c.write(2, "\n", 1);
+            }
         },
     };
 }
@@ -2400,6 +2445,14 @@ const Connection = struct {
             if (deadline_ns <= now) return null;
             break :blk .{ .duration = .fromNanoseconds(deadline_ns - now) };
         } else .none;
+        // t-1002 gauge: this actor is about to park with a protocol deadline
+        // armed. The probe lines print the count, so a slow close correlates
+        // (or does not) with parked-on-deadline neighbours.
+        const probe_deadline_park = close_probe and timeout != .none;
+        if (probe_deadline_park) _ = close_probe_parked.fetchAdd(1, .acq_rel);
+        defer if (probe_deadline_park) {
+            _ = close_probe_parked.fetchSub(1, .acq_rel);
+        };
         const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
         // The hold leaves completions buffered in the channel, exactly as the
         // gated drain leaves them queued.
@@ -2658,6 +2711,7 @@ const Connection = struct {
         }
         self.runPendingInline();
 
+        if (close_probe) diagRawPrint("t1002 conn={x} sess={x} start peer={d} parked={d}\n", .{ @intFromPtr(self), @intFromPtr(&self.session), closeProbePeerPort(self.stream.socket.handle), close_probe_parked.load(.acquire) });
         if (self.config.mode == .h2c) {
             self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
                 @as(i96, nowNs(io) +% self.config.limits.preface_timeout_ns),
@@ -2799,7 +2853,9 @@ const Connection = struct {
         // shutdownHandlers returns only once every slot went through releaseSlot, so
         // both counters have already been decremented for this connection. Storing 0
         // here would clobber connections still serving on the same process.
+        if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} eof={} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), inbound_eof, self.sched.pendingCount(), close_probe_parked.load(.acquire) });
         try self.shutdownHandlers();
+        if (close_probe) diagRawPrint("t1002 conn={x} shutdown_done parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
     }
 
     fn receiveUntilDeadline(self: *Connection) !wire_pump.WireChunk {
@@ -3162,6 +3218,14 @@ const Connection = struct {
         //    hangSse sleep or an unacked wait.
         // 4. failAll / wakeAllSpace catch tickets whose chunk never reached
         //    write_ch, and capacity waits that reset after an earlier wake.
+        if (close_probe) {
+            // Racy read of the queue's byte count, without its mutex: a diag
+            // gauge, never a decision. Nonzero here means the socket shutdown
+            // below clips frames the Session already emitted (the GOAWAY race).
+            // Unit: ring bytes of queued WireChunk descriptors, not wire bytes.
+            const queued = self.write_ch.type_erased.len / @sizeOf(wire_pump.WireChunk);
+            diagRawPrint("t1002 conn={x} shutdownHandlers_enter unflushed_chunks={d} parked={d}\n", .{ @intFromPtr(self), queued, close_probe_parked.load(.acquire) });
+        }
         self.stream.shutdown(self.config.io, .both) catch {};
         self.writer_failed.store(true, .release);
         // Wake any handler (or the actor's last emit) parked on a full
@@ -3226,6 +3290,13 @@ const Connection = struct {
             self.tickets.failAll();
             self.wakeAllSpace();
             self.wakeAllDeadlines();
+            if (close_probe) {
+                var in_use: u32 = 0;
+                for (self.handlers) |s| {
+                    if (s.in_use) in_use += 1;
+                }
+                diagRawPrint("t1002 conn={x} shutdown_wait in_use={d} parked={d}\n", .{ @intFromPtr(self), in_use, close_probe_parked.load(.acquire) });
+            }
             const sid = self.completion_ch.receive() catch return error.Canceled;
             self.releaseSlot(sid);
         }
@@ -3941,6 +4012,7 @@ const Connection = struct {
                 .early_reject => {},
                 .stream_reset => |r| self.applyStreamResetIntent(r),
                 .connection_error => {
+                    if (close_probe) diagRawPrint("t1002 conn={x} intent_connection_error parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
                     for (self.handlers) |*slot| {
                         if (!slot.in_use) continue;
                         slot.terminal.setCause(.connection_closed);
