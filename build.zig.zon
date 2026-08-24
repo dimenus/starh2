@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#4f831ea9f635574195e5a842225baf68e1bb6fac",
-            .hash = "zio-0.17.0-xHbVVPl1KADG9IPAuydj7uq_0zcqPvj7x2AIWPVgxTqD",
+            .url = "git+https://github.com/dimenus/zio#f1681a4dc16840489ae7a9ba1d37cc09ba2700a6",
+            .hash = "zio-0.17.0-xHbVVGmFKADJXPqHKkh20hJCCU2lInWOgxw8LY8D1e6S",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.

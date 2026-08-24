@@ -2,10 +2,10 @@
   "zig": "0.16.0",
   "zio": {
     "tag": "v0.17.0",
-    "repo": "https://github.com/lalinsky/zio",
-    "commit": "4f831ea9f635574195e5a842225baf68e1bb6fac",
-    "hash": "zio-0.17.0-xHbVVPl1KADG9IPAuydj7uq_0zcqPvj7x2AIWPVgxTqD",
-    "fork_patches": "none. starh2 tracks upstream directly."
+    "repo": "https://github.com/dimenus/zio",
+    "commit": "f1681a4dc16840489ae7a9ba1d37cc09ba2700a6",
+    "hash": "zio-0.17.0-xHbVVGmFKADJXPqHKkh20hJCCU2lInWOgxw8LY8D1e6S",
+    "fork_patches": "one: refresh the cached awake snapshot after a backend poll that waited (upstream PR lalinsky/zio#711 on 4f831ea)."
   },
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"
