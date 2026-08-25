@@ -1,0 +1,8 @@
+mixed-w2 rc=0
+mixed-auto rc=0
+sse200 rc=0
+conns50-execauto rc=0
+conns50-exec2 rc=0
+conns50-exec24 rc=0
+conns50-auto-baselinecpu rc=0
+NACHOS-HEAD-DONE fail=0 sha=978213b rows=192 mixed_rows=40

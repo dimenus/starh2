@@ -1,0 +1,74 @@
+== width: starh2=12  go=12  kestrel=12  hyper=12  (OPPONENT_WIDTH=match)
+== mixed SSE + oneshot, one TLS connection per arm
+== 0 SSE streams, 5s + 1s warmup, one event per 10ms, 500 oneshot workers, 50 conns, 4 rounds
+== starh2 executors=auto (=12)  opponents width=12  SSE target 0 events/arm/round
+== arms: starh2 :19450  go-net/http :19451  kestrel :19452  hyper :19454
+== http2.zig is not an arm: one-shot handler API, no flush
+round 1
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=50 workers=500
+  starh2       oneshot ok=1575680 err=0 rps=315136 p50=475µs p99=14.28ms max=47.966ms
+  starh2 server CPU=20.00s (oneshot-only + mixed, including warmup)
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=50 workers=500
+  go-net/http  oneshot ok=1324400 err=0 rps=264880 p50=1.044ms p99=9.522ms max=30.407ms
+  go-net/http server CPU=46.00s (oneshot-only + mixed, including warmup)
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=50 workers=500
+  kestrel      oneshot ok=1413717 err=0 rps=282743 p50=583µs p99=13.737ms max=44.011ms
+  kestrel server CPU=53.00s (oneshot-only + mixed, including warmup)
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=50 workers=500
+  hyper        oneshot ok=1555691 err=0 rps=311138 p50=452µs p99=14.824ms max=56.475ms
+  hyper server CPU=15.00s (oneshot-only + mixed, including warmup)
+round 2
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=50 workers=500
+  go-net/http  oneshot ok=1325976 err=0 rps=265195 p50=1.022ms p99=9.758ms max=30.399ms
+  go-net/http server CPU=46.00s (oneshot-only + mixed, including warmup)
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=50 workers=500
+  kestrel      oneshot ok=1409790 err=0 rps=281958 p50=597µs p99=13.704ms max=42.528ms
+  kestrel server CPU=54.00s (oneshot-only + mixed, including warmup)
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=50 workers=500
+  hyper        oneshot ok=1560159 err=0 rps=312032 p50=462µs p99=14.407ms max=57.396ms
+  hyper server CPU=15.00s (oneshot-only + mixed, including warmup)
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=50 workers=500
+  starh2       oneshot ok=1571098 err=0 rps=314220 p50=466µs p99=14.674ms max=52.629ms
+  starh2 server CPU=21.00s (oneshot-only + mixed, including warmup)
+round 3
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=50 workers=500
+  kestrel      oneshot ok=1401050 err=0 rps=280210 p50=590µs p99=14.216ms max=43.321ms
+  kestrel server CPU=53.00s (oneshot-only + mixed, including warmup)
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=50 workers=500
+  hyper        oneshot ok=1554928 err=0 rps=310986 p50=449µs p99=14.665ms max=52.529ms
+  hyper server CPU=15.00s (oneshot-only + mixed, including warmup)
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=50 workers=500
+  starh2       oneshot ok=1570432 err=0 rps=314086 p50=456µs p99=14.854ms max=59.948ms
+  starh2 server CPU=20.00s (oneshot-only + mixed, including warmup)
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=50 workers=500
+  go-net/http  oneshot ok=1313788 err=0 rps=262758 p50=1.031ms p99=9.768ms max=30.028ms
+  go-net/http server CPU=45.00s (oneshot-only + mixed, including warmup)
+round 4
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=50 workers=500
+  hyper        oneshot ok=1555210 err=0 rps=311042 p50=448µs p99=14.771ms max=52.159ms
+  hyper server CPU=14.00s (oneshot-only + mixed, including warmup)
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=50 workers=500
+  starh2       oneshot ok=1572356 err=0 rps=314471 p50=461µs p99=14.756ms max=53.59ms
+  starh2 server CPU=20.00s (oneshot-only + mixed, including warmup)
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=50 workers=500
+  go-net/http  oneshot ok=1319514 err=0 rps=263903 p50=1.038ms p99=9.537ms max=29.092ms
+  go-net/http server CPU=45.00s (oneshot-only + mixed, including warmup)
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=50 workers=500
+  kestrel      oneshot ok=1398589 err=0 rps=279718 p50=582µs p99=14.334ms max=48.86ms
+  kestrel server CPU=54.00s (oneshot-only + mixed, including warmup)

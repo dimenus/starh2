@@ -1,0 +1,155 @@
+== width: starh2=2  go=2  kestrel=2  hyper=2  (OPPONENT_WIDTH=match)
+== mixed SSE + oneshot, one TLS connection per arm
+== 32 SSE streams, 5s + 1s warmup, one event per 10ms, 8 oneshot workers, 1 conns, 4 rounds
+== starh2 executors=2 (=2)  opponents width=2  SSE target 16000 events/arm/round
+== arms: starh2 :19450  go-net/http :19451  kestrel :19452  hyper :19454
+== http2.zig is not an arm: one-shot handler API, no flush
+round 1
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=1 workers=8
+  starh2       oneshot ok=1000885 err=0 rps=200177 p50=36µs p99=126µs max=413µs
+  --- starh2 mixed ---
+  starh2       streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  starh2       sse latency p50=46µs p99=144µs max=239µs
+  starh2       oneshot ok=959384 err=0 rps=191877 p50=38µs p99=114µs max=509µs
+  starh2 server CPU=10.00s (oneshot-only + mixed, including warmup)
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=1 workers=8
+  go-net/http  oneshot ok=489905 err=0 rps=97981 p50=76µs p99=223µs max=547µs
+  --- go-net/http mixed ---
+  go-net/http  streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  go-net/http  sse latency p50=31µs p99=156µs max=342µs
+  go-net/http  oneshot ok=557728 err=0 rps=111546 p50=66µs p99=217µs max=1.077ms
+  go-net/http server CPU=14.00s (oneshot-only + mixed, including warmup)
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=1 workers=8
+  kestrel      oneshot ok=802762 err=0 rps=160552 p50=44µs p99=156µs max=5.456ms
+  --- kestrel mixed ---
+  kestrel      streams=32 conns=1 opened=32 delivering=32 failed=0 events=16032
+  kestrel      sse latency p50=41µs p99=144µs max=5.397ms
+  kestrel      oneshot ok=874215 err=0 rps=174843 p50=40µs p99=129µs max=5.492ms
+  kestrel server CPU=30.00s (oneshot-only + mixed, including warmup)
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=1 workers=8
+  hyper        oneshot ok=922427 err=0 rps=184485 p50=37µs p99=150µs max=436µs
+  --- hyper mixed ---
+  hyper        streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  hyper        sse latency p50=26µs p99=142µs max=257µs
+  hyper        oneshot ok=954699 err=0 rps=190940 p50=37µs p99=127µs max=492µs
+  hyper server CPU=9.00s (oneshot-only + mixed, including warmup)
+round 2
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=1 workers=8
+  go-net/http  oneshot ok=498640 err=0 rps=99728 p50=75µs p99=216µs max=710µs
+  --- go-net/http mixed ---
+  go-net/http  streams=32 conns=1 opened=32 delivering=32 failed=0 events=16016
+  go-net/http  sse latency p50=34µs p99=150µs max=316µs
+  go-net/http  oneshot ok=559118 err=0 rps=111824 p50=66µs p99=215µs max=777µs
+  go-net/http server CPU=15.00s (oneshot-only + mixed, including warmup)
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=1 workers=8
+  kestrel      oneshot ok=818171 err=0 rps=163634 p50=43µs p99=155µs max=603µs
+  --- kestrel mixed ---
+  kestrel      streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  kestrel      sse latency p50=42µs p99=133µs max=284µs
+  kestrel      oneshot ok=867362 err=0 rps=173472 p50=41µs p99=131µs max=5.454ms
+  kestrel server CPU=28.00s (oneshot-only + mixed, including warmup)
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=1 workers=8
+  hyper        oneshot ok=947455 err=0 rps=189491 p50=36µs p99=143µs max=451µs
+  --- hyper mixed ---
+  hyper        streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  hyper        sse latency p50=27µs p99=111µs max=213µs
+  hyper        oneshot ok=949905 err=0 rps=189981 p50=37µs p99=129µs max=546µs
+  hyper server CPU=10.00s (oneshot-only + mixed, including warmup)
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=1 workers=8
+  starh2       oneshot ok=1013434 err=0 rps=202687 p50=35µs p99=122µs max=391µs
+  --- starh2 mixed ---
+  starh2       streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  starh2       sse latency p50=39µs p99=115µs max=208µs
+  starh2       oneshot ok=961010 err=0 rps=192202 p50=38µs p99=113µs max=1.162ms
+  starh2 server CPU=10.00s (oneshot-only + mixed, including warmup)
+round 3
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=1 workers=8
+  kestrel      oneshot ok=820719 err=0 rps=164144 p50=43µs p99=156µs max=524µs
+  --- kestrel mixed ---
+  kestrel      streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  kestrel      sse latency p50=41µs p99=143µs max=378µs
+  kestrel      oneshot ok=860619 err=0 rps=172124 p50=41µs p99=133µs max=5.524ms
+  kestrel server CPU=27.00s (oneshot-only + mixed, including warmup)
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=1 workers=8
+  hyper        oneshot ok=940515 err=0 rps=188103 p50=37µs p99=148µs max=504µs
+  --- hyper mixed ---
+  hyper        streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  hyper        sse latency p50=27µs p99=114µs max=180µs
+  hyper        oneshot ok=944017 err=0 rps=188803 p50=37µs p99=129µs max=625µs
+  hyper server CPU=9.00s (oneshot-only + mixed, including warmup)
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=1 workers=8
+  starh2       oneshot ok=993056 err=0 rps=198611 p50=36µs p99=126µs max=553µs
+  --- starh2 mixed ---
+  starh2       streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  starh2       sse latency p50=42µs p99=128µs max=265µs
+  starh2       oneshot ok=964287 err=0 rps=192857 p50=38µs p99=112µs max=438µs
+  starh2 server CPU=10.00s (oneshot-only + mixed, including warmup)
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=1 workers=8
+  go-net/http  oneshot ok=498192 err=0 rps=99638 p50=75µs p99=213µs max=502µs
+  --- go-net/http mixed ---
+  go-net/http  streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  go-net/http  sse latency p50=35µs p99=146µs max=379µs
+  go-net/http  oneshot ok=552576 err=0 rps=110515 p50=67µs p99=217µs max=520µs
+  go-net/http server CPU=14.00s (oneshot-only + mixed, including warmup)
+round 4
+  --- hyper oneshot-only ---
+  hyper        oneshot-only conns=1 workers=8
+  hyper        oneshot ok=906805 err=0 rps=181361 p50=38µs p99=152µs max=486µs
+  --- hyper mixed ---
+  hyper        streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  hyper        sse latency p50=25µs p99=87µs max=253µs
+  hyper        oneshot ok=959848 err=0 rps=191970 p50=37µs p99=127µs max=1.186ms
+  hyper server CPU=10.00s (oneshot-only + mixed, including warmup)
+  --- starh2 oneshot-only ---
+  starh2       oneshot-only conns=1 workers=8
+  starh2       oneshot ok=996445 err=0 rps=199289 p50=36µs p99=126µs max=568µs
+  --- starh2 mixed ---
+  starh2       streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  starh2       sse latency p50=35µs p99=108µs max=336µs
+  starh2       oneshot ok=970154 err=0 rps=194031 p50=38µs p99=109µs max=988µs
+  starh2 server CPU=11.00s (oneshot-only + mixed, including warmup)
+  --- go-net/http oneshot-only ---
+  go-net/http  oneshot-only conns=1 workers=8
+  go-net/http  oneshot ok=490601 err=0 rps=98120 p50=76µs p99=221µs max=503µs
+  --- go-net/http mixed ---
+  go-net/http  streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  go-net/http  sse latency p50=28µs p99=134µs max=271µs
+  go-net/http  oneshot ok=564709 err=0 rps=112942 p50=66µs p99=211µs max=520µs
+  go-net/http server CPU=14.00s (oneshot-only + mixed, including warmup)
+  --- kestrel oneshot-only ---
+  kestrel      oneshot-only conns=1 workers=8
+  kestrel      oneshot ok=804224 err=0 rps=160845 p50=43µs p99=163µs max=5.458ms
+  --- kestrel mixed ---
+  kestrel      streams=32 conns=1 opened=32 delivering=32 failed=0 events=16000
+  kestrel      sse latency p50=41µs p99=134µs max=256µs
+  kestrel      oneshot ok=870694 err=0 rps=174139 p50=41µs p99=131µs max=5.511ms
+  kestrel server CPU=27.00s (oneshot-only + mixed, including warmup)
+stall: one SSE stream stops reading; p99 of the others + oneshot rps
+  --- starh2 mixed + stall ---
+  starh2       streams=32 conns=1 opened=32 delivering=31 failed=0 events=15500
+  starh2       sse latency p50=39µs p99=119µs max=259µs
+  starh2       oneshot ok=953716 err=0 rps=190743 p50=38µs p99=116µs max=400µs
+  --- go-net/http mixed + stall ---
+  go-net/http  streams=32 conns=1 opened=32 delivering=31 failed=0 events=15500
+  go-net/http  sse latency p50=41µs p99=142µs max=289µs
+  go-net/http  oneshot ok=557585 err=0 rps=111517 p50=66µs p99=214µs max=539µs
+  --- kestrel mixed + stall ---
+  kestrel      streams=32 conns=1 opened=32 delivering=31 failed=0 events=15500
+  kestrel      sse latency p50=41µs p99=138µs max=462µs
+  kestrel      oneshot ok=861456 err=0 rps=172291 p50=41µs p99=132µs max=5.516ms
+  --- hyper mixed + stall ---
+  hyper        streams=32 conns=1 opened=32 delivering=31 failed=0 events=15500
+  hyper        sse latency p50=28µs p99=155µs max=508µs
+  hyper        oneshot ok=900945 err=0 rps=180189 p50=39µs p99=139µs max=1.127ms
