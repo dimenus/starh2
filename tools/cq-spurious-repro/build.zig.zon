@@ -1,0 +1,14 @@
+.{
+    .name = .cq_spurious_repro,
+    .version = "0.0.0",
+    .fingerprint = 0x50d3a00df27dfed,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Path dep into the machine-local zio clone (gitignored), so the
+        // reproducer targets exactly the checkout under test.
+        .zio = .{
+            .path = "../../../../oss/zio",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
