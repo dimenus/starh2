@@ -1,0 +1,414 @@
+== arm identity (embedded zio package hash) ==
+  premerge  zio-0.17.0-xHbVVJWrJwCbcT8hWsD3k3pG7-CHivGHuTrK8Q5kmLDh
+  clean4f  zio-0.17.0-xHbVVPl1KADG9IPAuydj7uq_0zcqPvj7x2AIWPVgxTqD
+  fixpin  zio-0.17.0-xHbVVGmFKADJXPqHKkh20hJCCU2lInWOgxw8LY8D1e6S
+  final  zio-0.17.0-xHbVVMePKABUH2T1flR2GHJHzVj4X7kj_Nj3IYISoZiD
+== host ==
+7.1.6-arch1-1
+cores=24
+ 15:47:59 up 15 days, 16:50,  6 users,  load average: 0.40, 0.35, 0.36
+== phase 1: perf ==
+r1 premerge sse200 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000073
+r1 premerge sse200 premerge     sse latency p50=11µs p99=20µs max=788µs
+r1 premerge sse500 premerge     streams=500 conns=1 opened=352 delivering=321 failed=148 events=3210155
+r1 premerge sse500 premerge     sse latency p50=14µs p99=44µs max=3.293ms
+r1 premerge oneshot-e2 finished in 2.31s, 867587.50 req/s, 37.23MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 premerge oneshot-e8 finished in 1.70s, 2357368.87 req/s, 101.17MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 clean4f sse200 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=294876
+r1 clean4f sse200 clean4f      sse latency p50=13µs p99=35µs max=256µs
+r1 clean4f sse500 clean4f      streams=500 conns=1 opened=382 delivering=256 failed=118 events=2560079
+r1 clean4f sse500 clean4f      sse latency p50=18µs p99=67µs max=1.899ms
+r1 clean4f oneshot-e2 finished in 2.32s, 861234.46 req/s, 36.96MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 clean4f oneshot-e8 finished in 1.67s, 2393260.58 req/s, 102.71MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 fixpin sse200 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000074
+r1 fixpin sse200 fixpin       sse latency p50=14µs p99=61µs max=1.348ms
+r1 fixpin sse500 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000247
+r1 fixpin sse500 fixpin       sse latency p50=21µs p99=148µs max=3.556ms
+r1 fixpin oneshot-e2 finished in 2.30s, 868754.63 req/s, 37.28MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 fixpin oneshot-e8 finished in 1.62s, 2465703.60 req/s, 105.82MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 final sse200 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000065
+r1 final sse200 final        sse latency p50=12µs p99=27µs max=798µs
+r1 final sse500 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000250
+r1 final sse500 final        sse latency p50=21µs p99=114µs max=4.302ms
+r1 final oneshot-e2 finished in 2.34s, 854466.06 req/s, 36.67MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 final oneshot-e8 finished in 1.64s, 2444611.22 req/s, 104.91MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 clean4f sse200 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000095
+r2 clean4f sse200 clean4f      sse latency p50=13µs p99=39µs max=2.048ms
+r2 clean4f sse500 clean4f      streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000218
+r2 clean4f sse500 clean4f      sse latency p50=22µs p99=92µs max=4.206ms
+r2 clean4f oneshot-e2 finished in 2.36s, 847240.43 req/s, 36.36MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 clean4f oneshot-e8 finished in 1.64s, 2441005.47 req/s, 104.76MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 fixpin sse200 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000073
+r2 fixpin sse200 fixpin       sse latency p50=12µs p99=28µs max=1.171ms
+r2 fixpin sse500 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000227
+r2 fixpin sse500 fixpin       sse latency p50=19µs p99=85µs max=5.208ms
+r2 fixpin oneshot-e2 finished in 2.33s, 858547.44 req/s, 36.85MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 fixpin oneshot-e8 finished in 1.60s, 2501574.43 req/s, 107.36MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 final sse200 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000075
+r2 final sse200 final        sse latency p50=12µs p99=29µs max=1.169ms
+r2 final sse500 final        streams=500 conns=1 opened=416 delivering=87 failed=84 events=870041
+r2 final sse500 final        sse latency p50=9µs p99=20µs max=171µs
+r2 final oneshot-e2 finished in 2.29s, 874548.62 req/s, 37.53MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 final oneshot-e8 finished in 1.62s, 2475581.48 req/s, 106.24MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 premerge sse200 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000076
+r2 premerge sse200 premerge     sse latency p50=10µs p99=18µs max=798µs
+r2 premerge sse500 premerge     streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999783
+r2 premerge sse500 premerge     sse latency p50=729µs p99=1.384ms max=6.313ms
+r2 premerge oneshot-e2 finished in 2.27s, 882356.70 req/s, 37.87MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 premerge oneshot-e8 finished in 1.59s, 2514282.70 req/s, 107.90MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 fixpin sse200 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000102
+r3 fixpin sse200 fixpin       sse latency p50=12µs p99=33µs max=1.607ms
+r3 fixpin sse500 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000269
+r3 fixpin sse500 fixpin       sse latency p50=20µs p99=82µs max=5.208ms
+r3 fixpin oneshot-e2 finished in 2.32s, 863355.81 req/s, 37.05MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 fixpin oneshot-e8 finished in 1.65s, 2426596.96 req/s, 104.14MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 final sse200 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000051
+r3 final sse200 final        sse latency p50=13µs p99=35µs max=1.625ms
+r3 final sse500 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000217
+r3 final sse500 final        sse latency p50=18µs p99=124µs max=4.976ms
+r3 final oneshot-e2 finished in 2.30s, 868719.54 req/s, 37.28MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 final oneshot-e8 finished in 1.64s, 2434267.18 req/s, 104.47MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 premerge sse200 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000095
+r3 premerge sse200 premerge     sse latency p50=10µs p99=23µs max=948µs
+r3 premerge sse500 premerge     streams=500 conns=1 opened=350 delivering=256 failed=150 events=2560090
+r3 premerge sse500 premerge     sse latency p50=14µs p99=67µs max=1.831ms
+r3 premerge oneshot-e2 finished in 2.26s, 885656.44 req/s, 38.01MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 premerge oneshot-e8 finished in 1.61s, 2484385.64 req/s, 106.62MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 clean4f sse200 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000118
+r3 clean4f sse200 clean4f      sse latency p50=13µs p99=39µs max=1.877ms
+r3 clean4f sse500 clean4f      streams=500 conns=1 opened=364 delivering=0 failed=136 events=0
+r3 clean4f sse500 clean4f      NO EVENTS — SSE delivered nothing while the connection was live
+r3 clean4f oneshot-e2 finished in 2.33s, 858699.68 req/s, 36.85MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 clean4f oneshot-e8 finished in 1.61s, 2477570.25 req/s, 106.33MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 final sse200 final        streams=200 conns=1 opened=178 delivering=0 failed=22 events=0
+r4 final sse200 final        NO EVENTS — SSE delivered nothing while the connection was live
+r4 final sse500 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000169
+r4 final sse500 final        sse latency p50=17µs p99=85µs max=5.565ms
+r4 final oneshot-e2 finished in 2.28s, 875587.74 req/s, 37.58MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 final oneshot-e8 finished in 1.60s, 2506000.30 req/s, 107.55MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 premerge sse200 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000085
+r4 premerge sse200 premerge     sse latency p50=11µs p99=23µs max=1.531ms
+r4 premerge sse500 premerge     streams=500 conns=1 opened=365 delivering=33 failed=135 events=330000
+r4 premerge sse500 premerge     sse latency p50=10µs p99=20µs max=493µs
+r4 premerge oneshot-e2 finished in 2.27s, 881952.04 req/s, 37.85MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 premerge oneshot-e8 finished in 1.60s, 2500628.28 req/s, 107.32MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 clean4f sse200 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000084
+r4 clean4f sse200 clean4f      sse latency p50=13µs p99=39µs max=1.434ms
+r4 clean4f sse500 clean4f      streams=500 conns=1 opened=500 delivering=500 failed=0 events=3932633
+r4 clean4f sse500 clean4f      sse latency p50=19µs p99=90µs max=3.652ms
+r4 clean4f oneshot-e2 finished in 2.32s, 862290.11 req/s, 37.01MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 clean4f oneshot-e8 finished in 1.60s, 2499019.13 req/s, 107.25MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 fixpin sse200 fixpin       streams=200 conns=1 opened=200 delivering=0 failed=0 events=0
+r4 fixpin sse200 fixpin       NO EVENTS — SSE delivered nothing while the connection was live
+r4 fixpin sse500 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000152
+r4 fixpin sse500 fixpin       sse latency p50=17µs p99=64µs max=4.561ms
+r4 fixpin oneshot-e2 finished in 2.29s, 872770.56 req/s, 37.46MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 fixpin oneshot-e8 finished in 1.62s, 2463896.22 req/s, 105.74MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 premerge sse200 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000103
+r5 premerge sse200 premerge     sse latency p50=11µs p99=30µs max=2.143ms
+r5 premerge sse500 premerge     streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999796
+r5 premerge sse500 premerge     sse latency p50=731µs p99=1.39ms max=3.547ms
+r5 premerge oneshot-e2 finished in 2.28s, 876770.75 req/s, 37.63MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 premerge oneshot-e8 finished in 1.59s, 2508798.04 req/s, 107.67MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 clean4f sse200 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000082
+r5 clean4f sse200 clean4f      sse latency p50=13µs p99=34µs max=2.078ms
+r5 clean4f sse500 clean4f      streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000241
+r5 clean4f sse500 clean4f      sse latency p50=19µs p99=77µs max=4.374ms
+r5 clean4f oneshot-e2 finished in 2.34s, 855028.62 req/s, 36.70MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 clean4f oneshot-e8 finished in 1.62s, 2470148.26 req/s, 106.01MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 fixpin sse200 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000092
+r5 fixpin sse200 fixpin       sse latency p50=14µs p99=42µs max=2.121ms
+r5 fixpin sse500 fixpin       streams=500 conns=1 opened=421 delivering=377 failed=79 events=2702401
+r5 fixpin sse500 fixpin       sse latency p50=13µs p99=44µs max=2.809ms
+r5 fixpin oneshot-e2 finished in 2.30s, 870151.25 req/s, 37.34MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 fixpin oneshot-e8 finished in 1.62s, 2475641.24 req/s, 106.24MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 final sse200 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000095
+r5 final sse200 final        sse latency p50=12µs p99=33µs max=2.026ms
+r5 final sse500 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000118
+r5 final sse500 final        sse latency p50=20µs p99=85µs max=3.301ms
+r5 final oneshot-e2 finished in 2.36s, 848711.27 req/s, 36.42MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 final oneshot-e8 finished in 1.60s, 2494417.18 req/s, 107.05MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+== phase 2: burst fail-close rate (50 rounds per arm) ==
+b1 premerge burst OK overflow=0 stage_failed=0
+b1 clean4f burst OK overflow=0 stage_failed=0
+b1 fixpin burst OK overflow=0 stage_failed=0
+b1 final burst FAIL burst        streams=200 conns=1 opened=166 delivering=96 failed=34 events=192024 overflow=1 stage_failed=0
+b1 final burst-log 
+b2 clean4f burst FAIL burst        streams=200 conns=1 opened=200 delivering=0 failed=0 events=0 overflow=0 stage_failed=0
+b2 clean4f burst-log 
+b2 fixpin burst OK overflow=0 stage_failed=0
+b2 final burst FAIL burst        streams=200 conns=1 opened=164 delivering=86 failed=36 events=172035 overflow=1 stage_failed=0
+b2 final burst-log 
+b2 premerge burst OK overflow=0 stage_failed=0
+b3 fixpin burst FAIL burst        streams=200 conns=1 opened=200 delivering=0 failed=0 events=0 overflow=0 stage_failed=0
+b3 fixpin burst-log 
+b3 final burst OK overflow=0 stage_failed=0
+b3 premerge burst OK overflow=0 stage_failed=0
+b3 clean4f burst OK overflow=0 stage_failed=0
+b4 final burst OK overflow=0 stage_failed=0
+b4 premerge burst FAIL burst        streams=200 conns=1 opened=181 delivering=109 failed=19 events=218039 overflow=1 stage_failed=0
+b4 premerge burst-log 
+b4 clean4f burst OK overflow=0 stage_failed=0
+b4 fixpin burst OK overflow=0 stage_failed=0
+b5 premerge burst OK overflow=0 stage_failed=0
+b5 clean4f burst OK overflow=0 stage_failed=0
+b5 fixpin burst OK overflow=0 stage_failed=0
+b5 final burst OK overflow=0 stage_failed=0
+b6 clean4f burst OK overflow=0 stage_failed=0
+b6 fixpin burst OK overflow=0 stage_failed=0
+b6 final burst OK overflow=0 stage_failed=0
+b6 premerge burst OK overflow=0 stage_failed=0
+b7 fixpin burst OK overflow=0 stage_failed=0
+b7 final burst FAIL burst        streams=200 conns=1 opened=167 delivering=45 failed=33 events=90013 overflow=1 stage_failed=0
+b7 final burst-log 
+b7 premerge burst OK overflow=0 stage_failed=0
+b7 clean4f burst OK overflow=0 stage_failed=0
+b8 final burst FAIL burst        streams=200 conns=1 opened=178 delivering=44 failed=22 events=88014 overflow=1 stage_failed=0
+b8 final burst-log 
+b8 premerge burst OK overflow=0 stage_failed=0
+b8 clean4f burst OK overflow=0 stage_failed=0
+b8 fixpin burst OK overflow=0 stage_failed=0
+b9 premerge burst OK overflow=0 stage_failed=0
+b9 clean4f burst OK overflow=0 stage_failed=0
+b9 fixpin burst FAIL burst        streams=200 conns=1 opened=169 delivering=0 failed=31 events=0 overflow=1 stage_failed=0
+b9 fixpin burst-log 
+b9 final burst OK overflow=0 stage_failed=0
+b10 clean4f burst OK overflow=0 stage_failed=0
+b10 fixpin burst OK overflow=0 stage_failed=0
+b10 final burst OK overflow=0 stage_failed=0
+b10 premerge burst OK overflow=0 stage_failed=0
+b11 fixpin burst OK overflow=0 stage_failed=0
+b11 final burst OK overflow=0 stage_failed=0
+b11 premerge burst OK overflow=0 stage_failed=0
+b11 clean4f burst OK overflow=0 stage_failed=0
+b12 final burst OK overflow=0 stage_failed=0
+b12 premerge burst OK overflow=0 stage_failed=0
+b12 clean4f burst OK overflow=0 stage_failed=0
+b12 fixpin burst OK overflow=0 stage_failed=0
+b13 premerge burst FAIL burst        streams=200 conns=1 opened=113 delivering=11 failed=87 events=22003 overflow=1 stage_failed=0
+b13 premerge burst-log 
+b13 clean4f burst FAIL burst        streams=200 conns=1 opened=171 delivering=12 failed=29 events=24003 overflow=1 stage_failed=0
+b13 clean4f burst-log 
+b13 fixpin burst FAIL burst        streams=200 conns=1 opened=185 delivering=0 failed=15 events=0 overflow=1 stage_failed=0
+b13 fixpin burst-log 
+b13 final burst OK overflow=0 stage_failed=0
+b14 clean4f burst OK overflow=0 stage_failed=0
+b14 fixpin burst OK overflow=0 stage_failed=0
+b14 final burst OK overflow=0 stage_failed=0
+b14 premerge burst OK overflow=0 stage_failed=0
+b15 fixpin burst OK overflow=0 stage_failed=0
+b15 final burst OK overflow=0 stage_failed=0
+b15 premerge burst OK overflow=0 stage_failed=0
+b15 clean4f burst OK overflow=0 stage_failed=0
+b16 final burst OK overflow=0 stage_failed=0
+b16 premerge burst OK overflow=0 stage_failed=0
+b16 clean4f burst OK overflow=0 stage_failed=0
+b16 fixpin burst OK overflow=0 stage_failed=0
+b17 premerge burst FAIL burst        streams=200 conns=1 opened=175 delivering=0 failed=25 events=0 overflow=1 stage_failed=0
+b17 premerge burst-log 
+b17 clean4f burst OK overflow=0 stage_failed=0
+b17 fixpin burst FAIL burst        streams=200 conns=1 opened=176 delivering=62 failed=24 events=124015 overflow=1 stage_failed=0
+b17 fixpin burst-log 
+b17 final burst OK overflow=0 stage_failed=0
+b18 clean4f burst OK overflow=0 stage_failed=0
+b18 fixpin burst OK overflow=0 stage_failed=0
+b18 final burst OK overflow=0 stage_failed=0
+b18 premerge burst OK overflow=0 stage_failed=0
+b19 fixpin burst OK overflow=0 stage_failed=0
+b19 final burst OK overflow=0 stage_failed=0
+b19 premerge burst OK overflow=0 stage_failed=0
+b19 clean4f burst OK overflow=0 stage_failed=0
+b20 final burst OK overflow=0 stage_failed=0
+b20 premerge burst OK overflow=0 stage_failed=0
+b20 clean4f burst OK overflow=0 stage_failed=0
+b20 fixpin burst OK overflow=0 stage_failed=0
+b21 premerge burst OK overflow=0 stage_failed=0
+b21 clean4f burst OK overflow=0 stage_failed=0
+b21 fixpin burst FAIL burst        streams=200 conns=1 opened=141 delivering=9 failed=59 events=18000 overflow=1 stage_failed=0
+b21 fixpin burst-log 
+b21 final burst OK overflow=0 stage_failed=0
+b22 clean4f burst OK overflow=0 stage_failed=0
+b22 fixpin burst OK overflow=0 stage_failed=0
+b22 final burst OK overflow=0 stage_failed=0
+b22 premerge burst OK overflow=0 stage_failed=0
+b23 fixpin burst FAIL burst        streams=200 conns=1 opened=159 delivering=0 failed=41 events=0 overflow=1 stage_failed=0
+b23 fixpin burst-log 
+b23 final burst OK overflow=0 stage_failed=0
+b23 premerge burst OK overflow=0 stage_failed=0
+b23 clean4f burst OK overflow=0 stage_failed=0
+b24 final burst OK overflow=0 stage_failed=0
+b24 premerge burst OK overflow=0 stage_failed=0
+b24 clean4f burst OK overflow=0 stage_failed=0
+b24 fixpin burst OK overflow=0 stage_failed=0
+b25 premerge burst OK overflow=0 stage_failed=0
+b25 clean4f burst OK overflow=0 stage_failed=0
+b25 fixpin burst FAIL burst        streams=200 conns=1 opened=200 delivering=0 failed=0 events=0 overflow=0 stage_failed=0
+b25 fixpin burst-log 
+b25 final burst OK overflow=0 stage_failed=0
+b26 clean4f burst OK overflow=0 stage_failed=0
+b26 fixpin burst FAIL burst        streams=200 conns=1 opened=152 delivering=0 failed=48 events=0 overflow=1 stage_failed=0
+b26 fixpin burst-log 
+b26 final burst OK overflow=0 stage_failed=0
+b26 premerge burst FAIL burst        streams=200 conns=1 opened=192 delivering=0 failed=8 events=0 overflow=1 stage_failed=0
+b26 premerge burst-log 
+b27 fixpin burst OK overflow=0 stage_failed=0
+b27 final burst OK overflow=0 stage_failed=0
+b27 premerge burst OK overflow=0 stage_failed=0
+b27 clean4f burst OK overflow=0 stage_failed=0
+b28 final burst FAIL burst        streams=200 conns=1 opened=132 delivering=5 failed=68 events=10005 overflow=1 stage_failed=0
+b28 final burst-log 
+b28 premerge burst OK overflow=0 stage_failed=0
+b28 clean4f burst OK overflow=0 stage_failed=0
+b28 fixpin burst OK overflow=0 stage_failed=0
+b29 premerge burst OK overflow=0 stage_failed=0
+b29 clean4f burst OK overflow=0 stage_failed=0
+b29 fixpin burst FAIL burst        streams=200 conns=1 opened=169 delivering=0 failed=31 events=0 overflow=1 stage_failed=0
+b29 fixpin burst-log 
+b29 final burst FAIL burst        streams=200 conns=1 opened=147 delivering=0 failed=53 events=0 overflow=1 stage_failed=0
+b29 final burst-log 
+b30 clean4f burst OK overflow=0 stage_failed=0
+b30 fixpin burst OK overflow=0 stage_failed=0
+b30 final burst OK overflow=0 stage_failed=0
+b30 premerge burst FAIL burst        streams=200 conns=1 opened=154 delivering=0 failed=46 events=0 overflow=1 stage_failed=0
+b30 premerge burst-log 
+b31 fixpin burst OK overflow=0 stage_failed=0
+b31 final burst OK overflow=0 stage_failed=0
+b31 premerge burst OK overflow=0 stage_failed=0
+b31 clean4f burst OK overflow=0 stage_failed=0
+b32 final burst OK overflow=0 stage_failed=0
+b32 premerge burst FAIL burst        streams=200 conns=1 opened=161 delivering=22 failed=39 events=44006 overflow=1 stage_failed=0
+b32 premerge burst-log 
+b32 clean4f burst OK overflow=0 stage_failed=0
+b32 fixpin burst OK overflow=0 stage_failed=0
+b33 premerge burst OK overflow=0 stage_failed=0
+b33 clean4f burst OK overflow=0 stage_failed=0
+b33 fixpin burst OK overflow=0 stage_failed=0
+b33 final burst OK overflow=0 stage_failed=0
+b34 clean4f burst OK overflow=0 stage_failed=0
+b34 fixpin burst OK overflow=0 stage_failed=0
+b34 final burst OK overflow=0 stage_failed=0
+b34 premerge burst OK overflow=0 stage_failed=0
+b35 fixpin burst OK overflow=0 stage_failed=0
+b35 final burst OK overflow=0 stage_failed=0
+b35 premerge burst OK overflow=0 stage_failed=0
+b35 clean4f burst OK overflow=0 stage_failed=0
+b36 final burst OK overflow=0 stage_failed=0
+b36 premerge burst OK overflow=0 stage_failed=0
+b36 clean4f burst OK overflow=0 stage_failed=0
+b36 fixpin burst OK overflow=0 stage_failed=0
+b37 premerge burst OK overflow=0 stage_failed=0
+b37 clean4f burst OK overflow=0 stage_failed=0
+b37 fixpin burst OK overflow=0 stage_failed=0
+b37 final burst OK overflow=0 stage_failed=0
+b38 clean4f burst OK overflow=0 stage_failed=0
+b38 fixpin burst OK overflow=0 stage_failed=0
+b38 final burst FAIL burst        streams=200 conns=1 opened=170 delivering=4 failed=30 events=8003 overflow=1 stage_failed=0
+b38 final burst-log 
+b38 premerge burst FAIL burst        streams=200 conns=1 opened=145 delivering=21 failed=55 events=42003 overflow=1 stage_failed=0
+b38 premerge burst-log 
+b39 fixpin burst OK overflow=0 stage_failed=0
+b39 final burst OK overflow=0 stage_failed=0
+b39 premerge burst OK overflow=0 stage_failed=0
+b39 clean4f burst FAIL burst        streams=200 conns=1 opened=172 delivering=28 failed=28 events=56006 overflow=1 stage_failed=0
+b39 clean4f burst-log 
+b40 final burst OK overflow=0 stage_failed=0
+b40 premerge burst FAIL burst        streams=200 conns=1 opened=128 delivering=55 failed=72 events=110011 overflow=1 stage_failed=0
+b40 premerge burst-log 
+b40 clean4f burst OK overflow=0 stage_failed=0
+b40 fixpin burst FAIL burst        streams=200 conns=1 opened=178 delivering=35 failed=22 events=70014 overflow=1 stage_failed=0
+b40 fixpin burst-log 
+b41 premerge burst OK overflow=0 stage_failed=0
+b41 clean4f burst OK overflow=0 stage_failed=0
+b41 fixpin burst OK overflow=0 stage_failed=0
+b41 final burst OK overflow=0 stage_failed=0
+b42 clean4f burst OK overflow=0 stage_failed=0
+b42 fixpin burst OK overflow=0 stage_failed=0
+b42 final burst OK overflow=0 stage_failed=0
+b42 premerge burst OK overflow=0 stage_failed=0
+b43 fixpin burst OK overflow=0 stage_failed=0
+b43 final burst OK overflow=0 stage_failed=0
+b43 premerge burst OK overflow=0 stage_failed=0
+b43 clean4f burst FAIL burst        streams=200 conns=1 opened=167 delivering=30 failed=33 events=60018 overflow=1 stage_failed=0
+b43 clean4f burst-log 
+b44 final burst OK overflow=0 stage_failed=0
+b44 premerge burst FAIL burst        streams=200 conns=1 opened=131 delivering=0 failed=69 events=0 overflow=1 stage_failed=0
+b44 premerge burst-log 
+b44 clean4f burst OK overflow=0 stage_failed=0
+b44 fixpin burst FAIL burst        streams=200 conns=1 opened=180 delivering=54 failed=20 events=108010 overflow=1 stage_failed=0
+b44 fixpin burst-log 
+b45 premerge burst OK overflow=0 stage_failed=0
+b45 clean4f burst OK overflow=0 stage_failed=0
+b45 fixpin burst OK overflow=0 stage_failed=0
+b45 final burst OK overflow=0 stage_failed=0
+b46 clean4f burst OK overflow=0 stage_failed=0
+b46 fixpin burst OK overflow=0 stage_failed=0
+b46 final burst OK overflow=0 stage_failed=0
+b46 premerge burst OK overflow=0 stage_failed=0
+b47 fixpin burst OK overflow=0 stage_failed=0
+b47 final burst OK overflow=0 stage_failed=0
+b47 premerge burst OK overflow=0 stage_failed=0
+b47 clean4f burst OK overflow=0 stage_failed=0
+b48 final burst OK overflow=0 stage_failed=0
+b48 premerge burst OK overflow=0 stage_failed=0
+b48 clean4f burst OK overflow=0 stage_failed=0
+b48 fixpin burst FAIL burst        streams=200 conns=1 opened=200 delivering=0 failed=0 events=0 overflow=0 stage_failed=0
+b48 fixpin burst-log 
+b49 premerge burst OK overflow=0 stage_failed=0
+b49 clean4f burst FAIL burst        streams=200 conns=1 opened=200 delivering=0 failed=0 events=0 overflow=0 stage_failed=0
+b49 clean4f burst-log 
+b49 fixpin burst OK overflow=0 stage_failed=0
+b49 final burst OK overflow=0 stage_failed=0
+b50 clean4f burst OK overflow=0 stage_failed=0
+b50 fixpin burst OK overflow=0 stage_failed=0
+b50 final burst OK overflow=0 stage_failed=0
+b50 premerge burst OK overflow=0 stage_failed=0
+== phase 3: server CPU per event at a FIXED offered load ==
+c1 premerge cpu200 ticks=445 tck=100 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000071
+c1 premerge cpu500 ticks=576 tck=100 premerge     streams=500 conns=1 opened=438 delivering=283 failed=62 events=2830097
+c1 clean4f cpu200 ticks=162 tck=100 clean4f      streams=200 conns=1 opened=165 delivering=45 failed=35 events=450014
+c1 clean4f cpu500 ticks=856 tck=100 clean4f      streams=500 conns=1 opened=386 delivering=296 failed=114 events=2960142
+c1 fixpin cpu200 ticks=425 tck=100 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=1218732
+c1 fixpin cpu500 ticks=822 tck=100 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=2607521
+c1 final cpu200 ticks=670 tck=100 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000071
+c1 final cpu500 ticks=1226 tck=100 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000161
+c2 clean4f cpu200 ticks=689 tck=100 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000083
+c2 clean4f cpu500 ticks=318 tck=100 clean4f      streams=500 conns=1 opened=454 delivering=274 failed=46 events=813628
+c2 fixpin cpu200 ticks=668 tck=100 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000064
+c2 fixpin cpu500 ticks=1236 tck=100 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000258
+c2 final cpu200 ticks=0 tck=100 final        streams=200 conns=1 opened=149 delivering=0 failed=51 events=0
+c2 final cpu500 ticks=1232 tck=100 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000098
+c2 premerge cpu200 ticks=433 tck=100 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000069
+c2 premerge cpu500 ticks=677 tck=100 premerge     streams=500 conns=1 opened=477 delivering=339 failed=23 events=3390075
+c3 fixpin cpu200 ticks=672 tck=100 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000082
+c3 fixpin cpu500 ticks=799 tck=100 fixpin       streams=500 conns=1 opened=478 delivering=249 failed=22 events=2490122
+c3 final cpu200 ticks=632 tck=100 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000113
+c3 final cpu500 ticks=1080 tck=100 final        streams=500 conns=1 opened=472 delivering=387 failed=28 events=3870222
+c3 premerge cpu200 ticks=411 tck=100 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000059
+c3 premerge cpu500 ticks=536 tck=100 premerge     streams=500 conns=1 opened=415 delivering=238 failed=85 events=2380129
+c3 clean4f cpu200 ticks=660 tck=100 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000074
+c3 clean4f cpu500 ticks=1254 tck=100 clean4f      streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000154
+c4 final cpu200 ticks=666 tck=100 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000054
+c4 final cpu500 ticks=1215 tck=100 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000227
+c4 premerge cpu200 ticks=445 tck=100 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000061
+c4 premerge cpu500 ticks=1076 tck=100 premerge     streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999841
+c4 clean4f cpu200 ticks=199 tck=100 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=470689
+c4 clean4f cpu500 ticks=1074 tck=100 clean4f      streams=500 conns=1 opened=487 delivering=391 failed=13 events=3910170
+c4 fixpin cpu200 ticks=76 tck=100 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=51079
+c4 fixpin cpu500 ticks=1016 tck=100 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=3729910
+c5 premerge cpu200 ticks=443 tck=100 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000073
+c5 premerge cpu500 ticks=1076 tck=100 premerge     streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999705
+c5 clean4f cpu200 ticks=671 tck=100 clean4f      streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000056
+c5 clean4f cpu500 ticks=256 tck=100 clean4f      streams=500 conns=1 opened=405 delivering=62 failed=95 events=620012
+c5 fixpin cpu200 ticks=132 tck=100 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=215976
+c5 fixpin cpu500 ticks=1140 tck=100 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=4615529
+c5 final cpu200 ticks=633 tck=100 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000077
+c5 final cpu500 ticks=1270 tck=100 final        streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000131
+c6 clean4f cpu200 ticks=0 tck=100 clean4f      streams=200 conns=1 opened=192 delivering=0 failed=8 events=0
+c6 clean4f cpu500 ticks=1232 tck=100 clean4f      streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000112
+c6 fixpin cpu200 ticks=672 tck=100 fixpin       streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000128
+c6 fixpin cpu500 ticks=1211 tck=100 fixpin       streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000298
+c6 final cpu200 ticks=695 tck=100 final        streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000087
+c6 final cpu500 ticks=789 tck=100 final        streams=500 conns=1 opened=388 delivering=256 failed=112 events=2560200
+c6 premerge cpu200 ticks=466 tck=100 premerge     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000062
+c6 premerge cpu500 ticks=1076 tck=100 premerge     streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999859
+== rows=328 ==
