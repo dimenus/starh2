@@ -1,0 +1,59 @@
+== width: starh2=2  go=2  kestrel=2  hyper=2  (OPPONENT_WIDTH=match)
+== 200 streams, 1 conns, 10s + 1s warmup, one event per 10ms, 4 rounds
+== runtime: starh2 executors=2 (=2)  opponents width=2  kestrel :19449  hyper :19453
+== target 200000 events per arm per round (20000 events/s)
+round 1
+  starh2       streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  starh2       sse latency p50=10µs p99=25µs max=141µs
+  starh2 server CPU=0.00s (opening + warmup + measurement)
+  go-net/http  streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  go-net/http  sse latency p50=43µs p99=199µs max=465µs
+  go-net/http server CPU=0.00s (opening + warmup + measurement)
+  kestrel      streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  kestrel      sse latency p50=81µs p99=227µs max=984µs
+  kestrel server CPU=1.00s (opening + warmup + measurement)
+  hyper        streams=200 conns=1 opened=200 delivering=200 failed=0 events=200117
+  hyper        sse latency p50=64µs p99=175µs max=551µs
+  hyper server CPU=0.00s (opening + warmup + measurement)
+round 2
+  go-net/http  streams=200 conns=1 opened=200 delivering=200 failed=0 events=200065
+  go-net/http  sse latency p50=35µs p99=148µs max=563µs
+  go-net/http server CPU=1.00s (opening + warmup + measurement)
+  kestrel      streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  kestrel      sse latency p50=101µs p99=252µs max=805µs
+  kestrel server CPU=1.00s (opening + warmup + measurement)
+  hyper        streams=200 conns=1 opened=200 delivering=200 failed=0 events=200062
+  hyper        sse latency p50=38µs p99=102µs max=407µs
+  hyper server CPU=0.00s (opening + warmup + measurement)
+  starh2       streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  starh2       sse latency p50=10µs p99=24µs max=374µs
+  starh2 server CPU=1.00s (opening + warmup + measurement)
+round 3
+  kestrel      streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  kestrel      sse latency p50=89µs p99=227µs max=1.614ms
+  kestrel server CPU=1.00s (opening + warmup + measurement)
+  hyper        streams=200 conns=1 opened=200 delivering=200 failed=0 events=200047
+  hyper        sse latency p50=52µs p99=153µs max=1.117ms
+  hyper server CPU=0.00s (opening + warmup + measurement)
+  starh2       streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  starh2       sse latency p50=10µs p99=27µs max=137µs
+  starh2 server CPU=1.00s (opening + warmup + measurement)
+  go-net/http  streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  go-net/http  sse latency p50=36µs p99=223µs max=611µs
+  go-net/http server CPU=0.00s (opening + warmup + measurement)
+round 4
+  hyper        streams=200 conns=1 opened=200 delivering=200 failed=0 events=200082
+  hyper        sse latency p50=42µs p99=119µs max=933µs
+  hyper server CPU=1.00s (opening + warmup + measurement)
+  starh2       streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  starh2       sse latency p50=9µs p99=25µs max=250µs
+  starh2 server CPU=1.00s (opening + warmup + measurement)
+  go-net/http  streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  go-net/http  sse latency p50=36µs p99=176µs max=453µs
+  go-net/http server CPU=1.00s (opening + warmup + measurement)
+  kestrel      streams=200 conns=1 opened=200 delivering=200 failed=0 events=200000
+  kestrel      sse latency p50=87µs p99=244µs max=1.516ms
+  kestrel server CPU=1.00s (opening + warmup + measurement)
+== RSS sampled during benchmark rounds
+  peak:     starh2=9284KB  go=16132KB  kestrel=124232KB  hyper=5548KB
+  retained: starh2= 9284KB  go=16132KB  kestrel=124264KB  hyper= 5500KB
