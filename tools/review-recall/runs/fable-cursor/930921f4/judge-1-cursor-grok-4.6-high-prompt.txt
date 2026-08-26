@@ -1,0 +1,51 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F3
+file: src/completion_queue.zig lines 309-320
+title: Do not report an open queue as error.Closed.
+After a stale wake, select returns error.Closed for a queue that is still open. error.Closed is overloaded, so a caller cannot tell a real close from a spurious win, and a multi-closer caller cannot disambiguate at all.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/completion_queue.zig lines 309-320
+title: Spurious error.Closed on an open queue is indistinguishable from a real close for callers whose queue can be closed by another task, silently tearing down the documented dispatcher pattern.
+getResult now returns error.Closed for a spurious select win with the queue EMPTY and OPEN. The comment's escape hatch — 'a caller that knows it never closed its own queue' — does not cover the library's own headline scenario: close() is thread-safe and the module header's long-lived dispatcher exists precisely so other tasks can submit (and close). For such a driver a spurious Closed and a genuine drained close are byte-identical, and the documented pattern 'error.Closed => break' exits the drive loop on an open queue with operations in flight; heap-backed operations owned by the driver (header lines 14-20) are then never drained or freed. The old assert crashed loudly at the protocol bug; this returns a well-typed lie. The Result type Closeable!*Completion cannot express 'spurious, re-poll', so the fix is either the acknowledged upstream signal-accounting repair before shipping this, or a contract change (e.g. a distinct retryable error / getResult re-checking closed-and-drained under the mutex it already holds so a genuine close stays unambiguous and the spurious case is at least observable).
+
+--- index 1
+file: src/completion_queue.zig lines 80-87
+title: The signal field doc, the future-protocol block comment and the module-header example still state the strict-wake / Closed-means-drained contract this change abolished.
+Three doc comments in the changed file now contradict the new behavior and were not updated: (1) the signal field doc ends 'The future protocol depends on the strict reading of a wake: a completion is takeable, or the queue is drained' (lines 80-87) — the strict reading is exactly what this push abandons; (2) the future-protocol block comment (lines 278-288) still says the registered wait completes when a completion is ready or the queue is drained, then getResult pops one or reports error.Closed; (3) the module-header dispatcher example (lines 40-49) glosses error.Closed as 'Closed and fully drained', the pattern the change makes unsafe. The new re-poll obligation lives only in a comment inside getResult's body, invisible on the API surface where consumers read the contract. Update all three to state that under select a mid-drive error.Closed can be spurious and what the caller must do.
+
+--- index 2
+file: src/completion_queue.zig lines 302-321
+title: No test pins the new tolerated path: getResult on an open, empty queue returning error.Closed instead of aborting.
+The push turns a former assert-abort into a defined return, but verification is delegated entirely to an out-of-repo HTTP/2 harness (per the commit message). None of the existing select tests reach getResult with the queue open and empty. A deterministic in-repo test is cheap: exercise the future protocol directly (asyncWait/getResult with a stack WaitContext, or call getResult after a manufactured claim) against an open empty queue and expect error.Closed. Without it, a future refactor could reintroduce an assert or change the return and the suite would stay green.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

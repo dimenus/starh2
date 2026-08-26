@@ -1,0 +1,34 @@
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/build.zig",
+    "tree/examples/cq_spurious_select_repro.zig",
+    "tree/examples/cq_two_driver_misuse.zig",
+    "tree/src/sync/Mutex.zig",
+    "tree/check.sh"
+  ],
+  "findings": [
+    {
+      "title": "The teardown defer closes the socketpair descriptors while still holding feed_mu, landing the deadlocking version the commit message says was replaced.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 82,
+      "end_line": 91,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The inner `defer sh.feed_mu.unlock()` runs when the outer defer block exits, i.e. AFTER both `std.c.close` calls, so the closes execute under the mutex hold. The commit message states the opposite contract ('the driver clears the descriptor under the mutex BEFORE closing it after unlock', 'The close must stay OUTSIDE the mutex') and reports that closing under the hold deadlocked about one run in ten on macOS: close blocks in the kernel on the driver's executor thread, the flooder parks on feed_mu forever, and the remaining executor sleeps in kevent with no wake coming. The in-file comment ('Clear and close under one mutex hold') documents the deadlock-prone ordering as intended, and the message's 30-clean-runs verification cannot have been of this code. Fix: set feed_fd = -1 inside the mutex hold, unlock, then close fds[0] and fds[1] outside the lock."
+    },
+    {
+      "title": "Both socketpair descriptors leak if the driver's cancelable feed_mu.lock() fails before the close defer is declared.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 77,
+      "end_line": 81,
+      "category": "stability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The socketpair is created at line 69, but the defer that closes fds[0] and fds[1] is only declared at line 85, after the `try sh.feed_mu.lock()` at line 78. If that lock returns error.Canceled the driver returns with both descriptors leaked. The previous version declared the close defers immediately after fcntl with no fallible statement in between, so this leak window is introduced by this push. Fix: use lockUncancelable for the publish (mirroring the teardown) or declare the close defer before taking the lock."
+    }
+  ]
+}

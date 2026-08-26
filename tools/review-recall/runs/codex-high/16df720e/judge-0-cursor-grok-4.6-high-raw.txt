@@ -1,0 +1,7 @@
+```json
+{"matches": [{"reference_id": "F8", "candidate_index": null, "why": "Neither candidate mentions the POSIX-only cq-spurious-select-repro example or a Windows build failure from socketpair/fcntl."},
+              {"reference_id": "F9", "candidate_index": null, "why": "Neither candidate reports the feed_fd close/reuse race between the flooder write and teardown."},
+              {"reference_id": "F10", "candidate_index": null, "why": "Candidate 1 names the same example but a different failure: missing CI run-step wiring, not the undetected-misuse path exiting 0."},
+              {"reference_id": "F11", "candidate_index": null, "why": "Neither candidate reports popping completed without checkSingleDriverLocked on timeout, cancel wait, or drainPending."},
+              {"reference_id": "F12", "candidate_index": null, "why": "Neither candidate reports the quiescence watch's cost from millions of per-byte expectEqual calls."}]}
+```

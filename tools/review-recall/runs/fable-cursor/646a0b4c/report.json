@@ -1,0 +1,44 @@
+{
+  "network_used": false,
+  "files_read": [
+    "brief.md",
+    "diff.patch",
+    "subject.txt",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig",
+    "tree/src/zio.zig",
+    "tree/docs/changelog.md"
+  ],
+  "findings": [
+    {
+      "title": "New public predicate isDrained has no test, including the closed-but-not-drained case the commit exists to fix.",
+      "file": "src/completion_queue.zig",
+      "start_line": 392,
+      "end_line": 396,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "isDrained() is the entire point of this push and nothing exercises it: not the trivial states (fresh open queue -> false; closed with an operation in flight -> false, the exact case the message says made isClosed wrong; closed and drained -> true), and not the documented driver pattern (select wins with error.Closed, isDrained() == false, keep driving, the in-flight completion is still delivered). The existing tests 'select on a drained queue reports error.Closed' (line 1222) and 'close over an in-flight operation does not wake a parked select' (line 1246) already construct these states; each could assert the predicate in one line. Fix: add isDrained assertions to those tests or a dedicated test covering the three states."
+    },
+    {
+      "title": "Module header still claims the select result equals wait's 'with one difference', which this change makes untrue.",
+      "file": "src/completion_queue.zig",
+      "start_line": 52,
+      "end_line": 57,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The header says the winning select result 'is what wait would have returned, with one difference' (cancel semantics). This push establishes a second difference: the queue arm can report error.Closed spuriously on an open or undrained queue, which wait() never does, and the driver must consult isDrained() before stopping. That contract is documented only inside getResult's internal comment and isDrained's doc; a consumer following the header treats select's error.Closed as terminal and either stops a live dispatcher or leaks the completions ownerCallback still delivers, the exact failure the commit message describes. Fix: state the spurious-Closed caveat and the isDrained protocol in the header's future-protocol paragraph, next to the dispatcher example."
+    },
+    {
+      "title": "signal field doc still asserts the strict wake reading that this change explicitly abandons.",
+      "file": "src/completion_queue.zig",
+      "start_line": 80,
+      "end_line": 87,
+      "category": "maintainability",
+      "severity": "trivial",
+      "effort": "quick_win",
+      "detail": "The doc on `signal` ends with 'The future protocol depends on the strict reading of a wake: a completion is takeable, or the queue is drained.' The updated getResult comment and the new isDrained doc say the opposite: a stale wake can win the arm with the queue empty and open, and the protocol now tolerates that by having the caller disambiguate. The field doc asserts an invariant the code no longer depends on, so a reader reasoning from it will reject the very state isDrained exists to handle. Fix: reword to say waiters tolerate spurious wakes by re-checking, and that strictness is no longer load-bearing."
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+I've verified everything I need. The commit adds only the reproducer example and its `build.zig` registration; the library-side claims in its doc comment (tolerant `error.Closed` in `getResult`, the publish-then-wake window in `ownerCallback`, the blocking `drainPending` teardown) all match the tree, and the zio API usage (`NetRecv`, `Timer`, `ReadBuf.fromSlice`, `Channel`, select's future protocol) checks out. Four findings survive scrutiny.
+
+**1. Windows build break (major).** The example is the only one in the repo that calls `std.c` directly: `std.c.socketpair`, `std.c.fcntl`, the `std.c.O` `NONBLOCK` bit, `std.c.fd_t`. None of these exist for Windows targets, and `build.zig` registers every example unconditionally for the selected target, so `zig build examples` — a documented, supported command — now fails to compile for Windows, which the project supports (there is an IOCP backend).
+
+**2. Error paths abandon in-flight operations pointing at the dying coroutine frame (major).** The `close/cancelAll(.keep)/drain` teardown runs only on the success path. Every error return — `error.Spurious` at line 96, `return err` at 98, or any failed `try cq.submit` — leaves the recv and timer completions registered with the event loop while the deferred fd closes run and the frame holding `cq`, `recv_op`, `t1`, `recv_buf` is recycled. A late completion then writes through dangling pointers (`ownerCallback` pushes into the freed `cq`). The spurious-detection path the example exists to hit exits through exactly this hole, and `main` joins the remaining workers (potentially the full 20 000 generations) before exiting, giving the dangling op ample time to fire.
+
+**3. `feed_fd` TOCTOU in the flooder (minor).** Between the flooder's load and its `write`, the driver can store `-1`, close the fd, and a new generation's `socketpair` can reuse the number, so the flooder writes into an unrelated socket. Benign in effect here but a real cross-thread race in the changed code.
+
+**4. Exit behaviour conflates infrastructure failure with reproduction (minor).** Any driver error — `error.SocketPair`, a submit failure — sets `failed` and produces exit 2, which the doc comment defines as "spurious win detected"; the join `catch` also discards which error occurred.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/build.zig",
+    "tree/examples/cq_spurious_select_repro.zig",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig",
+    "tree/src/ev/buf.zig",
+    "tree/src/ev/completion.zig",
+    "tree/src/os/root.zig",
+    "tree/src/os/base.zig",
+    "tree/src/os/net.zig",
+    "tree/src/zio.zig"
+  ],
+  "findings": [
+    {
+      "title": "The new example uses POSIX-only std.c APIs (socketpair, fcntl, O.NONBLOCK) and is registered unconditionally, breaking `zig build examples` for Windows targets.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 61,
+      "end_line": 77,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "This is the only example in the repo that calls std.c directly; std.c.socketpair, std.c.fcntl, the std.c.O NONBLOCK field, and POSIX fd semantics do not exist for Windows targets, and build.zig line 80 registers the example unconditionally for whatever -Dtarget is selected. The project supports Windows (there is an IOCP backend) and the documented way to build examples is `zig build examples`, so this commit makes that command fail to compile for a supported target. Fix: gate the example's registration in build.zig on the OS tag (or make the example compile to a no-op on Windows), or use the runtime's own portable socket abstractions instead of raw std.c."
+    },
+    {
+      "title": "Every error return in driver() skips the close/cancelAll/drain teardown, leaving in-flight completions registered with the event loop while the coroutine frame and its fds are torn down (use-after-free).",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 92,
+      "end_line": 98,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The teardown at lines 129-132 runs only when the generation loop completes normally. On `return error.Spurious` (line 96), `return err` (line 98), or any failed `try cq.submit` (lines 79, 81, 104, 107, 117, 120), the still-pending NetRecv and Timer completions remain registered with the backend loop while the deferred closes run on their fds and the coroutine's stack frame -- holding `cq`, `recv_op`, `t1`, `recv_buf`, `iov` -- is released and recycled. A late completion then makes ownerCallback push into the freed CompletionQueue and the backend write into the freed buffer. This is not theoretical: the spurious-detection path the example exists to trigger exits through exactly this hole, and main joins the remaining workers (up to the full 20000 generations each) before calling exit(2), so the dangling operation has ample time to fire; a successful reproduction can therefore crash with unrelated memory corruption instead of the clean SPURIOUS line and exit 2 the doc comment promises. Fix: perform the close(); cancelAll(.keep); drain teardown in a defer (it is idempotent enough for the success path), or errdefer it, so no path leaves operations in flight."
+    },
+    {
+      "title": "flooder() races feed_fd against the driver's close: it can write to a closed fd or one already reused by another generation's socketpair.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 48,
+      "end_line": 49,
+      "category": "functional_correctness",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "Between `sh.feed_fd.load` and `std.c.write`, the driver (on another executor thread) can store -1, close fds[1], and start a new generation whose socketpair -- or another worker's -- reuses the same fd number. The flooder then writes its byte into an unrelated socket. In this program the effect is benign (a stray byte into some socketpair, or an ignored EBADF), but it is a genuine cross-thread TOCTOU in the changed code and makes the feeding nondeterministic. A fix is to give the flooder ownership of the write end for the generation (e.g. hand over the fd through the channel and have the flooder acknowledge before close), or simply tolerate and document the race explicitly."
+    },
+    {
+      "title": "Exit code 2 conflates infrastructure failures with a reproduction, contradicting the documented exit contract, and the join catch discards the actual error.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 172,
+      "end_line": 185,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The doc comment (lines 27-30) defines exit 2 as 'the repro detects the spurious win itself' and exit 0 as no reproduction. But `failed` is set by any driver error -- error.SocketPair from fd exhaustion, a submit error -- and also produces exit 2, so a harness keying on the exit code misreads an environment failure as a reproduction (only the RESULT spurious=0 line disambiguates). The `catch { failed = true; }` also throws away which error occurred, losing the diagnosis. Fix: capture the join error, print it, and use a distinct exit code (or propagate the error) for non-Spurious failures, reserving exit 2 for spurious > 0."
+    }
+  ]
+}
+```

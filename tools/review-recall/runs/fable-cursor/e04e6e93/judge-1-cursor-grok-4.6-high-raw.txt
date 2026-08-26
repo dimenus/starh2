@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F2", "candidate_index": 2, "why": "Candidate 2 asks to gate the post-poll updateNow so it does not run when the backend poll was skipped, which is the same defect as guarding that unconditional refresh to only run when the backend actually waited."}]}
+```

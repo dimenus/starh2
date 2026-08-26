@@ -1,0 +1,3 @@
+```json
+{"matches":[{"reference_id":"F2","candidate_index":null,"why":"Neither candidate claims the post-poll clock refresh must be guarded to run only after a real non-zero wait, since one reports a missing non-blocking timer test and the other reports a locking race in updateNow."}]}
+```

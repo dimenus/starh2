@@ -1,0 +1,24 @@
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "../../brief.md",
+    "subject.txt",
+    "diff.patch",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig"
+  ],
+  "findings": [
+    {
+      "title": "`isClosed()` cannot reliably distinguish real drain from a spurious `error.Closed` once a concurrent close has started.",
+      "file": "src/completion_queue.zig",
+      "start_line": 381,
+      "end_line": 389,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "moderate",
+      "detail": "The new API/doc suggests callers can treat `error.Closed` + `isClosed()==true` as a real close and stop draining, but `close()` flips `closed` before in-flight work drains, while `getResult()` can still produce a stale/spurious `error.Closed` from a recycled select wake. In that race, `isClosed()` returns true even though pending completions remain, so a driver following this guidance can exit early and strand queued results. Fix by exposing a drained-state predicate (or richer queue state) rather than raw `closed`, or at minimum tighten the contract/docs to state that only `isClosed()==false` is definitive and `isClosed()==true` still requires re-poll/drain checks."
+    }
+  ]
+}
+```

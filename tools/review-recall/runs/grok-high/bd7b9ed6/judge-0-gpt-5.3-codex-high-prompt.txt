@@ -1,0 +1,46 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F4
+file: src/completion_queue.zig lines 381-390
+title: Do not treat isClosed() as proof that the queue is drained.
+isClosed() reports only the closed flag. A caller that stops on isClosed() stops while ownerCallback still has in-flight completions to deliver. The terminal-state test must check closed AND pending empty AND completed empty under one mutex hold.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/completion_queue.zig lines 381-390
+title: isClosed does not distinguish a real drained close from a spurious Closed while work is still in flight.
+The comment tells a select driver that `error.Closed` plus `isClosed() == false` is the only spurious case, so the implied other branch is to stop draining when `isClosed()` is true. That is not the stop condition `wait()` uses (`closed && pending.empty && completed.empty`), and it is not what `getResult` observed. `getResult` returns `error.Closed` whenever `completed` is empty, including on a stale select win. `close()` deliberately does not wake while operations are still pending, but a leftover select signal can still claim the arm then: `getResult` returns `error.Closed`, `isClosed()` is true, and a driver that stops as documented abandons in-flight (including heap-backed) operations. The same mis-stop happens if another task `submit`s and then `close`s between `getResult` and `isClosed` — two separate lock acquisitions, and both `submit` and `close` are documented thread-safe. The false direction is unambiguous because `closed` is sticky; the true direction is not. Stop only when the queue is closed and empty (`isClosed() && isEmpty()`, matching `wait`), and say that in the comment. Sampling `closed` and both queues under the same lock as the `getResult` pop would make the snapshot honest; `isClosed()` alone cannot.
+
+--- index 1
+file: src/completion_queue.zig lines 386-390
+title: No test covers isClosed or the select Closed disambiguation this commit adds.
+The new public predicate is the entire change, and no test calls it. Existing close tests (`wait on a closed empty queue`, `select on a drained queue`, `close over an in-flight operation`) never assert `isClosed()` false then true, and nothing pins the documented rule that a select `error.Closed` on an open queue must re-poll rather than tear down. A driver following the new comment is untested; at least assert the flag around `close()` and that a drained select Closed coincides with `isClosed() == true`.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

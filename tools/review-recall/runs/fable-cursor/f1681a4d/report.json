@@ -1,0 +1,45 @@
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/ev/loop.zig",
+    "tree/src/ev/test/timer.zig",
+    "tree/src/common.zig",
+    "tree/src/runtime.zig",
+    "tree/src/time.zig",
+    "tree/src/os/fs.zig",
+    "tree/src/os/posix.zig",
+    "tree/src/os/time.zig",
+    "tree/src/ev/completion.zig",
+    "tree/src/ev/backends/kqueue.zig",
+    "tree/src/ev/backends/common.zig",
+    "tree/src/ev/backends/poll.zig",
+    "tree/src/ev/backends/linux/epoll.zig",
+    "tree/src/fs.zig",
+    "tree/src/io.zig",
+    "tree/build.zig"
+  ],
+  "findings": [
+    {
+      "title": "The post-poll snapshot refresh runs after inline completion callbacks, so duration timers armed in those callbacks are still backdated and the new comment's 'completion callbacks here' claim is untrue.",
+      "file": "src/ev/loop.zig",
+      "start_line": 1428,
+      "end_line": 1438,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "moderate",
+      "detail": "Backends deliver non-deferred completions inline during backend.poll: markCompletedFromBackend -> markCompleted -> dispatchCompletion -> finishCompletion -> completion.call (see kqueue.zig poll and LoopState.finishCompletion; only defer_callback/rearm/null-callback completions are queued). Those callbacks therefore run at line 1426, before the updateNow at line 1437. A consumer arming a .duration timer via loop.add from an I/O completion callback after a long idle sleep still gets a deadline computed from the pre-sleep snapshot via armTimer/nowFor and fires immediately -- the exact defect this commit fixes, one delivery path down. The new comment explicitly claims the refresh covers 'completion callbacks here', which is false; the zio runtime is unaffected only because task wakes go through the dispatched queue and run after poll returns, which is also the only shape the regression test covers. Fix: refresh the snapshot before completions are delivered (in the backends, right after the wait syscall returns) or take a fresh clock read per .duration arm in armTimer as the commit message's first alternative describes."
+    },
+    {
+      "title": "The new updateNow() in poll mutates tick/now without the timer mutex, racing cross-thread setTimer which updates the same fields under the lock.",
+      "file": "src/ev/loop.zig",
+      "start_line": 1436,
+      "end_line": 1438,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "setTimer calls updateNow while holding timer_mutex (lines 621-634) and is used from non-owner threads: the existing test 'clearTimer racing a firing timer (cross-thread)' (src/ev/test/timer.zig lines 232-301) drives setTimer from a foreign thread and its comment calls setTimer a thread-safe API. The new call site writes tick, now[0] and now_tick[0] as plain non-atomic u64s with no lock, concurrently with that locked writer -- a data race (UB, TSan-visible); a torn or lost tick update can leave a stale boot/real now cached for a whole scan, producing wrong timer deadlines. The same unlocked pattern pre-exists in checkTimers (line 982), but its justifying comment (lines 977-981: 'updateNow is called here and in setTimer, both owner-thread') already contradicts the cross-thread test and is additionally made untrue by this change, which adds a third call site the enumeration does not mention. Either wrap the new updateNow in lockTimers()/unlockTimers() to match setTimer, or make the owner-thread-only contract real (assertOwnThread in setTimer) and fix the comments and test claim."
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+The push is tests plus a death-example; production claim protocol is already in the tree. Two issues stand out: the death-example’s “misuse not detected” path tears down a live queue, and the new race tests can free in-flight ops on assertion failure.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/build.zig",
+    "tree/examples/cq_two_driver_misuse.zig",
+    "tree/examples/cq_spurious_select_repro.zig",
+    "tree/examples/hello_world.zig",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig",
+    "tree/src/common.zig",
+    "tree/src/runtime.zig",
+    "tree/src/task.zig",
+    "tree/src/ev/completion.zig",
+    "tree/src/zio.zig"
+  ],
+  "findings": [
+    {
+      "title": "Two-driver death example can miss the panic, then free a live queue.",
+      "file": "examples/cq_two_driver_misuse.zig",
+      "start_line": 22,
+      "end_line": 75,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "asyncWait only panics when a second select tries to store `reg`. Two drivers on a hot queue both take the `.ready` path (the feeder keeps four Asyncs armed; the driver loop never yields on that path), so they can run the full 5s sleep without overlapping a park. After the sleep, `a.cancel()`/`b.cancel()` wait for the tasks but do not close or `cancelAll` the queue; select cancellation explicitly leaves in-flight ops running. `go` then returns, the stack `cq` and `mails` are released to the stack pool, and the other executors still hold those completions. `std.process.exit(0)` skips `rt.deinit()`. A harness that treats any non-zero status as “panic detected” will then credit a UAF crash as success. Pin the panic with two selects on an empty queue (no feeder), and after joining the drivers drain with `cancelAll(.discard)` before `go` returns; on the detected-misuse path, `_ = 1` is enough."
+    },
+    {
+      "title": "Race tests drop in-flight ops on the stack when an assertion fails.",
+      "file": "src/completion_queue.zig",
+      "start_line": 1527,
+      "end_line": 1621,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The close-vs-claim and cancel-vs-notify tests submit a Timer/Async, race another thread, then let `cq` and the operation leave scope with no `defer cq.cancelAll(.discard)` (the pattern used by the in-flight tests above them). On the success path they believe the queue is empty; on the path these tests exist to catch, it is not. Close-vs-claim failing `delivered == 1` means the timer is still pending. Cancel-vs-notify taking `error.Timeout` from `timedWait(.fromSeconds(5))` means the notified Async was never taken and may still complete into the queue. Either way the test returns, the stack objects die, and the loop callback runs against freed memory — a crash that hides the conservation failure. Add `defer cq.cancelAll(.discard)` (or an equivalent `errdefer`) around each round."
+    }
+  ]
+}
+```

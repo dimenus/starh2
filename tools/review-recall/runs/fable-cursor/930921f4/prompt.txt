@@ -1,0 +1,8 @@
+Read the review brief at /Users/rsaunderson/Source/mine/starh2/tools/review-recall/brief.md and follow it exactly.
+
+Your working directory is /Users/rsaunderson/Source/mine/starh2/tools/review-recall/corpus/930921f4. It holds tree/, diff.patch and subject.txt.
+Review the commit in diff.patch against the tree at /Users/rsaunderson/Source/mine/starh2/tools/review-recall/corpus/930921f4/tree.
+
+Do not read anything under /Users/rsaunderson/Source/mine/starh2/tools/review-recall other than brief.md. In particular do not open
+findings.json, runs/, or any file whose name mentions findings or recall: those
+hold the answer key for this exercise and reading one voids the run.

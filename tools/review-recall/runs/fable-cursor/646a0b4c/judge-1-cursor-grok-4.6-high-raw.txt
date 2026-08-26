@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F5", "candidate_index": 1, "why": "Candidate 1 flags the module header's select-equals-wait contract as stale and requires the spurious error.Closed caveat plus the keep-driving-until-isDrained rule."}, {"reference_id": "F6", "candidate_index": 0, "why": "Candidate 0 reports that isDrained() is untested and names the open, closed-but-not-drained, and fully-drained cases the reference asks for."}]}
+```

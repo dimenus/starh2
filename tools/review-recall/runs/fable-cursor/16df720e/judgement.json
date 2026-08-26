@@ -1,0 +1,60 @@
+{
+  "arm": "fable-cursor",
+  "commit": "16df720e",
+  "judges": [
+    "gpt-5.3-codex-high",
+    "cursor-grok-4.6-high"
+  ],
+  "judge_seconds": [
+    27,
+    60
+  ],
+  "n_candidates": 4,
+  "per_reference": {
+    "F8": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F9": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F10": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F11": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F12": {
+      "picks": [
+        3,
+        3
+      ],
+      "agreed": true,
+      "matched": true,
+      "contested": false
+    }
+  }
+}

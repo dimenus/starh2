@@ -1,0 +1,53 @@
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/ev/loop.zig",
+    "tree/src/runtime.zig",
+    "tree/src/ev/test/timer.zig",
+    "tree/src/common.zig"
+  ],
+  "findings": [
+    {
+      "title": "updateNow's new 'owner-thread only' claim is false: cross-thread setTimer writes tick/now under the timer lock while poll's two updateNow calls write them unlocked, an unsynchronized data race.",
+      "file": "src/ev/loop.zig",
+      "start_line": 383,
+      "end_line": 391,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "moderate",
+      "detail": "The comment justifies dropping the timer lock by saying only the cross-thread clearTimer exists and it never reads now/tick. But setTimer is also used cross-thread: the tree's test \"clearTimer racing a firing timer (cross-thread)\" calls loop.setTimer from a non-owner thread and its comment lists it among \"the thread-safe setTimer/clearTimer/wake APIs\", and the timer_mutex doc (lines 269-272) states the lock protects \"the cached `now` values\", which is only meaningful for cross-thread access. setTimer -> updateNow (line 636) and armTimer -> nowFor mutate tick, now[], and now_tick[] under the lock, while poll mutates the same plain u64 fields with no lock at lines 1392 and 1429 (tick +%= 1 is a read-modify-write), and Loop.now() reads now[0] unlocked. Concurrent unsynchronized access to non-atomic fields is a data race (torn reads on 32-bit, lost tick bumps, TSan failure); a cross-thread setTimer can compute a .duration deadline from a torn or stale snapshot. The pre-poll updateNow added by this push widens the window, and the new comment plus the contradicted timer_mutex doc enshrine a false invariant. Fix: pick one contract - either make setTimer owner-thread-only (assertOwnThread, delete the cross-thread test path) and update the timer_mutex doc to drop \"and the cached `now` values\", or keep poll's snapshot writes under the timer lock / make tick and now[0] atomic."
+    },
+    {
+      "title": "The timed_out rescan now uses a snapshot taken before completion callbacks ran, and its new rationale comment overclaims; a timer expiring during completion processing is delayed a full extra poll cycle.",
+      "file": "src/ev/loop.zig",
+      "start_line": 1444,
+      "end_line": 1448,
+      "category": "functional_correctness",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "In the parent, checkTimers took the tick itself, so the post-poll rescan compared deadlines against a clock read at its own top, after processAsyncHandles/processCancelQueue/processCompletions. Now it reuses the line-1429 snapshot taken before those callbacks run, and the comment asserts \"waking ahead of it means nothing has expired\", which ignores the arbitrary time spent in completion callbacks between the wake and this check (and the case where the backend timeout was the wake-flags-forced .zero rather than the earliest deadline). A timer whose deadline passes during the callback pass is no longer fired here; it waits for the next poll's pre-scan, i.e. one callback pass plus one executor task batch, the same class of delay the commit's pre-poll refresh exists to remove. Fix: run the rescan against a refreshed snapshot (move the checkTimers call before the line-1429 refresh consumers, or refresh again before it), or soften the comment to state the deferral."
+    },
+    {
+      "title": "poll now reads the clock twice per pass; the post-poll refresh is redundant when the backend poll was skipped, on the CPU-bound fast path the old comment explicitly protected.",
+      "file": "src/ev/loop.zig",
+      "start_line": 1424,
+      "end_line": 1429,
+      "category": "performance",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The deleted comment defended a single unconditional refresh as costing \"the same one clock read per poll that checkTimers paid\"; its CPU-bound-.zero rationale is now served by the new pre-poll updateNow at line 1392. After this push every poll pays two time.now reads plus two tick bumps. When should_poll is false (wait_cap .zero and nothing inflight - the executor's per-batch poll(.zero) hot path), nothing but sweepResend and the timeout arithmetic runs between the two, so the second read duplicates the first. Fix: gate the post-poll refresh on should_poll (the pre-poll snapshot is still fresh when the backend poll never ran)."
+    },
+    {
+      "title": "No test pins the pre-poll refresh predicate or the executor's new reliance on the cached snapshot being fresh after every poll.",
+      "file": "src/ev/loop.zig",
+      "start_line": 1392,
+      "end_line": 1393,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "moderate",
+      "detail": "The diff contains no test changes. The tree already has a regression test for the sibling post-poll predicate (\"duration timer armed after a long idle poll is not backdated\", src/ev/test/timer.zig:303), but nothing pins what this push introduces: (a) the pre-poll scan computing the backend poll timeout from a fresh clock, so a timer expiring during a task batch is not overslept by up to the batch length (testable in the same shape as the existing backdating test: arm a timer, burn CPU between polls, assert the poll wakes at the deadline); and (b) the Executor retune reading self.loop.now() (runtime.zig:778), which silently degrades to stale batch-window measurements if a future poll path stops refreshing on return. Reverting the line-1392 updateNow would leave the suite green."
+    }
+  ]
+}

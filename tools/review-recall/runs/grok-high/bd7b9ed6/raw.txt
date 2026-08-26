@@ -1,0 +1,38 @@
+The push adds `CompletionQueue.isClosed()` so a select driver can tell a real `error.Closed` from the spurious one `getResult` still has to return. `wait()` only yields `error.Closed` when the queue is closed **and** drained; `getResult` returns `error.Closed` whenever `completed` is empty. `close()` does not wake while operations are still pending, but a leftover select signal can still claim the arm in that state. The new helper only samples `closed`, and nothing tests the protocol.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig",
+    "tree/src/sync/channel.zig",
+    "tree/src/group.zig",
+    "tree/src/zio.zig"
+  ],
+  "findings": [
+    {
+      "title": "isClosed does not distinguish a real drained close from a spurious Closed while work is still in flight.",
+      "file": "src/completion_queue.zig",
+      "start_line": 381,
+      "end_line": 390,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The comment tells a select driver that `error.Closed` plus `isClosed() == false` is the only spurious case, so the implied other branch is to stop draining when `isClosed()` is true. That is not the stop condition `wait()` uses (`closed && pending.empty && completed.empty`), and it is not what `getResult` observed. `getResult` returns `error.Closed` whenever `completed` is empty, including on a stale select win. `close()` deliberately does not wake while operations are still pending, but a leftover select signal can still claim the arm then: `getResult` returns `error.Closed`, `isClosed()` is true, and a driver that stops as documented abandons in-flight (including heap-backed) operations. The same mis-stop happens if another task `submit`s and then `close`s between `getResult` and `isClosed` — two separate lock acquisitions, and both `submit` and `close` are documented thread-safe. The false direction is unambiguous because `closed` is sticky; the true direction is not. Stop only when the queue is closed and empty (`isClosed() && isEmpty()`, matching `wait`), and say that in the comment. Sampling `closed` and both queues under the same lock as the `getResult` pop would make the snapshot honest; `isClosed()` alone cannot."
+    },
+    {
+      "title": "No test covers isClosed or the select Closed disambiguation this commit adds.",
+      "file": "src/completion_queue.zig",
+      "start_line": 386,
+      "end_line": 390,
+      "category": "functional_correctness",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The new public predicate is the entire change, and no test calls it. Existing close tests (`wait on a closed empty queue`, `select on a drained queue`, `close over an in-flight operation`) never assert `isClosed()` false then true, and nothing pins the documented rule that a select `error.Closed` on an open queue must re-poll rather than tear down. A driver following the new comment is untested; at least assert the flag around `close()` and that a drained select Closed coincides with `isClosed() == true`."
+    }
+  ]
+}
+```

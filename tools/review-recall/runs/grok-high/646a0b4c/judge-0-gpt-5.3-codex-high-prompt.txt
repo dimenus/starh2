@@ -1,0 +1,51 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F5
+file: src/completion_queue.zig lines 318-320
+title: Update the module-level select contract.
+The module doc still states the old select contract and contradicts the new tolerate-a-spurious-win behaviour. The doc must carry the error.Closed caveat and the keep-driving-until-isDrained rule.
+
+--- F6
+file: src/completion_queue.zig lines 382-397
+title: Add regression tests for isDrained().
+isDrained() is the terminal-state decision gate and no test exercises it. Cases needed: open and empty, closed with pending, closed with completed, closed and fully drained.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/completion_queue.zig lines 392-396
+title: isDrained is untested, including the closed-but-not-drained case it exists to distinguish.
+The whole point of this push is that `isClosed` (or treating select's `error.Closed` as terminal) is wrong while operations are still in flight: the driver must keep draining or those completions leak. `isDrained()` is the public predicate that answers that, and nothing in this file calls it. Existing tests already set up the three states (`close` on empty, `close` over an in-flight timer, completions sitting in `completed`) and never assert the flag: open/in-flight/completed-but-untaken must be false; closed and empty must be true. The select tests that expect `error.Closed` also never check `isDrained() == true`. A one-line regression back to a closed-only check would compile, pass the suite, and revive the leak.
+
+--- index 1
+file: src/completion_queue.zig lines 52-57
+title: Module header still equates select's Closed with wait(), so a select driver will stop early and leak.
+`wait()` only returns `error.Closed` when the queue is closed and fully drained. `getResult` (the select arm) returns `error.Closed` whenever `completed` is empty, including a stale wake on an open queue and a close that raced in with work still in flight. This push documents that difference on `getResult` and `isDrained`, but the module header still says the winning select result is what `wait` would have returned, and the long-lived dispatcher snippet immediately above still does `error.Closed => break`. A consumer who copies that onto `select(.{ .io = &cq, ... })` will tear down while `ownerCallback` still has completions to deliver. The future-protocol block at 278-287 has the same drained-only story. The header's select paragraph needs the `isDrained()` disambiguation this commit is adding.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

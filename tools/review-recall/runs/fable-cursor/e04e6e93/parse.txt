@@ -1,0 +1,1 @@
+parsed 4 findings, 6 files_read, network_used=False

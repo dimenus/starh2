@@ -1,0 +1,41 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F13
+file: examples/cq_spurious_select_repro.zig lines 85-90
+title: Move descriptor close outside feed_mu.
+The teardown closes the descriptors while it still holds feed_mu. On macOS that deadlocks against the flooder's write under the same mutex. Clear feed_fd under the mutex, unlock, then close both descriptors.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: examples/cq_spurious_select_repro.zig lines 82-91
+title: Reproducer still closes the socketpair under feed_mu, reintroducing the macOS kqueue deadlock.
+The generation teardown defer takes feed_mu via lockUncancelable, sets feed_fd to -1, and only then close()s both socketpair ends before unlock. That is the protocol the commit message already rejected: a prior version that closed under the hold deadlocked about one run in ten on macOS, with close stuck in __close_nocancel, the flooder parked on the mutex, and an executor sleeping in kevent. Clearing the descriptor under the mutex is enough to stop a write from reaching a closed or reused fd (the flooder's write is the same hold); close must run after unlock. The inline comment that says to 'clear and close under one mutex hold' documents the broken version. Register the defer immediately after socketpair (the publish path currently does a cancelable lock() before the close defer exists, so a canceled lock also leaks the pair), then: lock, feed_fd = -1, unlock, close, close.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

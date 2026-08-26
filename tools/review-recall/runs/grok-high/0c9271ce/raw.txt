@@ -1,0 +1,31 @@
+The push’s stated protocol is: clear `feed_fd` under the mutex, then **close after unlock**, because closing while holding the lock deadlocked on macOS (~1/10, `__close_nocancel` stuck for tens of minutes). The tree still closes both fds inside that hold.
+
+`cq_two_driver_misuse` exiting 3 on a silent pass, and skipping the POSIX-only repro on Windows, match the claimed fixes.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/build.zig",
+    "tree/examples/cq_spurious_select_repro.zig",
+    "tree/examples/cq_two_driver_misuse.zig",
+    "tree/src/sync/Mutex.zig",
+    "tree/src/completion_queue.zig",
+    "tree/src/ev/backends/kqueue.zig"
+  ],
+  "findings": [
+    {
+      "title": "Reproducer still closes the socketpair under feed_mu, reintroducing the macOS kqueue deadlock.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 82,
+      "end_line": 91,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The generation teardown defer takes feed_mu via lockUncancelable, sets feed_fd to -1, and only then close()s both socketpair ends before unlock. That is the protocol the commit message already rejected: a prior version that closed under the hold deadlocked about one run in ten on macOS, with close stuck in __close_nocancel, the flooder parked on the mutex, and an executor sleeping in kevent. Clearing the descriptor under the mutex is enough to stop a write from reaching a closed or reused fd (the flooder's write is the same hold); close must run after unlock. The inline comment that says to 'clear and close under one mutex hold' documents the broken version. Register the defer immediately after socketpair (the publish path currently does a cancelable lock() before the close defer exists, so a canceled lock also leaks the pair), then: lock, feed_fd = -1, unlock, close, close."
+    }
+  ]
+}
+```

@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F1", "candidate_index": null, "why": "F1 is residual staleness after the new updateNow when a later callback or task batch outlasts the timer; candidate 0 is inline completions running before that refresh, and candidate 1 is an unlocked updateNow data race."}]}
+```

@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F2", "candidate_index": null, "why": "Both candidates address different issues in this area (runtime.zig's tick-budget retune timing, and the misleading checkTimers comment) but neither proposes guarding the unconditional `self.state.updateNow()` refresh at line 1429 to only run when the backend actually waited."}]}
+```

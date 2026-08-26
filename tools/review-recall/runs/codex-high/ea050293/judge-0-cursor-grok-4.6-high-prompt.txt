@@ -1,0 +1,46 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F7
+file: examples/cq_spurious_select_repro.zig lines 92-98
+title: Clean up the queue before returning error.Spurious.
+The early return on the spurious path leaves the queue live while the operations go out of scope, so pending operations later call into an unwound stack. The early-return path needs the same close, cancel and drain the normal path does.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: build.zig lines 80-80
+title: Windows example build is broken by unconditionally adding a POSIX-only repro.
+The new `cq-spurious-select-repro` example is always included in `zig build examples`, but its source uses Unix-only libc APIs (`socketpair`, `AF.UNIX`, `fcntl`) and no platform guard. That makes the examples step fail for Windows targets, violating the stated multi-platform build expectation. Gate this example out on Windows in `build.zig` (or provide a Windows-safe implementation/compile-time guard in the example).
+
+--- index 1
+file: examples/cq_spurious_select_repro.zig lines 154-171
+title: Partial worker startup failure can leave running tasks using freed memory.
+In `go`, task handles and shared state arrays are allocated, then flooder/driver tasks are spawned in a loop with `try`. If any later `spawn` fails, the function unwinds immediately and the deferred `alloc.free(...)` calls run, but already spawned tasks keep running and still dereference `shs`, `chans`, and `bufs`. This creates a use-after-free race/crash path on spawn error (e.g. allocation/resource exhaustion). Track how many tasks were started and join/cancel them before freeing shared allocations, or use a `zio.Group` that guarantees teardown on failure.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

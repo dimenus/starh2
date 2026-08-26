@@ -1,0 +1,4 @@
+```json
+{"matches": [{"reference_id": "F5", "candidate_index": 0, "why": "Both say the public select/future docs still treat error.Closed as drained-and-terminal, contradicting the new spurious-win behavior, so they must document isDrained() and keep driving until it is true."},
+              {"reference_id": "F6", "candidate_index": 1, "why": "Both say isDrained() is the new stop-versus-keep-driving gate after error.Closed and that no test exercises it, including the not-yet-drained cases that must keep driving."}]}
+```

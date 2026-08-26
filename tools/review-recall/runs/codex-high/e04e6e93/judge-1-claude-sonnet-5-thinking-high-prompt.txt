@@ -1,0 +1,46 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F2
+file: src/ev/loop.zig lines 1423-1429
+title: Guard the post-poll refresh for non-zero waits.
+CodeRabbit asked for the unconditional post-poll clock refresh to be guarded so it only runs when the backend actually waited. The author rejected it: a single unconditional refresh point is the design the upstream maintainer asked for.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/runtime.zig lines 776-789
+title: Executor tick retune now reads a pre-callback timestamp and can over-inflate the quantum budget.
+`tick_now` now comes from `self.loop.now()`, but `Loop.poll` refreshes that snapshot before running async/cancel/work completion callbacks. The retune window therefore excludes callback time, so under callback-heavy cycles `elapsed / n` is underestimated and `tick_task_budget` drifts upward (often toward `max_tick_budget`), delaying subsequent polls and increasing timer/I/O latency. Use a fresh monotonic read here (or move the loop snapshot refresh to the end of `poll`) so the retune window matches actual cycle wall time.
+
+--- index 1
+file: src/ev/loop.zig lines 1444-1447
+title: The new timed-out comment states an invariant that is not true at the call site.
+The comment says waking before the timeout means nothing has expired, but this branch runs after `processAsyncHandles`, `processCancelQueue`, and `processCompletions`; those callbacks can take arbitrarily long, during which timers can expire. The code still intentionally skips `checkTimers()` when `timed_out == false`, so the comment now overstates the guarantee and can mislead future changes. Reword it to describe the actual, narrower condition ("not expired at wake time").
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

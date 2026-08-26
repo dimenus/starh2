@@ -1,0 +1,66 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F8
+file: build.zig lines 80-80
+title: Add a Windows target guard for cq-spurious-select-repro.
+The default examples build includes a POSIX-only example that calls std.c.socketpair and std.c.fcntl. Those are unavailable for the supported Windows target, so zig build examples can fail for Windows. Exclude it on Windows and fail a direct selection with a clear message.
+
+--- F9
+file: examples/cq_spurious_select_repro.zig lines 46-50
+title: Synchronize feed_fd with descriptor close.
+An atomic FD value does not protect the descriptor lifetime. The flooder can load and write the old FD while teardown clears and closes it. If the OS reuses that FD number the flooder writes to an unrelated descriptor.
+
+--- F10
+file: examples/cq_two_driver_misuse.zig lines 74-75
+title: Return failure when the misuse is not detected.
+The undetected-misuse branch prints a diagnostic and exits 0, so the death-test harness reads two drivers running without a panic as a pass. It must exit non-zero.
+
+--- F11
+file: src/completion_queue.zig lines 260-270
+title: The timeout branch pops completed without the single-driver check.
+timedWait's error.Timeout branch pops completed without checkSingleDriverLocked(), so it steals a completion from a parked select. cancel's wait loop and drainPending's discard path have the same hole. Outside the diff, and STILL OPEN at upstream/main.
+
+--- F12
+file: src/completion_queue.zig lines 1660-1678
+title: The quiescence watch burns a lot of CI time for a probabilistic signal.
+200 rounds x 500 passes x sizeOf(CompletionQueue) is on the order of ten million expectEqual calls per run. Use std.mem.allEqual, or lower the inner count.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: examples/cq_two_driver_misuse.zig lines 22-75
+title: Two-driver death example can miss the panic, then free a live queue.
+asyncWait only panics when a second select tries to store `reg`. Two drivers on a hot queue both take the `.ready` path (the feeder keeps four Asyncs armed; the driver loop never yields on that path), so they can run the full 5s sleep without overlapping a park. After the sleep, `a.cancel()`/`b.cancel()` wait for the tasks but do not close or `cancelAll` the queue; select cancellation explicitly leaves in-flight ops running. `go` then returns, the stack `cq` and `mails` are released to the stack pool, and the other executors still hold those completions. `std.process.exit(0)` skips `rt.deinit()`. A harness that treats any non-zero status as “panic detected” will then credit a UAF crash as success. Pin the panic with two selects on an empty queue (no feeder), and after joining the drivers drain with `cancelAll(.discard)` before `go` returns; on the detected-misuse path, `_ = 1` is enough.
+
+--- index 1
+file: src/completion_queue.zig lines 1527-1621
+title: Race tests drop in-flight ops on the stack when an assertion fails.
+The close-vs-claim and cancel-vs-notify tests submit a Timer/Async, race another thread, then let `cq` and the operation leave scope with no `defer cq.cancelAll(.discard)` (the pattern used by the in-flight tests above them). On the success path they believe the queue is empty; on the path these tests exist to catch, it is not. Close-vs-claim failing `delivered == 1` means the timer is still pending. Cancel-vs-notify taking `error.Timeout` from `timedWait(.fromSeconds(5))` means the notified Async was never taken and may still complete into the queue. Either way the test returns, the stack objects die, and the loop callback runs against freed memory — a crash that hides the conservation failure. Add `defer cq.cancelAll(.discard)` (or an equivalent `errdefer`) around each round.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

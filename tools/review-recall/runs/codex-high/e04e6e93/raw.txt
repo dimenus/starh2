@@ -1,0 +1,34 @@
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/brief.md",
+    "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/corpus/e04e6e93/subject.txt",
+    "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/corpus/e04e6e93/diff.patch",
+    "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/corpus/e04e6e93/tree/src/ev/loop.zig",
+    "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/corpus/e04e6e93/tree/src/runtime.zig"
+  ],
+  "findings": [
+    {
+      "title": "Executor tick retune now reads a pre-callback timestamp and can over-inflate the quantum budget.",
+      "file": "src/runtime.zig",
+      "start_line": 776,
+      "end_line": 789,
+      "category": "performance",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "`tick_now` now comes from `self.loop.now()`, but `Loop.poll` refreshes that snapshot before running async/cancel/work completion callbacks. The retune window therefore excludes callback time, so under callback-heavy cycles `elapsed / n` is underestimated and `tick_task_budget` drifts upward (often toward `max_tick_budget`), delaying subsequent polls and increasing timer/I/O latency. Use a fresh monotonic read here (or move the loop snapshot refresh to the end of `poll`) so the retune window matches actual cycle wall time."
+    },
+    {
+      "title": "The new timed-out comment states an invariant that is not true at the call site.",
+      "file": "src/ev/loop.zig",
+      "start_line": 1444,
+      "end_line": 1447,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The comment says waking before the timeout means nothing has expired, but this branch runs after `processAsyncHandles`, `processCancelQueue`, and `processCompletions`; those callbacks can take arbitrarily long, during which timers can expire. The code still intentionally skips `checkTimers()` when `timed_out == false`, so the comment now overstates the guarantee and can mislead future changes. Reword it to describe the actual, narrower condition (\"not expired at wake time\")."
+    }
+  ]
+}
+```

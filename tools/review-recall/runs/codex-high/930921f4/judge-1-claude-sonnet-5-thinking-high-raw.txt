@@ -1,0 +1,5 @@
+Confirmed — the candidate directly addresses this exact defect at the same location.
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "Both identify that getResult/select returns error.Closed unconditionally after a stale wake even when the queue is still open, breaking the drained-only meaning of error.Closed for callers."}]}
+```

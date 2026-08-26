@@ -1,0 +1,42 @@
+This push stops `getResult` from asserting that a select win is a takeable completion or a drained queue. `wait()` still loops until that predicate is true; the select path now returns `error.Closed` whenever the pop is empty, including when the queue is open with work in flight.
+
+That overloads the only error the `Closeable!*Completion` contract can name. The module header still says a select win is what `wait()` would have returned, the dispatcher example still `break`s on `Closed`, and `signal`’s comment still requires a strict reading of a wake. A driver that follows those docs will tear down a live queue. The new “re-poll if you never closed” rule lives only in the function body, and it is incomplete: `getResult` no longer looks at `closed` or `pending`, so a close that races with in-flight ops is indistinguishable from a genuine drain. `isReady` still implements the old predicate.
+
+There is no test that `getResult` on an open empty queue returns `Closed`, nor that a select driver must continue after that result. The existing select test only covers a queue that was actually closed.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "subject.txt",
+    "diff.patch",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig",
+    "tree/src/common.zig",
+    "tree/src/sync/Futex.zig",
+    "tree/src/sync/channel.zig"
+  ],
+  "findings": [
+    {
+      "title": "getResult reports error.Closed for a still-open queue, but the public contract still treats Closed as drained.",
+      "file": "src/completion_queue.zig",
+      "start_line": 302,
+      "end_line": 320,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "moderate",
+      "detail": "After this change, getResult pops completed and, on an empty pop, always returns error.Closed. It no longer snapshots closed or pending, so Closed is now also the result for empty+open and for closed-with-in-flight. wait() and timedWait() still return Closed only when node == null && closed && pending.isEmpty(); isReady still uses that same predicate. The module header (lines 52–57) still says a select win is what wait() would have returned; the dispatcher example (lines 38–49) still breaks on Closed as “closed and fully drained”; the signal field (lines 80–86) still says the future protocol depends on a wake meaning a takeable completion or a drained queue; the future-protocol comment (lines 278–285) still says getResult reports Closed for drain. A select driver that follows that contract will tear down a live queue — the failure this commit measured — just without a ReleaseSafe crash. The body comment tells a caller that never closed the queue to re-poll; that rule is not in the public docs, is a second difference from wait() (which loops rather than returning), and is wrong when the caller did close but operations are still pending, because closed is no longer consulted. Either restore the drained check and change Result so the spurious case is not named Closed, or rewrite the public contract, the example, and the signal/future comments so a select driver must re-poll unless the queue is actually drained (isEmpty after close, not merely “I called close”)."
+    },
+    {
+      "title": "No test pins getResult on an empty open queue, the path this commit defines.",
+      "file": "src/completion_queue.zig",
+      "start_line": 1205,
+      "end_line": 1227,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The new specified behavior is: pop nothing from completed → error.Closed even when the queue is open. The suite has “select on a drained queue reports error.Closed”, which only covers a queue that was actually closed. Nothing calls getResult with completed empty and closed == false (that used to assert in ReleaseSafe). A direct unit test of that pop is enough to lock the new return; a select-loop test that continues after Closed while !isEmpty() would pin the caller protocol the body comment now requires. Without either, the production path this commit exists for is untested in-tree."
+    }
+  ]
+}
+```

@@ -1,0 +1,12 @@
+{
+  "arm": "grok-high",
+  "vendor_model": "cursor-grok-4.6-high",
+  "commit": "646a0b4c",
+  "exit_code": 0,
+  "wall_seconds": 306,
+  "raw_bytes": 2867,
+  "parsed": true,
+  "n_findings": 2,
+  "n_files_read": 7,
+  "network_used": false
+}

@@ -1,0 +1,4 @@
+```json
+{"matches": [{"reference_id": "F5", "candidate_index": 1, "why": "Both findings say the module-level doc comment still claims a select's winning result equals what wait() would return, omitting the new error.Closed/isDrained disambiguation for a closed-but-not-drained queue."},
+              {"reference_id": "F6", "candidate_index": 0, "why": "Both findings say isDrained() is the untested terminal-state gate and call out that no test exercises the closed-but-not-drained case that motivates it."}]}
+```

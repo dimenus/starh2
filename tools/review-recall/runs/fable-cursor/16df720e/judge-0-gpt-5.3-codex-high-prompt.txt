@@ -1,0 +1,76 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F8
+file: build.zig lines 80-80
+title: Add a Windows target guard for cq-spurious-select-repro.
+The default examples build includes a POSIX-only example that calls std.c.socketpair and std.c.fcntl. Those are unavailable for the supported Windows target, so zig build examples can fail for Windows. Exclude it on Windows and fail a direct selection with a clear message.
+
+--- F9
+file: examples/cq_spurious_select_repro.zig lines 46-50
+title: Synchronize feed_fd with descriptor close.
+An atomic FD value does not protect the descriptor lifetime. The flooder can load and write the old FD while teardown clears and closes it. If the OS reuses that FD number the flooder writes to an unrelated descriptor.
+
+--- F10
+file: examples/cq_two_driver_misuse.zig lines 74-75
+title: Return failure when the misuse is not detected.
+The undetected-misuse branch prints a diagnostic and exits 0, so the death-test harness reads two drivers running without a panic as a pass. It must exit non-zero.
+
+--- F11
+file: src/completion_queue.zig lines 260-270
+title: The timeout branch pops completed without the single-driver check.
+timedWait's error.Timeout branch pops completed without checkSingleDriverLocked(), so it steals a completion from a parked select. cancel's wait loop and drainPending's discard path have the same hole. Outside the diff, and STILL OPEN at upstream/main.
+
+--- F12
+file: src/completion_queue.zig lines 1660-1678
+title: The quiescence watch burns a lot of CI time for a probabilistic signal.
+200 rounds x 500 passes x sizeOf(CompletionQueue) is on the order of ten million expectEqual calls per run. Use std.mem.allEqual, or lower the inner count.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: examples/cq_two_driver_misuse.zig lines 6-16
+title: The two-driver death test is never executed by any gate; the harness the commit message describes does not exist.
+The example's doc says 'a harness runs it and checks for a NON-zero exit. Exit 0 means the misuse was silently accepted, which is the failure this example exists to catch' — but the push only adds the example to the build.zig examples list, which installs the binary and never runs it. CI drives check.sh --full, which builds examples and runs exactly one of them (stderr-smoke, including a --panic death check that fails the build if the binary does not abort), so the pattern for running this death test already exists and was not used. As shipped, a regression that makes the second registration silently accepted again (the pre-claims corruption this example exists to witness) passes zig build test 659/659 and passes CI; the only verification is the manual run recorded in the commit message. Wire the example into check.sh --full on native targets like stderr-smoke: run it, require a non-zero exit, and grep for the panic message 'selected from two tasks' rather than accepting any non-zero exit — main returns !void, so an incidental error return also exits non-zero and would read as a pass.
+
+--- index 1
+file: src/completion_queue.zig lines 1548-1560
+title: The cancelAll(.keep) conservation test runs on the default single executor, so the callback-vs-drain race it claims to exercise cannot occur.
+The test comment says some operations are 'completing on the loops right now (their callbacks racing the drain)', and the commit message names 'claim vs cancelAll's drain' as the edge under test. But Runtime.init(std.testing.allocator, .{}) uses RuntimeOptions' default executors = .exact(1) (runtime.zig line 147): one executor, no worker threads, one loop. Every ownerCallback runs on the same thread as cancelAll and can only run while the drain is parked in Futex.waitUncancelable, so the callback's claimToRegistered/fetchAdd can never interleave with requestCancelAll's pending-walk or drainPending's check mid-critical-section. The test still verifies conservation under cooperative interleaving, but the concurrent race it documents is structurally impossible in this configuration. The adjacent teardown test shows the needed shape: init with .executors = .exact(4) and submit from parallel tasks so completions land on several loops.
+
+--- index 2
+file: src/completion_queue.zig lines 1611-1621
+title: The canceled-select test's failure paths leave a live ev.Async armed against the test's dead stack frame.
+In the error branch, if expectEqual(error.Canceled, err) fails, or cq.timedWait(.fromSeconds(5)) returns error.Timeout, the test returns immediately while mail.c may still be pending in the queue and registered with the event loop. Both cq and mail live in the round's stack scope; the loop later invokes ownerCallback, which locks and writes through c.group.owner into the popped frame while the runner has moved on — one genuine failure cascades into memory corruption of subsequent tests instead of a clean report. The surrounding tests defend against exactly this with `defer cq.cancelAll(.discard)` (e.g. lines 1264, 1324, 1426); the new round-based tests have no unwind path. Add an errdefer/defer per round that closes and drains the queue (the same applies to the teardown test's `try h.join()` loop at line 1668, where a failed join would abandon 64 ten-second timers pointing into the frame).
+
+--- index 3
+file: src/completion_queue.zig lines 1671-1677
+title: The poison watch performs ~10M per-byte expectEqual calls per backend run across the full CI matrix for admittedly negligible detection power.
+200 rounds x 500 checks x sizeof(CompletionQueue) individual std.testing.expectEqual calls is on the order of ten million try-wrapped comparisons, and each round additionally spawns 4 tasks and submits-then-cancels 64 timers. The suite runs once per backend (up to four backends per CI job) on every matrix target including QEMU-emulated ones (arm, thumb, riscv32/64, loongarch64, ppc64le) inside a 10-minute job timeout, so this test's cost is multiplied where CPU is slowest. The test's own comment concedes that at the real gap width (two instructions) a pass 'is one more clean sample' — the 500-iteration watch buys almost nothing beyond the first scan. Replace the inner loops with std.mem.allEqual(u8, std.mem.asBytes(&cq), 0xAA) and reduce the check count (or the round count), keeping the instrumented 50us-gap validation as the documented evidence of sensitivity.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

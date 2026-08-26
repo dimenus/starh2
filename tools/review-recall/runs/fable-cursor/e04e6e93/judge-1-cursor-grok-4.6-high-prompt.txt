@@ -1,0 +1,56 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F2
+file: src/ev/loop.zig lines 1423-1429
+title: Guard the post-poll refresh for non-zero waits.
+CodeRabbit asked for the unconditional post-poll clock refresh to be guarded so it only runs when the backend actually waited. The author rejected it: a single unconditional refresh point is the design the upstream maintainer asked for.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/ev/loop.zig lines 383-391
+title: updateNow's new 'owner-thread only' claim is false: cross-thread setTimer writes tick/now under the timer lock while poll's two updateNow calls write them unlocked, an unsynchronized data race.
+The comment justifies dropping the timer lock by saying only the cross-thread clearTimer exists and it never reads now/tick. But setTimer is also used cross-thread: the tree's test "clearTimer racing a firing timer (cross-thread)" calls loop.setTimer from a non-owner thread and its comment lists it among "the thread-safe setTimer/clearTimer/wake APIs", and the timer_mutex doc (lines 269-272) states the lock protects "the cached `now` values", which is only meaningful for cross-thread access. setTimer -> updateNow (line 636) and armTimer -> nowFor mutate tick, now[], and now_tick[] under the lock, while poll mutates the same plain u64 fields with no lock at lines 1392 and 1429 (tick +%= 1 is a read-modify-write), and Loop.now() reads now[0] unlocked. Concurrent unsynchronized access to non-atomic fields is a data race (torn reads on 32-bit, lost tick bumps, TSan failure); a cross-thread setTimer can compute a .duration deadline from a torn or stale snapshot. The pre-poll updateNow added by this push widens the window, and the new comment plus the contradicted timer_mutex doc enshrine a false invariant. Fix: pick one contract - either make setTimer owner-thread-only (assertOwnThread, delete the cross-thread test path) and update the timer_mutex doc to drop "and the cached `now` values", or keep poll's snapshot writes under the timer lock / make tick and now[0] atomic.
+
+--- index 1
+file: src/ev/loop.zig lines 1444-1448
+title: The timed_out rescan now uses a snapshot taken before completion callbacks ran, and its new rationale comment overclaims; a timer expiring during completion processing is delayed a full extra poll cycle.
+In the parent, checkTimers took the tick itself, so the post-poll rescan compared deadlines against a clock read at its own top, after processAsyncHandles/processCancelQueue/processCompletions. Now it reuses the line-1429 snapshot taken before those callbacks run, and the comment asserts "waking ahead of it means nothing has expired", which ignores the arbitrary time spent in completion callbacks between the wake and this check (and the case where the backend timeout was the wake-flags-forced .zero rather than the earliest deadline). A timer whose deadline passes during the callback pass is no longer fired here; it waits for the next poll's pre-scan, i.e. one callback pass plus one executor task batch, the same class of delay the commit's pre-poll refresh exists to remove. Fix: run the rescan against a refreshed snapshot (move the checkTimers call before the line-1429 refresh consumers, or refresh again before it), or soften the comment to state the deferral.
+
+--- index 2
+file: src/ev/loop.zig lines 1424-1429
+title: poll now reads the clock twice per pass; the post-poll refresh is redundant when the backend poll was skipped, on the CPU-bound fast path the old comment explicitly protected.
+The deleted comment defended a single unconditional refresh as costing "the same one clock read per poll that checkTimers paid"; its CPU-bound-.zero rationale is now served by the new pre-poll updateNow at line 1392. After this push every poll pays two time.now reads plus two tick bumps. When should_poll is false (wait_cap .zero and nothing inflight - the executor's per-batch poll(.zero) hot path), nothing but sweepResend and the timeout arithmetic runs between the two, so the second read duplicates the first. Fix: gate the post-poll refresh on should_poll (the pre-poll snapshot is still fresh when the backend poll never ran).
+
+--- index 3
+file: src/ev/loop.zig lines 1392-1393
+title: No test pins the pre-poll refresh predicate or the executor's new reliance on the cached snapshot being fresh after every poll.
+The diff contains no test changes. The tree already has a regression test for the sibling post-poll predicate ("duration timer armed after a long idle poll is not backdated", src/ev/test/timer.zig:303), but nothing pins what this push introduces: (a) the pre-poll scan computing the backend poll timeout from a fresh clock, so a timer expiring during a task batch is not overslept by up to the batch length (testable in the same shape as the existing backdating test: arm a timer, burn CPU between polls, assert the poll wakes at the deadline); and (b) the Executor retune reading self.loop.now() (runtime.zig:778), which silently degrades to stale batch-window measurements if a future poll path stops refreshing on return. Reverting the line-1392 updateNow would leave the suite green.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

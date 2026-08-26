@@ -1,0 +1,53 @@
+I've read the whole touched file and confirmed how the queue's future protocol and consumers sit. Here's my assessment of this push.
+
+The commit adds one public method, `isClosed()`, so a select driver can distinguish a spurious `error.Closed` (stale wake on an open queue, documented at `getResult`) from a real close. The mutex use is correct (`closed` is written under `mutex`), and exposing a predicate rather than changing the `Closeable!*Completion` contract is a reasonable shape.
+
+The substantive problem is that the disambiguation protocol itself has a hole. The doc comment and commit message claim the check works "whoever closes the queue", but `isClosed()` is not atomic with the `getResult` call that produced the `error.Closed`. If a stale wake wins the queue arm while operations are in flight, and another task then calls `close()` before the driver checks, the driver sees `error.Closed` with `isClosed() == true` and stops draining — yet the queue is closed but not drained. `close()`'s own contract says in-flight operations "keep running and are still delivered", and the module header requires the driver to drain and free heap-backed submissions, so stopping here abandons or leaks them. The race-free predicate is drained-ness (`closed and pending.isEmpty() and completed.isEmpty()`), which is a latched, monotonic state on a closed queue: false always means "re-poll safely", true genuinely means nothing more will ever arrive. `isClosed()` alone is the wrong half of that condition.
+
+Two smaller points: the new public API lands with no test at all (not even close-then-check, let alone the select-driver re-poll it exists for), and the module header (lines 52–57) still says a select win "is what `wait` would have returned, with one difference" — the spurious `error.Closed` is a second difference, and the header never points a select driver at the re-poll protocol this commit is building.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/completion_queue.zig",
+    "tree/src/common.zig",
+    "tree/src/zio.zig",
+    "tree/docs/changelog.md"
+  ],
+  "findings": [
+    {
+      "title": "isClosed() cannot disambiguate a spurious error.Closed from a real close when another task closes concurrently: it reports closed-ness, not drained-ness.",
+      "file": "src/completion_queue.zig",
+      "start_line": 381,
+      "end_line": 390,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The doc claims 'error.Closed with isClosed() == false can only be the spurious case, whoever closes the queue', and the commit message adds 'a real close still reads as error.Closed with isClosed() true'. But isClosed() is not atomic with the getResult that produced the error.Closed. Sequence: the queue is open with operations in flight; a stale wake (the documented spurious case at getResult, lines 309-320) wins the select's queue arm and getResult returns error.Closed; before the driver checks, another task calls close(). isClosed() now returns true, so the driver treats the spurious win as a real close and stops draining -- but the queue is closed and NOT drained. close()'s contract (lines 146-150) says in-flight operations keep running and are still delivered, and the module header (lines 15-20) makes the driver responsible for draining and freeing heap-backed submissions from other tasks, so stopping here abandons those completions and leaks them. The race-free predicate is drained-ness: closed AND pending empty AND completed empty is a latched state on a closed queue (submit refuses, so nothing can un-drain it), so checking it after error.Closed cannot go stale in either direction; false always means re-poll, true always means done. Fix: expose isDrained() (or make getResult decide under the same mutex acquisition as its pop) instead of, or in addition to, the bare closed flag, and drop the 'whoever closes the queue' claim from the doc until the predicate actually supports it."
+    },
+    {
+      "title": "The new public isClosed() API ships with no test, including none for the select re-poll protocol it exists to enable.",
+      "file": "src/completion_queue.zig",
+      "start_line": 386,
+      "end_line": 390,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The file has an extensive test section (lines 575-1339) covering every other public entry point, including five select-protocol tests, but nothing exercises isClosed(): not the trivial false-before-close / true-after-close latch, and not the documented driver pattern (select arm returns error.Closed, isClosed() is false, driver re-polls and still receives the in-flight completion). Since the method exists solely to support that recovery loop, a test pinning the loop is what keeps the next protocol change from silently breaking it. Add at least: (1) isClosed() false on init, true after close(), still true after a second close(); (2) a select driver that treats error.Closed + !isClosed() as re-poll and verifies it eventually takes the real completion."
+    },
+    {
+      "title": "Module header still claims a select win is 'what wait would have returned' with one difference; the spurious error.Closed this commit works around is an undocumented second difference.",
+      "file": "src/completion_queue.zig",
+      "start_line": 52,
+      "end_line": 57,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The header says the winning result of a select over the queue 'is what wait would have returned, with one difference' (cancel semantics). wait() can never return a spurious error.Closed -- it re-checks state in a loop -- but the select arm's getResult can, which is the entire reason this commit adds isClosed(). That is a second difference between the two contracts, and the header is where a consumer building a long-lived select driver looks first; as written it tells them error.Closed from the arm means closed-and-drained, so they will tear down on the spurious case. Extend the header's select paragraph to name the spurious error.Closed and point at isClosed() (or the drained predicate per the other finding) as the re-poll guard."
+    }
+  ]
+}
+```

@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F2", "candidate_index": null, "why": "Both candidates address different defects (a missing test for timer firing on the skipped-poll path, and a data race between updateNow and setTimer over timer_mutex), not the request to guard the unconditional post-poll clock refresh so it only runs after a real wait."}]}
+```

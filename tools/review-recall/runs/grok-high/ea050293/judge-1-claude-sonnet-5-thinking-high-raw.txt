@@ -1,0 +1,5 @@
+Confirmed: this matches candidate index 0, which explicitly names the `error.Spurious` early return skipping the `close()`/`cancelAll`/drain teardown as its central case.
+
+```json
+{"matches": [{"reference_id": "F7", "candidate_index": 0, "why": "Candidate 0 identifies the exact same defect: the error.Spurious early return (and sibling error paths) skip the close/cancelAll/drain teardown that the normal path performs, leaving CQ ops live across the unwound stack."}]}
+```

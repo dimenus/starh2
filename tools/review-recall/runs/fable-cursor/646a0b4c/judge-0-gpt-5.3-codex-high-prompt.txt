@@ -1,0 +1,56 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F5
+file: src/completion_queue.zig lines 318-320
+title: Update the module-level select contract.
+The module doc still states the old select contract and contradicts the new tolerate-a-spurious-win behaviour. The doc must carry the error.Closed caveat and the keep-driving-until-isDrained rule.
+
+--- F6
+file: src/completion_queue.zig lines 382-397
+title: Add regression tests for isDrained().
+isDrained() is the terminal-state decision gate and no test exercises it. Cases needed: open and empty, closed with pending, closed with completed, closed and fully drained.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/completion_queue.zig lines 392-396
+title: New public predicate isDrained has no test, including the closed-but-not-drained case the commit exists to fix.
+isDrained() is the entire point of this push and nothing exercises it: not the trivial states (fresh open queue -> false; closed with an operation in flight -> false, the exact case the message says made isClosed wrong; closed and drained -> true), and not the documented driver pattern (select wins with error.Closed, isDrained() == false, keep driving, the in-flight completion is still delivered). The existing tests 'select on a drained queue reports error.Closed' (line 1222) and 'close over an in-flight operation does not wake a parked select' (line 1246) already construct these states; each could assert the predicate in one line. Fix: add isDrained assertions to those tests or a dedicated test covering the three states.
+
+--- index 1
+file: src/completion_queue.zig lines 52-57
+title: Module header still claims the select result equals wait's 'with one difference', which this change makes untrue.
+The header says the winning select result 'is what wait would have returned, with one difference' (cancel semantics). This push establishes a second difference: the queue arm can report error.Closed spuriously on an open or undrained queue, which wait() never does, and the driver must consult isDrained() before stopping. That contract is documented only inside getResult's internal comment and isDrained's doc; a consumer following the header treats select's error.Closed as terminal and either stops a live dispatcher or leaks the completions ownerCallback still delivers, the exact failure the commit message describes. Fix: state the spurious-Closed caveat and the isDrained protocol in the header's future-protocol paragraph, next to the dispatcher example.
+
+--- index 2
+file: src/completion_queue.zig lines 80-87
+title: signal field doc still asserts the strict wake reading that this change explicitly abandons.
+The doc on `signal` ends with 'The future protocol depends on the strict reading of a wake: a completion is takeable, or the queue is drained.' The updated getResult comment and the new isDrained doc say the opposite: a stale wake can win the arm with the queue empty and open, and the protocol now tolerates that by having the caller disambiguate. The field doc asserts an invariant the code no longer depends on, so a reader reasoning from it will reject the very state isDrained exists to handle. Fix: reword to say waiters tolerate spurious wakes by re-checking, and that strictness is no longer load-bearing.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

@@ -1,0 +1,7 @@
+```json
+{"matches": [{"reference_id": "F8", "candidate_index": null, "why": "No candidate mentions the POSIX-only cq-spurious-select-repro example, Windows, socketpair/fcntl, or a build.zig target guard."},
+             {"reference_id": "F9", "candidate_index": null, "why": "No candidate reports the feed_fd atomic/lifetime race where the flooder can write a reused descriptor after teardown close."},
+             {"reference_id": "F10", "candidate_index": null, "why": "Candidate 0 is the same example but a different failure: the death test is never wired into CI, not that the undetected-misuse path exits 0."},
+             {"reference_id": "F11", "candidate_index": null, "why": "No candidate reports timedWait/cancel/drainPending popping completed without checkSingleDriverLocked and stealing from a parked select."},
+             {"reference_id": "F12", "candidate_index": 3, "why": "Same quiescence-watch cost: ~10M per-byte expectEqual calls, with the same fix of std.mem.allEqual and/or fewer inner checks."}]}
+```

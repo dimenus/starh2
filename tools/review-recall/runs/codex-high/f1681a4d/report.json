@@ -1,0 +1,14 @@
+{
+  "network_used": false,
+  "files_read": [
+    "brief.md",
+    "subject.txt",
+    "diff.patch",
+    "tree/src/ev/loop.zig",
+    "tree/src/ev/test/timer.zig",
+    "tree/src/time.zig",
+    "tree/src/os/posix.zig",
+    "tree/src/ev/completion.zig"
+  ],
+  "findings": []
+}

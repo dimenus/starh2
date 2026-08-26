@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F2", "candidate_index": null, "why": "Neither candidate asks to skip the post-poll updateNow when the backend did not wait; they concern tick-retune windowing and a checkTimers comment instead."}]}
+```

@@ -1,0 +1,3 @@
+```json
+{"matches":[{"reference_id":"F1","candidate_index":0,"why":"Both describe the same core defect: duration timers can be armed against a stale cached time snapshot, producing backdated/immediate deadlines, with candidate 0 identifying a specific remaining path where that stale-time behavior still occurs."}]}
+```

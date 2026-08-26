@@ -1,0 +1,47 @@
+The commit splits tick ownership so `poll` refreshes the awake snapshot before `checkTimers` and again after the backend wait. That matches the stated bugs (stale poll timeout vs. backdated `Loop.add` after a sleep). Two issues remain: the new pre-poll path is untested, and the new “owner-thread only” claim on `updateNow` does not match `setTimer`.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "subject.txt",
+    "diff.patch",
+    "tree/src/ev/loop.zig",
+    "tree/src/runtime.zig",
+    "tree/src/ev/test/timer.zig",
+    "tree/src/ev/tests.zig",
+    "tree/src/ev/completion.zig",
+    "tree/src/time.zig",
+    "tree/src/common.zig",
+    "tree/src/task.zig",
+    "tree/src/ev/README.md",
+    "tree/src/ev/backends/linux/io_uring.zig",
+    "tree/src/ev/backends/linux/epoll.zig",
+    "tree/src/ev/backends/kqueue.zig",
+    "tree/src/ev/backends/iocp.zig",
+    "tree/src/ev/backends/poll.zig"
+  ],
+  "findings": [
+    {
+      "title": "No test that a timer expiring between polls is fired on the non-blocking path.",
+      "file": "src/ev/loop.zig",
+      "start_line": 1392,
+      "end_line": 1448,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The new pre-poll updateNow exists so checkTimers decides the wait from a fresh clock, and so a deadline that passed during the previous task batch fires even when the backend poll is skipped. That skip is the executor's busy path: poll(.zero) with no backend inflight sets timed_out=false, so the post-timeout checkTimers never runs and only the pre-poll scan can fire. The in-tree regression only covers Loop.add after a long poll(.max) that woke on I/O (the post-sleep refresh). A test that arms a short timer, spends longer than that duration without polling, then poll(.zero) with nothing in flight, would lock the new path: the timer must complete on that call, not after another remaining-duration wait."
+    },
+    {
+      "title": "updateNow writes now/tick without the timer lock while setTimer does so from other threads.",
+      "file": "src/ev/loop.zig",
+      "start_line": 383,
+      "end_line": 391,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The new comment says updateNow is owner-thread only because cross-thread clearTimer never reads now/tick. That is incomplete: setTimer also calls updateNow, while holding timer_mutex, and the cross-thread timer test treats setTimer as a thread-safe API used from a non-owner thread while the owner is in poll. poll now calls updateNow twice with no lock (before checkTimers and after backend.poll), so those writes race with setTimer's locked writes of the same non-atomic tick, now[0], and now_tick[0]. timer_mutex's own comment still claims it protects the cached now values. Take the timer lock inside updateNow, or stop calling updateNow from setTimer and document setTimer as owner-thread only (and change the test)."
+    }
+  ]
+}
+```

@@ -1,0 +1,60 @@
+{
+  "arm": "codex-high",
+  "commit": "16df720e",
+  "judges": [
+    "cursor-grok-4.6-high",
+    "claude-sonnet-5-thinking-high"
+  ],
+  "judge_seconds": [
+    99,
+    37
+  ],
+  "n_candidates": 2,
+  "per_reference": {
+    "F8": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F9": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F10": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F11": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    },
+    "F12": {
+      "picks": [
+        null,
+        null
+      ],
+      "agreed": true,
+      "matched": false,
+      "contested": false
+    }
+  }
+}

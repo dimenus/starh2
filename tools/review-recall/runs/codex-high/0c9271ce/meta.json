@@ -1,0 +1,12 @@
+{
+  "arm": "codex-high",
+  "vendor_model": "gpt-5.3-codex-high",
+  "commit": "0c9271ce",
+  "exit_code": 0,
+  "wall_seconds": 55,
+  "raw_bytes": 1175,
+  "parsed": true,
+  "n_findings": 1,
+  "n_files_read": 7,
+  "network_used": false
+}

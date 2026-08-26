@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F1", "candidate_index": null, "why": "No candidate findings were provided."}]}
+```

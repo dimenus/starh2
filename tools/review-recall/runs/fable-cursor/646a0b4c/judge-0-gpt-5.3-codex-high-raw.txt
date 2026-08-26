@@ -1,0 +1,3 @@
+```json
+{"matches":[{"reference_id":"F5","candidate_index":1,"why":"Candidate 1 flags the stale module/header select contract and explicitly requires documenting spurious error.Closed wins plus the keep-driving-until-isDrained rule, which is the same defect."},{"reference_id":"F6","candidate_index":0,"why":"Candidate 0 reports missing isDrained regression coverage and enumerates the same key drained vs not-drained states the reference asks to test."}]}
+```

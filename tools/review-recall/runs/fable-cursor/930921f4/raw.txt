@@ -1,0 +1,60 @@
+I've read everything I need: the changed file in full, plus `src/sync/Futex.zig` and `src/select.zig` to verify the race narrative and see what a caller of the future protocol can actually observe. Here is my assessment of the push.
+
+## What the change does
+
+`getResult` — the future-protocol result extraction used when the queue is one arm of a `select` — used to assert that popping nothing meant the queue was closed and drained. The push deletes the assert and the `drained` computation, and unconditionally returns `error.Closed` when the pop comes up empty, documenting (in a function-body comment) that a spurious select win on an open queue now surfaces as `error.Closed` and the caller must re-poll.
+
+## Findings
+
+**1. The spurious `error.Closed` is indistinguishable from a real one for a documented class of callers, so the mitigation converts a crash into silent teardown.** The escape hatch in the new comment is "a caller that knows it never closed its own queue". But `close` is thread-safe by design — the module header's whole long-lived-dispatcher scenario has *other* tasks submitting and, plausibly, closing. For such a driver, a spurious `Closed` and a genuine close look identical, and the documented dispatcher pattern (`error.Closed => break`) exits the drive loop on an open queue with operations still in flight. Since the driver owns heap-backed operations submitted by other tasks (header, lines 14-20), those are then never drained or freed. The ReleaseSafe crash at least pointed at the protocol bug; this returns a well-typed lie. The `Result` type (`Closeable!*Completion`) genuinely cannot express "spurious, re-poll", which is an argument for either fixing the signal accounting first or changing the contract type — a real cost given external consumers, but a knowable one, versus an ambiguity every caller inherits silently.
+
+**2. Three doc comments in the same file now state a contract the change abolished, and none were updated.** The `signal` field doc (lines 80-87) still ends with "The future protocol depends on the strict reading of a wake: a completion is takeable, or the queue is drained" — that strict reading is exactly what this push abandons. The future-protocol block comment (lines 278-288) still says the registered wait completes when a completion is ready or the queue is drained. And the module-header example (lines 40-49) still glosses `error.Closed` as "Closed and fully drained", which is the pattern finding 1 shows is now unsafe. The new re-poll obligation exists only inside `getResult`'s body, invisible to anyone reading the API surface.
+
+**3. The new tolerated path has no test.** The push turns a former abort into a defined return, and the commit message leans on an out-of-repo HTTP/2 harness for verification. A deterministic in-repo test is cheap: drive the future protocol directly (`asyncWait`/`getResult` with a `WaitContext`) against an open, empty queue and expect `error.Closed` rather than a crash — pinning the exact predicate this push introduces. Nothing in the existing select tests (lines 1112-1311) reaches `getResult` with the queue open and empty.
+
+I checked and am *not* reporting: `wait`/`timedWait` are unaffected (they keep the drained check and re-loop); the futex `cancelWait`/in-flight-wake mechanism in `Futex.zig` is consistent with the race the commit describes; and the underlying select signal-accounting bug is explicitly acknowledged and deferred upstream, so its absence here is not a finding against this push.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/completion_queue.zig",
+    "tree/src/sync/Futex.zig",
+    "tree/src/select.zig"
+  ],
+  "findings": [
+    {
+      "title": "Spurious error.Closed on an open queue is indistinguishable from a real close for callers whose queue can be closed by another task, silently tearing down the documented dispatcher pattern.",
+      "file": "src/completion_queue.zig",
+      "start_line": 309,
+      "end_line": 320,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "moderate",
+      "detail": "getResult now returns error.Closed for a spurious select win with the queue EMPTY and OPEN. The comment's escape hatch — 'a caller that knows it never closed its own queue' — does not cover the library's own headline scenario: close() is thread-safe and the module header's long-lived dispatcher exists precisely so other tasks can submit (and close). For such a driver a spurious Closed and a genuine drained close are byte-identical, and the documented pattern 'error.Closed => break' exits the drive loop on an open queue with operations in flight; heap-backed operations owned by the driver (header lines 14-20) are then never drained or freed. The old assert crashed loudly at the protocol bug; this returns a well-typed lie. The Result type Closeable!*Completion cannot express 'spurious, re-poll', so the fix is either the acknowledged upstream signal-accounting repair before shipping this, or a contract change (e.g. a distinct retryable error / getResult re-checking closed-and-drained under the mutex it already holds so a genuine close stays unambiguous and the spurious case is at least observable)."
+    },
+    {
+      "title": "The signal field doc, the future-protocol block comment and the module-header example still state the strict-wake / Closed-means-drained contract this change abolished.",
+      "file": "src/completion_queue.zig",
+      "start_line": 80,
+      "end_line": 87,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "Three doc comments in the changed file now contradict the new behavior and were not updated: (1) the signal field doc ends 'The future protocol depends on the strict reading of a wake: a completion is takeable, or the queue is drained' (lines 80-87) — the strict reading is exactly what this push abandons; (2) the future-protocol block comment (lines 278-288) still says the registered wait completes when a completion is ready or the queue is drained, then getResult pops one or reports error.Closed; (3) the module-header dispatcher example (lines 40-49) glosses error.Closed as 'Closed and fully drained', the pattern the change makes unsafe. The new re-poll obligation lives only in a comment inside getResult's body, invisible on the API surface where consumers read the contract. Update all three to state that under select a mid-drive error.Closed can be spurious and what the caller must do."
+    },
+    {
+      "title": "No test pins the new tolerated path: getResult on an open, empty queue returning error.Closed instead of aborting.",
+      "file": "src/completion_queue.zig",
+      "start_line": 302,
+      "end_line": 321,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The push turns a former assert-abort into a defined return, but verification is delegated entirely to an out-of-repo HTTP/2 harness (per the commit message). None of the existing select tests reach getResult with the queue open and empty. A deterministic in-repo test is cheap: exercise the future protocol directly (asyncWait/getResult with a stack WaitContext, or call getResult after a manufactured claim) against an open empty queue and expect error.Closed. Without it, a future refactor could reintroduce an assert or change the return and the suite would stay green."
+    }
+  ]
+}
+```

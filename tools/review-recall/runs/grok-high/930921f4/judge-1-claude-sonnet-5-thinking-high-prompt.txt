@@ -1,0 +1,46 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F3
+file: src/completion_queue.zig lines 309-320
+title: Do not report an open queue as error.Closed.
+After a stale wake, select returns error.Closed for a queue that is still open. error.Closed is overloaded, so a caller cannot tell a real close from a spurious win, and a multi-closer caller cannot disambiguate at all.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/completion_queue.zig lines 302-320
+title: getResult reports error.Closed for a still-open queue, but the public contract still treats Closed as drained.
+After this change, getResult pops completed and, on an empty pop, always returns error.Closed. It no longer snapshots closed or pending, so Closed is now also the result for empty+open and for closed-with-in-flight. wait() and timedWait() still return Closed only when node == null && closed && pending.isEmpty(); isReady still uses that same predicate. The module header (lines 52–57) still says a select win is what wait() would have returned; the dispatcher example (lines 38–49) still breaks on Closed as “closed and fully drained”; the signal field (lines 80–86) still says the future protocol depends on a wake meaning a takeable completion or a drained queue; the future-protocol comment (lines 278–285) still says getResult reports Closed for drain. A select driver that follows that contract will tear down a live queue — the failure this commit measured — just without a ReleaseSafe crash. The body comment tells a caller that never closed the queue to re-poll; that rule is not in the public docs, is a second difference from wait() (which loops rather than returning), and is wrong when the caller did close but operations are still pending, because closed is no longer consulted. Either restore the drained check and change Result so the spurious case is not named Closed, or rewrite the public contract, the example, and the signal/future comments so a select driver must re-poll unless the queue is actually drained (isEmpty after close, not merely “I called close”).
+
+--- index 1
+file: src/completion_queue.zig lines 1205-1227
+title: No test pins getResult on an empty open queue, the path this commit defines.
+The new specified behavior is: pop nothing from completed → error.Closed even when the queue is open. The suite has “select on a drained queue reports error.Closed”, which only covers a queue that was actually closed. Nothing calls getResult with completed empty and closed == false (that used to assert in ReleaseSafe). A direct unit test of that pop is enough to lock the new return; a select-loop test that continues after Closed while !isEmpty() would pin the caller protocol the body comment now requires. Without either, the production path this commit exists for is untested in-tree.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

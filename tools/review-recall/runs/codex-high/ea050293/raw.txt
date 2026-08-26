@@ -1,0 +1,36 @@
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "subject.txt",
+    "diff.patch",
+    "tree/build.zig",
+    "tree/examples/cq_spurious_select_repro.zig",
+    "tree/examples/ntp_client.zig",
+    "tree/examples/signal_demo.zig",
+    "tree/src/runtime.zig"
+  ],
+  "findings": [
+    {
+      "title": "Windows example build is broken by unconditionally adding a POSIX-only repro.",
+      "file": "build.zig",
+      "start_line": 80,
+      "end_line": 80,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The new `cq-spurious-select-repro` example is always included in `zig build examples`, but its source uses Unix-only libc APIs (`socketpair`, `AF.UNIX`, `fcntl`) and no platform guard. That makes the examples step fail for Windows targets, violating the stated multi-platform build expectation. Gate this example out on Windows in `build.zig` (or provide a Windows-safe implementation/compile-time guard in the example)."
+    },
+    {
+      "title": "Partial worker startup failure can leave running tasks using freed memory.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 154,
+      "end_line": 171,
+      "category": "stability",
+      "severity": "critical",
+      "effort": "moderate",
+      "detail": "In `go`, task handles and shared state arrays are allocated, then flooder/driver tasks are spawned in a loop with `try`. If any later `spawn` fails, the function unwinds immediately and the deferred `alloc.free(...)` calls run, but already spawned tasks keep running and still dereference `shs`, `chans`, and `bufs`. This creates a use-after-free race/crash path on spawn error (e.g. allocation/resource exhaustion). Track how many tasks were started and join/cancel them before freeing shared allocations, or use a `zio.Group` that guarantees teardown on failure."
+    }
+  ]
+}
+```

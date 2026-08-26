@@ -1,0 +1,7 @@
+```json
+{"matches": [{"reference_id": "F8", "candidate_index": null, "why": "No candidate discusses build.zig or a Windows target guard for this example."},
+              {"reference_id": "F9", "candidate_index": null, "why": "No candidate discusses cq_spurious_select_repro.zig or the feed_fd/close race."},
+              {"reference_id": "F10", "candidate_index": null, "why": "Candidate 0 covers a different failure mode (UAF from missing cancelAll before queue teardown misread as panic); it never flags that the undetected-misuse exit(0) itself must become non-zero."},
+              {"reference_id": "F11", "candidate_index": null, "why": "No candidate mentions timedWait's error.Timeout branch or the missing checkSingleDriverLocked call."},
+              {"reference_id": "F12", "candidate_index": null, "why": "No candidate discusses the 'teardown drain leaves the queue memory quiescent' test or its CI cost."}]}
+```

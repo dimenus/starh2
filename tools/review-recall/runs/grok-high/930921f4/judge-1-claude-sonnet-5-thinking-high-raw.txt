@@ -1,0 +1,7 @@
+Confirms the defect: `getResult` unconditionally returns `error.Closed` on an empty pop, even when the queue is open (stale wake case), and the comment concedes the caller must guess it was spurious since `error.Closed` can't express that.
+
+Candidate 0 directly names this same defect (getResult now returns Closed for empty+open, contract can't disambiguate). Candidate 1 is a distinct finding about missing test coverage for that path, not the defect itself.
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "Both findings describe getResult returning error.Closed for a still-open queue after a stale wake, making a real close indistinguishable from a spurious win."}]}
+```

@@ -1,0 +1,41 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F3
+file: src/completion_queue.zig lines 309-320
+title: Do not report an open queue as error.Closed.
+After a stale wake, select returns error.Closed for a queue that is still open. error.Closed is overloaded, so a caller cannot tell a real close from a spurious win, and a multi-closer caller cannot disambiguate at all.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/completion_queue.zig lines 309-320
+title: `CompletionQueue.getResult` now reports `error.Closed` for open queues.
+When a stale select wake wins and `completed.pop()` is null, this code now returns `error.Closed` unconditionally instead of only when drained. That makes `Closeable!*Completion` consumers unable to distinguish real queue shutdown from a transient protocol glitch, so existing callers that treat `error.Closed` as terminal can tear down while the queue is still open and operations are still pending. The change also contradicts the file’s own documented contract that `error.Closed` means drained. Fix by preserving the drained-only meaning of `error.Closed` (or introducing an explicit third outcome and updating select/callers to re-poll on it).
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

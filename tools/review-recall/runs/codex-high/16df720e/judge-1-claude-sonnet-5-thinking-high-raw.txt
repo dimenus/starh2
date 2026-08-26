@@ -1,0 +1,9 @@
+Confirmed all reference findings against the source. None of the two candidate findings address the same defects as F8–F12 (candidates cover a test-assertion weakness and a missing CI execution step for the misuse example, neither of which matches the Windows guard, FD lifetime race, wrong exit code, missing single-driver check on timeout, or the quiescence-test cost issue).
+
+```json
+{"matches": [{"reference_id": "F8", "candidate_index": null, "why": "No candidate addresses a Windows build guard for the POSIX-only spurious-select-repro example."},
+              {"reference_id": "F9", "candidate_index": null, "why": "No candidate addresses the atomic FD lifetime race between feed_fd and descriptor close/reuse."},
+              {"reference_id": "F10", "candidate_index": null, "why": "Candidate 1 flags that the misuse example isn't executed by any build step, but does not identify that the example itself exits 0 (success) when misuse goes undetected."},
+              {"reference_id": "F11", "candidate_index": null, "why": "No candidate discusses timedWait's Timeout branch popping completed without checkSingleDriverLocked()."},
+              {"reference_id": "F12", "candidate_index": null, "why": "No candidate addresses the quiescence-watch test's excessive expectEqual call volume/CI cost."}]}
+```

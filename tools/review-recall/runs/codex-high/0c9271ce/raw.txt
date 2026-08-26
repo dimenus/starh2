@@ -1,0 +1,26 @@
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/brief.md",
+    "subject.txt",
+    "diff.patch",
+    "tree/build.zig",
+    "tree/examples/cq_spurious_select_repro.zig",
+    "tree/examples/cq_two_driver_misuse.zig",
+    "tree/src/sync/Mutex.zig"
+  ],
+  "findings": [
+    {
+      "title": "Driver teardown holds feed mutex while closing sockets, enabling a runtime hang.",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 85,
+      "end_line": 90,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The deferred teardown acquires `feed_mu`, sets `feed_fd = -1`, and then calls `close` on both FDs before unlocking. `close` can block in-kernel on kqueue/socket teardown, so this can park the driver while still holding `feed_mu`; the flooder then blocks on the same mutex and the worker can stop making progress, turning the repro into a long hang instead of terminating. Keep only the descriptor state transition under the mutex (`feed_fd = -1`), release the lock, then close the FDs outside the critical section."
+    }
+  ]
+}
+```

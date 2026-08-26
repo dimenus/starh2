@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "Both describe getResult returning error.Closed after a stale select wake on an still-open empty queue, so a multi-closer caller cannot tell a spurious win from a real drained close."}]}
+```

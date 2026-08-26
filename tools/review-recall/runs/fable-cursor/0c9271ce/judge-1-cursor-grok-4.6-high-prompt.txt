@@ -1,0 +1,46 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F13
+file: examples/cq_spurious_select_repro.zig lines 85-90
+title: Move descriptor close outside feed_mu.
+The teardown closes the descriptors while it still holds feed_mu. On macOS that deadlocks against the flooder's write under the same mutex. Clear feed_fd under the mutex, unlock, then close both descriptors.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: examples/cq_spurious_select_repro.zig lines 82-91
+title: The teardown defer closes the socketpair descriptors while still holding feed_mu, landing the deadlocking version the commit message says was replaced.
+The inner `defer sh.feed_mu.unlock()` runs when the outer defer block exits, i.e. AFTER both `std.c.close` calls, so the closes execute under the mutex hold. The commit message states the opposite contract ('the driver clears the descriptor under the mutex BEFORE closing it after unlock', 'The close must stay OUTSIDE the mutex') and reports that closing under the hold deadlocked about one run in ten on macOS: close blocks in the kernel on the driver's executor thread, the flooder parks on feed_mu forever, and the remaining executor sleeps in kevent with no wake coming. The in-file comment ('Clear and close under one mutex hold') documents the deadlock-prone ordering as intended, and the message's 30-clean-runs verification cannot have been of this code. Fix: set feed_fd = -1 inside the mutex hold, unlock, then close fds[0] and fds[1] outside the lock.
+
+--- index 1
+file: examples/cq_spurious_select_repro.zig lines 77-81
+title: Both socketpair descriptors leak if the driver's cancelable feed_mu.lock() fails before the close defer is declared.
+The socketpair is created at line 69, but the defer that closes fds[0] and fds[1] is only declared at line 85, after the `try sh.feed_mu.lock()` at line 78. If that lock returns error.Canceled the driver returns with both descriptors leaked. The previous version declared the close defers immediately after fcntl with no fallible statement in between, so this leak window is introduced by this push. Fix: use lockUncancelable for the publish (mirroring the teardown) or declare the close defer before taking the lock.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

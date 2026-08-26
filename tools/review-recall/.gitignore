@@ -1,7 +1,8 @@
-# Corpus and run outputs are derived. corpus.sh rebuilds the corpus from
-# ~/Source/oss/zio; the arms rebuild runs/. Committing them would store a
-# statistic in the repo, and the whole point is that the number is re-derived.
+# The corpus is derived: corpus.sh rebuilds it from ~/Source/oss/zio, so it
+# is not committed. runs/ IS committed: an arm's raw output is evidence of a
+# stochastic system and cannot be re-observed, unlike the recall number,
+# which score.py re-derives from it on demand.
 corpus/
-runs/
 *.log
 *.pid
+__pycache__/

@@ -1,0 +1,5 @@
+Candidate 0 directly matches F4: it explicitly identifies that `isClosed()` alone is not proof of drained state, that the real stop condition must be `closed && pending.empty && completed.empty` (matching `wait()`), and proposes checking `isClosed() && isEmpty()` under one lock — the same defect and same fix as F4, just with more supporting detail. Candidate 1 is about missing test coverage, a different (process/testing) concern, not the same defect.
+
+```json
+{"matches": [{"reference_id": "F4", "candidate_index": 0, "why": "Candidate 0 identifies that isClosed() alone does not prove the queue is drained and states the correct stop condition (closed && pending empty && completed empty) sampled under one lock, matching F4's defect and fix exactly."}]}
+```

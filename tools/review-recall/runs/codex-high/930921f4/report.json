@@ -1,0 +1,22 @@
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig",
+    "tree/src/io.zig"
+  ],
+  "findings": [
+    {
+      "title": "`CompletionQueue.getResult` now reports `error.Closed` for open queues.",
+      "file": "src/completion_queue.zig",
+      "start_line": 309,
+      "end_line": 320,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "heavy_lift",
+      "detail": "When a stale select wake wins and `completed.pop()` is null, this code now returns `error.Closed` unconditionally instead of only when drained. That makes `Closeable!*Completion` consumers unable to distinguish real queue shutdown from a transient protocol glitch, so existing callers that treat `error.Closed` as terminal can tear down while the queue is still open and operations are still pending. The change also contradicts the file\u2019s own documented contract that `error.Closed` means drained. Fix by preserving the drained-only meaning of `error.Closed` (or introducing an explicit third outcome and updating select/callers to re-poll on it)."
+    }
+  ]
+}

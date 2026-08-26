@@ -1,0 +1,3 @@
+```json
+{"matches":[{"reference_id":"F5","candidate_index":1,"why":"Candidate 1 identifies the stale module-header select contract and explicitly calls for the error.Closed/isDrained disambiguation to avoid stopping early, which is the same defect."},{"reference_id":"F6","candidate_index":0,"why":"Candidate 0 directly states that isDrained lacks regression coverage and names the key state combinations (including closed-but-not-drained vs fully drained) that the reference finding requires."}]}
+```

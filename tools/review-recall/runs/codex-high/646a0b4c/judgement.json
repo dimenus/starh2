@@ -1,0 +1,33 @@
+{
+  "arm": "codex-high",
+  "commit": "646a0b4c",
+  "judges": [
+    "cursor-grok-4.6-high",
+    "claude-sonnet-5-thinking-high"
+  ],
+  "judge_seconds": [
+    92,
+    34
+  ],
+  "n_candidates": 2,
+  "per_reference": {
+    "F5": {
+      "picks": [
+        0,
+        0
+      ],
+      "agreed": true,
+      "matched": true,
+      "contested": false
+    },
+    "F6": {
+      "picks": [
+        1,
+        1
+      ],
+      "agreed": true,
+      "matched": true,
+      "contested": false
+    }
+  }
+}

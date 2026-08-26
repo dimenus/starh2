@@ -1,0 +1,46 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F2
+file: src/ev/loop.zig lines 1423-1429
+title: Guard the post-poll refresh for non-zero waits.
+CodeRabbit asked for the unconditional post-poll clock refresh to be guarded so it only runs when the backend actually waited. The author rejected it: a single unconditional refresh point is the design the upstream maintainer asked for.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: src/ev/loop.zig lines 1392-1448
+title: No test that a timer expiring between polls is fired on the non-blocking path.
+The new pre-poll updateNow exists so checkTimers decides the wait from a fresh clock, and so a deadline that passed during the previous task batch fires even when the backend poll is skipped. That skip is the executor's busy path: poll(.zero) with no backend inflight sets timed_out=false, so the post-timeout checkTimers never runs and only the pre-poll scan can fire. The in-tree regression only covers Loop.add after a long poll(.max) that woke on I/O (the post-sleep refresh). A test that arms a short timer, spends longer than that duration without polling, then poll(.zero) with nothing in flight, would lock the new path: the timer must complete on that call, not after another remaining-duration wait.
+
+--- index 1
+file: src/ev/loop.zig lines 383-391
+title: updateNow writes now/tick without the timer lock while setTimer does so from other threads.
+The new comment says updateNow is owner-thread only because cross-thread clearTimer never reads now/tick. That is incomplete: setTimer also calls updateNow, while holding timer_mutex, and the cross-thread timer test treats setTimer as a thread-safe API used from a non-owner thread while the owner is in poll. poll now calls updateNow twice with no lock (before checkTimers and after backend.poll), so those writes race with setTimer's locked writes of the same non-atomic tick, now[0], and now_tick[0]. timer_mutex's own comment still claims it protects the cached now values. Take the timer lock inside updateNow, or stop calling updateNow from setTimer and document setTimer as owner-thread only (and change the test).
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

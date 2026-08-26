@@ -1,0 +1,3 @@
+```json
+{"matches":[{"reference_id":"F2","candidate_index":2,"why":"Candidate 2 identifies the same issue by arguing the post-poll clock refresh should be conditional when polling is skipped and explicitly proposes gating it on `should_poll`."}]}
+```

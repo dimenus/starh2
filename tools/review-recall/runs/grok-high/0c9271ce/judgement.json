@@ -1,0 +1,24 @@
+{
+  "arm": "grok-high",
+  "commit": "0c9271ce",
+  "judges": [
+    "gpt-5.3-codex-high",
+    "claude-sonnet-5-thinking-high"
+  ],
+  "judge_seconds": [
+    9,
+    12
+  ],
+  "n_candidates": 1,
+  "per_reference": {
+    "F13": {
+      "picks": [
+        0,
+        0
+      ],
+      "agreed": true,
+      "matched": true,
+      "contested": false
+    }
+  }
+}

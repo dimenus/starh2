@@ -1,0 +1,32 @@
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/completion_queue.zig"
+  ],
+  "findings": [
+    {
+      "title": "Public select/future docs still describe `error.Closed` as terminal-only, but this push makes it ambiguous.",
+      "file": "src/completion_queue.zig",
+      "start_line": 278,
+      "end_line": 285,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The future-protocol contract says a queue arm reports readiness only for a takeable completion or a drained queue, and `getResult` then reports `error.Closed` for that drained state. But this commit explicitly allows `getResult` to return `error.Closed` on stale wakes while the queue is still open/not drained (lines 309-321), requiring a follow-up `isDrained()` check. Consumers following the unchanged contract comment can still treat `error.Closed` as terminal and stop driving too early (including closed-but-not-drained scenarios), leaking in-flight completions. Update the public contract comments/examples to require `isDrained()` disambiguation on `error.Closed` from select."
+    },
+    {
+      "title": "No regression test exercises the new `isDrained()` disambiguation path.",
+      "file": "src/completion_queue.zig",
+      "start_line": 382,
+      "end_line": 395,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "moderate",
+      "detail": "This push introduces `isDrained()` as the required guard after `error.Closed` from queue futures, but the test suite never asserts that driver behavior. Existing tests cover close/drain behavior and select outcomes, yet none verifies the new contract: on `error.Closed`, `isDrained()==false` must keep driving and `isDrained()==true` is the only stop condition. Without a dedicated test, this API-level fix can regress silently."
+    }
+  ]
+}
+```

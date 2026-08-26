@@ -1,0 +1,5 @@
+Confirmed: the code closes both descriptors while still holding `feed_mu` (lines 85-91), matching F13 exactly. Candidate 0 describes precisely this defect — closing under the mutex hold, the macOS deadlock, and the fix (clear under mutex, unlock, then close).
+
+```json
+{"matches": [{"reference_id": "F13", "candidate_index": 0, "why": "Candidate 0 identifies the same defect: teardown closes both socketpair fds while still holding feed_mu, reproducing the macOS deadlock, and prescribes the same fix of clearing feed_fd under the mutex then closing after unlock."}]}
+```

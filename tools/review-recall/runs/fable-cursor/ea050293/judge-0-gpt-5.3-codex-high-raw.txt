@@ -1,0 +1,3 @@
+```json
+{"matches":[{"reference_id":"F7","candidate_index":1,"why":"Candidate 1 identifies the same teardown bug: error paths (including `error.Spurious`) return before `close/cancelAll/drain`, leaving in-flight queue operations referencing stack state that has gone out of scope."}]}
+```

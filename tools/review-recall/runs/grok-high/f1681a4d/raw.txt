@@ -1,0 +1,34 @@
+The poll-path refresh matches how `Timeout.asyncWait` (zio.select) arms duration timers: `loopAdd` → `armTimer` from the cached snapshot, after `poll` returns. Default `defer_callback` defers I/O callbacks until `processCompletions`, which now runs after that refresh. The regression test arms via `Loop.add` after an I/O-woken wait, which is the case the trailing `checkTimers` used to miss.
+
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/src/ev/loop.zig",
+    "tree/src/ev/test/timer.zig",
+    "tree/src/ev/completion.zig",
+    "tree/src/ev/tests.zig",
+    "tree/src/ev/buf.zig",
+    "tree/src/ev/README.md",
+    "tree/src/ev/backend.zig",
+    "tree/src/ev/backends/linux.zig",
+    "tree/src/ev/backends/linux/io_uring.zig",
+    "tree/src/ev/backends/linux/epoll.zig",
+    "tree/src/ev/backends/kqueue.zig",
+    "tree/src/ev/backends/iocp.zig",
+    "tree/src/ev/backends/poll.zig",
+    "tree/src/ev/backends/common.zig",
+    "tree/src/time.zig",
+    "tree/src/os/time.zig",
+    "tree/src/os/posix.zig",
+    "tree/src/common.zig",
+    "tree/src/runtime.zig",
+    "tree/src/select.zig",
+    "tree/src/autocancel.zig",
+    "tree/build.zig"
+  ],
+  "findings": []
+}
+```

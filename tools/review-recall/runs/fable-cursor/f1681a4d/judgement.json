@@ -1,0 +1,24 @@
+{
+  "arm": "fable-cursor",
+  "commit": "f1681a4d",
+  "judges": [
+    "gpt-5.3-codex-high",
+    "cursor-grok-4.6-high"
+  ],
+  "judge_seconds": [
+    10,
+    67
+  ],
+  "n_candidates": 2,
+  "per_reference": {
+    "F1": {
+      "picks": [
+        0,
+        null
+      ],
+      "agreed": false,
+      "matched": false,
+      "contested": true
+    }
+  }
+}

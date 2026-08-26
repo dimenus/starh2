@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/parse_arm.py", line 58, in <module>
+    report = normalise(extract(raw))
+                       ~~~~~~~^^^^^
+  File "/Users/rsaunderson/Source/mine/starh2/tools/review-recall/parse_arm.py", line 31, in extract
+    raise ValueError("no fenced json block with a 'findings' key")
+ValueError: no fenced json block with a 'findings' key

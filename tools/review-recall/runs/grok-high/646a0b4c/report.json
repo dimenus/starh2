@@ -1,0 +1,34 @@
+{
+  "network_used": false,
+  "files_read": [
+    "subject.txt",
+    "diff.patch",
+    "tree/src/completion_queue.zig",
+    "tree/src/select.zig",
+    "tree/src/zio.zig",
+    "tree/src/utils/simple_queue.zig",
+    "tree/src/fs.zig"
+  ],
+  "findings": [
+    {
+      "title": "isDrained is untested, including the closed-but-not-drained case it exists to distinguish.",
+      "file": "src/completion_queue.zig",
+      "start_line": 392,
+      "end_line": 396,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "The whole point of this push is that `isClosed` (or treating select's `error.Closed` as terminal) is wrong while operations are still in flight: the driver must keep draining or those completions leak. `isDrained()` is the public predicate that answers that, and nothing in this file calls it. Existing tests already set up the three states (`close` on empty, `close` over an in-flight timer, completions sitting in `completed`) and never assert the flag: open/in-flight/completed-but-untaken must be false; closed and empty must be true. The select tests that expect `error.Closed` also never check `isDrained() == true`. A one-line regression back to a closed-only check would compile, pass the suite, and revive the leak."
+    },
+    {
+      "title": "Module header still equates select's Closed with wait(), so a select driver will stop early and leak.",
+      "file": "src/completion_queue.zig",
+      "start_line": 52,
+      "end_line": 57,
+      "category": "maintainability",
+      "severity": "major",
+      "effort": "quick_win",
+      "detail": "`wait()` only returns `error.Closed` when the queue is closed and fully drained. `getResult` (the select arm) returns `error.Closed` whenever `completed` is empty, including a stale wake on an open queue and a close that raced in with work still in flight. This push documents that difference on `getResult` and `isDrained`, but the module header still says the winning select result is what `wait` would have returned, and the long-lived dispatcher snippet immediately above still does `error.Closed => break`. A consumer who copies that onto `select(.{ .io = &cq, ... })` will tear down while `ownerCallback` still has completions to deliver. The future-protocol block at 278-287 has the same drained-only story. The header's select paragraph needs the `isDrained()` disambiguation this commit is adding."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "arm": "fable-cursor",
+  "vendor_model": "claude-fable-5-thinking-high",
+  "commit": "0c9271ce",
+  "exit_code": 0,
+  "wall_seconds": 217,
+  "raw_bytes": 5115,
+  "parsed": true,
+  "parse_note": "reparsed after parse_arm.py fence-toggle fallback fix"
+}

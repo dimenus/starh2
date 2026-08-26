@@ -1,0 +1,3 @@
+```json
+{"matches": [{"reference_id": "F7", "candidate_index": null, "why": "Neither candidate is the driver early-return that skips close/cancel/drain of the live CompletionQueue; index 0 is a Windows build gate and index 1 is a spawn-failure UAF of worker shared arrays in go()."}]}
+```

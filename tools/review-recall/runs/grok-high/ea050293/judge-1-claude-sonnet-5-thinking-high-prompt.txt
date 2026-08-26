@@ -1,0 +1,46 @@
+You are grading a code review, not performing one.
+
+Your working directory holds `tree/`, the source tree of the commit that was
+reviewed. Open any file in it to check a line reference.
+
+Below are REFERENCE findings (the ones a reference reviewer raised on this
+commit) and CANDIDATE findings (the ones the reviewer under test raised).
+
+For each REFERENCE finding, decide whether ANY candidate reports THE SAME
+DEFECT. Judge the substance, not the wording:
+
+- The same defect described in different words IS a match.
+- A different line number for the same defect IS still a match. Line anchors are
+  evidence, not the test.
+- A candidate that names the same symbol but a different failure is NOT a match.
+- A candidate that is broader and clearly contains the reference defect as one of
+  its named consequences IS a match. A vague catch-all is NOT.
+
+REFERENCE FINDINGS
+--- F7
+file: examples/cq_spurious_select_repro.zig lines 92-98
+title: Clean up the queue before returning error.Spurious.
+The early return on the spurious path leaves the queue live while the operations go out of scope, so pending operations later call into an unwound stack. The early-return path needs the same close, cancel and drain the normal path does.
+
+
+CANDIDATE FINDINGS
+--- index 0
+file: examples/cq_spurious_select_repro.zig lines 91-132
+title: Spurious-win return (and other errors) skip CQ teardown, leaving stack ops in the loop.
+The file header and the generation-success path tear down with close(); cancelAll(.keep); drain, which is the documented single-driver contract. The path this reproducer exists to take does not: on error.Closed it prints SPURIOUS and `return error.Spurious`, and every `try` in `driver` (select, submit, yield) does the same. recv_op, t1, and cq live on the coroutine stack; cancel never runs, then the defers close the socketpair under an in-flight NetRecv. join() then returns that stack to the pool while the other seven workers keep running. ownerCallback will lock a freed CompletionQueue and push a freed group node; io_uring/kqueue may complete the recv on a recycled fd. The CQ tests themselves use `defer cq.cancelAll(.discard)` for exactly this. Put that defer next to `init()` (ops are frame-local, so .discard is the right Results), and only then return.
+
+--- index 1
+file: examples/cq_spurious_select_repro.zig lines 40-71
+title: POSIX-only sockets are registered for every target, so Windows cannot build examples.
+build.zig adds cq-spurious-select-repro to the unconditional examples list (`zig build examples`, including check.sh --full). The program uses std.c.socketpair, std.c.fcntl, std.c.O.NONBLOCK, std.c.write/close, std.c.fd_t, and std.c.iovec. None of those are the Windows surface: socketpair is OperationUnsupported there, fcntl/O_* do not exist, NetHandle is SOCKET, and ReadBuf.fromSlice takes os.iovec (WSABUF, not std.c.iovec). The rest of the examples go through zio.os.net, which already has socketpair (POSIX, including Darwin nonblock-via-fcntl) and createLoopbackSocketPair (Windows). Use those, write through zio.os.net as well, and keep feed_fd as ev.Backend.NetHandle / os.net.fd_t with the platform invalid value — or omit the example on Windows. As landed, `zig build examples -Dtarget=x86_64-windows` and a native Windows examples build fail.
+
+
+Answer with exactly one fenced json block, and nothing after it:
+
+```json
+{"matches": [{"reference_id": "F3", "candidate_index": 0, "why": "one sentence"},
+              {"reference_id": "F6", "candidate_index": null, "why": "one sentence"}]}
+```
+
+Give one entry for every reference id above. `candidate_index` is the 0-based
+index of the matching candidate, or null when none matches.

@@ -1,0 +1,36 @@
+```json
+{
+  "network_used": false,
+  "files_read": [
+    "diff.patch",
+    "subject.txt",
+    "tree/build.zig",
+    "tree/examples/cq_two_driver_misuse.zig",
+    "tree/src/completion_queue.zig",
+    "tree/src/runtime.zig",
+    "tree/src/select.zig"
+  ],
+  "findings": [
+    {
+      "title": "The new cancelAll(.keep) race test does not actually prove per-operation conservation.",
+      "file": "src/completion_queue.zig",
+      "start_line": 1569,
+      "end_line": 1571,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "detail": "The test claims \"every one comes out exactly once\" but only checks total count (`seen == timers.len`). A duplicate+drop failure mode (one completion handed out twice while another is lost) would still satisfy this assertion and pass. Track identity (e.g., bitmap by timer index or pointer set) and assert each timer completion appears exactly once."
+    },
+    {
+      "title": "The two-driver misuse witness is not wired into an automated pass/fail gate.",
+      "file": "build.zig",
+      "start_line": 84,
+      "end_line": 104,
+      "category": "maintainability",
+      "severity": "minor",
+      "effort": "moderate",
+      "detail": "This push adds `cq-two-driver-misuse` as an example, but the `examples` step only builds/install artifacts and never executes them. A regression that stops panicking on two-driver misuse would therefore not fail `zig build test` or `zig build examples`. Add a dedicated run step (or test harness wrapper) that executes this binary and asserts non-zero exit plus the expected panic text."
+    }
+  ]
+}
+```

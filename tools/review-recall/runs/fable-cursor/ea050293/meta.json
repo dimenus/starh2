@@ -1,0 +1,12 @@
+{
+  "arm": "fable-cursor",
+  "vendor_model": "claude-fable-5-thinking-high",
+  "commit": "ea050293",
+  "exit_code": 0,
+  "wall_seconds": 351,
+  "raw_bytes": 7503,
+  "parsed": true,
+  "n_findings": 4,
+  "n_files_read": 12,
+  "network_used": false
+}
