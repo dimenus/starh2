@@ -1,0 +1,26 @@
+{
+  "commit": "646a0b4c",
+  "run": "fable-r1",
+  "meta": {
+    "cost_usd": 1.1705394999999998,
+    "num_turns": 9,
+    "duration_ms": 149735,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 2,
+  "matches": {
+    "F5": {
+      "candidate": 0,
+      "why": "Candidate 0 states the same defect: the module-level select doc still claims parity with wait while the arm can return error.Closed on a stale open-queue wake, causing a driver to break and leave completions undrained, and asks for the isDrained disambiguation to be documented there."
+    },
+    "F6": {
+      "candidate": 1,
+      "why": "Candidate 1 reports the same test gap at the same isDrained site, asking for assertions on the drained, closed-but-pending, and open-and-empty states to prevent regression to an isClosed-only check."
+    }
+  },
+  "extras": [],
+  "extra_titles": [],
+  "judge_cost_usd": 0.259463
+}

@@ -1,0 +1,26 @@
+{
+  "commit": "f1681a4d",
+  "run": "fable-r3",
+  "meta": {
+    "cost_usd": 2.2782904999999998,
+    "num_turns": 29,
+    "duration_ms": 284937,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 2,
+  "matches": {
+    "F1": {
+      "candidate": 0,
+      "why": "Candidate 0 states the same defect: Loop.add/addInternal calls armTimer without refreshing the clock, so a .duration deadline computed from stale nowFor can fire immediately, and proposes the same refresh-at-arm-site fix."
+    }
+  },
+  "extras": [
+    1
+  ],
+  "extra_titles": [
+    "The regression test does not assert its own precondition, so it can pass vacuously"
+  ],
+  "judge_cost_usd": 0.2991105
+}

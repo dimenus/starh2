@@ -1,0 +1,28 @@
+{
+  "commit": "930921f4",
+  "run": "fable-r2",
+  "meta": {
+    "cost_usd": 0.81342,
+    "num_turns": 6,
+    "duration_ms": 114255,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F3": {
+      "candidate": 0,
+      "why": "Candidate 0 describes the same defect at src/completion_queue.zig:320 \u2014 getResult returns error.Closed on an open, non-drained queue after a stale wake, which makes the select caller tear down or stop draining, and the caller cannot distinguish it because close() is concurrent."
+    }
+  },
+  "extras": [
+    1,
+    2
+  ],
+  "extra_titles": [
+    "The file still states the strict wake invariant that this change abandons",
+    "No test pins the new spurious-Closed behavior of getResult"
+  ],
+  "judge_cost_usd": 0.26179800000000003
+}

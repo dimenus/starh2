@@ -1,0 +1,30 @@
+{
+  "commit": "e04e6e93",
+  "run": "fable-r2",
+  "meta": {
+    "cost_usd": 1.463964,
+    "num_turns": 13,
+    "duration_ms": 240004,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F2": {
+      "candidate": null,
+      "why": "No candidate identifies the post-poll updateNow at line 1429 running after a non-sleeping or zero-timeout poll and corrupting the per-scan timer base; candidates 1 and 2 address a different mechanism (cross-thread races) and a different site/behavior (the pre-scan refresh at 1392)."
+    }
+  },
+  "extras": [
+    0,
+    1,
+    2
+  ],
+  "extra_titles": [
+    "Tick retune reads a snapshot that `poll` does not always refresh",
+    "New `updateNow` comment claims owner-thread-only, but `setTimer` calls it cross-thread",
+    "The new pre-scan refresh changes timer firing latency with no regression test"
+  ],
+  "judge_cost_usd": 0.268978
+}

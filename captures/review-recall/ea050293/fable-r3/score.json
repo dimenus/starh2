@@ -1,0 +1,34 @@
+{
+  "commit": "ea050293",
+  "run": "fable-r3",
+  "meta": {
+    "cost_usd": 2.5722644999999997,
+    "num_turns": 31,
+    "duration_ms": 320000,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 6,
+  "matches": {
+    "F7": {
+      "candidate": 1,
+      "why": "Candidate 1 describes the same defect at the same site: early returns (including line 96) leave completions armed on the stack-backed cq/recv_op/t1 after the driver unwinds, causing corruption or a bad callback, and prescribes cancellation cleanup."
+    }
+  },
+  "extras": [
+    0,
+    2,
+    3,
+    4,
+    5
+  ],
+  "extra_titles": [
+    "The new example uses POSIX-only `std.c` calls, so `zig build examples` breaks on Windows",
+    "The flooder can write to a descriptor the driver has already closed",
+    "A reproduction does not stop the other drivers, so exit 2 arrives long after the SPURIOUS line",
+    "The clean report counts the requested budget, not the work the probe actually did",
+    "A failed spawn leaves running tasks pointing at freed memory"
+  ],
+  "judge_cost_usd": 0.27000799999999997
+}

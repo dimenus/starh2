@@ -1,0 +1,297 @@
+{
+  "_protocol": [
+    "The oracle for the review-recall harness. Each row is one CodeRabbit finding on",
+    "lalinsky/zio PRs 711, 712 and 713, transcribed from captures/coderabbit-zio-prs/.",
+    "'commit' is the commit CodeRabbit reviewed, and it is also the corpus commit an arm",
+    "sees. 'file' and 'start_line'/'end_line' are the anchor CodeRabbit posted, in the line",
+    "numbers of that commit's own tree, so an arm's citation compares directly.",
+    "'verdict' records what the author decided, NOT what CodeRabbit claimed:",
+    "  defect   - a true defect, fixed.",
+    "  test_gap - a missing test, added.",
+    "  style    - a cost or style point, not a defect.",
+    "  withdrawn- CodeRabbit withdrew it after the author explained the design.",
+    "  rejected - the author rejected it and CodeRabbit did not press.",
+    "Headline recall counts defect + test_gap + style (11 rows). withdrawn and rejected are",
+    "reported separately as 'contested': an arm that raises one is neither right nor wrong.",
+    "'keys' are lowercase substrings used only to sort candidates for the semantic judge.",
+    "They never decide a match on their own; score.py requires the judge's verdict."
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "pr": 711,
+      "commit": "f1681a4d",
+      "file": "src/ev/loop.zig",
+      "start_line": 1425,
+      "end_line": 1438,
+      "category": "functional_correctness",
+      "severity": "major",
+      "effort": "quick_win",
+      "verdict": "withdrawn",
+      "title": "Refresh the clock at the timer arm site.",
+      "summary": "armTimer computes a deadline from the cached awake snapshot, so a task batch that runs longer than a timer's duration produces a backdated deadline. CodeRabbit withdrew it once the author explained the cached clock is intentional.",
+      "keys": [
+        "armtimer",
+        "cached clock",
+        "backdated deadline",
+        "updatenow"
+      ]
+    },
+    {
+      "id": "F2",
+      "pr": 711,
+      "commit": "e04e6e93",
+      "file": "src/ev/loop.zig",
+      "start_line": 1423,
+      "end_line": 1429,
+      "category": "functional_correctness",
+      "severity": "minor",
+      "effort": "quick_win",
+      "verdict": "rejected",
+      "title": "Guard the post-poll refresh for non-zero waits.",
+      "summary": "CodeRabbit asked for the unconditional post-poll clock refresh to be guarded so it only runs when the backend actually waited. The author rejected it: a single unconditional refresh point is the design the upstream maintainer asked for.",
+      "keys": [
+        "post-poll",
+        "unconditional refresh",
+        "guard",
+        "non-zero wait"
+      ]
+    },
+    {
+      "id": "F3",
+      "pr": 712,
+      "commit": "930921f4",
+      "file": "src/completion_queue.zig",
+      "start_line": 309,
+      "end_line": 320,
+      "category": "data_integrity",
+      "severity": "major",
+      "effort": "heavy_lift",
+      "verdict": "defect",
+      "title": "Do not report an open queue as error.Closed.",
+      "summary": "After a stale wake, select returns error.Closed for a queue that is still open. error.Closed is overloaded, so a caller cannot tell a real close from a spurious win, and a multi-closer caller cannot disambiguate at all.",
+      "keys": [
+        "error.closed",
+        "spurious",
+        "select",
+        "overloaded",
+        "stale wake"
+      ]
+    },
+    {
+      "id": "F4",
+      "pr": 712,
+      "commit": "bd7b9ed6",
+      "file": "src/completion_queue.zig",
+      "start_line": 381,
+      "end_line": 390,
+      "category": "data_integrity",
+      "severity": "major",
+      "effort": "heavy_lift",
+      "verdict": "defect",
+      "title": "Do not treat isClosed() as proof that the queue is drained.",
+      "summary": "isClosed() reports only the closed flag. A caller that stops on isClosed() stops while ownerCallback still has in-flight completions to deliver. The terminal-state test must check closed AND pending empty AND completed empty under one mutex hold.",
+      "keys": [
+        "isclosed",
+        "isdrained",
+        "in-flight",
+        "terminal state",
+        "pending",
+        "completed"
+      ]
+    },
+    {
+      "id": "F5",
+      "pr": 712,
+      "commit": "646a0b4c",
+      "file": "src/completion_queue.zig",
+      "start_line": 318,
+      "end_line": 320,
+      "category": "data_integrity",
+      "severity": "major",
+      "effort": "quick_win",
+      "verdict": "defect",
+      "title": "Update the module-level select contract.",
+      "summary": "The module doc still states the old select contract and contradicts the new tolerate-a-spurious-win behaviour. The doc must carry the error.Closed caveat and the keep-driving-until-isDrained rule.",
+      "keys": [
+        "module doc",
+        "select contract",
+        "documentation",
+        "contradict"
+      ]
+    },
+    {
+      "id": "F6",
+      "pr": 712,
+      "commit": "646a0b4c",
+      "file": "src/completion_queue.zig",
+      "start_line": 382,
+      "end_line": 397,
+      "category": "functional_correctness",
+      "severity": "trivial",
+      "effort": "quick_win",
+      "verdict": "test_gap",
+      "title": "Add regression tests for isDrained().",
+      "summary": "isDrained() is the terminal-state decision gate and no test exercises it. Cases needed: open and empty, closed with pending, closed with completed, closed and fully drained.",
+      "keys": [
+        "isdrained",
+        "regression test",
+        "no test",
+        "test coverage"
+      ]
+    },
+    {
+      "id": "F7",
+      "pr": 712,
+      "commit": "ea050293",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 92,
+      "end_line": 98,
+      "category": "stability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "verdict": "defect",
+      "title": "Clean up the queue before returning error.Spurious.",
+      "summary": "The early return on the spurious path leaves the queue live while the operations go out of scope, so pending operations later call into an unwound stack. The early-return path needs the same close, cancel and drain the normal path does.",
+      "keys": [
+        "early return",
+        "error.spurious",
+        "teardown",
+        "errdefer",
+        "out of scope",
+        "unwound stack"
+      ]
+    },
+    {
+      "id": "F8",
+      "pr": 713,
+      "commit": "16df720e",
+      "file": "build.zig",
+      "start_line": 80,
+      "end_line": 80,
+      "category": "stability",
+      "severity": "major",
+      "effort": "quick_win",
+      "verdict": "defect",
+      "title": "Add a Windows target guard for cq-spurious-select-repro.",
+      "summary": "The default examples build includes a POSIX-only example that calls std.c.socketpair and std.c.fcntl. Those are unavailable for the supported Windows target, so zig build examples can fail for Windows. Exclude it on Windows and fail a direct selection with a clear message.",
+      "keys": [
+        "windows",
+        "socketpair",
+        "fcntl",
+        "posix",
+        "examples build",
+        "target"
+      ]
+    },
+    {
+      "id": "F9",
+      "pr": 713,
+      "commit": "16df720e",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 46,
+      "end_line": 50,
+      "category": "stability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "verdict": "defect",
+      "title": "Synchronize feed_fd with descriptor close.",
+      "summary": "An atomic FD value does not protect the descriptor lifetime. The flooder can load and write the old FD while teardown clears and closes it. If the OS reuses that FD number the flooder writes to an unrelated descriptor.",
+      "keys": [
+        "feed_fd",
+        "atomic",
+        "descriptor lifetime",
+        "fd reuse",
+        "flooder",
+        "race"
+      ]
+    },
+    {
+      "id": "F10",
+      "pr": 713,
+      "commit": "16df720e",
+      "file": "examples/cq_two_driver_misuse.zig",
+      "start_line": 74,
+      "end_line": 75,
+      "category": "functional_correctness",
+      "severity": "minor",
+      "effort": "quick_win",
+      "verdict": "defect",
+      "title": "Return failure when the misuse is not detected.",
+      "summary": "The undetected-misuse branch prints a diagnostic and exits 0, so the death-test harness reads two drivers running without a panic as a pass. It must exit non-zero.",
+      "keys": [
+        "exit 0",
+        "exit code",
+        "death test",
+        "undetected",
+        "misuse",
+        "nonzero"
+      ]
+    },
+    {
+      "id": "F11",
+      "pr": 713,
+      "commit": "16df720e",
+      "file": "src/completion_queue.zig",
+      "start_line": 260,
+      "end_line": 270,
+      "category": "functional_correctness",
+      "severity": "minor",
+      "effort": "quick_win",
+      "verdict": "defect",
+      "title": "The timeout branch pops completed without the single-driver check.",
+      "summary": "timedWait's error.Timeout branch pops completed without checkSingleDriverLocked(), so it steals a completion from a parked select. cancel's wait loop and drainPending's discard path have the same hole. Outside the diff, and STILL OPEN at upstream/main.",
+      "keys": [
+        "checksingledriverlocked",
+        "timedwait",
+        "timeout branch",
+        "drainpending",
+        "cancel wait loop",
+        "single driver"
+      ]
+    },
+    {
+      "id": "F12",
+      "pr": 713,
+      "commit": "16df720e",
+      "file": "src/completion_queue.zig",
+      "start_line": 1660,
+      "end_line": 1678,
+      "category": "performance",
+      "severity": "trivial",
+      "effort": "low_value",
+      "verdict": "style",
+      "title": "The quiescence watch burns a lot of CI time for a probabilistic signal.",
+      "summary": "200 rounds x 500 passes x sizeOf(CompletionQueue) is on the order of ten million expectEqual calls per run. Use std.mem.allEqual, or lower the inner count.",
+      "keys": [
+        "expectequal",
+        "quiescence",
+        "ci time",
+        "allequal",
+        "500",
+        "hot loop"
+      ]
+    },
+    {
+      "id": "F13",
+      "pr": 713,
+      "commit": "0c9271ce",
+      "file": "examples/cq_spurious_select_repro.zig",
+      "start_line": 85,
+      "end_line": 90,
+      "category": "stability",
+      "severity": "minor",
+      "effort": "quick_win",
+      "verdict": "defect",
+      "title": "Move descriptor close outside feed_mu.",
+      "summary": "The teardown closes the descriptors while it still holds feed_mu. On macOS that deadlocks against the flooder's write under the same mutex. Clear feed_fd under the mutex, unlock, then close both descriptors.",
+      "keys": [
+        "feed_mu",
+        "close under the mutex",
+        "deadlock",
+        "macos",
+        "unlock before close"
+      ]
+    }
+  ]
+}

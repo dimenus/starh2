@@ -1,0 +1,46 @@
+{
+  "commit": "16df720e",
+  "run": "fable-r2",
+  "meta": {
+    "cost_usd": 2.8289754999999994,
+    "num_turns": 21,
+    "duration_ms": 455540,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 4,
+  "matches": {
+    "F8": {
+      "candidate": null,
+      "why": "No candidate mentions build.zig or the Windows/POSIX-only target guard."
+    },
+    "F9": {
+      "candidate": null,
+      "why": "No candidate raises the feed_fd descriptor-lifetime race in cq_spurious_select_repro.zig."
+    },
+    "F10": {
+      "candidate": null,
+      "why": "Candidates near the exit path discuss a use-after-free, a missing harness, and timing flakiness, not the defect that the not-detected branch returns exit code 0."
+    },
+    "F11": {
+      "candidate": null,
+      "why": "No candidate covers the missing checkSingleDriverLocked in the timeout/cancel/drainPending consuming paths."
+    },
+    "F12": {
+      "candidate": 3,
+      "why": "Candidate 3 targets the same quiescence watch loop and states the same excessive per-byte expectEqual cost, plus an extra optimizer concern."
+    }
+  },
+  "extras": [
+    0,
+    1,
+    2
+  ],
+  "extra_titles": [
+    "The example leaves four armed Async operations pointing at a dead coroutine frame",
+    "The documented death-test harness does not exist, so nothing runs this check",
+    "The misuse detection is timing-dependent, but exit 0 is declared a hard failure"
+  ],
+  "judge_cost_usd": 0.315678
+}

@@ -1,0 +1,135 @@
+{
+  "F1": {
+    "body": "_\ud83c\udfaf Functional Correctness_ | _\ud83d\udfe0 Major_ | _\u26a1 Quick win_\n\n**Refresh the clock at the timer arm site.**\n\nThis refresh only covers work executed before `Loop.poll` returns. `Loop.add` calls `armTimer` without another refresh, and `armTimer` uses cached `nowFor`. If a callback or task batch runs longer than the timer duration after this update, the next duration timer is calculated from the stale snapshot and can fire immediately. Read the clock in the `.duration` branch of `armTimer` so the deadline is relative to the actual arm time.\n\n\nProposed fix\n\n```diff\n-            .duration => |d| timer.deadline = self.nowFor(timer.clock).addDuration(d),\n+            .duration => |d| timer.deadline = time.now(timer.clock).addDuration(d),\n```",
+    "category": "Functional Correctness",
+    "commit": "f1681a4d",
+    "file": "src/ev/loop.zig",
+    "line": 1438,
+    "severity": "Major",
+    "source": "inline comment 3846089231",
+    "verdict": "by-design"
+  },
+  "F10": {
+    "body": "_\ud83c\udfaf Functional Correctness_ | _\ud83d\udfe1 Minor_ | _\u26a1 Quick win_\n\n**Return failure when the misuse is not detected.**\n\nLines 11-12 define exit code 0 as an undetected misuse. Line 75 returns exit code 0 after detecting that condition. An external death-test harness can then accept a silent two-driver regression.\n\nReturn a nonzero status here.",
+    "category": "Functional Correctness",
+    "commit": "16df720e",
+    "file": "examples/cq_two_driver_misuse.zig",
+    "line": 75,
+    "severity": "Minor",
+    "source": "inline comment 3855167279",
+    "verdict": "true-defect"
+  },
+  "F11": {
+    "body": "`260-270`: _\ud83c\udfaf Functional Correctness_ | _\ud83d\udfe1 Minor_ | _\u26a1 Quick win_\n\n**The timeout branch pops `completed` without the single-driver check.**\n\nThe header now promises a panic when a driver-only entry point runs while a select is parked. This branch skips `checkSingleDriverLocked()` and pops a completion anyway. A `timedWait` that times out while another task's select holds `reg` steals the completion silently, which is the failure mode the claim protocol removes elsewhere.\n\nThe same applies to two other consuming sections: `cancel`'s wait loop at Lines 521-523 unlinks from `completed`, and `drainPending` at Lines 604-611 drops completions on `.discard`. `cancelAll` covers the latter through `requestCancelAll`, but only on the first pass; a select registering mid-drain is not caught.\n\n\n\ud83e\ude79 Add the check to the timeout branch\n\n```diff\n                 error.Timeout => {\n                     // A completion, or the close, can still have landed\n                     // together with the timeout; report those rather than a\n                     // timeout that did not happen.\n                     self.mutex.lock();\n+                    self.checkSingleDriverLocked();\n                     const n = self.completed.pop();\n```\n\n\n\n\ud83e\udd16",
+    "category": "Functional Correctness",
+    "commit": "16df720e",
+    "file": "src/completion_queue.zig",
+    "line": 260,
+    "line_end": 270,
+    "severity": "Minor",
+    "source": "review body 5021479637",
+    "verdict": "true-defect"
+  },
+  "F12": {
+    "body": "`1660-1678`: _\ud83d\ude80 Performance & Scalability_ | _\ud83d\udd35 Trivial_ | _\ud83d\udca4 Low value_\n\n**The quiescence watch burns a lot of CI time for a probabilistic signal.**\n\n200 rounds \u00d7 500 passes \u00d7 `@sizeOf(CompletionQueue)` bytes is on the order of ten million `expectEqual` calls, each spawning 4 tasks and 64 timers beforehand. The comment already states the honest position: at the real gap width a pass is one more clean sample, not proof. That is fine as a test, but the current constants pay full price for it on every run.\n\nConsider dropping the inner watch to a smaller count, or comparing with `std.mem.allEqual` so the hot loop is one call instead of one per byte.\n\n\n\u267b\ufe0f Cheaper inner watch\n\n```diff\n         `@memset`(std.mem.asBytes(&cq), 0xAA);\n         var checks: u32 = 0;\n-        while (checks < 500) : (checks += 1) {\n-            for (std.mem.asBytes(&cq)) |b| {\n-                try std.testing.expectEqual(0xAA, b);\n-            }\n+        while (checks < 50) : (checks += 1) {\n+            try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&cq), 0xAA));\n         }\n```\n\n\n\n\ud83e\udd16",
+    "category": "Performance & Scalability",
+    "commit": "16df720e",
+    "file": "src/completion_queue.zig",
+    "line": 1660,
+    "line_end": 1678,
+    "severity": "Trivial",
+    "source": "review body 5021479637",
+    "verdict": "style-cost"
+  },
+  "F13": {
+    "body": "_\ud83e\ude7a Stability & Availability_ | _\ud83d\udfe1 Minor_ | _\u26a1 Quick win_\n\n**Move descriptor close outside `feed_mu`.**\n\nLines 86-90 close both descriptors while `feed_mu` is held. The prior macOS validation found that this can deadlock when `close` blocks. Clear `feed_fd` under `feed_mu`, unlock it, then close the descriptors.\n\n\nProposed fix\n\n```diff\n         defer {\n             sh.feed_mu.lockUncancelable();\n-            defer sh.feed_mu.unlock();\n             sh.feed_fd = -1;\n+            sh.feed_mu.unlock();\n             _ = std.c.close(fds[0]);\n             _ = std.c.close(fds[1]);\n         }\n```\n\n\n<!-- suggestion_start -->\n\n\n\ud83d\udcdd Committable suggestion\n\n\u203c\ufe0f **IMPORTANT**\nCarefully review the code before committing. Ensure that it accurately replaces the highlighted code, contains no missing lines, and has no issues with indentation. Thoroughly test & benchmark the code to ensure it meets the requirements.\n\n```suggestion\n        defer {\n            sh.feed_mu.lockUncancelable();\n            sh.feed_fd = -1;\n            sh.feed_mu.unlock();\n            _ = std.c.close(fds[0]);\n            _ = std.c.close(fds[1]);\n```\n\n\n\n<!-- suggestion_end -->",
+    "category": "Stability & Availability",
+    "commit": "0c9271ce",
+    "file": "examples/cq_spurious_select_repro.zig",
+    "line": 90,
+    "severity": "Minor",
+    "source": "inline comment 3855906664",
+    "verdict": "true-defect"
+  },
+  "F2": {
+    "body": "_\ud83c\udfaf Functional Correctness_ | _\ud83d\udfe1 Minor_ | _\u26a1 Quick win_\n\n**Guard the post-poll refresh for non-zero waits.**\n\nLine 1429 runs when `should_poll` is false and when `wake_flags` causes `backend.poll` to receive `.zero`. Neither path slept, so the cached snapshot is not stale by backend wait time. The extra refresh advances `tick` and gives callbacks after a non-blocking poll a different timer base from the initial scan. This breaks the per-scan timer-base contract and contradicts the zero-timeout behavior in the PR objective.\n\nCapture the actual timeout passed to `backend.poll` and refresh only when it is non-zero.\n\n\nProposed fix\n\n```diff\n         const should_poll = wait or self.backend.hasInflight();\n         const wake_flags = self.state.wake_requested.swap(0, .acq_rel);\n-        const timed_out = if (should_poll) try self.backend.poll(&self.state, if (wake_flags != 0) .zero else timeout) else false;\n+        const poll_timeout: Duration = if (wake_flags != 0) .zero else timeout;\n+        const timed_out = if (should_poll) try self.backend.poll(&self.state, poll_timeout) else false;\n\n-        self.state.updateNow();\n+        if (should_poll and poll_timeout.value != 0) self.state.updateNow();\n```",
+    "category": "Functional Correctness",
+    "commit": "e04e6e93",
+    "file": "src/ev/loop.zig",
+    "line": 1429,
+    "severity": "Minor",
+    "source": "inline comment 3849480409",
+    "verdict": "rejected"
+  },
+  "F3": {
+    "body": "_\ud83d\uddc4\ufe0f Data Integrity & Integration_ | _\ud83d\udfe0 Major_ | _\ud83c\udfd7\ufe0f Heavy lift_\n\n**Do not report an open queue as `error.Closed`.**\n\n`error.Closed` means that the queue is closed and fully drained. This path also returns it for an open queue after a stale wake.\n\n`src/select.zig:560-618` propagates `getResult` directly. A select caller can therefore treat an open queue as terminal and stop draining future completions. The caller also cannot safely infer that the result is spurious because another task can call `CompletionQueue.close`.\n\nReturn a distinct retryable result for the stale-wake case, or make `select` re-register internally after it confirms that the queue is still open. Keep `error.Closed` exclusive to the drained state.",
+    "category": "Data Integrity & Integration",
+    "commit": "930921f4",
+    "file": "src/completion_queue.zig",
+    "line": 320,
+    "severity": "Major",
+    "source": "inline comment 3847020408",
+    "verdict": "true-defect"
+  },
+  "F4": {
+    "body": "_\ud83d\uddc4\ufe0f Data Integrity & Integration_ | _\ud83d\udfe0 Major_ | _\ud83c\udfd7\ufe0f Heavy lift_\n\n**Do not treat `isClosed()` as proof that the queue is drained.**\n\n`getResult()` can return `error.Closed` for a stale wake. If another task calls `close()` before this method runs, `isClosed()` returns `true` even though an operation may still be in flight. `close()` leaves such operations running, and `ownerCallback` can later add their results to `completed`. A driver that stops on `true` can leave that completion undrained.\n\nExpose and use one mutex-protected check for `closed && pending.isEmpty() && completed.isEmpty()`, or preserve the drained-versus-spurious classification from `getResult()`. `isClosed()` alone does not provide the terminal-state guarantee described here.",
+    "category": "Data Integrity & Integration",
+    "commit": "bd7b9ed6",
+    "file": "src/completion_queue.zig",
+    "line": 390,
+    "severity": "Major",
+    "source": "inline comment 3847083700",
+    "verdict": "true-defect"
+  },
+  "F5": {
+    "body": "_\ud83d\uddc4\ufe0f Data Integrity & Integration_ | _\ud83d\udfe0 Major_ | _\u26a1 Quick win_\n\n**Update the module-level `select` contract.**\n\nThe documentation at Lines 52-57 says a `select` result matches `wait` except for cancellation. This change also allows `select` to return `error.Closed` for a stale wake while the queue is open. A driver following the module-level documentation can stop and leave later completions undrained. Document the `isDrained()` check and the required re-poll when it returns `false`.",
+    "category": "Data Integrity & Integration",
+    "commit": "646a0b4c",
+    "file": "src/completion_queue.zig",
+    "line": 320,
+    "severity": "Major",
+    "source": "inline comment 3847149689",
+    "verdict": "true-defect"
+  },
+  "F6": {
+    "body": "`382-397`: _\ud83c\udfaf Functional Correctness_ | _\ud83d\udd35 Trivial_ | _\u26a1 Quick win_\n\n**Add regression tests for `isDrained()`.**\n\nThis predicate is the terminal-state decision gate, but the current tests do not exercise it. Add cases for open and empty, closed with pending operations, closed with completed operations, and closed and fully drained. This protects the distinction from a future regression to an `isClosed()`-only check.\n\n\n\ud83e\udd16",
+    "category": "Functional Correctness",
+    "commit": "646a0b4c",
+    "file": "src/completion_queue.zig",
+    "line": 382,
+    "line_end": 397,
+    "severity": "Trivial",
+    "source": "review body 5012183609",
+    "verdict": "test-gap"
+  },
+  "F7": {
+    "body": "_\ud83e\ude7a Stability & Availability_ | _\ud83d\udfe1 Minor_ | _\u26a1 Quick win_\n\n**Clean up the queue before returning `error.Spurious`.**\n\nLine 96 bypasses the teardown at Lines 127-132. Pending operations can still call back through stack-backed `cq`, `recv_op`, or `t1` after `driver` unwinds. This can convert a detected spurious win into a crash or hang.\n\nAdd an `errdefer` after Line 75 that closes and cancels the queue before the local operations and file descriptors leave scope.\n\n\nProposed fix\n\n```diff\n         var cq = zio.CompletionQueue.init();\n+        errdefer {\n+            cq.close();\n+            cq.cancelAll(.discard);\n+        }\n         var recv_buf: [64]u8 = undefined;\n```",
+    "category": "Stability & Availability",
+    "commit": "ea050293",
+    "file": "examples/cq_spurious_select_repro.zig",
+    "line": 98,
+    "severity": "Minor",
+    "source": "inline comment 3853156069",
+    "verdict": "true-defect"
+  },
+  "F8": {
+    "body": "_\ud83e\ude7a Stability & Availability_ | _\ud83d\udfe0 Major_ | _\u26a1 Quick win_\n\n\n\ud83d\udd0e Supported by static analysis\n\n\ud83c\udfc1 Script executed:\n\n```shell\n#!/bin/bash\nset -eu\nprintf '%s\\n' '--- build.zig relevant sections ---'\nsed -n '1,130p' build.zig\nprintf '%s\\n' '--- reproducer source ---'\nsed -n '1,110p' examples/cq_spurious_select_repro.zig\nprintf '%s\\n' '--- target/backend/example references ---'\nrg -n --glob '*.zig' --glob 'build.zig' 'cq-spurious-select-repro|socketpair|fcntl|IOCP|target|examples' .\n```\n\nRepository: lalinsky/zio\n\nLength of output: 43108\n\n---\n\n\ud83c\udfc1 Script executed:\n\n```shell\n#!/bin/bash\nset -eu\nprintf '%s\\n' '--- project version and platform policy ---'\nfd -a -t f 'build.zig.zon|README.*|.*workflow.*|.*ya?ml' . | sort\nprintf '%s\\n' '--- build metadata ---'\nfor f in $(fd -a -t f 'build.zig.zon|README.*' . | sort | head -20); do\n  printf '\\n### %s\\n' \"$f\"\n  sed -n '1,180p' \"$f\"\ndone\nprintf '%s\\n' '--- Windows support declarations ---'\nrg -n -i --glob '*.zig' --glob '*.md' --glob '*.yml' --glob '*.yaml' 'windows|x86_64-windows|supported target|unsupported' . | head -160\n```\n\nRepository: lalinsky/zio\n\nLength of output: 24999\n\n---\n\n\ud83c\udf10 Web query:\n\n`Zig std.c socketpair fcntl Windows target availability std library`\n\n\ud83d\udca1 Result:\n\nIn Zig, both `socketpair` and `fcntl` are essentially POSIX-oriented APIs that are not natively supported as cross-platform abstractions on Windows within the `std` library [1][2][3]. socketpair The `socketpair` function is not available for Windows in the Zig standard library [1][4]. Because Windows does not support the Unix domain sockets (`AF_UNIX`) used by `socketpair` in the same way POSIX systems do, there is no direct equivalent in `std.os` [1][5]. Developers working on cross-platform code typically use alternative strategies, such as creating TCP loopback connections or using platform-specific pipe APIs (like `std.os.windows.CreatePipe`) to achieve similar inter-process communication [6][7]. fcntl The `fcntl` function is also a POSIX-specific API and is not part of the standard `std` library interface for Windows [8][9][3]. While Zig provides access to many underlying system calls, `fcntl` is specifically mapped to POSIX-compliant operating systems (like Linux and macOS) [10][3]. On Windows, developers are expected to use native Windows APIs (such as those in `std.os.windows`) to manage file descriptors, socket options, or file control operations, rather than relying on `fcntl` [6][11][8]. In summary, neither `socketpair` nor `fcntl` is available in the Zig standard library for Windows targets because they are deeply tied to POSIX system design [2][8]. When targeting Windows, you must use equivalent Windows-specific system calls or platform-agnostic high-level networking abstractions provided by Zig's `std.net` module [11][8].\n\nCitations:\n\n- 1: https://github.com/ziglang/zig/pull/18561\n- 2: https://github.com/ziglang/zig/blob/master/lib/std/os.zig\n- 3: https://github.com/ziglang/zig/pull/1355\n- 4: https://github.com/ziglang/zig/issues/18417\n- 5: https://codeberg.org/ziglang/zig/issues/31978\n- 6: https://github.com/ziglang/zig/blob/master/lib/std/os/windows.zig\n- 7: https://github.com/lalinsky/zio/commit/6b96a714c91d239aba0e06d06b047b8d17c7b5e3\n- 8: https://github.com/ziglang/zig/blob/master/lib/std/posix.zig\n- 9: https://github.com/ziglang/zig/blob/738d2be9/lib/std/os.zig\n- 10: https://github.com/ziglang/zig/blob/master/lib/std/c.zig\n- 11: https://github.com/ziglang/zig/pull/19751\n\n---\n\n\n\n\n\n**Add a Windows target guard for `cq-spurious-select-repro`.** The default examples build includes this POSIX-only example, which calls `std.c.socketpair` and `std.c.fcntl`. These APIs are unavailable for the supported Windows target, so `zig build examples` can fail for Windows. Exclude the example on Windows and emit a clear error when selected directly.",
+    "category": "Stability & Availability",
+    "commit": "16df720e",
+    "file": "build.zig",
+    "line": 80,
+    "severity": "Major",
+    "source": "inline comment 3855167251",
+    "verdict": "true-defect"
+  },
+  "F9": {
+    "body": "_\ud83e\ude7a Stability & Availability_ | _\ud83d\udfe1 Minor_ | _\u26a1 Quick win_\n\n**Synchronize `feed_fd` with descriptor close.**\n\nAn atomic FD value does not protect the descriptor lifetime. The flooder can load and write the old FD at Lines 48-49 while teardown clears and closes it at Lines 68-73. If the OS reuses that FD number, the flooder can write to an unrelated socket or event FD.\n\nGuard the load/write, clear, and close operations with one mutex. Alternatively, stop and join the flooder before closing the socketpair.\n\n\n\n\n\n\nAlso applies to: 68-73",
+    "category": "Stability & Availability",
+    "commit": "16df720e",
+    "file": "examples/cq_spurious_select_repro.zig",
+    "line": 50,
+    "severity": "Minor",
+    "source": "inline comment 3855167276",
+    "verdict": "true-defect"
+  }
+}

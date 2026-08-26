@@ -1,0 +1,30 @@
+{
+  "commit": "0c9271ce",
+  "run": "fable-r1",
+  "meta": {
+    "cost_usd": 1.3458975,
+    "num_turns": 18,
+    "duration_ms": 195340,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F13": {
+      "candidate": null,
+      "why": "Candidate 1 is at the same file and teardown region but describes a descriptor leak when lock fails, not the deadlock risk of closing descriptors while feed_mu is held."
+    }
+  },
+  "extras": [
+    0,
+    1,
+    2
+  ],
+  "extra_titles": [
+    "The death test's failure signal became a non-zero exit, and no harness in this tree enforces the new contract",
+    "The socketpair descriptors now leak if the first feed_mu.lock() fails",
+    "The posix_only gate keys on Windows only, so the same compile break returns on other non-POSIX targets"
+  ],
+  "judge_cost_usd": 0.262668
+}

@@ -1,0 +1,36 @@
+{
+  "commit": "ea050293",
+  "run": "fable-r2",
+  "meta": {
+    "cost_usd": 2.439936,
+    "num_turns": 29,
+    "duration_ms": 317306,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 7,
+  "matches": {
+    "F7": {
+      "candidate": 0,
+      "why": "Candidate 0 describes the same missing teardown on the early-return path at line 96 of the same file, with pending operations calling back into the freed/stack frame as the consequence."
+    }
+  },
+  "extras": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "extra_titles": [
+    "The new example is POSIX-only but is registered in the examples step unconditionally",
+    "The flooder writes to a descriptor the driver may already have closed",
+    "A driver error is discarded, so a broken run reports itself as a result",
+    "A reproduction does not stop the other drivers, so the verdict is delayed by the full budget",
+    "A clean exit does not prove the window was exercised",
+    "`closed_by_us` can never be true where it is read"
+  ],
+  "judge_cost_usd": 0.272363
+}

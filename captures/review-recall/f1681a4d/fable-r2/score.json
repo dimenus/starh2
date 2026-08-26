@@ -1,0 +1,28 @@
+{
+  "commit": "f1681a4d",
+  "run": "fable-r2",
+  "meta": {
+    "cost_usd": 3.1747885000000005,
+    "num_turns": 40,
+    "duration_ms": 402915,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F1": {
+      "candidate": 0,
+      "why": "Candidate 0 states the same mechanism \u2014 armTimer/addInternal computes .duration deadlines from a stale cached now instead of refreshing at arm time, causing timers to fire immediately \u2014 at the same loop.zig timer-arm site."
+    }
+  },
+  "extras": [
+    1,
+    2
+  ],
+  "extra_titles": [
+    "New unsynchronized write to `now`/`tick`, whose owner-thread-only claim is already false",
+    "Regression test has no guard that the backend poll actually slept"
+  ],
+  "judge_cost_usd": 0.3049355
+}

@@ -1,0 +1,7 @@
+# Corpus and run outputs are derived. corpus.sh rebuilds the corpus from
+# ~/Source/oss/zio; the arms rebuild runs/. Committing them would store a
+# statistic in the repo, and the whole point is that the number is re-derived.
+corpus/
+runs/
+*.log
+*.pid

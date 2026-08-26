@@ -1,0 +1,32 @@
+{
+  "commit": "0c9271ce",
+  "run": "fable-r3",
+  "meta": {
+    "cost_usd": 0.8631989999999999,
+    "num_turns": 15,
+    "duration_ms": 213877,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 4,
+  "matches": {
+    "F13": {
+      "candidate": null,
+      "why": "Candidate 2 touches the same teardown region but describes an fd leak from a fallible lock at line 78, not the deadlock risk of closing descriptors while feed_mu is held."
+    }
+  },
+  "extras": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "extra_titles": [
+    "Exit-code contract inverted with no in-tree harness to update",
+    "The mutex changes the flooder's hot-loop timing that the reproducer depends on, and the doc's reproduction claim is not revalidated",
+    "Both socketpair descriptors leak if the new fallible lock fails",
+    "Windows skip of a posix_only example is silent for the full examples build"
+  ],
+  "judge_cost_usd": 0.265518
+}

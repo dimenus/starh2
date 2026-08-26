@@ -1,0 +1,30 @@
+{
+  "commit": "e04e6e93",
+  "run": "fable-r1",
+  "meta": {
+    "cost_usd": 1.9199614999999999,
+    "num_turns": 20,
+    "duration_ms": 287525,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F2": {
+      "candidate": null,
+      "why": "No candidate flags the unconditional post-poll updateNow at line 1429 as wrong for zero/non-slept polls; candidate 1 discusses that same line but as a timestamp-ordering issue in runtime.zig tick budget, and candidate 2 only notes a missing test for the pre-poll refresh."
+    }
+  },
+  "extras": [
+    0,
+    1,
+    2
+  ],
+  "extra_titles": [
+    "The new `updateNow` comment claims owner-thread-only, but `setTimer` calls it from another thread",
+    "`tick_started_at` now predates the batch it timestamps, so the tick budget expires early",
+    "No test covers the new refresh at the top of `poll`"
+  ],
+  "judge_cost_usd": 0.3070405
+}

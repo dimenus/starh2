@@ -1,0 +1,32 @@
+{
+  "commit": "ea050293",
+  "run": "fable-r1",
+  "meta": {
+    "cost_usd": 2.3830045,
+    "num_turns": 31,
+    "duration_ms": 338117,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 5,
+  "matches": {
+    "F7": {
+      "candidate": 0,
+      "why": "Candidate 0 names the same missing-teardown-on-error-exit defect at the same site, covering the error.Spurious path at line 96 and the dangling stack-backed cq/recv_op/t1 consequence."
+    }
+  },
+  "extras": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "extra_titles": [
+    "The flooder writes to a descriptor the driver may have already closed and the kernel recycled",
+    "A POSIX-only example is registered unconditionally, so `zig build examples` breaks the Windows CI job",
+    "One worker's reproduction does not stop the other workers, so the run does not end when the bug is found",
+    "Exit 2 with `RESULT spurious=0` also reports a harness failure, which reads as a reproduction"
+  ],
+  "judge_cost_usd": 0.26824800000000004
+}

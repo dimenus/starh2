@@ -1,0 +1,26 @@
+{
+  "commit": "646a0b4c",
+  "run": "fable-r3",
+  "meta": {
+    "cost_usd": 0.795248,
+    "num_turns": 8,
+    "duration_ms": 111955,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 2,
+  "matches": {
+    "F5": {
+      "candidate": 0,
+      "why": "Candidate 0 states the module header's select-equals-wait contract omits the new error.Closed-on-stale-wake case, causing drivers to tear down early and drop in-flight completions, at the same doc site."
+    },
+    "F6": {
+      "candidate": 1,
+      "why": "Candidate 1 reports the same test gap for the new isDrained() predicate at the same lines, listing the closed-with-pending and completed-not-taken cases."
+    }
+  },
+  "extras": [],
+  "extra_titles": [],
+  "judge_cost_usd": 0.257228
+}

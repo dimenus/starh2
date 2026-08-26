@@ -1,0 +1,26 @@
+{
+  "commit": "646a0b4c",
+  "run": "fable-r2",
+  "meta": {
+    "cost_usd": 1.2175085,
+    "num_turns": 11,
+    "duration_ms": 134857,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 2,
+  "matches": {
+    "F5": {
+      "candidate": 0,
+      "why": "Candidate 0 targets the same module-level select contract docs (lines ~52-57) and the same mechanism: error.Closed on a non-drained queue makes a driver break and leave completions undrained, fixed by documenting isDrained()."
+    },
+    "F6": {
+      "candidate": 1,
+      "why": "Candidate 1 is the same test-gap finding for the new isDrained() predicate at the same site, asking for open/closed-not-drained/terminal assertions."
+    }
+  },
+  "extras": [],
+  "extra_titles": [],
+  "judge_cost_usd": 0.258588
+}

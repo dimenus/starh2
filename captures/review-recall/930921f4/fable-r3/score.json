@@ -1,0 +1,28 @@
+{
+  "commit": "930921f4",
+  "run": "fable-r3",
+  "meta": {
+    "cost_usd": 1.4266594999999997,
+    "num_turns": 10,
+    "duration_ms": 133874,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F3": {
+      "candidate": 0,
+      "why": "Candidate 0 targets the same getResult site and the same mechanism \u2014 error.Closed returned without the drained check after a stale wake \u2014 with the same consequence that a caller stops draining an open queue."
+    }
+  },
+  "extras": [
+    1,
+    2
+  ],
+  "extra_titles": [
+    "Three contract statements in this file still promise the strict reading of a wake that getResult abandoned",
+    "The new spurious error.Closed path has no test and no diagnostic"
+  ],
+  "judge_cost_usd": 0.26157800000000003
+}

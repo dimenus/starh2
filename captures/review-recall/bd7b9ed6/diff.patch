@@ -1,0 +1,22 @@
+diff --git a/src/completion_queue.zig b/src/completion_queue.zig
+index e585363..e39a7f1 100644
+--- a/src/completion_queue.zig
++++ b/src/completion_queue.zig
+@@ -378,6 +378,17 @@ pub const CompletionQueue = struct {
+         return if (had_signal) .requeued else .queued;
+     }
+ 
++    /// Whether `close` has been called. A select driver that receives
++    /// `error.Closed` from its queue arm can use this to tell a real close
++    /// (stop draining) from a spurious win (re-poll): `error.Closed` with
++    /// `isClosed() == false` can only be the spurious case, whoever closes
++    /// the queue.
++    pub fn isClosed(self: *CompletionQueue) bool {
++        self.mutex.lock();
++        defer self.mutex.unlock();
++        return self.closed;
++    }
++
+     pub fn asyncCancelWait(self: *CompletionQueue, waiter: *Waiter, ctx: *WaitContext) bool {
+         _ = self;
+         _ = waiter;

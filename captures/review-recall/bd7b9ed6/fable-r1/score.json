@@ -1,0 +1,28 @@
+{
+  "commit": "bd7b9ed6",
+  "run": "fable-r1",
+  "meta": {
+    "cost_usd": 0.7813464999999999,
+    "num_turns": 6,
+    "duration_ms": 65867,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F4": {
+      "candidate": 0,
+      "why": "Candidate 0 describes the same site and mechanism: isClosed() returns true after a close with operations still in flight, so a driver stops and leaves completions undrained, and it proposes the same drained-state predicate."
+    }
+  },
+  "extras": [
+    1,
+    2
+  ],
+  "extra_titles": [
+    "New public isClosed() has no test",
+    "isClosed() is placed inside the future-protocol block"
+  ],
+  "judge_cost_usd": 0.258568
+}

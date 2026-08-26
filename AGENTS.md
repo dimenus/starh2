@@ -59,6 +59,22 @@ tools/sse_bench/phase-trace.sh  # where one flushed event spends its time
 tools/perf-story.sh             # the whole two-OS characterization matrix in one run
 ```
 
+## Review recall — is an agent reviewer worth a pre-push gate?
+
+`tools/review-recall/` measures whether a model reviewing one commit reproduces
+the findings CodeRabbit raised on the same commit. The oracle is 13 transcribed
+findings on lalinsky/zio PRs 711-713 (`findings.json`); the corpus is the eight
+reviewed commits extracted with `git archive`, so an arm has no history to reach.
+
+```sh
+tools/review-recall/corpus.sh          # build the isolated corpus; aborts if it leaks an answer
+tools/review-recall/run-all-cursor.sh  # every cross-vendor arm over every commit
+tools/review-recall/judge-all.sh       # two vendor-disjoint judges per run, agreement required
+tools/review-recall/score.py           # recall per severity band, plus the unmatched load
+```
+
+Re-derive the recall numbers with these; do not cite a number from prose.
+
 ## Gates
 
 ```sh

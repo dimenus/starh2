@@ -1,0 +1,48 @@
+{
+  "commit": "16df720e",
+  "run": "fable-r1",
+  "meta": {
+    "cost_usd": 2.3319365000000003,
+    "num_turns": 19,
+    "duration_ms": 380570,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 5,
+  "matches": {
+    "F10": {
+      "candidate": null,
+      "why": "No candidate says line 75 returns exit 0 after detecting the misuse and must return nonzero; candidate 1 discusses a missing harness and criterion ambiguity, and candidate 0 mentions exit(0) only as skipping rt.deinit."
+    },
+    "F11": {
+      "candidate": null,
+      "why": "No candidate addresses the missing checkSingleDriverLocked() in the timeout branch of src/completion_queue.zig around lines 260-270."
+    },
+    "F12": {
+      "candidate": 4,
+      "why": "Candidate 4 flags the same cost mechanism at the same test loops, including the per-byte expectEqual passes and the allEqual bulk-compare remedy."
+    },
+    "F8": {
+      "candidate": null,
+      "why": "No candidate raises the Windows target guard for the POSIX-only cq-spurious-select-repro example in build.zig."
+    },
+    "F9": {
+      "candidate": null,
+      "why": "No candidate raises the feed_fd descriptor lifetime race between the flooder write and teardown close in cq_spurious_select_repro.zig."
+    }
+  },
+  "extras": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "extra_titles": [
+    "The example unwinds past live operations: the queue and its four Async completions die with the coroutine frame",
+    "The described death-test harness does not exist, and its stated pass criterion (non-zero exit) does not identify the panic",
+    "The panic is not guaranteed: asyncWait's ready fast path never inspects the registration slot",
+    "The poison watch reads non-volatile memory, so the optimizer may delete the whole check"
+  ],
+  "judge_cost_usd": 0.308623
+}

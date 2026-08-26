@@ -1,0 +1,30 @@
+{
+  "commit": "0c9271ce",
+  "run": "fable-r2",
+  "meta": {
+    "cost_usd": 1.1574010000000001,
+    "num_turns": 16,
+    "duration_ms": 192014,
+    "is_error": false,
+    "subtype": "success"
+  },
+  "status": "ok",
+  "n_candidates": 3,
+  "matches": {
+    "F13": {
+      "candidate": null,
+      "why": "Candidate 0 touches the same defer block but describes a different mechanism (fd leak on cancel due to defer registration order), not closing descriptors while feed_mu is held risking deadlock."
+    }
+  },
+  "extras": [
+    0,
+    1,
+    2
+  ],
+  "extra_titles": [
+    "The socketpair close defer is now registered after a fallible operation, so a cancel leaks two descriptors per generation",
+    "The stated harness contract accepts a bare SIGABRT, which the failure this death test exists to catch also produces",
+    "The reproduction-window claim in the header describes the old lock-free flooder and was not re-validated after the mutex was added"
+  ],
+  "judge_cost_usd": 0.261533
+}
