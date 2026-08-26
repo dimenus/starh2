@@ -1,0 +1,33 @@
+== zio-pin-gate candidate=3786083e5cb1ef1b60c076270f67ca34be4786b9 out=/tmp/zio-pin-gate.2mVG1e
+== phase 1: zio suite
+  659 of 659 tests passed
+== phase 2: conservation repros
+  select-cancel: clean
+  select-clobber: clean
+== phase 3: cq spurious-win repro (3 runs, 8 workers)
+  run1 rc=0
+  run2 rc=0
+  run3 rc=0
+  cq-repro: CLEAN (protocol race not observed - upstream-drop bar met)
+== phase 4: h2spec x2 (Darwin h2c, ReleaseSafe)
+  95 tests, 88 passed, 0 skipped, 7 failed
+  95 tests, 88 passed, 0 skipped, 7 failed
+  5.1/12 passed 2/2
+== phase 5: collapse probe (15 rounds on nachos)
+  round 1: OK events=2000065 failed=0
+  round 2: OK events=2000124 failed=0
+  round 3: OK events=2000063 failed=0
+  round 4: OK events=2000096 failed=0
+  round 5: OK events=2000091 failed=0
+  round 6: OK events=2000053 failed=0
+  round 7: OK events=2000117 failed=0
+  round 8: FAILCLOSED events=800013 failed=45
+  round 9: OK events=2000073 failed=0
+  round 10: OK events=2000081 failed=0
+  round 11: OK events=2000124 failed=0
+  round 12: OK events=2000064 failed=0
+  round 13: OK events=2000120 failed=0
+  round 14: OK events=2000024 failed=0
+  round 15: OK events=2000127 failed=0
+  PROBE-SUMMARY rounds=15 silent=0 visible_failclosed=1
+== VERDICT: PASS-CLEAN

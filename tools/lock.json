@@ -2,10 +2,10 @@
   "zig": "0.16.0",
   "zio": {
     "tag": "v0.17.0",
-    "repo": "https://github.com/dimenus/zio",
-    "commit": "8c9e4b68debae54bb85ecf1986016817883c587b",
-    "hash": "zio-0.17.0-xHbVVL60KABlSCPZLcju4NZ5v6srlGDIRHNilRSSDtcI",
-    "fork_patches": "four commits on 4f831ea: post-backend-poll snapshot refresh (upstream PR lalinsky/zio#711); CompletionQueue spurious-win tolerance, isDrained, docs+tests, and the standalone reproducer (upstream PR lalinsky/zio#712)."
+    "repo": "https://github.com/lalinsky/zio",
+    "commit": "3786083e5cb1ef1b60c076270f67ca34be4786b9",
+    "hash": "zio-0.17.0-xHbVVKy_KACrmjGRFj5FBs34dw6eCHjsfsj0-0bEMT24",
+    "fork_patches": "none. Upstream main carries every patch this repo needed: #709 (select conservation), #711 (post-backend-poll snapshot refresh), #713 (CompletionQueue producer claims)."
   },
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"
