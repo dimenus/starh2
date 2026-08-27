@@ -223,6 +223,7 @@ fn selectGenerations(rt: *zio.Runtime) !void {
 const SelectCancel = struct {
     cq: zio.CompletionQueue,
     io_timer: zio.ev.Timer,
+    park_catch: usize = 0,
 };
 
 fn selectCancelDriver(p: *SelectCancel) !void {
@@ -230,7 +231,10 @@ fn selectCancelDriver(p: *SelectCancel) !void {
         .io = &p.cq,
         .timer = zio.Timeout.fromMilliseconds(100),
     }) catch |err| switch (err) {
-        error.Canceled => return,
+        error.Canceled => {
+            p.park_catch += 1;
+            return;
+        },
     };
     switch (result) {
         .io => |r| _ = r catch {},
@@ -243,6 +247,7 @@ fn selectCancelPoster(p: *SelectCancel) !void {
 }
 
 fn selectTaskCancel(rt: *zio.Runtime) !void {
+    var caught: usize = 0;
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         var park: SelectCancel = .{
@@ -254,8 +259,10 @@ fn selectTaskCancel(rt: *zio.Runtime) !void {
         var p = try rt.spawn(selectCancelPoster, .{&park});
         d.cancel();
         p.join() catch {};
+        caught += park.park_catch;
         park.cq.cancelAll(.discard);
     }
+    std.debug.print("PARK_CATCH={d}\n", .{caught});
 }
 
 /// Select with a channel recv arm. A poster send races `JoinHandle.cancel`
