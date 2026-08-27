@@ -15,6 +15,9 @@ const Fixture = enum {
     close_inflight,
     overflow_1k,
     setclock_real,
+    io_pipe,
+    io_timeout_race,
+    io_close_inflight,
 };
 
 const RunOut = struct {
@@ -53,6 +56,9 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .close_inflight => try closeInflight(rt),
         .overflow_1k => try overflow1k(rt),
         .setclock_real => try setclockReal(rt),
+        .io_pipe => try ioPipe(rt),
+        .io_timeout_race => try ioTimeoutRace(rt),
+        .io_close_inflight => try ioCloseInflight(rt),
     }
 
     return .{
@@ -181,6 +187,103 @@ fn setclockReal(rt: *zio.Runtime) !void {
     }
 }
 
+const IoRace = struct {
+    cq: zio.CompletionQueue,
+    send: zio.ev.NetSend,
+    recv: zio.ev.NetRecv,
+    out: [8]u8,
+};
+
+fn ioPipe(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    const payload = "hello";
+    var out: [8]u8 = @splat(0);
+    var send_store: [1]zio.os.iovec_const = undefined;
+    var recv_store: [1]zio.os.iovec = undefined;
+    var send_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(payload, &send_store), .{});
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&recv_op.c);
+    try cq.submit(&send_op.c);
+    var got_recv: bool = false;
+    var got_send: bool = false;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const c = try cq.wait();
+        if (c == &recv_op.c) {
+            got_recv = true;
+            const n = try recv_op.getResult();
+            if (n != payload.len) return error.BadRecvLen;
+            if (!std.mem.eql(u8, out[0..n], payload)) return error.BadRecvData;
+        } else if (c == &send_op.c) {
+            got_send = true;
+            const n = try send_op.getResult();
+            if (n != payload.len) return error.BadSendLen;
+        } else return error.UnknownCompletion;
+    }
+    if (!got_recv or !got_send) return error.MissingCompletion;
+    var close_op = zio.ev.NetClose.init(fds[0]);
+    try cq.submit(&close_op.c);
+    _ = try cq.wait();
+}
+
+fn ioRecvDriver(r: *IoRace) !void {
+    try r.cq.submit(&r.recv.c);
+    const c = r.cq.timedWait(.{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
+        error.Timeout, error.Closed, error.Canceled => return,
+    };
+    _ = c;
+}
+
+fn ioSendPoster(r: *IoRace) !void {
+    try zio.sleep(.fromMilliseconds(10));
+    try r.cq.submit(&r.send.c);
+}
+
+fn ioTimeoutRace(rt: *zio.Runtime) !void {
+    const fds = zio.sim.pipePair();
+    const payload = "xy";
+    var send_store: [1]zio.os.iovec_const = undefined;
+    var recv_store: [1]zio.os.iovec = undefined;
+    var race: IoRace = .{
+        .cq = zio.CompletionQueue.init(),
+        .out = @splat(0),
+        .send = undefined,
+        .recv = undefined,
+    };
+    race.send = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(payload, &send_store), .{});
+    race.recv = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&race.out, &recv_store), .{});
+    var d = try rt.spawn(ioRecvDriver, .{&race});
+    var p = try rt.spawn(ioSendPoster, .{&race});
+    p.join() catch {};
+    d.join() catch {};
+    race.cq.cancelAll(.discard);
+}
+
+fn ioCloseInflight(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    var out: [8]u8 = @splat(0);
+    var recv_store: [1]zio.os.iovec = undefined;
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&recv_op.c);
+    var close_op = zio.ev.NetClose.init(fds[1]);
+    try cq.submit(&close_op.c);
+    var saw_recv = false;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const c = try cq.wait();
+        if (c == &recv_op.c) {
+            saw_recv = true;
+            const n = try recv_op.getResult();
+            if (n != 0) return error.ExpectedEof;
+        }
+    }
+    if (!saw_recv) return error.RecvNotCompleted;
+}
+
 fn overflowInc(counter: *usize) void {
     counter.* += 1;
 }
@@ -256,6 +359,7 @@ fn checkD4(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
     std.debug.print("== D4 NO WALL CLOCK (arm clock and futex)\n", .{});
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "clock" }, "sim: real clock_gettime");
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "futex" }, "sim: real kernel futex");
+    try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "io" }, "sim: real backend.poll");
     std.debug.print("D4 PASS\n", .{});
 }
 
@@ -279,6 +383,10 @@ fn checkD5(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
     const named = std.mem.trim(u8, rest[0..line_end], " \t");
     if (named.len == 0) {
         std.debug.print("D5 FAIL: unsimulated line is empty (silent real source)\n", .{});
+        std.process.exit(1);
+    }
+    if (std.mem.indexOf(u8, text, "net_pipe") == null) {
+        std.debug.print("D5 FAIL: simulated line does not name net_pipe\n{s}\n", .{text});
         std.process.exit(1);
     }
     std.debug.print("{s}", .{text});
@@ -375,6 +483,16 @@ fn armD4Inner(kind: []const u8) noreturn {
         zio.os.thread.Futex.wait(&word, 0);
         std.debug.print("D4 FAIL: kernel futex wait returned in sim mode\n", .{});
         std.process.exit(1);
+    } else if (std.mem.eql(u8, kind, "io")) {
+        const rt = zio.Runtime.init(std.heap.page_allocator, runtimeOpts()) catch {
+            std.debug.print("D4 FAIL: Runtime.init for backend.poll trip\n", .{});
+            std.process.exit(1);
+        };
+        const exec = zio.getCurrentExecutor();
+        _ = exec.loop.backend.poll(&exec.loop.state, .zero) catch {};
+        rt.deinit();
+        std.debug.print("D4 FAIL: backend.poll returned in sim mode\n", .{});
+        std.process.exit(1);
     } else {
         std.debug.print("unknown --arm-d4-inner {s}\n", .{kind});
         std.process.exit(2);
@@ -444,12 +562,12 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print(
-                \\zio-dst — M1 DST harness for zio CQ/select/timer
+                \\zio-dst — DST harness for zio CQ/select/timer/sim I/O
                 \\  --d1 --d2 --d4 --d5   mechanical checks
                 \\  --all-fixtures        run every shape-axis fixture once
                 \\  --run <fixture> --seed N
                 \\  --arm-mutant          validity (needs -Dsim-mutant=arm_timer_stale)
-                \\  --arm-d4-inner clock|futex
+                \\  --arm-d4-inner clock|futex|io
                 \\
             , .{});
             return;
