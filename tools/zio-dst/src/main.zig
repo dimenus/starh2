@@ -14,6 +14,7 @@ const Fixture = enum {
     remote_submit,
     close_inflight,
     overflow_1k,
+    setclock_real,
 };
 
 const RunOut = struct {
@@ -51,6 +52,7 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .remote_submit => try remoteSubmit(rt),
         .close_inflight => try closeInflight(rt),
         .overflow_1k => try overflow1k(rt),
+        .setclock_real => try setclockReal(rt),
     }
 
     return .{
@@ -139,6 +141,43 @@ fn closeInflight(rt: *zio.Runtime) !void {
     } else |err| switch (err) {
         error.Closed => {},
         else => return err,
+    }
+}
+
+/// `AutoCancel.setClock` (#717). A `.real` deadline on the awake heap
+/// never fires (unix epoch vs monotonic). Under sim, `.real` lives in a
+/// distinct epoch so this fixture deadlocks if `setClock` does not assign
+/// `timer.clock`.
+fn expectAutoCancel(rt: *zio.Runtime, timeout: *zio.AutoCancel) !void {
+    if (rt.sleep(.fromMilliseconds(500))) |_| {
+        return error.DidNotCancel;
+    } else |err| switch (err) {
+        error.Canceled => {
+            if (!timeout.check(err)) return error.NotAutoCancel;
+        },
+    }
+}
+
+fn setclockReal(rt: *zio.Runtime) !void {
+    {
+        var timeout: zio.AutoCancel = .init;
+        defer timeout.clear();
+        timeout.setClock(.fromMilliseconds(10), .real);
+        try expectAutoCancel(rt, &timeout);
+    }
+    {
+        var timeout: zio.AutoCancel = .init;
+        defer timeout.clear();
+        const deadline = zio.Timestamp.now(.real).addDuration(.fromMilliseconds(10));
+        timeout.setClock(.{ .deadline = deadline }, .real);
+        try expectAutoCancel(rt, &timeout);
+    }
+    {
+        var timeout: zio.AutoCancel = .init;
+        defer timeout.clear();
+        timeout.setClock(.fromSeconds(60), .real);
+        timeout.setClock(.fromMilliseconds(10), .awake);
+        try expectAutoCancel(rt, &timeout);
     }
 }
 
