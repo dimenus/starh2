@@ -13,6 +13,7 @@ const Fixture = enum {
     select_park,
     select_generations,
     select_task_cancel,
+    select_channel,
     zero_timer,
     remote_submit,
     close_inflight,
@@ -58,6 +59,7 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .select_park => try selectPark(rt),
         .select_generations => try selectGenerations(rt),
         .select_task_cancel => try selectTaskCancel(rt),
+        .select_channel => try selectChannel(rt),
         .zero_timer => try zeroTimer(rt),
         .remote_submit => try remoteSubmit(rt),
         .close_inflight => try closeInflight(rt),
@@ -243,7 +245,7 @@ fn selectTaskCancel(rt: *zio.Runtime) !void {
     while (i < 8) : (i += 1) {
         var park: SelectCancel = .{
             .cq = zio.CompletionQueue.init(),
-            .io_timer = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) }),
+            .io_timer = zio.ev.Timer.init(.{ .duration = .fromNanoseconds(0) }),
         };
         var d = try rt.spawn(selectCancelDriver, .{&park});
         try zio.yield();
@@ -251,6 +253,44 @@ fn selectTaskCancel(rt: *zio.Runtime) !void {
         d.cancel();
         p.join() catch {};
         park.cq.cancelAll(.discard);
+    }
+}
+
+/// Select with a channel recv arm. A poster send races `JoinHandle.cancel`
+/// so a claim can land on the channel while cancel deregisters.
+const SelectCh = struct {
+    buf: [1]u32 = undefined,
+    ch: zio.Channel(u32) = undefined,
+};
+
+fn selectChannelDriver(s: *SelectCh) !void {
+    var recv = s.ch.asyncReceive();
+    const result = zio.select(.{
+        .recv = &recv,
+        .timer = zio.Timeout.fromMilliseconds(50),
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .recv => |r| _ = r catch {},
+        .timer => {},
+    }
+}
+
+fn selectChannelPoster(s: *SelectCh) !void {
+    s.ch.send(1) catch {};
+}
+
+fn selectChannel(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var s: SelectCh = .{};
+        s.ch = zio.Channel(u32).init(&s.buf);
+        var d = try rt.spawn(selectChannelDriver, .{&s});
+        try zio.yield();
+        var p = try rt.spawn(selectChannelPoster, .{&s});
+        d.cancel();
+        p.join() catch {};
     }
 }
 
@@ -459,6 +499,12 @@ fn ioMidSleep(rt: *zio.Runtime) !void {
     while (i < 2) : (i += 1) {
         _ = try cq.wait();
     }
+    // After a mid-sleep I/O wake (`timed_out=false`), arm a duration
+    // timer. That is the #711 consumer: the snapshot after an I/O wake,
+    // not after a timer timeout (checkTimers already refreshed).
+    var later = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) });
+    try cq.submit(&later.c);
+    _ = try cq.wait();
     sleeper.cancel();
     if (zio.sim.clockNs() >= 50_000_000) return error.Overslept;
 }
@@ -797,7 +843,8 @@ pub fn main(init: std.process.Init) !void {
                 // overflow_1k may still emit task_switch events; a true zero
                 // on a timer fixture means the instrument did not fire.
                 if (fix == .zero_timer or fix == .same_tick_race or fix == .select_park or
-                    fix == .select_generations or fix == .select_task_cancel or fix == .io_mid_sleep)
+                    fix == .select_generations or fix == .select_task_cancel or
+                    fix == .select_channel or fix == .io_mid_sleep)
                 {
                     std.debug.print("FAIL fixture {s}: zero events\n", .{@tagName(fix)});
                     std.process.exit(1);
