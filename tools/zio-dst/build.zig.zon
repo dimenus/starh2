@@ -4,10 +4,10 @@
     .fingerprint = 0x6e270d0db05b332f,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // dimenus/zio sim/dst-m1 (mid-sleep I/O + select sweep yield).
+        // dimenus/zio sim/dst-m1 (deposit conservation + one post-wait refresh).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#d47c6f6052c39ef5acaaa7e116fe96e5a9b607d6",
-            .hash = "zio-0.17.0-xHbVVCRfKQCqYaip8oJK0v4GHfk7GHGtFUA2xx7_j9IW",
+            .url = "git+https://github.com/dimenus/zio#4c19c3b92e3387a371207ed44ef20e96545d30ce",
+            .hash = "zio-0.17.0-xHbVVGZkKQDK3EKmelqOImb3eEfA2ZWbWAIn1KNSpRBk",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },
