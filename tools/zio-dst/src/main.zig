@@ -11,6 +11,8 @@ const zio = @import("zio");
 const Fixture = enum {
     same_tick_race,
     select_park,
+    select_generations,
+    select_task_cancel,
     zero_timer,
     remote_submit,
     close_inflight,
@@ -19,6 +21,7 @@ const Fixture = enum {
     io_pipe,
     io_timeout_race,
     io_close_inflight,
+    io_mid_sleep,
 };
 
 const RunOut = struct {
@@ -53,6 +56,8 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
     switch (fixture) {
         .same_tick_race => try sameTickRace(rt),
         .select_park => try selectPark(rt),
+        .select_generations => try selectGenerations(rt),
+        .select_task_cancel => try selectTaskCancel(rt),
         .zero_timer => try zeroTimer(rt),
         .remote_submit => try remoteSubmit(rt),
         .close_inflight => try closeInflight(rt),
@@ -61,6 +66,7 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .io_pipe => try ioPipe(rt),
         .io_timeout_race => try ioTimeoutRace(rt),
         .io_close_inflight => try ioCloseInflight(rt),
+        .io_mid_sleep => try ioMidSleep(rt),
     }
 
     return .{
@@ -154,6 +160,96 @@ fn selectPark(rt: *zio.Runtime) !void {
         p.join() catch {};
         c.join() catch {};
         d.join() catch {};
+        park.cq.cancelAll(.discard);
+    }
+}
+
+/// Two select generations on one queue. After the first result, `next`,
+/// then select again while a poster keeps submitting. A one-select-per-queue
+/// lifetime cannot see a stale wake from generation 1 claim generation 2.
+const SelectGen = struct {
+    cq: zio.CompletionQueue,
+    timers: [8]zio.ev.Timer,
+};
+
+fn genDriver(g: *SelectGen) !void {
+    var gen: usize = 0;
+    while (gen < 2) : (gen += 1) {
+        const result = zio.select(.{
+            .io = &g.cq,
+            .timer = zio.Timeout.fromMilliseconds(50),
+        }) catch |err| switch (err) {
+            error.Canceled => return,
+        };
+        switch (result) {
+            .io => |r| _ = r catch {},
+            .timer => {},
+        }
+        _ = g.cq.next();
+    }
+}
+
+fn genPoster(g: *SelectGen) !void {
+    var i: usize = 0;
+    while (i < g.timers.len) : (i += 1) {
+        try g.cq.submit(&g.timers[i].c);
+        try zio.yield();
+    }
+}
+
+fn selectGenerations(rt: *zio.Runtime) !void {
+    var g: SelectGen = .{
+        .cq = zio.CompletionQueue.init(),
+        .timers = undefined,
+    };
+    var i: usize = 0;
+    while (i < g.timers.len) : (i += 1) {
+        g.timers[i] = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) });
+    }
+    var d = try rt.spawn(genDriver, .{&g});
+    try zio.yield();
+    var p = try rt.spawn(genPoster, .{&g});
+    p.join() catch {};
+    d.join() catch {};
+    g.cq.cancelAll(.discard);
+}
+
+/// Task cancel of the selecting task, not a ResetEvent arm win. A poster
+/// races a claim while `JoinHandle.cancel` runs.
+const SelectCancel = struct {
+    cq: zio.CompletionQueue,
+    io_timer: zio.ev.Timer,
+};
+
+fn selectCancelDriver(p: *SelectCancel) !void {
+    const result = zio.select(.{
+        .io = &p.cq,
+        .timer = zio.Timeout.fromMilliseconds(100),
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .io => |r| _ = r catch {},
+        .timer => {},
+    }
+}
+
+fn selectCancelPoster(p: *SelectCancel) !void {
+    try p.cq.submit(&p.io_timer.c);
+}
+
+fn selectTaskCancel(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var park: SelectCancel = .{
+            .cq = zio.CompletionQueue.init(),
+            .io_timer = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) }),
+        };
+        var d = try rt.spawn(selectCancelDriver, .{&park});
+        try zio.yield();
+        var p = try rt.spawn(selectCancelPoster, .{&park});
+        d.cancel();
+        p.join() catch {};
         park.cq.cancelAll(.discard);
     }
 }
@@ -338,6 +434,33 @@ fn ioCloseInflight(rt: *zio.Runtime) !void {
         }
     }
     if (!saw_recv) return error.RecvNotCompleted;
+}
+
+fn sleep50ms() !void {
+    try zio.sleep(.fromMilliseconds(50));
+}
+
+/// Recv+send on a pipe while a 50 ms timer is also armed. Delayed I/O must
+/// wake `waitForEvents` at the due-I/O time (`timed_out=false`). Advancing
+/// the full timer would oversleep.
+fn ioMidSleep(rt: *zio.Runtime) !void {
+    var sleeper = try rt.spawn(sleep50ms, .{});
+    const fds = zio.sim.pipePair();
+    const payload = "hi";
+    var out: [8]u8 = @splat(0);
+    var send_store: [1]zio.os.iovec_const = undefined;
+    var recv_store: [1]zio.os.iovec = undefined;
+    var send_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(payload, &send_store), .{});
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&recv_op.c);
+    try cq.submit(&send_op.c);
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        _ = try cq.wait();
+    }
+    sleeper.cancel();
+    if (zio.sim.clockNs() >= 50_000_000) return error.Overslept;
 }
 
 fn overflowInc(counter: *usize) void {
@@ -673,7 +796,9 @@ pub fn main(init: std.process.Init) !void {
             if (out.events == 0 and fix != .overflow_1k) {
                 // overflow_1k may still emit task_switch events; a true zero
                 // on a timer fixture means the instrument did not fire.
-                if (fix == .zero_timer or fix == .same_tick_race or fix == .select_park) {
+                if (fix == .zero_timer or fix == .same_tick_race or fix == .select_park or
+                    fix == .select_generations or fix == .select_task_cancel or fix == .io_mid_sleep)
+                {
                     std.debug.print("FAIL fixture {s}: zero events\n", .{@tagName(fix)});
                     std.process.exit(1);
                 }
