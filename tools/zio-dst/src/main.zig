@@ -1,4 +1,4 @@
-//! DST harness for zio CQ / select / timer (t-1166 M1).
+//! DST harness for zio CQ / select / timer (t-1166).
 //!
 //! Builds zio with `-Dsim=true`. Does not replace `tools/zio-pin-gate`.
 //!
@@ -10,6 +10,11 @@ const zio = @import("zio");
 
 const Fixture = enum {
     same_tick_race,
+    select_park,
+    select_generations,
+    select_task_cancel,
+    select_channel,
+    select_clobber,
     zero_timer,
     remote_submit,
     close_inflight,
@@ -18,6 +23,12 @@ const Fixture = enum {
     io_pipe,
     io_timeout_race,
     io_close_inflight,
+    io_mid_sleep,
+    io_backpressure,
+    io_id_identity,
+    io_cancel_identity,
+    io_send_after_close,
+    io_cancel_parked,
 };
 
 const RunOut = struct {
@@ -42,6 +53,15 @@ fn runtimeOpts() zio.RuntimeOptions {
 }
 
 fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: bool) !RunOut {
+    if (fixture == .io_id_identity or fixture == .io_cancel_identity) {
+        if (print_scope) {
+            zio.sim.begin(seed);
+            defer zio.sim.end();
+            zio.sim.printScope();
+        }
+        return if (fixture == .io_id_identity) ioIdIdentity(seed) else ioCancelIdentity(seed);
+    }
+
     zio.sim.begin(seed);
     defer zio.sim.end();
     if (print_scope) zio.sim.printScope();
@@ -49,8 +69,30 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
     const rt = try zio.Runtime.init(gpa, runtimeOpts());
     defer rt.deinit();
 
+    runNamed(rt, fixture) catch |err| {
+        std.debug.print(
+            "TRACE_HASH={x:0>16} SEED={d} fixture={s} error={s}\n",
+            .{ zio.sim.traceHash(), seed, @tagName(fixture), @errorName(err) },
+        );
+        return err;
+    };
+
+    return .{
+        .trace = zio.sim.traceHash(),
+        .state = zio.sim.stateDigest(),
+        .events = zio.sim.eventCount(),
+        .clock = zio.sim.clockNs(),
+    };
+}
+
+fn runNamed(rt: *zio.Runtime, fixture: Fixture) !void {
     switch (fixture) {
         .same_tick_race => try sameTickRace(rt),
+        .select_park => try selectPark(rt),
+        .select_generations => try selectGenerations(rt),
+        .select_task_cancel => try selectTaskCancel(rt),
+        .select_channel => try selectChannel(rt),
+        .select_clobber => try selectClobber(rt),
         .zero_timer => try zeroTimer(rt),
         .remote_submit => try remoteSubmit(rt),
         .close_inflight => try closeInflight(rt),
@@ -59,13 +101,41 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .io_pipe => try ioPipe(rt),
         .io_timeout_race => try ioTimeoutRace(rt),
         .io_close_inflight => try ioCloseInflight(rt),
+        .io_mid_sleep => try ioMidSleep(rt),
+        .io_backpressure => try ioBackpressure(rt),
+        .io_send_after_close => try ioSendAfterClose(rt),
+        .io_cancel_parked => try ioCancelParked(rt),
+        .io_id_identity, .io_cancel_identity => unreachable,
     }
+}
 
+fn ioIdIdentity(seed: u64) !RunOut {
+    return compareOrderProbes(seed, &zio.sim.runWakeOrderProbe, error.WakeOrderAlias);
+}
+
+fn ioCancelIdentity(seed: u64) !RunOut {
+    return compareOrderProbes(seed, &zio.sim.runCancelOrderProbe, error.CancelOrderAlias);
+}
+
+fn compareOrderProbes(
+    seed: u64,
+    probe: *const fn (u64, zio.sim.WakeFirst) zio.sim.ProbeOut,
+    alias: anyerror,
+) !RunOut {
+    const ab = probe(seed, .a);
+    const ba = probe(seed, .b);
+    if (ab.trace == ba.trace or ab.state == ba.state) {
+        std.debug.print(
+            "ORDER_ALIAS SEED={d} TRACE_AB={x:0>16} TRACE_BA={x:0>16} STATE_AB={x:0>16} STATE_BA={x:0>16}\n",
+            .{ seed, ab.trace, ba.trace, ab.state, ba.state },
+        );
+        return alias;
+    }
     return .{
-        .trace = zio.sim.traceHash(),
-        .state = zio.sim.stateDigest(),
-        .events = zio.sim.eventCount(),
-        .clock = zio.sim.clockNs(),
+        .trace = ab.trace,
+        .state = ab.state,
+        .events = ab.events,
+        .clock = ab.clock,
     };
 }
 
@@ -99,6 +169,231 @@ fn sameTickRace(rt: *zio.Runtime) !void {
         p.join() catch {};
         d.join() catch {};
         race.cq.cancelAll(.discard);
+    }
+}
+
+/// Parks `zio.select` with a CQ arm, a timer arm, and a cancellation arm.
+/// Without this, select/asyncWait never sits on the queue and select-class
+/// bugs cannot fire no matter the seed count.
+const SelectPark = struct {
+    cq: zio.CompletionQueue,
+    io_timer: zio.ev.Timer,
+    cancel: zio.ResetEvent,
+};
+
+fn selectDriver(p: *SelectPark) !void {
+    const result = zio.select(.{
+        .io = &p.cq,
+        .timer = zio.Timeout.fromMilliseconds(10),
+        .cancel = &p.cancel,
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .io => |r| _ = r catch {},
+        .timer => {},
+        .cancel => {},
+    }
+}
+
+fn selectPoster(p: *SelectPark) !void {
+    try p.cq.submit(&p.io_timer.c);
+}
+
+fn selectCanceler(p: *SelectPark) !void {
+    p.cancel.set();
+}
+
+fn selectPark(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var park: SelectPark = .{
+            .cq = zio.CompletionQueue.init(),
+            .io_timer = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) }),
+            .cancel = .init,
+        };
+        // Park the select first: CQ asyncWait, Timeout arm, ResetEvent arm.
+        // Poster and canceler spawn after that so the wait is on the queue
+        // rather than winning on the registration sweep.
+        var d = try rt.spawn(selectDriver, .{&park});
+        try zio.yield();
+        var p = try rt.spawn(selectPoster, .{&park});
+        var c = try rt.spawn(selectCanceler, .{&park});
+        p.join() catch {};
+        c.join() catch {};
+        d.join() catch {};
+        park.cq.cancelAll(.discard);
+    }
+}
+
+/// Two select generations on one queue. After the first result, `next`,
+/// then select again while a poster keeps submitting. A one-select-per-queue
+/// lifetime cannot see a stale wake from generation 1 claim generation 2.
+const SelectGen = struct {
+    cq: zio.CompletionQueue,
+    timers: [8]zio.ev.Timer,
+};
+
+fn genDriver(g: *SelectGen) !void {
+    var gen: usize = 0;
+    while (gen < 2) : (gen += 1) {
+        const result = zio.select(.{
+            .io = &g.cq,
+            .timer = zio.Timeout.fromMilliseconds(50),
+        }) catch |err| switch (err) {
+            error.Canceled => return,
+        };
+        switch (result) {
+            .io => |r| _ = r catch {},
+            .timer => {},
+        }
+        _ = g.cq.next();
+    }
+}
+
+fn genPoster(g: *SelectGen) !void {
+    var i: usize = 0;
+    while (i < g.timers.len) : (i += 1) {
+        try g.cq.submit(&g.timers[i].c);
+        try zio.yield();
+    }
+}
+
+fn selectGenerations(rt: *zio.Runtime) !void {
+    var g: SelectGen = .{
+        .cq = zio.CompletionQueue.init(),
+        .timers = undefined,
+    };
+    var i: usize = 0;
+    while (i < g.timers.len) : (i += 1) {
+        g.timers[i] = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) });
+    }
+    var d = try rt.spawn(genDriver, .{&g});
+    try zio.yield();
+    var p = try rt.spawn(genPoster, .{&g});
+    p.join() catch {};
+    d.join() catch {};
+    g.cq.cancelAll(.discard);
+}
+
+/// Task cancel of the selecting task, not a ResetEvent arm win. A poster
+/// races a claim while `JoinHandle.cancel` runs.
+const SelectCancel = struct {
+    cq: zio.CompletionQueue,
+    io_timer: zio.ev.Timer,
+};
+
+fn selectCancelDriver(p: *SelectCancel) !void {
+    const result = zio.select(.{
+        .io = &p.cq,
+        .timer = zio.Timeout.fromMilliseconds(100),
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .io => |r| _ = r catch {},
+        .timer => {},
+    }
+}
+
+fn selectCancelPoster(p: *SelectCancel) !void {
+    try p.cq.submit(&p.io_timer.c);
+}
+
+fn selectTaskCancel(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var park: SelectCancel = .{
+            .cq = zio.CompletionQueue.init(),
+            .io_timer = zio.ev.Timer.init(.{ .duration = .fromNanoseconds(0) }),
+        };
+        var d = try rt.spawn(selectCancelDriver, .{&park});
+        try zio.yield();
+        var p = try rt.spawn(selectCancelPoster, .{&park});
+        d.cancel();
+        p.join() catch {};
+        park.cq.cancelAll(.discard);
+    }
+}
+
+/// Select with a channel recv arm. A poster send races `JoinHandle.cancel`
+/// so a claim can land on the channel while cancel deregisters.
+const SelectCh = struct {
+    buf: [1]u32 = undefined,
+    ch: zio.Channel(u32) = undefined,
+};
+
+fn selectChannelDriver(s: *SelectCh) !void {
+    var recv = s.ch.asyncReceive();
+    const result = zio.select(.{
+        .recv = &recv,
+        .timer = zio.Timeout.fromMilliseconds(50),
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .recv => |r| _ = r catch {},
+        .timer => {},
+    }
+}
+
+fn selectChannelPoster(s: *SelectCh) !void {
+    s.ch.send(1) catch {};
+}
+
+fn selectChannel(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var s: SelectCh = .{};
+        s.ch = zio.Channel(u32).init(&s.buf);
+        var d = try rt.spawn(selectChannelDriver, .{&s});
+        try zio.yield();
+        var p = try rt.spawn(selectChannelPoster, .{&s});
+        d.cancel();
+        p.join() catch {};
+    }
+}
+
+/// One arm is already ready at sweep (pre-buffered channel). A sender
+/// races the earlier-registered empty arm. Sweep coop-yield after the
+/// empty arm queues, so the send can claim it before the ready arm wins.
+const Clobber = struct {
+    empty_buf: [1]u32 = undefined,
+    ready_buf: [1]u32 = undefined,
+    empty: zio.Channel(u32) = undefined,
+    ready: zio.Channel(u32) = undefined,
+};
+
+fn clobberDriver(c: *Clobber) !void {
+    var recv_empty = c.empty.asyncReceive();
+    var recv_ready = c.ready.asyncReceive();
+    const result = zio.select(.{
+        .empty = &recv_empty,
+        .ready = &recv_ready,
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .empty => |r| _ = r catch {},
+        .ready => |r| _ = r catch {},
+    }
+}
+
+fn clobberPoster(c: *Clobber) !void {
+    c.empty.send(2) catch {};
+}
+
+fn selectClobber(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var c: Clobber = .{};
+        c.empty = zio.Channel(u32).init(&c.empty_buf);
+        c.ready = zio.Channel(u32).init(&c.ready_buf);
+        c.ready.send(1) catch {};
+        var d = try rt.spawn(clobberDriver, .{&c});
+        var p = try rt.spawn(clobberPoster, .{&c});
+        p.join() catch {};
+        d.join() catch {};
     }
 }
 
@@ -155,6 +450,7 @@ fn closeInflight(rt: *zio.Runtime) !void {
 /// distinct epoch so this fixture deadlocks if `setClock` does not assign
 /// `timer.clock`.
 fn expectAutoCancel(rt: *zio.Runtime, timeout: *zio.AutoCancel) !void {
+    const before = zio.sim.clockNs();
     if (rt.sleep(.fromMilliseconds(500))) |_| {
         return error.DidNotCancel;
     } else |err| switch (err) {
@@ -162,6 +458,8 @@ fn expectAutoCancel(rt: *zio.Runtime, timeout: *zio.AutoCancel) !void {
             if (!timeout.check(err)) return error.NotAutoCancel;
         },
     }
+    const elapsed = zio.sim.clockNs() - before;
+    if (elapsed != 10_000_000) return error.WrongClockAdvance;
 }
 
 fn setclockReal(rt: *zio.Runtime) !void {
@@ -228,6 +526,89 @@ fn ioPipe(rt: *zio.Runtime) !void {
     _ = try cq.wait();
 }
 
+fn ioBackpressure(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    const cap = zio.sim.pipe_buf_cap;
+    var fill: [cap]u8 = @splat('A');
+    var extra: [16]u8 = @splat('B');
+    var out: [cap]u8 = undefined;
+    var fill_store: [1]zio.os.iovec_const = undefined;
+    var extra_store: [1]zio.os.iovec_const = undefined;
+    var recv_store: [1]zio.os.iovec = undefined;
+    var fill_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(&fill, &fill_store), .{});
+    var extra_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(&extra, &extra_store), .{});
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&fill_op.c);
+    const fill_c = try cq.wait();
+    if (fill_c != &fill_op.c) return error.ExpectedFill;
+    const fill_n = try fill_op.getResult();
+    if (fill_n != cap) return error.BadFillLen;
+    try cq.submit(&extra_op.c);
+    try cq.submit(&recv_op.c);
+    var got_extra = false;
+    var got_recv = false;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const c = try cq.wait();
+        if (c == &extra_op.c) {
+            got_extra = true;
+            const n = extra_op.getResult() catch return error.ParkedSendFailed;
+            if (n != extra.len) return error.BadExtraLen;
+        } else if (c == &recv_op.c) {
+            got_recv = true;
+            const n = try recv_op.getResult();
+            if (n != cap) return error.BadRecvLen;
+            if (!std.mem.eql(u8, out[0..n], fill[0..n])) return error.BadRecvData;
+        } else return error.UnknownCompletion;
+    }
+    if (!got_extra or !got_recv) return error.MissingCompletion;
+}
+
+fn ioSendAfterClose(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    var cq = zio.CompletionQueue.init();
+    var close_op = zio.ev.NetClose.init(fds[0]);
+    try cq.submit(&close_op.c);
+    _ = try cq.wait();
+    const payload = "x";
+    var send_store: [1]zio.os.iovec_const = undefined;
+    var send_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(payload, &send_store), .{});
+    try cq.submit(&send_op.c);
+    const c = cq.timedWait(.{ .duration = .fromMilliseconds(100) }) catch |err| switch (err) {
+        error.Timeout => return error.SendAfterCloseDeadlock,
+        else => return err,
+    };
+    if (c != &send_op.c) return error.UnknownCompletion;
+    if (send_op.getResult()) |_| {
+        return error.ExpectedBrokenPipe;
+    } else |err| switch (err) {
+        error.BrokenPipe => {},
+        else => return err,
+    }
+}
+
+fn ioCancelParked(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    var out: [8]u8 = @splat(0);
+    var recv_store: [1]zio.os.iovec = undefined;
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&recv_op.c);
+    cq.cancelAll(.keep);
+    const c = try cq.wait();
+    if (c != &recv_op.c) return error.UnknownCompletion;
+    if (recv_op.getResult()) |_| {
+        return error.ExpectedCanceled;
+    } else |err| switch (err) {
+        error.Canceled => {},
+        else => return err,
+    }
+}
+
 fn ioRecvDriver(r: *IoRace) !void {
     try r.cq.submit(&r.recv.c);
     const c = r.cq.timedWait(.{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
@@ -282,6 +663,39 @@ fn ioCloseInflight(rt: *zio.Runtime) !void {
         }
     }
     if (!saw_recv) return error.RecvNotCompleted;
+}
+
+fn sleep50ms() !void {
+    try zio.sleep(.fromMilliseconds(50));
+}
+
+/// Recv+send on a pipe while a 50 ms timer is also armed. Delayed I/O must
+/// wake `waitForEvents` at the due-I/O time (`timed_out=false`). Advancing
+/// the full timer would oversleep.
+fn ioMidSleep(rt: *zio.Runtime) !void {
+    var sleeper = try rt.spawn(sleep50ms, .{});
+    const fds = zio.sim.pipePair();
+    const payload = "hi";
+    var out: [8]u8 = @splat(0);
+    var send_store: [1]zio.os.iovec_const = undefined;
+    var recv_store: [1]zio.os.iovec = undefined;
+    var send_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(payload, &send_store), .{});
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&recv_op.c);
+    try cq.submit(&send_op.c);
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        _ = try cq.wait();
+    }
+    // After a mid-sleep I/O wake (`timed_out=false`), arm a duration
+    // timer. That is the #711 consumer: the snapshot after an I/O wake,
+    // not after a timer timeout (checkTimers already refreshed).
+    var later = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) });
+    try cq.submit(&later.c);
+    _ = try cq.wait();
+    sleeper.cancel();
+    if (zio.sim.clockNs() >= 50_000_000) return error.Overslept;
 }
 
 fn overflowInc(counter: *usize) void {
@@ -356,7 +770,7 @@ fn checkD2(gpa: std.mem.Allocator) !void {
 }
 
 fn checkD4(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
-    std.debug.print("== D4 NO WALL CLOCK (arm clock and futex)\n", .{});
+    std.debug.print("== D4 NO WALL CLOCK (arm clock, futex, backend.poll)\n", .{});
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "clock" }, "sim: real clock_gettime");
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "futex" }, "sim: real kernel futex");
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "io" }, "sim: real backend.poll");
@@ -432,6 +846,35 @@ fn expectChildPanic(
     std.debug.print("  armed `{s}`: fired\n", .{needle});
 }
 
+fn parseTraceHash(text: []const u8) ?u64 {
+    const key = "TRACE_HASH=";
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    const rest = text[i + key.len ..];
+    var n: usize = 0;
+    while (n < rest.len and n < 16) : (n += 1) {
+        const c = rest[n];
+        const hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!hex) break;
+    }
+    if (n == 0) return null;
+    return std.fmt.parseInt(u64, rest[0..n], 16) catch null;
+}
+
+fn parsePanicMessage(text: []const u8) ?[]const u8 {
+    const key = "panic: ";
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    const rest = text[i + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const msg = std.mem.trim(u8, rest[0..end], " \r");
+    if (msg.len == 0) return null;
+    return msg;
+}
+
+fn combinedChildText(stderr: []const u8, stdout: []const u8) []const u8 {
+    if (stderr.len > 0) return stderr;
+    return stdout;
+}
+
 fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
     const stale = zio.sim.mutantArmTimerStale();
     const omit = zio.sim.mutantOmitTimeoutRecheck();
@@ -453,26 +896,63 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
         });
         defer gpa.free(res.stdout);
         defer gpa.free(res.stderr);
-        const hit = std.mem.indexOf(u8, res.stderr, needle) != null or
-            std.mem.indexOf(u8, res.stdout, needle) != null;
-        if (!hit) continue;
+        const text1 = combinedChildText(res.stderr, res.stdout);
+        if (std.mem.indexOf(u8, text1, needle) == null) continue;
 
-        std.debug.print("MUTANT_FIRED SEED={d}\n", .{seed});
+        const h1 = parseTraceHash(text1) orelse parseTraceHash(res.stdout);
+        if (h1 == null) {
+            std.debug.print("D3 FAIL: SEED={d} panic had no TRACE_HASH\nstderr={s}\nstdout={s}\n", .{
+                seed,
+                res.stderr,
+                res.stdout,
+            });
+            std.process.exit(1);
+        }
+        const msg1_slice = parsePanicMessage(text1) orelse parsePanicMessage(res.stdout);
+        if (msg1_slice == null) {
+            std.debug.print("D3 FAIL: SEED={d} panic had no panic: line\nstderr={s}\nstdout={s}\n", .{
+                seed,
+                res.stderr,
+                res.stdout,
+            });
+            std.process.exit(1);
+        }
+        const msg1 = try gpa.dupe(u8, msg1_slice.?);
+        defer gpa.free(msg1);
+
+        std.debug.print("MUTANT_FIRED SEED={d} TRACE_HASH={x:0>16} PANIC={s}\n", .{ seed, h1.?, msg1 });
         const res2 = try std.process.run(gpa, io, .{
             .argv = &.{ exe, "--run", "same_tick_race", "--seed", seed_s },
         });
         defer gpa.free(res2.stdout);
         defer gpa.free(res2.stderr);
-        const hit2 = std.mem.indexOf(u8, res2.stderr, needle) != null or
-            std.mem.indexOf(u8, res2.stdout, needle) != null;
-        if (!hit2) {
+        const text2 = combinedChildText(res2.stderr, res2.stdout);
+        const h2 = parseTraceHash(text2) orelse parseTraceHash(res2.stdout);
+        const msg2 = parsePanicMessage(text2) orelse parsePanicMessage(res2.stdout);
+        if (msg2 == null) {
             std.debug.print("D3 FAIL: replay of SEED={d} did not reproduce the panic\nstderr={s}\n", .{
                 seed,
                 res2.stderr,
             });
             std.process.exit(1);
         }
-        std.debug.print("D3 PASS (replay SEED={d} same panic)\n", .{seed});
+        if (!std.mem.eql(u8, msg1, msg2.?)) {
+            std.debug.print("D3 FAIL: replay panic message mismatch SEED={d} first={s} second={s}\n", .{
+                seed,
+                msg1,
+                msg2.?,
+            });
+            std.process.exit(1);
+        }
+        if (h2 == null or h2.? != h1.?) {
+            std.debug.print("D3 FAIL: replay TRACE_HASH mismatch SEED={d} first={x} second={x}\n", .{
+                seed,
+                h1.?,
+                h2 orelse 0,
+            });
+            std.process.exit(1);
+        }
+        std.debug.print("D3 PASS (replay SEED={d} same panic message and TRACE_HASH)\n", .{seed});
         return;
     }
     std.debug.print("MUTANT_NOT_FOUND after 1000 seeds (a clean sweep at this count is a fail)\n", .{});
@@ -566,7 +1046,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, a, "--arm-d4-inner")) {
             arm_d4_inner = args.next() orelse {
-                std.debug.print("--arm-d4-inner needs clock|futex\n", .{});
+                std.debug.print("--arm-d4-inner needs clock|futex|io\n", .{});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -617,7 +1097,10 @@ pub fn main(init: std.process.Init) !void {
             if (out.events == 0 and fix != .overflow_1k) {
                 // overflow_1k may still emit task_switch events; a true zero
                 // on a timer fixture means the instrument did not fire.
-                if (fix == .zero_timer or fix == .same_tick_race) {
+                if (fix == .zero_timer or fix == .same_tick_race or fix == .select_park or
+                    fix == .select_generations or fix == .select_task_cancel or
+                    fix == .select_channel or fix == .select_clobber or fix == .io_mid_sleep)
+                {
                     std.debug.print("FAIL fixture {s}: zero events\n", .{@tagName(fix)});
                     std.process.exit(1);
                 }
@@ -628,5 +1111,5 @@ pub fn main(init: std.process.Init) !void {
     if (do_d2) try checkD2(gpa);
     if (do_d4) try checkD4(gpa, io, exe);
 
-    std.debug.print("M1 checks finished\n", .{});
+    std.debug.print("DST checks finished\n", .{});
 }
