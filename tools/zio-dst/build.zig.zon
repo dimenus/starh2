@@ -4,10 +4,10 @@
     .fingerprint = 0x6e270d0db05b332f,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // dimenus/zio sim/dst-m1 (cancel-settle yield).
+        // dimenus/zio sim/dst-m1 (task-side coop yield harvests poll(.zero)).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#b83f8d1dc1f9006037540f5887ad726d07372598",
-            .hash = "zio-0.17.0-xHbVVPxsKQDRNN5PwW2T6FKHUZoye8_fYF-TxWIMij34",
+            .url = "git+https://github.com/dimenus/zio#3c265dea2ff1c4e685fa3528b3ce0fac1cca4575",
+            .hash = "zio-0.17.0-xHbVVHRvKQD00VdTVrH3CopK0EZNIP8GzmwFnn6xan4m",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },
