@@ -1,0 +1,14 @@
+.{
+    .name = .zio_dst,
+    .version = "0.0.0",
+    .fingerprint = 0x6e270d0db05b332f,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Clean worktree of dimenus/zio feat/cq-producer-claims (f639f7b).
+        // Not the dirty /oss/zio checkout.
+        .zio = .{
+            .path = "../../../../oss/zio-wt-dst",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },
+}
