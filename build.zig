@@ -294,6 +294,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_protocol_tests = b.addRunArtifact(protocol_tests);
 
+    const http1_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/http1.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_http1_tests = b.addRunArtifact(http1_tests);
+    const http1_step = b.step("test-http1", "Run HTTP/1.1 oneshot gates");
+    http1_step.dependOn(&run_http1_tests.step);
+
     const limits_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/limits.zig"),
@@ -464,6 +479,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_protocol_tests.step);
+    test_step.dependOn(&run_http1_tests.step);
     test_step.dependOn(&run_limits_tests.step);
     test_step.dependOn(&run_transport_tests.step);
     test_step.dependOn(&run_multiplex_tests.step);
