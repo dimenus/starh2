@@ -56,6 +56,23 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
     const rt = try zio.Runtime.init(gpa, runtimeOpts());
     defer rt.deinit();
 
+    runNamed(rt, fixture) catch |err| {
+        std.debug.print(
+            "TRACE_HASH={x:0>16} SEED={d} fixture={s} error={s}\n",
+            .{ zio.sim.traceHash(), seed, @tagName(fixture), @errorName(err) },
+        );
+        return err;
+    };
+
+    return .{
+        .trace = zio.sim.traceHash(),
+        .state = zio.sim.stateDigest(),
+        .events = zio.sim.eventCount(),
+        .clock = zio.sim.clockNs(),
+    };
+}
+
+fn runNamed(rt: *zio.Runtime, fixture: Fixture) !void {
     switch (fixture) {
         .same_tick_race => try sameTickRace(rt),
         .select_park => try selectPark(rt),
@@ -74,13 +91,6 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .io_mid_sleep => try ioMidSleep(rt),
         .io_backpressure => try ioBackpressure(rt),
     }
-
-    return .{
-        .trace = zio.sim.traceHash(),
-        .state = zio.sim.stateDigest(),
-        .events = zio.sim.eventCount(),
-        .clock = zio.sim.clockNs(),
-    };
 }
 
 const Race = struct {
@@ -403,9 +413,7 @@ fn expectAutoCancel(rt: *zio.Runtime, timeout: *zio.AutoCancel) !void {
         },
     }
     const elapsed = zio.sim.clockNs() - before;
-    if (elapsed < 10_000_000) return error.ClockDidNotAdvance;
-    // 10 ms AutoCancel. A 500 ms sleep that wins the wrong timer must fail.
-    if (elapsed >= 30_000_000) return error.OversleptWallTimer;
+    if (elapsed != 10_000_000) return error.WrongClockAdvance;
 }
 
 fn setclockReal(rt: *zio.Runtime) !void {
