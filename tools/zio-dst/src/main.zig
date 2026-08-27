@@ -25,6 +25,7 @@ const Fixture = enum {
     io_close_inflight,
     io_mid_sleep,
     io_backpressure,
+    io_id_identity,
 };
 
 const RunOut = struct {
@@ -49,6 +50,15 @@ fn runtimeOpts() zio.RuntimeOptions {
 }
 
 fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: bool) !RunOut {
+    if (fixture == .io_id_identity) {
+        if (print_scope) {
+            zio.sim.begin(seed);
+            defer zio.sim.end();
+            zio.sim.printScope();
+        }
+        return ioIdIdentity(seed);
+    }
+
     zio.sim.begin(seed);
     defer zio.sim.end();
     if (print_scope) zio.sim.printScope();
@@ -90,7 +100,26 @@ fn runNamed(rt: *zio.Runtime, fixture: Fixture) !void {
         .io_close_inflight => try ioCloseInflight(rt),
         .io_mid_sleep => try ioMidSleep(rt),
         .io_backpressure => try ioBackpressure(rt),
+        .io_id_identity => unreachable,
     }
+}
+
+fn ioIdIdentity(seed: u64) !RunOut {
+    const ab = zio.sim.runWakeOrderProbe(seed, .a);
+    const ba = zio.sim.runWakeOrderProbe(seed, .b);
+    if (ab.trace == ba.trace or ab.state == ba.state) {
+        std.debug.print(
+            "WAKE_ORDER_ALIAS SEED={d} TRACE_AB={x:0>16} TRACE_BA={x:0>16} STATE_AB={x:0>16} STATE_BA={x:0>16}\n",
+            .{ seed, ab.trace, ba.trace, ab.state, ba.state },
+        );
+        return error.WakeOrderAlias;
+    }
+    return .{
+        .trace = ab.trace,
+        .state = ab.state,
+        .events = ab.events,
+        .clock = ab.clock,
+    };
 }
 
 const Race = struct {
