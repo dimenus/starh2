@@ -1,0 +1,14 @@
+.{
+    .name = .cq_misuse_repro,
+    .version = "0.0.0",
+    .fingerprint = 0xfab21530cf1b04c8,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Path dep into the machine-local zio clone (gitignored), so the
+        // death test targets exactly the checkout under test.
+        .zio = .{
+            .path = "../../../../oss/zio",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
