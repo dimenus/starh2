@@ -4,10 +4,10 @@
     .fingerprint = 0x6e270d0db05b332f,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // dimenus/zio sim/dst-m1 (merge-review fixes).
+        // dimenus/zio sim/dst-m1 (round-2 merge-review fixes).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#61c12cc6b1a9268730d7ef07452f60698bb42328",
-            .hash = "zio-0.17.0-xHbVVN6CKQCnlL0T2xvkuL38hsazaVz70fY6vVnE4jlM",
+            .url = "git+https://github.com/dimenus/zio#60175e2318436be00171053d985f5eb7be77b6a6",
+            .hash = "zio-0.17.0-xHbVVLqtKQASGBNCcvFAeGnmWi4r0AWw4WtGGZXfHvIN",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },

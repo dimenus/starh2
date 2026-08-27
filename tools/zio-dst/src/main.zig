@@ -24,6 +24,7 @@ const Fixture = enum {
     io_timeout_race,
     io_close_inflight,
     io_mid_sleep,
+    io_backpressure,
 };
 
 const RunOut = struct {
@@ -71,6 +72,7 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .io_timeout_race => try ioTimeoutRace(rt),
         .io_close_inflight => try ioCloseInflight(rt),
         .io_mid_sleep => try ioMidSleep(rt),
+        .io_backpressure => try ioBackpressure(rt),
     }
 
     return .{
@@ -402,7 +404,8 @@ fn expectAutoCancel(rt: *zio.Runtime, timeout: *zio.AutoCancel) !void {
     }
     const elapsed = zio.sim.clockNs() - before;
     if (elapsed < 10_000_000) return error.ClockDidNotAdvance;
-    if (elapsed >= 1_000_000_000) return error.OversleptWallTimer;
+    // 10 ms AutoCancel. A 500 ms sleep that wins the wrong timer must fail.
+    if (elapsed >= 30_000_000) return error.OversleptWallTimer;
 }
 
 fn setclockReal(rt: *zio.Runtime) !void {
@@ -467,6 +470,46 @@ fn ioPipe(rt: *zio.Runtime) !void {
     var close_op = zio.ev.NetClose.init(fds[0]);
     try cq.submit(&close_op.c);
     _ = try cq.wait();
+}
+
+fn ioBackpressure(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    const cap = zio.sim.pipe_buf_cap;
+    var fill: [cap]u8 = @splat('A');
+    var extra: [16]u8 = @splat('B');
+    var out: [cap]u8 = undefined;
+    var fill_store: [1]zio.os.iovec_const = undefined;
+    var extra_store: [1]zio.os.iovec_const = undefined;
+    var recv_store: [1]zio.os.iovec = undefined;
+    var fill_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(&fill, &fill_store), .{});
+    var extra_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(&extra, &extra_store), .{});
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&fill_op.c);
+    const fill_c = try cq.wait();
+    if (fill_c != &fill_op.c) return error.ExpectedFill;
+    const fill_n = try fill_op.getResult();
+    if (fill_n != cap) return error.BadFillLen;
+    try cq.submit(&extra_op.c);
+    try cq.submit(&recv_op.c);
+    var got_extra = false;
+    var got_recv = false;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const c = try cq.wait();
+        if (c == &extra_op.c) {
+            got_extra = true;
+            const n = extra_op.getResult() catch return error.ParkedSendFailed;
+            if (n != extra.len) return error.BadExtraLen;
+        } else if (c == &recv_op.c) {
+            got_recv = true;
+            const n = try recv_op.getResult();
+            if (n != cap) return error.BadRecvLen;
+            if (!std.mem.eql(u8, out[0..n], fill[0..n])) return error.BadRecvData;
+        } else return error.UnknownCompletion;
+    }
+    if (!got_extra or !got_recv) return error.MissingCompletion;
 }
 
 fn ioRecvDriver(r: *IoRace) !void {
@@ -630,7 +673,7 @@ fn checkD2(gpa: std.mem.Allocator) !void {
 }
 
 fn checkD4(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
-    std.debug.print("== D4 NO WALL CLOCK (arm clock and futex)\n", .{});
+    std.debug.print("== D4 NO WALL CLOCK (arm clock, futex, backend.poll)\n", .{});
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "clock" }, "sim: real clock_gettime");
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "futex" }, "sim: real kernel futex");
     try expectChildPanic(gpa, io, exe, &.{ "--arm-d4-inner", "io" }, "sim: real backend.poll");
@@ -720,6 +763,21 @@ fn parseTraceHash(text: []const u8) ?u64 {
     return std.fmt.parseInt(u64, rest[0..n], 16) catch null;
 }
 
+fn parsePanicMessage(text: []const u8) ?[]const u8 {
+    const key = "panic: ";
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    const rest = text[i + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const msg = std.mem.trim(u8, rest[0..end], " \r");
+    if (msg.len == 0) return null;
+    return msg;
+}
+
+fn combinedChildText(stderr: []const u8, stdout: []const u8) []const u8 {
+    if (stderr.len > 0) return stderr;
+    return stdout;
+}
+
 fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
     const stale = zio.sim.mutantArmTimerStale();
     const omit = zio.sim.mutantOmitTimeoutRecheck();
@@ -741,11 +799,10 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
         });
         defer gpa.free(res.stdout);
         defer gpa.free(res.stderr);
-        const hit = std.mem.indexOf(u8, res.stderr, needle) != null or
-            std.mem.indexOf(u8, res.stdout, needle) != null;
-        if (!hit) continue;
+        const text1 = combinedChildText(res.stderr, res.stdout);
+        if (std.mem.indexOf(u8, text1, needle) == null) continue;
 
-        const h1 = parseTraceHash(res.stderr) orelse parseTraceHash(res.stdout);
+        const h1 = parseTraceHash(text1) orelse parseTraceHash(res.stdout);
         if (h1 == null) {
             std.debug.print("D3 FAIL: SEED={d} panic had no TRACE_HASH\nstderr={s}\nstdout={s}\n", .{
                 seed,
@@ -754,20 +811,39 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
             });
             std.process.exit(1);
         }
+        const msg1_slice = parsePanicMessage(text1) orelse parsePanicMessage(res.stdout);
+        if (msg1_slice == null) {
+            std.debug.print("D3 FAIL: SEED={d} panic had no panic: line\nstderr={s}\nstdout={s}\n", .{
+                seed,
+                res.stderr,
+                res.stdout,
+            });
+            std.process.exit(1);
+        }
+        const msg1 = try gpa.dupe(u8, msg1_slice.?);
+        defer gpa.free(msg1);
 
-        std.debug.print("MUTANT_FIRED SEED={d} TRACE_HASH={x:0>16}\n", .{ seed, h1.? });
+        std.debug.print("MUTANT_FIRED SEED={d} TRACE_HASH={x:0>16} PANIC={s}\n", .{ seed, h1.?, msg1 });
         const res2 = try std.process.run(gpa, io, .{
             .argv = &.{ exe, "--run", "same_tick_race", "--seed", seed_s },
         });
         defer gpa.free(res2.stdout);
         defer gpa.free(res2.stderr);
-        const hit2 = std.mem.indexOf(u8, res2.stderr, needle) != null or
-            std.mem.indexOf(u8, res2.stdout, needle) != null;
-        const h2 = parseTraceHash(res2.stderr) orelse parseTraceHash(res2.stdout);
-        if (!hit2) {
+        const text2 = combinedChildText(res2.stderr, res2.stdout);
+        const h2 = parseTraceHash(text2) orelse parseTraceHash(res2.stdout);
+        const msg2 = parsePanicMessage(text2) orelse parsePanicMessage(res2.stdout);
+        if (msg2 == null) {
             std.debug.print("D3 FAIL: replay of SEED={d} did not reproduce the panic\nstderr={s}\n", .{
                 seed,
                 res2.stderr,
+            });
+            std.process.exit(1);
+        }
+        if (!std.mem.eql(u8, msg1, msg2.?)) {
+            std.debug.print("D3 FAIL: replay panic message mismatch SEED={d} first={s} second={s}\n", .{
+                seed,
+                msg1,
+                msg2.?,
             });
             std.process.exit(1);
         }
@@ -779,7 +855,7 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
             });
             std.process.exit(1);
         }
-        std.debug.print("D3 PASS (replay SEED={d} same panic and TRACE_HASH)\n", .{seed});
+        std.debug.print("D3 PASS (replay SEED={d} same panic message and TRACE_HASH)\n", .{seed});
         return;
     }
     std.debug.print("MUTANT_NOT_FOUND after 1000 seeds (a clean sweep at this count is a fail)\n", .{});
