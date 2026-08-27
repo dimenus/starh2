@@ -20,6 +20,10 @@ fn handleEcho(_: *anyopaque, req: *const starh2.Request, reply: *starh2.http1.Re
     try reply.send(200, &.{}, req.body);
 }
 
+fn handleInject(_: *anyopaque, _: *const starh2.Request, reply: *starh2.http1.Reply) anyerror!void {
+    try reply.send(200, &.{.{ .name = "x-evil", .value = "a\r\nX-Injected: 1" }}, "ok");
+}
+
 const ReadRace = union(enum) {
     byte: std.Io.Reader.Error!u8,
     timeout: std.Io.Cancelable!void,
@@ -244,6 +248,86 @@ fn runPostMissingLengthRejected(io: std.Io, gpa: std.mem.Allocator) !void {
     serving = false;
 }
 
+fn runInjectedHeaderIs500(io: std.Io, gpa: std.mem.Allocator) !void {
+    var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleInject });
+    defer server.deinit(gpa);
+    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(io) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+
+    const stream = try server.localAddress().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var read_buf: [1024]u8 = undefined;
+    var write_buf: [256]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
+    try starh2.http1.writeRequest(&writer.interface, "GET", "/", "127.0.0.1", &.{}, "");
+    try writer.interface.flush();
+
+    var resp = try starh2.http1.readResponse(&reader.interface, gpa, .{});
+    defer resp.deinit();
+    try std.testing.expectEqual(@as(u16, 500), resp.status);
+    try std.testing.expectEqualStrings("", resp.body);
+
+    server.requestShutdown();
+    try serve_future.await(io);
+    serving = false;
+}
+
+fn runAcceptFatalUnblocksServe(io: std.Io, gpa: std.mem.Allocator) !void {
+    var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleTask });
+    defer server.deinit(gpa);
+    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(io) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    server.next_accept_fault.store(2, .release);
+    {
+        const stream = try server.localAddress().connect(io, .{ .mode = .stream });
+        stream.close(io);
+    }
+
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    try std.testing.expectError(error.AcceptFailed, serve_future.await(io));
+    serving = false;
+    const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed < 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(starh2.http1.BindState.failed, server.bind_state.load(.acquire));
+}
+
+fn runAcceptResourceBackoffStillServes(io: std.Io, gpa: std.mem.Allocator) !void {
+    var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleTask });
+    defer server.deinit(gpa);
+    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(io) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    server.next_accept_fault.store(1, .release);
+
+    var first = try starh2.http1.get(io, gpa, server.localAddress(), "127.0.0.1", "/v1/tasks/t-7");
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+
+    var second = try starh2.http1.get(io, gpa, server.localAddress(), "127.0.0.1", "/v1/tasks/t-7");
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+    try std.testing.expectEqualStrings("task-7", second.body);
+
+    server.requestShutdown();
+    try serve_future.await(io);
+    serving = false;
+}
+
 fn runZio(rt: *zio.Runtime, gpa: std.mem.Allocator, f: *const fn (std.Io, std.mem.Allocator) anyerror!void) !void {
     try f(rt.io(), gpa);
 }
@@ -287,5 +371,26 @@ test "POST without Content-Length is 411" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator, runPostMissingLengthRejected });
+    try handle.join();
+}
+
+test "handler header with CR/LF is 500 not injected on the wire" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator, runInjectedHeaderIs500 });
+    try handle.join();
+}
+
+test "fatal accept error unblocks serve instead of leaving a listening zombie" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator, runAcceptFatalUnblocksServe });
+    try handle.join();
+}
+
+test "accept resource pressure backs off and keeps serving" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator, runAcceptResourceBackoffStillServes });
     try handle.join();
 }

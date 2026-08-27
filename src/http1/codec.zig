@@ -163,6 +163,8 @@ pub fn parseResponseHead(head: []const u8, storage: []Header, limits: Limits) Er
     };
 }
 
+pub const WriteError = Error || std.Io.Writer.Error;
+
 pub fn writeRequest(
     w: *std.Io.Writer,
     method: []const u8,
@@ -170,7 +172,9 @@ pub fn writeRequest(
     host: []const u8,
     headers: []const Header,
     body: []const u8,
-) std.Io.Writer.Error!void {
+) WriteError!void {
+    try validateRequestLine(method, target, host);
+    try validateHeaders(headers);
     try w.print("{s} {s} HTTP/1.1\r\n", .{ method, target });
     try w.print("host: {s}\r\n", .{host});
     try w.print("content-length: {d}\r\n", .{body.len});
@@ -185,7 +189,8 @@ pub fn writeResponse(
     status: u16,
     headers: []const Header,
     body: []const u8,
-) std.Io.Writer.Error!void {
+) WriteError!void {
+    try validateHeaders(headers);
     try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, reasonPhrase(status) });
     try w.print("content-length: {d}\r\n", .{body.len});
     try w.writeAll("connection: close\r\n");
@@ -270,6 +275,20 @@ fn writeExtraHeaders(w: *std.Io.Writer, headers: []const Header) std.Io.Writer.E
     }
 }
 
+fn validateRequestLine(method: []const u8, target: []const u8, host: []const u8) Error!void {
+    if (!isToken(method)) return error.ProtocolError;
+    if (target.len == 0 or target[0] != '/') return error.ProtocolError;
+    if (std.mem.findScalar(u8, target, ' ') != null) return error.ProtocolError;
+    if (!valueOk(target)) return error.ProtocolError;
+    if (host.len == 0 or !valueOk(host)) return error.ProtocolError;
+}
+
+fn validateHeaders(headers: []const Header) Error!void {
+    for (headers) |h| {
+        if (!isToken(h.name) or !valueOk(h.value)) return error.ProtocolError;
+    }
+}
+
 fn isReservedHeader(name: []const u8) bool {
     return eqlIgnoreCase(name, "host") or
         eqlIgnoreCase(name, "content-length") or
@@ -349,7 +368,7 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-fn dump(gpa: std.mem.Allocator, write: *const fn (*std.Io.Writer) std.Io.Writer.Error!void) ![]u8 {
+fn dump(gpa: std.mem.Allocator, write: *const fn (*std.Io.Writer) WriteError!void) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     try write(&aw.writer);
@@ -461,7 +480,7 @@ test "Connection close token is detected" {
 test "writeResponse always frames with Content-Length and close" {
     const gpa = std.testing.allocator;
     const bytes = try dump(gpa, struct {
-        fn f(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        fn f(w: *std.Io.Writer) WriteError!void {
             try writeResponse(w, 200, &.{.{ .name = "content-type", .value = "text/plain" }}, "ok");
         }
     }.f);
@@ -481,7 +500,7 @@ test "writeResponse always frames with Content-Length and close" {
 test "writeRequest is origin-form HTTP/1.1 with Host" {
     const gpa = std.testing.allocator;
     const bytes = try dump(gpa, struct {
-        fn f(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        fn f(w: *std.Io.Writer) WriteError!void {
             try writeRequest(w, "GET", "/v1/tasks/t-7", "127.0.0.1", &.{}, "");
         }
     }.f);
@@ -502,7 +521,7 @@ test "writeRequest is origin-form HTTP/1.1 with Host" {
 test "writer-supplied framing headers are not duplicated" {
     const gpa = std.testing.allocator;
     const bytes = try dump(gpa, struct {
-        fn f(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        fn f(w: *std.Io.Writer) WriteError!void {
             try writeResponse(w, 200, &.{
                 .{ .name = "Content-Length", .value = "99" },
                 .{ .name = "Connection", .value = "keep-alive" },
@@ -514,4 +533,42 @@ test "writer-supplied framing headers are not duplicated" {
         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
         bytes,
     );
+}
+
+test "writeRequest rejects CR/LF/NUL in method target host" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.ProtocolError, dump(gpa, struct {
+        fn f(w: *std.Io.Writer) WriteError!void {
+            try writeRequest(w, "GET\r\nX: 1", "/", "h", &.{}, "");
+        }
+    }.f));
+    try std.testing.expectError(error.ProtocolError, dump(gpa, struct {
+        fn f(w: *std.Io.Writer) WriteError!void {
+            try writeRequest(w, "GET", "/x\r\nHost: evil", "h", &.{}, "");
+        }
+    }.f));
+    try std.testing.expectError(error.ProtocolError, dump(gpa, struct {
+        fn f(w: *std.Io.Writer) WriteError!void {
+            try writeRequest(w, "GET", "/", "h\x00evil", &.{}, "");
+        }
+    }.f));
+}
+
+test "writeResponse rejects CR/LF in a header instead of emitting it" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.ProtocolError, dump(gpa, struct {
+        fn f(w: *std.Io.Writer) WriteError!void {
+            try writeResponse(w, 200, &.{.{ .name = "x-evil", .value = "a\r\nX-Injected: 1" }}, "ok");
+        }
+    }.f));
+    try std.testing.expectError(error.ProtocolError, dump(gpa, struct {
+        fn f(w: *std.Io.Writer) WriteError!void {
+            try writeResponse(w, 200, &.{.{ .name = "x-evil\r\nX-Injected", .value = "1" }}, "ok");
+        }
+    }.f));
+    try std.testing.expectError(error.ProtocolError, dump(gpa, struct {
+        fn f(w: *std.Io.Writer) WriteError!void {
+            try writeResponse(w, 200, &.{.{ .name = "Connection", .value = "close\r\nX-Injected: 1" }}, "ok");
+        }
+    }.f));
 }

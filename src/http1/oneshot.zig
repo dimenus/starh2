@@ -68,7 +68,27 @@ pub const ServeError = error{
     ListenFailed,
     TransportSetupFailed,
     RuntimeShutdown,
+    AcceptFailed,
 };
+
+/// What `accept` should do with an error. Transient resource pressure retries
+/// after a short sleep. Anything else that is not cancelation is fatal: the
+/// accept task must wake `serve`, because returning alone leaves `serve`
+/// parked on `shutdown_event` forever while `waitUntilListening` still says
+/// listening.
+pub const AcceptDisposition = enum { retry, backoff, fail, cancel };
+
+pub fn acceptDisposition(err: anyerror) AcceptDisposition {
+    return switch (err) {
+        error.Canceled => .cancel,
+        error.ConnectionAborted => .retry,
+        error.WouldBlock,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        error.SystemResources => .backoff,
+        else => .fail,
+    };
+}
 
 pub const ServerConfig = struct {
     address: std.Io.net.IpAddress,
@@ -91,6 +111,8 @@ pub const Server = struct {
     bind_state: std.atomic.Value(BindState) = .init(.pending),
     bind_event: std.Io.Event = .unset,
     active_connections: std.atomic.Value(usize) = .init(0),
+    /// Test hook: 0 none, 1 `SystemResources` (backoff), 2 `NetworkDown` (fail).
+    next_accept_fault: std.atomic.Value(u8) = .init(0),
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, config: ServerConfig) InitError!Server {
         if (config.max_connections == 0) return error.InvalidConfig;
@@ -143,6 +165,7 @@ pub const Server = struct {
             };
         }
         if (canceled) return error.RuntimeShutdown;
+        if (self.bind_state.load(.acquire) == .failed) return error.AcceptFailed;
     }
 
     pub fn requestShutdown(self: *Server) void {
@@ -204,15 +227,21 @@ pub const Server = struct {
     }
 
     fn acceptLoop(self: *Server, connection_group: *std.Io.Group) std.Io.Cancelable!void {
+        // Any exit that is not an explicit shutdown must wake `serve`.
+        defer if (!self.shutdown_flag.load(.acquire)) {
+            self.bind_state.store(.failed, .release);
+            self.shutdown_event.set(self.io);
+        };
         while (!self.shutdown_flag.load(.acquire)) {
             const listener = if (self.listener) |*l| l else return;
-            const stream = listener.accept(self.io) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.ConnectionAborted, error.SocketNotListening => {
-                    if (self.shutdown_flag.load(.acquire)) return;
+            const stream = self.acceptOne(listener) catch |err| switch (acceptDisposition(err)) {
+                .cancel => return error.Canceled,
+                .retry => continue,
+                .backoff => {
+                    self.io.sleep(.fromMilliseconds(10), .awake) catch return error.Canceled;
                     continue;
                 },
-                else => return,
+                .fail => return,
             };
             setTcpNoDelay(stream) catch {};
             if (!self.tryAdmit()) {
@@ -225,6 +254,15 @@ pub const Server = struct {
                 continue;
             };
         }
+    }
+
+    fn acceptOne(self: *Server, listener: *std.Io.net.Server) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+        switch (self.next_accept_fault.swap(0, .acq_rel)) {
+            1 => return error.SystemResources,
+            2 => return error.NetworkDown,
+            else => {},
+        }
+        return listener.accept(self.io);
     }
 
     fn connEntry(self: *Server, stream: std.Io.net.Stream) std.Io.Cancelable!void {
@@ -354,7 +392,13 @@ fn serveOne(
         try writeStatus(writer, 500);
         return;
     }
-    try codec.writeResponse(writer, reply.status, reply.headers, reply.body);
+    codec.writeResponse(writer, reply.status, reply.headers, reply.body) catch |err| switch (err) {
+        error.ProtocolError => {
+            try writeStatus(writer, 500);
+            return;
+        },
+        else => |e| return e,
+    };
     try writer.flush();
 }
 
@@ -404,6 +448,19 @@ fn readBody(reader: *std.Io.Reader, gpa: std.mem.Allocator, content_length: ?u64
         else => return err,
     };
     return body;
+}
+
+test "acceptDisposition retries pressure and fails fatal" {
+    try std.testing.expectEqual(AcceptDisposition.cancel, acceptDisposition(error.Canceled));
+    try std.testing.expectEqual(AcceptDisposition.retry, acceptDisposition(error.ConnectionAborted));
+    try std.testing.expectEqual(AcceptDisposition.backoff, acceptDisposition(error.SystemResources));
+    try std.testing.expectEqual(AcceptDisposition.backoff, acceptDisposition(error.ProcessFdQuotaExceeded));
+    try std.testing.expectEqual(AcceptDisposition.backoff, acceptDisposition(error.SystemFdQuotaExceeded));
+    try std.testing.expectEqual(AcceptDisposition.backoff, acceptDisposition(error.WouldBlock));
+    try std.testing.expectEqual(AcceptDisposition.fail, acceptDisposition(error.NetworkDown));
+    try std.testing.expectEqual(AcceptDisposition.fail, acceptDisposition(error.SocketNotListening));
+    try std.testing.expectEqual(AcceptDisposition.fail, acceptDisposition(error.ProtocolFailure));
+    try std.testing.expectEqual(AcceptDisposition.fail, acceptDisposition(error.BlockedByFirewall));
 }
 
 fn setTcpNoDelay(stream: std.Io.net.Stream) std.posix.SetSockOptError!void {

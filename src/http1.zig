@@ -20,16 +20,21 @@ pub const parseRequestHead = codec.parseRequestHead;
 pub const parseResponseHead = codec.parseResponseHead;
 pub const writeRequest = codec.writeRequest;
 pub const writeResponse = codec.writeResponse;
+pub const WriteError = codec.WriteError;
 
 pub const Handler = oneshot.Handler;
 pub const Reply = oneshot.Reply;
 pub const Response = oneshot.Response;
 pub const Server = oneshot.Server;
 pub const ServerConfig = oneshot.ServerConfig;
+pub const BindState = oneshot.BindState;
+pub const ServeError = oneshot.ServeError;
 pub const serveConn = oneshot.serveConn;
 pub const get = oneshot.get;
 pub const exchange = oneshot.exchange;
 pub const readResponse = oneshot.readResponse;
+pub const AcceptDisposition = oneshot.AcceptDisposition;
+pub const acceptDisposition = oneshot.acceptDisposition;
 
 test {
     _ = codec;
