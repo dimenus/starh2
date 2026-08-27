@@ -29,7 +29,7 @@ const RunOut = struct {
 
 fn runtimeOpts() zio.RuntimeOptions {
     return .{
-        .executors = .exact(1),
+        .executors = .exact(2),
         .enable_main_executor = true,
         .enable_task_migration = false,
         .thread_pool = .{ .max_threads = 0 },
@@ -389,6 +389,10 @@ fn checkD5(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
         std.debug.print("D5 FAIL: simulated line does not name net_pipe\n{s}\n", .{text});
         std.process.exit(1);
     }
+    if (std.mem.indexOf(u8, text, "extra_logical_executors") == null) {
+        std.debug.print("D5 FAIL: simulated line does not name extra_logical_executors\n{s}\n", .{text});
+        std.process.exit(1);
+    }
     std.debug.print("{s}", .{text});
     std.debug.print("D5 PASS\n", .{});
 }
@@ -429,11 +433,17 @@ fn expectChildPanic(
 }
 
 fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
-    std.debug.print("== VALIDITY mutant arm_timer_stale\n", .{});
-    if (!zio.sim.mutantArmTimerStale()) {
-        std.debug.print("MUTANT_NOT_COMPILED: rebuild with -Dsim-mutant=arm_timer_stale\n", .{});
+    const stale = zio.sim.mutantArmTimerStale();
+    const omit = zio.sim.mutantOmitTimeoutRecheck();
+    const needle: []const u8 = if (stale)
+        "armTimer backdated"
+    else if (omit)
+        "timedWait Timeout with a ready completion"
+    else {
+        std.debug.print("MUTANT_NOT_COMPILED: rebuild with -Dsim-mutant=arm_timer_stale or omit_timeout_recheck\n", .{});
         std.process.exit(1);
-    }
+    };
+    std.debug.print("== VALIDITY mutant {s}\n", .{if (stale) "arm_timer_stale" else "omit_timeout_recheck"});
     var seed: u64 = 1;
     var buf: [32]u8 = undefined;
     while (seed <= 1000) : (seed += 1) {
@@ -443,7 +453,6 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
         });
         defer gpa.free(res.stdout);
         defer gpa.free(res.stderr);
-        const needle = "armTimer backdated";
         const hit = std.mem.indexOf(u8, res.stderr, needle) != null or
             std.mem.indexOf(u8, res.stdout, needle) != null;
         if (!hit) continue;
