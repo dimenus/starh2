@@ -205,7 +205,7 @@ pub const Server = struct {
 
     fn acceptLoop(self: *Server, connection_group: *std.Io.Group) std.Io.Cancelable!void {
         while (!self.shutdown_flag.load(.acquire)) {
-            const listener = self.listener orelse return;
+            const listener = if (self.listener) |*l| l else return;
             const stream = listener.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.ConnectionAborted, error.SocketNotListening => {

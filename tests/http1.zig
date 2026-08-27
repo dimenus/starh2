@@ -42,8 +42,9 @@ fn expectEofSoon(io: std.Io, reader: *std.Io.Reader, timeout_ns: u64) !void {
     select.cancelDiscard();
     switch (selected) {
         .byte => |result| {
-            if (result) |_| return error.ExpectedEof;
-            else |err| switch (err) {
+            if (result) |_| {
+                return error.ExpectedEof;
+            } else |err| switch (err) {
                 error.EndOfStream => return,
                 else => return err,
             }
