@@ -358,15 +358,16 @@ fn dump(gpa: std.mem.Allocator, write: *const fn (*std.Io.Writer) std.Io.Writer.
 
 test "HeadEnd finds CRLFCRLF across feeds" {
     const data = "GET / HTTP/1.1\r\nHost: x\r\n\r\nBODY";
+    const head_len = std.mem.findPos(u8, data, 0, "\r\n\r\n").? + 4;
     var i: usize = 0;
-    while (i < 35) : (i += 1) {
+    while (i < head_len) : (i += 1) {
         var p: HeadEnd = .{};
         const a = p.feed(data[0..i]);
         try std.testing.expectEqual(i, a);
         try std.testing.expect(!p.done());
         const b = p.feed(data[i..]);
         try std.testing.expect(p.done());
-        try std.testing.expectEqual(@as(usize, 35 - i), b);
+        try std.testing.expectEqual(head_len - i, b);
     }
 }
 
