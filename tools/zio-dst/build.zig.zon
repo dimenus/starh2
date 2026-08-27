@@ -4,10 +4,10 @@
     .fingerprint = 0x6e270d0db05b332f,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // dimenus/zio sim/dst-m1 (channel deposit + mux poll interleave).
+        // dimenus/zio sim/dst-m1 (cancel-settle yield).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#b0c06bac2591cbdd26e0115df995b2f592d6f3e3",
-            .hash = "zio-0.17.0-xHbVVPNqKQCe7IKAkm6mvOBXh-dwTyxeAuHOmu139Wbs",
+            .url = "git+https://github.com/dimenus/zio#b83f8d1dc1f9006037540f5887ad726d07372598",
+            .hash = "zio-0.17.0-xHbVVPxsKQDRNN5PwW2T6FKHUZoye8_fYF-TxWIMij34",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },

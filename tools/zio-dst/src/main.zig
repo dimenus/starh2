@@ -14,6 +14,7 @@ const Fixture = enum {
     select_generations,
     select_task_cancel,
     select_channel,
+    select_clobber,
     zero_timer,
     remote_submit,
     close_inflight,
@@ -60,6 +61,7 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
         .select_generations => try selectGenerations(rt),
         .select_task_cancel => try selectTaskCancel(rt),
         .select_channel => try selectChannel(rt),
+        .select_clobber => try selectClobber(rt),
         .zero_timer => try zeroTimer(rt),
         .remote_submit => try remoteSubmit(rt),
         .close_inflight => try closeInflight(rt),
@@ -291,6 +293,49 @@ fn selectChannel(rt: *zio.Runtime) !void {
         var p = try rt.spawn(selectChannelPoster, .{&s});
         d.cancel();
         p.join() catch {};
+    }
+}
+
+/// One arm is already ready at sweep (pre-buffered channel). A sender
+/// races the earlier-registered empty arm. Sweep coop-yield after the
+/// empty arm queues, so the send can claim it before the ready arm wins.
+const Clobber = struct {
+    empty_buf: [1]u32 = undefined,
+    ready_buf: [1]u32 = undefined,
+    empty: zio.Channel(u32) = undefined,
+    ready: zio.Channel(u32) = undefined,
+};
+
+fn clobberDriver(c: *Clobber) !void {
+    var recv_empty = c.empty.asyncReceive();
+    var recv_ready = c.ready.asyncReceive();
+    const result = zio.select(.{
+        .empty = &recv_empty,
+        .ready = &recv_ready,
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .empty => |r| _ = r catch {},
+        .ready => |r| _ = r catch {},
+    }
+}
+
+fn clobberPoster(c: *Clobber) !void {
+    c.empty.send(2) catch {};
+}
+
+fn selectClobber(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var c: Clobber = .{};
+        c.empty = zio.Channel(u32).init(&c.empty_buf);
+        c.ready = zio.Channel(u32).init(&c.ready_buf);
+        c.ready.send(1) catch {};
+        var d = try rt.spawn(clobberDriver, .{&c});
+        var p = try rt.spawn(clobberPoster, .{&c});
+        p.join() catch {};
+        d.join() catch {};
     }
 }
 
@@ -844,7 +889,7 @@ pub fn main(init: std.process.Init) !void {
                 // on a timer fixture means the instrument did not fire.
                 if (fix == .zero_timer or fix == .same_tick_race or fix == .select_park or
                     fix == .select_generations or fix == .select_task_cancel or
-                    fix == .select_channel or fix == .io_mid_sleep)
+                    fix == .select_channel or fix == .select_clobber or fix == .io_mid_sleep)
                 {
                     std.debug.print("FAIL fixture {s}: zero events\n", .{@tagName(fix)});
                     std.process.exit(1);
