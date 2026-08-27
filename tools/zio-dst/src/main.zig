@@ -26,6 +26,9 @@ const Fixture = enum {
     io_mid_sleep,
     io_backpressure,
     io_id_identity,
+    io_cancel_identity,
+    io_send_after_close,
+    io_cancel_parked,
 };
 
 const RunOut = struct {
@@ -50,13 +53,13 @@ fn runtimeOpts() zio.RuntimeOptions {
 }
 
 fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: bool) !RunOut {
-    if (fixture == .io_id_identity) {
+    if (fixture == .io_id_identity or fixture == .io_cancel_identity) {
         if (print_scope) {
             zio.sim.begin(seed);
             defer zio.sim.end();
             zio.sim.printScope();
         }
-        return ioIdIdentity(seed);
+        return if (fixture == .io_id_identity) ioIdIdentity(seed) else ioCancelIdentity(seed);
     }
 
     zio.sim.begin(seed);
@@ -100,19 +103,33 @@ fn runNamed(rt: *zio.Runtime, fixture: Fixture) !void {
         .io_close_inflight => try ioCloseInflight(rt),
         .io_mid_sleep => try ioMidSleep(rt),
         .io_backpressure => try ioBackpressure(rt),
-        .io_id_identity => unreachable,
+        .io_send_after_close => try ioSendAfterClose(rt),
+        .io_cancel_parked => try ioCancelParked(rt),
+        .io_id_identity, .io_cancel_identity => unreachable,
     }
 }
 
 fn ioIdIdentity(seed: u64) !RunOut {
-    const ab = zio.sim.runWakeOrderProbe(seed, .a);
-    const ba = zio.sim.runWakeOrderProbe(seed, .b);
+    return compareOrderProbes(seed, &zio.sim.runWakeOrderProbe, error.WakeOrderAlias);
+}
+
+fn ioCancelIdentity(seed: u64) !RunOut {
+    return compareOrderProbes(seed, &zio.sim.runCancelOrderProbe, error.CancelOrderAlias);
+}
+
+fn compareOrderProbes(
+    seed: u64,
+    probe: *const fn (u64, zio.sim.WakeFirst) zio.sim.ProbeOut,
+    alias: anyerror,
+) !RunOut {
+    const ab = probe(seed, .a);
+    const ba = probe(seed, .b);
     if (ab.trace == ba.trace or ab.state == ba.state) {
         std.debug.print(
-            "WAKE_ORDER_ALIAS SEED={d} TRACE_AB={x:0>16} TRACE_BA={x:0>16} STATE_AB={x:0>16} STATE_BA={x:0>16}\n",
+            "ORDER_ALIAS SEED={d} TRACE_AB={x:0>16} TRACE_BA={x:0>16} STATE_AB={x:0>16} STATE_BA={x:0>16}\n",
             .{ seed, ab.trace, ba.trace, ab.state, ba.state },
         );
-        return error.WakeOrderAlias;
+        return alias;
     }
     return .{
         .trace = ab.trace,
@@ -547,6 +564,49 @@ fn ioBackpressure(rt: *zio.Runtime) !void {
         } else return error.UnknownCompletion;
     }
     if (!got_extra or !got_recv) return error.MissingCompletion;
+}
+
+fn ioSendAfterClose(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    var cq = zio.CompletionQueue.init();
+    var close_op = zio.ev.NetClose.init(fds[0]);
+    try cq.submit(&close_op.c);
+    _ = try cq.wait();
+    const payload = "x";
+    var send_store: [1]zio.os.iovec_const = undefined;
+    var send_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(payload, &send_store), .{});
+    try cq.submit(&send_op.c);
+    const c = cq.timedWait(.{ .duration = .fromMilliseconds(100) }) catch |err| switch (err) {
+        error.Timeout => return error.SendAfterCloseDeadlock,
+        else => return err,
+    };
+    if (c != &send_op.c) return error.UnknownCompletion;
+    if (send_op.getResult()) |_| {
+        return error.ExpectedBrokenPipe;
+    } else |err| switch (err) {
+        error.BrokenPipe => {},
+        else => return err,
+    }
+}
+
+fn ioCancelParked(rt: *zio.Runtime) !void {
+    _ = rt;
+    const fds = zio.sim.pipePair();
+    var out: [8]u8 = @splat(0);
+    var recv_store: [1]zio.os.iovec = undefined;
+    var recv_op = zio.ev.NetRecv.init(fds[0], zio.ev.ReadBuf.fromSlice(&out, &recv_store), .{});
+    var cq = zio.CompletionQueue.init();
+    try cq.submit(&recv_op.c);
+    cq.cancelAll(.keep);
+    const c = try cq.wait();
+    if (c != &recv_op.c) return error.UnknownCompletion;
+    if (recv_op.getResult()) |_| {
+        return error.ExpectedCanceled;
+    } else |err| switch (err) {
+        error.Canceled => {},
+        else => return err,
+    }
 }
 
 fn ioRecvDriver(r: *IoRace) !void {
