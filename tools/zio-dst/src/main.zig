@@ -1,4 +1,4 @@
-//! DST harness for zio CQ / select / timer (t-1166 M1).
+//! DST harness for zio CQ / select / timer (t-1166).
 //!
 //! Builds zio with `-Dsim=true`. Does not replace `tools/zio-pin-gate`.
 //!
@@ -223,7 +223,6 @@ fn selectGenerations(rt: *zio.Runtime) !void {
 const SelectCancel = struct {
     cq: zio.CompletionQueue,
     io_timer: zio.ev.Timer,
-    park_catch: usize = 0,
 };
 
 fn selectCancelDriver(p: *SelectCancel) !void {
@@ -231,10 +230,7 @@ fn selectCancelDriver(p: *SelectCancel) !void {
         .io = &p.cq,
         .timer = zio.Timeout.fromMilliseconds(100),
     }) catch |err| switch (err) {
-        error.Canceled => {
-            p.park_catch += 1;
-            return;
-        },
+        error.Canceled => return,
     };
     switch (result) {
         .io => |r| _ = r catch {},
@@ -247,7 +243,6 @@ fn selectCancelPoster(p: *SelectCancel) !void {
 }
 
 fn selectTaskCancel(rt: *zio.Runtime) !void {
-    var caught: usize = 0;
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         var park: SelectCancel = .{
@@ -259,10 +254,8 @@ fn selectTaskCancel(rt: *zio.Runtime) !void {
         var p = try rt.spawn(selectCancelPoster, .{&park});
         d.cancel();
         p.join() catch {};
-        caught += park.park_catch;
         park.cq.cancelAll(.discard);
     }
-    std.debug.print("PARK_CATCH={d}\n", .{caught});
 }
 
 /// Select with a channel recv arm. A poster send races `JoinHandle.cancel`
@@ -399,6 +392,7 @@ fn closeInflight(rt: *zio.Runtime) !void {
 /// distinct epoch so this fixture deadlocks if `setClock` does not assign
 /// `timer.clock`.
 fn expectAutoCancel(rt: *zio.Runtime, timeout: *zio.AutoCancel) !void {
+    const before = zio.sim.clockNs();
     if (rt.sleep(.fromMilliseconds(500))) |_| {
         return error.DidNotCancel;
     } else |err| switch (err) {
@@ -406,6 +400,9 @@ fn expectAutoCancel(rt: *zio.Runtime, timeout: *zio.AutoCancel) !void {
             if (!timeout.check(err)) return error.NotAutoCancel;
         },
     }
+    const elapsed = zio.sim.clockNs() - before;
+    if (elapsed < 10_000_000) return error.ClockDidNotAdvance;
+    if (elapsed >= 1_000_000_000) return error.OversleptWallTimer;
 }
 
 fn setclockReal(rt: *zio.Runtime) !void {
@@ -709,6 +706,20 @@ fn expectChildPanic(
     std.debug.print("  armed `{s}`: fired\n", .{needle});
 }
 
+fn parseTraceHash(text: []const u8) ?u64 {
+    const key = "TRACE_HASH=";
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    const rest = text[i + key.len ..];
+    var n: usize = 0;
+    while (n < rest.len and n < 16) : (n += 1) {
+        const c = rest[n];
+        const hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!hex) break;
+    }
+    if (n == 0) return null;
+    return std.fmt.parseInt(u64, rest[0..n], 16) catch null;
+}
+
 fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
     const stale = zio.sim.mutantArmTimerStale();
     const omit = zio.sim.mutantOmitTimeoutRecheck();
@@ -734,7 +745,17 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
             std.mem.indexOf(u8, res.stdout, needle) != null;
         if (!hit) continue;
 
-        std.debug.print("MUTANT_FIRED SEED={d}\n", .{seed});
+        const h1 = parseTraceHash(res.stderr) orelse parseTraceHash(res.stdout);
+        if (h1 == null) {
+            std.debug.print("D3 FAIL: SEED={d} panic had no TRACE_HASH\nstderr={s}\nstdout={s}\n", .{
+                seed,
+                res.stderr,
+                res.stdout,
+            });
+            std.process.exit(1);
+        }
+
+        std.debug.print("MUTANT_FIRED SEED={d} TRACE_HASH={x:0>16}\n", .{ seed, h1.? });
         const res2 = try std.process.run(gpa, io, .{
             .argv = &.{ exe, "--run", "same_tick_race", "--seed", seed_s },
         });
@@ -742,6 +763,7 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
         defer gpa.free(res2.stderr);
         const hit2 = std.mem.indexOf(u8, res2.stderr, needle) != null or
             std.mem.indexOf(u8, res2.stdout, needle) != null;
+        const h2 = parseTraceHash(res2.stderr) orelse parseTraceHash(res2.stdout);
         if (!hit2) {
             std.debug.print("D3 FAIL: replay of SEED={d} did not reproduce the panic\nstderr={s}\n", .{
                 seed,
@@ -749,7 +771,15 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
             });
             std.process.exit(1);
         }
-        std.debug.print("D3 PASS (replay SEED={d} same panic)\n", .{seed});
+        if (h2 == null or h2.? != h1.?) {
+            std.debug.print("D3 FAIL: replay TRACE_HASH mismatch SEED={d} first={x} second={x}\n", .{
+                seed,
+                h1.?,
+                h2 orelse 0,
+            });
+            std.process.exit(1);
+        }
+        std.debug.print("D3 PASS (replay SEED={d} same panic and TRACE_HASH)\n", .{seed});
         return;
     }
     std.debug.print("MUTANT_NOT_FOUND after 1000 seeds (a clean sweep at this count is a fail)\n", .{});
@@ -843,7 +873,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, a, "--arm-d4-inner")) {
             arm_d4_inner = args.next() orelse {
-                std.debug.print("--arm-d4-inner needs clock|futex\n", .{});
+                std.debug.print("--arm-d4-inner needs clock|futex|io\n", .{});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -908,5 +938,5 @@ pub fn main(init: std.process.Init) !void {
     if (do_d2) try checkD2(gpa);
     if (do_d4) try checkD4(gpa, io, exe);
 
-    std.debug.print("M1 checks finished\n", .{});
+    std.debug.print("DST checks finished\n", .{});
 }
