@@ -10,6 +10,7 @@ const zio = @import("zio");
 
 const Fixture = enum {
     same_tick_race,
+    select_park,
     zero_timer,
     remote_submit,
     close_inflight,
@@ -51,6 +52,7 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
 
     switch (fixture) {
         .same_tick_race => try sameTickRace(rt),
+        .select_park => try selectPark(rt),
         .zero_timer => try zeroTimer(rt),
         .remote_submit => try remoteSubmit(rt),
         .close_inflight => try closeInflight(rt),
@@ -99,6 +101,60 @@ fn sameTickRace(rt: *zio.Runtime) !void {
         p.join() catch {};
         d.join() catch {};
         race.cq.cancelAll(.discard);
+    }
+}
+
+/// Parks `zio.select` with a CQ arm, a timer arm, and a cancellation arm.
+/// Without this, select/asyncWait never sits on the queue and select-class
+/// bugs cannot fire no matter the seed count.
+const SelectPark = struct {
+    cq: zio.CompletionQueue,
+    io_timer: zio.ev.Timer,
+    cancel: zio.ResetEvent,
+};
+
+fn selectDriver(p: *SelectPark) !void {
+    const result = zio.select(.{
+        .io = &p.cq,
+        .timer = zio.Timeout.fromMilliseconds(10),
+        .cancel = &p.cancel,
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .io => |r| _ = r catch {},
+        .timer => {},
+        .cancel => {},
+    }
+}
+
+fn selectPoster(p: *SelectPark) !void {
+    try p.cq.submit(&p.io_timer.c);
+}
+
+fn selectCanceler(p: *SelectPark) !void {
+    p.cancel.set();
+}
+
+fn selectPark(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var park: SelectPark = .{
+            .cq = zio.CompletionQueue.init(),
+            .io_timer = zio.ev.Timer.init(.{ .duration = .fromMilliseconds(10) }),
+            .cancel = .init,
+        };
+        // Park the select first: CQ asyncWait, Timeout arm, ResetEvent arm.
+        // Poster and canceler spawn after that so the wait is on the queue
+        // rather than winning on the registration sweep.
+        var d = try rt.spawn(selectDriver, .{&park});
+        try zio.yield();
+        var p = try rt.spawn(selectPoster, .{&park});
+        var c = try rt.spawn(selectCanceler, .{&park});
+        p.join() catch {};
+        c.join() catch {};
+        d.join() catch {};
+        park.cq.cancelAll(.discard);
     }
 }
 
@@ -617,7 +673,7 @@ pub fn main(init: std.process.Init) !void {
             if (out.events == 0 and fix != .overflow_1k) {
                 // overflow_1k may still emit task_switch events; a true zero
                 // on a timer fixture means the instrument did not fire.
-                if (fix == .zero_timer or fix == .same_tick_race) {
+                if (fix == .zero_timer or fix == .same_tick_race or fix == .select_park) {
                     std.debug.print("FAIL fixture {s}: zero events\n", .{@tagName(fix)});
                     std.process.exit(1);
                 }
