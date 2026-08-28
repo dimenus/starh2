@@ -1074,6 +1074,27 @@ fn runAbortMidUpload(
     try std.testing.expectEqual(@as(usize, 1), peak);
 }
 
+fn runTaskPostReuses(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    const payload = "{\"hello\":1}";
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [4096]u8 = undefined;
+    var wb: [512]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "POST /echo-task HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\nContent-Type: application/json\r\n\r\n{\"hello\":1}");
+    var cap1 = try readResponse(&reader.interface, gpa, false);
+    defer cap1.deinit();
+    if (cap1.status != 200) return error.TaskPostNoResponse;
+    try std.testing.expectEqualStrings(payload, cap1.body.items);
+    try std.testing.expectEqualStrings(payload, observed.body);
+    if (cap1.saw_conn_close) return error.TaskPostClosedConnection;
+    try writeReq(&writer.interface, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    var cap2 = try readResponse(&reader.interface, gpa, false);
+    defer cap2.deinit();
+    if (cap2.status != 200) return error.TaskPostNoReuse;
+}
+
 fn runSlowHandler(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -2178,6 +2199,10 @@ fn namedSlowHandler(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try withBatteryServer(rt, gpa, runSlowHandler);
 }
 
+fn namedTaskPostReuses(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runTaskPostReuses);
+}
+
 test "h1.frame.early_second_request" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -2196,6 +2221,13 @@ test "h1.keepalive.idle_reaped" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     var handle = try rt.spawn(runIdleReaped, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+test "h1.keepalive.task_post_reuses" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedTaskPostReuses, .{ rt, std.testing.allocator });
     try handle.join();
 }
 

@@ -178,6 +178,22 @@ pub fn main(init: std.process.Init) !void {
         assertCurlReuse(ka_tls, "tls");
         connections += 2;
 
+        var sig_url_buf: [128]u8 = undefined;
+        const sig_url = std.fmt.bufPrint(&sig_url_buf, "https://127.0.0.1:{d}/signals", .{port}) catch abort("url", .{});
+        const ka_post_tls = try curl(gpa, io, &.{
+            "curl", "-sk", "--http1.1",
+            "-o", "/dev/null", "-o", "/dev/null",
+            "-w", "n=%{num_connects} c=%{http_code}\n",
+            "-H", "Content-Type: application/json",
+            "--data-binary", "{\"nonce\":\"x\",\"sequence\":1}",
+            sig_url, sig_url,
+        });
+        defer gpa.free(ka_post_tls.stdout);
+        defer gpa.free(ka_post_tls.stderr);
+        std.debug.print("h1-smoke: tls task POST keep-alive curl {s}\n", .{ka_post_tls.stdout});
+        assertCurlReuse(ka_post_tls, "tls-task-post");
+        connections += 2;
+
         var once_url_buf: [128]u8 = undefined;
         const once_url = std.fmt.bufPrint(&once_url_buf, "https://127.0.0.1:{d}/h1-once", .{port}) catch abort("url", .{});
         const once = try curl(gpa, io, &.{ "curl", "-sk", "--http1.1", "--max-time", "3", once_url });
@@ -248,6 +264,22 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(ka.stderr);
         std.debug.print("h1-smoke: keep-alive curl {s}\n", .{ka.stdout});
         assertCurlReuse(ka, "h1c");
+        connections += 2;
+
+        var sig_url_buf: [128]u8 = undefined;
+        const sig_url = std.fmt.bufPrint(&sig_url_buf, "http://127.0.0.1:{d}/signals", .{port}) catch abort("url", .{});
+        const ka_post = try curl(gpa, io, &.{
+            "curl", "-s",
+            "-o", "/dev/null", "-o", "/dev/null",
+            "-w", "n=%{num_connects} c=%{http_code}\n",
+            "-H", "Content-Type: application/json",
+            "--data-binary", "{\"nonce\":\"x\",\"sequence\":1}",
+            sig_url, sig_url,
+        });
+        defer gpa.free(ka_post.stdout);
+        defer gpa.free(ka_post.stderr);
+        std.debug.print("h1-smoke: task POST keep-alive curl {s}\n", .{ka_post.stdout});
+        assertCurlReuse(ka_post, "h1c-task-post");
         connections += 2;
 
         // SSE event within 2s.
