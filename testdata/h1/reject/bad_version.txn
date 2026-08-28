@@ -1,0 +1,4 @@
+status: 505
+connection: close
+
+GET / HTTP/2.0\r\nHost: h\r\n\r\n

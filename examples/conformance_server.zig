@@ -29,6 +29,29 @@ fn installSignalHandlers() void {
     std.posix.sigaction(.INT, &action, null);
 }
 
+fn h1OnceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.start(200, &.{});
+    try body.writeAll("chunk-ok");
+    try body.finish();
+}
+
+fn h1SseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = req;
+    var body = try resp.startSse(&.{});
+    try body.writeAll("data: ping\n\n");
+    try body.flush();
+    while (true) {
+        const now = std.Io.Clock.awake.now(resp.io);
+        const deadline = std.Io.Timestamp.fromNanoseconds(now.nanoseconds + 200 * std.time.ns_per_ms);
+        body.waitUntil(deadline) catch break;
+        if (body.terminalCause() != null) return;
+    }
+}
+
+fn echoHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, req.body);
+}
+
 fn helloHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     var nonce: []const u8 = "missing";
     for (req.headers) |h| {
@@ -186,8 +209,13 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const args = try parseArgs(gpa, process_args);
     const addr = try starh2.EndpointAddress.parseIp4(args.host, args.port);
 
+    starh2.edge.h1.applyTestMutationFromEnv();
+
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } } },
+        .{ .method = .POST, .path = "/echo", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = echoHandler } } },
+        .{ .method = .GET, .path = "/h1-once", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1OnceHandler } } },
+        .{ .method = .GET, .path = "/h1-sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1SseHandler } } },
         .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigHandler } } },
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } } },
         .{ .method = .POST, .path = "/morph", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = morphHandler } } },
@@ -207,8 +235,11 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, cpath, gpa, .limited(64 * 1024));
         key_pem = try std.Io.Dir.cwd().readFileAlloc(io, kpath, gpa, .limited(16 * 1024));
         tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
-        break :blk .{ .tls_h2 = addr };
-    } else .{ .h2c_prior_knowledge = addr };
+        break :blk .{ .tls = addr };
+    } else if (std.mem.eql(u8, args.mode, "h1c"))
+        .{ .h1c = addr }
+    else
+        .{ .h2c_prior_knowledge = addr };
 
     var limits = starh2.Limits.defaults;
     limits.response_compression = true;
@@ -244,7 +275,12 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const local = server.localAddress(0);
     const port = local.getPort();
 
-    const protocol = if (std.mem.eql(u8, args.mode, "tls")) "h2" else "h2c";
+    const protocol = if (std.mem.eql(u8, args.mode, "tls"))
+        "tls"
+    else if (std.mem.eql(u8, args.mode, "h1c"))
+        "h1c"
+    else
+        "h2c";
     const ready = try std.fmt.allocPrint(gpa, "{{\"ready\":true,\"mode\":\"{s}\",\"protocol\":\"{s}\",\"port\":{d}}}\n", .{ args.mode, protocol, port });
     defer gpa.free(ready);
     var out = zio.stdout().writer(&.{});

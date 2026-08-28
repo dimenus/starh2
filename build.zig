@@ -309,6 +309,24 @@ pub fn build(b: *std.Build) void {
     const http1_step = b.step("test-http1", "Run HTTP/1.1 oneshot gates");
     http1_step.dependOn(&run_http1_tests.step);
 
+    const h1_battery_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/h1_battery.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+            },
+        }),
+    });
+    const run_h1_battery = b.addRunArtifact(h1_battery_tests);
+    run_h1_battery.setCwd(b.path("."));
+    run_h1_battery.has_side_effects = true;
+    const h1_battery_step = b.step("test-h1-battery", "Run HTTP/1.1 edge-channel battery");
+    h1_battery_step.dependOn(&run_h1_battery.step);
+
     const limits_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/limits.zig"),
@@ -480,6 +498,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_protocol_tests.step);
     test_step.dependOn(&run_http1_tests.step);
+    test_step.dependOn(&run_h1_battery.step);
     test_step.dependOn(&run_limits_tests.step);
     test_step.dependOn(&run_transport_tests.step);
     test_step.dependOn(&run_multiplex_tests.step);
@@ -626,7 +645,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // The TLS-edge gate. `zig build test` cannot reach the TLS paths at all —
-    // no test binds a tls_h2 endpoint — so without this step a TLS regression
+    // no test binds a tls endpoint — so without this step a TLS regression
     // ships green. It drives the conformance server with real curl connections
     // because the oracle must share no code with the stack under test; see the
     // header of tools/tls_smoke.zig for the full reasoning.
@@ -647,6 +666,42 @@ pub fn build(b: *std.Build) void {
     tls_smoke_run.stdio = .inherit;
     const tls_smoke_step = b.step("tls-smoke", "TLS-edge gate: fresh curl connections against the conformance server");
     tls_smoke_step.dependOn(&tls_smoke_run.step);
+
+    const h1_smoke_exe = b.addExecutable(.{
+        .name = "h1-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/h1_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const h1_smoke_run = b.addRunArtifact(h1_smoke_exe);
+    h1_smoke_run.addArg("--bin");
+    h1_smoke_run.addFileArg(conformance_exe.?.getEmittedBin());
+    h1_smoke_run.setCwd(b.path("."));
+    h1_smoke_run.has_side_effects = true;
+    h1_smoke_run.stdio = .inherit;
+    const h1_smoke_step = b.step("h1-smoke", "HTTP/1.1 edge gate: curl against tls ALPN fallback and h1c");
+    h1_smoke_step.dependOn(&h1_smoke_run.step);
+
+    const h1_go_smoke_exe = b.addExecutable(.{
+        .name = "h1-go-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/h1_go_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const h1_go_smoke_run = b.addRunArtifact(h1_go_smoke_exe);
+    h1_go_smoke_run.addArg("--bin");
+    h1_go_smoke_run.addFileArg(conformance_exe.?.getEmittedBin());
+    h1_go_smoke_run.addArg("--go");
+    h1_go_smoke_run.addFileArg(b.path("tools/h1_go_client.go"));
+    h1_go_smoke_run.setCwd(b.path("."));
+    h1_go_smoke_run.has_side_effects = true;
+    h1_go_smoke_run.stdio = .inherit;
+    const h1_go_smoke_step = b.step("h1-go-smoke", "HTTP/1.1 Go net/http oracle: keep-alive and 100-continue");
+    h1_go_smoke_step.dependOn(&h1_go_smoke_run.step);
 
     // The README gate. `zig build test` compiles the examples, never the
     // README, so a snippet can name an API no consumer can reach and stay
@@ -725,6 +780,8 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(test_exact_step);
     ci_step.dependOn(fuzz_smoke_step);
     ci_step.dependOn(&tls_smoke_run.step);
+    ci_step.dependOn(&h1_smoke_run.step);
+    ci_step.dependOn(&h1_go_smoke_run.step);
     ci_step.dependOn(&readme_doctest_run.step);
     ci_step.dependOn(release_step);
 }

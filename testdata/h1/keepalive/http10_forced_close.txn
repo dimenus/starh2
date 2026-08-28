@@ -1,0 +1,5 @@
+status: 200
+connection: close
+body: ok
+
+GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n

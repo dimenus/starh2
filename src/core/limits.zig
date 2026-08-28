@@ -66,11 +66,13 @@ pub const Terms = struct {
     /// Concurrent brotli contexts × per-context budget, counted once server-wide.
     compression_contexts: usize = 0,
     tasks: usize = 0,
+    h1_head: usize = 0,
+    h1_body: usize = 0,
 };
 
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
 pub const HANDLER_SLOT_SIZE: usize = 20;
-pub const HANDLER_JOB_SIZE: usize = 608;
+pub const HANDLER_JOB_SIZE: usize = 616;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
 pub const REAPER_JOB_SIZE: usize = 32;
 
@@ -112,6 +114,11 @@ pub const Limits = struct {
     outbound_bytes_per_server: usize = 256 * 1024 * 1024,
     request_bytes_per_connection: usize = 8 * 1024 * 1024,
     request_bytes_per_server: usize = 256 * 1024 * 1024,
+    /// Reserved HTTP/1.1 request-head size per connection. A head over this
+    /// bound is 431; the buffer never grows. Each connection allocates this
+    /// size three times: `head_buf`, `name_scratch`, and the head prefix of
+    /// `carry_buf`.
+    h1_head_bytes: usize = 16 * 1024,
     control_bytes_per_connection: usize = 64 * 1024,
     control_entries_per_connection: usize = 256,
     stream_tombstones: usize = 1_024,
@@ -132,11 +139,11 @@ pub const Limits = struct {
     path_wire_bytes: usize = 24 * 1024,
     path_component_bytes: usize = 16 * 1024,
     query_component_bytes: usize = 16 * 1024,
-    /// Per-stream decoded body cap (413 threshold). Does not by itself grow
-    /// `resourceUpperBound`: concurrent body residency is gated by
-    /// `request_bytes_per_connection` / `request_bytes_per_server`. Raising this
-    /// to B with S streams requires `request_bytes_per_connection >= B*S` (and a
-    /// matching server ceiling) if every stream may hold a full body at once.
+    /// Per-stream decoded body cap (413). Each H1 connection reserves this
+    /// size twice (`body_buf` and the body suffix of `carry_buf`). A new
+    /// value moves `terms.h1_body` and `allocator_bytes`. H2 concurrent body
+    /// residency stays on `request_bytes_per_connection` /
+    /// `request_bytes_per_server`.
     request_body_bytes: usize = 256 * 1024,
     /// Outbound DATA slabs for the WHOLE SERVER, each `outbound_bytes_per_stream`
     /// bytes. Slabs are rented when a stream first queues DATA and returned when
@@ -239,6 +246,7 @@ pub const Limits = struct {
             return error.InvalidConfig;
         }
         if (self.response_compression and self.compression_contexts_per_server == 0) return error.InvalidConfig;
+        if (self.h1_head_bytes == 0) return error.InvalidConfig;
 
         // Rung-4 enforcement: these sizes are load-bearing inputs to the bound,
         // so a struct that gains a field must break the BUILD and not the
@@ -292,13 +300,18 @@ pub const Limits = struct {
         const deadline_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
         const deadline_state = deadline_events;
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
+        // head_buf, name_scratch, and the head prefix of carry_buf (init in edge/h1.zig).
+        terms.h1_head = try checkedMul(self.max_connections, try checkedMul(self.h1_head_bytes, 3));
+        // body_buf plus the body-sized suffix of carry_buf (init in edge/h1.zig).
+        terms.h1_body = try checkedMul(self.max_connections, try checkedMul(self.request_body_bytes, 2));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_stream_bytes, try checkedAdd(header_maps, intents)))));
 
         const sid_and_inline = try checkedAdd(sid_scratch, try checkedAdd(inline_sids, complete_receipt_sids));
         const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
         // wire_descs already counts read+write channel descriptors; TLS
         // reuses the write capacity for its channel, so no extra desc term.
-        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, terms.tls_cipher_payload))));
+        const h1_per_conn = try checkedAdd(try checkedMul(self.h1_head_bytes, 3), try checkedMul(self.request_body_bytes, 2));
+        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, try checkedAdd(terms.tls_cipher_payload, h1_per_conn)))));
 
         terms.routes = try checkedAdd(
             self.max_route_path_bytes,
@@ -461,6 +474,33 @@ test "rejects response_compression with zero contexts" {
     var lim = Limits.defaults;
     lim.response_compression = true;
     lim.compression_contexts_per_server = 0;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
+test "h1_head term counts three head-sized regions" {
+    const per = Limits.defaults.h1_head_bytes;
+    const n = Limits.defaults.max_connections;
+    const base = try Limits.defaults.resourceUpperBound();
+    try std.testing.expectEqual(n * per * 3, base.terms.h1_head);
+    var more = Limits.defaults;
+    more.h1_head_bytes = per * 2;
+    const bigger = try more.resourceUpperBound();
+    try std.testing.expectEqual(n * per * 2 * 3, bigger.terms.h1_head);
+    try std.testing.expectEqual(base.allocator_bytes + n * per * 3, bigger.allocator_bytes);
+}
+
+test "h1_body term moves allocator_bytes with request_body_bytes" {
+    const base = try Limits.defaults.resourceUpperBound();
+    var more = Limits.defaults;
+    more.request_body_bytes = Limits.defaults.request_body_bytes * 2;
+    const bigger = try more.resourceUpperBound();
+    try std.testing.expect(bigger.terms.h1_body > base.terms.h1_body);
+    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+}
+
+test "rejects zero h1_head_bytes" {
+    var lim = Limits.defaults;
+    lim.h1_head_bytes = 0;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 

@@ -575,7 +575,7 @@ pub const trace = struct {
     }
 };
 
-pub const Mode = enum { h2c, tls_h2 };
+pub const Mode = enum { h2c, tls, h1c };
 
 pub const ConnConfig = struct {
     io: std.Io,
@@ -597,6 +597,9 @@ pub const ConnConfig = struct {
     compression_pool: ?*brotli.Pool = null,
     /// True when accept path reserved a concurrent TLS handshake slot.
     handshake_held: bool = false,
+    /// Pre-handshaked TLS. When set, `run` skips handshake and owns this Conn.
+    tls_ready: ?*tls_edge.Conn = null,
+    tls_leftover: []const u8 = &.{},
 };
 
 /// Shared with Server: global stream/reaper/memory/handshake admission.
@@ -909,6 +912,10 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cance
         if (config.handshake_held) {
             if (config.accounting) |a| a.releaseHandshake();
         }
+        if (config.tls_ready) |t| {
+            t.deinit();
+            config.gpa.destroy(t);
+        }
         stream.close(config.io);
         return;
     };
@@ -1199,7 +1206,7 @@ const Connection = struct {
 
         var tls_read_buf: []u8 = &.{};
         var tls_write_buf: []wire_pump.WireChunk = &.{};
-        if (config.mode == .tls_h2) {
+        if (config.mode == .tls) {
             tls_read_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
             errdefer gpa.free(tls_read_buf);
             tls_write_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
@@ -1230,7 +1237,7 @@ const Connection = struct {
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
         errdefer gpa.free(intent_batch);
 
-        if (config.mode == .tls_h2) {
+        if (config.mode == .tls) {
             if (config.tls_acceptor == null) return error.InvalidConfig;
         }
 
@@ -1914,7 +1921,7 @@ const Connection = struct {
         while (!self.tickets.isSignaled(slot_i)) {
             self.drainWriteAcks();
             if (self.tickets.isSignaled(slot_i)) break;
-            if (self.config.mode == .tls_h2) {
+            if (self.config.mode == .tls) {
                 // Acks apply locally in `post`. If a ticket is still dark,
                 // the send is in flight: drive the CQ, never park on a
                 // channel with no TLS producer.
@@ -2489,7 +2496,7 @@ const Connection = struct {
             &test_release_complete_receipt_ack
         else
             &no_ack_hold_event;
-        if (self.config.mode == .tls_h2) {
+        if (self.config.mode == .tls) {
             const pump = self.tls_driver.?;
             // t-866: never park while inbound plaintext, unread records, or a
             // stashed cipher suffix sit. The recv is unarmed in the last case.
@@ -2644,7 +2651,7 @@ const Connection = struct {
                 read_pump.stop();
                 write_pump.stop();
             }
-            if (self.config.mode == .tls_h2) {
+            if (self.config.mode == .tls) {
                 self.tls_write_ch.close(.graceful);
             } else {
                 _ = self.write_ch.putUncancelable(io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
@@ -2667,11 +2674,25 @@ const Connection = struct {
             }
         }
 
-        if (self.config.mode == .tls_h2) {
-            try self.prepareTls();
-            // Handshake first: the actor-side handshake subtask reads the
-            // socket itself now; no read task exists before the driver.
-            try self.handshakeTls();
+        if (self.config.mode == .tls) {
+            if (self.config.tls_ready) |ready| {
+                self.tls = ready;
+                if (self.config.tls_leftover.len != 0) {
+                    self.lockSessionUncancelable(io);
+                    defer self.unlockSession(io);
+                    try self.session.ingest(self.config.tls_leftover);
+                    if (self.session.terminal != .none) return error.ConnectionClosed;
+                }
+                if (self.handshake_held) {
+                    if (self.config.accounting) |a| a.releaseHandshake();
+                    self.handshake_held = false;
+                }
+            } else {
+                try self.prepareTls();
+                // Handshake first: the actor-side handshake subtask reads the
+                // socket itself now; no read task exists before the driver.
+                try self.handshakeTls();
+            }
             tls_pump = .{
                 .io = io,
                 .conn = self.tls.?,
@@ -2836,7 +2857,7 @@ const Connection = struct {
             // two-turn shape as taking EOF as the only chunk on the next wait.
             if (inbound_eof) break;
 
-            if (self.config.mode == .tls_h2) {
+            if (self.config.mode == .tls) {
                 if (try self.driveTlsTurn()) break;
                 continue;
             }
@@ -4137,7 +4158,7 @@ const Connection = struct {
     /// going away: tryPut, shut the socket to unstick a blocked write, retry
     /// once, then fail. A healthy connection still `putOne`s for backpressure.
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
-        if (self.config.mode == .tls_h2) {
+        if (self.config.mode == .tls) {
             // SSL_write + stage + arm on this task. Acks apply in `post` via
             // `ack_apply` (no write_ack_ch hop). `pause` (DATA) and
             // `pause_control` (HEADERS/WINDOW_UPDATE) stop drain before this

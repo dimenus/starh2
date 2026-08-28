@@ -1,0 +1,4 @@
+status: 200
+connection: keep
+
+GET /sse-once HTTP/1.1\r\nHost: example.test\r\n\r\n

@@ -1,0 +1,4 @@
+status: 200
+connection: close
+
+GET /sse-once HTTP/1.0\r\n\r\n

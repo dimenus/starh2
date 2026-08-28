@@ -95,12 +95,12 @@ For TLS, swap the endpoint and supply PEM bytes:
 
 <!-- doctest: config -->
 ```zig
-.endpoints = &.{.{ .tls_h2 = addr }},
+.endpoints = &.{.{ .tls = addr }},
 .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
 ```
 
-ALPN must reach `h2`. A peer that does not agree to HTTP/2 is refused at the
-handshake.
+ALPN prefers `h2` and falls back to `http/1.1`. A client that sends no ALPN
+is served HTTP/1.1. Cleartext HTTP/1.1 uses the `h1c` endpoint.
 
 ### Responses
 

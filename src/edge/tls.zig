@@ -150,6 +150,7 @@ fn rawPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub const alpn_h2 = "h2";
+pub const alpn_http11 = "http/1.1";
 pub const stream_buffer_size: usize = limits_mod.TLS_STREAM_BUFFER_SIZE;
 pub const cipher_chunk_size: usize = limits_mod.TLS_CIPHER_CHUNK_SIZE;
 pub const MaxHandshakeIterations: u32 = 4096;
@@ -171,10 +172,19 @@ pub fn isHttp2Alpn(selected: ?[]const u8) bool {
     return std.mem.eql(u8, proto, alpn_h2);
 }
 
+pub fn isHttp11Alpn(selected: ?[]const u8) bool {
+    const proto = selected orelse return true;
+    return std.mem.eql(u8, proto, alpn_http11);
+}
+
 const AlpnCtx = struct {};
 
-fn selectH2Only(_: *AlpnCtx, _: *boring.ssl.SslRef, input: []const u8) boring.ssl.AlpnSelectResult {
+/// Prefer `h2`. Fall back to `http/1.1`. An empty client list (no ALPN) selects
+/// `http/1.1`. Unknown-only lists are fatal.
+pub fn selectAlpn(_: *AlpnCtx, _: *boring.ssl.SslRef, input: []const u8) boring.ssl.AlpnSelectResult {
+    if (input.len == 0) return .{ .selected = alpn_http11 };
     var index: usize = 0;
+    var h1: ?[]const u8 = null;
     while (index < input.len) {
         const protocol_len = input[index];
         const start = index + 1;
@@ -182,8 +192,10 @@ fn selectH2Only(_: *AlpnCtx, _: *boring.ssl.SslRef, input: []const u8) boring.ss
         if (next > input.len) break;
         const proto = input[start..next];
         if (std.mem.eql(u8, proto, alpn_h2)) return .{ .selected = proto };
+        if (std.mem.eql(u8, proto, alpn_http11)) h1 = proto;
         index = next;
     }
+    if (h1) |proto| return .{ .selected = proto };
     return .alertFatal;
 }
 
@@ -202,7 +214,7 @@ pub const Acceptor = struct {
         builder.usePrivateKey(&key) catch return error.InvalidCertificate;
         builder.checkPrivateKey() catch return error.InvalidCertificate;
         builder.setVerify(boring.ssl.VerifyMode.none);
-        builder.setAlpnSelectCallback(AlpnCtx, &alpn_select_ctx, selectH2Only) catch
+        builder.setAlpnSelectCallback(AlpnCtx, &alpn_select_ctx, selectAlpn) catch
             return error.InvalidCertificate;
 
         return .{ .tls_context = builder.build() };
@@ -234,6 +246,41 @@ pub fn loopbackClientConnector() !ClientConnector {
     errdefer builder.deinit();
     builder.setVerify(boring.ssl.VerifyMode.none);
     try builder.setClientAlpnProtocol(alpn_h2);
+    return .initWithBuilder(&builder);
+}
+
+/// Loopback HTTP/1.1 client. Production never uses this — TlsPump owns the
+/// server SSL object.
+pub fn loopbackH1ClientConnector() !ClientConnector {
+    boring.init();
+    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
+    errdefer builder.deinit();
+    builder.setVerify(boring.ssl.VerifyMode.none);
+    try builder.setClientAlpnProtocol(alpn_http11);
+    return .initWithBuilder(&builder);
+}
+
+/// Client offers `h2` then `http/1.1`. The server must select `h2`.
+pub fn loopbackBothAlpnClientConnector() !ClientConnector {
+    boring.init();
+    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
+    errdefer builder.deinit();
+    builder.setVerify(boring.ssl.VerifyMode.none);
+    var wire: [1 + 2 + 1 + 8]u8 = undefined;
+    wire[0] = 2;
+    @memcpy(wire[1..][0..2], alpn_h2);
+    wire[3] = 8;
+    @memcpy(wire[4..][0..8], alpn_http11);
+    try builder.setClientAlpnProtos(&wire);
+    return .initWithBuilder(&builder);
+}
+
+/// Client sends no ALPN. The server must select `http/1.1`.
+pub fn loopbackNoAlpnClientConnector() !ClientConnector {
+    boring.init();
+    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
+    errdefer builder.deinit();
+    builder.setVerify(boring.ssl.VerifyMode.none);
     return .initWithBuilder(&builder);
 }
 
@@ -363,13 +410,26 @@ pub const Conn = struct {
             };
         }
         self.drainToSocket() catch return error.TlsHandshakeFailed;
-        if (!isHttp2Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
     }
 
-    /// Single-task client handshake: this task is the ciphertext source.
-    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
-        self.bindIo(io);
-        try self.setupConnect(connector);
+    pub fn handshakeAny(self: *Conn, io: std.Io) !void {
+        try self.handshake(io);
+    }
+
+    /// Drain leftover plaintext after handshake (a pipelined request). Stops
+    /// on WantRead. Never grows `buf`.
+    pub fn drainLeftoverPlain(self: *Conn, buf: []u8) usize {
+        var n: usize = 0;
+        while (n < buf.len) {
+            const r = self.ssl.read(buf[n..]) catch break;
+            if (r == 0) break;
+            n += r;
+        }
+        return n;
+    }
+
+    fn handshakeLoop(self: *Conn, io: std.Io) !void {
+        _ = io;
         var iterations: u32 = 0;
         while (!self.ssl.isHandshakeComplete()) {
             iterations += 1;
@@ -386,7 +446,30 @@ pub const Conn = struct {
             };
         }
         self.drainToSocket() catch return error.TlsHandshakeFailed;
+    }
+
+    /// Single-task client handshake: this task is the ciphertext source.
+    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        self.bindIo(io);
+        try self.setupConnect(connector);
+        try self.handshakeLoop(io);
         if (!isHttp2Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
+    }
+
+    /// Single-task HTTP/1.1 client handshake. The test client is the
+    /// ciphertext source; the server still owns TlsPump on its SSL object.
+    pub fn handshakeClientH1(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        self.bindIo(io);
+        try self.setupConnect(connector);
+        try self.handshakeLoop(io);
+        if (!isHttp11Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
+    }
+
+    /// Handshake with no ALPN assertion. The caller checks `selectedAlpn`.
+    pub fn handshakeClientAny(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        self.bindIo(io);
+        try self.setupConnect(connector);
+        try self.handshakeLoop(io);
     }
 
     pub fn deinit(self: *Conn) void {
@@ -1338,6 +1421,28 @@ test "h2 ALPN matcher" {
     try std.testing.expect(isHttp2Alpn("h2"));
     try std.testing.expect(!isHttp2Alpn("http/1.1"));
     try std.testing.expect(!isHttp2Alpn(null));
+    try std.testing.expect(isHttp11Alpn(null));
+    try std.testing.expect(isHttp11Alpn("http/1.1"));
+    try std.testing.expect(!isHttp11Alpn("h2"));
+}
+
+test "ALPN select prefers h2, falls back to http/1.1, empty selects h1" {
+    var ctx: AlpnCtx = .{};
+    var ssl: boring.ssl.SslRef = undefined;
+    const both = [_]u8{ 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    switch (selectAlpn(&ctx, &ssl, &both)) {
+        .selected => |p| try std.testing.expectEqualStrings(alpn_h2, p),
+        else => return error.ExpectedH2,
+    }
+    const h1_only = [_]u8{ 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    switch (selectAlpn(&ctx, &ssl, &h1_only)) {
+        .selected => |p| try std.testing.expectEqualStrings(alpn_http11, p),
+        else => return error.ExpectedH1,
+    }
+    switch (selectAlpn(&ctx, &ssl, &.{})) {
+        .selected => |p| try std.testing.expectEqualStrings(alpn_http11, p),
+        else => return error.ExpectedH1Empty,
+    }
 }
 
 test "pump_trace moves on read_free-empty yield" {

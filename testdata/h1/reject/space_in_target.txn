@@ -1,0 +1,4 @@
+status: 400
+connection: close
+
+GET /foo bar HTTP/1.1\r\nHost: h\r\n\r\n

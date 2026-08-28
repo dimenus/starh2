@@ -914,7 +914,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, args.cert, gpa, .limited(64 * 1024));
         key_pem = try std.Io.Dir.cwd().readFileAlloc(io, args.key, gpa, .limited(16 * 1024));
         tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
-        break :blk .{ .tls_h2 = addr };
+        break :blk .{ .tls = addr };
     } else .{ .h2c_prior_knowledge = addr };
 
     var server = try starh2.Server.init(server_gpa, rt.io(), .{
