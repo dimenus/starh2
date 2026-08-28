@@ -62,6 +62,22 @@ fn curl(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !std.proce
         abort("curl failed to start", .{});
 }
 
+fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ns: u64) !std.process.Child.Term {
+    const pid = child.id orelse return error.AlreadyGone;
+    const Wd = struct {
+        fn run(p: std.process.Child.Id, inner: std.Io, ns: u64) void {
+            inner.sleep(.fromNanoseconds(ns), .awake) catch return;
+            std.posix.kill(p, std.posix.SIG.KILL) catch {};
+        }
+    };
+    var wd = io.concurrent(Wd.run, .{ pid, io, timeout_ns }) catch {
+        return child.wait(io);
+    };
+    const term = try child.wait(io);
+    wd.cancel(io);
+    return term;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -120,12 +136,15 @@ pub fn main(init: std.process.Init) !void {
         io.sleep(.fromMilliseconds(500), .awake) catch {};
         const pid = child.id orelse abort("server was already gone before SIGTERM", .{});
         std.posix.kill(pid, std.posix.SIG.TERM) catch abort("SIGTERM failed", .{});
-        const term = child.wait(io) catch abort("wait after SIGTERM failed", .{});
+        const term = waitChildBounded(&child, io, 10 * std.time.ns_per_s) catch abort("wait after SIGTERM failed", .{});
         reaped = true;
         g_pid = null;
         if (sse.id != null) sse.kill(io);
         switch (term) {
             .exited => {},
+            .signal => |s| {
+                if (s == std.posix.SIG.KILL) abort("server hung >10s after SIGTERM with /h1-sse open", .{});
+            },
             else => abort("server did not exit after SIGTERM with SSE open: {any}", .{term}),
         }
     }
@@ -170,7 +189,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (child.id) |pid| std.posix.kill(pid, std.posix.SIG.TERM) catch {};
-        _ = child.wait(io) catch {};
+        _ = waitChildBounded(&child, io, 10 * std.time.ns_per_s) catch {};
         reaped = true;
         g_pid = null;
     }

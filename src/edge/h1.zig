@@ -15,16 +15,21 @@ const parser = @import("../http1/parser.zig");
 const connection = @import("connection.zig");
 const tls_edge = @import("tls.zig");
 const io_queue = @import("io_queue.zig");
+const wire_pump = @import("wire_pump.zig");
+const limits_mod = @import("../core/wire_const.zig");
 
 const live: u8 = 0;
 const reaper_owned: u8 = 1;
 const reported: u8 = 2;
+
+var no_shutdown_event: zio.ResetEvent = .init;
 
 pub const ChannelMutation = enum {
     none,
     m2_no_chunk_end,
     m3_ignore_close,
     m4_keep_after_400,
+    m5_skip_validate,
     m6_buffer_sse,
     m7_grow_head,
 };
@@ -86,8 +91,28 @@ const H1Conn = struct {
     committed: bool = false,
     occupies: bool = false,
     want_close: bool = false,
+    finished: bool = false,
+    no_payload: bool = false,
+    resp_status: u16 = 0,
     request_held: usize = 0,
     socket_closed: bool = false,
+    dispatch_headers: []request.Header = &.{},
+
+    tls_pump: ?*tls_edge.Pump = null,
+    tls_pump_storage: []u8 = &.{},
+    tls_recv_buf: []u8 = &.{},
+    tls_chunk_storage: []u8 = &.{},
+    tls_to_actor_buf: []wire_pump.WireChunk = &.{},
+    tls_write_ch_buf: []wire_pump.WireChunk = &.{},
+    tls_ack_buf: []wire_pump.WriteCompletion = &.{},
+    tls_read_free_buf: []u32 = &.{},
+    tls_to_actor: zio.Channel(wire_pump.WireChunk) = undefined,
+    tls_write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
+    tls_acks: zio.Channel(wire_pump.WriteCompletion) = undefined,
+    tls_read_free: std.Io.Queue(u32) = undefined,
+    tls_site: std.atomic.Value(u8) = .init(0),
+    tls_live_handlers: std.atomic.Value(usize) = .init(0),
+    tls_out: []u8 = &.{},
 
     fn deinit(self: *H1Conn) void {
         std.debug.assert(!self.slot.in_use);
@@ -111,6 +136,18 @@ const H1Conn = struct {
         self.gpa.free(self.path_q_buf);
         self.gpa.free(self.carry_buf);
         self.gpa.free(self.pending_storage);
+        if (self.tls_pump) |p| {
+            p.shutdownCq();
+            self.gpa.destroy(p);
+            self.tls_pump = null;
+        }
+        if (self.tls_recv_buf.len != 0) self.gpa.free(self.tls_recv_buf);
+        if (self.tls_chunk_storage.len != 0) self.gpa.free(self.tls_chunk_storage);
+        if (self.tls_to_actor_buf.len != 0) self.gpa.free(self.tls_to_actor_buf);
+        if (self.tls_write_ch_buf.len != 0) self.gpa.free(self.tls_write_ch_buf);
+        if (self.tls_ack_buf.len != 0) self.gpa.free(self.tls_ack_buf);
+        if (self.tls_read_free_buf.len != 0) self.gpa.free(self.tls_read_free_buf);
+        if (self.tls_out.len != 0) self.gpa.free(self.tls_out);
         self.* = undefined;
     }
 };
@@ -121,7 +158,8 @@ pub fn serve(
     tls: ?*tls_edge.Conn,
     leftover: []const u8,
 ) std.Io.Cancelable!void {
-    var conn = initConn(stream, config, tls) catch {
+    var conn: H1Conn = undefined;
+    initConn(&conn, stream, config, tls) catch {
         if (tls) |t| {
             t.deinit();
             config.gpa.destroy(t);
@@ -130,11 +168,11 @@ pub fn serve(
         return;
     };
     defer conn.deinit();
-    if (tls) |t| t.bindIo(config.io);
+    if (tls != null) startTlsPump(&conn) catch {
+        return;
+    };
     if (leftover.len != 0) {
-        const n = @min(leftover.len, conn.carry_buf.len);
-        @memcpy(conn.carry_buf[0..n], leftover[0..n]);
-        conn.carry_len = n;
+        stashCarry(&conn, leftover, 0) catch return;
     }
     runLoop(&conn) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -142,7 +180,7 @@ pub fn serve(
     };
 }
 
-fn initConn(stream: std.Io.net.Stream, config: connection.ConnConfig, tls: ?*tls_edge.Conn) !H1Conn {
+fn initConn(self: *H1Conn, stream: std.Io.net.Stream, config: connection.ConnConfig, tls: ?*tls_edge.Conn) !void {
     const gpa = config.gpa;
     const head_buf = try gpa.alloc(u8, config.limits.h1_head_bytes);
     errdefer gpa.free(head_buf);
@@ -165,7 +203,7 @@ fn initConn(stream: std.Io.net.Stream, config: connection.ConnConfig, tls: ?*tls
     const pending_storage = try gpa.alloc(u8, config.limits.outbound_bytes_per_stream);
     errdefer gpa.free(pending_storage);
 
-    var self: H1Conn = .{
+    self.* = .{
         .config = config,
         .stream = stream,
         .tls = tls,
@@ -191,7 +229,50 @@ fn initConn(stream: std.Io.net.Stream, config: connection.ConnConfig, tls: ?*tls
         self.writer = stream.writer(config.io, self.write_buf);
         self.reader_bound = true;
     }
-    return self;
+}
+
+fn tlsNetHandle(h: std.Io.net.Socket.Handle) zio.ev.Backend.NetHandle {
+    return if (@typeInfo(zio.ev.Backend.NetHandle) == .pointer) @ptrCast(h) else h;
+}
+
+fn startTlsPump(self: *H1Conn) !void {
+    const t = self.tls orelse return;
+    const gpa = self.gpa;
+    self.tls_recv_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
+    self.tls_chunk_storage = try gpa.alloc(u8, limits_mod.WIRE_CHUNK_SIZE);
+    self.tls_to_actor_buf = try gpa.alloc(wire_pump.WireChunk, 1);
+    self.tls_write_ch_buf = try gpa.alloc(wire_pump.WireChunk, 4);
+    self.tls_ack_buf = try gpa.alloc(wire_pump.WriteCompletion, 4);
+    self.tls_read_free_buf = try gpa.alloc(u32, 1);
+    self.tls_out = try gpa.alloc(u8, limits_mod.WIRE_CHUNK_SIZE);
+
+    self.tls_to_actor = .init(self.tls_to_actor_buf);
+    self.tls_write_ch = .init(self.tls_write_ch_buf);
+    self.tls_acks = .init(self.tls_ack_buf);
+    self.tls_read_free = .init(self.tls_read_free_buf);
+
+    const pump = try gpa.create(tls_edge.Pump);
+    errdefer gpa.destroy(pump);
+    pump.* = .{
+        .io = self.io,
+        .conn = t,
+        .to_actor = &self.tls_to_actor,
+        .write_ch = &self.tls_write_ch,
+        .sock = tlsNetHandle(self.stream.socket.handle),
+        .recv_buf = self.tls_recv_buf,
+        .site = &self.tls_site,
+        .completions = &self.tls_acks,
+        .gpa = gpa,
+        .chunk_storage = self.tls_chunk_storage,
+        .n_chunks = 1,
+        .read_free = &self.tls_read_free,
+        .live_task_handlers = &self.tls_live_handlers,
+    };
+    if (!pump.start()) {
+        pump.shutdownCq();
+        return error.TlsPumpStartFailed;
+    }
+    self.tls_pump = pump;
 }
 
 fn runLoop(self: *H1Conn) !void {
@@ -204,6 +285,9 @@ fn runLoop(self: *H1Conn) !void {
         _ = self.arena.reset(.retain_capacity);
         self.acc.reset();
         self.committed = false;
+        self.finished = false;
+        self.no_payload = false;
+        self.resp_status = 0;
         self.framing = .content_length;
         self.pending_len = 0;
     }
@@ -255,21 +339,39 @@ fn serveOne(self: *H1Conn) !bool {
                 self.request_held = body.len;
             }
 
-            const st = parser.validateAsH2Fields(
-                head,
-                self.scheme,
-                self.field_scratch,
-                self.name_scratch,
-                self.path_q_buf,
-            );
-            if (st != 0) {
-                releaseRequest(self);
-                try writeError(self, st);
-                return false;
+            var headers: []const request.Header = head.headers;
+            var path = head.path;
+            var query = head.query;
+            var authority = head.authority;
+            if (test_channel_mutation != .m5_skip_validate) {
+                const v = parser.validateAsH2Fields(
+                    head,
+                    self.scheme,
+                    self.field_scratch,
+                    self.name_scratch,
+                    self.path_q_buf,
+                );
+                if (v.status != 0) {
+                    releaseRequest(self);
+                    try writeError(self, v.status);
+                    return false;
+                }
+                const regular_n = if (v.field_n > 4) v.field_n - 4 else 0;
+                var i: usize = 0;
+                while (i < regular_n) : (i += 1) {
+                    const f = self.field_scratch[4 + i];
+                    self.header_storage[i] = .{ .name = f.name, .value = f.value };
+                }
+                self.dispatch_headers = self.header_storage[0..regular_n];
+                headers = self.dispatch_headers;
+                if (v.path.len != 0) path = v.path;
+                query = v.query;
+                if (v.authority.len != 0) authority = v.authority;
             }
 
-            try dispatch(self, head, body);
+            try dispatch(self, head, body, headers, path, query, authority);
             releaseRequest(self);
+            if (test_channel_mutation == .m3_ignore_close) self.want_close = false;
             if (self.want_close or close_after) return false;
             return true;
         },
@@ -318,12 +420,12 @@ fn readHead(self: *H1Conn) !?HeadOutcome {
         switch (r) {
             .need_more => {},
             .head => |h| {
-                stashCarry(self, tmp[0..n], h.consumed);
+                try stashCarry(self, tmp[0..n], h.consumed);
                 return parseFilled(self);
             },
             .http09 => return .http09,
             .reject => |rj| {
-                stashCarry(self, tmp[0..n], rj.consumed);
+                try stashCarry(self, tmp[0..n], rj.consumed);
                 return .{ .reject = rj.status };
             },
         }
@@ -336,6 +438,7 @@ fn feedHead(self: *H1Conn, bytes: []const u8) parser.Accumulator.Feed {
             const new_buf = self.gpa.alloc(u8, self.acc.buf.len + bytes.len + 1024) catch {
                 return .{ .reject = .{ .status = 431, .consumed = 0 } };
             };
+            _ = test_gpa_allocs.fetchAdd(1, .monotonic);
             @memcpy(new_buf[0..self.acc.filled], self.acc.buf[0..self.acc.filled]);
             const old = self.head_buf;
             self.head_buf = new_buf;
@@ -352,7 +455,10 @@ fn parseFilled(self: *H1Conn) HeadOutcome {
         self.header_storage,
         self.field_scratch,
         .{
-            .head_bytes = self.config.limits.h1_head_bytes,
+            .head_bytes = if (test_channel_mutation == .m7_grow_head)
+                std.math.maxInt(usize)
+            else
+                self.config.limits.h1_head_bytes,
             .header_fields = self.config.limits.header_fields,
             .body_bytes = self.config.limits.request_body_bytes,
         },
@@ -383,7 +489,7 @@ fn readBody(self: *H1Conn, head: parser.Head) !?[]const u8 {
         const take = @min(n, need - got);
         @memcpy(self.body_buf[got .. got + take], tmp[0..take]);
         got += take;
-        if (take < n) stashCarry(self, tmp[0..n], take);
+        if (take < n) try stashCarry(self, tmp[0..n], take);
     }
     return self.body_buf[0..need];
 }
@@ -398,50 +504,103 @@ fn shiftCarry(self: *H1Conn, consumed: usize) void {
     self.carry_len = remain;
 }
 
-fn stashCarry(self: *H1Conn, chunk: []const u8, consumed: usize) void {
+fn stashCarry(self: *H1Conn, chunk: []const u8, consumed: usize) !void {
     if (consumed >= chunk.len) {
         return;
     }
     const rest = chunk[consumed..];
-    const n = @min(rest.len, self.carry_buf.len);
-    @memcpy(self.carry_buf[0..n], rest[0..n]);
-    self.carry_len = n;
+    if (rest.len > self.carry_buf.len) {
+        const new_buf = try self.gpa.realloc(self.carry_buf, rest.len);
+        _ = test_gpa_allocs.fetchAdd(1, .monotonic);
+        self.carry_buf = new_buf;
+    }
+    @memcpy(self.carry_buf[0..rest.len], rest);
+    self.carry_len = rest.len;
+}
+
+fn takeTlsPending(pump: *tls_edge.Pump, buf: []u8) ?usize {
+    const chunk = pump.pending_read orelse return null;
+    const n = @min(buf.len, chunk.len);
+    @memcpy(buf[0..n], chunk.bytes[0..n]);
+    if (n < chunk.len) {
+        pump.pending_read = .{ .bytes = chunk.bytes[n..], .len = chunk.len - n };
+    } else {
+        pump.pending_read = null;
+    }
+    return n;
+}
+
+fn driveTlsUntilIdle(self: *H1Conn) response.ResponseError!void {
+    const pump = self.tls_pump orelse return;
+    while (pump.pending_n > 0 or pump.send_armed) {
+        waitTlsCq(self, null) catch return error.WriteFailed;
+        if (pump.pending_n > 0) {
+            if (!pump.drivePending()) return error.WriteFailed;
+        }
+    }
+}
+
+fn waitTlsCq(self: *H1Conn, deadline_ns: ?u64) !void {
+    const pump = self.tls_pump orelse return;
+    const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
+    const timeout: zio.Timeout = if (deadline_ns) |d| blk: {
+        const now = nowNs(self.io);
+        if (d <= now) return;
+        break :blk .{ .duration = .fromNanoseconds(d - now) };
+    } else .none;
+    const winner = zio.select(.{
+        .io = &pump.cq,
+        .timer = timeout,
+        .shutdown = shutdown_ev,
+    }) catch return error.Canceled;
+    switch (winner) {
+        .io => |r| {
+            const c = r catch {
+                if (pump.cq.isDrained()) return;
+                return;
+            };
+            _ = pump.onCqComplete(c);
+        },
+        .timer => {},
+        .shutdown => return error.Canceled,
+    }
+}
+
+fn readSomeTls(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
+    const pump = self.tls_pump orelse return error.TlsReadFailed;
+    if (takeTlsPending(pump, buf)) |n| return n;
+    if (pump.inbound_eof) return @as(usize, 0);
+    while (true) {
+        if (shutdownRequested(self)) return error.Canceled;
+        if (nowNs(self.io) >= deadline_ns) return null;
+        if (pump.pending_cipher != null and pump.pending_read == null) {
+            const bytes = pump.pending_cipher.?;
+            pump.pending_cipher = null;
+            if (!pump.ingestCipher(bytes)) return @as(usize, 0);
+        }
+        if (pump.pending_read == null and pump.conn.pendingInbound()) {
+            switch (pump.readOne()) {
+                .eof => return @as(usize, 0),
+                .ok, .want, .stuck => {},
+            }
+        }
+        if (takeTlsPending(pump, buf)) |n| return n;
+        if (pump.inbound_eof) return @as(usize, 0);
+        switch (pump.pollRecv()) {
+            .exit => return @as(usize, 0),
+            .progress => continue,
+            .none => {},
+        }
+        waitTlsCq(self, deadline_ns) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+        };
+        if (nowNs(self.io) >= deadline_ns) return null;
+    }
 }
 
 fn readSome(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
-    if (self.tls) |t| {
-        const Read = union(enum) {
-            data: anyerror!usize,
-            timer: std.Io.Cancelable!void,
-            shutdown: std.Io.Cancelable!void,
-        };
-        var result_buf: [3]Read = undefined;
-        var select = std.Io.Select(Read).init(self.io, &result_buf);
-        errdefer select.cancelDiscard();
-        const ReadFn = struct {
-            fn run(conn: *tls_edge.Conn, out: []u8) anyerror!usize {
-                return conn.readPlain(out);
-            }
-        };
-        try select.concurrent(.data, ReadFn.run, .{ t, buf });
-        const timeout: std.Io.Timeout = .{ .deadline = .{
-            .raw = std.Io.Timestamp.fromNanoseconds(@intCast(deadline_ns)),
-            .clock = .awake,
-        } };
-        try select.concurrent(.timer, waitTimer, .{ timeout, self.io });
-        if (self.config.shutdown_event) |ev| {
-            try select.concurrent(.shutdown, waitShutdown, .{ ev, self.io });
-        }
-        const selected = try select.await();
-        defer select.cancelDiscard();
-        return switch (selected) {
-            .data => |r| r catch |err| switch (err) {
-                error.TlsReadFailed => @as(usize, 0),
-                else => return err,
-            },
-            .timer => null,
-            .shutdown => error.Canceled,
-        };
+    if (self.tls != null) {
+        return readSomeTls(self, buf, deadline_ns);
     }
     var dest: [1][]u8 = .{buf};
     const Read = union(enum) {
@@ -491,7 +650,19 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 
-fn dispatch(self: *H1Conn, head: parser.Head, body: []const u8) !void {
+fn suppressPayload(method: request.Method, status: u16) bool {
+    return method == .HEAD or status < 200 or status == 204 or status == 304;
+}
+
+fn dispatch(
+    self: *H1Conn,
+    head: parser.Head,
+    body: []const u8,
+    headers: []const request.Header,
+    path: []const u8,
+    query: []const u8,
+    authority: []const u8,
+) !void {
     if (self.config.accounting) |a| {
         if (!a.tryAdmitStream()) {
             try writeError(self, 503);
@@ -536,14 +707,14 @@ fn dispatch(self: *H1Conn, head: parser.Head, body: []const u8) !void {
     const req: request.Request = .{
         .method = method,
         .scheme = self.scheme,
-        .authority = head.authority,
-        .path = head.path,
+        .authority = authority,
+        .path = path,
         .path_remainder = switch (matched) {
             .found => |f| f.path_remainder,
             else => "",
         },
-        .query = head.query,
-        .headers = head.headers,
+        .query = query,
+        .headers = headers,
         .body = body,
         .trailers = &.{},
         .arena = self.arena.allocator(),
@@ -575,7 +746,7 @@ fn dispatch(self: *H1Conn, head: parser.Head, body: []const u8) !void {
             .found => |f| {
                 var cr: response.CompleteResponse = .{ .inner = &self.job_resp };
                 f.handler.complete.runFn(f.handler.complete.ptr, &self.job_req, &cr) catch {
-                    if (!self.job_resp.committed) writeError(self, 500) catch {};
+                    if (!self.committed) writeError(self, 500) catch {};
                     self.want_close = true;
                 };
             },
@@ -596,7 +767,7 @@ fn dispatch(self: *H1Conn, head: parser.Head, body: []const u8) !void {
     const Job = struct {
         fn run(conn: *H1Conn) void {
             defer finishSlotFromTask(conn);
-            conn.job_handler.runFn(conn.job_handler.ptr, &conn.job_req, &conn.job_resp) catch {};
+            runTaskBody(conn);
         }
     };
     const handle = self.io.concurrent(Job.run, .{self}) catch {
@@ -610,17 +781,60 @@ fn dispatch(self: *H1Conn, head: parser.Head, body: []const u8) !void {
         return;
     };
     self.join = handle;
+    try waitDispatch(self);
+}
 
-    while (self.slot.in_use) {
-        if (shutdownRequested(self)) {
-            self.slot.terminal.setCause(.server_shutdown);
-            cancelJoin(self);
+fn runTaskBody(self: *H1Conn) void {
+    if (self.slot.terminal.cancel_flag.load(.acquire)) return;
+    if (self.slot.terminal.getCause() != null) return;
+    const run_res: anyerror!void = self.job_handler.runFn(self.job_handler.ptr, &self.job_req, &self.job_resp);
+    run_res catch {
+        if (self.slot.terminal.getCause() != null) return;
+        if (!self.job_resp.committed) {
+            self.job_resp.send(500, &.{}, "internal error") catch {};
+        } else if (!self.job_resp.finished) {
+            finishFraming(self) catch {};
+            self.want_close = true;
+            self.job_resp.finished = true;
         }
+    };
+    if (self.slot.terminal.getCause() == null and !self.job_resp.committed) {
+        self.job_resp.send(500, &.{}, "no response") catch {};
+    }
+}
+
+fn waitPeerByte(self: *H1Conn) anyerror!?usize {
+    var tmp: [256]u8 = undefined;
+    const far = nowNs(self.io) +% (365 * std.time.ns_per_s);
+    const n = try readSome(self, tmp[0..], far) orelse return @as(usize, 0);
+    if (n != 0) try stashCarry(self, tmp[0..n], 0);
+    return n;
+}
+
+fn waitDispatch(self: *H1Conn) !void {
+    var reaping = false;
+    while (self.slot.in_use) {
+        if (shutdownRequested(self) and !reaping) {
+            self.slot.terminal.setCause(.server_shutdown);
+            if (!cancelJoin(self)) {
+                finishSlot(self);
+                break;
+            }
+            reaping = true;
+        }
+        if (reaping) {
+            const sid = self.completion_ch.receive() catch return error.Canceled;
+            _ = sid;
+            finishSlot(self);
+            break;
+        }
+
         const Race = union(enum) {
             done: anyerror!u31,
             shutdown: std.Io.Cancelable!void,
+            peer: anyerror!?usize,
         };
-        var result_buf: [2]Race = undefined;
+        var result_buf: [3]Race = undefined;
         var select = std.Io.Select(Race).init(self.io, &result_buf);
         errdefer select.cancelDiscard();
         const Recv = struct {
@@ -632,6 +846,7 @@ fn dispatch(self: *H1Conn, head: parser.Head, body: []const u8) !void {
         if (self.config.shutdown_event) |ev| {
             try select.concurrent(.shutdown, waitShutdown, .{ ev, self.io });
         }
+        try select.concurrent(.peer, waitPeerByte, .{self});
         const selected = try select.await();
         defer select.cancelDiscard();
         switch (selected) {
@@ -645,7 +860,25 @@ fn dispatch(self: *H1Conn, head: parser.Head, body: []const u8) !void {
             },
             .shutdown => {
                 self.slot.terminal.setCause(.server_shutdown);
-                cancelJoin(self);
+                if (!cancelJoin(self)) {
+                    finishSlot(self);
+                    break;
+                }
+                reaping = true;
+            },
+            .peer => |r| {
+                const n = r catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => @as(?usize, 0),
+                };
+                if (n == null or n == 0) {
+                    self.slot.terminal.setCause(.connection_closed);
+                    if (!cancelJoin(self)) {
+                        finishSlot(self);
+                        break;
+                    }
+                    reaping = true;
+                }
             },
         }
     }
@@ -673,7 +906,7 @@ fn finishSlot(self: *H1Conn) void {
     if (self.config.accounting) |a| a.releaseStream();
 }
 
-fn cancelJoin(self: *H1Conn) void {
+fn cancelJoin(self: *H1Conn) bool {
     if (self.join) |handle| {
         const prev = self.slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
         if (prev == null) {
@@ -685,24 +918,24 @@ fn cancelJoin(self: *H1Conn) void {
                     .completion = &self.completion_ch,
                     .stream_id = 1,
                 });
-                if (!queued) {
-                    var h = handle;
-                    h.cancel(self.io);
-                    self.slot.completion_owner.store(reported, .release);
-                }
-            } else {
-                var h = handle;
-                h.cancel(self.io);
-                self.slot.completion_owner.store(reported, .release);
+                if (queued) return true;
             }
+            var h = handle;
+            h.cancel(self.io);
+            self.slot.completion_owner.store(reported, .release);
+            return false;
         }
     }
+    return false;
 }
 
 fn shutdownHandlers(self: *H1Conn) !void {
     if (!self.slot.in_use) return;
     self.slot.terminal.setCause(.server_shutdown);
-    cancelJoin(self);
+    if (!cancelJoin(self)) {
+        finishSlot(self);
+        return;
+    }
     while (self.slot.in_use) {
         const sid = self.completion_ch.receive() catch return error.Canceled;
         _ = sid;
@@ -710,27 +943,55 @@ fn shutdownHandlers(self: *H1Conn) !void {
     }
 }
 
+fn headerLineOk(name: []const u8, value: []const u8) bool {
+    for (name) |c| {
+        if (c == '\r' or c == '\n' or c == ':') return false;
+    }
+    for (value) |c| {
+        if (c == '\r' or c == '\n') return false;
+    }
+    return true;
+}
+
 fn sendCb(ctx: *anyopaque, _: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {
     const h: *Hctx = @ptrCast(@alignCast(ctx));
     const self = h.conn;
     if (self.committed) return error.ResponseCommitted;
+    for (headers) |hdr| {
+        if (!headerLineOk(hdr.name, hdr.value)) return error.InvalidHeader;
+    }
     self.committed = true;
-    self.framing = if (self.head.version == .http10) .close_delimited else .content_length;
-    if (self.head.version == .http10) self.want_close = true;
+    self.resp_status = status;
+    self.no_payload = suppressPayload(h.method, status);
+    if (self.head.version == .http10) {
+        self.framing = .close_delimited;
+        self.want_close = true;
+    } else {
+        self.framing = .content_length;
+    }
+    const cl: usize = if (h.method == .HEAD) body.len else if (self.no_payload) 0 else body.len;
     try writeStatus(self, status);
-    try writeCommonHeaders(self, headers, self.framing, body.len);
+    try writeCommonHeaders(self, headers, self.framing, cl);
     try writeRaw(self, "\r\n");
-    if (h.method != .HEAD and body.len != 0) try writeRaw(self, body);
+    if (!self.no_payload and body.len != 0) try writeRaw(self, body);
     try flushSink(self);
+    self.finished = true;
 }
 
 fn startCb(ctx: *anyopaque, _: u31, status: u16, headers: []const request.Header, sse: bool) response.ResponseError!void {
     const h: *Hctx = @ptrCast(@alignCast(ctx));
     const self = h.conn;
     if (self.committed) return error.ResponseCommitted;
+    for (headers) |hdr| {
+        if (!headerLineOk(hdr.name, hdr.value)) return error.InvalidHeader;
+    }
     self.committed = true;
+    self.resp_status = status;
+    self.no_payload = suppressPayload(h.method, status);
     if (sse) self.occupies = true;
-    if (self.head.version == .http10) {
+    if (self.no_payload) {
+        self.framing = .content_length;
+    } else if (self.head.version == .http10) {
         self.framing = .close_delimited;
         self.want_close = true;
     } else {
@@ -753,8 +1014,11 @@ fn writeCb(ctx: *anyopaque, _: u31, bytes: []const u8, end: bool, wait: bool, em
     const h: *Hctx = @ptrCast(@alignCast(ctx));
     const self = h.conn;
     _ = wait;
-    if (h.method == .HEAD) {
-        if (end) try finishFraming(self);
+    if (self.no_payload) {
+        if (end) {
+            try flushSink(self);
+            self.finished = true;
+        }
         return;
     }
     if (bytes.len != 0) {
@@ -817,13 +1081,14 @@ fn emitPending(self: *H1Conn) response.ResponseError!void {
 
 fn finishFraming(self: *H1Conn) response.ResponseError!void {
     try emitPending(self);
-    if (self.framing == .chunked) {
+    if (self.framing == .chunked and !self.no_payload) {
         if (test_channel_mutation != .m2_no_chunk_end) {
             try writeRaw(self, "0\r\n\r\n");
         }
     }
     try flushSink(self);
     if (self.framing == .close_delimited) self.want_close = true;
+    self.finished = true;
 }
 
 fn writeChunk(self: *H1Conn, data: []const u8) response.ResponseError!void {
@@ -843,6 +1108,12 @@ fn writeStatus(self: *H1Conn, status: u16) response.ResponseError!void {
 }
 
 fn writeHeaderLine(self: *H1Conn, name: []const u8, value: []const u8) response.ResponseError!void {
+    for (name) |c| {
+        if (c == '\r' or c == '\n' or c == ':') return error.InvalidHeader;
+    }
+    for (value) |c| {
+        if (c == '\r' or c == '\n') return error.InvalidHeader;
+    }
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{s}: {s}\r\n", .{ name, value }) catch return error.WriteFailed;
     try writeRaw(self, s);
@@ -859,6 +1130,9 @@ fn writeCommonHeaders(
         if (std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) continue;
         if (std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
         try writeHeaderLine(self, h.name, h.value);
+    }
+    if (self.resp_status != 0 and self.resp_status < 200) {
+        return;
     }
     switch (framing) {
         .content_length => {
@@ -894,14 +1168,30 @@ fn writeError(self: *H1Conn, status: u16) !void {
 }
 
 fn writeRaw(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
-    if (self.tls) |t| {
-        t.writePlain(bytes) catch return error.WriteFailed;
+    if (self.tls != null) {
+        try writeRawTls(self, bytes);
         return;
     }
     self.writer.interface.writeAll(bytes) catch return error.WriteFailed;
 }
 
+fn writeRawTls(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
+    const pump = self.tls_pump orelse return error.WriteFailed;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = @min(bytes.len - off, self.tls_out.len);
+        const owned = self.gpa.dupe(u8, bytes[off..][0..n]) catch return error.WriteFailed;
+        const chunk = wire_pump.WireChunk{ .bytes = owned, .len = n };
+        if (!pump.writeChunks(chunk)) return error.WriteFailed;
+        try driveTlsUntilIdle(self);
+        off += n;
+    }
+}
+
 fn flushSink(self: *H1Conn) response.ResponseError!void {
-    if (self.tls != null) return;
+    if (self.tls != null) {
+        try driveTlsUntilIdle(self);
+        return;
+    }
     self.writer.interface.flush() catch return error.WriteFailed;
 }

@@ -317,6 +317,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "starh2", .module = starh2_mod },
                 .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
             },
         }),
     });

@@ -249,6 +249,17 @@ pub fn loopbackClientConnector() !ClientConnector {
     return .initWithBuilder(&builder);
 }
 
+/// Loopback HTTP/1.1 client. Production never uses this — TlsPump owns the
+/// server SSL object.
+pub fn loopbackH1ClientConnector() !ClientConnector {
+    boring.init();
+    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
+    errdefer builder.deinit();
+    builder.setVerify(boring.ssl.VerifyMode.none);
+    try builder.setClientAlpnProtocol(alpn_http11);
+    return .initWithBuilder(&builder);
+}
+
 fn loadCertificateChain(builder: *boring.ssl.ContextBuilder, pem: []const u8) !void {
     var stack = boring.x509.X509.stackFromPem(pem) catch return error.InvalidCertificate;
     defer stack.deinit();
@@ -414,6 +425,30 @@ pub const Conn = struct {
         }
         self.drainToSocket() catch return error.TlsHandshakeFailed;
         if (!isHttp2Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
+    }
+
+    /// Single-task HTTP/1.1 client handshake. The test client is the
+    /// ciphertext source; the server still owns TlsPump on its SSL object.
+    pub fn handshakeClientH1(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        self.bindIo(io);
+        try self.setupConnect(connector);
+        var iterations: u32 = 0;
+        while (!self.ssl.isHandshakeComplete()) {
+            iterations += 1;
+            if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
+            self.drainToSocket() catch return error.TlsHandshakeFailed;
+            self.ssl.doHandshake() catch |err| switch (err) {
+                error.WantRead => {
+                    self.drainToSocket() catch return error.TlsHandshakeFailed;
+                    if (self.ssl.isHandshakeComplete()) break;
+                    self.feedFromSocket() catch return error.TlsHandshakeFailed;
+                },
+                error.WantWrite => {},
+                else => return error.TlsHandshakeFailed,
+            };
+        }
+        self.drainToSocket() catch return error.TlsHandshakeFailed;
+        if (!isHttp11Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
     }
 
     pub fn deinit(self: *Conn) void {

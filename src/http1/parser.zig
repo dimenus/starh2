@@ -189,14 +189,18 @@ pub fn parse(head: []const u8, storage: []Header, field_scratch: []hpack.HeaderF
     const target_end = std.mem.findScalar(u8, after_method, ' ') orelse return .{ .reject = 400 };
     if (target_end == 0) return .{ .reject = 400 };
     const target = after_method[0..target_end];
-    if (std.mem.findScalar(u8, target, ' ') != null) return .{ .reject = 400 };
+    for (target) |c| {
+        if (c <= 0x20) return .{ .reject = 400 };
+    }
 
     const version_tok = after_method[target_end + 1 ..];
     const version = parseVersion(version_tok) orelse {
-        if (std.mem.startsWith(u8, version_tok, "HTTP/") and version_tok.len >= 8) {
+        if (std.mem.startsWith(u8, version_tok, "HTTP/") and version_tok.len >= 8 and version_tok[5] != '1') {
             return .{ .reject = 505 };
         }
-        return .http09;
+        // A version token is present (two SPs on the request line). A token
+        // that is not HTTP/1.x is a malformed version, not HTTP/0.9.
+        return .{ .reject = 400 };
     };
 
     if (std.mem.eql(u8, method, "CONNECT")) return .{ .reject = 501 };
@@ -224,13 +228,9 @@ pub fn parse(head: []const u8, storage: []Header, field_scratch: []hpack.HeaderF
         return .{ .reject = 400 };
     if (scanned.status) |st| return .{ .reject = st };
 
-    var host = scanned.host;
-    if (authority_from_target.len != 0) {
-        if (host.len != 0 and !eqlIgnoreCase(host, authority_from_target)) {
-            return .{ .reject = 400 };
-        }
-        if (host.len == 0) host = authority_from_target;
-    }
+    // RFC 9112: absolute-form request-target authority replaces Host.
+    const host = if (authority_from_target.len != 0) authority_from_target else scanned.host;
+    if (host.len != 0 and !hostOk(host)) return .{ .reject = 400 };
 
     if (version == .http11 and host.len == 0) return .{ .reject = 400 };
 
@@ -254,16 +254,25 @@ pub fn parse(head: []const u8, storage: []Header, field_scratch: []hpack.HeaderF
 
 /// Build the `validateRequestFields` input: lowercase names, hop-by-hop
 /// stripped, synthetic `:method` / `:scheme` / `:authority` / `:path`.
-/// Returns the mapped reject status, or 0 on success.
+pub const Validated = struct {
+    status: u16,
+    field_n: usize = 0,
+    path: []const u8 = "",
+    query: []const u8 = "",
+    authority: []const u8 = "",
+};
+
+/// Returns `.status == 0` on success. `field_scratch[4..field_n]` are the
+/// lowercase regular headers after hop-by-hop strip.
 pub fn validateAsH2Fields(
     head: Head,
     scheme: []const u8,
     field_scratch: []hpack.HeaderField,
     name_scratch: []u8,
     path_q_buf: []u8,
-) u16 {
+) Validated {
     var n: usize = 0;
-    if (n + 4 > field_scratch.len) return 431;
+    if (n + 4 > field_scratch.len) return .{ .status = 431 };
 
     field_scratch[n] = .{ .name = ":method", .value = head.method_raw };
     n += 1;
@@ -277,8 +286,8 @@ pub fn validateAsH2Fields(
     var name_off: usize = 0;
     for (head.headers) |h| {
         if (isHopByHop(h.name)) continue;
-        if (n >= field_scratch.len) return 431;
-        if (name_off + h.name.len > name_scratch.len) return 431;
+        if (n >= field_scratch.len) return .{ .status = 431 };
+        if (name_off + h.name.len > name_scratch.len) return .{ .status = 431 };
         const lower = name_scratch[name_off..][0..h.name.len];
         _ = std.ascii.lowerString(lower, h.name);
         name_off += h.name.len;
@@ -286,12 +295,18 @@ pub fn validateAsH2Fields(
         n += 1;
     }
 
-    _ = fields_mod.validateRequestFields(field_scratch[0..n]) catch |err| switch (err) {
-        error.PathTooLong => return 400,
-        error.HeaderTooLarge => return 431,
-        error.ProtocolError => return 400,
+    const v = fields_mod.validateRequestFields(field_scratch[0..n]) catch |err| return switch (err) {
+        error.PathTooLong => .{ .status = 400, .field_n = n },
+        error.HeaderTooLarge => .{ .status = 431, .field_n = n },
+        error.ProtocolError => .{ .status = 400, .field_n = n },
     };
-    return 0;
+    return .{
+        .status = 0,
+        .field_n = n,
+        .path = v.path,
+        .query = v.query,
+        .authority = v.authority,
+    };
 }
 
 pub fn colonPath(head: Head, buf: []u8) []const u8 {
@@ -408,6 +423,14 @@ fn scanFields(head: []const u8, start: usize, storage: []Header, limits: Limits)
                 .expect_100 = expect_100,
                 .status = 400,
             };
+            if (!hostOk(value)) return .{
+                .headers = storage[0..n],
+                .content_length = content_length,
+                .host = host,
+                .connection_close = connection_close,
+                .expect_100 = expect_100,
+                .status = 400,
+            };
             host = value;
         } else if (eqlIgnoreCase(name, "connection")) {
             if (connectionHasClose(value)) connection_close = true;
@@ -458,6 +481,14 @@ fn scanFields(head: []const u8, start: usize, storage: []Header, limits: Limits)
         .expect_100 = expect_100,
         .status = null,
     };
+}
+
+fn hostOk(h: []const u8) bool {
+    if (h.len == 0) return false;
+    for (h) |c| {
+        if (c == ',' or c == ' ' or c == '\t' or c < 0x21 or c == 0x7f) return false;
+    }
+    return true;
 }
 
 fn parseVersion(tok: []const u8) ?Version {
@@ -524,7 +555,7 @@ fn isChunkedOnly(value: []const u8) bool {
 fn parseContentLength(value: []const u8) ?u64 {
     if (value.len == 0) return null;
     if (test_mutation == .m8_lenient_cl) {
-        return std.fmt.parseInt(u64, trimOws(value), 0) catch null;
+        return std.fmt.parseInt(u64, trimOws(value), 10) catch null;
     }
     for (value) |c| {
         if (c < '0' or c > '9') return null;
@@ -603,6 +634,7 @@ pub fn reasonPhrase(status: u16) []const u8 {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -737,6 +769,24 @@ test "accept: absolute-form reduces to path + authority" {
     try std.testing.expectEqualStrings("host", h.authority);
 }
 
+test "accept: absolute-form authority replaces a mismatched Host" {
+    const h = try expectOk("GET http://target.example/hello HTTP/1.1\r\nHost: other.example\r\n\r\n");
+    try std.testing.expectEqualStrings("/hello", h.path);
+    try std.testing.expectEqualStrings("target.example", h.authority);
+}
+
+test "cut: malformed version is 400 not HTTP/0.9" {
+    try expectReject("GET / HTTX/1.1\r\nHost: h\r\n\r\n", 400);
+}
+
+test "cut: tab in request-target is 400" {
+    try expectReject("GET /\tfoo HTTP/1.1\r\nHost: h\r\n\r\n", 400);
+}
+
+test "cut: comma in Host is 400" {
+    try expectReject("GET / HTTP/1.1\r\nHost: good.example,evil.example\r\n\r\n", 400);
+}
+
 test "accept: leading CRLF" {
     const h = try expectOk("\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n");
     try std.testing.expectEqualStrings("/", h.path);
@@ -793,7 +843,7 @@ test "validateRequestFields is called on the h1 field list" {
     var scratch: [16]hpack.HeaderField = undefined;
     var names: [64]u8 = undefined;
     var path_q: [64]u8 = undefined;
-    try std.testing.expectEqual(@as(u16, 0), validateAsH2Fields(h, "http", &scratch, &names, &path_q));
+    try std.testing.expectEqual(@as(u16, 0), validateAsH2Fields(h, "http", &scratch, &names, &path_q).status);
 }
 
 var buf_scratch: [4096]u8 = undefined;
