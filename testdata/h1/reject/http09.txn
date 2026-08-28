@@ -1,0 +1,4 @@
+status: none
+connection: close
+
+GET /\r\n

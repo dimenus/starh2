@@ -28,14 +28,16 @@ const zio = @import("zio");
 const limits_mod = @import("../core/limits.zig");
 const router_mod = @import("../http/router.zig");
 const connection = @import("connection.zig");
+const h1 = @import("h1.zig");
 const slab_pool = @import("slab_pool.zig");
 const brotli = @import("../http/brotli.zig");
 const tls_edge = @import("tls.zig");
 pub const EndpointAddress = std.Io.net.IpAddress;
 
 pub const EndpointConfig = union(enum) {
-    tls_h2: EndpointAddress,
+    tls: EndpointAddress,
     h2c_prior_knowledge: EndpointAddress,
+    h1c: EndpointAddress,
 };
 
 pub const TlsConfig = struct {
@@ -129,7 +131,7 @@ pub const Server = struct {
 
         var need_tls = false;
         for (config.endpoints) |ep| {
-            if (ep == .tls_h2) need_tls = true;
+            if (ep == .tls) need_tls = true;
         }
         if (need_tls and config.tls == null) return error.InvalidConfig;
 
@@ -244,8 +246,9 @@ pub const Server = struct {
 
         for (self.endpoints, 0..) |endpoint, i| {
             const address = switch (endpoint) {
-                .tls_h2 => |value| value,
+                .tls => |value| value,
                 .h2c_prior_knowledge => |value| value,
+                .h1c => |value| value,
             };
             self.listeners[i] = address.listen(self.io, .{ .reuse_address = true }) catch return error.ListenFailed;
             self.local_addrs[i] = self.listeners[i].socket.address;
@@ -273,8 +276,9 @@ pub const Server = struct {
 
         for (self.endpoints, 0..) |endpoint, i| {
             const mode: connection.Mode = switch (endpoint) {
-                .tls_h2 => .tls_h2,
+                .tls => .tls,
                 .h2c_prior_knowledge => .h2c,
+                .h1c => .h1c,
             };
             accept_group.concurrent(self.io, acceptLoop, .{ self, i, mode, &connection_group }) catch {
                 accept_group.cancel(self.io);
@@ -326,7 +330,113 @@ pub const Server = struct {
 
     fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
+        if (config.mode == .h1c) return h1.serve(stream, config, null, &.{});
+        if (config.mode == .tls) return serveTlsThenBranch(stream, config);
         return connection.serveAccepted(stream, config);
+    }
+
+    fn serveTlsThenBranch(stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
+        const acceptor = config.tls_acceptor orelse {
+            stream.close(config.io);
+            return;
+        };
+        const tls_conn = config.gpa.create(tls_edge.Conn) catch {
+            if (config.handshake_held) {
+                if (config.accounting) |a| a.releaseHandshake();
+            }
+            stream.close(config.io);
+            return;
+        };
+        tls_conn.initTcp(stream);
+        tls_conn.setupAccept(acceptor) catch {
+            config.gpa.destroy(tls_conn);
+            if (config.handshake_held) {
+                if (config.accounting) |a| a.releaseHandshake();
+            }
+            stream.close(config.io);
+            return;
+        };
+
+        handshakeWithTimeout(tls_conn, config) catch {
+            tls_conn.deinit();
+            config.gpa.destroy(tls_conn);
+            if (config.handshake_held) {
+                if (config.accounting) |a| a.releaseHandshake();
+            }
+            stream.close(config.io);
+            return;
+        };
+        if (config.handshake_held) {
+            if (config.accounting) |a| a.releaseHandshake();
+        }
+
+        var leftover_buf: [16 * 1024]u8 = undefined;
+        const leftover_n = tls_conn.drainLeftoverPlain(&leftover_buf);
+        const leftover = leftover_buf[0..leftover_n];
+
+        if (tls_edge.isHttp2Alpn(tls_conn.ssl.selectedAlpn())) {
+            const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {
+                tls_conn.deinit();
+                config.gpa.destroy(tls_conn);
+                stream.close(config.io);
+                return;
+            };
+            var cfg = config;
+            cfg.handshake_held = false;
+            cfg.tls_ready = tls_conn;
+            cfg.tls_leftover = owned;
+            connection.serveAccepted(stream, cfg) catch |err| {
+                if (owned.len != 0) config.gpa.free(owned);
+                return err;
+            };
+            if (owned.len != 0) config.gpa.free(owned);
+            return;
+        }
+
+        const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {
+            tls_conn.deinit();
+            config.gpa.destroy(tls_conn);
+            stream.close(config.io);
+            return;
+        };
+        defer if (owned.len != 0) config.gpa.free(owned);
+        var cfg = config;
+        cfg.handshake_held = false;
+        return h1.serve(stream, cfg, tls_conn, owned);
+    }
+
+    fn handshakeWithTimeout(tls_conn: *tls_edge.Conn, config: connection.ConnConfig) !void {
+        const Hs = union(enum) {
+            hs: anyerror!void,
+            timer: std.Io.Cancelable!void,
+        };
+        const Handshake = struct {
+            fn run(conn: *tls_edge.Conn, inner_io: std.Io) anyerror!void {
+                try conn.handshakeAny(inner_io);
+            }
+        };
+        var result_buf: [2]Hs = undefined;
+        var select = std.Io.Select(Hs).init(config.io, &result_buf);
+        errdefer select.cancelDiscard();
+        try select.concurrent(.hs, Handshake.run, .{ tls_conn, config.io });
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(config.limits.preface_timeout_ns)),
+            .clock = .awake,
+        } };
+        try select.concurrent(.timer, struct {
+            fn run(t: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
+                return t.sleep(io);
+            }
+        }.run, .{ timeout, config.io });
+        const selected = try select.await();
+        defer select.cancelDiscard();
+        switch (selected) {
+            .hs => |result| try result,
+            .timer => |result| {
+                try result;
+                return error.TlsHandshakeTimeout;
+            },
+        }
     }
 
     /// Accept until shutdown. One loop per endpoint.
@@ -375,7 +485,7 @@ pub const Server = struct {
             }
 
             var handshake_held = false;
-            if (mode == .tls_h2) {
+            if (mode == .tls) {
                 if (!self.accounting.tryAdmitHandshake()) {
                     _ = self.active_connections.fetchSub(1, .acq_rel);
                     stream.close(self.io);

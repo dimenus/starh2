@@ -1,0 +1,5 @@
+status: 200
+connection: keep
+body: ok
+
+GET / HTTP/1.1\r\nHost: example.test\r\nRange: bytes=0-1\r\n\r\n

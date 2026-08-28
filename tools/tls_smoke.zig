@@ -2,7 +2,7 @@
 //!
 //! # Why this exists, and why it is not a Zig test
 //!
-//! `zig build test` never executes the TLS edge. No test binds a `tls_h2`
+//! `zig build test` never executes the TLS edge. No test binds a `tls`
 //! endpoint, so `handshakeTls`, `TlsPump`, and leftover-preface drain are
 //! unreachable from the suite. That was proven, not assumed: an always-false
 //! assert placed inside the TLS handshake left the suite green, and aborted

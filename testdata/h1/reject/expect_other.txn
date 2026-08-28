@@ -1,0 +1,4 @@
+status: 417
+connection: close
+
+POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nExpect: 100-wait\r\n\r\n

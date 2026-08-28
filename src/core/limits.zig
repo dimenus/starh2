@@ -66,6 +66,8 @@ pub const Terms = struct {
     /// Concurrent brotli contexts × per-context budget, counted once server-wide.
     compression_contexts: usize = 0,
     tasks: usize = 0,
+    h1_head: usize = 0,
+    h1_body: usize = 0,
 };
 
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
@@ -112,6 +114,9 @@ pub const Limits = struct {
     outbound_bytes_per_server: usize = 256 * 1024 * 1024,
     request_bytes_per_connection: usize = 8 * 1024 * 1024,
     request_bytes_per_server: usize = 256 * 1024 * 1024,
+    /// Reserved HTTP/1.1 request-head buffer per connection. A head over this
+    /// bound is 431; the buffer never grows.
+    h1_head_bytes: usize = 16 * 1024,
     control_bytes_per_connection: usize = 64 * 1024,
     control_entries_per_connection: usize = 256,
     stream_tombstones: usize = 1_024,
@@ -239,6 +244,7 @@ pub const Limits = struct {
             return error.InvalidConfig;
         }
         if (self.response_compression and self.compression_contexts_per_server == 0) return error.InvalidConfig;
+        if (self.h1_head_bytes == 0) return error.InvalidConfig;
 
         // Rung-4 enforcement: these sizes are load-bearing inputs to the bound,
         // so a struct that gains a field must break the BUILD and not the
@@ -292,13 +298,15 @@ pub const Limits = struct {
         const deadline_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
         const deadline_state = deadline_events;
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
+        terms.h1_head = try checkedMul(self.max_connections, self.h1_head_bytes);
+        terms.h1_body = try checkedMul(self.max_connections, self.request_body_bytes);
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_stream_bytes, try checkedAdd(header_maps, intents)))));
 
         const sid_and_inline = try checkedAdd(sid_scratch, try checkedAdd(inline_sids, complete_receipt_sids));
         const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
         // wire_descs already counts read+write channel descriptors; TLS
         // reuses the write capacity for its channel, so no extra desc term.
-        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, terms.tls_cipher_payload))));
+        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, try checkedAdd(terms.tls_cipher_payload, self.h1_head_bytes)))));
 
         terms.routes = try checkedAdd(
             self.max_route_path_bytes,
@@ -461,6 +469,23 @@ test "rejects response_compression with zero contexts" {
     var lim = Limits.defaults;
     lim.response_compression = true;
     lim.compression_contexts_per_server = 0;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
+test "h1_head term moves with the limit" {
+    const base = try Limits.defaults.resourceUpperBound();
+    try std.testing.expect(base.terms.h1_head > 0);
+    try std.testing.expect(base.terms.h1_body > 0);
+    var more = Limits.defaults;
+    more.h1_head_bytes = Limits.defaults.h1_head_bytes * 2;
+    const bigger = try more.resourceUpperBound();
+    try std.testing.expect(bigger.terms.h1_head > base.terms.h1_head);
+    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+}
+
+test "rejects zero h1_head_bytes" {
+    var lim = Limits.defaults;
+    lim.h1_head_bytes = 0;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 

@@ -89,8 +89,9 @@ pub const FramedDataEntryShape = fair_scheduler.FramedDataEntry;
 pub const EVENT_SIZE: usize = @sizeOf(std.Io.Event);
 pub const ROUTE_SIZE: usize = @sizeOf(router_mod.Route);
 pub const ENDPOINT_CONFIG_SIZE: usize = @sizeOf(union(enum) {
-    tls_h2: std.Io.net.IpAddress,
+    tls: std.Io.net.IpAddress,
     h2c_prior_knowledge: std.Io.net.IpAddress,
+    h1c: std.Io.net.IpAddress,
 });
 pub const LISTENER_SIZE: usize = @sizeOf(std.Io.net.Server);
 pub const ENDPOINT_ADDRESS_SIZE: usize = @sizeOf(std.Io.net.IpAddress);

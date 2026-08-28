@@ -1,0 +1,5 @@
+status: 200
+connection: keep
+body: ok
+
+GET / HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\n\r\n

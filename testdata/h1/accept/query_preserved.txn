@@ -1,0 +1,5 @@
+status: 200
+connection: keep
+body: x=1&y=2
+
+GET /query?x=1&y=2 HTTP/1.1\r\nHost: example.test\r\n\r\n

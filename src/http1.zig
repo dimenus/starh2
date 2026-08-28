@@ -9,6 +9,7 @@
 //! pipelining, keep-alive reuse, `CONNECT`, and TLS wait.
 pub const codec = @import("http1/codec.zig");
 pub const oneshot = @import("http1/oneshot.zig");
+pub const parser = @import("http1/parser.zig");
 
 pub const Limits = codec.Limits;
 pub const Header = codec.Header;
@@ -39,4 +40,5 @@ pub const acceptDisposition = oneshot.acceptDisposition;
 test {
     _ = codec;
     _ = oneshot;
+    _ = parser;
 }

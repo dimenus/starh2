@@ -56,6 +56,7 @@ pub const edge = struct {
     pub const connection = @import("edge/connection.zig");
     pub const wire_pump = @import("edge/wire_pump.zig");
     pub const tls_edge = @import("edge/tls.zig");
+    pub const h1 = @import("edge/h1.zig");
     pub const h2c = @import("edge/h2c.zig");
     pub const ticket_table = @import("edge/ticket_table.zig");
     pub const control_pool = @import("edge/control_pool.zig");
@@ -119,6 +120,7 @@ test {
     _ = edge.connection;
     _ = edge.wire_pump;
     _ = edge.tls_edge;
+    _ = edge.h1;
     _ = edge.h2c;
     _ = edge.ticket_table;
     _ = edge.control_pool;

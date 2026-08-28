@@ -51,6 +51,8 @@ test "bound terms use concrete sizes and capacities" {
     try std.testing.expect(b.terms.tls_cipher_payload > 0);
     try std.testing.expect(b.terms.endpoints_listeners > 0);
     try std.testing.expect(b.terms.tasks > 0);
+    try std.testing.expect(b.terms.h1_head > 0);
+    try std.testing.expect(b.terms.h1_body > 0);
 
     var no_chunks = lim;
     no_chunks.inbound_wire_chunks_per_connection = 1;

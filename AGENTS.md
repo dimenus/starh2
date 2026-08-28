@@ -78,7 +78,7 @@ Re-derive the recall numbers with these; do not cite a number from prose.
 ## Gates
 
 ```sh
-./zb build ci # definition of done (suite + exact + fuzz smoke + TLS gate + release targets)
+./zb build ci # definition of done (suite + exact + fuzz smoke + TLS gate + H1 gate + release targets)
 ```
 
 Release targets included in `ci`: native ReleaseSafe examples via `release`, plus
@@ -87,9 +87,10 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 
 ```sh
 ./zb build tls-smoke # TLS edge: fresh curl connections + clean shutdown
+./zb build h1-smoke  # HTTP/1.1 edge: curl --http1.1 against tls, curl against h1c, SSE, SIGTERM
 ```
 
-**`zig build test` cannot reach the TLS edge at all.** No test binds a `tls_h2`
+**`zig build test` cannot reach the TLS edge at all.** No test binds a `tls`
 endpoint, so `handshakeTls`, `TlsPump`, and leftover-preface drain never run
 under the suite. That is measured, not assumed: an always-false assert inside
 the TLS handshake left the suite green and aborts on the first curl request.
