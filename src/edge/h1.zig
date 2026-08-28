@@ -1,10 +1,12 @@
 //! HTTP/1.1 edge channel. One stream, no Session, no FairScheduler.
 //!
 //! The connection task owns the socket (h1c) or the TLS `Conn` (ALPN `http/1.1`
-//! / no ALPN). It accumulates a head into a boot-reserved buffer, parses once,
-//! reads a Content-Length body into a reserved buffer, dispatches into the
-//! existing `Router` / `Response` surface, and writes one framing (Content-Length,
-//! chunked, or close-delimited). Keep-alive loops until a close reason.
+//! / no ALPN). It accumulates a head into a boot-reserved buffer and parses
+//! once. A complete handler reads the Content-Length body, then runs on the
+//! actor. A task handler starts after the head; unread body bytes force close
+//! so they are not the next request. The response uses one framing
+//! (Content-Length, chunked, or close-delimited). Keep-alive loops until a
+//! close reason.
 const std = @import("std");
 const zio = @import("zio");
 const request = @import("../http/request.zig");
@@ -740,7 +742,9 @@ fn dispatch(
     self.slot.completion_owner.store(live, .release);
     self.slot.reaper_reserved = reaper_reserved;
     self.join = null;
-    self.want_close = head.connection_close;
+    // Preserve unread-body close from serveOne. A bare assignment dropped it,
+    // so leftover Content-Length bytes became the next request.
+    self.want_close = self.want_close or head.connection_close;
     self.occupies = false;
 
     const req: request.Request = .{

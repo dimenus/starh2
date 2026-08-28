@@ -2047,6 +2047,26 @@ fn namedEarlySecond(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try withBatteryServer(rt, gpa, runEarlySecondRequest);
 }
 
+fn runUnreadBodyForcesClose(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [4096]u8 = undefined;
+    var wb: [512]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "GET /task-none HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nABCDGET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    var cap = try readResponse(&reader.interface, gpa, false);
+    defer cap.deinit();
+    try std.testing.expectEqual(@as(?u16, 500), cap.status);
+    try std.testing.expect(cap.saw_conn_close);
+    _ = readByte(&reader.interface) catch return;
+    return error.UnreadBodyServedSecondRequest;
+}
+
+fn namedUnreadBodyCloses(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runUnreadBodyForcesClose);
+}
+
 fn namedAbortMidUpload(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const r = routes();
@@ -2109,6 +2129,13 @@ test "h1.shape.abort_mid_upload" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     var handle = try rt.spawn(namedAbortMidUpload, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+test "h1.shape.unread_body_closes" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedUnreadBodyCloses, .{ rt, std.testing.allocator });
     try handle.join();
 }
 
