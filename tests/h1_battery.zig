@@ -45,6 +45,10 @@ fn unescapeRequest(gpa: std.mem.Allocator, escaped: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+const required_categories = [_][]const u8{
+    "accept", "reject", "frame", "resp", "sse", "limits", "keepalive", "shape", "parity", "alpn",
+};
+
 fn loadFixtures(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8) ![]Fixture {
     var list: std.ArrayList(Fixture) = .empty;
     errdefer {
@@ -53,10 +57,8 @@ fn loadFixtures(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8) ![]Fi
     }
     var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer root.close(io);
-    var cats = root.iterate();
-    while (try cats.next(io)) |cat_ent| {
-        if (cat_ent.kind != .directory) continue;
-        var cat_dir = try root.openDir(io, cat_ent.name, .{ .iterate = true });
+    for (required_categories) |cat_name| {
+        var cat_dir = root.openDir(io, cat_name, .{ .iterate = true }) catch return error.MissingCategory;
         defer cat_dir.close(io);
         var files = cat_dir.iterate();
         var n: usize = 0;
@@ -100,7 +102,7 @@ fn loadFixtures(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8) ![]Fi
             req_esc = std.mem.trim(u8, req_buf.items, "\n");
             const request = try unescapeRequest(gpa, req_esc);
             const name = try gpa.dupe(u8, fent.name[0 .. fent.name.len - 4]);
-            const category = try gpa.dupe(u8, cat_ent.name);
+            const category = try gpa.dupe(u8, cat_name);
             const body_owned: ?[]const u8 = if (body) |b| try gpa.dupe(u8, b) else null;
             try list.append(gpa, .{
                 .name = name,
@@ -112,7 +114,7 @@ fn loadFixtures(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8) ![]Fi
             });
             n += 1;
         }
-        std.debug.print("category={s} fixtures={d}\n", .{ cat_ent.name, n });
+        std.debug.print("category={s} fixtures={d}\n", .{ cat_name, n });
         if (n == 0) return error.EmptyCategory;
     }
     if (list.items.len == 0) return error.NoFixtures;
@@ -458,6 +460,9 @@ fn runOne(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress, fx: 
     var reader = stream.reader(io, &read_buf);
     var writer = stream.writer(io, &write_buf);
     try writeSeg(&writer.interface, fx.request, mode);
+    if (std.mem.eql(u8, fx.name, "halfclose")) {
+        stream.shutdown(io, .send) catch {};
+    }
 
     if (fx.status == null) {
         const b = readByte(&reader.interface) catch return .{ .gpa = gpa, .closed = true };
@@ -576,7 +581,6 @@ fn serveBattery(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try runSequential(rt.io(), gpa, addr);
     try runHeadersAtBound(rt.io(), gpa, addr, lim.h1_head_bytes);
     try runHeadOverBound(rt.io(), gpa, addr, lim.h1_head_bytes);
-    try runZeroAlloc(rt.io(), gpa, addr);
     try runMaxBodyPlusPipelined(rt.io(), gpa, addr, lim.request_body_bytes);
     try runNobodyPipeline(rt.io(), gpa, addr);
     try runHandlerFallbacks(rt.io(), gpa, addr);
@@ -682,8 +686,66 @@ fn writeReq(writer: *std.Io.Writer, bytes: []const u8) !void {
     try writer.flush();
 }
 
-fn runZeroAlloc(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
-    _ = gpa;
+const CountGpa = struct {
+    parent: std.mem.Allocator,
+    allocs: std.atomic.Value(usize) = .init(0),
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn allocator(self: *CountGpa) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountGpa = @ptrCast(@alignCast(ctx));
+        const p = self.parent.rawAlloc(len, alignment, ra) orelse return null;
+        _ = self.allocs.fetchAdd(1, .monotonic);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountGpa = @ptrCast(@alignCast(ctx));
+        return self.parent.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountGpa = @ptrCast(@alignCast(ctx));
+        return self.parent.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *CountGpa = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, alignment, ra);
+    }
+};
+
+fn runZeroAlloc(io: std.Io, gpa: std.mem.Allocator, _: starh2.EndpointAddress) !void {
+    var count: CountGpa = .{ .parent = std.heap.page_allocator };
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.request_body_bytes = 1024;
+    lim.h1_head_bytes = 1024;
+    var server = try starh2.Server.init(count.allocator(), io, .{
+        .endpoints = &.{.{ .h1c = listen }},
+        .routes = &r,
+        .tls = null,
+        .limits = lim,
+    });
+    defer server.deinit(count.allocator());
+    var serve_future = try io.concurrent(starh2.Server.serve, .{ &server, count.allocator() });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(io) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    const addr = server.localAddress(0);
     const req = "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -692,14 +754,21 @@ fn runZeroAlloc(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress
     var reader = stream.reader(io, &rb);
     var writer = stream.writer(io, &wb);
     try writeReq(&writer.interface, req);
-    var warm = try readResponse(&reader.interface, std.testing.allocator, false);
+    var warm = try readResponse(&reader.interface, gpa, false);
     defer warm.deinit();
-    const before = starh2.edge.h1.test_gpa_allocs.load(.acquire);
-    try writeReq(&writer.interface, req);
-    var cap = try readResponse(&reader.interface, std.testing.allocator, false);
-    defer cap.deinit();
-    try std.testing.expectEqual(@as(?u16, 200), cap.status);
-    try std.testing.expectEqual(before, starh2.edge.h1.test_gpa_allocs.load(.acquire));
+    try std.testing.expectEqual(@as(?u16, 200), warm.status);
+    const before = count.allocs.load(.acquire);
+    var n: usize = 0;
+    while (n < 20) : (n += 1) {
+        try writeReq(&writer.interface, req);
+        var cap = try readResponse(&reader.interface, gpa, false);
+        defer cap.deinit();
+        try std.testing.expectEqual(@as(?u16, 200), cap.status);
+    }
+    try std.testing.expectEqual(before, count.allocs.load(.acquire));
+    server.requestShutdown();
+    try serve_future.await(io);
+    serving = false;
 }
 
 fn runMaxBodyPlusPipelined(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress, body_lim: usize) !void {
@@ -1120,7 +1189,15 @@ test "h1.parity.request_table" {
 }
 
 test "h1.limits.zero_alloc_steady" {
-    // Covered inside the battery run.
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const Job = struct {
+        fn run(runtime: *zio.Runtime, gpa: std.mem.Allocator) !void {
+            try runZeroAlloc(runtime.io(), gpa, undefined);
+        }
+    };
+    var handle = try rt.spawn(Job.run, .{ rt, std.testing.allocator });
+    try handle.join();
 }
 
 test "h1.sse.client_abort" {

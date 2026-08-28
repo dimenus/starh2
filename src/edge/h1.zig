@@ -36,6 +36,13 @@ pub const ChannelMutation = enum {
 
 pub var test_channel_mutation: ChannelMutation = .none;
 
+/// Conformance/smoke process: `STARH2_H1_MUTATION=m2` omits the last chunk.
+pub fn applyTestMutationFromEnv() void {
+    const raw = std.c.getenv("STARH2_H1_MUTATION") orelse return;
+    const v = std.mem.span(raw);
+    if (std.mem.eql(u8, v, "m2")) test_channel_mutation = .m2_no_chunk_end;
+}
+
 /// After connection setup, a counting GPA should see this stay flat for a
 /// request whose head fits `h1_head_bytes` (I4). Tests snapshot it.
 pub var test_gpa_allocs: std.atomic.Value(usize) = .init(0);
@@ -110,9 +117,17 @@ const H1Conn = struct {
     tls_write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
     tls_acks: zio.Channel(wire_pump.WriteCompletion) = undefined,
     tls_read_free: std.Io.Queue(u32) = undefined,
+    tls_write_free_buf: []u32 = &.{},
+    tls_write_free: std.Io.Queue(u32) = undefined,
+    tls_req_buf: [1]u32 = undefined,
+    tls_req_ch: zio.Channel(u32) = undefined,
+    tls_ok_buf: [1]bool = undefined,
+    tls_ok_ch: zio.Channel(bool) = undefined,
     tls_site: std.atomic.Value(u8) = .init(0),
     tls_live_handlers: std.atomic.Value(usize) = .init(0),
     tls_out: []u8 = &.{},
+    offload_tls_io: bool = false,
+    tls_write_inflight: bool = false,
 
     fn deinit(self: *H1Conn) void {
         std.debug.assert(!self.slot.in_use);
@@ -147,6 +162,7 @@ const H1Conn = struct {
         if (self.tls_write_ch_buf.len != 0) self.gpa.free(self.tls_write_ch_buf);
         if (self.tls_ack_buf.len != 0) self.gpa.free(self.tls_ack_buf);
         if (self.tls_read_free_buf.len != 0) self.gpa.free(self.tls_read_free_buf);
+        if (self.tls_write_free_buf.len != 0) self.gpa.free(self.tls_write_free_buf);
         if (self.tls_out.len != 0) self.gpa.free(self.tls_out);
         self.* = undefined;
     }
@@ -198,7 +214,8 @@ fn initConn(self: *H1Conn, stream: std.Io.net.Stream, config: connection.ConnCon
     errdefer gpa.free(name_scratch);
     const path_q_buf = try gpa.alloc(u8, config.limits.path_wire_bytes);
     errdefer gpa.free(path_q_buf);
-    const carry_buf = try gpa.alloc(u8, config.limits.h1_head_bytes);
+    // Declared bound: one body plus one pipelined head. Do not grow later (I4).
+    const carry_buf = try gpa.alloc(u8, config.limits.h1_head_bytes + config.limits.request_body_bytes);
     errdefer gpa.free(carry_buf);
     const pending_storage = try gpa.alloc(u8, config.limits.outbound_bytes_per_stream);
     errdefer gpa.free(pending_storage);
@@ -244,12 +261,17 @@ fn startTlsPump(self: *H1Conn) !void {
     self.tls_write_ch_buf = try gpa.alloc(wire_pump.WireChunk, 4);
     self.tls_ack_buf = try gpa.alloc(wire_pump.WriteCompletion, 4);
     self.tls_read_free_buf = try gpa.alloc(u32, 1);
+    self.tls_write_free_buf = try gpa.alloc(u32, 1);
     self.tls_out = try gpa.alloc(u8, limits_mod.WIRE_CHUNK_SIZE);
 
     self.tls_to_actor = .init(self.tls_to_actor_buf);
     self.tls_write_ch = .init(self.tls_write_ch_buf);
     self.tls_acks = .init(self.tls_ack_buf);
     self.tls_read_free = .init(self.tls_read_free_buf);
+    self.tls_write_free = .init(self.tls_write_free_buf);
+    self.tls_req_ch = .init(&self.tls_req_buf);
+    self.tls_ok_ch = .init(&self.tls_ok_buf);
+    self.tls_write_free.putOneUncancelable(self.io, 0) catch unreachable;
 
     const pump = try gpa.create(tls_edge.Pump);
     errdefer gpa.destroy(pump);
@@ -266,6 +288,7 @@ fn startTlsPump(self: *H1Conn) !void {
         .chunk_storage = self.tls_chunk_storage,
         .n_chunks = 1,
         .read_free = &self.tls_read_free,
+        .write_free = &self.tls_write_free,
         .live_task_handlers = &self.tls_live_handlers,
     };
     if (!pump.start()) {
@@ -509,11 +532,7 @@ fn stashCarry(self: *H1Conn, chunk: []const u8, consumed: usize) !void {
         return;
     }
     const rest = chunk[consumed..];
-    if (rest.len > self.carry_buf.len) {
-        const new_buf = try self.gpa.realloc(self.carry_buf, rest.len);
-        _ = test_gpa_allocs.fetchAdd(1, .monotonic);
-        self.carry_buf = new_buf;
-    }
+    if (rest.len > self.carry_buf.len) return error.CarryOverflow;
     @memcpy(self.carry_buf[0..rest.len], rest);
     self.carry_len = rest.len;
 }
@@ -770,7 +789,9 @@ fn dispatch(
             runTaskBody(conn);
         }
     };
+    self.offload_tls_io = self.tls_pump != null;
     const handle = self.io.concurrent(Job.run, .{self}) catch {
+        self.offload_tls_io = false;
         if (reaper_reserved) {
             if (self.config.accounting) |a| a.releaseReaper();
             self.slot.reaper_reserved = false;
@@ -781,7 +802,11 @@ fn dispatch(
         return;
     };
     self.join = handle;
-    try waitDispatch(self);
+    waitDispatch(self) catch |err| {
+        self.offload_tls_io = false;
+        return err;
+    };
+    self.offload_tls_io = false;
 }
 
 fn runTaskBody(self: *H1Conn) void {
@@ -811,7 +836,152 @@ fn waitPeerByte(self: *H1Conn) anyerror!?usize {
     return n;
 }
 
+fn tlsIdle(pump: *tls_edge.Pump) bool {
+    return pump.pending_n == 0 and !pump.send_armed;
+}
+
+fn ackTlsWrite(self: *H1Conn, ok: bool) void {
+    self.tls_write_inflight = false;
+    self.tls_ok_ch.trySend(ok) catch {};
+}
+
+fn driveHandlerTlsWrite(self: *H1Conn, n: u32) void {
+    const pump = self.tls_pump orelse {
+        ackTlsWrite(self, false);
+        return;
+    };
+    const idx = io_queue.tryGet(u32, &self.tls_write_free, self.io) orelse {
+        ackTlsWrite(self, false);
+        return;
+    };
+    const chunk = wire_pump.WireChunk{
+        .bytes = self.tls_out[0..n],
+        .len = n,
+        .pool_index = idx,
+    };
+    if (!pump.writeChunks(chunk)) {
+        ackTlsWrite(self, false);
+        return;
+    }
+    if (tlsIdle(pump)) {
+        ackTlsWrite(self, true);
+        return;
+    }
+    self.tls_write_inflight = true;
+}
+
+fn ingestTlsPeer(self: *H1Conn) bool {
+    const pump = self.tls_pump orelse return false;
+    if (pump.inbound_eof) return true;
+    if (pump.pending_read == null and pump.conn.pendingInbound()) {
+        switch (pump.readOne()) {
+            .eof => return true,
+            .ok, .want, .stuck => {},
+        }
+    }
+    var tmp: [256]u8 = undefined;
+    if (takeTlsPending(pump, tmp[0..])) |n| {
+        if (n == 0) return true;
+        stashCarry(self, tmp[0..n], 0) catch return true;
+    }
+    return pump.inbound_eof;
+}
+
+fn waitDispatchTls(self: *H1Conn) !void {
+    var reaping = false;
+    const pump = self.tls_pump.?;
+    const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
+    while (self.slot.in_use) {
+        if (shutdownRequested(self) and !reaping) {
+            self.slot.terminal.setCause(.server_shutdown);
+            if (!cancelJoin(self)) {
+                finishSlot(self);
+                break;
+            }
+            reaping = true;
+        }
+        if (reaping) {
+            const sid = self.completion_ch.receive() catch return error.Canceled;
+            _ = sid;
+            finishSlot(self);
+            break;
+        }
+
+        const winner = zio.select(.{
+            .io = &pump.cq,
+            .comps = self.completion_ch.asyncReceive(),
+            .writes = self.tls_req_ch.asyncReceive(),
+            .shutdown = shutdown_ev,
+        }) catch return error.Canceled;
+        switch (winner) {
+            .io => |r| {
+                const c = r catch {
+                    if (pump.cq.isDrained()) {
+                        self.slot.terminal.setCause(.connection_closed);
+                        if (!cancelJoin(self)) {
+                            finishSlot(self);
+                            break;
+                        }
+                        reaping = true;
+                    }
+                    continue;
+                };
+                if (pump.onCqComplete(c) == .exit) {
+                    self.slot.terminal.setCause(.connection_closed);
+                    if (!cancelJoin(self)) {
+                        finishSlot(self);
+                        break;
+                    }
+                    reaping = true;
+                    continue;
+                }
+                if (self.tls_write_inflight) {
+                    if (pump.pending_n > 0) {
+                        if (!pump.drivePending()) {
+                            ackTlsWrite(self, false);
+                            self.slot.terminal.setCause(.connection_closed);
+                            if (!cancelJoin(self)) {
+                                finishSlot(self);
+                                break;
+                            }
+                            reaping = true;
+                            continue;
+                        }
+                    }
+                    if (tlsIdle(pump)) ackTlsWrite(self, true);
+                }
+                if (ingestTlsPeer(self)) {
+                    self.slot.terminal.setCause(.connection_closed);
+                    if (!cancelJoin(self)) {
+                        finishSlot(self);
+                        break;
+                    }
+                    reaping = true;
+                }
+            },
+            .comps => |r| {
+                _ = r catch {};
+                finishSlot(self);
+                break;
+            },
+            .writes => |r| {
+                const n = r catch continue;
+                driveHandlerTlsWrite(self, n);
+            },
+            .shutdown => {
+                self.slot.terminal.setCause(.server_shutdown);
+                if (!cancelJoin(self)) {
+                    finishSlot(self);
+                    break;
+                }
+                reaping = true;
+            },
+        }
+    }
+}
+
 fn waitDispatch(self: *H1Conn) !void {
+    if (self.tls_pump != null) return waitDispatchTls(self);
     var reaping = false;
     while (self.slot.in_use) {
         if (shutdownRequested(self) and !reaping) {
@@ -1169,19 +1339,40 @@ fn writeError(self: *H1Conn, status: u16) !void {
 
 fn writeRaw(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
     if (self.tls != null) {
-        try writeRawTls(self, bytes);
+        if (self.offload_tls_io) {
+            try writeRawTlsFromHandler(self, bytes);
+        } else {
+            try writeRawTlsOwner(self, bytes);
+        }
         return;
     }
     self.writer.interface.writeAll(bytes) catch return error.WriteFailed;
 }
 
-fn writeRawTls(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
+fn writeRawTlsFromHandler(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = @min(bytes.len - off, self.tls_out.len);
+        @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
+        self.tls_req_ch.send(@intCast(n)) catch return error.WriteFailed;
+        const ok = self.tls_ok_ch.receive() catch return error.WriteFailed;
+        if (!ok) return error.WriteFailed;
+        off += n;
+    }
+}
+
+fn writeRawTlsOwner(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
     const pump = self.tls_pump orelse return error.WriteFailed;
     var off: usize = 0;
     while (off < bytes.len) {
         const n = @min(bytes.len - off, self.tls_out.len);
-        const owned = self.gpa.dupe(u8, bytes[off..][0..n]) catch return error.WriteFailed;
-        const chunk = wire_pump.WireChunk{ .bytes = owned, .len = n };
+        @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
+        const idx = io_queue.tryGet(u32, &self.tls_write_free, self.io) orelse return error.WriteFailed;
+        const chunk = wire_pump.WireChunk{
+            .bytes = self.tls_out[0..n],
+            .len = n,
+            .pool_index = idx,
+        };
         if (!pump.writeChunks(chunk)) return error.WriteFailed;
         try driveTlsUntilIdle(self);
         off += n;
@@ -1190,6 +1381,7 @@ fn writeRawTls(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
 
 fn flushSink(self: *H1Conn) response.ResponseError!void {
     if (self.tls != null) {
+        if (self.offload_tls_io) return;
         try driveTlsUntilIdle(self);
         return;
     }

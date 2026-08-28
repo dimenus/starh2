@@ -70,9 +70,8 @@ fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ns: u64) !std
             std.posix.kill(p, std.posix.SIG.KILL) catch {};
         }
     };
-    var wd = io.concurrent(Wd.run, .{ pid, io, timeout_ns }) catch {
-        return child.wait(io);
-    };
+    var wd = io.concurrent(Wd.run, .{ pid, io, timeout_ns }) catch
+        abort("watchdog spawn failed — unbounded wait is not a result", .{});
     const term = try child.wait(io);
     wd.cancel(io);
     return term;
@@ -123,6 +122,19 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.indexOf(u8, res.stdout, "1.1") == null) abort("tls did not negotiate HTTP/1.1: {s}", .{res.stdout});
         connections += 1;
         std.debug.print("h1-smoke: tls --http1.1 /hello 200\n", .{});
+
+        var once_url_buf: [128]u8 = undefined;
+        const once_url = std.fmt.bufPrint(&once_url_buf, "https://127.0.0.1:{d}/h1-once", .{port}) catch abort("url", .{});
+        const once = try curl(gpa, io, &.{ "curl", "-sk", "--http1.1", "--max-time", "3", once_url });
+        defer gpa.free(once.stdout);
+        defer gpa.free(once.stderr);
+        switch (once.term) {
+            .exited => |c| if (c != 0) abort("tls /h1-once curl exit {d} stdout={s}", .{ c, once.stdout }),
+            else => abort("tls /h1-once curl term={any}", .{once.term}),
+        }
+        if (std.mem.indexOf(u8, once.stdout, "chunk-ok") == null) {
+            abort("tls /h1-once did not complete: stdout={s}", .{once.stdout});
+        }
 
         // SIGTERM with SSE open.
         var sse_url_buf: [128]u8 = undefined;
@@ -186,6 +198,19 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(sse.stderr);
         if (std.mem.indexOf(u8, sse.stdout, "data: ping") == null) {
             abort("h1c SSE did not deliver an event within 2s: {s}", .{sse.stdout});
+        }
+
+        var once_url_buf: [128]u8 = undefined;
+        const once_url = std.fmt.bufPrint(&once_url_buf, "http://127.0.0.1:{d}/h1-once", .{port}) catch abort("url", .{});
+        const once = try curl(gpa, io, &.{ "curl", "-s", "--max-time", "3", once_url });
+        defer gpa.free(once.stdout);
+        defer gpa.free(once.stderr);
+        switch (once.term) {
+            .exited => |c| if (c != 0) abort("h1c /h1-once curl exit {d} stdout={s}", .{ c, once.stdout }),
+            else => abort("h1c /h1-once curl term={any}", .{once.term}),
+        }
+        if (std.mem.indexOf(u8, once.stdout, "chunk-ok") == null) {
+            abort("h1c /h1-once did not complete: stdout={s}", .{once.stdout});
         }
 
         if (child.id) |pid| std.posix.kill(pid, std.posix.SIG.TERM) catch {};

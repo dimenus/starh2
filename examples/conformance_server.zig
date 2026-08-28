@@ -29,6 +29,12 @@ fn installSignalHandlers() void {
     std.posix.sigaction(.INT, &action, null);
 }
 
+fn h1OnceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.start(200, &.{});
+    try body.writeAll("chunk-ok");
+    try body.finish();
+}
+
 fn h1SseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
     var body = try resp.startSse(&.{});
@@ -199,8 +205,11 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const args = try parseArgs(gpa, process_args);
     const addr = try starh2.EndpointAddress.parseIp4(args.host, args.port);
 
+    starh2.edge.h1.applyTestMutationFromEnv();
+
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } } },
+        .{ .method = .GET, .path = "/h1-once", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1OnceHandler } } },
         .{ .method = .GET, .path = "/h1-sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1SseHandler } } },
         .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigHandler } } },
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } } },
