@@ -48,6 +48,10 @@ fn h1SseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Respons
     }
 }
 
+fn echoHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, req.body);
+}
+
 fn helloHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     var nonce: []const u8 = "missing";
     for (req.headers) |h| {
@@ -209,6 +213,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
 
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } } },
+        .{ .method = .POST, .path = "/echo", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = echoHandler } } },
         .{ .method = .GET, .path = "/h1-once", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1OnceHandler } } },
         .{ .method = .GET, .path = "/h1-sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1SseHandler } } },
         .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigHandler } } },

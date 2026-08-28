@@ -88,6 +88,7 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ```sh
 ./zb build tls-smoke # TLS edge: fresh curl connections + clean shutdown
 ./zb build h1-smoke  # HTTP/1.1 edge: curl --http1.1 against tls, curl against h1c, SSE, SIGTERM
+./zb build h1-go-smoke  # HTTP/1.1 Go net/http oracle: keep-alive reuse and Expect 100-continue; ABORTS if go is missing
 ```
 
 **`zig build test` cannot reach the TLS edge at all.** No test binds a `tls`

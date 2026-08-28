@@ -684,6 +684,25 @@ pub fn build(b: *std.Build) void {
     const h1_smoke_step = b.step("h1-smoke", "HTTP/1.1 edge gate: curl against tls ALPN fallback and h1c");
     h1_smoke_step.dependOn(&h1_smoke_run.step);
 
+    const h1_go_smoke_exe = b.addExecutable(.{
+        .name = "h1-go-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/h1_go_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const h1_go_smoke_run = b.addRunArtifact(h1_go_smoke_exe);
+    h1_go_smoke_run.addArg("--bin");
+    h1_go_smoke_run.addFileArg(conformance_exe.?.getEmittedBin());
+    h1_go_smoke_run.addArg("--go");
+    h1_go_smoke_run.addFileArg(b.path("tools/h1_go_client.go"));
+    h1_go_smoke_run.setCwd(b.path("."));
+    h1_go_smoke_run.has_side_effects = true;
+    h1_go_smoke_run.stdio = .inherit;
+    const h1_go_smoke_step = b.step("h1-go-smoke", "HTTP/1.1 Go net/http oracle: keep-alive and 100-continue");
+    h1_go_smoke_step.dependOn(&h1_go_smoke_run.step);
+
     // The README gate. `zig build test` compiles the examples, never the
     // README, so a snippet can name an API no consumer can reach and stay
     // green for months — which is exactly what happened to the Datastar
@@ -762,6 +781,7 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(fuzz_smoke_step);
     ci_step.dependOn(&tls_smoke_run.step);
     ci_step.dependOn(&h1_smoke_run.step);
+    ci_step.dependOn(&h1_go_smoke_run.step);
     ci_step.dependOn(&readme_doctest_run.step);
     ci_step.dependOn(release_step);
 }
