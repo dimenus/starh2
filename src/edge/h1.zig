@@ -132,6 +132,9 @@ const H1Conn = struct {
     fn deinit(self: *H1Conn) void {
         std.debug.assert(!self.slot.in_use);
         std.debug.assert(self.request_held == 0);
+        if (self.tls_pump) |p| {
+            p.shutdownCq();
+        }
         if (!self.socket_closed) {
             self.stream.close(self.io);
             self.socket_closed = true;
@@ -152,7 +155,6 @@ const H1Conn = struct {
         self.gpa.free(self.carry_buf);
         self.gpa.free(self.pending_storage);
         if (self.tls_pump) |p| {
-            p.shutdownCq();
             self.gpa.destroy(p);
             self.tls_pump = null;
         }
@@ -532,9 +534,13 @@ fn stashCarry(self: *H1Conn, chunk: []const u8, consumed: usize) !void {
         return;
     }
     const rest = chunk[consumed..];
-    if (rest.len > self.carry_buf.len) return error.CarryOverflow;
-    @memcpy(self.carry_buf[0..rest.len], rest);
-    self.carry_len = rest.len;
+    const new_len = self.carry_len + rest.len;
+    if (new_len > self.carry_buf.len) return error.CarryOverflow;
+    // Append. A replace drops a pipelined prefix already in carry when
+    // waitPeerByte (or a second TLS ingest) delivers the rest of the next
+    // request in a later read.
+    @memcpy(self.carry_buf[self.carry_len..][0..rest.len], rest);
+    self.carry_len = new_len;
 }
 
 fn takeTlsPending(pump: *tls_edge.Pump, buf: []u8) ?usize {

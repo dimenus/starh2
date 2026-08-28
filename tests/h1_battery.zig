@@ -143,6 +143,19 @@ fn sseOnce(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anye
     try body.finish();
 }
 
+fn streamWait(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    slow_live.store(true, .release);
+    defer slow_live.store(false, .release);
+    var body = try resp.start(200, &.{});
+    try body.writeAll("part1");
+    try body.flush();
+    const now = std.Io.Clock.awake.now(resp.io);
+    const deadline = std.Io.Timestamp.fromNanoseconds(now.nanoseconds + 300 * std.time.ns_per_ms);
+    body.waitUntil(deadline) catch {};
+    try body.writeAll("part2");
+    try body.finish();
+}
+
 fn slow(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     const now = std.Io.Clock.awake.now(resp.io);
     const deadline = std.Io.Timestamp.fromNanoseconds(now.nanoseconds + 2 * std.time.ns_per_s);
@@ -196,8 +209,11 @@ const Observed = struct {
 
 var observed: Observed = .{};
 var abort_seen: std.atomic.Value(bool) = .init(false);
+var slow_live: std.atomic.Value(bool) = .init(false);
+var observe_during_slow: std.atomic.Value(bool) = .init(false);
 
 fn observeH(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    if (slow_live.load(.acquire)) observe_during_slow.store(true, .release);
     observed.record(resp.inner.io, req);
     try resp.send(200, &.{}, "ok");
 }
@@ -250,7 +266,7 @@ fn sseAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) any
     if (body.terminalCause() != null) abort_seen.store(true, .release);
 }
 
-fn routes() [20]starh2.Route {
+fn routes() [21]starh2.Route {
     return .{
         .{ .method = .GET, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
         .{ .method = .HEAD, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
@@ -259,6 +275,7 @@ fn routes() [20]starh2.Route {
         .{ .method = .GET, .path = "/echo", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = echo } } },
         .{ .method = .GET, .path = "/query", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = queryH } } },
         .{ .method = .GET, .path = "/sse-once", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseOnce } } },
+        .{ .method = .GET, .path = "/stream-wait", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = streamWait } } },
         .{ .method = .GET, .path = "/slow", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = slow } } },
         .{ .method = .GET, .path = "/observe", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = observeH } } },
         .{ .method = .GET, .path = "/204", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = status204 } } },
@@ -586,6 +603,16 @@ fn serveBattery(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try runHandlerFallbacks(rt.io(), gpa, addr);
     try runCrlfHeader(rt.io(), gpa, addr);
     try runClientAbort(rt.io(), gpa, addr);
+    runOccupyConnection(rt.io(), gpa, addr) catch |err| {
+        std.debug.print("FAIL occupy: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    runEarlySecondRequest(rt.io(), gpa, addr) catch |err| {
+        std.debug.print("FAIL early_second: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    try runAbortMidUpload(rt.io(), gpa, addr);
+    try runSlowHandler(rt.io(), gpa, addr);
     try runParityTable(rt.io(), gpa, addr);
     try runValidationShared(rt.io(), gpa, addr);
     try runFlushLatency(rt.io(), gpa, addr);
@@ -876,6 +903,146 @@ fn runCrlfHeader(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddres
     defer cap.deinit();
     try std.testing.expectEqual(@as(?u16, 500), cap.status);
     try std.testing.expect(std.mem.indexOf(u8, cap.headers.items, "X-Injected") == null);
+}
+
+fn countNeedle(hay: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, i, needle)) |at| {
+        n += 1;
+        i = at + 1;
+    }
+    return n;
+}
+
+fn drainTimed(reader: *std.Io.Reader, io: std.Io, gpa: std.mem.Allocator, timeout_ns: u64) !std.ArrayList(u8) {
+    var rest: std.ArrayList(u8) = .empty;
+    errdefer rest.deinit(gpa);
+    const ReadRace = union(enum) {
+        data: std.Io.Reader.Error!u8,
+        timer: std.Io.Cancelable!void,
+    };
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i128, @intCast(timeout_ns));
+    while (rest.items.len < 4096) {
+        const remain = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remain <= 0) break;
+        var result_buf: [2]ReadRace = undefined;
+        var select = std.Io.Select(ReadRace).init(io, &result_buf);
+        const ReadFn = struct {
+            fn run(r: *std.Io.Reader) std.Io.Reader.Error!u8 {
+                return r.takeByte();
+            }
+        };
+        try select.concurrent(.data, ReadFn.run, .{reader});
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(remain)),
+            .clock = .awake,
+        } };
+        try select.concurrent(.timer, waitTimerIo, .{ timeout, io });
+        const selected = try select.await();
+        defer select.cancelDiscard();
+        switch (selected) {
+            .data => |r| {
+                const b = r catch break;
+                try rest.append(gpa, b);
+            },
+            .timer => break,
+        }
+    }
+    return rest;
+}
+
+fn runOccupyConnection(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    observed.deinit();
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [8192]u8 = undefined;
+    var wb: [512]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "GET /sse-once HTTP/1.1\r\nHost: h\r\n\r\n");
+    const saw = try readUntilNeedle(&reader.interface, io, "data: hi", 150 * std.time.ns_per_ms);
+    if (!saw) return error.SseNotFlushed;
+    try writeReq(&writer.interface, "GET /observe HTTP/1.1\r\nHost: h\r\n\r\n");
+    var rest = try drainTimed(&reader.interface, io, gpa, 800 * std.time.ns_per_ms);
+    defer rest.deinit(gpa);
+    // Status of the SSE response is already consumed. Occupy must not emit
+    // a second status, and must not dispatch /observe.
+    if (countNeedle(rest.items, "HTTP/1.1 200") != 0) return error.SecondRequestExecuted;
+    if (std.mem.indexOf(u8, rest.items, "data: hi") == null and
+        std.mem.indexOf(u8, rest.items, "\n\n") == null)
+    {
+        return error.SseLost;
+    }
+    if (observed.path.len != 0 and std.mem.eql(u8, observed.path, "/observe")) {
+        return error.PipelinedObserveDispatched;
+    }
+}
+
+fn runEarlySecondRequest(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    observed.deinit();
+    observe_during_slow.store(false, .release);
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [8192]u8 = undefined;
+    var wb: [512]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "GET /stream-wait HTTP/1.1\r\nHost: h\r\n\r\n");
+    const saw = try readUntilNeedle(&reader.interface, io, "part1", 500 * std.time.ns_per_ms);
+    if (!saw) return error.StreamNotFlushed;
+    // Two writes so waitPeerByte must append, not replace, the carry.
+    try writeReq(&writer.interface, "GET /observe HTTP/1.1\r\n");
+    io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try writeReq(&writer.interface, "Host: h\r\n\r\n");
+    var rest = try drainTimed(&reader.interface, io, gpa, 1200 * std.time.ns_per_ms);
+    defer rest.deinit(gpa);
+    if (std.mem.indexOf(u8, rest.items, "part2") == null) return error.StreamTailLost;
+    // First status already consumed. The second request must produce one 200.
+    const n200 = countNeedle(rest.items, "HTTP/1.1 200");
+    if (n200 == 0) return error.PipelinedRequestLost;
+    if (n200 != 1) return error.SecondRequestConcurrent;
+    if (!std.mem.eql(u8, observed.path, "/observe")) return error.ObserveNotDispatched;
+    if (observe_during_slow.load(.acquire)) return error.SecondRequestConcurrent;
+}
+
+fn runAbortMidUpload(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    {
+        const stream = try addr.connect(io, .{ .mode = .stream });
+        var wb: [256]u8 = undefined;
+        var writer = stream.writer(io, &wb);
+        try writer.interface.writeAll("POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\nPARTIAL");
+        try writer.interface.flush();
+        stream.close(io);
+    }
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [4096]u8 = undefined;
+    var wb: [256]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    var cap = try readResponse(&reader.interface, gpa, false);
+    defer cap.deinit();
+    try std.testing.expectEqual(@as(?u16, 200), cap.status);
+}
+
+fn runSlowHandler(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [4096]u8 = undefined;
+    var wb: [256]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "GET /slow HTTP/1.1\r\nHost: h\r\n\r\n");
+    var cap1 = try readResponse(&reader.interface, gpa, false);
+    defer cap1.deinit();
+    try std.testing.expectEqual(@as(?u16, 200), cap1.status);
+    try writeReq(&writer.interface, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    var cap2 = try readResponse(&reader.interface, gpa, false);
+    defer cap2.deinit();
+    try std.testing.expectEqual(@as(?u16, 200), cap2.status);
 }
 
 fn runClientAbort(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
@@ -1194,6 +1361,7 @@ test "h1.limits.zero_alloc_steady" {
     const Job = struct {
         fn run(runtime: *zio.Runtime, gpa: std.mem.Allocator) !void {
             try runZeroAlloc(runtime.io(), gpa, undefined);
+            try runZeroAllocTls(runtime, gpa);
         }
     };
     var handle = try rt.spawn(Job.run, .{ rt, std.testing.allocator });
@@ -1233,15 +1401,24 @@ test "h1.accept.absolute_form" {
 }
 
 test "h1.alpn.both_offered prefers h2" {
-    try std.testing.expect(starh2.edge.tls_edge.isHttp2Alpn("h2"));
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runAlpnBoth, .{ rt, std.testing.allocator });
+    try handle.join();
 }
 
 test "h1.alpn.h1_only" {
-    try std.testing.expect(starh2.edge.tls_edge.isHttp11Alpn("http/1.1"));
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runAlpnH1Only, .{ rt, std.testing.allocator });
+    try handle.join();
 }
 
 test "h1.alpn.none_offered" {
-    try std.testing.expect(starh2.edge.tls_edge.isHttp11Alpn(null));
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runAlpnNone, .{ rt, std.testing.allocator });
+    try handle.join();
 }
 
 test "h1.mutate.M1 two_in_one_segment fails" {
@@ -1295,6 +1472,7 @@ test "h1.limits.head_over_bound" {
 test "h1.limits.resource_upper_bound" {
     const b = try starh2.Limits.defaults.resourceUpperBound();
     try std.testing.expect(b.terms.h1_head > 0);
+    try std.testing.expect(b.terms.h1_body > 0);
 }
 
 test "h1.alpn.h2c_unchanged" {
@@ -1465,5 +1643,415 @@ test "h1.shape.tls_small_records" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     var handle = try rt.spawn(runTlsSmallRecords, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+fn openTlsServer(rt: *zio.Runtime, gpa: std.mem.Allocator) !struct {
+    server: *starh2.Server,
+    future: std.Io.Future(starh2.ServeError!void),
+    cert_pem: []u8,
+    key_pem: []u8,
+} {
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(rt.io(), "testdata/cert.pem", gpa, .limited(64 * 1024));
+    errdefer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(rt.io(), "testdata/key.pem", gpa, .limited(64 * 1024));
+    errdefer gpa.free(key_pem);
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    const server = try gpa.create(starh2.Server);
+    errdefer gpa.destroy(server);
+    server.* = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .tls = listen }},
+        .routes = &r,
+        .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
+    });
+    const future = try rt.io().concurrent(starh2.Server.serve, .{ server, gpa });
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    return .{ .server = server, .future = future, .cert_pem = cert_pem, .key_pem = key_pem };
+}
+
+fn tlsGet200(client: *starh2.edge.tls_edge.Conn) !void {
+    try client.writePlain("GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
+    var out: [1024]u8 = undefined;
+    var used: usize = 0;
+    var spins: usize = 0;
+    while (used < out.len and spins < 64) : (spins += 1) {
+        const n = client.readPlain(out[used..]) catch break;
+        if (n == 0) break;
+        used += n;
+        if (std.mem.indexOf(u8, out[0..used], "HTTP/1.1 200") != null) return;
+    }
+    return error.TlsH1NotSelected;
+}
+
+fn runAlpnBoth(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var ts = try openTlsServer(rt, gpa);
+    defer gpa.free(ts.cert_pem);
+    defer gpa.free(ts.key_pem);
+    defer {
+        ts.server.deinit(gpa);
+        gpa.destroy(ts.server);
+    }
+    var serving = true;
+    defer if (serving) {
+        ts.server.requestShutdown();
+        ts.future.cancel(rt.io()) catch {};
+    };
+
+    const stream = try ts.server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var client: starh2.edge.tls_edge.Conn = .{};
+    client.initTcp(stream);
+    defer client.deinit();
+    var connector = try starh2.edge.tls_edge.loopbackBothAlpnClientConnector();
+    defer connector.deinit();
+    try client.handshakeClientAny(&connector, rt.io());
+    const alpn = client.ssl.selectedAlpn() orelse return error.NoAlpn;
+    try std.testing.expectEqualStrings("h2", alpn);
+
+    const wire = try h2c.buildClientHello(gpa, "/");
+    defer gpa.free(wire);
+    try client.writePlain(wire);
+    var out: [1024]u8 = undefined;
+    var used: usize = 0;
+    var spins: usize = 0;
+    while (used < 24 and spins < 64) : (spins += 1) {
+        const n = client.readPlain(out[used..]) catch break;
+        if (n == 0) break;
+        used += n;
+    }
+    if (used < 9) return error.NoH2Frame;
+    if (std.mem.startsWith(u8, out[0..used], "HTTP/1.1")) return error.H1OnH2Alpn;
+
+    ts.server.requestShutdown();
+    try ts.future.await(rt.io());
+    serving = false;
+}
+
+fn runAlpnH1Only(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var ts = try openTlsServer(rt, gpa);
+    defer gpa.free(ts.cert_pem);
+    defer gpa.free(ts.key_pem);
+    defer {
+        ts.server.deinit(gpa);
+        gpa.destroy(ts.server);
+    }
+    var serving = true;
+    defer if (serving) {
+        ts.server.requestShutdown();
+        ts.future.cancel(rt.io()) catch {};
+    };
+    const stream = try ts.server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var client: starh2.edge.tls_edge.Conn = .{};
+    client.initTcp(stream);
+    defer client.deinit();
+    var connector = try starh2.edge.tls_edge.loopbackH1ClientConnector();
+    defer connector.deinit();
+    try client.handshakeClientH1(&connector, rt.io());
+    try tlsGet200(&client);
+    ts.server.requestShutdown();
+    try ts.future.await(rt.io());
+    serving = false;
+}
+
+fn runAlpnNone(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var ts = try openTlsServer(rt, gpa);
+    defer gpa.free(ts.cert_pem);
+    defer gpa.free(ts.key_pem);
+    defer {
+        ts.server.deinit(gpa);
+        gpa.destroy(ts.server);
+    }
+    var serving = true;
+    defer if (serving) {
+        ts.server.requestShutdown();
+        ts.future.cancel(rt.io()) catch {};
+    };
+    const stream = try ts.server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var client: starh2.edge.tls_edge.Conn = .{};
+    client.initTcp(stream);
+    defer client.deinit();
+    var connector = try starh2.edge.tls_edge.loopbackNoAlpnClientConnector();
+    defer connector.deinit();
+    try client.handshakeClientAny(&connector, rt.io());
+    try std.testing.expect(starh2.edge.tls_edge.isHttp11Alpn(client.ssl.selectedAlpn()));
+    try tlsGet200(&client);
+    ts.server.requestShutdown();
+    try ts.future.await(rt.io());
+    serving = false;
+}
+
+fn runBodyLargerThanRecv(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.request_body_bytes = 8192;
+    lim.h1_head_bytes = 1024;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = listen }},
+        .routes = &r,
+        .tls = null,
+        .limits = lim,
+    });
+    defer server.deinit(gpa);
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    const addr = server.localAddress(0);
+    const body_len: usize = 5000;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    try req.appendSlice(gpa, "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5000\r\n\r\n");
+    var i: usize = 0;
+    while (i < body_len) : (i += 1) try req.append(gpa, @truncate(i));
+    const stream = try addr.connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var rb: [16 * 1024]u8 = undefined;
+    var wb: [1024]u8 = undefined;
+    var reader = stream.reader(rt.io(), &rb);
+    var writer = stream.writer(rt.io(), &wb);
+    var off: usize = 0;
+    while (off < req.items.len) {
+        const n = @min(1024, req.items.len - off);
+        try writer.interface.writeAll(req.items[off..][0..n]);
+        try writer.interface.flush();
+        off += n;
+    }
+    var cap = try readResponse(&reader.interface, gpa, false);
+    defer cap.deinit();
+    if (cap.status != 200) {
+        std.debug.print("body_larger status={any} closed={} body_len={d}\n", .{ cap.status, cap.closed, cap.body.items.len });
+    }
+    try std.testing.expectEqual(@as(?u16, 200), cap.status);
+    try std.testing.expectEqual(@as(usize, body_len), cap.body.items.len);
+    i = 0;
+    while (i < body_len) : (i += 1) {
+        if (cap.body.items[i] != @as(u8, @truncate(i))) return error.BodyCorrupt;
+    }
+    server.requestShutdown();
+    try serve_future.await(rt.io());
+    serving = false;
+}
+
+fn runIdleReaped(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.field_block_timeout_ns = 200 * std.time.ns_per_ms;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = listen }},
+        .routes = &r,
+        .tls = null,
+        .limits = lim,
+    });
+    defer server.deinit(gpa);
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    const stream = try server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var rb: [256]u8 = undefined;
+    var reader = stream.reader(rt.io(), &rb);
+    rt.io().sleep(.fromMilliseconds(500), .awake) catch {};
+    const b = readByte(&reader.interface) catch {
+        server.requestShutdown();
+        try serve_future.await(rt.io());
+        serving = false;
+        return;
+    };
+    _ = b;
+    return error.IdleNotReaped;
+}
+
+fn runSlowLoris(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.field_block_timeout_ns = 200 * std.time.ns_per_ms;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = listen }},
+        .routes = &r,
+        .tls = null,
+        .limits = lim,
+    });
+    defer server.deinit(gpa);
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    const stream = try server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var rb: [256]u8 = undefined;
+    var wb: [64]u8 = undefined;
+    var reader = stream.reader(rt.io(), &rb);
+    var writer = stream.writer(rt.io(), &wb);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\n");
+    try writer.interface.flush();
+    rt.io().sleep(.fromMilliseconds(400), .awake) catch {};
+    writer.interface.writeAll("Host: h\r\n\r\n") catch {};
+    writer.interface.flush() catch {};
+    const b = readByte(&reader.interface) catch {
+        server.requestShutdown();
+        try serve_future.await(rt.io());
+        serving = false;
+        return;
+    };
+    if (b == 'H') return error.SlowLorisNotReaped;
+    server.requestShutdown();
+    try serve_future.await(rt.io());
+    serving = false;
+}
+
+fn runZeroAllocTls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var count: CountGpa = .{ .parent = std.heap.page_allocator };
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(rt.io(), "testdata/cert.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(rt.io(), "testdata/key.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.h1_head_bytes = 1024;
+    var server = try starh2.Server.init(count.allocator(), rt.io(), .{
+        .endpoints = &.{.{ .tls = listen }},
+        .routes = &r,
+        .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
+        .limits = lim,
+    });
+    defer server.deinit(count.allocator());
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, count.allocator() });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    const stream = try server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var client: starh2.edge.tls_edge.Conn = .{};
+    client.initTcp(stream);
+    defer client.deinit();
+    var connector = try starh2.edge.tls_edge.loopbackH1ClientConnector();
+    defer connector.deinit();
+    try client.handshakeClientH1(&connector, rt.io());
+    try tlsGet200(&client);
+    const before = count.allocs.load(.acquire);
+    var n: usize = 0;
+    while (n < 10) : (n += 1) {
+        try tlsGet200(&client);
+    }
+    try std.testing.expectEqual(before, count.allocs.load(.acquire));
+    server.requestShutdown();
+    try serve_future.await(rt.io());
+    serving = false;
+}
+
+test "h1.frame.body_larger_than_recv_buffer" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runBodyLargerThanRecv, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+fn withBatteryServer(
+    rt: *zio.Runtime,
+    gpa: std.mem.Allocator,
+    run: *const fn (std.Io, std.mem.Allocator, starh2.EndpointAddress) anyerror!void,
+) !void {
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.request_body_bytes = 1024;
+    lim.h1_head_bytes = 1024;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = listen }},
+        .routes = &r,
+        .tls = null,
+        .limits = lim,
+    });
+    defer server.deinit(gpa);
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    observed.gpa = gpa;
+    defer observed.deinit();
+    try run(rt.io(), gpa, server.localAddress(0));
+    server.requestShutdown();
+    try serve_future.await(rt.io());
+    serving = false;
+}
+
+fn namedOccupy(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runOccupyConnection);
+}
+
+fn namedEarlySecond(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runEarlySecondRequest);
+}
+
+fn namedAbortMidUpload(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runAbortMidUpload);
+}
+
+fn namedSlowHandler(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runSlowHandler);
+}
+
+test "h1.frame.early_second_request" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedEarlySecond, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+test "h1.sse.occupies_connection" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedOccupy, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+test "h1.keepalive.idle_reaped" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runIdleReaped, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+test "h1.limits.slow_loris" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runSlowLoris, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+test "h1.shape.abort_mid_upload" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedAbortMidUpload, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
+test "h1.shape.slow_handler" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedSlowHandler, .{ rt, std.testing.allocator });
     try handle.join();
 }

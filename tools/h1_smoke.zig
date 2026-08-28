@@ -62,6 +62,21 @@ fn curl(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !std.proce
         abort("curl failed to start", .{});
 }
 
+/// Two URLs, one curl process. `%{num_connects}` is per transfer: the first
+/// request is `n=1`, a reused connection is `n=0`. A server that closes after
+/// the first response makes the second transfer `n=1` as well.
+fn assertCurlReuse(stdout: []const u8, site: []const u8) void {
+    if (std.mem.indexOf(u8, stdout, "n=1") == null) {
+        abort("{s} keep-alive first transfer did not connect: {s}", .{ site, stdout });
+    }
+    if (std.mem.indexOf(u8, stdout, "n=0") == null) {
+        abort("{s} keep-alive second transfer opened a new connection: {s}", .{ site, stdout });
+    }
+    if (std.mem.indexOf(u8, stdout, "c=200") == null) {
+        abort("{s} keep-alive did not return 200: {s}", .{ site, stdout });
+    }
+}
+
 fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ns: u64) !std.process.Child.Term {
     const pid = child.id orelse return error.AlreadyGone;
     const Wd = struct {
@@ -122,6 +137,17 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.indexOf(u8, res.stdout, "1.1") == null) abort("tls did not negotiate HTTP/1.1: {s}", .{res.stdout});
         connections += 1;
         std.debug.print("h1-smoke: tls --http1.1 /hello 200\n", .{});
+
+        const ka_tls = try curl(gpa, io, &.{
+            "curl", "-sk", "--http1.1",
+            "-o", "/dev/null", "-o", "/dev/null",
+            "-w", "n=%{num_connects} c=%{http_code}\n", url, url,
+        });
+        defer gpa.free(ka_tls.stdout);
+        defer gpa.free(ka_tls.stderr);
+        std.debug.print("h1-smoke: tls keep-alive curl {s}\n", .{ka_tls.stdout});
+        assertCurlReuse(ka_tls.stdout, "tls");
+        connections += 2;
 
         var once_url_buf: [128]u8 = undefined;
         const once_url = std.fmt.bufPrint(&once_url_buf, "https://127.0.0.1:{d}/h1-once", .{port}) catch abort("url", .{});
@@ -184,10 +210,15 @@ pub fn main(init: std.process.Init) !void {
         // Two URLs in one invocation: keep-alive reuse.
         var url2_buf: [128]u8 = undefined;
         const url2 = std.fmt.bufPrint(&url2_buf, "http://127.0.0.1:{d}/hello", .{port}) catch abort("url", .{});
-        const ka = try curl(gpa, io, &.{ "curl", "-s", "-w", "%{num_connects} %{http_code} %{http_code}", "-o", "/dev/null", url, url2 });
+        const ka = try curl(gpa, io, &.{
+            "curl", "-s",
+            "-o", "/dev/null", "-o", "/dev/null",
+            "-w", "n=%{num_connects} c=%{http_code}\n", url, url2,
+        });
         defer gpa.free(ka.stdout);
         defer gpa.free(ka.stderr);
         std.debug.print("h1-smoke: keep-alive curl {s}\n", .{ka.stdout});
+        assertCurlReuse(ka.stdout, "h1c");
         connections += 2;
 
         // SSE event within 2s.

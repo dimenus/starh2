@@ -260,6 +260,30 @@ pub fn loopbackH1ClientConnector() !ClientConnector {
     return .initWithBuilder(&builder);
 }
 
+/// Client offers `h2` then `http/1.1`. The server must select `h2`.
+pub fn loopbackBothAlpnClientConnector() !ClientConnector {
+    boring.init();
+    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
+    errdefer builder.deinit();
+    builder.setVerify(boring.ssl.VerifyMode.none);
+    var wire: [1 + 2 + 1 + 8]u8 = undefined;
+    wire[0] = 2;
+    @memcpy(wire[1..][0..2], alpn_h2);
+    wire[3] = 8;
+    @memcpy(wire[4..][0..8], alpn_http11);
+    try builder.setClientAlpnProtos(&wire);
+    return .initWithBuilder(&builder);
+}
+
+/// Client sends no ALPN. The server must select `http/1.1`.
+pub fn loopbackNoAlpnClientConnector() !ClientConnector {
+    boring.init();
+    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
+    errdefer builder.deinit();
+    builder.setVerify(boring.ssl.VerifyMode.none);
+    return .initWithBuilder(&builder);
+}
+
 fn loadCertificateChain(builder: *boring.ssl.ContextBuilder, pem: []const u8) !void {
     var stack = boring.x509.X509.stackFromPem(pem) catch return error.InvalidCertificate;
     defer stack.deinit();
@@ -404,10 +428,8 @@ pub const Conn = struct {
         return n;
     }
 
-    /// Single-task client handshake: this task is the ciphertext source.
-    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
-        self.bindIo(io);
-        try self.setupConnect(connector);
+    fn handshakeLoop(self: *Conn, io: std.Io) !void {
+        _ = io;
         var iterations: u32 = 0;
         while (!self.ssl.isHandshakeComplete()) {
             iterations += 1;
@@ -424,6 +446,13 @@ pub const Conn = struct {
             };
         }
         self.drainToSocket() catch return error.TlsHandshakeFailed;
+    }
+
+    /// Single-task client handshake: this task is the ciphertext source.
+    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        self.bindIo(io);
+        try self.setupConnect(connector);
+        try self.handshakeLoop(io);
         if (!isHttp2Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
     }
 
@@ -432,23 +461,15 @@ pub const Conn = struct {
     pub fn handshakeClientH1(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
         self.bindIo(io);
         try self.setupConnect(connector);
-        var iterations: u32 = 0;
-        while (!self.ssl.isHandshakeComplete()) {
-            iterations += 1;
-            if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
-            self.drainToSocket() catch return error.TlsHandshakeFailed;
-            self.ssl.doHandshake() catch |err| switch (err) {
-                error.WantRead => {
-                    self.drainToSocket() catch return error.TlsHandshakeFailed;
-                    if (self.ssl.isHandshakeComplete()) break;
-                    self.feedFromSocket() catch return error.TlsHandshakeFailed;
-                },
-                error.WantWrite => {},
-                else => return error.TlsHandshakeFailed,
-            };
-        }
-        self.drainToSocket() catch return error.TlsHandshakeFailed;
+        try self.handshakeLoop(io);
         if (!isHttp11Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
+    }
+
+    /// Handshake with no ALPN assertion. The caller checks `selectedAlpn`.
+    pub fn handshakeClientAny(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+        self.bindIo(io);
+        try self.setupConnect(connector);
+        try self.handshakeLoop(io);
     }
 
     pub fn deinit(self: *Conn) void {
