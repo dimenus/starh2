@@ -209,6 +209,7 @@ const Observed = struct {
 
 var observed: Observed = .{};
 var abort_seen: std.atomic.Value(bool) = .init(false);
+var upload_entered: std.atomic.Value(bool) = .init(false);
 var slow_live: std.atomic.Value(bool) = .init(false);
 var observe_during_slow: std.atomic.Value(bool) = .init(false);
 
@@ -266,7 +267,18 @@ fn sseAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) any
     if (body.terminalCause() != null) abort_seen.store(true, .release);
 }
 
-fn routes() [21]starh2.Route {
+fn uploadAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    upload_entered.store(true, .release);
+    const now = std.Io.Clock.awake.now(resp.io);
+    const deadline = std.Io.Timestamp.fromNanoseconds(now.nanoseconds + 30 * std.time.ns_per_s);
+    resp.waitUntil(deadline) catch {
+        abort_seen.store(true, .release);
+        return;
+    };
+    if (resp.slotTerminal() != null) abort_seen.store(true, .release);
+}
+
+fn routes() [22]starh2.Route {
     return .{
         .{ .method = .GET, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
         .{ .method = .HEAD, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
@@ -287,6 +299,7 @@ fn routes() [21]starh2.Route {
         .{ .method = .GET, .path = "/task-err", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = taskErr } } },
         .{ .method = .GET, .path = "/task-err-after", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = taskErrAfter } } },
         .{ .method = .GET, .path = "/sse-abort", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseAbort } } },
+        .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = uploadAbort } } },
         .{ .method = .GET, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
         .{ .method = .HEAD, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
     };
@@ -611,7 +624,7 @@ fn serveBattery(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         std.debug.print("FAIL early_second: {s}\n", .{@errorName(err)});
         return err;
     };
-    try runAbortMidUpload(rt.io(), gpa, addr);
+    try runAbortMidUpload(rt.io(), gpa, addr, &server.accounting);
     try runSlowHandler(rt.io(), gpa, addr);
     try runParityTable(rt.io(), gpa, addr);
     try runValidationShared(rt.io(), gpa, addr);
@@ -1006,26 +1019,47 @@ fn runEarlySecondRequest(io: std.Io, gpa: std.mem.Allocator, addr: starh2.Endpoi
     if (observe_during_slow.load(.acquire)) return error.SecondRequestConcurrent;
 }
 
-fn runAbortMidUpload(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
-    {
-        const stream = try addr.connect(io, .{ .mode = .stream });
-        var wb: [256]u8 = undefined;
-        var writer = stream.writer(io, &wb);
-        try writer.interface.writeAll("POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\nPARTIAL");
-        try writer.interface.flush();
-        stream.close(io);
-    }
-    io.sleep(.fromMilliseconds(50), .awake) catch {};
+fn runAbortMidUpload(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    addr: starh2.EndpointAddress,
+    acct: *starh2.edge.connection.GlobalAccounting,
+) !void {
+    _ = gpa;
+    abort_seen.store(false, .release);
+    upload_entered.store(false, .release);
+    try std.testing.expectEqual(@as(usize, 0), acct.active_streams.load(.acquire));
     const stream = try addr.connect(io, .{ .mode = .stream });
-    defer stream.close(io);
-    var rb: [4096]u8 = undefined;
     var wb: [256]u8 = undefined;
-    var reader = stream.reader(io, &rb);
     var writer = stream.writer(io, &wb);
-    try writeReq(&writer.interface, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
-    var cap = try readResponse(&reader.interface, gpa, false);
-    defer cap.deinit();
-    try std.testing.expectEqual(@as(?u16, 200), cap.status);
+    try writer.interface.writeAll("POST /upload HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\nPARTIAL");
+    try writer.interface.flush();
+    var waits: usize = 0;
+    var peak: usize = 0;
+    while (!upload_entered.load(.acquire) and waits < 100) : (waits += 1) {
+        const live = acct.active_streams.load(.acquire);
+        if (live > peak) peak = live;
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    if (!upload_entered.load(.acquire)) {
+        stream.close(io);
+        return error.UploadHandlerDidNotStart;
+    }
+    peak = @max(peak, acct.active_streams.load(.acquire));
+    stream.close(io);
+    waits = 0;
+    while (!abort_seen.load(.acquire) and waits < 100) : (waits += 1) {
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    try std.testing.expect(abort_seen.load(.acquire));
+    waits = 0;
+    while (acct.active_streams.load(.acquire) != 0 and waits < 100) : (waits += 1) {
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 0), acct.active_streams.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), acct.request_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), acct.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), peak);
 }
 
 fn runSlowHandler(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
@@ -1470,9 +1504,10 @@ test "h1.limits.head_over_bound" {
 }
 
 test "h1.limits.resource_upper_bound" {
-    const b = try starh2.Limits.defaults.resourceUpperBound();
-    try std.testing.expect(b.terms.h1_head > 0);
-    try std.testing.expect(b.terms.h1_body > 0);
+    const lim = starh2.Limits.defaults;
+    const b = try lim.resourceUpperBound();
+    try std.testing.expectEqual(lim.max_connections * lim.h1_head_bytes * 3, b.terms.h1_head);
+    try std.testing.expectEqual(lim.max_connections * lim.request_body_bytes * 2, b.terms.h1_body);
 }
 
 test "h1.alpn.h2c_unchanged" {
@@ -1898,11 +1933,17 @@ fn runSlowLoris(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var wb: [64]u8 = undefined;
     var reader = stream.reader(rt.io(), &rb);
     var writer = stream.writer(rt.io(), &wb);
-    try writer.interface.writeAll("GET / HTTP/1.1\r\n");
-    try writer.interface.flush();
-    rt.io().sleep(.fromMilliseconds(400), .awake) catch {};
-    writer.interface.writeAll("Host: h\r\n\r\n") catch {};
-    writer.interface.flush() catch {};
+    const req = "GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+    // One byte every 40 ms: each gap is under the 200 ms field-block
+    // timeout, so a per-byte deadline reset would accept the request.
+    // Total time is ~1.2 s, so a start-of-head deadline reaps it.
+    // A peer that already closed returns a write error; that is a reap.
+    for (req) |byte| {
+        var one = [1]u8{byte};
+        writer.interface.writeAll(one[0..]) catch break;
+        writer.interface.flush() catch break;
+        rt.io().sleep(.fromMilliseconds(40), .awake) catch {};
+    }
     const b = readByte(&reader.interface) catch {
         server.requestShutdown();
         try serve_future.await(rt.io());
@@ -2007,7 +2048,29 @@ fn namedEarlySecond(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 fn namedAbortMidUpload(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    try withBatteryServer(rt, gpa, runAbortMidUpload);
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.request_body_bytes = 1024;
+    lim.h1_head_bytes = 1024;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = listen }},
+        .routes = &r,
+        .tls = null,
+        .limits = lim,
+    });
+    defer server.deinit(gpa);
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    try runAbortMidUpload(rt.io(), gpa, server.localAddress(0), &server.accounting);
+    server.requestShutdown();
+    try serve_future.await(rt.io());
+    serving = false;
 }
 
 fn namedSlowHandler(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {

@@ -64,16 +64,45 @@ fn curl(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !std.proce
 
 /// Two URLs, one curl process. `%{num_connects}` is per transfer: the first
 /// request is `n=1`, a reused connection is `n=0`. A server that closes after
-/// the first response makes the second transfer `n=1` as well.
-fn assertCurlReuse(stdout: []const u8, site: []const u8) void {
-    if (std.mem.indexOf(u8, stdout, "n=1") == null) {
-        abort("{s} keep-alive first transfer did not connect: {s}", .{ site, stdout });
+/// the first response makes the second transfer `n=1`. A failed second
+/// transfer is `c=000` with a nonzero curl exit; that is not reuse.
+const CurlTransfer = struct { n: u32, c: u16 };
+
+fn parseNc(line: []const u8) ?CurlTransfer {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (!std.mem.startsWith(u8, t, "n=")) return null;
+    const sp = std.mem.indexOfScalar(u8, t, ' ') orelse return null;
+    const n = std.fmt.parseInt(u32, t[2..sp], 10) catch return null;
+    const rest = std.mem.trim(u8, t[sp + 1 ..], " \t");
+    if (!std.mem.startsWith(u8, rest, "c=")) return null;
+    const c = std.fmt.parseInt(u16, rest[2..], 10) catch return null;
+    return .{ .n = n, .c = c };
+}
+
+fn assertCurlReuse(res: std.process.RunResult, site: []const u8) void {
+    switch (res.term) {
+        .exited => |code| if (code != 0) {
+            abort("{s} keep-alive curl exit {d} stdout={s}", .{ site, code, res.stdout });
+        },
+        else => abort("{s} keep-alive curl term={any} stdout={s}", .{ site, res.term, res.stdout }),
     }
-    if (std.mem.indexOf(u8, stdout, "n=0") == null) {
-        abort("{s} keep-alive second transfer opened a new connection: {s}", .{ site, stdout });
+    var recs: [2]CurlTransfer = undefined;
+    var nrec: usize = 0;
+    var it = std.mem.splitScalar(u8, res.stdout, '\n');
+    while (it.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        const rec = parseNc(line) orelse
+            abort("{s} keep-alive unreadable transfer line {s} stdout={s}", .{ site, line, res.stdout });
+        if (nrec == 2) abort("{s} keep-alive more than two transfer records: {s}", .{ site, res.stdout });
+        recs[nrec] = rec;
+        nrec += 1;
     }
-    if (std.mem.indexOf(u8, stdout, "c=200") == null) {
-        abort("{s} keep-alive did not return 200: {s}", .{ site, stdout });
+    if (nrec != 2) abort("{s} keep-alive want 2 transfer records, got {d}: {s}", .{ site, nrec, res.stdout });
+    if (recs[0].n != 1 or recs[0].c != 200) {
+        abort("{s} keep-alive first transfer n={d} c={d} stdout={s}", .{ site, recs[0].n, recs[0].c, res.stdout });
+    }
+    if (recs[1].n != 0 or recs[1].c != 200) {
+        abort("{s} keep-alive second transfer n={d} c={d} stdout={s}", .{ site, recs[1].n, recs[1].c, res.stdout });
     }
 }
 
@@ -146,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(ka_tls.stdout);
         defer gpa.free(ka_tls.stderr);
         std.debug.print("h1-smoke: tls keep-alive curl {s}\n", .{ka_tls.stdout});
-        assertCurlReuse(ka_tls.stdout, "tls");
+        assertCurlReuse(ka_tls, "tls");
         connections += 2;
 
         var once_url_buf: [128]u8 = undefined;
@@ -218,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(ka.stdout);
         defer gpa.free(ka.stderr);
         std.debug.print("h1-smoke: keep-alive curl {s}\n", .{ka.stdout});
-        assertCurlReuse(ka.stdout, "h1c");
+        assertCurlReuse(ka, "h1c");
         connections += 2;
 
         // SSE event within 2s.

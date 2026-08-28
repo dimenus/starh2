@@ -114,8 +114,10 @@ pub const Limits = struct {
     outbound_bytes_per_server: usize = 256 * 1024 * 1024,
     request_bytes_per_connection: usize = 8 * 1024 * 1024,
     request_bytes_per_server: usize = 256 * 1024 * 1024,
-    /// Reserved HTTP/1.1 request-head buffer per connection. A head over this
-    /// bound is 431; the buffer never grows.
+    /// Reserved HTTP/1.1 request-head size per connection. A head over this
+    /// bound is 431; the buffer never grows. Each connection allocates this
+    /// size three times: `head_buf`, `name_scratch`, and the head prefix of
+    /// `carry_buf`.
     h1_head_bytes: usize = 16 * 1024,
     control_bytes_per_connection: usize = 64 * 1024,
     control_entries_per_connection: usize = 256,
@@ -298,7 +300,8 @@ pub const Limits = struct {
         const deadline_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
         const deadline_state = deadline_events;
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        terms.h1_head = try checkedMul(self.max_connections, self.h1_head_bytes);
+        // head_buf, name_scratch, and the head prefix of carry_buf (init in edge/h1.zig).
+        terms.h1_head = try checkedMul(self.max_connections, try checkedMul(self.h1_head_bytes, 3));
         // body_buf plus the body-sized suffix of carry_buf (init in edge/h1.zig).
         terms.h1_body = try checkedMul(self.max_connections, try checkedMul(self.request_body_bytes, 2));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_stream_bytes, try checkedAdd(header_maps, intents)))));
@@ -307,7 +310,7 @@ pub const Limits = struct {
         const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
         // wire_descs already counts read+write channel descriptors; TLS
         // reuses the write capacity for its channel, so no extra desc term.
-        const h1_per_conn = try checkedAdd(self.h1_head_bytes, try checkedMul(self.request_body_bytes, 2));
+        const h1_per_conn = try checkedAdd(try checkedMul(self.h1_head_bytes, 3), try checkedMul(self.request_body_bytes, 2));
         const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, try checkedAdd(terms.tls_cipher_payload, h1_per_conn)))));
 
         terms.routes = try checkedAdd(
@@ -474,15 +477,16 @@ test "rejects response_compression with zero contexts" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
-test "h1_head term moves with the limit" {
+test "h1_head term counts three head-sized regions" {
+    const per = Limits.defaults.h1_head_bytes;
+    const n = Limits.defaults.max_connections;
     const base = try Limits.defaults.resourceUpperBound();
-    try std.testing.expect(base.terms.h1_head > 0);
-    try std.testing.expect(base.terms.h1_body > 0);
+    try std.testing.expectEqual(n * per * 3, base.terms.h1_head);
     var more = Limits.defaults;
-    more.h1_head_bytes = Limits.defaults.h1_head_bytes * 2;
+    more.h1_head_bytes = per * 2;
     const bigger = try more.resourceUpperBound();
-    try std.testing.expect(bigger.terms.h1_head > base.terms.h1_head);
-    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+    try std.testing.expectEqual(n * per * 2 * 3, bigger.terms.h1_head);
+    try std.testing.expectEqual(base.allocator_bytes + n * per * 3, bigger.allocator_bytes);
 }
 
 test "h1_body term moves allocator_bytes with request_body_bytes" {

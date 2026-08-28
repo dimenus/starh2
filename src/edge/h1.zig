@@ -348,20 +348,34 @@ fn serveOne(self: *H1Conn) !bool {
                 try flushSink(self);
             }
 
-            const body = try readBody(self, head) orelse {
-                try writeError(self, 413);
-                return false;
+            const method = request.Method.parse(head.method_raw);
+            const matched = self.config.router.match(method, head.path);
+            const complete_inline = switch (matched) {
+                .found => |f| f.handler == .complete,
+                else => true,
             };
-            if (body.len > self.config.limits.request_body_bytes) {
-                try writeError(self, 413);
-                return false;
-            }
-            if (self.config.accounting) |a| {
-                if (!a.tryReserveRequest(body.len)) {
+
+            var body: []const u8 = &.{};
+            if (complete_inline) {
+                body = try readBody(self, head) orelse {
+                    try writeError(self, 413);
+                    return false;
+                };
+                if (body.len > self.config.limits.request_body_bytes) {
                     try writeError(self, 413);
                     return false;
                 }
-                self.request_held = body.len;
+                if (self.config.accounting) |a| {
+                    if (!a.tryReserveRequest(body.len)) {
+                        try writeError(self, 413);
+                        return false;
+                    }
+                    self.request_held = body.len;
+                }
+            } else if (head.content_length != 0) {
+                // Task handler starts after the head. Unread body bytes stay
+                // on the socket; do not parse them as the next request.
+                self.want_close = true;
             }
 
             var headers: []const request.Header = head.headers;
