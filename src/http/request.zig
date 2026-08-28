@@ -64,6 +64,8 @@ pub const Request = struct {
     path_remainder: []const u8 = "",
     query: []const u8,
     headers: []const Header,
+    /// Bounded request body. Empty when the peer sent none, or when the route
+    /// set `TaskHandler.stream_request` (H1 starts after the head).
     body: []const u8,
     trailers: []const Header,
     arena: std.mem.Allocator,

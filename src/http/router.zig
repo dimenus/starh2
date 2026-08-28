@@ -20,9 +20,15 @@ const response = @import("response.zig");
 
 /// A handler that may block, stream, or sleep. Always runs on its own task so
 /// a stuck SSE or a database wait cannot stop ingest on that connection.
+///
+/// `Request.body` is the bounded request body (H1 Content-Length, H2 DATA).
+/// Set `stream_request` to start after the request head with an empty body.
+/// H1 then forces close when Content-Length is unread, so leftover bytes
+/// are not the next request.
 pub const TaskHandler = struct {
     ptr: *anyopaque,
     runFn: *const fn (*anyopaque, *const request.Request, *response.Response) anyerror!void,
+    stream_request: bool = false,
 };
 
 /// A handler that only `CompleteResponse.send`s. May run on the connection
@@ -183,4 +189,12 @@ test "complete and task handlers both match" {
         .found => |f| try std.testing.expect(f.handler == .task),
         else => return error.ExpectedTask,
     }
+}
+
+test "task handler stream_request defaults false" {
+    const dummy: u8 = 0;
+    const t: TaskHandler = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        fn f(_: *anyopaque, _: *const request.Request, _: *response.Response) anyerror!void {}
+    }.f };
+    try std.testing.expect(!t.stream_request);
 }

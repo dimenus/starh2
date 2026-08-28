@@ -3,10 +3,12 @@
 //! The connection task owns the socket (h1c) or the TLS `Conn` (ALPN `http/1.1`
 //! / no ALPN). It accumulates a head into a boot-reserved buffer and parses
 //! once. A complete handler reads the Content-Length body, then runs on the
-//! actor. A task handler starts after the head; unread body bytes force close
-//! so they are not the next request. The response uses one framing
-//! (Content-Length, chunked, or close-delimited). Keep-alive loops until a
-//! close reason.
+//! actor. A task handler reads the same bounded body, then runs on its own
+//! task (`Request.body` holds those bytes). `TaskHandler.stream_request`
+//! starts after the head with an empty body; unread Content-Length forces
+//! close so leftover bytes are not the next request. The response uses one
+//! framing (Content-Length, chunked, or close-delimited). Keep-alive loops
+//! until a close reason.
 const std = @import("std");
 const zio = @import("zio");
 const request = @import("../http/request.zig");
@@ -329,6 +331,16 @@ fn shutdownRequested(self: *H1Conn) bool {
     return false;
 }
 
+fn skipRequestBody(matched: router_mod.Match) bool {
+    return switch (matched) {
+        .found => |f| switch (f.handler) {
+            .task => |t| t.stream_request,
+            .complete => false,
+        },
+        else => false,
+    };
+}
+
 fn serveOne(self: *H1Conn) !bool {
     const parsed = try readHead(self) orelse return false;
     switch (parsed) {
@@ -352,13 +364,12 @@ fn serveOne(self: *H1Conn) !bool {
 
             const method = request.Method.parse(head.method_raw);
             const matched = self.config.router.match(method, head.path);
-            const complete_inline = switch (matched) {
-                .found => |f| f.handler == .complete,
-                else => true,
-            };
 
             var body: []const u8 = &.{};
-            if (complete_inline) {
+            if (skipRequestBody(matched)) {
+                // Streaming contract: handler starts after the head.
+                if (head.content_length != 0) self.want_close = true;
+            } else {
                 body = try readBody(self, head) orelse {
                     try writeError(self, 413);
                     return false;
@@ -374,10 +385,6 @@ fn serveOne(self: *H1Conn) !bool {
                     }
                     self.request_held = body.len;
                 }
-            } else if (head.content_length != 0) {
-                // Task handler starts after the head. Unread body bytes stay
-                // on the socket; do not parse them as the next request.
-                self.want_close = true;
             }
 
             var headers: []const request.Header = head.headers;

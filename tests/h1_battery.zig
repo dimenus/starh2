@@ -125,6 +125,11 @@ fn echo(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteRespons
     try resp.send(200, &.{}, req.body);
 }
 
+fn echoTask(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    observed.record(resp.io, req);
+    try resp.send(200, &.{}, req.body);
+}
+
 fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     try resp.send(200, &.{}, "ok");
 }
@@ -169,6 +174,7 @@ const Observed = struct {
     query: []u8 = &.{},
     authority: []u8 = &.{},
     headers: []u8 = &.{},
+    body: []u8 = &.{},
     header_n: usize = 0,
     mu: std.Io.Mutex = .init,
     gpa: std.mem.Allocator = undefined,
@@ -178,10 +184,12 @@ const Observed = struct {
         if (self.query.len != 0) self.gpa.free(self.query);
         if (self.authority.len != 0) self.gpa.free(self.authority);
         if (self.headers.len != 0) self.gpa.free(self.headers);
+        if (self.body.len != 0) self.gpa.free(self.body);
         self.path = &.{};
         self.query = &.{};
         self.authority = &.{};
         self.headers = &.{};
+        self.body = &.{};
     }
 
     fn record(self: *Observed, io: std.Io, req: *const starh2.Request) void {
@@ -192,9 +200,11 @@ const Observed = struct {
         if (self.query.len != 0) self.gpa.free(self.query);
         if (self.authority.len != 0) self.gpa.free(self.authority);
         if (self.headers.len != 0) self.gpa.free(self.headers);
+        if (self.body.len != 0) self.gpa.free(self.body);
         self.path = self.gpa.dupe(u8, req.path) catch return;
         self.query = self.gpa.dupe(u8, req.query) catch return;
         self.authority = self.gpa.dupe(u8, req.authority) catch return;
+        self.body = self.gpa.dupe(u8, req.body) catch &.{};
         self.header_n = req.headers.len;
         var dump: std.ArrayList(u8) = .empty;
         for (req.headers) |h| {
@@ -278,13 +288,14 @@ fn uploadAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) 
     if (resp.slotTerminal() != null) abort_seen.store(true, .release);
 }
 
-fn routes() [22]starh2.Route {
+fn routes() [24]starh2.Route {
     return .{
         .{ .method = .GET, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
         .{ .method = .HEAD, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
         .{ .method = .OPTIONS, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
         .{ .method = .POST, .path = "/echo", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = echo } } },
         .{ .method = .GET, .path = "/echo", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = echo } } },
+        .{ .method = .POST, .path = "/echo-task", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = echoTask } } },
         .{ .method = .GET, .path = "/query", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = queryH } } },
         .{ .method = .GET, .path = "/sse-once", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseOnce } } },
         .{ .method = .GET, .path = "/stream-wait", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = streamWait } } },
@@ -296,10 +307,11 @@ fn routes() [22]starh2.Route {
         .{ .method = .GET, .path = "/crlf", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = crlfH } } },
         .{ .method = .HEAD, .path = "/head-stream", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = headStream } } },
         .{ .method = .GET, .path = "/task-none", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = taskNone } } },
+        .{ .method = .POST, .path = "/stream-none", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = taskNone, .stream_request = true } } },
         .{ .method = .GET, .path = "/task-err", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = taskErr } } },
         .{ .method = .GET, .path = "/task-err-after", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = taskErrAfter } } },
         .{ .method = .GET, .path = "/sse-abort", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseAbort } } },
-        .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = uploadAbort } } },
+        .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = uploadAbort, .stream_request = true } } },
         .{ .method = .GET, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
         .{ .method = .HEAD, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
     };
@@ -1622,6 +1634,75 @@ test "h1.parity.request_table wire h1 vs h2" {
     try handle.join();
 }
 
+fn runParityTaskPostBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    observed.gpa = gpa;
+    defer observed.deinit();
+    const payload = "{\"hello\":1}";
+    const h1_listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const h2_listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{ .{ .h1c = h1_listen }, .{ .h2c_prior_knowledge = h2_listen } },
+        .routes = &r,
+        .tls = null,
+    });
+    defer server.deinit(gpa);
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+
+    {
+        const stream = try server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+        defer stream.close(rt.io());
+        var rb: [4096]u8 = undefined;
+        var wb: [512]u8 = undefined;
+        var reader = stream.reader(rt.io(), &rb);
+        var writer = stream.writer(rt.io(), &wb);
+        try writeReq(&writer.interface, "POST /echo-task HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\nContent-Type: application/json\r\n\r\n{\"hello\":1}");
+        var cap = try readResponse(&reader.interface, gpa, false);
+        defer cap.deinit();
+        try std.testing.expectEqual(@as(?u16, 200), cap.status);
+        try std.testing.expectEqualStrings(payload, cap.body.items);
+    }
+    try std.testing.expectEqualStrings(payload, observed.body);
+    const h1_body = try gpa.dupe(u8, observed.body);
+    defer gpa.free(h1_body);
+    observed.deinit();
+
+    {
+        const stream = try server.localAddress(1).connect(rt.io(), .{ .mode = .stream });
+        defer stream.close(rt.io());
+        var wb: [4096]u8 = undefined;
+        var writer = stream.writer(rt.io(), &wb);
+        const wire = try h2c.buildClientPost(gpa, "/echo-task", payload);
+        defer gpa.free(wire);
+        try writer.interface.writeAll(wire);
+        try writer.interface.flush();
+        var waits: usize = 0;
+        while (observed.body.len == 0 and waits < 40) : (waits += 1) {
+            rt.io().sleep(.fromMilliseconds(50), .awake) catch {};
+        }
+    }
+
+    try std.testing.expectEqualStrings(payload, observed.body);
+    try std.testing.expectEqualStrings(h1_body, observed.body);
+
+    server.requestShutdown();
+    try serve_future.await(rt.io());
+    serving = false;
+}
+
+test "h1.parity.task_post_body wire h1 vs h2" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runParityTaskPostBody, .{ rt, std.testing.allocator });
+    try handle.join();
+}
+
 fn runTlsSmallRecords(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const cert_pem = try std.Io.Dir.cwd().readFileAlloc(rt.io(), "testdata/cert.pem", gpa, .limited(64 * 1024));
     defer gpa.free(cert_pem);
@@ -2054,7 +2135,7 @@ fn runUnreadBodyForcesClose(io: std.Io, gpa: std.mem.Allocator, addr: starh2.End
     var wb: [512]u8 = undefined;
     var reader = stream.reader(io, &rb);
     var writer = stream.writer(io, &wb);
-    try writeReq(&writer.interface, "GET /task-none HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nABCDGET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    try writeReq(&writer.interface, "POST /stream-none HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nABCDGET / HTTP/1.1\r\nHost: h\r\n\r\n");
     var cap = try readResponse(&reader.interface, gpa, false);
     defer cap.deinit();
     try std.testing.expectEqual(@as(?u16, 500), cap.status);
