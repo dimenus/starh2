@@ -28,11 +28,14 @@
 //!
 //! # What this stack deliberately does not do
 //!
-//! HTTP/2 only: no HTTP/1.1, no h2c Upgrade, no ALPN fallback, no HTTP/3. Also
-//! no server push, no CONNECT, no response trailers, and no streaming request
-//! bodies. Datastar needs multiplexed long-lived SSE beside one-shot updates,
-//! and every omission above removes a code path that would otherwise need the
-//! same conformance and security work as the ones that are used.
+//! HTTP/2 is the primary surface. HTTP/1.1 lives beside it as `http1` — a
+//! different parser, not an h2c Upgrade, not a preface fallback, and not a
+//! second reader inside `Session`. First cut: Content-Length one-shots and a
+//! `Connection: close` that actually half-closes. No chunked encoding, no
+//! pipelining, no keep-alive reuse, no CONNECT, no HTTP/3, no server push, no
+//! response trailers, and no streaming request bodies. Datastar still needs
+//! multiplexed long-lived SSE beside one-shot updates; the h1 sibling is for
+//! the one-shot clients that do not speak h2.
 const std = @import("std");
 
 pub const core = struct {
@@ -71,6 +74,10 @@ pub const http = struct {
     pub const content_coding = @import("http/content_coding.zig");
     pub const brotli = @import("http/brotli.zig");
 };
+
+/// HTTP/1.1 request/response codec and one-shot connection helper.
+/// Sibling of the h2 session — a different parser.
+pub const http1 = @import("http1.zig");
 
 
 pub const Limits = core.limits.Limits;
@@ -126,4 +133,5 @@ test {
     _ = http.form;
     _ = http.content_coding;
     _ = http.brotli;
+    _ = http1;
 }

@@ -15,7 +15,9 @@ These are refused on purpose, not missing. Each one would pull in parsers or
 lifecycle modes that the target workload does not use, and every one of them
 would need the same conformance and security work as the paths that are used.
 
-- HTTP/1.1, h2c `Upgrade`, ALPN fallback to http/1.1, HTTP/3
+- HTTP/1.1 keep-alive, chunked encoding, h2c `Upgrade`, ALPN fallback, HTTP/3
+  (a first-cut HTTP/1.1 oneshot sibling lives in `starh2.http1`: Content-Length
+  framing and `Connection: close` that actually ends the connection)
 - Server push, `CONNECT`, WebSockets, response trailers
 - Streaming request bodies, response compression
 - A client library
