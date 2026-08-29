@@ -217,7 +217,7 @@ pub const Session = struct {
         /// Route body cap for this method and path. Null hook uses `Limits.request_body_bytes`.
         requestBodyCap: ?*const fn (*anyopaque, method: []const u8, path: []const u8) usize = null,
         /// Allocator for one stream's decoded request-list (not the dynamic table).
-        headerListAlloc: ?*const fn (*anyopaque, u31) std.mem.Allocator = null;
+        headerListAlloc: ?*const fn (*anyopaque, u31) std.mem.Allocator = null,
         /// Reset that allocator after a decode that will not be dispatched.
         discardHeaderList: ?*const fn (*anyopaque, u31) void = null,
         /// Rent a boot-reserved outbound frame slab. `n` is the on-wire size.
