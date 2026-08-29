@@ -51,8 +51,9 @@ pub const Route = struct {
     /// When true, `path` is a prefix; exact routes are still tried first.
     prefix: bool = false,
     handler: Handler,
-    /// When set, H1 413s a Content-Length above this before reading the body.
-    /// Null uses `Limits.request_body_bytes`.
+    /// When set, H1 413s a Content-Length above this before reading the body,
+    /// and H2 413s on Content-Length and on DATA past this cap without
+    /// retaining the overflow. Null uses `Limits.request_body_bytes`.
     max_request_body_bytes: ?usize = null,
 };
 

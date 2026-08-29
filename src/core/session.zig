@@ -214,8 +214,10 @@ pub const Session = struct {
         onRelease: *const fn (*anyopaque) void,
         tryReserveRequest: ?*const fn (*anyopaque, usize) bool = null,
         releaseRequest: ?*const fn (*anyopaque, usize) void = null,
+        /// Route body cap for this method and path. Null hook uses `Limits.request_body_bytes`.
+        requestBodyCap: ?*const fn (*anyopaque, method: []const u8, path: []const u8) usize = null,
         /// Allocator for one stream's decoded request-list (not the dynamic table).
-        headerListAlloc: ?*const fn (*anyopaque, u31) std.mem.Allocator = null,
+        headerListAlloc: ?*const fn (*anyopaque, u31) std.mem.Allocator = null;
         /// Reset that allocator after a decode that will not be dispatched.
         discardHeaderList: ?*const fn (*anyopaque, u31) void = null,
         /// Rent a boot-reserved outbound frame slab. `n` is the on-wire size.
@@ -226,6 +228,14 @@ pub const Session = struct {
         /// decides which; a prefix of a slab is reconstructed to the full lease.
         releaseFrame: ?*const fn (*anyopaque, []u8) void = null,
     };
+
+    fn routeBodyCap(self: *const Session, method: []const u8, path: []const u8) usize {
+        const global = self.limits.request_body_bytes;
+        if (self.stream_hooks) |h| {
+            if (h.requestBodyCap) |f| return @min(f(h.ctx, method, path), global);
+        }
+        return global;
+    }
 
     fn headerListAllocator(self: *Session, stream_id: u31) std.mem.Allocator {
         if (self.stream_hooks) |h| {
@@ -1075,7 +1085,8 @@ pub const Session = struct {
                 try self.pending_bodies.put(hdr.stream_id, .empty);
                 break :blk self.pending_bodies.getPtr(hdr.stream_id).?;
             };
-            if (body.items.len + data.len > self.limits.request_body_bytes) {
+            const cap = s.request_body_cap orelse self.limits.request_body_bytes;
+            if (body.items.len + data.len > cap) {
                 s.refused_before_dispatch = true;
                 s.early_status = 413;
                 // Discard overflow bytes; do not retain or dispatch.
@@ -1388,8 +1399,10 @@ pub const Session = struct {
             s.refused_before_dispatch = true;
             s.early_status = 431;
         }
+        s.request_body_cap = self.routeBodyCap(parsed.method, parsed.path);
         if (parsed.content_length) |cl| {
-            if (cl > self.limits.request_body_bytes) {
+            const cap = s.request_body_cap orelse self.limits.request_body_bytes;
+            if (cl > cap) {
                 s.refused_before_dispatch = true;
                 s.early_status = 413;
             }

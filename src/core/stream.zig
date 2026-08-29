@@ -45,6 +45,9 @@ pub const Stream = struct {
     generation: u32 = 0,
     /// Set when emitting 431/414/413 without dispatch.
     early_status: ?u16 = null,
+    /// Per-stream body cap from the matched route, or null to use
+    /// `Limits.request_body_bytes`. Set when request headers are validated.
+    request_body_cap: ?usize = null,
     /// Exactly one early HTTP response frameset has been emitted.
     early_response_sent: bool = false,
     /// Concurrent active_streams credit already released for this stream.

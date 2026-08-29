@@ -1185,6 +1185,16 @@ const Connection = struct {
                     c.releaseWireBytes(buf);
                 }
             }.f,
+            .requestBodyCap = struct {
+                fn f(ctx: *anyopaque, method: []const u8, path: []const u8) usize {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    const matched = c.config.router.match(request.Method.parse(method), path);
+                    return switch (matched) {
+                        .found => |found| found.max_request_body_bytes orelse c.config.limits.request_body_bytes,
+                        else => c.config.limits.request_body_bytes,
+                    };
+                }
+            }.f,
         };
         if (config.accounting != null) {
             session.stream_hooks.?.tryReserveRequest = struct {

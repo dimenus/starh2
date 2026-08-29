@@ -181,6 +181,99 @@ test "regression: body limit+1 yields early 413 not dispatch" {
     try std.testing.expect(!saw_dispatch);
 }
 
+test "regression: route body cap 413s H2 DATA without retaining overflow" {
+    const session_mod = starh2.core.session;
+    const frame = starh2.core.frame;
+    const hpack = starh2.core.hpack;
+    const cap: usize = 16 * 1024;
+    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    defer session.deinit();
+    const Hooks = struct {
+        fn admit(_: *anyopaque) bool {
+            return true;
+        }
+        fn release(_: *anyopaque) void {}
+        fn bodyCap(_: *anyopaque, _: []const u8, _: []const u8) usize {
+            return cap;
+        }
+    };
+    var dummy: u8 = 0;
+    session.stream_hooks = .{
+        .ctx = &dummy,
+        .tryAdmit = Hooks.admit,
+        .onRelease = Hooks.release,
+        .requestBodyCap = Hooks.bodyCap,
+    };
+    freeIntents(session.drainIntents());
+
+    const fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/v1/auth/apple/native" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(std.testing.allocator, &fields);
+    defer std.testing.allocator.free(block);
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try prefaceSettings(&wire);
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    const fh = frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true },
+        .stream_id = 1,
+    };
+    fh.encode(&hdr_buf);
+    try wire.appendSlice(std.testing.allocator, &hdr_buf);
+    try wire.appendSlice(std.testing.allocator, block);
+
+    {
+        var data = try std.testing.allocator.alloc(u8, frame.FRAME_HEADER_LEN + cap);
+        defer std.testing.allocator.free(data);
+        const dh = frame.FrameHeader{
+            .length = @intCast(cap),
+            .type = .data,
+            .flags = .{},
+            .stream_id = 1,
+        };
+        dh.encode(data[0..frame.FRAME_HEADER_LEN]);
+        @memset(data[frame.FRAME_HEADER_LEN..], 'x');
+        try wire.appendSlice(std.testing.allocator, data);
+    }
+    {
+        var data: [frame.FRAME_HEADER_LEN + 1]u8 = undefined;
+        const dh = frame.FrameHeader{
+            .length = 1,
+            .type = .data,
+            .flags = .{ .end_stream = true },
+            .stream_id = 1,
+        };
+        dh.encode(data[0..frame.FRAME_HEADER_LEN]);
+        data[frame.FRAME_HEADER_LEN] = 'y';
+        try wire.appendSlice(std.testing.allocator, &data);
+    }
+
+    try session.ingest(wire.items);
+    const intents = session.drainIntents();
+    defer freeIntents(intents);
+    var saw_413 = false;
+    var saw_dispatch = false;
+    for (intents) |it| switch (it) {
+        .early_reject => |e| {
+            if (e.status == 413) saw_413 = true;
+        },
+        .dispatch_request => |d| {
+            saw_dispatch = true;
+            try std.testing.expect(d.body.len <= cap);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_413);
+    try std.testing.expect(!saw_dispatch);
+}
+
 test "regression: half-closed-remote HEADERS is STREAM_CLOSED" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
