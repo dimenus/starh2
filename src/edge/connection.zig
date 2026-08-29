@@ -214,10 +214,16 @@ fn closeProbePeerPort(handle: std.posix.socket_t) u16 {
 const mapped_v4_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
 
 /// Connection peer without a port. IPv4-mapped IPv6 becomes IPv4.
+///
+/// Uses libc getpeername, not std.posix.getpeername. posix maps EINVAL to
+/// `unreachable`, and a lifecycle test socket can return that.
 pub fn peerFromHandle(handle: std.posix.socket_t) request.Peer {
-    var storage: std.posix.sockaddr.storage = undefined;
+    var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    if (@hasField(std.posix.sockaddr.storage, "len")) {
+        storage.len = @sizeOf(std.posix.sockaddr.storage);
+    }
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    std.posix.getpeername(handle, @ptrCast(&storage), &len) catch return .unknown;
+    if (std.c.getpeername(handle, @ptrCast(&storage), &len) != 0) return .unknown;
     switch (storage.family) {
         std.posix.AF.INET => {
             const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
