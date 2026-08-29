@@ -55,6 +55,15 @@ pub const Header = struct {
     value: []const u8,
 };
 
+/// Connection peer address, without a port. IPv4-mapped IPv6 is stored as IPv4
+/// so the two encodings of one client share a key. `.unknown` when getpeername
+/// failed.
+pub const Peer = union(enum) {
+    unknown,
+    ip4: [4]u8,
+    ip6: [16]u8,
+};
+
 pub const Request = struct {
     method: Method,
     scheme: []const u8,
@@ -69,4 +78,6 @@ pub const Request = struct {
     body: []const u8,
     trailers: []const Header,
     arena: std.mem.Allocator,
+    /// TCP/TLS peer, filled from getpeername on the accepted socket.
+    peer: Peer = .unknown,
 };

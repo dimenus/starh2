@@ -153,6 +153,7 @@ pub const Server = struct {
                 .path = try gpa.dupe(u8, route.path),
                 .prefix = route.prefix,
                 .handler = route.handler,
+                .max_request_body_bytes = route.max_request_body_bytes,
             };
         }
 

@@ -211,6 +211,29 @@ fn closeProbePeerPort(handle: std.posix.socket_t) u16 {
     return std.mem.bigToNative(u16, in.port);
 }
 
+const mapped_v4_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+
+/// Connection peer without a port. IPv4-mapped IPv6 becomes IPv4.
+pub fn peerFromHandle(handle: std.posix.socket_t) request.Peer {
+    var storage: std.posix.sockaddr.storage = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(handle, @ptrCast(&storage), &len) catch return .unknown;
+    switch (storage.family) {
+        std.posix.AF.INET => {
+            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+            return .{ .ip4 = std.mem.toBytes(in.addr) };
+        },
+        std.posix.AF.INET6 => {
+            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            if (std.mem.eql(u8, in6.addr[0..12], &mapped_v4_prefix)) {
+                return .{ .ip4 = in6.addr[12..16].* };
+            }
+            return .{ .ip6 = in6.addr };
+        },
+        else => return .unknown,
+    }
+}
+
 /// The print body for `session.close_probe_fn`. Lives here because core is
 /// clock-free and I/O-free by contract; the binary wires the two together.
 pub fn closeProbeSessionPrint(ev: session_mod.CloseProbeEvent) void {
@@ -4505,6 +4528,7 @@ const Connection = struct {
             .body = d.body,
             .trailers = trailers,
             .arena = a,
+            .peer = peerFromHandle(self.stream.socket.handle),
         };
         job.resp = .{
             .stream_id = d.stream_id,

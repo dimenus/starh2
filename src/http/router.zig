@@ -51,12 +51,16 @@ pub const Route = struct {
     /// When true, `path` is a prefix; exact routes are still tried first.
     prefix: bool = false,
     handler: Handler,
+    /// When set, H1 413s a Content-Length above this before reading the body.
+    /// Null uses `Limits.request_body_bytes`.
+    max_request_body_bytes: ?usize = null,
 };
 
 pub const Found = struct {
     handler: Handler,
     /// Bytes of the request path after a matched prefix; empty for exact matches.
     path_remainder: []const u8 = "",
+    max_request_body_bytes: ?usize = null,
 };
 
 pub const Match = union(enum) {
@@ -81,7 +85,10 @@ pub const Router = struct {
                     allowed[allowed_len] = r.method;
                     allowed_len += 1;
                 }
-                if (r.method == method) return .{ .found = .{ .handler = r.handler } };
+                if (r.method == method) return .{ .found = .{
+                    .handler = r.handler,
+                    .max_request_body_bytes = r.max_request_body_bytes,
+                } };
             }
         }
         if (path_exists) return .{ .method_not_allowed = allowed[0..allowed_len] };
@@ -112,7 +119,11 @@ pub const Router = struct {
             if (r.method != method) continue;
             if (r.path.len >= best_len) {
                 best_len = r.path.len;
-                best = .{ .handler = r.handler, .path_remainder = path[r.path.len..] };
+                best = .{
+                    .handler = r.handler,
+                    .path_remainder = path[r.path.len..],
+                    .max_request_body_bytes = r.max_request_body_bytes,
+                };
             }
         }
         if (best) |f| return .{ .found = f };
@@ -188,6 +199,26 @@ test "complete and task handlers both match" {
     switch (r.match(.GET, "/sse")) {
         .found => |f| try std.testing.expect(f.handler == .task),
         else => return error.ExpectedTask,
+    }
+}
+
+test "match copies max_request_body_bytes onto Found" {
+    const dummy: u8 = 0;
+    const h: Handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = struct {
+        fn f(_: *anyopaque, _: *const request.Request, _: *response.CompleteResponse) anyerror!void {}
+    }.f } };
+    const routes = [_]Route{
+        .{ .method = .POST, .path = "/small", .handler = h, .max_request_body_bytes = 16 * 1024 },
+        .{ .method = .POST, .path = "/open", .handler = h },
+    };
+    const r: Router = .{ .routes = &routes };
+    switch (r.match(.POST, "/small")) {
+        .found => |f| try std.testing.expectEqual(@as(?usize, 16 * 1024), f.max_request_body_bytes),
+        else => return error.ExpectedFound,
+    }
+    switch (r.match(.POST, "/open")) {
+        .found => |f| try std.testing.expectEqual(@as(?usize, null), f.max_request_body_bytes),
+        else => return error.ExpectedFound,
     }
 }
 
