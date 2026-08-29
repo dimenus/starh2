@@ -364,17 +364,17 @@ fn serveOne(self: *H1Conn) !bool {
             var close_after = head.connection_close;
             if (test_channel_mutation == .m3_ignore_close) close_after = false;
 
-            if (head.expect_100) {
-                try writeRaw(self, "HTTP/1.1 100 Continue\r\n\r\n");
-                try flushSink(self);
-            }
-
             const method = request.Method.parse(head.method_raw);
             const matched = self.config.router.match(method, head.path);
             const body_cap = requestBodyCap(matched, self.config.limits.request_body_bytes);
             if (head.content_length > body_cap) {
                 try writeError(self, 413);
                 return false;
+            }
+
+            if (head.expect_100) {
+                try writeRaw(self, "HTTP/1.1 100 Continue\r\n\r\n");
+                try flushSink(self);
             }
 
             var body: []const u8 = &.{};
