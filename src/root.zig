@@ -97,6 +97,7 @@ pub const TaskHandler = http.router.TaskHandler;
 pub const CompleteHandler = http.router.CompleteHandler;
 pub const Route = http.router.Route;
 pub const Request = http.request.Request;
+pub const Peer = http.request.Peer;
 pub const Response = http.response.Response;
 pub const CompleteResponse = http.response.CompleteResponse;
 pub const Body = http.response.Body;

@@ -211,6 +211,35 @@ fn closeProbePeerPort(handle: std.posix.socket_t) u16 {
     return std.mem.bigToNative(u16, in.port);
 }
 
+const mapped_v4_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+
+/// Connection peer without a port. IPv4-mapped IPv6 becomes IPv4.
+///
+/// Uses libc getpeername, not std.posix.getpeername. posix maps EINVAL to
+/// `unreachable`, and a lifecycle test socket can return that.
+pub fn peerFromHandle(handle: std.posix.socket_t) request.Peer {
+    var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    if (@hasField(std.posix.sockaddr.storage, "len")) {
+        storage.len = @sizeOf(std.posix.sockaddr.storage);
+    }
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    if (std.c.getpeername(handle, @ptrCast(&storage), &len) != 0) return .unknown;
+    switch (storage.family) {
+        std.posix.AF.INET => {
+            const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+            return .{ .ip4 = std.mem.toBytes(in.addr) };
+        },
+        std.posix.AF.INET6 => {
+            const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            if (std.mem.eql(u8, in6.addr[0..12], &mapped_v4_prefix)) {
+                return .{ .ip4 = in6.addr[12..16].* };
+            }
+            return .{ .ip6 = in6.addr };
+        },
+        else => return .unknown,
+    }
+}
+
 /// The print body for `session.close_probe_fn`. Lives here because core is
 /// clock-free and I/O-free by contract; the binary wires the two together.
 pub fn closeProbeSessionPrint(ev: session_mod.CloseProbeEvent) void {
@@ -1154,6 +1183,16 @@ const Connection = struct {
                 fn f(ctx: *anyopaque, buf: []u8) void {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     c.releaseWireBytes(buf);
+                }
+            }.f,
+            .requestBodyCap = struct {
+                fn f(ctx: *anyopaque, method: []const u8, path: []const u8) usize {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    const matched = c.config.router.match(request.Method.parse(method), path);
+                    return switch (matched) {
+                        .found => |found| found.max_request_body_bytes orelse c.config.limits.request_body_bytes,
+                        else => c.config.limits.request_body_bytes,
+                    };
                 }
             }.f,
         };
@@ -4505,6 +4544,7 @@ const Connection = struct {
             .body = d.body,
             .trailers = trailers,
             .arena = a,
+            .peer = peerFromHandle(self.stream.socket.handle),
         };
         job.resp = .{
             .stream_id = d.stream_id,

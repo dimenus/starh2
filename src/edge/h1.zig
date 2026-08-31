@@ -341,6 +341,13 @@ fn skipRequestBody(matched: router_mod.Match) bool {
     };
 }
 
+fn requestBodyCap(matched: router_mod.Match, fallback: usize) usize {
+    return switch (matched) {
+        .found => |f| f.max_request_body_bytes orelse fallback,
+        else => fallback,
+    };
+}
+
 fn serveOne(self: *H1Conn) !bool {
     const parsed = try readHead(self) orelse return false;
     switch (parsed) {
@@ -357,13 +364,18 @@ fn serveOne(self: *H1Conn) !bool {
             var close_after = head.connection_close;
             if (test_channel_mutation == .m3_ignore_close) close_after = false;
 
+            const method = request.Method.parse(head.method_raw);
+            const matched = self.config.router.match(method, head.path);
+            const body_cap = requestBodyCap(matched, self.config.limits.request_body_bytes);
+            if (head.content_length > body_cap) {
+                try writeError(self, 413);
+                return false;
+            }
+
             if (head.expect_100) {
                 try writeRaw(self, "HTTP/1.1 100 Continue\r\n\r\n");
                 try flushSink(self);
             }
-
-            const method = request.Method.parse(head.method_raw);
-            const matched = self.config.router.match(method, head.path);
 
             var body: []const u8 = &.{};
             if (skipRequestBody(matched)) {
@@ -374,7 +386,7 @@ fn serveOne(self: *H1Conn) !bool {
                     try writeError(self, 413);
                     return false;
                 };
-                if (body.len > self.config.limits.request_body_bytes) {
+                if (body.len > body_cap) {
                     try writeError(self, 413);
                     return false;
                 }
@@ -768,6 +780,7 @@ fn dispatch(
         .body = body,
         .trailers = &.{},
         .arena = self.arena.allocator(),
+        .peer = connection.peerFromHandle(self.stream.socket.handle),
     };
 
     self.job_hctx = .{
