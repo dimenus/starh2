@@ -540,15 +540,18 @@ fn readBody(self: *H1Conn, head: parser.Head) !?[]const u8 {
         shiftCarry(self, take);
         got = take;
     }
-    const deadline_ns = nowNs(self.io) +% self.config.limits.request_body_idle_timeout_ns;
+    // Idle, not total: re-arm on each byte of progress so a slow-but-moving
+    // body is not killed by time spent on earlier chunks.
+    var idle_deadline_ns = nowNs(self.io) +% self.config.limits.request_body_idle_timeout_ns;
     while (got < need) {
-        if (nowNs(self.io) >= deadline_ns) return error.IdleTimeout;
+        if (nowNs(self.io) >= idle_deadline_ns) return error.IdleTimeout;
         var tmp: [4096]u8 = undefined;
-        const n = try readSome(self, tmp[0..], deadline_ns) orelse return error.IdleTimeout;
+        const n = try readSome(self, tmp[0..], idle_deadline_ns) orelse return error.IdleTimeout;
         if (n == 0) return error.ConnectionClosed;
         const take = @min(n, need - got);
         @memcpy(self.body_buf[got .. got + take], tmp[0..take]);
         got += take;
+        idle_deadline_ns = nowNs(self.io) +% self.config.limits.request_body_idle_timeout_ns;
         if (take < n) try stashCarry(self, tmp[0..n], take);
     }
     return self.body_buf[0..need];

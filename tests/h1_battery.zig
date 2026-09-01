@@ -2258,3 +2258,91 @@ test "h1.shape.slow_handler" {
     var handle = try rt.spawn(namedSlowHandler, .{ rt, std.testing.allocator });
     try handle.join();
 }
+
+fn runExpect100BodyAfterContinue(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    const body_len: usize = 1_200_000;
+    const body = try gpa.alloc(u8, body_len);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    const head = try std.fmt.allocPrint(gpa, "POST /echo HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
+    defer gpa.free(head);
+
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [8192]u8 = undefined;
+    var wb: [1024]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writer.interface.writeAll(head);
+    try writer.interface.flush();
+
+    var probe: [64]u8 = undefined;
+    var probe_len: usize = 0;
+    while (probe_len + 4 <= probe.len) {
+        const n = try reader.interface.readSliceShort(probe[probe_len..][0..1]);
+        if (n == 0) return error.No100Continue;
+        probe_len += n;
+        if (probe_len >= 4 and std.mem.eql(u8, probe[probe_len - 4 .. probe_len], "\r\n\r\n")) break;
+    }
+    if (std.mem.indexOf(u8, probe[0..probe_len], "100 Continue") == null) return error.No100Continue;
+
+    // Gap after 100: the t-333 client reads the interim line, then writes.
+    io.sleep(.fromMilliseconds(50), .awake) catch {};
+    writer.interface.writeAll(body) catch |err| {
+        std.debug.print("expect_100_after write err={s}\n", .{@errorName(err)});
+        return err;
+    };
+    try writer.interface.flush();
+
+    var cap = try readResponse(&reader.interface, gpa, false);
+    defer cap.deinit();
+    if (cap.status != 200) {
+        std.debug.print("expect_100_after status={any} closed={} body_len={d}\n", .{ cap.status, cap.closed, cap.body.items.len });
+    }
+    try std.testing.expectEqual(@as(?u16, 200), cap.status);
+    try std.testing.expectEqual(body.len, cap.body.items.len);
+}
+
+fn namedExpect100BodyAfterContinue(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const r = routes();
+    var lim = starh2.Limits.defaults;
+    lim.max_connections = 8;
+    lim.max_streams_per_connection = 8;
+    lim.max_streams_per_server = 8;
+    lim.request_body_bytes = 4 * 1024 * 1024;
+    lim.outbound_bytes_per_stream = 2 * 1024 * 1024;
+    lim.outbound_bytes_per_connection = 2 * 1024 * 1024;
+    lim.request_body_idle_timeout_ns = 5 * std.time.ns_per_s;
+    var server = starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = listen }},
+        .routes = &r,
+        .tls = null,
+        .limits = lim,
+    }) catch |err| {
+        std.debug.print("expect_100_after init err={s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer server.deinit(gpa);
+    var serve_future = try rt.io().concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_future.cancel(rt.io()) catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    runExpect100BodyAfterContinue(rt.io(), gpa, server.localAddress(0)) catch |err| {
+        std.debug.print("expect_100_after run err={s}\n", .{@errorName(err)});
+        return err;
+    };
+    server.requestShutdown();
+    try serve_future.await(rt.io());
+    serving = false;
+}
+
+test "h1.accept.expect_100_body_after_continue" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedExpect100BodyAfterContinue, .{ rt, std.testing.allocator });
+    try handle.join();
+}
