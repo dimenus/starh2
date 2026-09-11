@@ -475,11 +475,7 @@ pub const Server = struct {
             // 21k req/s with p99 glued to 42.01 ms while TLS (larger records)
             // was fine. Darwin's default is less punishing; the option is still
             // correct on every accepted socket.
-            setTcpNoDelay(stream) catch {
-                // A TCP listener that cannot take TCP_NODELAY is still a live
-                // connection; refusing it would turn a setsockopt miss into an
-                // outage. The next write just pays Nagle.
-            };
+            setTcpNoDelay(stream);
             if (!self.tryAdmitConnection()) {
                 stream.close(self.io);
                 continue;
@@ -589,18 +585,27 @@ pub const Server = struct {
 
 /// Turn off Nagle on an accepted TCP socket.
 ///
-/// `posix.setsockopt` is a Windows compile error (`use std.Io instead`); this
-/// stack's gates are Darwin and Linux, and `builtin.os.tag` is comptime so the
-/// Windows branch is not analyzed there.
-fn setTcpNoDelay(stream: std.Io.net.Stream) std.posix.SetSockOptError!void {
+/// `posix.setsockopt` treats `.INVAL` as unreachable (Zig 0.16
+/// `lib/std/posix.zig:1081`). Darwin returns EINVAL when the peer RST'd
+/// between accept and this call, which aborted the process before the
+/// accept-loop catch could run. `system.setsockopt` reports the errno;
+/// any failure is non-fatal — the connection is live, the next write pays
+/// Nagle.
+///
+/// `posix.setsockopt` is also a Windows compile error (`use std.Io instead`);
+/// this stack's gates are Darwin and Linux, and `builtin.os.tag` is comptime
+/// so the Windows branch is not analyzed there.
+fn setTcpNoDelay(stream: std.Io.net.Stream) void {
     if (builtin.os.tag == .windows) return;
     const on: c_int = 1;
-    try std.posix.setsockopt(
+    const opt = std.mem.asBytes(&on);
+    _ = std.posix.errno(std.posix.system.setsockopt(
         stream.socket.handle,
         std.posix.IPPROTO.TCP,
         std.posix.TCP.NODELAY,
-        std.mem.asBytes(&on),
-    );
+        opt.ptr,
+        @intCast(opt.len),
+    ));
 }
 
 test "accepted TCP sockets take TCP_NODELAY" {
@@ -614,7 +619,7 @@ test "accepted TCP sockets take TCP_NODELAY" {
     defer client.close(io);
     const accepted = try listener.accept(io);
     defer accepted.close(io);
-    try setTcpNoDelay(accepted);
+    setTcpNoDelay(accepted);
     var val: c_int = 0;
     var len: std.posix.socklen_t = @sizeOf(c_int);
     switch (std.posix.errno(std.posix.system.getsockopt(
@@ -631,4 +636,59 @@ test "accepted TCP sockets take TCP_NODELAY" {
     // (verified against CPython on this host). Linux returns 1. Both are "Nagle
     // is off"; the kernel boolean is nonzero.
     try std.testing.expect(val != 0);
+}
+
+test "TCP_NODELAY after peer RST does not abort" {
+    if (builtin.os.tag == .windows) return;
+    const io = std.testing.io;
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try bind.listen(io, .{ .reuse_address = true });
+    defer listener.socket.close(io);
+    const dest = listener.socket.address;
+    const client = try dest.connect(io, .{ .mode = .stream });
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+
+    // SO_LINGER 0 + close is RST, not FIN. posix.setsockopt cannot be used
+    // here either: the same `.INVAL => unreachable` would abort if the
+    // option itself failed.
+    const linger_val = std.posix.linger{ .onoff = 1, .linger = 0 };
+    const linger_bytes = std.mem.asBytes(&linger_val);
+    switch (std.posix.errno(std.posix.system.setsockopt(
+        client.socket.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.LINGER,
+        linger_bytes.ptr,
+        @intCast(linger_bytes.len),
+    ))) {
+        .SUCCESS => {},
+        else => {
+            client.close(io);
+            return error.LingerSetFailed;
+        },
+    }
+    client.close(io);
+
+    // Recv so Darwin processes the RST before TCP_NODELAY. Without this,
+    // setsockopt still succeeds (the option race has not landed yet).
+    var scratch: [1]u8 = undefined;
+    var dest_bufs: [1][]u8 = .{&scratch};
+    var reader = accepted.reader(io, &.{});
+    _ = reader.interface.readVec(&dest_bufs) catch {};
+
+    const on: c_int = 1;
+    const opt = std.mem.asBytes(&on);
+    const nodelay_errno = std.posix.errno(std.posix.system.setsockopt(
+        accepted.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        opt.ptr,
+        @intCast(opt.len),
+    ));
+    if (builtin.os.tag.isDarwin()) {
+        // This is the errno posix.setsockopt used to treat as unreachable.
+        try std.testing.expectEqual(std.posix.E.INVAL, nodelay_errno);
+    }
+
+    setTcpNoDelay(accepted);
 }

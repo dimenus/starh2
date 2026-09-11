@@ -243,7 +243,7 @@ pub const Server = struct {
                 },
                 .fail => return,
             };
-            setTcpNoDelay(stream) catch {};
+            setTcpNoDelay(stream);
             if (!self.tryAdmit()) {
                 stream.close(self.io);
                 continue;
@@ -463,13 +463,18 @@ test "acceptDisposition retries pressure and fails fatal" {
     try std.testing.expectEqual(AcceptDisposition.fail, acceptDisposition(error.BlockedByFirewall));
 }
 
-fn setTcpNoDelay(stream: std.Io.net.Stream) std.posix.SetSockOptError!void {
+/// Same contract as `edge/server.zig` `setTcpNoDelay`: `posix.setsockopt`
+/// marks Darwin EINVAL (peer RST between accept and the option) unreachable,
+/// so this calls `system.setsockopt` and treats every errno as non-fatal.
+fn setTcpNoDelay(stream: std.Io.net.Stream) void {
     if (builtin.os.tag == .windows) return;
     const on: c_int = 1;
-    try std.posix.setsockopt(
+    const opt = std.mem.asBytes(&on);
+    _ = std.posix.errno(std.posix.system.setsockopt(
         stream.socket.handle,
         std.posix.IPPROTO.TCP,
         std.posix.TCP.NODELAY,
-        std.mem.asBytes(&on),
-    );
+        opt.ptr,
+        @intCast(opt.len),
+    ));
 }
