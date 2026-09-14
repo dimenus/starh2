@@ -661,6 +661,34 @@ fn readSomeTls(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     }
 }
 
+/// Drain a finished `readSome` select and return how many bytes the read task
+/// managed to take off the socket before it was canceled. Zero when the read
+/// never completed, which is the ordinary case.
+fn reapRead(select: anytype) usize {
+    var n: usize = 0;
+    while (select.cancel()) |left| switch (left) {
+        .data => |r| n = r catch 0,
+        else => {},
+    };
+    return n;
+}
+
+/// Park reaped bytes in the carry buffer. Used on the paths where `readSome`
+/// returns an error and so cannot hand the count back to its caller. `readHead`
+/// and `readBody` both drain carry before they read again, so the bytes stay in
+/// order. An overflow here would silently truncate the request stream, so close
+/// the connection instead of serving a request with a hole in it.
+fn stashReaped(self: *H1Conn, buf: []u8, n: usize) void {
+    if (n == 0) return;
+    stashCarry(self, buf[0..n], 0) catch {
+        self.want_close = true;
+    };
+}
+
+fn keepReadBytes(self: *H1Conn, select: anytype, buf: []u8) void {
+    stashReaped(self, buf, reapRead(select));
+}
+
 fn readSome(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     if (self.tls != null) {
         return readSomeTls(self, buf, deadline_ns);
@@ -688,15 +716,29 @@ fn readSome(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     if (self.config.shutdown_event) |ev| {
         try select.concurrent(.shutdown, waitShutdown, .{ ev, self.io });
     }
-    const selected = try select.await();
-    defer select.cancelDiscard();
+    // `Select.cancelDiscard` throws away results from tasks that finished while
+    // cancelation was in flight. For `readVec` that result is bytes already taken
+    // off the socket, so discarding it loses them with nothing on the wire left to
+    // re-read. Reap the losing read instead: `Select.cancel` hands the result back.
+    const selected = select.await() catch |err| {
+        keepReadBytes(self, &select, buf);
+        return err;
+    };
+    const reaped = reapRead(&select);
     return switch (selected) {
-        .data => |r| r catch |err| switch (err) {
+        .data => |r| r catch |e| switch (e) {
             error.EndOfStream => @as(usize, 0),
-            else => return err,
+            else => return e,
         },
-        .timer => null,
-        .shutdown => error.Canceled,
+        // A read that landed while the timer fired is a read, not a timeout.
+        // Reporting a timeout here strands the connection: t-1760 lost a whole
+        // pipelined request this way, and the caller then sat out the full
+        // field-block timeout and closed a connection it had promised to reuse.
+        .timer => if (reaped != 0) reaped else null,
+        .shutdown => blk: {
+            stashReaped(self, buf, reaped);
+            break :blk error.Canceled;
+        },
     };
 }
 

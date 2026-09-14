@@ -1092,7 +1092,20 @@ fn runTaskPostReuses(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAd
     try writeReq(&writer.interface, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
     var cap2 = try readResponse(&reader.interface, gpa, false);
     defer cap2.deinit();
-    if (cap2.status != 200) return error.TaskPostNoReuse;
+    // This test is the detector for t-1760: the edge dropped a pipelined request
+    // that a canceled read had already taken off the socket, so the server closed
+    // a connection it had promised to reuse. `zig build` runs the test binary with
+    // `--listen=-`, and that reporter prints the error return trace but not the
+    // error value, so a bare `try` reports the failure anonymously. Print both
+    // captures, because "reuse status=null closed=true" is what names the defect
+    // and "reuse status=<some other code>" would be a different one.
+    if (cap2.status != 200) {
+        std.debug.print("task_post_reuses: reuse status={?d} closed={} conn_close={} body_len={d}; post status={?d} closed={} conn_close={}\n", .{
+            cap2.status, cap2.closed, cap2.saw_conn_close, cap2.body.items.len,
+            cap1.status, cap1.closed, cap1.saw_conn_close,
+        });
+        return error.TaskPostNoReuse;
+    }
 }
 
 fn runSlowHandler(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
@@ -2228,7 +2241,10 @@ test "h1.keepalive.task_post_reuses" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     var handle = try rt.spawn(namedTaskPostReuses, .{ rt, std.testing.allocator });
-    try handle.join();
+    handle.join() catch |err| {
+        std.debug.print("h1.keepalive.task_post_reuses failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
 }
 
 test "h1.limits.slow_loris" {
