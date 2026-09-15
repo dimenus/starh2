@@ -78,9 +78,24 @@ const H1Conn = struct {
     carry_buf: []u8,
     carry_len: usize = 0,
 
-    reader: std.Io.net.Stream.Reader = undefined,
     writer: std.Io.net.Stream.Writer = undefined,
     reader_bound: bool = false,
+
+    // Cleartext inbound. One `ev.NetRecv` the actor submits and re-submits,
+    // never cancels. A canceled WAIT is free; a canceled READ is what lost a
+    // pipelined request twice in t-1760, because every std.Io path that fails
+    // a read discards what it already took off the socket. Nothing is reset
+    // here and nothing is rolled back, so that class is unsayable. Mirrors
+    // `tls_edge.Pump`, which is why the TLS path never carried t-1760.
+    cq: zio.CompletionQueue = undefined,
+    recv_op: zio.ev.NetRecv = undefined,
+    recv_iov: [1]zio.os.iovec = undefined,
+    recv_armed: bool = false,
+    recv_started: bool = false,
+    /// Bytes delivered by the last completion that no caller has taken yet.
+    /// Always a slice of `recv_buf`.
+    recv_pending: []u8 = &.{},
+    recv_eof: bool = false,
 
     slot: connection.HandlerSlot = .{},
     arena: std.heap.ArenaAllocator,
@@ -138,6 +153,12 @@ const H1Conn = struct {
         std.debug.assert(self.request_held == 0);
         if (self.tls_pump) |p| {
             p.shutdownCq();
+        }
+        if (self.recv_started) {
+            self.cq.close();
+            self.cq.cancelAll(.keep);
+            while (self.cq.next()) |_| {}
+            self.recv_started = false;
         }
         if (!self.socket_closed) {
             self.stream.close(self.io);
@@ -248,9 +269,9 @@ fn initConn(self: *H1Conn, stream: std.Io.net.Stream, config: connection.ConnCon
     self.acc = parser.Accumulator.init(self.head_buf);
     self.completion_ch = .init(&self.completion_buf);
     if (tls == null) {
-        self.reader = stream.reader(config.io, self.recv_buf);
         self.writer = stream.writer(config.io, self.write_buf);
         self.reader_bound = true;
+        startRecv(self);
     }
 }
 
@@ -574,8 +595,8 @@ fn stashCarry(self: *H1Conn, chunk: []const u8, consumed: usize) !void {
     const rest = chunk[consumed..];
     const new_len = self.carry_len + rest.len;
     if (new_len > self.carry_buf.len) return error.CarryOverflow;
-    // Append. A replace drops a pipelined prefix already in carry when
-    // waitPeerByte (or a second TLS ingest) delivers the rest of the next
+    // Append. A replace drops a pipelined prefix already in carry when the
+    // mid-handler wait (or a second TLS ingest) delivers the rest of the next
     // request in a later read.
     @memcpy(self.carry_buf[self.carry_len..][0..rest.len], rest);
     self.carry_len = new_len;
@@ -661,101 +682,107 @@ fn readSomeTls(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     }
 }
 
-/// Drain a finished `readSome` select and return how many bytes the read task
-/// managed to take off the socket before it was canceled. Zero when the read
-/// never completed, which is the ordinary case.
-fn reapRead(select: anytype) usize {
-    var n: usize = 0;
-    while (select.cancel()) |left| switch (left) {
-        .data => |r| n = r catch 0,
-        else => {},
-    };
-    return n;
+/// Wire the CQ and the recv op at this connection's final address, then arm the
+/// first read. `ReadBuf` points into `recv_iov`, so this must run after the
+/// struct is in place, never in an init that returns by value.
+fn startRecv(self: *H1Conn) void {
+    self.cq = zio.CompletionQueue.init();
+    self.recv_op = zio.ev.NetRecv.init(
+        tlsNetHandle(self.stream.socket.handle),
+        zio.ev.ReadBuf.fromSlice(self.recv_buf, &self.recv_iov),
+        .{},
+    );
+    self.recv_armed = false;
+    self.recv_started = true;
+    _ = armRecv(self);
 }
 
-/// Park reaped bytes in the carry buffer. Used on the paths where `readSome`
-/// returns an error and so cannot hand the count back to its caller. `readHead`
-/// and `readBody` both drain carry before they read again, so the bytes stay in
-/// order. An overflow here would silently truncate the request stream, so close
-/// the connection instead of serving a request with a hole in it.
-fn stashReaped(self: *H1Conn, buf: []u8, n: usize) void {
-    if (n == 0) return;
-    stashCarry(self, buf[0..n], 0) catch {
-        self.want_close = true;
+/// (Re)submit the socket read once `recv_buf` is free. False only when the CQ
+/// is already closed, which means teardown owns the exit.
+fn armRecv(self: *H1Conn) bool {
+    if (self.recv_armed) return true;
+    if (self.recv_eof) return false;
+    std.debug.assert(self.recv_pending.len == 0);
+    self.cq.submit(&self.recv_op.c) catch |err| switch (err) {
+        error.Closed => return false,
+        // The op is ours alone: never grouped, never rearm-flagged.
+        error.InvalidCompletion => unreachable,
     };
+    self.recv_armed = true;
+    return true;
 }
 
-fn keepReadBytes(self: *H1Conn, select: anytype, buf: []u8) void {
-    stashReaped(self, buf, reapRead(select));
+/// The recv completion fired. Publish its bytes in `recv_pending`; a caller
+/// takes them when it wants them. Nothing is dropped on any path here, which
+/// is the whole point of the shape.
+fn onRecvComplete(self: *H1Conn) void {
+    std.debug.assert(self.recv_pending.len == 0);
+    self.recv_armed = false;
+    const n = self.recv_op.getResult() catch {
+        // Only teardown cancels this op, and every other errno ends the
+        // connection the same way EOF does.
+        self.recv_eof = true;
+        return;
+    };
+    if (n == 0) {
+        self.recv_eof = true;
+        return;
+    }
+    self.recv_pending = self.recv_buf[0..n];
+}
+
+/// Park until the recv completion arrives, the deadline passes, or shutdown is
+/// requested. Canceling THIS wait is free: the read stays submitted and its
+/// bytes are still delivered to `recv_pending` on a later turn.
+fn waitRecvCq(self: *H1Conn, deadline_ns: ?u64) !void {
+    const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
+    const timeout: zio.Timeout = if (deadline_ns) |d| blk: {
+        const now = nowNs(self.io);
+        if (d <= now) return;
+        break :blk .{ .duration = .fromNanoseconds(d - now) };
+    } else .none;
+    const winner = zio.select(.{
+        .io = &self.cq,
+        .timer = timeout,
+        .shutdown = shutdown_ev,
+    }) catch return error.Canceled;
+    switch (winner) {
+        .io => |r| {
+            const c = r catch {
+                if (self.cq.isDrained()) self.recv_eof = true;
+                return;
+            };
+            std.debug.assert(c == &self.recv_op.c);
+            onRecvComplete(self);
+        },
+        .timer => {},
+        .shutdown => return error.Canceled,
+    }
+}
+
+/// Hand out bytes the connection already holds. Returns 0 at end of stream and
+/// null when the deadline passed with nothing delivered.
+fn takeRecv(self: *H1Conn, buf: []u8) ?usize {
+    if (self.recv_pending.len == 0) return null;
+    const take = @min(self.recv_pending.len, buf.len);
+    @memcpy(buf[0..take], self.recv_pending[0..take]);
+    self.recv_pending = self.recv_pending[take..];
+    if (self.recv_pending.len == 0) _ = armRecv(self);
+    return take;
 }
 
 fn readSome(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     if (self.tls != null) {
         return readSomeTls(self, buf, deadline_ns);
     }
-    // `Io.Reader.readVec` copies whatever the reader already holds into `data`
-    // and advances `seek` BEFORE it calls the vtable, and its `ReadFailed` arm
-    // then returns the error without reporting those bytes (std/Io/Reader.zig,
-    // `readVec`). A canceled read would swallow them exactly as `cancelDiscard`
-    // used to swallow a completed one. Take them here, so the cancelable read
-    // below only ever runs against an empty reader buffer and its error paths
-    // have nothing to lose. Without this, t-1760 comes back for any pipelined
-    // request longer than `waitPeerByte`'s 256-byte destination.
-    const held = self.reader.interface.buffered();
-    if (held.len != 0) {
-        const take = @min(held.len, buf.len);
-        @memcpy(buf[0..take], held[0..take]);
-        self.reader.interface.toss(take);
-        return take;
+    while (true) {
+        if (takeRecv(self, buf)) |n| return n;
+        if (self.recv_eof) return @as(usize, 0);
+        if (!armRecv(self)) return @as(usize, 0);
+        if (nowNs(self.io) >= deadline_ns) return null;
+        try waitRecvCq(self, deadline_ns);
+        if (self.recv_pending.len == 0 and !self.recv_eof and nowNs(self.io) >= deadline_ns) return null;
     }
-
-    var dest: [1][]u8 = .{buf};
-    const Read = union(enum) {
-        data: std.Io.Reader.Error!usize,
-        timer: std.Io.Cancelable!void,
-        shutdown: std.Io.Cancelable!void,
-    };
-    var result_buf: [3]Read = undefined;
-    var select = std.Io.Select(Read).init(self.io, &result_buf);
-    errdefer select.cancelDiscard();
-    const ReadFn = struct {
-        fn run(reader: *std.Io.Reader, d: [][]u8) std.Io.Reader.Error!usize {
-            return reader.readVec(d);
-        }
-    };
-    try select.concurrent(.data, ReadFn.run, .{ &self.reader.interface, dest[0..] });
-    const timeout: std.Io.Timeout = .{ .deadline = .{
-        .raw = std.Io.Timestamp.fromNanoseconds(@intCast(deadline_ns)),
-        .clock = .awake,
-    } };
-    try select.concurrent(.timer, waitTimer, .{ timeout, self.io });
-    if (self.config.shutdown_event) |ev| {
-        try select.concurrent(.shutdown, waitShutdown, .{ ev, self.io });
-    }
-    // `Select.cancelDiscard` throws away results from tasks that finished while
-    // cancelation was in flight. For `readVec` that result is bytes already taken
-    // off the socket, so discarding it loses them with nothing on the wire left to
-    // re-read. Reap the losing read instead: `Select.cancel` hands the result back.
-    const selected = select.await() catch |err| {
-        keepReadBytes(self, &select, buf);
-        return err;
-    };
-    const reaped = reapRead(&select);
-    return switch (selected) {
-        .data => |r| r catch |e| switch (e) {
-            error.EndOfStream => @as(usize, 0),
-            else => return e,
-        },
-        // A read that landed while the timer fired is a read, not a timeout.
-        // Reporting a timeout here strands the connection: t-1760 lost a whole
-        // pipelined request this way, and the caller then sat out the full
-        // field-block timeout and closed a connection it had promised to reuse.
-        .timer => if (reaped != 0) reaped else null,
-        .shutdown => blk: {
-            stashReaped(self, buf, reaped);
-            break :blk error.Canceled;
-        },
-    };
 }
 
 fn waitTimer(timeout: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
@@ -933,13 +960,6 @@ fn runTaskBody(self: *H1Conn) void {
     }
 }
 
-fn waitPeerByte(self: *H1Conn) anyerror!?usize {
-    var tmp: [256]u8 = undefined;
-    const far = nowNs(self.io) +% (365 * std.time.ns_per_s);
-    const n = try readSome(self, tmp[0..], far) orelse return @as(usize, 0);
-    if (n != 0) try stashCarry(self, tmp[0..n], 0);
-    return n;
-}
 
 fn tlsIdle(pump: *tls_edge.Pump) bool {
     return pump.pending_n == 0 and !pump.send_armed;
@@ -1088,6 +1108,7 @@ fn waitDispatchTls(self: *H1Conn) !void {
 fn waitDispatch(self: *H1Conn) !void {
     if (self.tls_pump != null) return waitDispatchTls(self);
     var reaping = false;
+    const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
     while (self.slot.in_use) {
         if (shutdownRequested(self) and !reaping) {
             self.slot.terminal.setCause(.server_shutdown);
@@ -1098,48 +1119,47 @@ fn waitDispatch(self: *H1Conn) !void {
             reaping = true;
         }
         if (reaping) {
-            const sid = self.completion_ch.receive() catch return error.Canceled;
-            _ = sid;
+            _ = self.completion_ch.receive() catch return error.Canceled;
             finishSlot(self);
             break;
         }
-
-        const Race = union(enum) {
-            done: anyerror!u31,
-            shutdown: std.Io.Cancelable!void,
-            peer: anyerror!?usize,
-        };
-        var result_buf: [3]Race = undefined;
-        var select = std.Io.Select(Race).init(self.io, &result_buf);
-        errdefer select.cancelDiscard();
-        const Recv = struct {
-            fn run(ch: *zio.Channel(u31)) anyerror!u31 {
-                return ch.receive();
-            }
-        };
-        try select.concurrent(.done, Recv.run, .{&self.completion_ch});
-        if (self.config.shutdown_event) |ev| {
-            try select.concurrent(.shutdown, waitShutdown, .{ ev, self.io });
-        }
-        try select.concurrent(.peer, waitPeerByte, .{self});
-        const selected = try select.await();
-        // Same class as the read loss above, one layer up. `cancelDiscard` drops
-        // results from tasks that finished during cancelation, and for `.done`
-        // that result is the handler's ONLY completion token: `finishSlotFromTask`
-        // sends it once behind a cmpxchg, so a dropped token is never resent.
-        // Reaped `.peer` bytes need no handling here, because `waitPeerByte`
-        // parks them in carry before it returns.
-        var reaped_done = false;
-        while (select.cancel()) |left| switch (left) {
-            .done => reaped_done = true,
-            else => {},
-        };
-        switch (selected) {
-            .done => |r| {
-                _ = r catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => {},
+        // `zio.select` over the CQ and the completion channel, the same wait the
+        // TLS actor uses. Not `std.Io.Select`: that one discards results from
+        // tasks that finish during cancelation, and for the completion channel
+        // that result is the handler's only token, sent once behind a cmpxchg.
+        // zio closed the equivalent hole in its own select (lalinsky/zio #700,
+        // #701, #706, all in the pinned revision), so a committed item survives
+        // a cancel here instead of needing to be reaped by hand.
+        const winner = zio.select(.{
+            .io = &self.cq,
+            .comps = self.completion_ch.asyncReceive(),
+            .shutdown = shutdown_ev,
+        }) catch return error.Canceled;
+        switch (winner) {
+            .io => |r| {
+                const c = r catch {
+                    if (self.cq.isDrained()) self.recv_eof = true;
+                    continue;
                 };
+                std.debug.assert(c == &self.recv_op.c);
+                onRecvComplete(self);
+                if (self.recv_pending.len != 0) {
+                    stashCarry(self, self.recv_pending, 0) catch {
+                        self.want_close = true;
+                    };
+                    self.recv_pending = &.{};
+                    _ = armRecv(self);
+                }
+                if (self.recv_eof) {
+                    self.slot.terminal.setCause(.connection_closed);
+                    if (!cancelJoin(self)) {
+                        finishSlot(self);
+                        break;
+                    }
+                    reaping = true;
+                }
+            },
+            .comps => {
                 finishSlot(self);
                 break;
             },
@@ -1150,28 +1170,6 @@ fn waitDispatch(self: *H1Conn) !void {
                     break;
                 }
                 reaping = true;
-            },
-            .peer => |r| {
-                const n = r catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => @as(?usize, 0),
-                };
-                if (n == null or n == 0) {
-                    self.slot.terminal.setCause(.connection_closed);
-                    if (!cancelJoin(self)) {
-                        finishSlot(self);
-                        break;
-                    }
-                    reaping = true;
-                } else if (reaped_done) {
-                    // The handler finished while this peer read was landing, and
-                    // its token was reaped above. Nothing will send it again, so
-                    // looping here would park on an empty channel and a 365-day
-                    // peer read while a keep-alive client waits for a response
-                    // that never comes. The client's bytes are already in carry.
-                    finishSlot(self);
-                    break;
-                }
             },
         }
     }
