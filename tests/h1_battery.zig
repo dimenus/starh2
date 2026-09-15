@@ -1092,7 +1092,64 @@ fn runTaskPostReuses(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAd
     try writeReq(&writer.interface, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
     var cap2 = try readResponse(&reader.interface, gpa, false);
     defer cap2.deinit();
-    if (cap2.status != 200) return error.TaskPostNoReuse;
+    // This test is the detector for t-1760: the edge dropped a pipelined request
+    // that a canceled read had already taken off the socket, so the server closed
+    // a connection it had promised to reuse. `zig build` runs the test binary with
+    // `--listen=-`, and that reporter prints the error return trace but not the
+    // error value, so a bare `try` reports the failure anonymously. Print both
+    // captures, because "reuse status=null closed=true" is what names the defect
+    // and "reuse status=<some other code>" would be a different one.
+    if (cap2.status != 200) {
+        std.debug.print("task_post_reuses: reuse status={?d} closed={} conn_close={} body_len={d}; post status={?d} closed={} conn_close={}\n", .{
+            cap2.status, cap2.closed, cap2.saw_conn_close, cap2.body.items.len,
+            cap1.status, cap1.closed, cap1.saw_conn_close,
+        });
+        return error.TaskPostNoReuse;
+    }
+}
+
+/// The t-1760 shape with a reuse request LARGER than waitPeerByte's 256-byte
+/// dest. Two independent cross-vendor reviewers said the readSome fix cannot
+/// cover this: readVec fills dest, leaves the remainder in the Stream.Reader's
+/// own buffer, and a later canceled readVec copies that remainder into dest,
+/// advances seek, then returns ReadFailed with the copied bytes unreported.
+/// runTaskPostReuses sends 27 bytes, so it cannot see it.
+fn runTaskPostReusesLarge(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    const payload = "{\"hello\":1}";
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [4096]u8 = undefined;
+    var wb: [2048]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "POST /echo-task HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\nContent-Type: application/json\r\n\r\n{\"hello\":1}");
+    var cap1 = try readResponse(&reader.interface, gpa, false);
+    defer cap1.deinit();
+    if (cap1.status != 200) return error.TaskPostNoResponse;
+    try std.testing.expectEqualStrings(payload, cap1.body.items);
+    if (cap1.saw_conn_close) return error.TaskPostClosedConnection;
+
+    // 900 bytes of padding puts the reuse request well past the 256-byte dest,
+    // so readVec must split it across dest and the reader's own buffer.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    try big.appendSlice(gpa, "GET / HTTP/1.1\r\nHost: h\r\nX-Pad: ");
+    try big.appendNTimes(gpa, 'p', 900);
+    try big.appendSlice(gpa, "\r\n\r\n");
+    try writeReq(&writer.interface, big.items);
+
+    var cap2 = try readResponse(&reader.interface, gpa, false);
+    defer cap2.deinit();
+    if (cap2.status != 200) {
+        std.debug.print("task_post_reuses_large: req_len={d} reuse status={?d} closed={} conn_close={} body_len={d}\n", .{
+            big.items.len, cap2.status, cap2.closed, cap2.saw_conn_close, cap2.body.items.len,
+        });
+        return error.TaskPostLargeNoReuse;
+    }
+}
+
+fn namedTaskPostReusesLarge(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runTaskPostReusesLarge);
 }
 
 fn runSlowHandler(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
@@ -1467,6 +1524,16 @@ test "h1.accept.absolute_form" {
     // Covered by testdata, including Host mismatch.
 }
 
+test "h1.keepalive.tls_task_post_reuses" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(runTlsTaskPostReuses, .{ rt, std.testing.allocator });
+    handle.join() catch |err| {
+        std.debug.print("h1.keepalive.tls_task_post_reuses failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
 test "h1.alpn.both_offered prefers h2" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -1819,6 +1886,86 @@ fn tlsGet200(client: *starh2.edge.tls_edge.Conn) !void {
         if (std.mem.indexOf(u8, out[0..used], "HTTP/1.1 200") != null) return;
     }
     return error.TlsH1NotSelected;
+}
+
+/// Read one complete HTTP/1.1 response off a TLS connection: the head, then the
+/// `content-length` body. Returns null when the peer closed with nothing to send,
+/// which is the shape t-1760 produced on the cleartext path.
+fn tlsReadResponse(client: *starh2.edge.tls_edge.Conn, buf: []u8) !?u16 {
+    var used: usize = 0;
+    var head_end: usize = 0;
+    var need: usize = 0;
+    var spins: usize = 0;
+    while (spins < 512) : (spins += 1) {
+        if (head_end == 0) {
+            if (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n")) |i| {
+                head_end = i + 4;
+                const cl = headerValue(buf[0..i], "content-length") orelse "0";
+                need = std.fmt.parseInt(usize, cl, 10) catch 0;
+            }
+        }
+        if (head_end != 0 and used - head_end >= need) {
+            if (used < 12) return null;
+            return std.fmt.parseInt(u16, buf[9..12], 10) catch null;
+        }
+        if (used == buf.len) return error.TlsResponseTooLarge;
+        const n = client.readPlain(buf[used..]) catch return null;
+        if (n == 0) return null;
+        used += n;
+    }
+    return error.TlsResponseStalled;
+}
+
+/// t-1760 over TLS. This is the shape the deployed qmdsync unit runs: a `.task`
+/// handler behind a TLS endpoint, with a pooled client that sends its next
+/// request the moment the previous response lands. The cleartext twin
+/// (`h1.keepalive.task_post_reuses`) caught the discarded-read defect; nothing
+/// covered the same race on the TLS path, where `readSomeTls` buffers through
+/// `tls_edge.Pump` instead of racing `readVec` in a select.
+fn runTlsTaskPostReuses(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const payload = "{\"hello\":1}";
+    var ts = try openTlsServer(rt, gpa);
+    defer gpa.free(ts.cert_pem);
+    defer gpa.free(ts.key_pem);
+    defer {
+        ts.server.deinit(gpa);
+        gpa.destroy(ts.server);
+    }
+    var serving = true;
+    defer if (serving) {
+        ts.server.requestShutdown();
+        ts.future.cancel(rt.io()) catch {};
+    };
+
+    const stream = try ts.server.localAddress(0).connect(rt.io(), .{ .mode = .stream });
+    defer stream.close(rt.io());
+    var client: starh2.edge.tls_edge.Conn = .{};
+    client.initTcp(stream);
+    defer client.deinit();
+    var connector = try starh2.edge.tls_edge.loopbackH1ClientConnector();
+    defer connector.deinit();
+    try client.handshakeClientH1(&connector, rt.io());
+
+    observed.gpa = gpa;
+    defer observed.deinit();
+
+    var buf: [4096]u8 = undefined;
+    try client.writePlain("POST /echo-task HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\nContent-Type: application/json\r\n\r\n" ++ payload);
+    const first = try tlsReadResponse(&client, buf[0..]);
+    if (first != @as(?u16, 200)) return error.TlsTaskPostNoResponse;
+    try std.testing.expectEqualStrings(payload, observed.body);
+
+    try client.writePlain("GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    var buf2: [4096]u8 = undefined;
+    const second = try tlsReadResponse(&client, buf2[0..]);
+    if (second != @as(?u16, 200)) {
+        std.debug.print("tls_task_post_reuses: reuse status={?d}; post status={?d}\n", .{ second, first });
+        return error.TlsTaskPostNoReuse;
+    }
+
+    ts.server.requestShutdown();
+    try ts.future.await(rt.io());
+    serving = false;
 }
 
 fn runAlpnBoth(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
@@ -2228,7 +2375,20 @@ test "h1.keepalive.task_post_reuses" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     var handle = try rt.spawn(namedTaskPostReuses, .{ rt, std.testing.allocator });
-    try handle.join();
+    handle.join() catch |err| {
+        std.debug.print("h1.keepalive.task_post_reuses failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+test "h1.keepalive.task_post_reuses_large" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedTaskPostReusesLarge, .{ rt, std.testing.allocator });
+    handle.join() catch |err| {
+        std.debug.print("h1.keepalive.task_post_reuses_large failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
 }
 
 test "h1.limits.slow_loris" {

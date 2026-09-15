@@ -661,10 +661,54 @@ fn readSomeTls(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     }
 }
 
+/// Drain a finished `readSome` select and return how many bytes the read task
+/// managed to take off the socket before it was canceled. Zero when the read
+/// never completed, which is the ordinary case.
+fn reapRead(select: anytype) usize {
+    var n: usize = 0;
+    while (select.cancel()) |left| switch (left) {
+        .data => |r| n = r catch 0,
+        else => {},
+    };
+    return n;
+}
+
+/// Park reaped bytes in the carry buffer. Used on the paths where `readSome`
+/// returns an error and so cannot hand the count back to its caller. `readHead`
+/// and `readBody` both drain carry before they read again, so the bytes stay in
+/// order. An overflow here would silently truncate the request stream, so close
+/// the connection instead of serving a request with a hole in it.
+fn stashReaped(self: *H1Conn, buf: []u8, n: usize) void {
+    if (n == 0) return;
+    stashCarry(self, buf[0..n], 0) catch {
+        self.want_close = true;
+    };
+}
+
+fn keepReadBytes(self: *H1Conn, select: anytype, buf: []u8) void {
+    stashReaped(self, buf, reapRead(select));
+}
+
 fn readSome(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     if (self.tls != null) {
         return readSomeTls(self, buf, deadline_ns);
     }
+    // `Io.Reader.readVec` copies whatever the reader already holds into `data`
+    // and advances `seek` BEFORE it calls the vtable, and its `ReadFailed` arm
+    // then returns the error without reporting those bytes (std/Io/Reader.zig,
+    // `readVec`). A canceled read would swallow them exactly as `cancelDiscard`
+    // used to swallow a completed one. Take them here, so the cancelable read
+    // below only ever runs against an empty reader buffer and its error paths
+    // have nothing to lose. Without this, t-1760 comes back for any pipelined
+    // request longer than `waitPeerByte`'s 256-byte destination.
+    const held = self.reader.interface.buffered();
+    if (held.len != 0) {
+        const take = @min(held.len, buf.len);
+        @memcpy(buf[0..take], held[0..take]);
+        self.reader.interface.toss(take);
+        return take;
+    }
+
     var dest: [1][]u8 = .{buf};
     const Read = union(enum) {
         data: std.Io.Reader.Error!usize,
@@ -688,15 +732,29 @@ fn readSome(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     if (self.config.shutdown_event) |ev| {
         try select.concurrent(.shutdown, waitShutdown, .{ ev, self.io });
     }
-    const selected = try select.await();
-    defer select.cancelDiscard();
+    // `Select.cancelDiscard` throws away results from tasks that finished while
+    // cancelation was in flight. For `readVec` that result is bytes already taken
+    // off the socket, so discarding it loses them with nothing on the wire left to
+    // re-read. Reap the losing read instead: `Select.cancel` hands the result back.
+    const selected = select.await() catch |err| {
+        keepReadBytes(self, &select, buf);
+        return err;
+    };
+    const reaped = reapRead(&select);
     return switch (selected) {
-        .data => |r| r catch |err| switch (err) {
+        .data => |r| r catch |e| switch (e) {
             error.EndOfStream => @as(usize, 0),
-            else => return err,
+            else => return e,
         },
-        .timer => null,
-        .shutdown => error.Canceled,
+        // A read that landed while the timer fired is a read, not a timeout.
+        // Reporting a timeout here strands the connection: t-1760 lost a whole
+        // pipelined request this way, and the caller then sat out the full
+        // field-block timeout and closed a connection it had promised to reuse.
+        .timer => if (reaped != 0) reaped else null,
+        .shutdown => blk: {
+            stashReaped(self, buf, reaped);
+            break :blk error.Canceled;
+        },
     };
 }
 
@@ -1065,7 +1123,17 @@ fn waitDispatch(self: *H1Conn) !void {
         }
         try select.concurrent(.peer, waitPeerByte, .{self});
         const selected = try select.await();
-        defer select.cancelDiscard();
+        // Same class as the read loss above, one layer up. `cancelDiscard` drops
+        // results from tasks that finished during cancelation, and for `.done`
+        // that result is the handler's ONLY completion token: `finishSlotFromTask`
+        // sends it once behind a cmpxchg, so a dropped token is never resent.
+        // Reaped `.peer` bytes need no handling here, because `waitPeerByte`
+        // parks them in carry before it returns.
+        var reaped_done = false;
+        while (select.cancel()) |left| switch (left) {
+            .done => reaped_done = true,
+            else => {},
+        };
         switch (selected) {
             .done => |r| {
                 _ = r catch |err| switch (err) {
@@ -1095,6 +1163,14 @@ fn waitDispatch(self: *H1Conn) !void {
                         break;
                     }
                     reaping = true;
+                } else if (reaped_done) {
+                    // The handler finished while this peer read was landing, and
+                    // its token was reaped above. Nothing will send it again, so
+                    // looping here would park on an empty channel and a 365-day
+                    // peer read while a keep-alive client waits for a response
+                    // that never comes. The client's bytes are already in carry.
+                    finishSlot(self);
+                    break;
                 }
             },
         }
