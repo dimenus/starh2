@@ -1473,6 +1473,19 @@ const Connection = struct {
         };
         var rel: RelCtx = .{ .c = self };
         self.sched.forEachPending(@ptrCast(&rel), RelCtx.cb);
+        // Snapshot the slot ledger BEFORE `sched.deinit` frees `pending_slots`.
+        // The leak detector below used to walk that array after the free, so its
+        // numbers were read out of freed memory: that is where the "integer
+        // overflow" in the leak panic came from, not from a real slot length.
+        var leak_slot_bytes: usize = 0;
+        var leak_slot_n: usize = 0;
+        var leak_slot_max: usize = 0;
+        for (self.sched.pending_slots) |ps| {
+            if (ps.stream_id == 0) continue;
+            leak_slot_bytes +|= ps.len;
+            if (ps.len > leak_slot_max) leak_slot_max = ps.len;
+            leak_slot_n += 1;
+        }
         self.sched.deinit();
         self.frame_pool.deinit(self.config.gpa);
         if (self.tls) |tls_conn| {
@@ -1509,22 +1522,22 @@ const Connection = struct {
         const pending_held = self.pending_outbound_held.load(.acquire);
         const wire_held = self.wire_outbound_held.load(.acquire);
         if (held != pending_held + wire_held or held != 0) {
-            // The ledger, before dying: which side leaked and how much.
-            var slot_bytes: usize = 0;
-            var slot_n: usize = 0;
-            for (self.sched.pending_slots) |ps| {
-                if (ps.stream_id == 0) continue;
-                slot_bytes += ps.len;
-                slot_n += 1;
-            }
+            // The ledger, before dying: which side leaked and how much. The slot
+            // figures are the snapshot taken above, while `pending_slots` was
+            // still allocated. `data_release` is the deferred-quantum side
+            // channel: non-zero here means a quantum left the slab and nothing
+            // paid it back, which is a different fault from bytes still sitting
+            // in slots.
             std.debug.panic(
-                "outbound leak at deinit: held={d} pending={d} wire={d} sched_slots={d} sched_bytes={d} rel_posted={d} rel_applied={d} ack_q={d} held_acks={d} write_q={d} read_q={d}",
+                "outbound leak at deinit: held={d} pending={d} wire={d} sched_slots={d} sched_bytes={d} slot_max={d} data_release={d} rel_posted={d} rel_applied={d} ack_q={d} held_acks={d} write_q={d} read_q={d}",
                 .{
                     held,
                     pending_held,
                     wire_held,
-                    slot_n,
-                    slot_bytes,
+                    leak_slot_n,
+                    leak_slot_bytes,
+                    leak_slot_max,
+                    self.pending_data_outbound_release,
                     wire_pump.diag_acks.posted_release.load(.acquire),
                     wire_pump.diag_acks.applied_release.load(.acquire),
                     io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch),
@@ -1595,6 +1608,17 @@ const Connection = struct {
             .pending => self.pending_outbound_held.fetchSub(n, .acq_rel),
             .wire => self.wire_outbound_held.fetchSub(n, .acq_rel),
         };
+        // Name the ledger before trapping. A bare assert says only that the
+        // counter went negative, which is the one thing already obvious from the
+        // crash; the amounts and the kind are what identify WHICH release was
+        // doubled. Gated on `runtime_safety` so this stays exactly as absent from
+        // ReleaseFast as the assert it precedes.
+        if (std.debug.runtime_safety and kind_prev < n) {
+            std.debug.panic(
+                "outbound over-release: kind={s} n={d} kind_held_before={d} total_held={d}",
+                .{ @tagName(kind), n, kind_prev, self.outbound_held.load(.acquire) },
+            );
+        }
         std.debug.assert(kind_prev >= n);
         const prev = self.outbound_held.fetchSub(n, .acq_rel);
         std.debug.assert(prev >= n);
