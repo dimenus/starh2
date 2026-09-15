@@ -693,6 +693,22 @@ fn readSome(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
     if (self.tls != null) {
         return readSomeTls(self, buf, deadline_ns);
     }
+    // `Io.Reader.readVec` copies whatever the reader already holds into `data`
+    // and advances `seek` BEFORE it calls the vtable, and its `ReadFailed` arm
+    // then returns the error without reporting those bytes (std/Io/Reader.zig,
+    // `readVec`). A canceled read would swallow them exactly as `cancelDiscard`
+    // used to swallow a completed one. Take them here, so the cancelable read
+    // below only ever runs against an empty reader buffer and its error paths
+    // have nothing to lose. Without this, t-1760 comes back for any pipelined
+    // request longer than `waitPeerByte`'s 256-byte destination.
+    const held = self.reader.interface.buffered();
+    if (held.len != 0) {
+        const take = @min(held.len, buf.len);
+        @memcpy(buf[0..take], held[0..take]);
+        self.reader.interface.toss(take);
+        return take;
+    }
+
     var dest: [1][]u8 = .{buf};
     const Read = union(enum) {
         data: std.Io.Reader.Error!usize,
@@ -1107,7 +1123,17 @@ fn waitDispatch(self: *H1Conn) !void {
         }
         try select.concurrent(.peer, waitPeerByte, .{self});
         const selected = try select.await();
-        defer select.cancelDiscard();
+        // Same class as the read loss above, one layer up. `cancelDiscard` drops
+        // results from tasks that finished during cancelation, and for `.done`
+        // that result is the handler's ONLY completion token: `finishSlotFromTask`
+        // sends it once behind a cmpxchg, so a dropped token is never resent.
+        // Reaped `.peer` bytes need no handling here, because `waitPeerByte`
+        // parks them in carry before it returns.
+        var reaped_done = false;
+        while (select.cancel()) |left| switch (left) {
+            .done => reaped_done = true,
+            else => {},
+        };
         switch (selected) {
             .done => |r| {
                 _ = r catch |err| switch (err) {
@@ -1137,6 +1163,14 @@ fn waitDispatch(self: *H1Conn) !void {
                         break;
                     }
                     reaping = true;
+                } else if (reaped_done) {
+                    // The handler finished while this peer read was landing, and
+                    // its token was reaped above. Nothing will send it again, so
+                    // looping here would park on an empty channel and a 365-day
+                    // peer read while a keep-alive client waits for a response
+                    // that never comes. The client's bytes are already in carry.
+                    finishSlot(self);
+                    break;
                 }
             },
         }

@@ -1108,6 +1108,50 @@ fn runTaskPostReuses(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAd
     }
 }
 
+/// The t-1760 shape with a reuse request LARGER than waitPeerByte's 256-byte
+/// dest. Two independent cross-vendor reviewers said the readSome fix cannot
+/// cover this: readVec fills dest, leaves the remainder in the Stream.Reader's
+/// own buffer, and a later canceled readVec copies that remainder into dest,
+/// advances seek, then returns ReadFailed with the copied bytes unreported.
+/// runTaskPostReuses sends 27 bytes, so it cannot see it.
+fn runTaskPostReusesLarge(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
+    const payload = "{\"hello\":1}";
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rb: [4096]u8 = undefined;
+    var wb: [2048]u8 = undefined;
+    var reader = stream.reader(io, &rb);
+    var writer = stream.writer(io, &wb);
+    try writeReq(&writer.interface, "POST /echo-task HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\nContent-Type: application/json\r\n\r\n{\"hello\":1}");
+    var cap1 = try readResponse(&reader.interface, gpa, false);
+    defer cap1.deinit();
+    if (cap1.status != 200) return error.TaskPostNoResponse;
+    try std.testing.expectEqualStrings(payload, cap1.body.items);
+    if (cap1.saw_conn_close) return error.TaskPostClosedConnection;
+
+    // 900 bytes of padding puts the reuse request well past the 256-byte dest,
+    // so readVec must split it across dest and the reader's own buffer.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    try big.appendSlice(gpa, "GET / HTTP/1.1\r\nHost: h\r\nX-Pad: ");
+    try big.appendNTimes(gpa, 'p', 900);
+    try big.appendSlice(gpa, "\r\n\r\n");
+    try writeReq(&writer.interface, big.items);
+
+    var cap2 = try readResponse(&reader.interface, gpa, false);
+    defer cap2.deinit();
+    if (cap2.status != 200) {
+        std.debug.print("task_post_reuses_large: req_len={d} reuse status={?d} closed={} conn_close={} body_len={d}\n", .{
+            big.items.len, cap2.status, cap2.closed, cap2.saw_conn_close, cap2.body.items.len,
+        });
+        return error.TaskPostLargeNoReuse;
+    }
+}
+
+fn namedTaskPostReusesLarge(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    try withBatteryServer(rt, gpa, runTaskPostReusesLarge);
+}
+
 fn runSlowHandler(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddress) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -2333,6 +2377,16 @@ test "h1.keepalive.task_post_reuses" {
     var handle = try rt.spawn(namedTaskPostReuses, .{ rt, std.testing.allocator });
     handle.join() catch |err| {
         std.debug.print("h1.keepalive.task_post_reuses failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+test "h1.keepalive.task_post_reuses_large" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var handle = try rt.spawn(namedTaskPostReusesLarge, .{ rt, std.testing.allocator });
+    handle.join() catch |err| {
+        std.debug.print("h1.keepalive.task_post_reuses_large failed: {s}\n", .{@errorName(err)});
         return err;
     };
 }
