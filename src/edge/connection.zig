@@ -741,14 +741,14 @@ pub const GlobalAccounting = struct {
 /// outlive the job. `Response.terminal` therefore points here and never into
 /// the arena.
 ///
-/// `completion_owner` is a three-state race arbiter, and it is what makes the
+/// `completion_owner` is a four-state race arbiter, and it is what makes the
 /// slot release exactly-once. Two tasks can decide that a handler is finished:
 /// the handler itself when it returns, and the actor when it cancels. Both
 /// attempt a CAS; the winner posts the completion, the loser does nothing.
 /// - `live` (0): the handler is running and will report itself.
-/// - `reaper_owned` (1): the actor won the race and moved the join handle to a
-///   reaper worker, which reports after `cancel` returns.
+/// - `reaper_owned` (1): the join is in the reaper queue; no worker has it yet.
 /// - `reported` (2): the completion is posted or queued. Also the free state.
+/// - `reaper_running` (3): a worker dequeued the job and is in `Future.cancel`.
 pub const HandlerSlot = struct {
     terminal: response.SlotTerminal = .{},
     completion_owner: std.atomic.Value(u8) = .init(2), // start reported/free
@@ -823,6 +823,7 @@ const HandlerJob = struct {
 const live: u8 = 0;
 const reaper_owned: u8 = 1;
 const reported: u8 = 2;
+const reaper_running: u8 = 3;
 
 /// Complete-handler drain turns that may await their wire receipts at once.
 /// Independent of the deeper WritePump queue. 2 serialized the 8-worker
@@ -867,6 +868,8 @@ pub const ReaperJob = struct {
     /// The actor selects on this channel; the post IS the wake.
     completion: *zio.Channel(u31),
     stream_id: u31,
+    /// Connection-local count of successful `trySend` publications.
+    post_ok: *std.atomic.Value(usize),
 };
 
 comptime {
@@ -880,7 +883,10 @@ comptime {
         ));
     }
     if (@sizeOf(ReaperJob) != limits_mod.REAPER_JOB_SIZE) {
-        @compileError("REAPER_JOB_SIZE must match @sizeOf(ReaperJob)");
+        @compileError(std.fmt.comptimePrint(
+            "REAPER_JOB_SIZE must match @sizeOf(ReaperJob) (got {d})",
+            .{@sizeOf(ReaperJob)},
+        ));
     }
 }
 
@@ -916,12 +922,12 @@ pub const ReaperPool = struct {
 
     /// The worker's order is fixed and load-bearing:
     ///
-    /// 1. `cancel` — waits until the handler task has really stopped. Only then
+    /// 1. Mark `reaper_running` so a stall dump can tell queued from cancel.
+    /// 2. `cancel` — waits until the handler task has really stopped. Only then
     ///    is the handler's arena unused and its slot safe to reuse.
-    /// 2. `swap(reported)` — claim the right to report. If the handler returned
-    ///    naturally in the meantime it already reported, and the previous value
-    ///    is not `reaper_owned`; this worker then stays silent.
-    /// 3. post the completion. The actor selects on the channel, so the post
+    /// 3. `swap(reported)` — claim the right to report. If the previous value
+    ///    is not `reaper_running`, the handler already reported; stay silent.
+    /// 4. post the completion. The actor selects on the channel, so the post
     ///    IS the wake.
     pub fn worker(self: *ReaperPool) std.Io.Cancelable!void {
         while (true) {
@@ -929,17 +935,21 @@ pub const ReaperPool = struct {
                 error.Closed => return,
                 error.Canceled => return error.Canceled,
             };
+            job.owner.store(reaper_running, .release);
+            std.debug.assert(job.owner.load(.acquire) == reaper_running);
             job.handle.cancel(self.io);
             const prev = job.owner.swap(reported, .acq_rel);
-            if (prev == reaper_owned) {
-                job.completion.trySend(job.stream_id) catch |err| switch (err) {
+            if (prev == reaper_running) {
+                if (job.completion.trySend(job.stream_id)) |_| {
+                    _ = job.post_ok.fetchAdd(1, .acq_rel);
+                } else |err| switch (err) {
                     // One completion per slot, capacity max_streams: full is a
                     // broken invariant, never a wait.
                     error.WouldBlock => @panic("completion channel over proven capacity"),
                     error.Closed => {
                         // Connection teardown has already closed completion delivery.
                     },
-                };
+                }
             }
         }
     }
@@ -1121,8 +1131,12 @@ const Connection = struct {
     slots_rolled_back: usize = 0,
     slots_finalized: std.atomic.Value(usize) = .init(0),
     /// In-use slots at the teardown wait, and how many `releaseSlot` ran.
+    /// `released` counts in-use → free transitions only, never a stale SID.
     teardown_wait_expected: usize = 0,
     teardown_wait_released: usize = 0,
+    /// Successful reaper `tryPut` and `trySend` publications on this connection.
+    reaper_queue_ok: std.atomic.Value(usize) = .init(0),
+    reaper_post_ok: std.atomic.Value(usize) = .init(0),
     /// Actor-owned batches whose drain-turn receipt is attached but not yet
     /// consumed. Separate from `inline_sids`, which is the ready queue.
     complete_receipt_sid_storage: []u31 = &.{},
@@ -1490,7 +1504,7 @@ const Connection = struct {
         }
         // Late reaper posts can arrive after shutdownHandlers; never discard without releaseSlot.
         while (io_queue.tryRecv(u31, &self.completion_ch)) |sid| {
-            self.releaseSlot(sid);
+            _ = self.releaseSlot(sid);
         }
         if (std.debug.runtime_safety) {
             const claimed = self.slots_claimed;
@@ -2151,11 +2165,13 @@ const Connection = struct {
         }
     }
 
-    fn drainCompletions(self: *Connection) void {
-        if (test_hold_completion_drain.load(.acquire)) return;
+    fn drainCompletions(self: *Connection) usize {
+        if (test_hold_completion_drain.load(.acquire)) return 0;
+        var n: usize = 0;
         while (io_queue.tryRecv(u31, &self.completion_ch)) |sid| {
-            self.releaseSlot(sid);
+            if (self.releaseSlot(sid)) n += 1;
         }
+        return n;
     }
 
     /// Trace-only: leftover `read_ch` after this take. Locks the channel
@@ -2191,7 +2207,7 @@ const Connection = struct {
     /// here — extras share one drain-turn after the batch.
     fn inboundBatchShouldStop(self: *Connection) InboundBatchStop {
         self.drainWriteAcks();
-        self.drainCompletions();
+        _ = self.drainCompletions();
         self.drainPendingCompleteReceipts(false);
         if (self.writer_failed.load(.acquire)) return .failed;
         self.lockSessionUncancelable(self.config.io);
@@ -2330,7 +2346,7 @@ const Connection = struct {
                 }
                 finishHandlerJob(job);
             }
-            self.drainCompletions();
+            _ = self.drainCompletions();
 
             const reusable = receipt.stream_ids;
             var i: usize = 1;
@@ -2660,7 +2676,9 @@ const Connection = struct {
                 },
                 .comps => |r| {
                     const sid = r catch return null;
-                    self.releaseSlot(sid);
+                    if (!self.releaseSlot(sid)) {
+                        std.debug.panic("completion sid={d} released no slot", .{sid});
+                    }
                 },
                 .bell => |r| {
                     _ = r catch return null;
@@ -2691,7 +2709,9 @@ const Connection = struct {
             },
             .comps => |r| {
                 const sid = r catch return null;
-                self.releaseSlot(sid);
+                if (!self.releaseSlot(sid)) {
+                    std.debug.panic("completion sid={d} released no slot", .{sid});
+                }
             },
             .bell => |r| {
                 // The token is the consumed wake; the flags it covered are
@@ -2919,7 +2939,7 @@ const Connection = struct {
             _ = self.sched_refilled.swap(false, .acq_rel);
             self.drainWriteAcks();
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
-            self.drainCompletions();
+            _ = self.drainCompletions();
             self.drainPendingCompleteReceipts(false);
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
             if (!leaving and !self.writer_failed.load(.acquire)) self.runPendingInline();
@@ -3068,13 +3088,25 @@ const Connection = struct {
 
         self.teardownExhaustive();
         torn_down = true;
+        // endShield only drops shield_count. A cancel that arrived during
+        // the shield is still pending; consume and return it.
+        try zio.checkCancel();
         if (close_probe) diagRawPrint("t1002 conn={x} shutdown_done parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
     }
 
-    /// Finish every slot even if this task is canceled. Shield so a select
-    /// in the wait cannot return Canceled with live slots. Recancel after
-    /// the caller sees the original Canceled.
+    /// Last owned turn, then lock-free wait. Every `run` exit uses this,
+    /// including errdefer: a complete job can sit in `inline_sids` with
+    /// `teardown_inline_n == 0` if an intent error skipped the loop freeze.
+    /// Close write queues before the lock: a handler can park in `putOne`
+    /// while holding `session_mu`.
     fn teardownExhaustive(self: *Connection) void {
+        std.debug.assert(shutdown_sweep.get() == null);
+        self.closeWriterQueues();
+        {
+            self.lockSessionUncancelable(self.config.io);
+            defer self.unlockSession(self.config.io);
+            self.freezeAndSweepLocked();
+        }
         zio.beginShield();
         defer zio.endShield();
         if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), self.sched.pendingCount(), close_probe_parked.load(.acquire) });
@@ -3325,38 +3357,39 @@ const Connection = struct {
     /// lifetime actually ends. Releasing it earlier — at cancel time — would
     /// hand the capacity to a new stream while the old handler was still
     /// running.
-    fn releaseSlot(self: *Connection, stream_id: u31) void {
-        if (self.slotIndex(stream_id)) |i| {
-            const slot = &self.handlers[i];
-            std.debug.assert(slot.in_use);
-            const n = slot.finalize_count.load(.acquire);
-            if (slot.admitted) {
-                if (std.debug.runtime_safety) {
-                    if (n == 0) {
-                        std.debug.panic("handler slot sid={d} released with no finalize", .{stream_id});
-                    }
-                    if (n != 1) {
-                        std.debug.panic("handler slot sid={d} finalize_count={d} at release", .{ stream_id, n });
-                    }
+    /// Returns true only when an in-use slot became free. A stale or duplicate
+    /// SID returns false and must not count as teardown progress.
+    fn releaseSlot(self: *Connection, stream_id: u31) bool {
+        const i = self.slotIndex(stream_id) orelse return false;
+        const slot = &self.handlers[i];
+        std.debug.assert(slot.in_use);
+        const n = slot.finalize_count.load(.acquire);
+        if (slot.admitted) {
+            if (std.debug.runtime_safety) {
+                if (n == 0) {
+                    std.debug.panic("handler slot sid={d} released with no finalize", .{stream_id});
                 }
-            } else {
-                std.debug.assert(n == 0);
-                self.slots_rolled_back += 1;
+                if (n != 1) {
+                    std.debug.panic("handler slot sid={d} finalize_count={d} at release", .{ stream_id, n });
+                }
             }
-            if (self.handler_joins[i]) |*handle| handle.await(self.config.io);
-            self.handler_joins[i] = null;
-            if (slot.reaper_reserved) {
-                if (self.config.accounting) |a| a.releaseReaper();
-                slot.reaper_reserved = false;
-            }
-            slot.in_use = false;
-            slot.admitted = false;
-            if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
-            slot.terminal.clear();
-            slot.completion_owner.store(reported, .release);
-            // Event state is reset only when this slot is admitted again; every
-            // waiter rechecks capacity and terminal state under session_mu.
+        } else {
+            std.debug.assert(n == 0);
+            self.slots_rolled_back += 1;
         }
+        if (self.handler_joins[i]) |*handle| handle.await(self.config.io);
+        self.handler_joins[i] = null;
+        if (slot.reaper_reserved) {
+            if (self.config.accounting) |a| a.releaseReaper();
+            slot.reaper_reserved = false;
+        }
+        slot.in_use = false;
+        slot.admitted = false;
+        if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
+        slot.terminal.clear();
+        slot.completion_owner.store(reported, .release);
+        std.debug.assert(!slot.in_use);
+        return true;
     }
 
     fn enqueueReaperOrFail(self: *Connection, slot: *HandlerSlot, handle: std.Io.Future(void), stream_id: u31) void {
@@ -3367,8 +3400,11 @@ const Connection = struct {
                 .owner = &slot.completion_owner,
                 .completion = &self.completion_ch,
                 .stream_id = stream_id,
+                .post_ok = &self.reaper_post_ok,
             });
-            if (!queued) {
+            if (queued) {
+                _ = self.reaper_queue_ok.fetchAdd(1, .acq_rel);
+            } else {
                 // Invariant: reserved capacity must make this impossible.
                 std.debug.assert(false);
                 owned_handle.cancel(self.config.io);
@@ -3377,13 +3413,13 @@ const Connection = struct {
                 self.session.applyCommand(.{ .goaway = .{ .code = .internal_error, .last_stream_id = self.session.last_processed_stream } }) catch {};
                 // No wire recovery is possible after the reserved reaper queue rejected the job.
                 self.processIntents() catch {};
-                self.releaseSlot(stream_id);
+                std.debug.assert(self.releaseSlot(stream_id));
             }
         } else {
             var h = handle;
             h.cancel(self.config.io);
             slot.completion_owner.store(reported, .release);
-            self.releaseSlot(stream_id);
+            std.debug.assert(self.releaseSlot(stream_id));
         }
     }
 
@@ -3568,7 +3604,7 @@ const Connection = struct {
             runHandlerJobBody(job);
             finishHandlerJob(job);
         }
-        self.drainCompletions();
+        _ = self.drainCompletions();
     }
 
     /// Finish complete jobs that still hold a drain-turn receipt. Does not
@@ -3594,7 +3630,7 @@ const Connection = struct {
                 }
                 finishHandlerJob(job);
             }
-            self.drainCompletions();
+            _ = self.drainCompletions();
 
             const reusable = receipt.stream_ids;
             var i: usize = 1;
@@ -3617,11 +3653,12 @@ const Connection = struct {
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) continue;
             const owner = slot.completion_owner.load(.acquire);
-            if (owner != live and owner != reaper_owned and owner != reported) {
+            if (owner != live and owner != reaper_owned and owner != reaper_running and owner != reported) {
                 std.debug.panic("teardown slot sid={d} owner={d} is not live/reaper/reported", .{ slot.stream_id, owner });
             }
             if (owner == reported) continue;
             if (owner == reaper_owned) continue;
+            if (owner == reaper_running) continue;
             if (self.handler_joins[i] != null) continue;
             std.debug.panic(
                 "teardown slot sid={d} has no poster (owner={d} join=null)",
@@ -3636,11 +3673,16 @@ const Connection = struct {
         var in_use: usize = 0;
         var reaper_n: usize = 0;
         var owner_live: usize = 0;
+        var reaper_queued: usize = 0;
+        var reaper_run: usize = 0;
         for (self.handlers) |s| {
             if (!s.in_use) continue;
             in_use += 1;
             if (s.reaper_reserved) reaper_n += 1;
-            if (s.completion_owner.load(.acquire) == live) owner_live += 1;
+            const owner = s.completion_owner.load(.acquire);
+            if (owner == live) owner_live += 1;
+            if (owner == reaper_owned) reaper_queued += 1;
+            if (owner == reaper_running) reaper_run += 1;
         }
         std.debug.assert(in_use != 0);
         for (self.handlers, 0..) |s, i| {
@@ -3658,7 +3700,7 @@ const Connection = struct {
             );
         }
         std.debug.panic(
-            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d}",
+            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d}",
             .{
                 self.live_handlers.load(.acquire),
                 in_use,
@@ -3666,6 +3708,10 @@ const Connection = struct {
                 owner_live,
                 self.teardown_wait_expected,
                 self.teardown_wait_released,
+                reaper_queued,
+                reaper_run,
+                self.reaper_queue_ok.load(.acquire),
+                self.reaper_post_ok.load(.acquire),
             },
         );
     }
@@ -3701,7 +3747,7 @@ const Connection = struct {
         std.debug.assert(self.writer_failed.load(.acquire));
         self.closeWriterQueues();
         self.publishTeardownWakes();
-        self.drainCompletions();
+        _ = self.drainCompletions();
         self.finishPendingReceiptsNoWait();
         self.enqueueTeardownReapers();
         if (std.debug.runtime_safety) self.assertTeardownPosters();
@@ -3737,6 +3783,8 @@ const Connection = struct {
                 } else if (prev == @as(?u8, reaper_owned)) {
                     self.handler_joins[i] = null;
                     self.enqueueReaperOrFail(slot, handle, slot.stream_id);
+                } else if (prev == @as(?u8, reaper_running)) {
+                    std.debug.panic("teardown join still set while reaper running sid={d}", .{slot.stream_id});
                 } else {
                     std.debug.assert(prev == @as(?u8, reported));
                     // Keep the join. The handler has posted, but finishHandlerJob
@@ -3757,12 +3805,15 @@ const Connection = struct {
         var waits: usize = 0;
         while (true) {
             const before = self.countInUseSlots();
-            self.drainCompletions();
+            const n = self.drainCompletions();
             const after_drain = self.countInUseSlots();
-            if (after_drain < before) {
-                self.teardown_wait_released += before - after_drain;
+            std.debug.assert(before >= after_drain);
+            std.debug.assert(before - after_drain == n);
+            if (n != 0) {
+                self.teardown_wait_released += n;
                 last_progress_ns = nowNs(self.config.io);
             }
+            std.debug.assert(self.teardown_wait_released + after_drain == self.teardown_wait_expected);
             if (after_drain == 0) break;
             std.debug.assert(self.teardown_wait_released < self.teardown_wait_expected);
             self.tickets.failAll();
@@ -3774,9 +3825,12 @@ const Connection = struct {
             waits += 1;
             std.debug.assert(waits <= self.handlers.len);
             const sid = self.takeTeardownCompletion(last_progress_ns, no_progress_ns);
-            self.releaseSlot(sid);
+            if (!self.releaseSlot(sid)) {
+                std.debug.panic("teardown completion sid={d} released no slot", .{sid});
+            }
             self.teardown_wait_released += 1;
             last_progress_ns = nowNs(self.config.io);
+            std.debug.assert(self.teardown_wait_released + self.countInUseSlots() == self.teardown_wait_expected);
         }
         std.debug.assert(self.countInUseSlots() == 0);
     }
@@ -4869,7 +4923,7 @@ const Connection = struct {
             try self.processIntents();
             return;
         };
-        errdefer self.releaseSlot(d.stream_id);
+        errdefer std.debug.assert(self.releaseSlot(d.stream_id));
         const slot_i = self.slotIndex(d.stream_id) orelse unreachable;
         const job = &self.handler_jobs[slot_i];
         const keep_arena = self.header_lease_sid[slot_i] == d.stream_id;
@@ -5332,7 +5386,7 @@ const Connection = struct {
                 const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
                 finishHandlerJob(job);
             }
-            self.drainCompletions();
+            _ = self.drainCompletions();
         }
 
         {
@@ -6544,4 +6598,48 @@ pub fn testTrapDeinitLive(io: std.Io) void {
     std.debug.assert(trap.hop.conn.live_handlers.load(.acquire) == 1);
     trap.hop.conn.deinit();
     std.debug.panic("deinit live_handlers did not fire", .{});
+}
+
+fn trapStaleSidPoster(conn: *Connection) void {
+    std.debug.assert(conn.handlers.len != 0);
+    zio.sleep(.fromMilliseconds(300)) catch std.debug.panic("stale sid poster sleep canceled", .{});
+    conn.completion_ch.trySend(1) catch |err| switch (err) {
+        error.WouldBlock => std.debug.panic("stale sid trySend WouldBlock", .{}),
+        error.Closed => std.debug.panic("stale sid trySend Closed", .{}),
+    };
+}
+
+/// Finding 2 arm: a duplicate SID after the real release must panic, not
+/// refresh last_progress_ns.
+pub fn testTrapStaleTeardownSid(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    const job1 = trapAdmitJob(&trap.hop.conn, 1);
+    _ = trapAdmitJob(&trap.hop.conn, 3);
+    Connection.finishHandlerJob(job1);
+    var poster = zio.spawn(trapStaleSidPoster, .{&trap.hop.conn}) catch std.debug.panic("stale sid poster spawn failed", .{});
+    var node: @TypeOf(shutdown_sweep).Node = .unset;
+    shutdown_sweep.set(&node, {});
+    defer shutdown_sweep.clear(&node);
+    trap.hop.conn.waitTeardownCompletions();
+    _ = poster.join();
+    std.debug.panic("stale sid did not fire", .{});
+}
+
+/// Finding 5 arm: a complete job in `inline_sids` with `teardown_inline_n == 0`.
+/// `teardownExhaustive` must freeze before the lock-free wait.
+pub fn testTrapErrorPathFreeze(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    defer trap.close();
+    _ = trapAdmitJob(&trap.hop.conn, 1);
+    std.debug.assert(trap.hop.conn.inline_sids.len != 0);
+    trap.hop.conn.inline_sids[0] = 1;
+    trap.hop.conn.inline_n = 1;
+    std.debug.assert(trap.hop.conn.teardown_inline_n == 0);
+    trap.hop.conn.teardownExhaustive();
+    std.debug.assert(trap.hop.conn.countInUseSlots() == 0);
+    std.debug.print("error-path freeze ok\n", .{});
 }

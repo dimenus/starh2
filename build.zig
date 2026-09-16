@@ -469,6 +469,15 @@ pub fn build(b: *std.Build) void {
     run_deinit_live_trap.addArg("deinit-live");
     run_deinit_live_trap.addCheck(.{ .expect_stderr_match = "deinit with live_handlers=1" });
     run_deinit_live_trap.has_side_effects = true;
+    const run_stale_sid_trap = b.addRunArtifact(teardown_traps);
+    run_stale_sid_trap.addArg("stale-sid");
+    run_stale_sid_trap.addCheck(.{ .expect_stderr_match = "teardown completion sid=1 released no slot" });
+    run_stale_sid_trap.has_side_effects = true;
+    const run_error_path_freeze_trap = b.addRunArtifact(teardown_traps);
+    run_error_path_freeze_trap.addArg("error-path-freeze");
+    run_error_path_freeze_trap.addCheck(.{ .expect_stderr_match = "error-path freeze ok" });
+    run_error_path_freeze_trap.expectExitCode(0);
+    run_error_path_freeze_trap.has_side_effects = true;
     lifecycle_step.dependOn(&run_double_finalize_trap.step);
     lifecycle_step.dependOn(&run_sweep_lock_trap.step);
     lifecycle_step.dependOn(&run_sweep_lock_session_trap.step);
@@ -477,6 +486,8 @@ pub fn build(b: *std.Build) void {
     lifecycle_step.dependOn(&run_watchdog_healthy_trap.step);
     lifecycle_step.dependOn(&run_conservation_trap.step);
     lifecycle_step.dependOn(&run_deinit_live_trap.step);
+    lifecycle_step.dependOn(&run_stale_sid_trap.step);
+    lifecycle_step.dependOn(&run_error_path_freeze_trap.step);
 
     const backend_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{

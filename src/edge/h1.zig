@@ -26,6 +26,8 @@ const live: u8 = 0;
 const reaper_owned: u8 = 1;
 const reported: u8 = 2;
 
+var h1_reaper_post_ok: std.atomic.Value(usize) = .init(0);
+
 var no_shutdown_event: zio.ResetEvent = .init;
 
 pub const ChannelMutation = enum {
@@ -1208,6 +1210,7 @@ fn cancelJoin(self: *H1Conn) bool {
                     .owner = &self.slot.completion_owner,
                     .completion = &self.completion_ch,
                     .stream_id = 1,
+                    .post_ok = &h1_reaper_post_ok,
                 });
                 if (queued) return true;
             }

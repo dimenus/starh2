@@ -8,7 +8,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.next();
     const which = it.next() orelse {
-        std.debug.print("usage: teardown-traps double-finalize | sweep-lock | sweep-lock-session | unlocked-sweep | watchdog-stall | watchdog-healthy | conservation | deinit-live\n", .{});
+        std.debug.print("usage: teardown-traps double-finalize | sweep-lock | sweep-lock-session | unlocked-sweep | watchdog-stall | watchdog-healthy | conservation | deinit-live | stale-sid | error-path-freeze\n", .{});
         std.process.exit(2);
     };
     const gpa = std.heap.page_allocator;
@@ -50,6 +50,16 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
     if (std.mem.eql(u8, which, "deinit-live")) {
         var handle = rt.spawn(starh2.edge.connection.testTrapDeinitLive, .{rt.io()}) catch std.process.exit(3);
+        handle.join();
+        std.process.exit(0);
+    }
+    if (std.mem.eql(u8, which, "stale-sid")) {
+        var handle = rt.spawn(starh2.edge.connection.testTrapStaleTeardownSid, .{rt.io()}) catch std.process.exit(3);
+        handle.join();
+        std.process.exit(0);
+    }
+    if (std.mem.eql(u8, which, "error-path-freeze")) {
+        var handle = rt.spawn(starh2.edge.connection.testTrapErrorPathFreeze, .{rt.io()}) catch std.process.exit(3);
         handle.join();
         std.process.exit(0);
     }
