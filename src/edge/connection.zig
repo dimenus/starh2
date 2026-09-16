@@ -3677,10 +3677,12 @@ const Connection = struct {
         var owner_live: usize = 0;
         var reaper_queued: usize = 0;
         var reaper_run: usize = 0;
+        var awaiting_n: usize = 0;
         for (self.handlers) |s| {
             if (!s.in_use) continue;
             in_use += 1;
             if (s.reaper_reserved) reaper_n += 1;
+            if (s.awaiting_receipt.load(.acquire)) awaiting_n += 1;
             const owner = s.completion_owner.load(.acquire);
             if (owner == live) owner_live += 1;
             if (owner == reaper_owned) reaper_queued += 1;
@@ -3690,7 +3692,7 @@ const Connection = struct {
         for (self.handlers, 0..) |s, i| {
             if (!s.in_use) continue;
             diagRawPrint(
-                "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d} receipt={d} session_held={d}\n",
+                "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d} awaiting_receipt={d} session_held={d}\n",
                 .{
                     s.stream_id,
                     s.completion_owner.load(.acquire),
@@ -3704,7 +3706,7 @@ const Connection = struct {
             );
         }
         std.debug.panic(
-            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d} session_held={d}",
+            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d} awaiting_receipt={d} session_held={d}",
             .{
                 self.live_handlers.load(.acquire),
                 in_use,
@@ -3716,6 +3718,7 @@ const Connection = struct {
                 reaper_run,
                 self.reaper_queue_ok.load(.acquire),
                 self.reaper_post_ok.load(.acquire),
+                awaiting_n,
                 @intFromBool(self.session_held),
             },
         );
@@ -6547,19 +6550,23 @@ pub fn testTrapWatchdogNoProgress(io: std.Io) void {
 
 fn trapParkForever() void {
     while (true) {
+        // Swallow Canceled so Future.cancel cannot finish: the next sleep is
+        // not a cancel point (zio consumes one Canceled per request).
         zio.sleep(.fromSeconds(30)) catch {};
     }
 }
 
-/// Axis D arm: a reaper-owned slot whose worker never posts. Goes through
-/// `shutdownHandlers` so `assertTeardownPosters` accepts the owner. The live
-/// stall arm cannot take that path: join-null plus owner=live panics first.
+/// Axis D arm: a running reaper whose `Future.cancel` never returns. A worker
+/// must be live: a pool with nobody home only arms `reaper_queued`, not
+/// `reaper_running`. Same spawn as `server.zig` `reaper_group.concurrent`.
 pub fn testTrapWatchdogReaperNoPost(io: std.Io) void {
     const gpa = std.heap.page_allocator;
     var trap: TrapHop = undefined;
     openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
     var pool = ReaperPool.init(gpa, io, 1) catch std.debug.panic("trap reaper pool failed", .{});
     trap.hop.conn.reaper = &pool;
+    var reaper_group: std.Io.Group = .init;
+    reaper_group.concurrent(io, ReaperPool.worker, .{&pool}) catch std.debug.panic("trap reaper worker spawn failed", .{});
     const slot = trap.hop.conn.allocSlot(1) orelse std.debug.panic("trap allocSlot failed", .{});
     trap.hop.conn.admitHandler(slot);
     slot.reaper_reserved = true;
