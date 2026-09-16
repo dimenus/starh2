@@ -38,14 +38,25 @@ const response = @import("../http/response.zig");
 
 pub const no_completion_slot = std.math.maxInt(u32);
 
+/// First writer wins. `complete(ok=true)` must not become failure if `failAll`
+/// runs after the waiter has consumed `event` and is about to read `ok`.
+const ok_none: u8 = 0;
+const ok_fail: u8 = 1;
+const ok_pass: u8 = 2;
+
 pub const TicketWait = struct {
     event: std.Io.Event = .unset,
-    ok: bool = false,
+    ok: std.atomic.Value(u8) = .init(ok_none),
     in_use: std.atomic.Value(bool) = .init(false),
     ticket: std.atomic.Value(u64) = .init(0),
     /// Actor-written, actor-read link for tickets sharing one wire chunk.
     completion_next: std.atomic.Value(u32) = .init(no_completion_slot),
 };
+
+fn publishOk(slot: *TicketWait, passed: bool) void {
+    const want: u8 = if (passed) ok_pass else ok_fail;
+    _ = slot.ok.cmpxchgStrong(ok_none, want, .release, .monotonic);
+}
 
 /// Test-only two-task barrier around reserve preclaim/postclaim.
 pub const TestReserveBarrier = struct {
@@ -110,13 +121,13 @@ pub const TicketTable = struct {
                     slot.in_use.store(false, .release);
                     return error.WriteFailed;
                 }
-                slot.ok = false;
+                slot.ok.store(ok_none, .release);
                 slot.event.reset();
                 slot.completion_next.store(no_completion_slot, .release);
                 slot.ticket.store(ticket, .release);
                 // Recheck again after publishing ticket (failAll may race between checks).
                 if (self.write_failed.load(.acquire)) {
-                    slot.ok = false;
+                    publishOk(slot, false);
                     slot.event.set(self.io);
                     slot.ticket.store(0, .release);
                     slot.in_use.store(false, .release);
@@ -193,7 +204,7 @@ pub const TicketTable = struct {
             bump(&diag_dropped_mismatch);
             return;
         }
-        slot.ok = ok;
+        publishOk(slot, ok);
         slot.event.set(self.io);
         bump(&diag_completed);
     }
@@ -213,7 +224,7 @@ pub const TicketTable = struct {
         self.write_failed.store(true, .release);
         for (self.slots) |*slot| {
             if (!slot.in_use.load(.acquire)) continue;
-            slot.ok = false;
+            publishOk(slot, false);
             slot.event.set(self.io);
         }
     }
@@ -234,11 +245,20 @@ pub const TicketTable = struct {
             if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
             return error.Canceled;
         };
-        if (slot.ok) return;
+        if (slot.ok.load(.acquire) == ok_pass) return;
         if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
         return error.WriteFailed;
     }
 };
+
+test "complete ok is not overwritten by failAll" {
+    var storage: [1]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    const a = try table.reserve();
+    table.complete(a[1], a[0], true);
+    table.failAll();
+    try table.wait(a[1], null);
+}
 
 test "ticket reserve wait complete reuse" {
     var storage: [4]TicketWait = undefined;
