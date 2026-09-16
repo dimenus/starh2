@@ -855,7 +855,25 @@ pub fn build(b: *std.Build) void {
     const pipeline_bench_step = b.step("bench-pipeline", "Isolated HPACK, frame parsing, and task lifecycle costs");
     pipeline_bench_step.dependOn(&pipeline_bench_run.step);
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + every release target");
+    // ban is on the std.Io CONCURRENCY abstractions, because each one differs
+    // from the zio primitive underneath it in a way that has already cost a
+    // defect: `Select.cancelDiscard` discarded bytes already off the socket
+    // (t-1760); `Future.cancel` is request PLUS mandatory await, so a worker
+    // blocks forever on a handler in an uncancelable wait, where zio's
+    // `AnyTask.cancel` is setCanceled+wake and returns at once (t-1802); and
+    // `Event.set` on an already-set event neither wakes nor re-synchronizes a
+    // waiter that already returned, which makes a following plain field read
+    // a data race (t-1802). Reach for zio, or ask before adding one.
+    const std_io_gate_run = b.addSystemCommand(&.{ "bash", "tools/std-io-gate/gate.sh" });
+    std_io_gate_run.addArg(".");
+    std_io_gate_run.setCwd(b.path("."));
+    std_io_gate_run.has_side_effects = true;
+    std_io_gate_run.stdio = .inherit;
+    const std_io_gate_step = b.step("std-io-gate", "Fail on any new std.Io concurrency abstraction; zio owns concurrency here");
+    std_io_gate_step.dependOn(&std_io_gate_run.step);
+
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + every release target");
+    ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(test_step);
     ci_step.dependOn(test_exact_step);
     ci_step.dependOn(fuzz_smoke_step);
