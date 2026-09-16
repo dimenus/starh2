@@ -484,6 +484,12 @@ pub fn build(b: *std.Build) void {
     run_error_path_freeze_trap.addCheck(.{ .expect_stderr_match = "error-path freeze ok" });
     run_error_path_freeze_trap.expectExitCode(0);
     run_error_path_freeze_trap.has_side_effects = true;
+    const run_r158_parked_trap = b.addRunArtifact(teardown_traps);
+    run_r158_parked_trap.addArg("r158-parked");
+    run_r158_parked_trap.addCheck(.{ .expect_stderr_match = "r158 parked enroll ok" });
+    run_r158_parked_trap.addCheck(.{ .expect_stderr_match = "reaper-stuck absent" });
+    run_r158_parked_trap.expectExitCode(0);
+    run_r158_parked_trap.has_side_effects = true;
     lifecycle_step.dependOn(&run_double_finalize_trap.step);
     lifecycle_step.dependOn(&run_sweep_lock_trap.step);
     lifecycle_step.dependOn(&run_sweep_lock_session_trap.step);
@@ -495,6 +501,7 @@ pub fn build(b: *std.Build) void {
     lifecycle_step.dependOn(&run_deinit_live_trap.step);
     lifecycle_step.dependOn(&run_stale_sid_trap.step);
     lifecycle_step.dependOn(&run_error_path_freeze_trap.step);
+    lifecycle_step.dependOn(&run_r158_parked_trap.step);
 
     const backend_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
