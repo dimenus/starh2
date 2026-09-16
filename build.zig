@@ -455,6 +455,8 @@ pub fn build(b: *std.Build) void {
     run_watchdog_stall_trap.addArg("watchdog-stall");
     run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "teardown wait exceeded 5s no progress: live_handlers=1 slots=1 reaper=0 owner_live=1 expected=1 released=0" });
     run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "teardown stall sid=1" });
+    run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "space_wait=0 deadline_wait=0" });
+    run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "ticket_wait=0 dead_wait=0" });
     run_watchdog_stall_trap.has_side_effects = true;
     const run_watchdog_healthy_trap = b.addRunArtifact(teardown_traps);
     run_watchdog_healthy_trap.addArg("watchdog-healthy");
@@ -466,6 +468,8 @@ pub fn build(b: *std.Build) void {
     run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "teardown wait exceeded 5s no progress: live_handlers=1 slots=1 reaper=1 owner_live=0 expected=1 released=0 reaper_queued=0 reaper_running=1" });
     run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "teardown stall sid=1 owner=3" });
     run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "awaiting_receipt=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "space_wait=0 deadline_wait=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "ticket_wait=0" });
     run_watchdog_reaper_trap.has_side_effects = true;
     const run_conservation_trap = b.addRunArtifact(teardown_traps);
     run_conservation_trap.addArg("conservation");

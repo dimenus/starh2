@@ -3677,6 +3677,26 @@ const Connection = struct {
         }
     }
 
+    fn resetHasWaiters(e: *const zio.ResetEvent) bool {
+        return e.wait_queue.hasWaiters();
+    }
+
+    fn countTicketInUse(self: *const Connection) usize {
+        var n: usize = 0;
+        for (self.tickets.slots) |*slot| {
+            if (slot.in_use.load(.acquire)) n += 1;
+        }
+        return n;
+    }
+
+    fn countTicketWaiters(self: *const Connection) usize {
+        var n: usize = 0;
+        for (self.tickets.slots) |*slot| {
+            if (slot.in_use.load(.acquire) and slot.event.wait_queue.hasWaiters()) n += 1;
+        }
+        return n;
+    }
+
     fn panicTeardownWatchdog(self: *const Connection) noreturn {
         std.debug.assert(self.teardown_wait_expected <= self.handlers.len);
         std.debug.assert(self.teardown_wait_released < self.teardown_wait_expected);
@@ -3699,8 +3719,10 @@ const Connection = struct {
         std.debug.assert(in_use != 0);
         for (self.handlers, 0..) |s, i| {
             if (!s.in_use) continue;
+            const space_wait = i < self.space_events.len and resetHasWaiters(&self.space_events[i]);
+            const deadline_wait = i < self.deadline_events.len and resetHasWaiters(&self.deadline_events[i]);
             diagRawPrint(
-                "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d} awaiting_receipt={d} session_held={d}\n",
+                "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d} awaiting_receipt={d} cause={d} space_wait={d} deadline_wait={d} session_held={d}\n",
                 .{
                     s.stream_id,
                     s.completion_owner.load(.acquire),
@@ -3709,12 +3731,15 @@ const Connection = struct {
                     s.finalize_count.load(.acquire),
                     @intFromBool(s.reaper_reserved),
                     @intFromBool(s.awaiting_receipt.load(.acquire)),
+                    s.terminal.kind.load(.acquire),
+                    @intFromBool(space_wait),
+                    @intFromBool(deadline_wait),
                     @intFromBool(self.session_held),
                 },
             );
         }
         std.debug.panic(
-            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d} awaiting_receipt={d} session_held={d}",
+            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d} awaiting_receipt={d} ticket_in_use={d} ticket_wait={d} dead_wait={d} session_held={d}",
             .{
                 self.live_handlers.load(.acquire),
                 in_use,
@@ -3727,6 +3752,9 @@ const Connection = struct {
                 self.reaper_queue_ok.load(.acquire),
                 self.reaper_post_ok.load(.acquire),
                 awaiting_n,
+                self.countTicketInUse(),
+                self.countTicketWaiters(),
+                @intFromBool(resetHasWaiters(&self.dead)),
                 @intFromBool(self.session_held),
             },
         );
