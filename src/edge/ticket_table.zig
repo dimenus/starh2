@@ -34,6 +34,7 @@
 //! `wait` checks `ok` BEFORE the terminal cause, and that order is the whole
 //! point of `wait`'s doc comment below.
 const std = @import("std");
+const zio = @import("zio");
 const response = @import("../http/response.zig");
 
 pub const no_completion_slot = std.math.maxInt(u32);
@@ -45,12 +46,15 @@ const ok_fail: u8 = 1;
 const ok_pass: u8 = 2;
 
 pub const TicketWait = struct {
-    event: std.Io.Event = .unset,
+    event: zio.ResetEvent = .init,
     ok: std.atomic.Value(u8) = .init(ok_none),
     in_use: std.atomic.Value(bool) = .init(false),
     ticket: std.atomic.Value(u64) = .init(0),
     /// Actor-written, actor-read link for tickets sharing one wire chunk.
     completion_next: std.atomic.Value(u32) = .init(no_completion_slot),
+    /// Set while `wait` is inside `zio.select` / `event.wait`. The r158 arm
+    /// sequences on this: only this wait stores true.
+    waiting: std.atomic.Value(bool) = .init(false),
 };
 
 fn publishOk(slot: *TicketWait, passed: bool) void {
@@ -91,6 +95,8 @@ pub const TicketTable = struct {
     slots: []TicketWait,
     next_ticket: std.atomic.Value(u64) = .init(1),
     write_failed: std.atomic.Value(bool) = .init(false),
+    /// Connection teardown event. One-shot, never reset. Null in unit tests.
+    dead: ?*zio.ResetEvent = null,
 
     pub fn init(io: std.Io, slots: []TicketWait) TicketTable {
         for (slots) |*s| s.* = .{};
@@ -128,7 +134,7 @@ pub const TicketTable = struct {
                 // Recheck again after publishing ticket (failAll may race between checks).
                 if (self.write_failed.load(.acquire)) {
                     publishOk(slot, false);
-                    slot.event.set(self.io);
+                    slot.event.set();
                     slot.ticket.store(0, .release);
                     slot.in_use.store(false, .release);
                     return error.WriteFailed;
@@ -178,15 +184,22 @@ pub const TicketTable = struct {
     ///   acks and then pop the wrong receipt.
     pub fn isSignaled(self: *TicketTable, slot_i: u32) bool {
         if (slot_i >= self.slots.len) return false;
-        return @atomicLoad(std.Io.Event, &self.slots[slot_i].event, .acquire) == .is_set;
+        return self.slots[slot_i].event.isSet();
     }
 
-    /// Nonblocking probe: `Event.wait` has taken the slot to `.waiting`.
-    /// Only that wait writes `.waiting`. Used by the r158-parked arm to prove
-    /// the holder is inside `tickets.wait`, not on a barrier before it.
+    /// Nonblocking probe: `wait` is inside `zio.select` / `event.wait`.
     pub fn isWaiting(self: *TicketTable, slot_i: u32) bool {
         if (slot_i >= self.slots.len) return false;
-        return @atomicLoad(std.Io.Event, &self.slots[slot_i].event, .acquire) == .waiting;
+        return self.slots[slot_i].waiting.load(.acquire);
+    }
+
+    /// True if any slot is inside `wait`'s select / `event.wait`.
+    pub fn anyWaiting(self: *const TicketTable) bool {
+        var i: usize = 0;
+        while (i < self.slots.len) : (i += 1) {
+            if (self.slots[i].waiting.load(.acquire)) return true;
+        }
+        return false;
     }
 
     pub fn releaseReserved(self: *TicketTable, slot_i: u32) void {
@@ -213,7 +226,7 @@ pub const TicketTable = struct {
             return;
         }
         publishOk(slot, ok);
-        slot.event.set(self.io);
+        slot.event.set();
         bump(&diag_completed);
     }
 
@@ -233,7 +246,7 @@ pub const TicketTable = struct {
         for (self.slots) |*slot| {
             if (!slot.in_use.load(.acquire)) continue;
             publishOk(slot, false);
-            slot.event.set(self.io);
+            slot.event.set();
         }
     }
 
@@ -249,12 +262,35 @@ pub const TicketTable = struct {
         if (slot_i >= self.slots.len) return error.OutOfMemory;
         const slot = &self.slots[slot_i];
         defer self.releaseReserved(slot_i);
-        slot.event.wait(self.io) catch {
-            if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
-            return error.Canceled;
-        };
+        slot.waiting.store(true, .release);
+        defer slot.waiting.store(false, .release);
+        var canceled = false;
+        if (!slot.event.isSet()) {
+            if (self.dead) |dead| {
+                if (dead.isSet()) {
+                    canceled = true;
+                } else if (zio.select(.{
+                    .ticket = &slot.event,
+                    .dead = dead,
+                })) |winner| {
+                    switch (winner) {
+                        .ticket => {},
+                        .dead => canceled = true,
+                    }
+                } else |_| {
+                    canceled = true;
+                }
+            } else {
+                slot.event.wait() catch {
+                    canceled = true;
+                };
+            }
+        }
+        // Completed-ok is a fact about the past (t-537). Check it before
+        // cause or cancel, including when `dead` won the select.
         if (slot.ok.load(.acquire) == ok_pass) return;
         if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
+        if (canceled) return error.Canceled;
         return error.WriteFailed;
     }
 };
@@ -451,4 +487,29 @@ test "wait maps SlotTerminal connection_closed over WriteFailed" {
     term.setCause(.server_shutdown);
     table.complete(a[1], a[0], false);
     try std.testing.expectError(error.ConnectionClosed, table.wait(a[1], &term));
+}
+
+test "wait returns through dead without a ticket signal" {
+    var storage: [1]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    var dead: zio.ResetEvent = .init;
+    table.dead = &dead;
+    var term: response.SlotTerminal = .{};
+    const a = try table.reserve();
+    term.setCause(.server_shutdown);
+    dead.set();
+    try std.testing.expectError(error.ConnectionClosed, table.wait(a[1], &term));
+}
+
+test "a completed-ok ticket survives dead (t-537)" {
+    var storage: [1]TicketWait = undefined;
+    var table = TicketTable.init(std.testing.io, &storage);
+    var dead: zio.ResetEvent = .init;
+    table.dead = &dead;
+    var term: response.SlotTerminal = .{};
+    const a = try table.reserve();
+    table.complete(a[1], a[0], true);
+    term.setCause(.server_shutdown);
+    dead.set();
+    try table.wait(a[1], &term);
 }

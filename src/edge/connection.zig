@@ -1037,6 +1037,9 @@ const Connection = struct {
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
     session_mu: std.Io.Mutex = .init,
+    /// One-shot teardown event. Set once, never reset. Handlers select on
+    /// this OR their work. Same shape as `ConnConfig.shutdown_event`.
+    dead: zio.ResetEvent = .init,
     /// Debug proof that `session_mu` is held where Session or the scheduler is
     /// touched. Written only while the mutex is held, so it needs no atomic.
     ///
@@ -1079,11 +1082,11 @@ const Connection = struct {
     /// Set when a write completion reports failure; actor owns handler terminal transition.
     writer_failed: std.atomic.Value(bool) = .init(false),
     writer_fail_handled: bool = false,
-    /// Capacity waiters: one std.Io.Event per HandlerSlot (sparse IDs safe).
-    space_events: []std.Io.Event = &.{},
+    /// Capacity waiters: one `zio.ResetEvent` per HandlerSlot (sparse IDs safe).
+    space_events: []zio.ResetEvent = &.{},
     /// Time waiters. Occupancy and time are different waits; do not overload
     /// `space_events`. Cadence is a heap entry, not a handler timer.
-    deadline_events: []std.Io.Event = &.{},
+    deadline_events: []zio.ResetEvent = &.{},
     /// Actor-owned intent batch — filled by drainIntentsInto (no nested Session drain).
     intent_batch: []session_mod.Intent = &.{},
     rates: rates_mod.RateLimiter = .{},
@@ -1314,12 +1317,12 @@ const Connection = struct {
             config.limits.max_streams_per_connection * complete_receipt_capacity,
         );
         errdefer gpa.free(complete_receipt_sid_storage);
-        const space_events = try gpa.alloc(std.Io.Event, config.limits.max_streams_per_connection);
+        const space_events = try gpa.alloc(zio.ResetEvent, config.limits.max_streams_per_connection);
         errdefer gpa.free(space_events);
-        @memset(space_events, .unset);
-        const deadline_events = try gpa.alloc(std.Io.Event, config.limits.max_streams_per_connection);
+        @memset(space_events, .init);
+        const deadline_events = try gpa.alloc(zio.ResetEvent, config.limits.max_streams_per_connection);
         errdefer gpa.free(deadline_events);
-        @memset(deadline_events, .unset);
+        @memset(deadline_events, .init);
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
         errdefer gpa.free(intent_batch);
 
@@ -1413,6 +1416,9 @@ const Connection = struct {
         // The doorbell buffer is an inline field, so the channel must bind it
         // here, at the struct's final address (init returns by value).
         self.doorbell = .init(&self.doorbell_buf);
+        // Same init-move hazard: `&self.dead` inside `init` dangles after the
+        // return-move. Bind at the final address, like the doorbell.
+        self.tickets.dead = &self.dead;
         if (self.session.stream_hooks != null) {
             self.session.stream_hooks.?.ctx = self;
         }
@@ -1890,21 +1896,21 @@ const Connection = struct {
 
     fn wakeStreamSpace(self: *Connection, stream_id: u31) void {
         if (self.spaceIndex(stream_id)) |i| {
-            if (i < self.space_events.len) self.space_events[i].set(self.config.io);
+            if (i < self.space_events.len) self.space_events[i].set();
         }
     }
 
     fn wakeAllSpace(self: *Connection) void {
-        for (self.space_events) |*event| event.set(self.config.io);
+        for (self.space_events) |*event| event.set();
     }
 
     fn wakeHandlerDeadline(self: *Connection, stream_id: u31) void {
         const i = self.slotIndex(stream_id) orelse return;
-        if (i < self.deadline_events.len) self.deadline_events[i].set(self.config.io);
+        if (i < self.deadline_events.len) self.deadline_events[i].set();
     }
 
     fn wakeAllDeadlines(self: *Connection) void {
-        for (self.deadline_events) |*event| event.set(self.config.io);
+        for (self.deadline_events) |*event| event.set();
     }
 
     /// Write-ack-signaled writer failure: terminate connection, reset every stream,
@@ -3759,9 +3765,15 @@ const Connection = struct {
         self.publishTeardownWakes();
         _ = self.drainCompletions();
         self.finishPendingReceiptsNoWait();
-        self.enqueueTeardownReapers();
-        if (std.debug.runtime_safety) self.assertTeardownPosters();
-        self.waitTeardownCompletions();
+        // Ticket waiters select on `dead` / failAll and post with no
+        // Future.cancel. Wait for those first. Enroll only leftovers
+        // (uncooperative waits such as a cancel-swallowing sleep).
+        self.waitCooperativeTeardown();
+        if (self.countInUseSlots() != 0) {
+            self.enqueueTeardownReapers();
+            if (std.debug.runtime_safety) self.assertTeardownPosters();
+            self.waitTeardownCompletions();
+        }
     }
 
     fn publishTeardownWakes(self: *Connection) void {
@@ -3774,6 +3786,7 @@ const Connection = struct {
         self.tickets.failAll();
         self.wakeAllDeadlines();
         self.wakeAllSpace();
+        self.dead.set();
     }
 
     fn enqueueTeardownReapers(self: *Connection) void {
@@ -3810,7 +3823,16 @@ const Connection = struct {
         }
     }
 
-    fn waitTeardownCompletions(self: *Connection) void {
+    fn markedSidStillInUse(self: *Connection, sids: []const u31) bool {
+        for (sids) |sid| {
+            if (self.slotIndex(sid) != null) return true;
+        }
+        return false;
+    }
+
+    /// Wait until every snapshotted ticket holder has posted. `require_empty`
+    /// is the leftover wait after reaper enroll: every in-use slot.
+    fn waitTeardownLoop(self: *Connection, require_empty: bool, marked: []const u31) void {
         std.debug.assert(shutdown_sweep.get() != null);
         self.teardown_wait_expected = self.countInUseSlots();
         self.teardown_wait_released = 0;
@@ -3830,6 +3852,7 @@ const Connection = struct {
             }
             std.debug.assert(self.teardown_wait_released + after_drain == self.teardown_wait_expected);
             if (after_drain == 0) break;
+            if (!require_empty and !self.markedSidStillInUse(marked) and !self.tickets.anyWaiting()) break;
             std.debug.assert(self.teardown_wait_released < self.teardown_wait_expected);
             self.tickets.failAll();
             self.wakeAllSpace();
@@ -3847,7 +3870,24 @@ const Connection = struct {
             last_progress_ns = nowNs(self.config.io);
             std.debug.assert(self.teardown_wait_released + self.countInUseSlots() == self.teardown_wait_expected);
         }
-        std.debug.assert(self.countInUseSlots() == 0);
+        if (require_empty) std.debug.assert(self.countInUseSlots() == 0);
+    }
+
+    fn waitCooperativeTeardown(self: *Connection) void {
+        std.debug.assert(shutdown_sweep.get() != null);
+        var n: usize = 0;
+        for (self.handlers) |*slot| {
+            if (!slot.in_use) continue;
+            if (!slot.awaiting_receipt.load(.acquire)) continue;
+            std.debug.assert(n < self.sid_scratch.len);
+            self.sid_scratch[n] = slot.stream_id;
+            n += 1;
+        }
+        self.waitTeardownLoop(false, self.sid_scratch[0..n]);
+    }
+
+    fn waitTeardownCompletions(self: *Connection) void {
+        self.waitTeardownLoop(true, &.{});
     }
 
     fn takeTeardownCompletion(self: *Connection, wait_started_ns: u64, watchdog_ns: u64) u31 {
@@ -3982,7 +4022,16 @@ const Connection = struct {
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             self.unlockSession(self.config.io);
-            const wait_res: anyerror!void = if (event) |e| e.wait(self.config.io) else error.Canceled;
+            const wait_res: anyerror!void = if (event) |e| blk: {
+                const winner = zio.select(.{
+                    .space = e,
+                    .dead = &self.dead,
+                }) catch break :blk error.Canceled;
+                break :blk switch (winner) {
+                    .space => {},
+                    .dead => error.Canceled,
+                };
+            } else error.Canceled;
             self.lockSessionUncancelable(self.config.io);
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
@@ -5958,17 +6007,25 @@ const Connection = struct {
             if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             if (nowNs(io) >= deadline_ns) return;
-            event.waitTimeout(io, .{ .deadline = .{
-                .raw = deadline,
-                .clock = .awake,
-            } }) catch |err| switch (err) {
-                // The deadline itself; the contract's normal completion.
-                error.Timeout => return,
+            const remain = deadline_ns - nowNs(io);
+            const winner = zio.select(.{
+                .ev = event,
+                .dead = &self.dead,
+                .timer = zio.Timeout.fromNanoseconds(remain),
+            }) catch |err| switch (err) {
                 error.Canceled => {
                     if (hctx.terminal.getCause()) |c| return response.causeToError(c);
                     return error.Canceled;
                 },
             };
+            switch (winner) {
+                .ev => {},
+                .dead => {
+                    if (hctx.terminal.getCause()) |c| return response.causeToError(c);
+                    return error.Canceled;
+                },
+                .timer => return,
+            }
             // Early wake: loop, recheck cause, re-arm the remaining time.
         }
     }
@@ -6618,15 +6675,13 @@ fn trapAssertSweepClean(conn: *Connection) void {
         std.debug.panic("reaper-stuck leftover reaper_running={d}", .{running_n});
     }
     std.debug.assert(conn.countInUseSlots() == 0);
+    if (conn.reaper_queue_ok.load(.acquire) != 0) {
+        std.debug.panic("teardown used Future.cancel queue_ok={d}", .{conn.reaper_queue_ok.load(.acquire)});
+    }
 }
 
-/// One arm, two forbidden leftovers after `shutdownHandlers`:
-/// - r158: `owner_live != 0` (skip, never enrolled).
-/// - reaper-stuck: `reaper_running != 0` (enrolled, worker in `Future.cancel`).
-/// Holder parks inside `tickets.wait` (`Event.wait`). Ready signal is
-/// `TicketTable.isWaiting`: only `Event.wait` writes `.waiting`. Shield wraps
-/// that wait, so cancel cannot finish it; `failAll` / A2 `dead` still can,
-/// because a shield suppresses cancellation, not event delivery.
+/// A2 gate: a handler parked in `tickets.wait` returns with no Future.cancel.
+/// Ready signal is `TicketTable.isWaiting`. Handshake hang is t-1946, not armed.
 pub fn testTrapR158Parked(io: std.Io) void {
     const gpa = std.heap.page_allocator;
     var trap: TrapHop = undefined;
