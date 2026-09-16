@@ -1114,8 +1114,11 @@ const Connection = struct {
     /// Frozen complete-job count from the last owned turn. `runPendingInline`
     /// must not run these: it takes `session_mu`.
     teardown_inline_n: usize = 0,
-    /// `claimSlot` increments. `finishHandlerJob` increments `slots_finalized`.
-    slots_ever_in_use: usize = 0,
+    /// `claimSlot` increments. Rollback `releaseSlot` increments `slots_rolled_back`.
+    /// `finishHandlerJob` increments `slots_finalized`. deinit: claimed ==
+    /// finalized + rolled_back.
+    slots_claimed: usize = 0,
+    slots_rolled_back: usize = 0,
     slots_finalized: std.atomic.Value(usize) = .init(0),
     /// In-use slots at the teardown wait, and how many `releaseSlot` ran.
     teardown_wait_expected: usize = 0,
@@ -1488,10 +1491,14 @@ const Connection = struct {
         }
         for (self.handlers) |s| std.debug.assert(!s.in_use);
         if (std.debug.runtime_safety) {
-            const ever = self.slots_ever_in_use;
+            const claimed = self.slots_claimed;
             const finalized = self.slots_finalized.load(.acquire);
-            if (ever != finalized) {
-                std.debug.panic("slot finalize conservation: ever={d} finalized={d}", .{ ever, finalized });
+            const rolled = self.slots_rolled_back;
+            if (claimed != finalized + rolled) {
+                std.debug.panic(
+                    "slot conservation: claimed={d} finalized={d} rolled_back={d}",
+                    .{ claimed, finalized, rolled },
+                );
             }
             if (self.teardown_wait_expected != 0) {
                 if (self.teardown_wait_expected != self.teardown_wait_released) {
@@ -2748,6 +2755,12 @@ const Connection = struct {
         var write_handle: ?std.Io.Future(void) = null;
         var tls_started = false;
         var h2c_started = false;
+        var torn_down = false;
+        errdefer |err| if (!torn_down) {
+            torn_down = true;
+            self.teardownExhaustive();
+            if (err == error.Canceled) zio.recancel();
+        };
 
         defer {
             if (self.diag_registered) diagDeregister(self);
@@ -3046,15 +3059,22 @@ const Connection = struct {
             self.runPendingInline();
         }
 
+        self.teardownExhaustive();
+        torn_down = true;
+        if (close_probe) diagRawPrint("t1002 conn={x} shutdown_done parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
+    }
+
+    /// Finish every slot even if this task is canceled. Shield so a select
+    /// in the wait cannot return Canceled with live slots. Recancel after
+    /// the caller sees the original Canceled.
+    fn teardownExhaustive(self: *Connection) void {
+        zio.beginShield();
+        defer zio.endShield();
+        if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), self.sched.pendingCount(), close_probe_parked.load(.acquire) });
         self.finishTerminalInline(self.teardown_inline_n);
         self.teardown_inline_n = 0;
-
-        // shutdownHandlers returns only once every slot went through releaseSlot, so
-        // both counters have already been decremented for this connection. Storing 0
-        // here would clobber connections still serving on the same process.
-        if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} eof={} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), inbound_eof, self.sched.pendingCount(), close_probe_parked.load(.acquire) });
-        try self.shutdownHandlers();
-        if (close_probe) diagRawPrint("t1002 conn={x} shutdown_done parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
+        self.shutdownHandlers();
+        std.debug.assert(self.countInUseSlots() == 0);
     }
 
     fn receiveUntilDeadline(self: *Connection) !wire_pump.WireChunk {
@@ -3210,6 +3230,7 @@ const Connection = struct {
         std.debug.assert(i < self.handlers.len);
         std.debug.assert(stream_id != 0);
         slot.in_use = true;
+        self.slots_claimed += 1;
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
         slot.stream_id = stream_id;
         slot.terminal.clear();
@@ -3225,6 +3246,17 @@ const Connection = struct {
         std.debug.assert(!slot.admitted);
         std.debug.assert(slot.finalize_count.load(.acquire) == 0);
         return slot;
+    }
+
+    /// Production admission. Dispatch is the only caller besides the
+    /// double-finalize trap, which must use this rather than forging counters.
+    fn admitHandler(self: *Connection, slot: *HandlerSlot) void {
+        std.debug.assert(slot.in_use);
+        std.debug.assert(!slot.admitted);
+        slot.admitted = true;
+        _ = self.live_handlers.fetchAdd(1, .acq_rel);
+        if (comptime test_observe) _ = test_observed_live_handlers.fetchAdd(1, .acq_rel);
+        std.debug.assert(slot.admitted);
     }
 
     /// Lease a request-list allocator for `stream_id` before HPACK decode.
@@ -3290,18 +3322,19 @@ const Connection = struct {
         if (self.slotIndex(stream_id)) |i| {
             const slot = &self.handlers[i];
             std.debug.assert(slot.in_use);
-            if (std.debug.runtime_safety) {
-                const n = slot.finalize_count.load(.acquire);
-                if (slot.admitted) {
+            const n = slot.finalize_count.load(.acquire);
+            if (slot.admitted) {
+                if (std.debug.runtime_safety) {
                     if (n == 0) {
                         std.debug.panic("handler slot sid={d} released with no finalize", .{stream_id});
                     }
                     if (n != 1) {
                         std.debug.panic("handler slot sid={d} finalize_count={d} at release", .{ stream_id, n });
                     }
-                } else {
-                    std.debug.assert(n == 0);
                 }
+            } else {
+                std.debug.assert(n == 0);
+                self.slots_rolled_back += 1;
             }
             if (self.handler_joins[i]) |*handle| handle.await(self.config.io);
             self.handler_joins[i] = null;
@@ -3603,8 +3636,22 @@ const Connection = struct {
             if (s.completion_owner.load(.acquire) == live) owner_live += 1;
         }
         std.debug.assert(in_use != 0);
+        for (self.handlers, 0..) |s, i| {
+            if (!s.in_use) continue;
+            diagRawPrint(
+                "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d}\n",
+                .{
+                    s.stream_id,
+                    s.completion_owner.load(.acquire),
+                    @intFromBool(self.handler_joins[i] != null),
+                    @intFromBool(s.admitted),
+                    s.finalize_count.load(.acquire),
+                    @intFromBool(s.reaper_reserved),
+                },
+            );
+        }
         std.debug.panic(
-            "teardown wait exceeded 5s: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d}",
+            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d}",
             .{
                 self.live_handlers.load(.acquire),
                 in_use,
@@ -3625,7 +3672,7 @@ const Connection = struct {
     /// froze the inline queue. This path does not take `session_mu`. Wakes
     /// run before any wait: a handler in `waitForStreamSpace` cannot post
     /// until space is set.
-    fn shutdownHandlers(self: *Connection) !void {
+    fn shutdownHandlers(self: *Connection) void {
         var sweep_node: @TypeOf(shutdown_sweep).Node = .unset;
         shutdown_sweep.set(&sweep_node, {});
         defer shutdown_sweep.clear(&sweep_node);
@@ -3651,7 +3698,7 @@ const Connection = struct {
         self.finishPendingReceiptsNoWait();
         self.enqueueTeardownReapers();
         if (std.debug.runtime_safety) self.assertTeardownPosters();
-        try self.waitTeardownCompletions();
+        self.waitTeardownCompletions();
     }
 
     fn publishTeardownWakes(self: *Connection) void {
@@ -3693,19 +3740,22 @@ const Connection = struct {
         }
     }
 
-    fn waitTeardownCompletions(self: *Connection) !void {
+    fn waitTeardownCompletions(self: *Connection) void {
         std.debug.assert(shutdown_sweep.get() != null);
         self.teardown_wait_expected = self.countInUseSlots();
         self.teardown_wait_released = 0;
         std.debug.assert(self.teardown_wait_expected <= self.handlers.len);
-        const wait_started_ns = nowNs(self.config.io);
-        const watchdog_ns: u64 = 5 * std.time.ns_per_s;
+        const no_progress_ns: u64 = 5 * std.time.ns_per_s;
+        var last_progress_ns = nowNs(self.config.io);
         var waits: usize = 0;
         while (true) {
             const before = self.countInUseSlots();
             self.drainCompletions();
             const after_drain = self.countInUseSlots();
-            if (after_drain < before) self.teardown_wait_released += before - after_drain;
+            if (after_drain < before) {
+                self.teardown_wait_released += before - after_drain;
+                last_progress_ns = nowNs(self.config.io);
+            }
             if (after_drain == 0) break;
             std.debug.assert(self.teardown_wait_released < self.teardown_wait_expected);
             self.tickets.failAll();
@@ -3716,14 +3766,15 @@ const Connection = struct {
             }
             waits += 1;
             std.debug.assert(waits <= self.handlers.len);
-            const sid = try self.takeTeardownCompletion(wait_started_ns, watchdog_ns);
+            const sid = self.takeTeardownCompletion(last_progress_ns, no_progress_ns);
             self.releaseSlot(sid);
             self.teardown_wait_released += 1;
+            last_progress_ns = nowNs(self.config.io);
         }
         std.debug.assert(self.countInUseSlots() == 0);
     }
 
-    fn takeTeardownCompletion(self: *Connection, wait_started_ns: u64, watchdog_ns: u64) !u31 {
+    fn takeTeardownCompletion(self: *Connection, wait_started_ns: u64, watchdog_ns: u64) u31 {
         std.debug.assert(watchdog_ns != 0);
         const elapsed = nowNs(self.config.io) -% wait_started_ns;
         if (elapsed >= watchdog_ns) self.panicTeardownWatchdog();
@@ -3731,7 +3782,7 @@ const Connection = struct {
             .comp = self.completion_ch.asyncReceive(),
             .timer = zio.Timeout.fromNanoseconds(watchdog_ns - elapsed),
         }) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
+            error.Canceled => std.debug.panic("teardown select canceled under shield", .{}),
         };
         return switch (winner) {
             .comp => |r| r catch |err| switch (err) {
@@ -4932,12 +4983,7 @@ const Connection = struct {
         job.hctx.slot = slot;
         job.resp.ctx = &job.hctx;
 
-        std.debug.assert(slot.in_use);
-        std.debug.assert(!slot.admitted);
-        slot.admitted = true;
-        self.slots_ever_in_use += 1;
-        _ = self.live_handlers.fetchAdd(1, .acq_rel);
-        if (comptime test_observe) _ = test_observed_live_handlers.fetchAdd(1, .acq_rel);
+        self.admitHandler(slot);
         if (trace.enabled) {
             const n = trace.jobs.fetchAdd(1, .monotonic);
             if (n % trace.sample_every == 0) {
@@ -5295,9 +5341,7 @@ const Connection = struct {
     }
 
     fn withSession(self: *Connection, comptime f: anytype, arg: anytype) void {
-        assertNotInShutdownSweep();
-        self.session_mu.lock(self.config.io) catch return;
-        self.session_held = true;
+        self.lockSession() catch return;
         defer self.unlockSession(self.config.io);
         f(self, arg);
     }
@@ -6311,10 +6355,16 @@ fn openTrapHop(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io) !void {
     };
 }
 
-/// Axis E arm: two `finishHandlerJob` calls on one admitted slot. Must panic
-/// inside `recordFinalize` via the production finalizer, not the helper.
+/// Axis E arm: two `finishHandlerJob` calls on one slot admitted through
+/// `admitHandler`. Body is DebugAllocator-owned so a finalize after free
+/// is a double-free, not a silent second panic on a helper.
 pub fn testTrapDoubleFinalize(io: std.Io) void {
-    const gpa = std.heap.page_allocator;
+    var dbg = std.heap.DebugAllocator(.{
+        .never_unmap = true,
+        .retain_metadata = true,
+        .safety = true,
+    }).init;
+    const gpa = dbg.allocator();
     var trap: TrapHop = undefined;
     openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
     defer trap.close();
@@ -6324,6 +6374,7 @@ pub fn testTrapDoubleFinalize(io: std.Io) void {
     job.conn = &trap.hop.conn;
     job.stream_id = 1;
     job.slot = slot;
+    const body = gpa.dupe(u8, "trap-body") catch std.debug.panic("trap body dupe failed", .{});
     job.owned_request = .{
         .stream_id = 1,
         .method = "GET",
@@ -6332,19 +6383,16 @@ pub fn testTrapDoubleFinalize(io: std.Io) void {
         .path = "/",
         .query = "",
         .headers = &.{},
-        .body = &.{},
+        .body = body,
         .trailers = &.{},
     };
     job.hctx.encoder = null;
-    slot.admitted = true;
-    trap.hop.conn.slots_ever_in_use += 1;
-    _ = trap.hop.conn.live_handlers.fetchAdd(1, .acq_rel);
+    trap.hop.conn.admitHandler(slot);
     Connection.finishHandlerJob(job);
     Connection.finishHandlerJob(job);
 }
 
-/// Axis B arm: bind the sweep TaskLocal, then the real lock wrapper.
-/// Must run on a zio task (`TaskLocal.set` panics outside one).
+/// Axis B arm: bind the sweep TaskLocal, then `lockSessionUncancelable`.
 pub fn testTrapLockDuringShutdownSweep(io: std.Io) void {
     const gpa = std.heap.page_allocator;
     var trap: TrapHop = undefined;
@@ -6354,6 +6402,18 @@ pub fn testTrapLockDuringShutdownSweep(io: std.Io) void {
     shutdown_sweep.set(&node, {});
     defer shutdown_sweep.clear(&node);
     trap.hop.conn.lockSessionUncancelable(trap.hop.conn.config.io);
+}
+
+/// Axis B arm: bind the sweep TaskLocal, then `lockSession`.
+pub fn testTrapLockSessionDuringShutdownSweep(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    defer trap.close();
+    var node: @TypeOf(shutdown_sweep).Node = .unset;
+    shutdown_sweep.set(&node, {});
+    defer shutdown_sweep.clear(&node);
+    _ = trap.hop.conn.lockSession() catch unreachable;
 }
 
 /// Axis A arm: `wakeHandlerWaiters` with `session_mu` not held.

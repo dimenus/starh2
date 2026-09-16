@@ -443,12 +443,17 @@ pub fn build(b: *std.Build) void {
     run_sweep_lock_trap.addArg("sweep-lock");
     run_sweep_lock_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
     run_sweep_lock_trap.has_side_effects = true;
+    const run_sweep_lock_session_trap = b.addRunArtifact(teardown_traps);
+    run_sweep_lock_session_trap.addArg("sweep-lock-session");
+    run_sweep_lock_session_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
+    run_sweep_lock_session_trap.has_side_effects = true;
     const run_unlocked_sweep_trap = b.addRunArtifact(teardown_traps);
     run_unlocked_sweep_trap.addArg("unlocked-sweep");
     run_unlocked_sweep_trap.addCheck(.{ .expect_stderr_match = "session_mu not held at wakeHandlerWaiters" });
     run_unlocked_sweep_trap.has_side_effects = true;
     lifecycle_step.dependOn(&run_double_finalize_trap.step);
     lifecycle_step.dependOn(&run_sweep_lock_trap.step);
+    lifecycle_step.dependOn(&run_sweep_lock_session_trap.step);
     lifecycle_step.dependOn(&run_unlocked_sweep_trap.step);
 
     const backend_parity_tests = b.addTest(.{
