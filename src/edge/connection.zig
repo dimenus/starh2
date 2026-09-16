@@ -764,8 +764,12 @@ pub const HandlerSlot = struct {
     /// closed in the ack's wake-to-run gap (t-537).
     awaiting_receipt: std.atomic.Value(bool) = .init(false),
     /// Incremented as the first act of every `finishHandlerJob`. Exactly 1 at
-    /// `releaseSlot`. Not an idempotency flag: a second increment panics.
+    /// `releaseSlot` for an admitted job. Not an idempotency flag: a second
+    /// increment panics.
     finalize_count: std.atomic.Value(u8) = .init(0),
+    /// Set when `live_handlers` is incremented. `errdefer releaseSlot` before
+    /// that point is rollback, not a missing finalize.
+    admitted: bool = false,
 };
 
 const HandlerCtx = struct {
@@ -3206,18 +3210,19 @@ const Connection = struct {
         std.debug.assert(i < self.handlers.len);
         std.debug.assert(stream_id != 0);
         slot.in_use = true;
-        self.slots_ever_in_use += 1;
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
         slot.stream_id = stream_id;
         slot.terminal.clear();
         _ = slot.terminal.generation.fetchAdd(1, .acq_rel);
         slot.completion_owner.store(live, .release);
         slot.finalize_count.store(0, .release);
+        slot.admitted = false;
         slot.reaper_reserved = false;
         self.handler_joins[i] = null;
         if (i < self.space_events.len) self.space_events[i].reset();
         if (i < self.deadline_events.len) self.deadline_events[i].reset();
         std.debug.assert(slot.in_use);
+        std.debug.assert(!slot.admitted);
         std.debug.assert(slot.finalize_count.load(.acquire) == 0);
         return slot;
     }
@@ -3287,11 +3292,15 @@ const Connection = struct {
             std.debug.assert(slot.in_use);
             if (std.debug.runtime_safety) {
                 const n = slot.finalize_count.load(.acquire);
-                if (n == 0) {
-                    std.debug.panic("handler slot sid={d} released with no finalize", .{stream_id});
-                }
-                if (n != 1) {
-                    std.debug.panic("handler slot sid={d} finalize_count={d} at release", .{ stream_id, n });
+                if (slot.admitted) {
+                    if (n == 0) {
+                        std.debug.panic("handler slot sid={d} released with no finalize", .{stream_id});
+                    }
+                    if (n != 1) {
+                        std.debug.panic("handler slot sid={d} finalize_count={d} at release", .{ stream_id, n });
+                    }
+                } else {
+                    std.debug.assert(n == 0);
                 }
             }
             if (self.handler_joins[i]) |*handle| handle.await(self.config.io);
@@ -3301,6 +3310,7 @@ const Connection = struct {
                 slot.reaper_reserved = false;
             }
             slot.in_use = false;
+            slot.admitted = false;
             if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
             slot.terminal.clear();
             slot.completion_owner.store(reported, .release);
@@ -3674,7 +3684,10 @@ const Connection = struct {
                     self.handler_joins[i] = null;
                     self.enqueueReaperOrFail(slot, handle, slot.stream_id);
                 } else {
-                    self.handler_joins[i] = null;
+                    std.debug.assert(prev == @as(?u8, reported));
+                    // Keep the join. The handler has posted, but finishHandlerJob
+                    // still resets the arena and frees the request body. releaseSlot
+                    // awaits this handle so deinit cannot race that cleanup.
                 }
             }
         }
@@ -3712,12 +3725,6 @@ const Connection = struct {
 
     fn takeTeardownCompletion(self: *Connection, wait_started_ns: u64, watchdog_ns: u64) !u31 {
         std.debug.assert(watchdog_ns != 0);
-        if (!std.debug.runtime_safety) {
-            return self.completion_ch.receive() catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                error.Closed => return error.Canceled,
-            };
-        }
         const elapsed = nowNs(self.config.io) -% wait_started_ns;
         if (elapsed >= watchdog_ns) self.panicTeardownWatchdog();
         const winner = zio.select(.{
@@ -4925,6 +4932,10 @@ const Connection = struct {
         job.hctx.slot = slot;
         job.resp.ctx = &job.hctx;
 
+        std.debug.assert(slot.in_use);
+        std.debug.assert(!slot.admitted);
+        slot.admitted = true;
+        self.slots_ever_in_use += 1;
         _ = self.live_handlers.fetchAdd(1, .acq_rel);
         if (comptime test_observe) _ = test_observed_live_handlers.fetchAdd(1, .acq_rel);
         if (trace.enabled) {
@@ -4999,6 +5010,7 @@ const Connection = struct {
     fn finishHandlerJob(job: *HandlerJob) void {
         const self = job.conn;
         std.debug.assert(job.slot.in_use);
+        std.debug.assert(job.slot.admitted);
         std.debug.assert(job.stream_id == job.slot.stream_id);
         recordFinalize(job.slot);
         _ = self.slots_finalized.fetchAdd(1, .acq_rel);
@@ -6253,19 +6265,103 @@ test "recordFinalize first call stores 1" {
     try std.testing.expectEqual(@as(u8, 1), slot.finalize_count.load(.acquire));
 }
 
-/// Trap arm for Axis E. Two calls must panic. Runs on any thread.
-pub fn testTrapDoubleFinalize() void {
-    var slot: HandlerSlot = .{};
-    slot.in_use = true;
-    Connection.recordFinalize(&slot);
-    Connection.recordFinalize(&slot);
+const TrapHop = struct {
+    hop: BenchHop,
+    peer: std.Io.net.Stream,
+    slabs: slab_pool.SlabPool,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+
+    fn close(self: *TrapHop) void {
+        self.hop.deinit();
+        self.peer.close(self.io);
+        self.slabs.deinit(self.gpa);
+    }
+};
+
+fn openTrapHop(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io) !void {
+    out.gpa = gpa;
+    out.io = io;
+    out.slabs = try slab_pool.SlabPool.init(gpa, io, limits_mod.Limits.defaults.outbound_bytes_per_stream, 8);
+    errdefer out.slabs.deinit(gpa);
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try bind.listen(io, .{ .reuse_address = true });
+    const dest = listener.socket.address;
+    const peer = dest.connect(io, .{ .mode = .stream }) catch |err| {
+        listener.socket.close(io);
+        return err;
+    };
+    const accepted = listener.accept(io) catch |err| {
+        peer.close(io);
+        listener.socket.close(io);
+        return err;
+    };
+    listener.socket.close(io);
+    out.peer = peer;
+    out.hop.open(accepted, .{
+        .io = io,
+        .mode = .h2c,
+        .limits = limits_mod.Limits.defaults,
+        .router = .{ .routes = &.{} },
+        .gpa = gpa,
+        .slab_pool = &out.slabs,
+    }) catch |err| {
+        peer.close(io);
+        return err;
+    };
 }
 
-/// Trap arm for Axis B. Must run on a zio task: `TaskLocal.set` panics
-/// outside one (`getCurrentTask`).
-pub fn testTrapLockDuringShutdownSweep() void {
+/// Axis E arm: two `finishHandlerJob` calls on one admitted slot. Must panic
+/// inside `recordFinalize` via the production finalizer, not the helper.
+pub fn testTrapDoubleFinalize(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    defer trap.close();
+    const slot = trap.hop.conn.allocSlot(1) orelse std.debug.panic("trap allocSlot failed", .{});
+    const i = trap.hop.conn.slotIndex(1) orelse std.debug.panic("trap slotIndex failed", .{});
+    const job = &trap.hop.conn.handler_jobs[i];
+    job.conn = &trap.hop.conn;
+    job.stream_id = 1;
+    job.slot = slot;
+    job.owned_request = .{
+        .stream_id = 1,
+        .method = "GET",
+        .scheme = "http",
+        .authority = "",
+        .path = "/",
+        .query = "",
+        .headers = &.{},
+        .body = &.{},
+        .trailers = &.{},
+    };
+    job.hctx.encoder = null;
+    slot.admitted = true;
+    trap.hop.conn.slots_ever_in_use += 1;
+    _ = trap.hop.conn.live_handlers.fetchAdd(1, .acq_rel);
+    Connection.finishHandlerJob(job);
+    Connection.finishHandlerJob(job);
+}
+
+/// Axis B arm: bind the sweep TaskLocal, then the real lock wrapper.
+/// Must run on a zio task (`TaskLocal.set` panics outside one).
+pub fn testTrapLockDuringShutdownSweep(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    defer trap.close();
     var node: @TypeOf(shutdown_sweep).Node = .unset;
     shutdown_sweep.set(&node, {});
     defer shutdown_sweep.clear(&node);
-    Connection.assertNotInShutdownSweep();
+    trap.hop.conn.lockSessionUncancelable(trap.hop.conn.config.io);
+}
+
+/// Axis A arm: `wakeHandlerWaiters` with `session_mu` not held.
+pub fn testTrapUnlockedWakeHandlerWaiters(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    defer trap.close();
+    std.debug.assert(!trap.hop.conn.session_held);
+    trap.hop.conn.wakeHandlerWaiters(1);
 }

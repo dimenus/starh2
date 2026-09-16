@@ -554,6 +554,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
             if (starh2.edge.connection.test_waiting_for_space.load(.acquire) != 0) break;
             zio.sleep(.fromMilliseconds(5)) catch {};
         }
+        try std.testing.expect(starh2.edge.connection.test_waiting_for_space.load(.acquire) != 0);
         // Fail the next transport write while the handler is mid-send.
         starh2.edge.wire_pump.test_fail_next_write.store(true, .release);
         var boost: std.ArrayList(u8) = .empty;

@@ -8,17 +8,23 @@ pub fn main(init: std.process.Init.Minimal) void {
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.next();
     const which = it.next() orelse {
-        std.debug.print("usage: teardown-traps double-finalize | sweep-lock\n", .{});
+        std.debug.print("usage: teardown-traps double-finalize | sweep-lock | unlocked-sweep\n", .{});
         std.process.exit(2);
     };
+    const gpa = std.heap.page_allocator;
+    const rt = zio.Runtime.init(gpa, .{}) catch std.process.exit(3);
     if (std.mem.eql(u8, which, "double-finalize")) {
-        starh2.edge.connection.testTrapDoubleFinalize();
+        var handle = rt.spawn(starh2.edge.connection.testTrapDoubleFinalize, .{rt.io()}) catch std.process.exit(3);
+        handle.join();
         std.process.exit(0);
     }
     if (std.mem.eql(u8, which, "sweep-lock")) {
-        const gpa = std.heap.page_allocator;
-        const rt = zio.Runtime.init(gpa, .{}) catch std.process.exit(3);
-        var handle = rt.spawn(starh2.edge.connection.testTrapLockDuringShutdownSweep, .{}) catch std.process.exit(3);
+        var handle = rt.spawn(starh2.edge.connection.testTrapLockDuringShutdownSweep, .{rt.io()}) catch std.process.exit(3);
+        handle.join();
+        std.process.exit(0);
+    }
+    if (std.mem.eql(u8, which, "unlocked-sweep")) {
+        var handle = rt.spawn(starh2.edge.connection.testTrapUnlockedWakeHandlerWaiters, .{rt.io()}) catch std.process.exit(3);
         handle.join();
         std.process.exit(0);
     }

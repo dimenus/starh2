@@ -443,8 +443,13 @@ pub fn build(b: *std.Build) void {
     run_sweep_lock_trap.addArg("sweep-lock");
     run_sweep_lock_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
     run_sweep_lock_trap.has_side_effects = true;
+    const run_unlocked_sweep_trap = b.addRunArtifact(teardown_traps);
+    run_unlocked_sweep_trap.addArg("unlocked-sweep");
+    run_unlocked_sweep_trap.addCheck(.{ .expect_stderr_match = "session_mu not held at wakeHandlerWaiters" });
+    run_unlocked_sweep_trap.has_side_effects = true;
     lifecycle_step.dependOn(&run_double_finalize_trap.step);
     lifecycle_step.dependOn(&run_sweep_lock_trap.step);
+    lifecycle_step.dependOn(&run_unlocked_sweep_trap.step);
 
     const backend_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -527,7 +532,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_multiplex_tests.step);
     test_step.dependOn(&run_interop_tests.step);
     test_step.dependOn(&run_regression_tests.step);
-    test_step.dependOn(&run_lifecycle_tests.step);
+    test_step.dependOn(lifecycle_step);
     test_step.dependOn(&run_backend_parity_tests.step);
     test_step.dependOn(&run_live_exact_tests.step);
     test_step.dependOn(&run_writer_tests.step);
