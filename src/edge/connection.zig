@@ -1438,7 +1438,10 @@ const Connection = struct {
     fn deinit(self: *Connection) void {
         const io = self.config.io;
         // Must not free while handlers still live.
-        std.debug.assert(self.live_handlers.load(.acquire) == 0);
+        const live_n = self.live_handlers.load(.acquire);
+        if (std.debug.runtime_safety and live_n != 0) {
+            std.debug.panic("deinit with live_handlers={d}", .{live_n});
+        }
         std.debug.assert(self.live_task_handlers.load(.acquire) == 0);
         if (self.handshake_held) {
             if (self.config.accounting) |a| a.releaseHandshake();
@@ -1489,7 +1492,6 @@ const Connection = struct {
         while (io_queue.tryRecv(u31, &self.completion_ch)) |sid| {
             self.releaseSlot(sid);
         }
-        for (self.handlers) |s| std.debug.assert(!s.in_use);
         if (std.debug.runtime_safety) {
             const claimed = self.slots_claimed;
             const finalized = self.slots_finalized.load(.acquire);
@@ -1507,6 +1509,11 @@ const Connection = struct {
                         .{ self.teardown_wait_expected, self.teardown_wait_released },
                     );
                 }
+            }
+        }
+        for (self.handlers) |s| {
+            if (s.in_use) {
+                std.debug.panic("deinit with slot sid={d} still in_use", .{s.stream_id});
             }
         }
         self.assertWriteAcksDrained();
@@ -6424,4 +6431,117 @@ pub fn testTrapUnlockedWakeHandlerWaiters(io: std.Io) void {
     defer trap.close();
     std.debug.assert(!trap.hop.conn.session_held);
     trap.hop.conn.wakeHandlerWaiters(1);
+}
+
+fn trapAdmitJob(conn: *Connection, sid: u31) *HandlerJob {
+    const slot = conn.allocSlot(sid) orelse std.debug.panic("trap allocSlot failed", .{});
+    std.debug.assert(slot.in_use);
+    std.debug.assert(!slot.admitted);
+    const i = conn.slotIndex(sid) orelse std.debug.panic("trap slotIndex failed", .{});
+    const job = &conn.handler_jobs[i];
+    job.conn = conn;
+    job.stream_id = sid;
+    job.slot = slot;
+    job.owned_request = .{
+        .stream_id = sid,
+        .method = "GET",
+        .scheme = "http",
+        .authority = "",
+        .path = "/",
+        .query = "",
+        .headers = &.{},
+        .body = &.{},
+        .trailers = &.{},
+    };
+    job.hctx = .{
+        .conn = conn,
+        .terminal = &slot.terminal,
+        .slot = slot,
+        .stream_id = sid,
+    };
+    conn.admitHandler(slot);
+    std.debug.assert(slot.admitted);
+    return job;
+}
+
+/// Axis D arm: one admitted slot never posts. `waitTeardownCompletions` is
+/// the production wait; `shutdownHandlers` would hit `assertTeardownPosters`
+/// first on a join-null slot and would not arm the watchdog.
+pub fn testTrapWatchdogNoProgress(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    const slot = trap.hop.conn.allocSlot(1) orelse std.debug.panic("trap allocSlot failed", .{});
+    trap.hop.conn.admitHandler(slot);
+    std.debug.assert(slot.in_use);
+    std.debug.assert(trap.hop.conn.live_handlers.load(.acquire) == 1);
+    var node: @TypeOf(shutdown_sweep).Node = .unset;
+    shutdown_sweep.set(&node, {});
+    defer shutdown_sweep.clear(&node);
+    std.debug.assert(shutdown_sweep.get() != null);
+    trap.hop.conn.waitTeardownCompletions();
+    std.debug.panic("watchdog did not fire", .{});
+}
+
+fn trapWatchdogHealthyPoster(jobs: [3]*HandlerJob) void {
+    std.debug.assert(jobs.len == 3);
+    for (jobs) |job| {
+        std.debug.assert(job.slot.in_use);
+        std.debug.assert(job.slot.admitted);
+        zio.sleep(.fromSeconds(3)) catch std.debug.panic("watchdog healthy poster sleep canceled", .{});
+        Connection.finishHandlerJob(job);
+    }
+}
+
+/// Axis D arm: three completions 3s apart. Total past the old 5s deadline;
+/// each gap under the 5s no-progress clock. Teardown must return.
+pub fn testTrapWatchdogHealthyProgress(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    defer trap.close();
+    const sids = [_]u31{ 1, 3, 5 };
+    var jobs: [3]*HandlerJob = undefined;
+    for (sids, 0..) |sid, i| {
+        jobs[i] = trapAdmitJob(&trap.hop.conn, sid);
+    }
+    std.debug.assert(trap.hop.conn.live_handlers.load(.acquire) == 3);
+    var poster = zio.spawn(trapWatchdogHealthyPoster, .{jobs}) catch std.debug.panic("trap poster spawn failed", .{});
+    var node: @TypeOf(shutdown_sweep).Node = .unset;
+    shutdown_sweep.set(&node, {});
+    defer shutdown_sweep.clear(&node);
+    const t0 = nowNs(io);
+    trap.hop.conn.waitTeardownCompletions();
+    const elapsed = nowNs(io) -% t0;
+    std.debug.assert(elapsed > 5 * std.time.ns_per_s);
+    _ = poster.join();
+    std.debug.assert(trap.hop.conn.countInUseSlots() == 0);
+    std.debug.print("teardown no-progress healthy elapsed_ns={d}\n", .{elapsed});
+}
+
+/// Axis E/F arm: `claimSlot` with no admit and no rollback. deinit must
+/// panic conservation, not a generic `in_use` assert.
+pub fn testTrapConservation(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    _ = trap.hop.conn.allocSlot(1) orelse std.debug.panic("trap allocSlot failed", .{});
+    std.debug.assert(trap.hop.conn.slots_claimed == 1);
+    std.debug.assert(trap.hop.conn.slots_finalized.load(.acquire) == 0);
+    std.debug.assert(trap.hop.conn.slots_rolled_back == 0);
+    std.debug.assert(trap.hop.conn.live_handlers.load(.acquire) == 0);
+    trap.hop.conn.deinit();
+    std.debug.panic("conservation did not fire", .{});
+}
+
+/// Axis F arm: admitted slot still live at deinit.
+pub fn testTrapDeinitLive(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    const slot = trap.hop.conn.allocSlot(1) orelse std.debug.panic("trap allocSlot failed", .{});
+    trap.hop.conn.admitHandler(slot);
+    std.debug.assert(trap.hop.conn.live_handlers.load(.acquire) == 1);
+    trap.hop.conn.deinit();
+    std.debug.panic("deinit live_handlers did not fire", .{});
 }
