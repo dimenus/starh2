@@ -3955,8 +3955,9 @@ const Connection = struct {
             // actor's drain, so parking here would never return. A body that
             // does not fit in the stream slab belongs on a task handler.
             if (self.running_inline) return error.WriteFailed;
-            // Prove sparse/dense capacity wait for live gates (HandlerSlot-indexed sem).
-            test_waiting_for_space.store(@as(u32, stream_id), .release);
+            // Prove sparse/dense capacity wait for live gates. Debug (and
+            // -Dobserve=true) only: same gate as the other hot test hooks.
+            if (comptime test_observe) test_waiting_for_space.store(@as(u32, stream_id), .release);
             // Explicit lock ownership: unlock for wait, always reacquire uncancelable
             // before any return so caller defer unlock stays balanced.
             const event = if (self.spaceIndex(stream_id)) |i| &self.space_events[i] else null;
@@ -6535,6 +6536,34 @@ pub fn testTrapWatchdogNoProgress(io: std.Io) void {
     std.debug.assert(shutdown_sweep.get() != null);
     trap.hop.conn.waitTeardownCompletions();
     std.debug.panic("watchdog did not fire", .{});
+}
+
+fn trapParkForever() void {
+    while (true) {
+        zio.sleep(.fromSeconds(30)) catch {};
+    }
+}
+
+/// Axis D arm: a reaper-owned slot whose worker never posts. Goes through
+/// `shutdownHandlers` so `assertTeardownPosters` accepts the owner. The live
+/// stall arm cannot take that path: join-null plus owner=live panics first.
+pub fn testTrapWatchdogReaperNoPost(io: std.Io) void {
+    const gpa = std.heap.page_allocator;
+    var trap: TrapHop = undefined;
+    openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
+    var pool = ReaperPool.init(gpa, io, 1) catch std.debug.panic("trap reaper pool failed", .{});
+    trap.hop.conn.reaper = &pool;
+    const slot = trap.hop.conn.allocSlot(1) orelse std.debug.panic("trap allocSlot failed", .{});
+    trap.hop.conn.admitHandler(slot);
+    slot.reaper_reserved = true;
+    const i = trap.hop.conn.slotIndex(1) orelse std.debug.panic("trap slotIndex failed", .{});
+    std.debug.assert(trap.hop.conn.handler_joins[i] == null);
+    const handle = io.concurrent(trapParkForever, .{}) catch std.debug.panic("trap park spawn failed", .{});
+    trap.hop.conn.handler_joins[i] = handle;
+    std.debug.assert(slot.completion_owner.load(.acquire) == live);
+    std.debug.assert(trap.hop.conn.live_handlers.load(.acquire) == 1);
+    trap.hop.conn.shutdownHandlers();
+    std.debug.panic("reaper watchdog did not fire", .{});
 }
 
 fn trapWatchdogHealthyPoster(jobs: [3]*HandlerJob) void {

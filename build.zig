@@ -461,6 +461,11 @@ pub fn build(b: *std.Build) void {
     run_watchdog_healthy_trap.addCheck(.{ .expect_stderr_match = "teardown no-progress healthy" });
     run_watchdog_healthy_trap.expectExitCode(0);
     run_watchdog_healthy_trap.has_side_effects = true;
+    const run_watchdog_reaper_trap = b.addRunArtifact(teardown_traps);
+    run_watchdog_reaper_trap.addArg("watchdog-reaper");
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "teardown wait exceeded 5s no progress: live_handlers=1 slots=1 reaper=1 owner_live=0 expected=1 released=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "teardown stall sid=1 owner=1" });
+    run_watchdog_reaper_trap.has_side_effects = true;
     const run_conservation_trap = b.addRunArtifact(teardown_traps);
     run_conservation_trap.addArg("conservation");
     run_conservation_trap.addCheck(.{ .expect_stderr_match = "slot conservation: claimed=1 finalized=0 rolled_back=0" });
@@ -484,6 +489,7 @@ pub fn build(b: *std.Build) void {
     lifecycle_step.dependOn(&run_unlocked_sweep_trap.step);
     lifecycle_step.dependOn(&run_watchdog_stall_trap.step);
     lifecycle_step.dependOn(&run_watchdog_healthy_trap.step);
+    lifecycle_step.dependOn(&run_watchdog_reaper_trap.step);
     lifecycle_step.dependOn(&run_conservation_trap.step);
     lifecycle_step.dependOn(&run_deinit_live_trap.step);
     lifecycle_step.dependOn(&run_stale_sid_trap.step);
