@@ -179,10 +179,7 @@ pub var test_deadline_waits: std.atomic.Value(usize) = .init(0);
 /// Test-only: Connection finished boot allocations (pools, sched slabs, session maps).
 pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
 
-/// Test-only: wrap `tickets.wait` in a zio shield so `Future.cancel` cannot
-/// finish the holder. The holder must already be inside that wait; sequence
-/// on `TicketTable.isWaiting`, not on a barrier event before it.
-pub var test_shield_ticket_wait: bool = false;
+
 
 /// Per-task binding: the current task is inside `shutdownHandlers`.
 ///
@@ -2099,8 +2096,6 @@ const Connection = struct {
     }
 
     fn waitTicket(self: *Connection, stream_id: u31, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
-        if (test_shield_ticket_wait) zio.beginShield();
-        defer if (test_shield_ticket_wait) zio.endShield();
         self.tickets.wait(slot_i, terminal) catch |err| {
             if (terminal.getCause()) |c| return response.causeToError(c);
             self.lockSessionUncancelable(self.config.io);
@@ -6637,8 +6632,6 @@ pub fn testTrapR158Parked(io: std.Io) void {
     var trap: TrapHop = undefined;
     openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
     defer trap.close();
-    test_shield_ticket_wait = true;
-    defer test_shield_ticket_wait = false;
     trap_r158_ticket_slot.store(ticket_table.no_completion_slot, .release);
     var pool = ReaperPool.init(gpa, io, 1) catch std.debug.panic("trap reaper pool failed", .{});
     trap.hop.conn.reaper = &pool;
