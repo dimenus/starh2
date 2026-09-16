@@ -923,8 +923,10 @@ pub const ReaperPool = struct {
     /// The worker's order is fixed and load-bearing:
     ///
     /// 1. Mark `reaper_running` so a stall dump can tell queued from cancel.
-    /// 2. `cancel` — waits until the handler task has really stopped. Only then
-    ///    is the handler's arena unused and its slot safe to reuse.
+    /// 2. `std.Io.Future.cancel` requests cancel, then waits until the task
+    ///    actually stops (`zio` `awaitOrCancel`). A handler in an uncancelable
+    ///    wait (lockUncancelable, or Futex's no_cancel handshake after a
+    ///    racing wake) never returns, so this worker never posts.
     /// 3. `swap(reported)` — claim the right to report. If the previous value
     ///    is not `reaper_running`, the handler already reported; stay silent.
     /// 4. post the completion. The actor selects on the channel, so the post
@@ -3688,7 +3690,7 @@ const Connection = struct {
         for (self.handlers, 0..) |s, i| {
             if (!s.in_use) continue;
             diagRawPrint(
-                "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d}\n",
+                "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d} receipt={d} session_held={d}\n",
                 .{
                     s.stream_id,
                     s.completion_owner.load(.acquire),
@@ -3696,11 +3698,13 @@ const Connection = struct {
                     @intFromBool(s.admitted),
                     s.finalize_count.load(.acquire),
                     @intFromBool(s.reaper_reserved),
+                    @intFromBool(s.awaiting_receipt.load(.acquire)),
+                    @intFromBool(self.session_held),
                 },
             );
         }
         std.debug.panic(
-            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d}",
+            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d} session_held={d}",
             .{
                 self.live_handlers.load(.acquire),
                 in_use,
@@ -3712,6 +3716,7 @@ const Connection = struct {
                 reaper_run,
                 self.reaper_queue_ok.load(.acquire),
                 self.reaper_post_ok.load(.acquire),
+                @intFromBool(self.session_held),
             },
         );
     }
@@ -3771,10 +3776,12 @@ const Connection = struct {
         std.debug.assert(self.handlers.len == self.handler_joins.len);
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) continue;
-            // t-537's awaiting_receipt skip is for a live connection (RST
-            // while an ack is in flight). After the actor loop has exited
-            // nothing else will emit; cancel so a handler in zio.sleep or
-            // an unacked wait still posts a completion.
+            // Same skip as `cancelHandler`. `sendCb` parks on `waitTicket`
+            // with `awaiting_receipt` set and forbids cancel: `failAll` and
+            // the write-ack path are the guaranteed wake. `Future.cancel`
+            // waits until the task stops; canceling that wait is how a
+            // worker sits in `reaper_running` and never posts.
+            if (slot.awaiting_receipt.load(.acquire)) continue;
             if (self.handler_joins[i]) |handle| {
                 const prev = slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
                 if (prev == null) {
