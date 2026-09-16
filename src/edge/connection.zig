@@ -3539,7 +3539,7 @@ const Connection = struct {
         }
     }
 
-    fn panicTeardownWatchdog(self: *const Connection) void {
+    fn panicTeardownWatchdog(self: *const Connection) noreturn {
         var in_use: usize = 0;
         var reaper_n: usize = 0;
         var owner_live: usize = 0;
@@ -3641,10 +3641,6 @@ const Connection = struct {
             self.tickets.failAll();
             self.wakeAllSpace();
             self.wakeAllDeadlines();
-            if (std.debug.runtime_safety) {
-                const elapsed = nowNs(self.config.io) -% wait_started_ns;
-                if (elapsed > watchdog_ns) self.panicTeardownWatchdog();
-            }
             if (close_probe) {
                 var in_use: u32 = 0;
                 for (self.handlers) |s| {
@@ -3652,7 +3648,24 @@ const Connection = struct {
                 }
                 diagRawPrint("t1002 conn={x} shutdown_wait in_use={d} parked={d}\n", .{ @intFromPtr(self), in_use, close_probe_parked.load(.acquire) });
             }
-            const sid = self.completion_ch.receive() catch return error.Canceled;
+            // A clock check after `receive` never runs while `receive` is
+            // parked. Park in `zio.select` with the remaining deadline so a
+            // lost wakeup is a timer win, then panic. Not `withTimeout`: that
+            // cancels the task and returns Timeout (cancel and continue).
+            // Select keeps a committed channel item across cancel of the
+            // loser arm (`src/select.zig` claim-before-consume).
+            const sid: u31 = if (std.debug.runtime_safety) blk: {
+                const elapsed = nowNs(self.config.io) -% wait_started_ns;
+                if (elapsed >= watchdog_ns) self.panicTeardownWatchdog();
+                const winner = zio.select(.{
+                    .comp = self.completion_ch.asyncReceive(),
+                    .timer = zio.Timeout.fromNanoseconds(watchdog_ns - elapsed),
+                }) catch return error.Canceled;
+                break :blk switch (winner) {
+                    .comp => |r| r catch return error.Canceled,
+                    .timer => self.panicTeardownWatchdog(),
+                };
+            } else self.completion_ch.receive() catch return error.Canceled;
             self.releaseSlot(sid);
             self.teardown_wait_released += 1;
         }
