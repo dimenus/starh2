@@ -423,6 +423,29 @@ pub fn build(b: *std.Build) void {
     const lifecycle_step = b.step("test-lifecycle", "Run lifecycle gates only");
     lifecycle_step.dependOn(&run_lifecycle_tests.step);
 
+    const teardown_traps = b.addExecutable(.{
+        .name = "teardown-traps",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/teardown_traps.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_double_finalize_trap = b.addRunArtifact(teardown_traps);
+    run_double_finalize_trap.addArg("double-finalize");
+    run_double_finalize_trap.addCheck(.{ .expect_stderr_match = "handler slot finalized 2 times" });
+    run_double_finalize_trap.has_side_effects = true;
+    const run_sweep_lock_trap = b.addRunArtifact(teardown_traps);
+    run_sweep_lock_trap.addArg("sweep-lock");
+    run_sweep_lock_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
+    run_sweep_lock_trap.has_side_effects = true;
+    lifecycle_step.dependOn(&run_double_finalize_trap.step);
+    lifecycle_step.dependOn(&run_sweep_lock_trap.step);
+
     const backend_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/backend_parity.zig"),
