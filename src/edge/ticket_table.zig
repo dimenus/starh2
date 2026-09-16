@@ -181,6 +181,14 @@ pub const TicketTable = struct {
         return @atomicLoad(std.Io.Event, &self.slots[slot_i].event, .acquire) == .is_set;
     }
 
+    /// Nonblocking probe: `Event.wait` has taken the slot to `.waiting`.
+    /// Only that wait writes `.waiting`. Used by the r158-parked arm to prove
+    /// the holder is inside `tickets.wait`, not on a barrier before it.
+    pub fn isWaiting(self: *TicketTable, slot_i: u32) bool {
+        if (slot_i >= self.slots.len) return false;
+        return @atomicLoad(std.Io.Event, &self.slots[slot_i].event, .acquire) == .waiting;
+    }
+
     pub fn releaseReserved(self: *TicketTable, slot_i: u32) void {
         if (slot_i >= self.slots.len) return;
         const slot = &self.slots[slot_i];

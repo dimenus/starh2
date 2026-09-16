@@ -179,16 +179,10 @@ pub var test_deadline_waits: std.atomic.Value(usize) = .init(0);
 /// Test-only: Connection finished boot allocations (pools, sched slabs, session maps).
 pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
 
-/// Test-only two-task barrier at `waitTicket`. Same shape as
-/// `ticket_table.TestReserveBarrier`. `parked` is set after the caller has
-/// stored `awaiting_receipt`. `go` is waited under a zio shield before
-/// `tickets.wait`, so `Future.cancel` cannot finish: that is the 8364251
-/// reaper-stuck dump. Teardown must not set `go`.
-pub const TestAwaitBarrier = struct {
-    parked: zio.ResetEvent = .init,
-    go: zio.ResetEvent = .init,
-};
-pub var test_await_barrier: ?*TestAwaitBarrier = null;
+/// Test-only: wrap `tickets.wait` in a zio shield so `Future.cancel` cannot
+/// finish the holder. The holder must already be inside that wait; sequence
+/// on `TicketTable.isWaiting`, not on a barrier event before it.
+pub var test_shield_ticket_wait: bool = false;
 
 /// Per-task binding: the current task is inside `shutdownHandlers`.
 ///
@@ -2105,12 +2099,8 @@ const Connection = struct {
     }
 
     fn waitTicket(self: *Connection, stream_id: u31, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
-        if (test_await_barrier) |b| {
-            b.parked.set();
-            zio.beginShield();
-            defer zio.endShield();
-            b.go.wait() catch unreachable;
-        }
+        if (test_shield_ticket_wait) zio.beginShield();
+        defer if (test_shield_ticket_wait) zio.endShield();
         self.tickets.wait(slot_i, terminal) catch |err| {
             if (terminal.getCause()) |c| return response.causeToError(c);
             self.lockSessionUncancelable(self.config.io);
@@ -6605,10 +6595,13 @@ pub fn testTrapWatchdogReaperNoPost(io: std.Io) void {
     std.debug.panic("reaper watchdog did not fire", .{});
 }
 
+var trap_r158_ticket_slot: std.atomic.Value(u32) = .init(ticket_table.no_completion_slot);
+
 fn trapR158ParkedHolder(job: *HandlerJob) void {
     defer Connection.finishHandlerJob(job);
     const conn = job.conn;
     const pair = conn.tickets.reserve() catch return;
+    trap_r158_ticket_slot.store(pair[1], .release);
     job.slot.awaiting_receipt.store(true, .release);
     defer job.slot.awaiting_receipt.store(false, .release);
     conn.waitTicket(job.stream_id, pair[1], &job.slot.terminal) catch {};
@@ -6635,23 +6628,18 @@ fn trapAssertSweepClean(conn: *Connection) void {
 /// One arm, two forbidden leftovers after `shutdownHandlers`:
 /// - r158: `owner_live != 0` (skip, never enrolled).
 /// - reaper-stuck: `reaper_running != 0` (enrolled, worker in `Future.cancel`).
-/// A build that trades one for the other fails this run.
-/// Production line: `shutdownHandlers` → `enqueueTeardownReapers`.
-/// `go.wait` is under a zio shield so `Future.cancel` cannot finish: HEAD
-/// (8364251) must dump `reaper_running=1`. Aed3b82 skips enroll and dumps
-/// `owner_live=1`. Success strings are the candidate gate; ci stays red
-/// until teardown is level-triggered.
-///
-/// r158 deferred (named gap): store at the complete-receipt batch path does
-/// not call `waitTicket`. `finishPendingReceiptsNoWait` runs first.
+/// Holder parks inside `tickets.wait` (`Event.wait`). Ready signal is
+/// `TicketTable.isWaiting`: only `Event.wait` writes `.waiting`. Shield wraps
+/// that wait, so cancel cannot finish it; `failAll` / A2 `dead` still can,
+/// because a shield suppresses cancellation, not event delivery.
 pub fn testTrapR158Parked(io: std.Io) void {
     const gpa = std.heap.page_allocator;
     var trap: TrapHop = undefined;
     openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
     defer trap.close();
-    var barrier: TestAwaitBarrier = .{};
-    test_await_barrier = &barrier;
-    defer test_await_barrier = null;
+    test_shield_ticket_wait = true;
+    defer test_shield_ticket_wait = false;
+    trap_r158_ticket_slot.store(ticket_table.no_completion_slot, .release);
     var pool = ReaperPool.init(gpa, io, 1) catch std.debug.panic("trap reaper pool failed", .{});
     trap.hop.conn.reaper = &pool;
     _ = zio.spawn(ReaperPool.worker, .{&pool}) catch std.debug.panic("trap reaper worker spawn failed", .{});
@@ -6661,8 +6649,16 @@ pub fn testTrapR158Parked(io: std.Io) void {
     const handle = io.concurrent(trapR158ParkedHolder, .{job}) catch std.debug.panic("trap holder spawn failed", .{});
     trap.hop.conn.handler_joins[i] = handle;
     std.debug.assert(job.slot.completion_owner.load(.acquire) == live);
-    barrier.parked.wait() catch std.debug.panic("trap parked wait canceled", .{});
+    var spins: usize = 0;
+    while (true) {
+        const slot_i = trap_r158_ticket_slot.load(.acquire);
+        if (slot_i != ticket_table.no_completion_slot and trap.hop.conn.tickets.isWaiting(slot_i)) break;
+        spins += 1;
+        std.debug.assert(spins < 1_000_000);
+        zio.yield() catch std.debug.panic("trap yield canceled before wait", .{});
+    }
     std.debug.assert(job.slot.awaiting_receipt.load(.acquire));
+    std.debug.assert(trap.hop.conn.tickets.isWaiting(trap_r158_ticket_slot.load(.acquire)));
     trap.hop.conn.shutdownHandlers();
     trapAssertSweepClean(&trap.hop.conn);
     std.debug.print("r158 parked enroll ok\n", .{});
