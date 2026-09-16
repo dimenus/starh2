@@ -3852,7 +3852,13 @@ const Connection = struct {
             }
             std.debug.assert(self.teardown_wait_released + after_drain == self.teardown_wait_expected);
             if (after_drain == 0) break;
-            if (!require_empty and !self.markedSidStillInUse(marked) and !self.tickets.anyWaiting()) break;
+            if (!require_empty and !self.markedSidStillInUse(marked)) {
+                if (comptime ticket_table.observe) {
+                    if (!self.tickets.anyWaiting()) break;
+                } else {
+                    break;
+                }
+            }
             std.debug.assert(self.teardown_wait_released < self.teardown_wait_expected);
             self.tickets.failAll();
             self.wakeAllSpace();
@@ -6625,15 +6631,14 @@ fn trapParkForever() void {
 
 /// Axis D arm: a running reaper whose `Future.cancel` never returns. A worker
 /// must be live: a pool with nobody home only arms `reaper_queued`, not
-/// `reaper_running`. Same spawn as `server.zig` `reaper_group.concurrent`.
+/// `reaper_running`.
 pub fn testTrapWatchdogReaperNoPost(io: std.Io) void {
     const gpa = std.heap.page_allocator;
     var trap: TrapHop = undefined;
     openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
     var pool = ReaperPool.init(gpa, io, 1) catch std.debug.panic("trap reaper pool failed", .{});
     trap.hop.conn.reaper = &pool;
-    var reaper_group: std.Io.Group = .init;
-    reaper_group.concurrent(io, ReaperPool.worker, .{&pool}) catch std.debug.panic("trap reaper worker spawn failed", .{});
+    _ = zio.spawn(ReaperPool.worker, .{&pool}) catch std.debug.panic("trap reaper worker spawn failed", .{});
     const slot = trap.hop.conn.allocSlot(1) orelse std.debug.panic("trap allocSlot failed", .{});
     trap.hop.conn.admitHandler(slot);
     slot.reaper_reserved = true;

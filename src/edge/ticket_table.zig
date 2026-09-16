@@ -37,6 +37,10 @@ const std = @import("std");
 const zio = @import("zio");
 const response = @import("../http/response.zig");
 
+/// t-866 ticket-ledger diagnostics and the r158 `waiting` flag. Gated so the
+/// official bench path pays no atomic increments.
+pub const observe = @import("build_options").observe;
+
 pub const no_completion_slot = std.math.maxInt(u32);
 
 /// First writer wins. `complete(ok=true)` must not become failure if `failAll`
@@ -52,9 +56,9 @@ pub const TicketWait = struct {
     ticket: std.atomic.Value(u64) = .init(0),
     /// Actor-written, actor-read link for tickets sharing one wire chunk.
     completion_next: std.atomic.Value(u32) = .init(no_completion_slot),
-    /// Set while `wait` is inside `zio.select` / `event.wait`. The r158 arm
-    /// sequences on this: only this wait stores true.
-    waiting: std.atomic.Value(bool) = .init(false),
+    /// Test sequencing for r158-parked. Written only when `observe` is on
+    /// (Debug, or `-Dobserve=true`). The official bench path does not store.
+    waiting: if (observe) std.atomic.Value(bool) else void = if (observe) .init(false) else {},
 };
 
 fn publishOk(slot: *TicketWait, passed: bool) void {
@@ -76,11 +80,6 @@ pub const TestReserveBarrier = struct {
 
 pub var test_reserve_barrier: ?*TestReserveBarrier = null;
 
-/// t-866 ticket-ledger diagnostics: every completion outcome is counted, so
-/// a silently dropped completion (the two staleness guards) is visible.
-/// Gated on `observe` like every other hot-path counter; the official bench
-/// path pays no atomic increments.
-pub const observe = @import("build_options").observe;
 pub var diag_reserved: std.atomic.Value(u64) = .init(0);
 pub var diag_completed: std.atomic.Value(u64) = .init(0);
 pub var diag_dropped_not_in_use: std.atomic.Value(u64) = .init(0);
@@ -188,18 +187,28 @@ pub const TicketTable = struct {
     }
 
     /// Nonblocking probe: `wait` is inside `zio.select` / `event.wait`.
+    /// Observe-only: the flag is not stored when `observe` is off.
     pub fn isWaiting(self: *TicketTable, slot_i: u32) bool {
-        if (slot_i >= self.slots.len) return false;
-        return self.slots[slot_i].waiting.load(.acquire);
+        if (comptime !observe) {
+            @compileError("TicketTable.isWaiting is observe-only; waiting is not stored");
+        } else {
+            if (slot_i >= self.slots.len) return false;
+            return self.slots[slot_i].waiting.load(.acquire);
+        }
     }
 
     /// True if any slot is inside `wait`'s select / `event.wait`.
+    /// Observe-only: the flag is not stored when `observe` is off.
     pub fn anyWaiting(self: *const TicketTable) bool {
-        var i: usize = 0;
-        while (i < self.slots.len) : (i += 1) {
-            if (self.slots[i].waiting.load(.acquire)) return true;
+        if (comptime !observe) {
+            @compileError("TicketTable.anyWaiting is observe-only; waiting is not stored");
+        } else {
+            var i: usize = 0;
+            while (i < self.slots.len) : (i += 1) {
+                if (self.slots[i].waiting.load(.acquire)) return true;
+            }
+            return false;
         }
-        return false;
     }
 
     pub fn releaseReserved(self: *TicketTable, slot_i: u32) void {
@@ -262,8 +271,8 @@ pub const TicketTable = struct {
         if (slot_i >= self.slots.len) return error.OutOfMemory;
         const slot = &self.slots[slot_i];
         defer self.releaseReserved(slot_i);
-        slot.waiting.store(true, .release);
-        defer slot.waiting.store(false, .release);
+        if (comptime observe) slot.waiting.store(true, .release);
+        defer if (comptime observe) slot.waiting.store(false, .release);
         var canceled = false;
         if (!slot.event.isSet()) {
             if (self.dead) |dead| {
