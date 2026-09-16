@@ -3634,6 +3634,7 @@ const Connection = struct {
         self.stream.shutdown(self.config.io, .both) catch {};
         if (diag_park) diagRawPrint("WFSET shutdown_handlers conn={x}\n", .{ @intFromPtr(self) & 0xffff });
         self.writer_failed.store(true, .release);
+        std.debug.assert(self.writer_failed.load(.acquire));
         self.closeWriterQueues();
         self.publishTeardownWakes();
         self.drainCompletions();
@@ -3727,9 +3728,7 @@ const Connection = struct {
         };
         return switch (winner) {
             .comp => |r| r catch |err| switch (err) {
-                error.Closed => {
-                    std.debug.panic("completion_ch closed with slots still in use", .{});
-                },
+                error.Closed => std.debug.panic("completion_ch closed with slots still in use", .{}),
             },
             .timer => self.panicTeardownWatchdog(),
         };
