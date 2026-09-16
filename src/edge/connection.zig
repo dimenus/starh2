@@ -3777,14 +3777,17 @@ const Connection = struct {
     fn enqueueTeardownReapers(self: *Connection) void {
         std.debug.assert(shutdown_sweep.get() != null);
         std.debug.assert(self.handlers.len == self.handler_joins.len);
+        // WritePump is already closed. `cancelHandler`'s awaiting_receipt skip
+        // is safe only while the pump still acks and `wakeHandlerWaiters` just
+        // ran under the lock. Copying the skip without that precondition left
+        // SSE waitTicket holders live, join set, no worker (f88523f r158).
+        // Fail receipts, then enroll: one pass, one flag (`slot.in_use`).
+        self.tickets.failAll();
         for (self.handlers, 0..) |*slot, i| {
             if (!slot.in_use) continue;
-            // Same skip as `cancelHandler`. `sendCb` parks on `waitTicket`
-            // with `awaiting_receipt` set and forbids cancel: `failAll` and
-            // the write-ack path are the guaranteed wake. `Future.cancel`
-            // waits until the task stops; canceling that wait is how a
-            // worker sits in `reaper_running` and never posts.
-            if (slot.awaiting_receipt.load(.acquire)) continue;
+            std.debug.assert(slot.stream_id != 0);
+            self.wakeStreamSpace(slot.stream_id);
+            self.wakeHandlerDeadline(slot.stream_id);
             if (self.handler_joins[i]) |handle| {
                 const prev = slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
                 if (prev == null) {
