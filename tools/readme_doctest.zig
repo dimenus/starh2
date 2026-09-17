@@ -87,6 +87,9 @@ const Config = struct {
     /// dependency. Passed in rather than computed, so the build file that
     /// chooses `out` also states the answer.
     repo_rel: []const u8 = "../..",
+    /// Optional libc file forwarded to the nested `zig build`. Empty means
+    /// omit `--libc`. The generated consumer `build.zig` stays naive.
+    libc: []const u8 = "",
 };
 
 fn abort(comptime fmt: []const u8, args: anytype) noreturn {
@@ -113,6 +116,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Config {
             cfg.zig = try gpa.dupe(u8, val.next(&args, "--zig"));
         } else if (std.mem.eql(u8, a, "--repo-rel")) {
             cfg.repo_rel = try gpa.dupe(u8, val.next(&args, "--repo-rel"));
+        } else if (std.mem.eql(u8, a, "--libc")) {
+            cfg.libc = try gpa.dupe(u8, val.next(&args, "--libc"));
         } else {
             abort("unknown argument {s}", .{a});
         }
@@ -334,7 +339,8 @@ pub fn main(init: std.process.Init) !void {
                     .{ b.line, raised },
                 );
                 try cwd.writeFile(io, .{ .sub_path = path, .data = data });
-                try roots.print(arena, 
+                try roots.print(
+                    arena,
                     "    pub const {s} = @import(\"{s}.zig\");\n",
                     .{ name, name },
                 );
@@ -390,7 +396,7 @@ pub fn main(init: std.process.Init) !void {
                 , .{ b.line, i, discards, b.text, fill.items });
             },
             .snippet => {
-                try fixtures.print(arena, 
+                try fixtures.print(arena,
                     \\// README.md line {d}
                     \\pub fn doctestSnippet{d}() !void {{
                     \\{s}}}
@@ -493,22 +499,27 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         "readme-doctest: {d} zig blocks from {s} — build:{d} program:{d} handler:{d} route:{d} config:{d} snippet:{d}\n",
         .{
-            blocks.items.len,     cfg.readme,           counts.get(.build), counts.get(.program),
-            counts.get(.handler), counts.get(.route),   counts.get(.config), counts.get(.snippet),
+            blocks.items.len,     cfg.readme,         counts.get(.build),  counts.get(.program),
+            counts.get(.handler), counts.get(.route), counts.get(.config), counts.get(.snippet),
         },
     );
 
     const build_file = try std.fmt.allocPrint(arena, "{s}/build.zig", .{cfg.out});
     const prefix = try std.fmt.allocPrint(arena, "{s}/zig-out", .{cfg.out});
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{
+        cfg.zig,        "build",
+        "--build-file", build_file,
+        // Share this repo's cache, so starh2 and its C dependencies are not
+        // compiled a second time for the gate.
+        "--cache-dir",  ".zig-cache",
+        "--prefix",     prefix,
+    });
+    if (cfg.libc.len != 0) {
+        try argv.appendSlice(arena, &.{ "--libc", cfg.libc });
+    }
     var child = std.process.spawn(io, .{
-        .argv = &.{
-            cfg.zig,      "build",
-            "--build-file", build_file,
-            // Share this repo's cache, so starh2 and its C dependencies are not
-            // compiled a second time for the gate.
-            "--cache-dir", ".zig-cache",
-            "--prefix",    prefix,
-        },
+        .argv = argv.items,
         .stdout = .inherit,
         .stderr = .inherit,
     }) catch abort("cannot spawn {s}", .{cfg.zig});

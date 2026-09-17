@@ -1,2 +1,6 @@
 #!/bin/sh
-exec "$HOME/.zvm/bin/zig" "$@"
+zvm="$HOME/.zvm/bin/zig"
+if [ -x "$zvm" ]; then
+  exec "$zvm" "$@"
+fi
+exec zig "$@"
