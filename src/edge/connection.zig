@@ -3436,19 +3436,10 @@ const Connection = struct {
     /// Stop a handler because its stream is over — a peer RST, or a local
     /// reset. Actor-only.
     ///
-    /// The sequence is ordered so that a handler always has a way out:
-    /// 1. Publish the terminal cause. Every `Response` entry point reads it
-    ///    first, so a handler that is running notices at its next call.
-    /// 2. Wake anything that waits on this stream: the flush ticket and the
-    ///    capacity event. A waiter that is not woken here waits forever,
-    ///    because the stream will produce no further events.
-    /// 3. Skip the join-cancel if the handler is awaiting a wire receipt (see
-    ///    `HandlerSlot.awaiting_receipt`).
-    /// 4. Otherwise transfer the join handle to a reaper, but ONLY when a
-    ///    handle exists to transfer. A CAS without a handle once left the
-    ///    ownership stuck at `reaper_owned`: the handler exited without
-    ///    reporting, no reaper ever ran, and the slot plus its reaper token
-    ///    leaked for the life of the connection.
+    /// Publish the terminal cause and wake every wait this stream owns.
+    /// The handler returns on its next Response call or wait, then posts.
+    /// There is no Future.cancel: that path cannot reclaim an uncancelable
+    /// wait, and it is the Futex handshake that hung teardown.
     fn cancelHandler(self: *Connection, stream_id: u31, cause: response.TerminalCause) void {
         const i = self.slotIndex(stream_id) orelse {
             // The handler already posted its completion and released the slot.
@@ -3461,22 +3452,6 @@ const Connection = struct {
         const slot = &self.handlers[i];
         slot.terminal.setCause(cause);
         self.wakeHandlerWaiters(stream_id);
-        // A handler waiting on a wire receipt has a GUARANTEED wake: the
-        // WritePump acks or fail-drains every queued chunk on every exit path,
-        // and wakeHandlerWaiters above failed any ticket still in a pending.
-        // Canceling that wait is how a fully delivered response returned
-        // ConnectionClosed (t-537) — leave it to finish; its natural return
-        // posts the completion.
-        if (slot.awaiting_receipt.load(.acquire)) return;
-        // Only CAS to reaper_owned when a JoinHandle is present to transfer. Otherwise
-        // cooperative cancel via cause; natural return reports the slot.
-        // CAS-without-join left ownership stuck: handler exits without posting, reaper
-        // never runs, releaseSlot never runs → reaper_reserved leak.
-        const handle = self.handler_joins[i] orelse return;
-        const prev = slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
-        if (prev) |_| return;
-        self.handler_joins[i] = null;
-        self.enqueueReaperOrFail(slot, handle, stream_id);
     }
 
     /// Release everything a terminal stream still holds, and wake whoever waits
@@ -3793,15 +3768,9 @@ const Connection = struct {
         self.publishTeardownWakes();
         _ = self.drainCompletions();
         self.finishPendingReceiptsNoWait();
-        // Ticket waiters select on `dead` / failAll and post with no
-        // Future.cancel. Wait for those first. Enroll only leftovers
-        // (uncooperative waits such as a cancel-swallowing sleep).
-        self.waitCooperativeTeardown();
-        if (self.countInUseSlots() != 0) {
-            self.enqueueTeardownReapers();
-            if (std.debug.runtime_safety) self.assertTeardownPosters();
-            self.waitTeardownCompletions();
-        }
+        // Handlers in tickets.wait / space / deadline select on `dead` and
+        // post. An uncooperative wait does not return; the watchdog names it.
+        self.waitTeardownCompletions();
     }
 
     fn publishTeardownWakes(self: *Connection) void {
@@ -3817,50 +3786,7 @@ const Connection = struct {
         self.dead.set();
     }
 
-    fn enqueueTeardownReapers(self: *Connection) void {
-        std.debug.assert(shutdown_sweep.get() != null);
-        std.debug.assert(self.handlers.len == self.handler_joins.len);
-        // WritePump is already closed. `cancelHandler`'s awaiting_receipt skip
-        // is safe only while the pump still acks and `wakeHandlerWaiters` just
-        // ran under the lock. Copying the skip without that precondition left
-        // SSE waitTicket holders live, join set, no worker (f88523f r158).
-        // Fail receipts, then enroll: one pass, one flag (`slot.in_use`).
-        self.tickets.failAll();
-        for (self.handlers, 0..) |*slot, i| {
-            if (!slot.in_use) continue;
-            std.debug.assert(slot.stream_id != 0);
-            self.wakeStreamSpace(slot.stream_id);
-            self.wakeHandlerDeadline(slot.stream_id);
-            if (self.handler_joins[i]) |handle| {
-                const prev = slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
-                if (prev == null) {
-                    self.handler_joins[i] = null;
-                    self.enqueueReaperOrFail(slot, handle, slot.stream_id);
-                } else if (prev == @as(?u8, reaper_owned)) {
-                    self.handler_joins[i] = null;
-                    self.enqueueReaperOrFail(slot, handle, slot.stream_id);
-                } else if (prev == @as(?u8, reaper_running)) {
-                    std.debug.panic("teardown join still set while reaper running sid={d}", .{slot.stream_id});
-                } else {
-                    std.debug.assert(prev == @as(?u8, reported));
-                    // Keep the join. The handler has posted, but finishHandlerJob
-                    // still resets the arena and frees the request body. releaseSlot
-                    // awaits this handle so deinit cannot race that cleanup.
-                }
-            }
-        }
-    }
-
-    fn markedSidStillInUse(self: *Connection, sids: []const u31) bool {
-        for (sids) |sid| {
-            if (self.slotIndex(sid) != null) return true;
-        }
-        return false;
-    }
-
-    /// Wait until every snapshotted ticket holder has posted. `require_empty`
-    /// is the leftover wait after reaper enroll: every in-use slot.
-    fn waitTeardownLoop(self: *Connection, require_empty: bool, marked: []const u31) void {
+    fn waitTeardownCompletions(self: *Connection) void {
         std.debug.assert(shutdown_sweep.get() != null);
         self.teardown_wait_expected = self.countInUseSlots();
         self.teardown_wait_released = 0;
@@ -3880,13 +3806,6 @@ const Connection = struct {
             }
             std.debug.assert(self.teardown_wait_released + after_drain == self.teardown_wait_expected);
             if (after_drain == 0) break;
-            if (!require_empty and !self.markedSidStillInUse(marked)) {
-                if (comptime ticket_table.observe) {
-                    if (!self.tickets.anyWaiting()) break;
-                } else {
-                    break;
-                }
-            }
             std.debug.assert(self.teardown_wait_released < self.teardown_wait_expected);
             self.tickets.failAll();
             self.wakeAllSpace();
@@ -3904,24 +3823,7 @@ const Connection = struct {
             last_progress_ns = nowNs(self.config.io);
             std.debug.assert(self.teardown_wait_released + self.countInUseSlots() == self.teardown_wait_expected);
         }
-        if (require_empty) std.debug.assert(self.countInUseSlots() == 0);
-    }
-
-    fn waitCooperativeTeardown(self: *Connection) void {
-        std.debug.assert(shutdown_sweep.get() != null);
-        var n: usize = 0;
-        for (self.handlers) |*slot| {
-            if (!slot.in_use) continue;
-            if (!slot.awaiting_receipt.load(.acquire)) continue;
-            std.debug.assert(n < self.sid_scratch.len);
-            self.sid_scratch[n] = slot.stream_id;
-            n += 1;
-        }
-        self.waitTeardownLoop(false, self.sid_scratch[0..n]);
-    }
-
-    fn waitTeardownCompletions(self: *Connection) void {
-        self.waitTeardownLoop(true, &.{});
+        std.debug.assert(self.countInUseSlots() == 0);
     }
 
     fn takeTeardownCompletion(self: *Connection, wait_started_ns: u64, watchdog_ns: u64) u31 {
