@@ -71,10 +71,10 @@ pub const Terms = struct {
 };
 
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
-pub const HANDLER_SLOT_SIZE: usize = 20;
+pub const HANDLER_SLOT_SIZE: usize = 24;
 pub const HANDLER_JOB_SIZE: usize = 648;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
-pub const REAPER_JOB_SIZE: usize = 32;
+pub const REAPER_JOB_SIZE: usize = 40;
 
 pub const WIRE_CHUNK_SIZE = wire_const.WIRE_CHUNK_SIZE;
 pub const TLS_PLAINTEXT_SCRATCH_SIZE = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;

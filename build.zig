@@ -423,6 +423,92 @@ pub fn build(b: *std.Build) void {
     const lifecycle_step = b.step("test-lifecycle", "Run lifecycle gates only");
     lifecycle_step.dependOn(&run_lifecycle_tests.step);
 
+    const teardown_traps = b.addExecutable(.{
+        .name = "teardown-traps",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/teardown_traps.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_double_finalize_trap = b.addRunArtifact(teardown_traps);
+    run_double_finalize_trap.addArg("double-finalize");
+    run_double_finalize_trap.addCheck(.{ .expect_stderr_match = "handler slot finalized 2 times" });
+    run_double_finalize_trap.has_side_effects = true;
+    const run_sweep_lock_trap = b.addRunArtifact(teardown_traps);
+    run_sweep_lock_trap.addArg("sweep-lock");
+    run_sweep_lock_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
+    run_sweep_lock_trap.has_side_effects = true;
+    const run_sweep_lock_session_trap = b.addRunArtifact(teardown_traps);
+    run_sweep_lock_session_trap.addArg("sweep-lock-session");
+    run_sweep_lock_session_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
+    run_sweep_lock_session_trap.has_side_effects = true;
+    const run_unlocked_sweep_trap = b.addRunArtifact(teardown_traps);
+    run_unlocked_sweep_trap.addArg("unlocked-sweep");
+    run_unlocked_sweep_trap.addCheck(.{ .expect_stderr_match = "session_mu not held at wakeHandlerWaiters" });
+    run_unlocked_sweep_trap.has_side_effects = true;
+    const run_watchdog_stall_trap = b.addRunArtifact(teardown_traps);
+    run_watchdog_stall_trap.addArg("watchdog-stall");
+    run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "teardown wait exceeded 5s no progress: live_handlers=1 slots=1 reaper=0 owner_live=1 expected=1 released=0" });
+    run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "teardown stall sid=1" });
+    run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "space_wait=0 deadline_wait=0" });
+    run_watchdog_stall_trap.addCheck(.{ .expect_stderr_match = "ticket_wait=0 dead_wait=0" });
+    run_watchdog_stall_trap.has_side_effects = true;
+    const run_watchdog_healthy_trap = b.addRunArtifact(teardown_traps);
+    run_watchdog_healthy_trap.addArg("watchdog-healthy");
+    run_watchdog_healthy_trap.addCheck(.{ .expect_stderr_match = "teardown no-progress healthy" });
+    run_watchdog_healthy_trap.expectExitCode(0);
+    run_watchdog_healthy_trap.has_side_effects = true;
+    const run_watchdog_reaper_trap = b.addRunArtifact(teardown_traps);
+    run_watchdog_reaper_trap.addArg("watchdog-reaper");
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "teardown wait exceeded 5s no progress: live_handlers=1 slots=1 reaper=1 owner_live=1 expected=1 released=0 reaper_queued=0 reaper_running=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "teardown stall sid=1 owner=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "join=1" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "finalize=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "awaiting_receipt=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "space_wait=0 deadline_wait=0" });
+    run_watchdog_reaper_trap.addCheck(.{ .expect_stderr_match = "ticket_wait=0" });
+    run_watchdog_reaper_trap.has_side_effects = true;
+    const run_conservation_trap = b.addRunArtifact(teardown_traps);
+    run_conservation_trap.addArg("conservation");
+    run_conservation_trap.addCheck(.{ .expect_stderr_match = "slot conservation: claimed=1 finalized=0 rolled_back=0" });
+    run_conservation_trap.has_side_effects = true;
+    const run_deinit_live_trap = b.addRunArtifact(teardown_traps);
+    run_deinit_live_trap.addArg("deinit-live");
+    run_deinit_live_trap.addCheck(.{ .expect_stderr_match = "deinit with live_handlers=1" });
+    run_deinit_live_trap.has_side_effects = true;
+    const run_stale_sid_trap = b.addRunArtifact(teardown_traps);
+    run_stale_sid_trap.addArg("stale-sid");
+    run_stale_sid_trap.addCheck(.{ .expect_stderr_match = "teardown completion sid=1 released no slot" });
+    run_stale_sid_trap.has_side_effects = true;
+    const run_error_path_freeze_trap = b.addRunArtifact(teardown_traps);
+    run_error_path_freeze_trap.addArg("error-path-freeze");
+    run_error_path_freeze_trap.addCheck(.{ .expect_stderr_match = "error-path freeze ok" });
+    run_error_path_freeze_trap.expectExitCode(0);
+    run_error_path_freeze_trap.has_side_effects = true;
+    const run_r158_parked_trap = b.addRunArtifact(teardown_traps);
+    run_r158_parked_trap.addArg("r158-parked");
+    run_r158_parked_trap.addCheck(.{ .expect_stderr_match = "r158 parked enroll ok" });
+    run_r158_parked_trap.addCheck(.{ .expect_stderr_match = "reaper-stuck absent" });
+    run_r158_parked_trap.expectExitCode(0);
+    run_r158_parked_trap.has_side_effects = true;
+    lifecycle_step.dependOn(&run_double_finalize_trap.step);
+    lifecycle_step.dependOn(&run_sweep_lock_trap.step);
+    lifecycle_step.dependOn(&run_sweep_lock_session_trap.step);
+    lifecycle_step.dependOn(&run_unlocked_sweep_trap.step);
+    lifecycle_step.dependOn(&run_watchdog_stall_trap.step);
+    lifecycle_step.dependOn(&run_watchdog_healthy_trap.step);
+    lifecycle_step.dependOn(&run_watchdog_reaper_trap.step);
+    lifecycle_step.dependOn(&run_conservation_trap.step);
+    lifecycle_step.dependOn(&run_deinit_live_trap.step);
+    lifecycle_step.dependOn(&run_stale_sid_trap.step);
+    lifecycle_step.dependOn(&run_error_path_freeze_trap.step);
+    lifecycle_step.dependOn(&run_r158_parked_trap.step);
+
     const backend_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/backend_parity.zig"),
@@ -504,7 +590,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_multiplex_tests.step);
     test_step.dependOn(&run_interop_tests.step);
     test_step.dependOn(&run_regression_tests.step);
-    test_step.dependOn(&run_lifecycle_tests.step);
+    test_step.dependOn(lifecycle_step);
     test_step.dependOn(&run_backend_parity_tests.step);
     test_step.dependOn(&run_live_exact_tests.step);
     test_step.dependOn(&run_writer_tests.step);
@@ -775,7 +861,27 @@ pub fn build(b: *std.Build) void {
     const pipeline_bench_step = b.step("bench-pipeline", "Isolated HPACK, frame parsing, and task lifecycle costs");
     pipeline_bench_step.dependOn(&pipeline_bench_run.step);
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + every release target");
+    // The std.Io gate. zio is the runtime; `std.Io` is the vtable it
+    // implements, so `io: std.Io` is correct and is NOT what this bans. The
+    // ban is on the std.Io CONCURRENCY abstractions, because each one differs
+    // from the zio primitive underneath it in a way that has already cost a
+    // defect: `Select.cancelDiscard` discarded bytes already off the socket
+    // (t-1760); `Future.cancel` is request PLUS mandatory await, so a worker
+    // blocks forever on a handler in an uncancelable wait, where zio's
+    // `AnyTask.cancel` is setCanceled+wake and returns at once (t-1802); and
+    // `Event.set` on an already-set event neither wakes nor re-synchronizes a
+    // waiter that already returned, which makes a following plain field read
+    // a data race (t-1802). Reach for zio, or ask before adding one.
+    const std_io_gate_run = b.addSystemCommand(&.{ "bash", "tools/std-io-gate/gate.sh" });
+    std_io_gate_run.addArg(".");
+    std_io_gate_run.setCwd(b.path("."));
+    std_io_gate_run.has_side_effects = true;
+    std_io_gate_run.stdio = .inherit;
+    const std_io_gate_step = b.step("std-io-gate", "Fail on any new std.Io concurrency abstraction; zio owns concurrency here");
+    std_io_gate_step.dependOn(&std_io_gate_run.step);
+
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + every release target");
+    ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(test_step);
     ci_step.dependOn(test_exact_step);
     ci_step.dependOn(fuzz_smoke_step);

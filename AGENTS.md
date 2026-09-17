@@ -89,6 +89,7 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ./zb build tls-smoke # TLS edge: fresh curl connections + clean shutdown
 ./zb build h1-smoke  # HTTP/1.1 edge: curl --http1.1 against tls, curl against h1c, SSE, SIGTERM
 ./zb build h1-go-smoke  # HTTP/1.1 Go net/http oracle: keep-alive reuse and Expect 100-continue; ABORTS if go is missing
+./zb build std-io-gate  # fails on any NEW std.Io concurrency abstraction; prints files and lines scanned
 ```
 
 **`zig build test` cannot reach the TLS edge at all.** No test binds a `tls`
@@ -115,6 +116,20 @@ see `tools/README.md`.
 
 ## Ownership and concurrency
 
+- **zio owns concurrency. Do not reach for a `std.Io` concurrency abstraction.
+  Use the zio primitive, or ask Ryan first.** `std.Io` itself is the vtable zio
+  implements, so `io: std.Io` is correct; `std.Io.Cancelable` is an error set.
+  The ban is `Event`, `Queue`, `Group`, `Future`, `Select`, `Mutex`,
+  `Condition`, `Semaphore`. Each differs from the zio primitive under it in a
+  way that has already cost a defect: `Select.cancelDiscard` discarded bytes
+  already read off the socket (t-1760); `Future.cancel` is request PLUS
+  mandatory await, so a reaper worker blocks forever on a handler in an
+  uncancelable wait, where zio's `AnyTask.cancel` is setCanceled+wake and
+  returns at once (t-1802); `Event.set` on an already-set event neither wakes
+  nor re-synchronizes a waiter that already returned, so a plain field read
+  after it is a data race (t-1802). `./zb build std-io-gate` enforces this and
+  runs inside `ci`; `tools/std-io-gate/baseline.txt` is the measured remaining
+  set, not a budget, and it ratchets in both directions.
 - `Session` is the deterministic protocol authority. `Connection` serializes
   Session access with `session_mu`; handlers communicate through commands.
 - ReadPump and WritePump are the sole owners of their socket directions on h2c.

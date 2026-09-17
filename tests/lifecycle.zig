@@ -6,6 +6,14 @@ const h2c = @import("starh2_h2_client");
 
 const dummy: u8 = 0;
 
+/// Axis G: never_unmap so a use-after-free or double free is the allocator's
+/// trap, not a silent reuse of the same page.
+const LifecycleDbg = std.heap.DebugAllocator(.{
+    .never_unmap = true,
+    .retain_metadata = true,
+    .safety = true,
+});
+
 fn hello(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
     try resp.send(200, &.{}, "ok");
@@ -382,7 +390,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         const status = dbg.deinit();
         if (status != .ok) {
@@ -413,7 +421,7 @@ test "lifecycle: DebugAllocator clean under live SSE reset/shutdown" {
 }
 
 test "complete receipt pipeline ingests B while A write ack is held" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         const status = dbg.deinit();
         if (status != .ok) @panic("DebugAllocator reported leak/UAF in complete receipt pipeline");
@@ -532,6 +540,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         starh2.edge.connection.test_observed_writer_fail_handled.store(false, .release);
         starh2.edge.connection.test_queue_wire_bypass.store(0, .release);
         starh2.edge.connection.test_last_handler_err.store(0, .release);
+        starh2.edge.connection.test_waiting_for_space.store(0, .release);
         const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
         var stream = try peer.connect(.{});
         defer stream.close();
@@ -540,9 +549,12 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try writeAllStreamAt(stream, wire, @src());
         var waited: u64 = 0;
         while (waited < 1000) : (waited += 5) {
-            if (starh2.edge.connection.test_observed_live_handlers.load(.acquire) > 0) break;
+            // The 70 KiB body parks in waitForStreamSpace. live_handlers > 0 is
+            // admission, not a waiter: a fail before send starts leaves herr=0.
+            if (starh2.edge.connection.test_waiting_for_space.load(.acquire) != 0) break;
             zio.sleep(.fromMilliseconds(5)) catch {};
         }
+        try std.testing.expect(starh2.edge.connection.test_waiting_for_space.load(.acquire) != 0);
         // Fail the next transport write while the handler is mid-send.
         starh2.edge.wire_pump.test_fail_next_write.store(true, .release);
         var boost: std.ArrayList(u8) = .empty;
@@ -568,7 +580,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 test "waitForStreamSpace: cancel while blocked is lock-balanced under DebugAllocator" {
     // Mechanical: per-stream space_sem + lockUncancelable reacquire. Prove cancel
     // while waiting does not double-unlock (DebugAllocator / ASan would trap).
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         const status = dbg.deinit();
         if (status != .ok) @panic("DebugAllocator leak/UAF after space-wait cancel");
@@ -609,7 +621,7 @@ test "waitForStreamSpace: cancel while blocked is lock-balanced under DebugAlloc
 }
 
 test "lifecycle: 100x write-fail ticket wake (no hang)" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         const status = dbg.deinit();
         if (status != .ok) @panic("DebugAllocator leak after write-fail stress");
@@ -752,7 +764,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "lifecycle: global stream cap and cancellation storm" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         const status = dbg.deinit();
         if (status != .ok) @panic("DebugAllocator leak after global cap storm");
@@ -1286,7 +1298,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
 }
 
 test "lifecycle: >64KiB body under small window + RST (stream 1)" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         if (dbg.deinit() != .ok) @panic("DebugAllocator leak after large-body gate");
     }
@@ -1302,7 +1314,7 @@ test "lifecycle: >64KiB body under small window + RST (stream 1)" {
 }
 
 test "lifecycle: >64KiB body under small window + RST (sparse stream id)" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         if (dbg.deinit() != .ok) @panic("DebugAllocator leak after sparse large-body gate");
     }
@@ -1449,7 +1461,7 @@ fn capCrossingAttempt(gpa: std.mem.Allocator, server: *starh2.Server, port: u16)
 }
 
 test "lifecycle: a single send bigger than outbound_bytes_per_stream completes (t-482)" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         if (dbg.deinit() != .ok) @panic("DebugAllocator leak after cap-crossing gate");
     }
@@ -1512,7 +1524,7 @@ fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "lifecycle: the first wire frame is the server's own SETTINGS, never an ack (t-538)" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         if (dbg.deinit() != .ok) @panic("DebugAllocator leak after preface-first gate");
     }
@@ -1583,7 +1595,7 @@ fn runListeningReadiness(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "lifecycle: waitUntilListening is authoritative for bind success and failure" {
-    var dbg = std.heap.DebugAllocator(.{}).init;
+    var dbg = LifecycleDbg.init;
     defer {
         if (dbg.deinit() != .ok) @panic("DebugAllocator leak after readiness gate");
     }
