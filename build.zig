@@ -945,7 +945,7 @@ pub fn build(b: *std.Build) void {
             probe_step.dependOn(&probe.step);
         }
         ci_step.dependOn(probe_step);
-    } else if (builtin.os.tag == .macos) {
+    } else if (builtin.os.tag == .macos and !macos_apply.guard_installed) {
         std.debug.print("macos-sdk: no rejected SDK to probe\n", .{});
     }
 }
@@ -953,6 +953,7 @@ pub fn build(b: *std.Build) void {
 const MacosLibcApply = struct {
     libc_file: ?std.Build.LazyPath = null,
     rejected_higher: []const []const u8 = &.{},
+    guard_installed: bool = false,
 };
 
 const MacosSdkSelection = struct {
@@ -970,8 +971,17 @@ fn applyMacosSdkLibc(b: *std.Build, override: ?[]const u8, extra_root: ?[]const 
     if (sel.guard_msg) |msg| {
         const fail = b.addFail(msg);
         fail.step.name = "macos-sdk-guard";
-        _ = attachGuardToOwnedMacosCompiles(b, &fail.step);
-        return .{};
+        const n = attachGuardToOwnedMacosCompiles(b, &fail.step);
+        // Same as the libc-file n==0 check below: a build.zig programming
+        // error. The two paths are deliberately symmetric. A broken walk on
+        // the guard path must not fall through to the opaque libcxx wall.
+        if (n == 0) {
+            std.process.fatal(
+                "{s}\nmacos-sdk: guard covered no Compile steps",
+                .{msg},
+            );
+        }
+        return .{ .guard_installed = true };
     }
     const chosen = sel.chosen orelse return .{ .rejected_higher = sel.rejected_higher };
     std.debug.print("macos-sdk: using {s}\n", .{chosen.resolved_path});
