@@ -202,6 +202,11 @@ pub fn build(b: *std.Build) void {
         "macos-sdk",
         "Force a macOS SDK root and skip the SDK scan",
     );
+    const macos_sdk_extra_root = b.option(
+        []const u8,
+        "macos-sdk-extra-root",
+        "Additional directory of MacOSX*.sdk entries to scan",
+    );
     // Gate builds are Debug; ReleaseFast benches compile the counters out unless
     // `-Dobserve=true`. Do not read `builtin.mode` inside connection.zig — an
     // imported module's mode is not the test artifact's mode.
@@ -917,7 +922,7 @@ pub fn build(b: *std.Build) void {
     // also hit linux cross targets (`crt_dir may not be empty for linux`) and
     // would miss the nested `readme-doctest` build. Walk the graph so a new
     // Compile step inherits the fix.
-    const macos_apply = applyMacosSdkLibc(b, macos_sdk_override);
+    const macos_apply = applyMacosSdkLibc(b, macos_sdk_override, macos_sdk_extra_root);
     if (macos_apply.libc_file) |lp| {
         readme_doctest_run.addArg("--libc");
         readme_doctest_run.addFileArg(lp);
@@ -953,11 +958,21 @@ const MacosLibcApply = struct {
 const MacosSdkSelection = struct {
     chosen: ?macos_sdk.Candidate = null,
     rejected_higher: []const []const u8 = &.{},
+    /// Fail-closed message for native macOS compiles. Null means no guard.
+    /// This is a Step, not `std.process.fatal`: an environment condition must
+    /// not kill `--help` or `std-io-gate`.
+    guard_msg: ?[]const u8 = null,
 };
 
-fn applyMacosSdkLibc(b: *std.Build, override: ?[]const u8) MacosLibcApply {
+fn applyMacosSdkLibc(b: *std.Build, override: ?[]const u8, extra_root: ?[]const u8) MacosLibcApply {
     if (builtin.os.tag != .macos) return .{};
-    const sel = selectMacosSdk(b, override);
+    const sel = selectMacosSdk(b, override, extra_root);
+    if (sel.guard_msg) |msg| {
+        const fail = b.addFail(msg);
+        fail.step.name = "macos-sdk-guard";
+        _ = attachGuardToOwnedMacosCompiles(b, &fail.step);
+        return .{};
+    }
     const chosen = sel.chosen orelse return .{ .rejected_higher = sel.rejected_higher };
     std.debug.print("macos-sdk: using {s}\n", .{chosen.resolved_path});
     const include_dir = b.pathJoin(&.{ chosen.resolved_path, "usr", "include" });
@@ -965,6 +980,10 @@ fn applyMacosSdkLibc(b: *std.Build, override: ?[]const u8) MacosLibcApply {
     const wf = b.addWriteFiles();
     const lp = wf.add("macos-sdk.libc", bytes);
     const n = applyLibcToOwnedMacosCompiles(b, lp);
+    // Configure-time fatal: a build.zig programming error. We produced a libc
+    // file and then found nobody to give it to. An environment condition
+    // (unreadable SDK, no usable SDK) is a Step, not a fatal, so --help and
+    // std-io-gate still run.
     if (n == 0) {
         std.process.fatal(
             "macOS SDK workaround: libc file generated but 0 Compile steps received it",
@@ -974,7 +993,7 @@ fn applyMacosSdkLibc(b: *std.Build, override: ?[]const u8) MacosLibcApply {
     return .{ .libc_file = lp, .rejected_higher = sel.rejected_higher };
 }
 
-fn selectMacosSdk(b: *std.Build, override: ?[]const u8) MacosSdkSelection {
+fn selectMacosSdk(b: *std.Build, override: ?[]const u8, extra_root: ?[]const u8) MacosSdkSelection {
     const io = b.graph.io;
     const gpa = b.allocator;
 
@@ -986,7 +1005,15 @@ fn selectMacosSdk(b: *std.Build, override: ?[]const u8) MacosSdkSelection {
                 .{ path, @errorName(err) },
             );
         };
-        if (cand.verdict != .usable) fatalMacosSdk(b, cand);
+        if (cand.verdict != .usable) {
+            const zig_sdk = std.zig.system.darwin.getSdk(gpa, io, &b.graph.host.result);
+            const roots = collectMacosSdkRoots(b, zig_sdk, extra_root);
+            const scanned = macos_sdk.scan(gpa, io, roots) catch |err| {
+                std.process.fatal("macOS SDK workaround: scan failed: {s}", .{@errorName(err)});
+            };
+            const report = macos_sdk.formatScanReport(gpa, roots, scanned, cand) catch @panic("OOM");
+            return .{ .guard_msg = report };
+        }
         override_chosen = cand;
     }
 
@@ -999,13 +1026,15 @@ fn selectMacosSdk(b: *std.Build, override: ?[]const u8) MacosSdkSelection {
         }
     }
 
-    const roots = collectMacosSdkRoots(b, zig_sdk);
+    const roots = collectMacosSdkRoots(b, zig_sdk, extra_root);
     const scanned = macos_sdk.scan(gpa, io, roots) catch |err| {
         std.process.fatal("macOS SDK workaround: scan failed: {s}", .{@errorName(err)});
     };
     const chosen_opt = override_chosen orelse macos_sdk.choose(scanned);
     if (macos_sdk.firstChoiceBlocker(scanned, chosen_opt)) |block| {
-        fatalChoiceBlocker(b, block, roots, scanned, override_chosen);
+        const msg = macos_sdk.formatChoiceBlocker(gpa, block) catch @panic("OOM");
+        const report = macos_sdk.formatScanReport(gpa, roots, scanned, override_chosen) catch @panic("OOM");
+        return .{ .guard_msg = b.fmt("{s}\n{s}", .{ msg, report }) };
     }
     if (chosen_opt) |c| {
         return .{
@@ -1014,32 +1043,7 @@ fn selectMacosSdk(b: *std.Build, override: ?[]const u8) MacosSdkSelection {
         };
     }
     const report = macos_sdk.formatScanReport(gpa, roots, scanned, null) catch @panic("OOM");
-    std.process.fatal("{s}", .{report});
-}
-
-fn fatalChoiceBlocker(
-    b: *std.Build,
-    block: macos_sdk.ChoiceBlocker,
-    roots: []const []const u8,
-    scanned: macos_sdk.ScanResult,
-    forced: ?macos_sdk.Candidate,
-) noreturn {
-    const gpa = b.allocator;
-    const msg = macos_sdk.formatChoiceBlocker(gpa, block) catch @panic("OOM");
-    const report = macos_sdk.formatScanReport(gpa, roots, scanned, forced) catch @panic("OOM");
-    std.process.fatal("{s}\n{s}", .{ msg, report });
-}
-
-fn fatalMacosSdk(b: *std.Build, forced: macos_sdk.Candidate) noreturn {
-    const io = b.graph.io;
-    const gpa = b.allocator;
-    const zig_sdk = std.zig.system.darwin.getSdk(gpa, io, &b.graph.host.result);
-    const roots = collectMacosSdkRoots(b, zig_sdk);
-    const scanned = macos_sdk.scan(gpa, io, roots) catch |err| {
-        std.process.fatal("macOS SDK workaround: scan failed: {s}", .{@errorName(err)});
-    };
-    const report = macos_sdk.formatScanReport(gpa, roots, scanned, forced) catch @panic("OOM");
-    std.process.fatal("{s}", .{report});
+    return .{ .guard_msg = report };
 }
 
 fn rejectedHigherPaths(
@@ -1056,7 +1060,7 @@ fn rejectedHigherPaths(
     return list.toOwnedSlice(gpa) catch @panic("OOM");
 }
 
-fn collectMacosSdkRoots(b: *std.Build, zig_sdk: ?[]const u8) []const []const u8 {
+fn collectMacosSdkRoots(b: *std.Build, zig_sdk: ?[]const u8, extra_root: ?[]const u8) []const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     for (macos_sdk.default_search_roots) |root| {
         list.append(b.allocator, root) catch @panic("OOM");
@@ -1070,17 +1074,24 @@ fn collectMacosSdkRoots(b: *std.Build, zig_sdk: ?[]const u8) []const []const u8 
             if (!dup) list.append(b.allocator, parent) catch @panic("OOM");
         }
     }
+    if (extra_root) |root| {
+        var dup = false;
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing, root)) dup = true;
+        }
+        if (!dup) list.append(b.allocator, root) catch @panic("OOM");
+    }
     return list.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
-fn applyLibcToOwnedMacosCompiles(b: *std.Build, libc_file: std.Build.LazyPath) usize {
+fn ownedMacosCompiles(b: *std.Build) []*std.Build.Step.Compile {
     var seen_steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
     var roots: std.ArrayList(*std.Build.Step.Compile) = .empty;
     for (b.top_level_steps.values()) |tls| {
         collectCompiles(&tls.step, &seen_steps, &roots, b.allocator);
     }
     var applied: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
-    var n: usize = 0;
+    var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
     for (roots.items) |root_compile| {
         for (root_compile.getCompileDependencies(true)) |compile| {
             if (applied.contains(compile)) continue;
@@ -1088,11 +1099,26 @@ fn applyLibcToOwnedMacosCompiles(b: *std.Build, libc_file: std.Build.LazyPath) u
             if (compile.step.owner != b) continue;
             const resolved = compile.root_module.resolved_target orelse continue;
             if (resolved.result.os.tag != .macos) continue;
-            compile.setLibCFile(libc_file);
-            n += 1;
+            out.append(b.allocator, compile) catch @panic("OOM");
         }
     }
-    return n;
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+fn applyLibcToOwnedMacosCompiles(b: *std.Build, libc_file: std.Build.LazyPath) usize {
+    const compiles = ownedMacosCompiles(b);
+    for (compiles) |compile| {
+        compile.setLibCFile(libc_file);
+    }
+    return compiles.len;
+}
+
+fn attachGuardToOwnedMacosCompiles(b: *std.Build, guard: *std.Build.Step) usize {
+    const compiles = ownedMacosCompiles(b);
+    for (compiles) |compile| {
+        compile.step.dependOn(guard);
+    }
+    return compiles.len;
 }
 
 fn collectCompiles(
