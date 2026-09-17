@@ -861,6 +861,8 @@ pub fn build(b: *std.Build) void {
     const pipeline_bench_step = b.step("bench-pipeline", "Isolated HPACK, frame parsing, and task lifecycle costs");
     pipeline_bench_step.dependOn(&pipeline_bench_run.step);
 
+    // The std.Io gate. zio is the runtime; `std.Io` is the vtable it
+    // implements, so `io: std.Io` is correct and is NOT what this bans. The
     // ban is on the std.Io CONCURRENCY abstractions, because each one differs
     // from the zio primitive underneath it in a way that has already cost a
     // defect: `Select.cancelDiscard` discarded bytes already off the socket

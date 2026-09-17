@@ -6635,14 +6635,21 @@ pub fn testTrapR158Parked(io: std.Io) void {
     var spins: usize = 0;
     while (true) {
         const slot_i = trap_r158_ticket_slot.load(.acquire);
-        if (slot_i != ticket_table.no_completion_slot and trap.hop.conn.tickets.isWaiting(slot_i)) break;
+        if (slot_i != ticket_table.no_completion_slot and
+            trap.hop.conn.tickets.isWaiting(slot_i) and
+            trap.hop.conn.countTicketWaiters() == 1 and
+            Connection.resetHasWaiters(&trap.hop.conn.dead)) break;
         spins += 1;
         std.debug.assert(spins < 1_000_000);
         zio.yield() catch std.debug.panic("trap yield canceled before wait", .{});
     }
     std.debug.assert(job.slot.awaiting_receipt.load(.acquire));
     std.debug.assert(trap.hop.conn.tickets.isWaiting(trap_r158_ticket_slot.load(.acquire)));
+    std.debug.assert(trap.hop.conn.countTicketWaiters() == 1);
+    std.debug.assert(Connection.resetHasWaiters(&trap.hop.conn.dead));
     trap.hop.conn.shutdownHandlers();
+    std.debug.assert(trap.hop.conn.countTicketWaiters() == 0);
+    std.debug.assert(!Connection.resetHasWaiters(&trap.hop.conn.dead));
     trapAssertSweepClean(&trap.hop.conn);
     std.debug.print("r158 parked enroll ok\n", .{});
     std.debug.print("reaper-stuck absent\n", .{});
