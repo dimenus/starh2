@@ -1,12 +1,22 @@
 //! Select a macOS SDK that zig's bundled libcxx can compile.
 //!
-//! `usr/include/math.h` containing `__need_infinity_nan` is the discriminator:
-//! it agrees with a `zig build-exe -lc++` reproducer on every SDK path on the
-//! machine that found this defect. It is not a proven cause. A `zig c++ -c`
-//! of a file that includes `<random>` against the failing SDK compiles clean.
+//! Mechanism (qmdsync t-1749, confirmed here): SDK 27 `math.h` defines
+//! INFINITY only when `__has_feature(modules)` is off, and otherwise defines
+//! `__need_infinity_nan` and hands the job to the compiler's `float.h`. clang
+//! reports that feature for every C++20-or-later translation unit. zig builds
+//! its own libc++ at `-std=c++23`, so the branch fires with no `-fmodules`
+//! anywhere. zig 0.16.0's bundled clang headers predate LLVM's protocol
+//! (llvm/llvm-project PR #164348, merged upstream; zig 0.16.0 predates it).
 //!
-//! This module names the token, scans SDK roots, and picks the highest-version
-//! SDK that does not need the workaround.
+//! Measured here: `zig c++ -std=c++17 -c` has `__has_feature(modules)` off;
+//! `-std=c++20` and `-std=c++23` have it on. A default `zig c++ -c` of
+//! `<random>` compiles clean because the default standard is below C++20.
+//! zig 0.16.0 `lib/include` has `float.h` but not `__float_float.h`,
+//! `__float_header_macro.h`, or `__float_infinity_nan.h`. A zig that carries
+//! the protocol ships those three. Nothing is filed on zig's tracker.
+//!
+//! `__need_infinity_nan` is the discriminator: it agrees with
+//! `zig build-exe -lc++` on every SDK path on this machine.
 //!
 //! No process spawn lives in this file. `build.zig` calls `xcrun` the same
 //! way `std.zig.system.darwin` does, then uses these predicates and the scan.
