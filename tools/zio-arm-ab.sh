@@ -113,6 +113,12 @@ ONESHOT_LAT=${ONESHOT_LAT:-0}
 SAME_ZIO_OK=${SAME_ZIO_OK:-0}
 IDLE_MAX_CORES=${IDLE_MAX_CORES:-1.5}
 CLIENT_BIN=${CLIENT_BIN:-/tmp/zioab-client}
+# Row selectors, so a bisect runs only the rows it classifies on. The defaults
+# run every row. An empty PERF_SSE_STREAMS skips the phase-1 SSE rows.
+PERF_SSE_STREAMS=${PERF_SSE_STREAMS-$SSE_LOW $SSE_HIGH}
+ONESHOT_PLAIN=${ONESHOT_PLAIN:-1}
+ONESHOT_WIDTHS=${ONESHOT_WIDTHS:-$EXECUTORS $WIDE_EXECUTORS}
+CPU_STREAMS=${CPU_STREAMS:-$SSE_LOW $SSE_HIGH}
 
 SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1) || true
 export SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-$SOCK}
@@ -161,7 +167,9 @@ ssh "$HOST" "ARMS='$ARMS' PERF_ROUNDS=$PERF_ROUNDS BURST_ROUNDS=$BURST_ROUNDS CP
   SECONDS_RUN=$SECONDS_RUN INTERVAL=$INTERVAL EXECUTORS=$EXECUTORS \
   WIDE_EXECUTORS=$WIDE_EXECUTORS ONESHOT_N=$ONESHOT_N ONESHOT_WIDE_N=$ONESHOT_WIDE_N \
   SSE_LOW=$SSE_LOW SSE_HIGH=$SSE_HIGH D=$REMOTE_DIR PHASES='$PHASES' H2LOAD='$H2LOAD' \
-  ONESHOT_LAT=$ONESHOT_LAT IDLE_MAX_CORES=$IDLE_MAX_CORES SHAS='$shas' sh -s" <<'REMOTE'
+  ONESHOT_LAT=$ONESHOT_LAT IDLE_MAX_CORES=$IDLE_MAX_CORES SHAS='$shas' \
+  PERF_SSE_STREAMS='$PERF_SSE_STREAMS' ONESHOT_PLAIN=$ONESHOT_PLAIN ONESHOT_WIDTHS='$ONESHOT_WIDTHS' \
+  CPU_STREAMS='$CPU_STREAMS' sh -s" <<'REMOTE'
 set -u
 chmod +x $D/*-server $D/client
 echo "== host =="
@@ -270,7 +278,7 @@ r=1
 while [ $r -le $PERF_ROUNDS ]; do
   rotate $r
   for arm in $ORDER; do
-    for S in $SSE_LOW $SSE_HIGH; do
+    for S in $PERF_SSE_STREAMS; do
       start_srv $arm $EXECUTORS
       if [ -n "$SRV_PORT" ]; then
         out=$(timeout 180 $D/client -url https://127.0.0.1:$SRV_PORT/sse -streams $S \
@@ -281,12 +289,11 @@ while [ $r -le $PERF_ROUNDS ]; do
       stop_srv
     done
 
-    oneshot $arm $EXECUTORS $ONESHOT_N
-    oneshot $arm $WIDE_EXECUTORS $ONESHOT_WIDE_N
-    if [ "$ONESHOT_LAT" = 1 ]; then
-      oneshot_lat $arm $EXECUTORS $ONESHOT_N
-      oneshot_lat $arm $WIDE_EXECUTORS $ONESHOT_WIDE_N
-    fi
+    for W in $ONESHOT_WIDTHS; do
+      if [ "$W" = "$EXECUTORS" ]; then N=$ONESHOT_N; else N=$ONESHOT_WIDE_N; fi
+      [ "$ONESHOT_PLAIN" = 1 ] && oneshot $arm $W $N
+      [ "$ONESHOT_LAT" = 1 ] && oneshot_lat $arm $W $N
+    done
   done
   r=$((r+1))
 done
@@ -334,7 +341,7 @@ c=1
 while [ $c -le $CPU_ROUNDS ]; do
   rotate $c
   for arm in $ORDER; do
-    for S in $SSE_LOW $SSE_HIGH; do
+    for S in $CPU_STREAMS; do
       start_srv $arm $EXECUTORS
       if [ -n "$SRV_PORT" ]; then
         line=$(timeout 180 $D/client -url https://127.0.0.1:$SRV_PORT/sse -streams $S \

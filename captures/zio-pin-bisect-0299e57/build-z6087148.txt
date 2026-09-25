@@ -1,0 +1,6 @@
+warning: overwriting existing dependency named 'zio'
+macos-sdk: no rejected SDK to probe
+arm z6087148: base=treeB src=git+https://github.com/lalinsky/zio#608714846b8911c77947338a845e2fc299ec8230
+arm z6087148: zio-0.18.0-xHbVVCoOKgAGgWWhes-P-8Gp5O1gtVvcNBWqmMO-kn3A
+arm z6087148: pub const scheduling: []const u8 = "work_stealing";
+arm z6087148: sha256=7be071883df13a133cdead64c60d153ae22e88701367296e410c48a1443a7baf
