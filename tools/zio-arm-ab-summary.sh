@@ -17,10 +17,11 @@
 # succeeded. A row without that line cannot prove it did the work, so it is
 # excluded and counted, not read as a rate.
 #
-# With EXACTLY two arms, a paired section follows: for each metric, each
-# round's value per arm and the ratio second/first (arm order is first-seen,
-# which is the ARMS order), then the median and range of those per-round
-# ratios. Rounds are paired because they ran back to back; the ratio range is
+# With two arms, a paired section follows: for each metric, each round's value
+# per arm and the ratio second/first (arm order is first-seen, which is the
+# ARMS order), then the median and range of those per-round ratios. With more
+# arms, REF=<arm> names the reference and every other arm is paired with it
+# (`REF=WS tools/zio-arm-ab-summary.sh rows.txt`). Rounds are paired because they ran back to back; the ratio range is
 # what an A/A run's range is compared against. CPU pairs are in clock ticks
 # per million delivered events, the unit t-1061 used.
 #
@@ -74,6 +75,18 @@ $3 ~ /^oneshot-(lat-)?e[0-9]+$/ && /req\/s/ {
   }
 }
 $3 ~ /^oneshot-(lat-)?e[0-9]+$/ && /WEDGE-OR-FAIL/ { k = $1 SUBSEP arm SUBSEP $3; note(k); wedged[k] = 1 }
+# One-connection one-shot rows (phase 4): the Go client prints ok, err and
+# rps; a row with any err, or no ok, is unproven like a failed h2load row.
+$3 ~ /^oneconn-e[0-9]+$/ {
+  k = $1 SUBSEP arm SUBSEP $3; note(k); req_total[k] = 0
+  for (i = 1; i <= NF; i++) {
+    if ($i ~ /^ok=/)  { val = $i; sub(/^ok=/, "", val);  req_ok[k] = val + 0; req_total[k] += val + 0 }
+    if ($i ~ /^err=/) { val = $i; sub(/^err=/, "", val); req_total[k] += val + 0 }
+    if ($i ~ /^rps=/) { val = $i; sub(/^rps=/, "", val); rps[k] = val + 0 }
+    if ($i ~ /^p50=/) { val = $i; sub(/^p50=/, "", val); p50[k] = tous(val) }
+    if ($i ~ /^p99=/) { val = $i; sub(/^p99=/, "", val); p99[k] = tous(val) }
+  }
+}
 
 $3 ~ /^cpu[0-9]+$/ {
   k = $1 SUBSEP arm SUBSEP $3; note(k)
@@ -84,7 +97,7 @@ $3 ~ /^cpu[0-9]+$/ {
     if ($i ~ /^failed=/) { val = $i; sub(/^failed=/, "", val); fail[k] = val + 0 }
   }
 }
-$3 == "burst" {
+$1 ~ /^b[0-9]+$/ && $3 == "burst" {
   burst_n[arm]++
   if ($4 == "FAIL") burst_fail[arm]++
   for (i = 1; i <= NF; i++) {
@@ -99,7 +112,7 @@ END {
     g = a SUBSEP m
     if (!(g in seeng)) { seeng[g] = 1; groups[++ng] = g }
     k = rkeys[i]; rd = p[1]
-    if (m ~ /^oneshot/) {
+    if (m ~ /^one(shot|conn)/) {
       if (k in wedged) { gw[g]++ ; continue }
       if (!(k in req_ok) || req_ok[k] != req_total[k] || req_ok[k] == 0 || non200[k] > 0) { gbad[g]++; continue }
       if (k in rps) { gn[g]++; gv[g, gn[g]] = rps[k]; pair(rd, m " rps", a, rps[k]) }
@@ -131,10 +144,10 @@ END {
     if (n > 0) {
       for (j = 1; j <= n; j++) v[j] = gv[groups[i], j]
       lo = v[1]; hi = v[1]; for (j = 1; j <= n; j++) { if (v[j] < lo) lo = v[j]; if (v[j] > hi) hi = v[j] }
-      unit = (m ~ /^oneshot/) ? " req/s" : ((m ~ /^cpu/) ? " cpu-us/ev" : " p50us")
+      unit = (m ~ /^one(shot|conn)/) ? " req/s" : ((m ~ /^cpu/) ? " cpu-us/ev" : " p50us")
       if (m ~ /^cpu/) printf "%-9s %-16s %12.3f %5d %-19s %s\n", a, m unit, med(v, n), n, sprintf("%.3f-%.3f", lo, hi), (gfail[groups[i]] + 0) " fail-closed"
       else printf "%-9s %-16s %12.0f %5d %-19s %s\n", a, m unit, med(v, n), n, sprintf("%.0f-%.0f", lo, hi), \
-        (m ~ /^oneshot/ ? (gw[groups[i]] + 0) " wedged " (gbad[groups[i]] + 0) " unproven" : (gfail[groups[i]] + 0) " fail-closed")
+        (m ~ /^one(shot|conn)/ ? (gw[groups[i]] + 0) " wedged " (gbad[groups[i]] + 0) " unproven" : (gfail[groups[i]] + 0) " fail-closed")
     }
     if (g5n[groups[i]] + 0 > 0) {
       n = g5n[groups[i]]; for (j = 1; j <= n; j++) v[j] = g5v[groups[i], j]
@@ -159,24 +172,30 @@ END {
     if (burst_n[a] + 0 == 0) continue
     printf "%-9s %8d %8d %s\n", a, burst_fail[a] + 0, burst_n[a] + 0, (ovmoved[a] + 0) "/" (stmoved[a] + 0)
   }
-  if (npa != 2) exit 0
-  a1 = parms[1]; a2 = parms[2]
-  print ""
-  print "paired rounds, ratio = " a2 "/" a1 ":"
-  for (i = 1; i <= nm; i++) {
-    mt = metrics[i]; n = 0
-    print mt
-    for (j = 1; j <= mrn[mt]; j++) {
-      rd = mr[mt, j]
-      if (((mt, rd, a1) in pv) && ((mt, rd, a2) in pv) && pv[mt, rd, a1] > 0) {
-        n++; x1[n] = pv[mt, rd, a1]; x2[n] = pv[mt, rd, a2]; rt[n] = x2[n] / x1[n]
-        printf "  %-5s %s=%.1f %s=%.1f ratio=%.3f\n", rd, a1, x1[n], a2, x2[n], rt[n]
-      } else printf "  %-5s unpaired (one arm row excluded)\n", rd
+  if (npa < 2) exit 0
+  if (npa > 2 && ref == "") exit 0
+  if (ref == "") ref = parms[1]
+  if (!(ref in seenpa)) { print "REF=" ref " is not an arm in these rows" > "/dev/stderr"; exit 1 }
+  for (q = 1; q <= npa; q++) {
+    a1 = ref; a2 = parms[q]
+    if (a2 == a1) continue
+    print ""
+    print "paired rounds, ratio = " a2 "/" a1 ":"
+    for (i = 1; i <= nm; i++) {
+      mt = metrics[i]; n = 0
+      print mt
+      for (j = 1; j <= mrn[mt]; j++) {
+        rd = mr[mt, j]
+        if (((mt, rd, a1) in pv) && ((mt, rd, a2) in pv) && pv[mt, rd, a1] > 0) {
+          n++; x1[n] = pv[mt, rd, a1]; x2[n] = pv[mt, rd, a2]; rt[n] = x2[n] / x1[n]
+          printf "  %-5s %s=%.1f %s=%.1f ratio=%.3f\n", rd, a1, x1[n], a2, x2[n], rt[n]
+        } else printf "  %-5s unpaired (one arm row excluded)\n", rd
+      }
+      if (n == 0) continue
+      lo = rt[1]; hi = rt[1]; for (j = 1; j <= n; j++) { if (rt[j] < lo) lo = rt[j]; if (rt[j] > hi) hi = rt[j] }
+      printf "  pairs=%d median %s=%.1f %s=%.1f ratio-of-medians=%.3f per-round-ratio median=%.3f range=%.3f-%.3f\n", \
+        n, a1, med(x1, n), a2, med(x2, n), med(x2, n) / med(x1, n), med(rt, n), lo, hi
     }
-    if (n == 0) continue
-    lo = rt[1]; hi = rt[1]; for (j = 1; j <= n; j++) { if (rt[j] < lo) lo = rt[j]; if (rt[j] > hi) hi = rt[j] }
-    printf "  pairs=%d median %s=%.1f %s=%.1f ratio-of-medians=%.3f per-round-ratio median=%.3f range=%.3f-%.3f\n", \
-      n, a1, med(x1, n), a2, med(x2, n), med(x2, n) / med(x1, n), med(rt, n), lo, hi
   }
 }
-' "$@"
+' ref="${REF:-}" "$@"

@@ -1,0 +1,43 @@
+macos-sdk: no rejected SDK to probe
+arm WS: src=pinned in 1080022 build.zig.zon
+arm WS: zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e
+arm WS: pub const scheduling: []const u8 = "work_stealing";
+arm WS: sha256=73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915
+macos-sdk: no rejected SDK to probe
+arm P: src=pinned in 1080022 build.zig.zon
+arm P: zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e
+arm P: pub const scheduling: []const u8 = "pinned";
+arm P: sha256=dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806
+warning: overwriting existing dependency named 'zio'
+macos-sdk: no rejected SDK to probe
+arm WSN: src=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/zio-718n.tar.gz
+arm WSN: zio-0.18.0-xHbVVIaiKgDezISI3ldxsInJLXvTstkunFphdkji2nYl
+arm WSN: pub const scheduling: []const u8 = "work_stealing";
+arm WSN: sha256=1cb4a7d3eaefb9bc07b26ffd5780e6dc6e1bf010c788cd04e4ef6c511deff5b5
+warning: overwriting existing dependency named 'zio'
+macos-sdk: no rejected SDK to probe
+arm WSR: src=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/zio-unpeek.tar.gz
+arm WSR: zio-0.18.0-xHbVVEehKgCA0PPlDAplcjzt0fPkDMtZDixIh7_9iD7Y
+arm WSR: pub const scheduling: []const u8 = "work_stealing";
+arm WSR: sha256=1c8a1cb1b0000e25272c1fc18577cb4e688a04a005d434c906f98c439aa3442f
+warning: overwriting existing dependency named 'zio'
+macos-sdk: no rejected SDK to probe
+arm WSI: src=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/zio-instr.tar.gz
+arm WSI: zio-0.18.0-xHbVVCejKgDbcOG_yeNlRwv1hlDiNjxZXkSgmGNLoXNu
+arm WSI: pub const scheduling: []const u8 = "work_stealing";
+arm WSI: sha256=060064be05cd9e88a7b813173741a529d523719c68aaa93ba97d3715983fc58a
+warning: overwriting existing dependency named 'zio'
+macos-sdk: no rejected SDK to probe
+arm WSIR: src=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/zio-instr-r747.tar.gz
+arm WSIR: zio-0.18.0-xHbVVOuhKgBRq92aBjtJ8HorSkOmP3U8APUm3vlgoyPK
+arm WSIR: pub const scheduling: []const u8 = "work_stealing";
+arm WSIR: sha256=7c8bd6b783955543a9865d75da17dd4f117f57b0b770942d8bd059211b4a71b5
+69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-A/bin/starh2-bench-server
+dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-P/bin/starh2-bench-server
+dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-PA/bin/starh2-bench-server
+dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-PL/bin/starh2-bench-server
+73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-WS/bin/starh2-bench-server
+060064be05cd9e88a7b813173741a529d523719c68aaa93ba97d3715983fc58a  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-WSI/bin/starh2-bench-server
+7c8bd6b783955543a9865d75da17dd4f117f57b0b770942d8bd059211b4a71b5  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-WSIR/bin/starh2-bench-server
+1cb4a7d3eaefb9bc07b26ffd5780e6dc6e1bf010c788cd04e4ef6c511deff5b5  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-WSN/bin/starh2-bench-server
+1c8a1cb1b0000e25272c1fc18577cb4e688a04a005d434c906f98c439aa3442f  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/bins/out-WSR/bin/starh2-bench-server
