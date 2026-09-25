@@ -1127,7 +1127,7 @@ const Connection = struct {
     tickets: ticket_table.TicketTable = undefined,
     /// Indexed parallel to handlers; only valid while slot.in_use.
     handler_joins: []?zio.JoinHandle(void) = &.{},
-    handshake_deadline: ?std.Io.Timestamp = null,
+    preface_deadline: ?std.Io.Timestamp = null,
     /// Connection-local outbound/request reservations — actor applies write acks under atomics.
     outbound_held: std.atomic.Value(usize) = .init(0),
     pending_outbound_held: std.atomic.Value(usize) = .init(0),
@@ -2449,10 +2449,6 @@ const Connection = struct {
         return next;
     }
 
-    fn waitTimer(timeout: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
-        return timeout.sleep(io);
-    }
-
     fn traceParkSnapshot(self: *Connection) void {
         const acc: usize = 0;
         const complete = false;
@@ -2794,12 +2790,12 @@ const Connection = struct {
     /// The actor. One task, one connection, from first byte to close.
     ///
     /// ## Startup sequence
-    /// 1. TLS, if any: handshake on the actor's handshake subtask, which
-    ///    reads the socket itself (BoringSSL over memory BIOs; no HTTP/2
-    ///    yet). Drain leftover plaintext (a pipelined preface) into Session,
-    ///    then arm the CQ driver on this same task: sole SSL_read/SSL_write
-    ///    owner and sole socket reader from here on; flush is SSL_write +
-    ///    BIO_read + NetSend.
+    /// 1. TLS, if any: the handshake already ran on this same task, in
+    ///    `Server.serveTlsThenBranch`, which hands over `tls_ready` and the
+    ///    leftover plaintext (a pipelined preface). Ingest that into
+    ///    Session, then arm the CQ driver: sole SSL_read/SSL_write owner and
+    ///    sole socket reader from here on; flush is SSL_write + BIO_read +
+    ///    NetSend.
     /// 2. h2c: spawn ReadPump and WritePump on the raw socket.
     /// 3. Flush the server preface that `Session.init` already queued.
     /// 4. For h2c, wait for the client preface under the preface deadline.
@@ -2886,23 +2882,19 @@ const Connection = struct {
         }
 
         if (self.config.mode == .tls) {
-            if (self.config.tls_ready) |ready| {
-                self.tls = ready;
-                if (self.config.tls_leftover.len != 0) {
-                    self.lockSessionUncancelable(io);
-                    defer self.unlockSession(io);
-                    try self.session.ingest(self.config.tls_leftover);
-                    if (self.session.terminal != .none) return error.ConnectionClosed;
-                }
-                if (self.handshake_held) {
-                    if (self.config.accounting) |a| a.releaseHandshake();
-                    self.handshake_held = false;
-                }
-            } else {
-                try self.prepareTls();
-                // Handshake first: the actor-side handshake subtask reads the
-                // socket itself now; no read task exists before the driver.
-                try self.handshakeTls();
+            // One handshake site, `Server.serveTlsThenBranch`: it must pick
+            // HTTP/2 or HTTP/1.1 from ALPN before a Connection exists.
+            self.tls = self.config.tls_ready orelse
+                @panic("tls mode needs tls_ready: the handshake runs in Server.serveTlsThenBranch");
+            if (self.config.tls_leftover.len != 0) {
+                self.lockSessionUncancelable(io);
+                defer self.unlockSession(io);
+                try self.session.ingest(self.config.tls_leftover);
+                if (self.session.terminal != .none) return error.ConnectionClosed;
+            }
+            if (self.handshake_held) {
+                if (self.config.accounting) |a| a.releaseHandshake();
+                self.handshake_held = false;
             }
             tls_pump = .{
                 .io = io,
@@ -2990,7 +2982,7 @@ const Connection = struct {
 
         if (close_probe) diagRawPrint("t1002 conn={x} sess={x} start peer={d} parked={d}\n", .{ @intFromPtr(self), @intFromPtr(&self.session), closeProbePeerPort(self.stream.socket.handle), close_probe_parked.load(.acquire) });
         if (self.config.mode == .h2c) {
-            self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
+            self.preface_deadline = std.Io.Timestamp.fromNanoseconds(
                 @as(i96, nowNs(io) +% self.config.limits.preface_timeout_ns),
             );
             try self.waitH2cPreface();
@@ -3185,10 +3177,10 @@ const Connection = struct {
 
     fn receiveUntilDeadline(self: *Connection) !wire_pump.WireChunk {
         const io = self.config.io;
-        const timeout: zio.Timeout = if (self.handshake_deadline) |deadline| blk: {
+        const timeout: zio.Timeout = if (self.preface_deadline) |deadline| blk: {
             const deadline_ns: u64 = @intCast(deadline.nanoseconds);
             const now = nowNs(io);
-            if (now >= deadline_ns) return error.TlsHandshakeTimeout;
+            if (now >= deadline_ns) return error.PrefaceTimeout;
             break :blk .{ .duration = .fromNanoseconds(deadline_ns - now) };
         } else .none;
         const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
@@ -3200,81 +3192,8 @@ const Connection = struct {
         return switch (winner) {
             .read => |result| result catch error.ConnectionClosed,
             .shutdown => error.ConnectionClosed,
-            .timer => error.TlsHandshakeTimeout,
+            .timer => error.PrefaceTimeout,
         };
-    }
-
-    /// Handshake TLS on the actor, then ingest leftover plaintext (a client
-    /// that pipelines the h2 preface into the handshake flight). The CQ is
-    /// not armed yet, so this is the sole SSL_read; the handshake subtask
-    /// is the sole socket reader for its lifetime.
-    fn handshakeTls(self: *Connection) !void {
-        const io = self.config.io;
-        const tls_conn = self.tls orelse return error.InvalidConfig;
-
-        self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
-            @as(i96, nowNs(io) +% 5 * std.time.ns_per_s),
-        );
-        const Hs = union(enum) {
-            hs: anyerror!void,
-            timer: std.Io.Cancelable!void,
-        };
-        const Handshake = struct {
-            fn run(conn: *tls_edge.Conn, inner_io: std.Io) anyerror!void {
-                // The subtask reads the socket itself (feedFromSocket); the
-                // reader is bound on the subtask so the wait context is its
-                // own.
-                try conn.handshake(inner_io);
-            }
-        };
-        var result_buf: [2]Hs = undefined;
-        var select = std.Io.Select(Hs).init(io, &result_buf);
-        errdefer select.cancelDiscard();
-        try select.concurrent(.hs, Handshake.run, .{ tls_conn, io });
-        const timeout: std.Io.Timeout = .{ .deadline = .{
-            .raw = self.handshake_deadline.?,
-            .clock = .awake,
-        } };
-        try select.concurrent(.timer, waitTimer, .{ timeout, io });
-        const selected = try select.await();
-        defer select.cancelDiscard();
-        switch (selected) {
-            .hs => |result| try result,
-            .timer => |result| {
-                try result;
-                return error.TlsHandshakeTimeout;
-            },
-        }
-        try self.drainTlsLeftover(tls_conn);
-        self.handshake_deadline = null;
-        if (self.handshake_held) {
-            if (self.config.accounting) |a| a.releaseHandshake();
-            self.handshake_held = false;
-        }
-    }
-
-    fn prepareTls(self: *Connection) !void {
-        const acceptor = self.config.tls_acceptor orelse return error.InvalidConfig;
-        const tls_conn = try self.config.gpa.create(tls_edge.Conn);
-        errdefer self.config.gpa.destroy(tls_conn);
-        tls_conn.initTcp(self.stream);
-        errdefer tls_conn.deinit();
-        try tls_conn.setupAccept(acceptor);
-        self.tls = tls_conn;
-    }
-
-    fn drainTlsLeftover(self: *Connection, tls_conn: *tls_edge.Conn) !void {
-        var buf: [limits_mod.WIRE_CHUNK_SIZE]u8 = undefined;
-        while (true) {
-            const n = tls_conn.ssl.read(&buf) catch break;
-            if (n == 0) break;
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
-            try self.session.ingest(buf[0..n]);
-            // Do not processIntents/queueWire here: the CQ is not armed yet.
-            // Ingest only; emit after Pump.start.
-            if (self.session.terminal != .none) return error.ConnectionClosed;
-        }
     }
 
     fn recycleReadChunk(self: *Connection, chunk: wire_pump.WireChunk) void {
@@ -3290,10 +3209,7 @@ const Connection = struct {
 
     fn waitH2cPreface(self: *Connection) !void {
         while (self.session.parser.expecting_preface) {
-            const chunk = self.receiveUntilDeadline() catch |err| {
-                if (err == error.TlsHandshakeTimeout) return error.PrefaceTimeout;
-                return err;
-            };
+            const chunk = try self.receiveUntilDeadline();
             defer self.recycleReadChunk(chunk);
             if (chunk.len == 0) return error.ConnectionClosed;
             self.lockSessionUncancelable(self.config.io);
@@ -3304,7 +3220,7 @@ const Connection = struct {
                 if (self.session.terminal != .none) return error.ConnectionClosed;
             }
         }
-        self.handshake_deadline = null;
+        self.preface_deadline = null;
     }
 
     /// Claim a handler slot. Actor-only, so the linear scan needs no lock and

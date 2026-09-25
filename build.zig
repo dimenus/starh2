@@ -630,6 +630,23 @@ pub fn build(b: *std.Build) void {
     const placement_step = b.step("test-placement", "Run spawn placement gates (meaningful under -Dzio-scheduling=pinned)");
     placement_step.dependOn(&run_placement_tests.step);
 
+    const handshake_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/handshake.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_handshake_tests = b.addRunArtifact(handshake_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_handshake_tests.setCwd(b.path("."));
+    const handshake_step = b.step("test-handshake", "Run the TLS handshake timeout gate");
+    handshake_step.dependOn(&run_handshake_tests.step);
+
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/macos_sdk.zig"),
@@ -659,6 +676,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_compression_tests.step);
     test_step.dependOn(&run_deadline_tests.step);
     test_step.dependOn(&run_placement_tests.step);
+    test_step.dependOn(&run_handshake_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");

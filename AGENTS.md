@@ -92,12 +92,12 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ./zb build std-io-gate  # fails on any NEW std.Io concurrency abstraction; prints files and lines scanned
 ```
 
-**`zig build test` cannot reach the TLS edge at all.** No test binds a `tls`
-endpoint, so `handshakeTls`, `TlsPump`, and leftover-preface drain never run
-under the suite. That is measured, not assumed: an always-false assert inside
-the TLS handshake left the suite green and aborts on the first curl request.
-`tls-smoke` is therefore the only gate that covers that code, and it is in
-`ci`.
+**`zig build test` reaches only part of the TLS edge.** `tests/h1_battery.zig`
+(ALPN, HTTP/1.1 over TLS) and `tests/handshake.zig` (the handshake timeout)
+bind `tls` endpoints, so the server handshake runs under the suite: a panic in
+`tls_edge.Conn.handshake` fails both. Whether the suite reaches the HTTP/2 TLS
+`Pump` and the leftover-preface ingest has not been re-measured (t-2459).
+`tls-smoke` is the gate for that code, and it is in `ci`.
 
 It uses curl because the oracle must share no code with the stack under test;
 nghttp2 is strict about frame order and pipelines its preface, which is the
@@ -168,7 +168,9 @@ fetched boring package so zig-cc glibc headers do not -Werror memchr on
   a bounded memory pair (`BIO_new_bio_pair`); do not restore socket-coupled
   BIO callbacks. The handshake runs before the queue is armed and reads the
   socket itself (`Conn.handshake`, unbuffered so no ciphertext is left in a
-  reader buffer), in a subtask raced against a timer task.
+  reader buffer), on the connection's own task under `zio.withTimeout`
+  (`Server.handshakeWithTimeout`). Do not move it to a subtask: the loop
+  that first parks on a socket owns its reads for the fd's life.
 - Handshake leftover plaintext (a pipelined preface) is ingested on the actor
   before the queue is armed.
 - Packing stays in `emit_batch` (16 KiB concat). Do not put a record loop back
