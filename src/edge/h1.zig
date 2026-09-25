@@ -26,7 +26,8 @@ const live: u8 = 0;
 const reaper_owned: u8 = 1;
 const reported: u8 = 2;
 
-var h1_reaper_post_ok: std.atomic.Value(usize) = .init(0);
+/// Test-only: reaper completion posts for HTTP/1.1 connections, process-wide.
+pub var h1_reaper_post_ok: std.atomic.Value(usize) = .init(0);
 
 var no_shutdown_event: zio.Event = .init;
 
@@ -103,7 +104,9 @@ const H1Conn = struct {
     arena: std.heap.ArenaAllocator,
     completion_buf: [1]u31 = undefined,
     completion_ch: zio.Channel(u31) = undefined,
-    join: ?std.Io.Future(void) = null,
+    join: ?zio.JoinHandle(void) = null,
+    /// Written once by `serve` before any spawn; read by `connection.notePlacement`.
+    actor_thread: std.Thread.Id = 0,
 
     acc: parser.Accumulator = undefined,
     head: parser.Head = undefined,
@@ -213,6 +216,7 @@ pub fn serve(
         return;
     };
     defer conn.deinit();
+    if (comptime connection.placement_check) conn.actor_thread = std.Thread.getCurrentId();
     if (tls != null) startTlsPump(&conn) catch {
         return;
     };
@@ -919,12 +923,13 @@ fn dispatch(
     self.job_handler = matched.found.handler.task;
     const Job = struct {
         fn run(conn: *H1Conn) void {
+            connection.notePlacement(conn.actor_thread);
             defer finishSlotFromTask(conn);
             runTaskBody(conn);
         }
     };
     self.offload_tls_io = self.tls_pump != null;
-    const handle = self.io.concurrent(Job.run, .{self}) catch {
+    const handle = zio.spawnInto(connection.connPlacement(), Job.run, .{self}) catch {
         self.offload_tls_io = false;
         if (reaper_reserved) {
             if (self.config.accounting) |a| a.releaseReaper();
@@ -1187,7 +1192,7 @@ fn finishSlotFromTask(self: *H1Conn) void {
 fn finishSlot(self: *H1Conn) void {
     if (!self.slot.in_use) return;
     if (self.join) |*h| {
-        h.await(self.io);
+        h.join();
         self.join = null;
     }
     if (self.slot.reaper_reserved) {
@@ -1215,7 +1220,7 @@ fn cancelJoin(self: *H1Conn) bool {
                 if (queued) return true;
             }
             var h = handle;
-            h.cancel(self.io);
+            h.cancel();
             self.slot.completion_owner.store(reported, .release);
             return false;
         }
