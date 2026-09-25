@@ -1,0 +1,27 @@
+ 17:18:09 up 1 day,  6:13,  3 users,  load average: 0.36, 0.90, 1.55
+69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  /tmp/zio-openloop/A-server
+73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915  /tmp/zio-openloop/WS-server
+run1 offered=320000 t4 A n=1919996 p50us=119 p99us=348 p999us=487 finished in 7.00s, 319999.33 req/s, 13.73MB/s 
+run1 offered=320000 t4 WS n=1919996 p50us=120 p99us=368 p999us=493 finished in 7.00s, 319999.33 req/s, 13.73MB/s 
+run1 offered=320000 t8 A n=1919968 p50us=124 p99us=374 p999us=505 finished in 7.00s, 319994.67 req/s, 13.73MB/s 
+run1 offered=320000 t8 WS n=1920005 p50us=98 p99us=312 p999us=418 finished in 7.00s, 320000.83 req/s, 13.73MB/s 
+run1 offered=320000 t12 A n=1919991 p50us=83 p99us=272 p999us=467 finished in 7.00s, 319998.50 req/s, 13.73MB/s 
+run1 offered=320000 t12 WS n=1920002 p50us=95 p99us=274 p999us=354 finished in 7.00s, 320000.33 req/s, 13.73MB/s 
+run1 offered=590000 t4 A n=3540108 p50us=253 p99us=645 p999us=771 finished in 7.00s, 590018.00 req/s, 25.32MB/s 
+run1 offered=590000 t4 WS n=3540052 p50us=356 p99us=836 p999us=984 finished in 7.00s, 590008.67 req/s, 25.32MB/s 
+run1 offered=590000 t8 A n=3540002 p50us=275 p99us=787 p999us=1012 finished in 7.00s, 590000.33 req/s, 25.32MB/s 
+run1 offered=590000 t8 WS n=3540005 p50us=241 p99us=642 p999us=783 finished in 7.00s, 590000.83 req/s, 25.32MB/s 
+run1 offered=590000 t12 A n=3540012 p50us=257 p99us=675 p999us=790 finished in 7.00s, 590002.00 req/s, 25.32MB/s 
+run1 offered=590000 t12 WS n=3540083 p50us=186 p99us=585 p999us=698 finished in 7.00s, 590013.83 req/s, 25.32MB/s 
+run2 offered=320000 t4 A n=1919999 p50us=73 p99us=236 p999us=344 finished in 7.00s, 319999.83 req/s, 13.73MB/s 
+run2 offered=320000 t4 WS n=1920069 p50us=191 p99us=480 p999us=604 finished in 7.00s, 320011.50 req/s, 13.73MB/s 
+run2 offered=320000 t8 A n=1919973 p50us=88 p99us=261 p999us=382 finished in 7.00s, 319995.50 req/s, 13.73MB/s 
+run2 offered=320000 t8 WS n=1919975 p50us=71 p99us=242 p999us=361 finished in 7.00s, 319995.83 req/s, 13.73MB/s 
+run2 offered=320000 t12 A n=1919990 p50us=77 p99us=250 p999us=326 finished in 7.00s, 319998.33 req/s, 13.73MB/s 
+run2 offered=320000 t12 WS n=1920012 p50us=100 p99us=290 p999us=411 finished in 7.00s, 320002.00 req/s, 13.73MB/s 
+run2 offered=590000 t4 A n=3541509 p50us=275 p99us=759 p999us=896 finished in 7.00s, 590251.50 req/s, 25.33MB/s 
+run2 offered=590000 t4 WS n=3539979 p50us=290 p99us=684 p999us=834 finished in 7.00s, 589996.50 req/s, 25.32MB/s 
+run2 offered=590000 t8 A n=3539962 p50us=277 p99us=752 p999us=881 finished in 7.00s, 589993.67 req/s, 25.32MB/s 
+run2 offered=590000 t8 WS n=3540037 p50us=284 p99us=752 p999us=924 finished in 7.00s, 590006.17 req/s, 25.32MB/s 
+run2 offered=590000 t12 A n=3539990 p50us=176 p99us=538 p999us=658 finished in 7.00s, 589998.33 req/s, 25.32MB/s 
+run2 offered=590000 t12 WS n=3540069 p50us=169 p99us=506 p999us=668 finished in 7.00s, 590011.50 req/s, 25.32MB/s 

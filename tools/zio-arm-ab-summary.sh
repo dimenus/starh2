@@ -63,7 +63,7 @@ $3 ~ /^sse[0-9]+$/ && /sse latency/ {
     if ($i ~ /^p99=/) { val = $i; sub(/^p99=/, "", val); p99[k] = tous(val) }
   }
 }
-$3 ~ /^oneshot-(lat-)?e[0-9]+$/ && /req\/s/ {
+$3 ~ /^(oneshot-(lat-)?|open[0-9]+k-)e[0-9]+$/ && /req\/s/ {
   k = $1 SUBSEP arm SUBSEP $3; note(k)
   for (i = 1; i <= NF; i++) {
     if ($(i+1) == "req/s,") { val = $i; sub(/,$/, "", val); rps[k] = val + 0 }
@@ -71,10 +71,12 @@ $3 ~ /^oneshot-(lat-)?e[0-9]+$/ && /req\/s/ {
     if ($(i+1) == "succeeded,") req_ok[k] = $i + 0
     if ($i ~ /^p50us=/) { val = $i; sub(/^p50us=/, "", val); p50[k] = val + 0 }
     if ($i ~ /^p99us=/) { val = $i; sub(/^p99us=/, "", val); p99[k] = val + 0 }
+    if ($i ~ /^p999us=/) { val = $i; sub(/^p999us=/, "", val); p999[k] = val + 0 }
+    if ($i ~ /^offered=/) { val = $i; sub(/^offered=/, "", val); offered[k] = val + 0 }
     if ($i ~ /^non200=/) { val = $i; sub(/^non200=/, "", val); non200[k] = val + 0 }
   }
 }
-$3 ~ /^oneshot-(lat-)?e[0-9]+$/ && /WEDGE-OR-FAIL/ { k = $1 SUBSEP arm SUBSEP $3; note(k); wedged[k] = 1 }
+$3 ~ /^(oneshot-(lat-)?|open[0-9]+k-)e[0-9]+$/ && /WEDGE-OR-FAIL/ { k = $1 SUBSEP arm SUBSEP $3; note(k); wedged[k] = 1 }
 # One-connection one-shot rows (phase 4): the Go client prints ok, err and
 # rps; a row with any err, or no ok, is unproven like a failed h2load row.
 $3 ~ /^oneconn-e[0-9]+$/ {
@@ -112,14 +114,18 @@ END {
     g = a SUBSEP m
     if (!(g in seeng)) { seeng[g] = 1; groups[++ng] = g }
     k = rkeys[i]; rd = p[1]
-    if (m ~ /^one(shot|conn)/) {
+    if (m ~ /^(one(shot|conn)|open)/) {
       if (k in wedged) { gw[g]++ ; continue }
       if (!(k in req_ok) || req_ok[k] != req_total[k] || req_ok[k] == 0 || non200[k] > 0) { gbad[g]++; continue }
-      if (k in rps) { gn[g]++; gv[g, gn[g]] = rps[k]; pair(rd, m " rps", a, rps[k]) }
+      # An open-loop row whose server fell behind the offered rate measured
+      # a different load; it is counted, not averaged in.
+      if ((k in offered) && rps[k] < 0.98 * offered[k]) { gbehind[g]++; continue }
+      if (k in rps) { gn[g]++; gv[g, gn[g]] = rps[k]; if (!(k in offered)) pair(rd, m " rps", a, rps[k]) }
       if (k in p50) {
         g9n[g]++; g9v[g, g9n[g]] = p99[k]; g5n[g]++; g5v[g, g5n[g]] = p50[k]
         pair(rd, m " p50us", a, p50[k]); pair(rd, m " p99us", a, p99[k])
       }
+      if (k in p999) { g3n[g]++; g3v[g, g3n[g]] = p999[k]; pair(rd, m " p999us", a, p999[k]) }
       continue
     }
     if (m ~ /^cpu/) {
@@ -144,10 +150,10 @@ END {
     if (n > 0) {
       for (j = 1; j <= n; j++) v[j] = gv[groups[i], j]
       lo = v[1]; hi = v[1]; for (j = 1; j <= n; j++) { if (v[j] < lo) lo = v[j]; if (v[j] > hi) hi = v[j] }
-      unit = (m ~ /^one(shot|conn)/) ? " req/s" : ((m ~ /^cpu/) ? " cpu-us/ev" : " p50us")
+      unit = (m ~ /^(one(shot|conn)|open)/) ? " req/s" : ((m ~ /^cpu/) ? " cpu-us/ev" : " p50us")
       if (m ~ /^cpu/) printf "%-9s %-16s %12.3f %5d %-19s %s\n", a, m unit, med(v, n), n, sprintf("%.3f-%.3f", lo, hi), (gfail[groups[i]] + 0) " fail-closed"
       else printf "%-9s %-16s %12.0f %5d %-19s %s\n", a, m unit, med(v, n), n, sprintf("%.0f-%.0f", lo, hi), \
-        (m ~ /^one(shot|conn)/ ? (gw[groups[i]] + 0) " wedged " (gbad[groups[i]] + 0) " unproven" : (gfail[groups[i]] + 0) " fail-closed")
+        (m ~ /^(one(shot|conn)|open)/ ? (gw[groups[i]] + 0) " wedged " (gbad[groups[i]] + 0) " unproven " (gbehind[groups[i]] + 0) " behind-offered" : (gfail[groups[i]] + 0) " fail-closed")
     }
     if (g5n[groups[i]] + 0 > 0) {
       n = g5n[groups[i]]; for (j = 1; j <= n; j++) v[j] = g5v[groups[i], j]
@@ -158,6 +164,11 @@ END {
       n = g9n[groups[i]]; for (j = 1; j <= n; j++) v[j] = g9v[groups[i], j]
       lo = v[1]; hi = v[1]; for (j = 1; j <= n; j++) { if (v[j] < lo) lo = v[j]; if (v[j] > hi) hi = v[j] }
       printf "%-9s %-16s %12.0f %5d %-19s\n", a, m " p99us", med(v, n), n, sprintf("%.0f-%.0f", lo, hi)
+    }
+    if (g3n[groups[i]] + 0 > 0) {
+      n = g3n[groups[i]]; for (j = 1; j <= n; j++) v[j] = g3v[groups[i], j]
+      lo = v[1]; hi = v[1]; for (j = 1; j <= n; j++) { if (v[j] < lo) lo = v[j]; if (v[j] > hi) hi = v[j] }
+      printf "%-9s %-16s %12.0f %5d %-19s\n", a, m " p999us", med(v, n), n, sprintf("%.0f-%.0f", lo, hi)
     }
     if (gen[groups[i]] + 0 > 0) {
       n = gen[groups[i]]; for (j = 1; j <= n; j++) v[j] = gev[groups[i], j]

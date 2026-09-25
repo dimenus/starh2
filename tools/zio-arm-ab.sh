@@ -155,6 +155,21 @@ ONECONN_ARMS=${ONECONN_ARMS:-$ARMS}
 ONECONN_WIDTHS=${ONECONN_WIDTHS:-$EXECUTORS}
 ONECONN_WORKERS=${ONECONN_WORKERS:-8}
 ONECONN_SECONDS=${ONECONN_SECONDS:-5}
+# Phase 5: open-loop latency. h2load -c 50 -m 10 at saturation is a CLOSED
+# loop: 500 requests are always in flight, so its latency mostly says how the
+# queue is shaped, not how fast the server is. Here h2load offers a FIXED
+# rate (--rps is per client, so each total in OPEN_RATES is divided by 50)
+# for OPEN_SECONDS after OPEN_WARMUP, and each row records offered and
+# achieved. A row whose achieved rate is short of the offered one is an arm
+# that could not keep up; the summary reports it and leaves it out of the
+# latency medians. OPEN_CLOSED=1 also runs one saturated closed-loop latency
+# row per arm per round, so both instruments sit in one session.
+OPEN_ROUNDS=${OPEN_ROUNDS:-10}
+OPEN_RATES=${OPEN_RATES:-320000 590000}
+OPEN_SECONDS=${OPEN_SECONDS:-6}
+OPEN_WARMUP=${OPEN_WARMUP:-1}
+OPEN_THREADS=${OPEN_THREADS:-12}
+OPEN_CLOSED=${OPEN_CLOSED:-1}
 
 # Per-arm server arguments and ready-line expectations: ARGS_<arm> is appended
 # to that arm's server command line, and EXPECT_<arm>, when set, must appear in
@@ -242,6 +257,8 @@ ssh "$HOST" "ARMS='$ARMS' BURST_ARMS='$BURST_ARMS' ONESHOT_LAT_WIDTHS='$ONESHOT_
   CHECK_SECONDS=$CHECK_SECONDS PROC_MAX_CORES=$PROC_MAX_CORES HOST_BLOCK_RE='$HOST_BLOCK_RE' \
   ONECONN_ROUNDS=$ONECONN_ROUNDS ONECONN_ARMS='$ONECONN_ARMS' ONECONN_WIDTHS='$ONECONN_WIDTHS' \
   ONECONN_WORKERS=$ONECONN_WORKERS ONECONN_SECONDS=$ONECONN_SECONDS \
+  OPEN_ROUNDS=$OPEN_ROUNDS OPEN_RATES='$OPEN_RATES' OPEN_SECONDS=$OPEN_SECONDS \
+  OPEN_WARMUP=$OPEN_WARMUP OPEN_THREADS=$OPEN_THREADS OPEN_CLOSED=$OPEN_CLOSED \
   PERF_ROUNDS=$PERF_ROUNDS BURST_ROUNDS=$BURST_ROUNDS CPU_ROUNDS=$CPU_ROUNDS \
   SECONDS_RUN=$SECONDS_RUN INTERVAL=$INTERVAL EXECUTORS=$EXECUTORS \
   WIDE_EXECUTORS=$WIDE_EXECUTORS ONESHOT_N=$ONESHOT_N ONESHOT_WIDE_N=$ONESHOT_WIDE_N \
@@ -348,7 +365,17 @@ start_srv() {
 }
 stop_srv() { kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null; }
 
-# rotate an arm list (default ARMS) by (round-1) so each arm takes every slot
+# rotate an arm list (default ARMS) by (round-1) so each arm takes every slot.
+#
+# With more than two arms, a pure rotation keeps every arm's neighbours: of
+# two adjacent arms, one runs first in all but one round in n. So rounds come
+# in blocks of n: the first block runs the n rotations forwards, the second
+# runs the same n rotations backwards, and so on. Over 2n rounds every ordered
+# pair then runs n times each way and every arm sits in every slot twice.
+# (Reversing on even rounds instead is balanced only for odd n: for even n,
+# forward rounds always get even rotations. That version ran one session,
+# captures/zio-openloop-0299e57/balanced-rows.txt.) Two arms need no
+# reversal: rotating by one already swaps them.
 rotate() {
   R=$1; LIST=${2:-$ARMS}; set -- $LIST; n=$#; k=$(( (R - 1) % n )); i=0; ORDER=""
   while [ $i -lt $n ]; do
@@ -356,6 +383,9 @@ rotate() {
     for a in $LIST; do [ $j -eq $idx ] && ORDER="$ORDER $a"; j=$((j+1)); done
     i=$((i+1))
   done
+  if [ $n -gt 2 ] && [ $(( ((R - 1) / n) % 2 )) -eq 1 ]; then
+    rev=""; for a in $ORDER; do rev="$a $rev"; done; ORDER=$rev
+  fi
 }
 
 # One h2load one-shot run. The `requests:` line is kept whole, so a row shows
@@ -375,14 +405,21 @@ oneshot() {
 
 # The same run with a per-request log, for latency. Column 2 is the status
 # (-1 for a failed stream), column 3 the microseconds to end of response.
+# h2load APPENDS to an existing log file, so it is deleted before every run.
 oneshot_lat() {
   ARM=$1; EXEC=$2; N=$3
+  h2lat $ARM $EXEC "oneshot-lat-e$EXEC" "" -n $N -c 50 -m 10 -t 4
+}
+
+# h2lat <arm> <executors> <label> <extra row text> <h2load args...>
+h2lat() {
+  ARM=$1; EXEC=$2; LABEL=$3; EXTRA=$4; shift 4
   start_srv $ARM $EXEC
   if [ -n "$SRV_PORT" ]; then
     rm -f $D/lat.tsv
-    out=$(timeout 180 "$H2LOAD" -n $N -c 50 -m 10 -t 4 --log-file=$D/lat.tsv https://127.0.0.1:$SRV_PORT/ 2>&1)
+    out=$(timeout 180 "$H2LOAD" "$@" --log-file=$D/lat.tsv https://127.0.0.1:$SRV_PORT/ 2>&1)
     rc=$?
-    if [ $rc -ne 0 ]; then echo "r$r $ARM oneshot-lat-e$EXEC WEDGE-OR-FAIL rc=$rc"
+    if [ $rc -ne 0 ]; then echo "r$r $ARM $LABEL WEDGE-OR-FAIL rc=$rc"
     else
       non200=$(awk -F'\t' '$2 != 200' $D/lat.tsv | wc -l)
       pct=$(awk -F'\t' '$2 == 200 {print $3}' $D/lat.tsv | sort -n | awk '
@@ -391,7 +428,8 @@ oneshot_lat() {
           if (NR == 0) { print "n=0"; exit }
           i50 = int(NR * 0.50); if (i50 < 1) i50 = 1
           i99 = int(NR * 0.99); if (i99 < 1) i99 = 1
-          printf "n=%d p50us=%d p99us=%d maxus=%d", NR, a[i50], a[i99], a[NR]
+          i999 = int(NR * 0.999); if (i999 < 1) i999 = 1
+          printf "n=%d p50us=%d p99us=%d p999us=%d maxus=%d", NR, a[i50], a[i99], a[i999], a[NR]
         }')
       thr=""
       if [ "$THREAD_CPU" = 1 ]; then
@@ -399,7 +437,7 @@ oneshot_lat() {
         # utime and stime are then fields 12 and 13.
         thr=" threads=$(for t in /proc/$SRV_PID/task/*; do sed 's/^.*) //' $t/stat 2>/dev/null | awk '{print $12+$13}'; done | sort -rn | tr '\n' ',' | sed 's/,$//')"
       fi
-      echo "r$r $ARM oneshot-lat-e$EXEC $pct non200=$non200$thr $(echo "$out" | grep -E 'finished in|requests:' | tr '\n' ' ')"
+      echo "r$r $ARM $LABEL $pct non200=$non200$thr$EXTRA $(echo "$out" | grep -E 'finished in|requests:' | tr '\n' ' ')"
     fi
     rm -f $D/lat.tsv
     rows=$((rows+1))
@@ -528,6 +566,25 @@ while [ $q -le $ONECONN_ROUNDS ]; do
     done
   done
   q=$((q+1))
+done
+fi
+
+if has_phase 5; then
+host_check "phase 5"
+echo "== phase 5: open-loop latency at $EXECUTORS executors, offered totals: $OPEN_RATES =="
+r=1
+while [ $r -le $OPEN_ROUNDS ]; do
+  round_check "open round $r"
+  rotate $r
+  for arm in $ORDER; do
+    for total in $OPEN_RATES; do
+      per=$((total / 50))
+      h2lat $arm $EXECUTORS "open$((total / 1000))k-e$EXECUTORS" " offered=$((per * 50))" \
+        -c 50 -m 10 -t $OPEN_THREADS --rps=$per -D $OPEN_SECONDS --warm-up-time $OPEN_WARMUP
+    done
+    [ "$OPEN_CLOSED" = 1 ] && oneshot_lat $arm $EXECUTORS $ONESHOT_N
+  done
+  r=$((r+1))
 done
 fi
 
