@@ -227,7 +227,6 @@ fn withRuntime(comptime func: anytype) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{
         .executors = .exact(2),
-        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(func, .{ rt, gpa });

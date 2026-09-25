@@ -28,7 +28,7 @@ const reported: u8 = 2;
 
 var h1_reaper_post_ok: std.atomic.Value(usize) = .init(0);
 
-var no_shutdown_event: zio.ResetEvent = .init;
+var no_shutdown_event: zio.Event = .init;
 
 pub const ChannelMutation = enum {
     none,
@@ -791,7 +791,7 @@ fn waitTimer(timeout: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
     return timeout.sleep(io);
 }
 
-fn waitShutdown(ev: *zio.ResetEvent, io: std.Io) std.Io.Cancelable!void {
+fn waitShutdown(ev: *zio.Event, io: std.Io) std.Io.Cancelable!void {
     _ = io;
     ev.wait() catch return error.Canceled;
 }

@@ -29,10 +29,10 @@ would need the same conformance and security work as the paths that are used.
 - Zig 0.16.0 (pinned; the TLS dependency is not source-compatible with 0.17-dev)
 - For TLS, a certificate and key in PEM form
 - curl built with HTTP/2, to run the TLS gate
-- With more than one zio executor, set `enable_task_migration = false`. The
-  pinned zio can otherwise strand a migrated socket task under repeated TLS
-  connection churn while readable and writable bytes remain queued in the
-  kernel.
+- Your zio dependency built with the same `.scheduling` as starh2's
+  `-Dzio-scheduling` (default `.work_stealing`). zio fixes scheduling at
+  compile time, and two different values give two zio modules in one build,
+  which fails to compile (`file exists in modules 'zio' and 'zio0'`).
 
 ## Install
 
@@ -48,8 +48,10 @@ exe_mod.addImport("starh2", starh2.module("starh2"));
 
 // `Server.init` takes a `std.Io`. zio provides one, and it is the
 // implementation starh2 is built and tested against. Declare it yourself, so
-// starh2's pin of zio is not forced on you.
-const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+// starh2's pin of zio is not forced on you. `.scheduling` must equal the
+// `zio-scheduling` option starh2 is built with (default `.work_stealing`):
+// a mismatch gives two zio modules, and the build fails to compile.
+const zio = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .work_stealing });
 exe_mod.addImport("zio", zio.module("zio"));
 ```
 

@@ -567,10 +567,6 @@ const Args = struct {
     trace: bool = false,
     trace_every: u64 = 1024,
     executors: ?u8 = null,
-    // Default ON since the two-OS t-853 gate: both 60-round stall runs were
-    // clean with migration on, and migration off is the home of the bimodal
-    // placement bands. --no-task-migration keeps the A/B arm reachable.
-    task_migration: bool = true,
     // A/B knob (zio fork announce-ab): whether a wake from a running task
     // onto an empty ring wakes a parked executor. Needs a zio pin that
     // exports `setAnnounceRunningWakes`; the flag fails loud otherwise.
@@ -605,10 +601,6 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.trace_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--executors")) {
             out.executors = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
-        } else if (std.mem.eql(u8, a, "--task-migration")) {
-            out.task_migration = true;
-        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
-            out.task_migration = false;
         } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
             out.announce_running_wakes = true;
         } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
@@ -632,7 +624,6 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 
 const RuntimeArgs = struct {
     executors: ?u8 = null,
-    task_migration: bool = true,
     announce_running_wakes: bool = true,
     batch_wake_sleepers: bool = true,
 };
@@ -647,10 +638,6 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
             const n = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidExecutorCount;
             out.executors = n;
-        } else if (std.mem.eql(u8, a, "--task-migration")) {
-            out.task_migration = true;
-        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
-            out.task_migration = false;
         } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
             out.announce_running_wakes = true;
         } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
@@ -964,10 +951,6 @@ pub fn main(init: std.process.Init) !void {
             .prewarm = 256,
         },
         .executors = .exact(if (runtime_args.executors) |n| n else starh2.physical_cpus.executorCount()),
-        // zio a2b134a can strand a migrated socket task while both directions
-        // have queued kernel data. Keep I/O tasks on their home executor; the
-        // opt-in flag exists only to preserve the upstream reproducer.
-        .enable_task_migration = runtime_args.task_migration,
     });
     defer rt.deinit();
     // The knob is a process-wide switch in the zio fork (announce-ab); a pin

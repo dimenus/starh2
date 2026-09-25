@@ -19,7 +19,7 @@
 //! # Two shutdown signals, not one
 //!
 //! `shutdown_flag` is what a loop polls; `shutdown_event` is what a parked task
-//! waits on (a zio.ResetEvent: set once, never reset, so the actor's select
+//! waits on (a zio.Event: set once, never reset, so the actor's select
 //! observes it race-free). Both are set together, because a connection actor
 //! may be parked in a select where a flag alone would never be observed.
 const std = @import("std");
@@ -98,7 +98,7 @@ pub const Server = struct {
     local_addrs: []EndpointAddress,
     tls_acceptor: ?tls_edge.Acceptor = null,
     shutdown_flag: std.atomic.Value(bool) = .init(false),
-    shutdown_event: zio.ResetEvent = .init,
+    shutdown_event: zio.Event = .init,
     active_connections: std.atomic.Value(usize) = .init(0),
     accounting: connection.GlobalAccounting,
     router: router_mod.Router = undefined,

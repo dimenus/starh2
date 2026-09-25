@@ -128,12 +128,12 @@ pub var test_hold_complete_receipt_ack: std.atomic.Value(bool) = .init(false);
 /// Test-only: true while a complete-batch write ack is stashed unapplied.
 pub var test_complete_receipt_ack_held: std.atomic.Value(bool) = .init(false);
 /// Test-only: wakes a parked actor that has a live complete-batch stash.
-/// A zio.ResetEvent so the actor's select can wait on it directly.
-pub var test_release_complete_receipt_ack: zio.ResetEvent = .init;
+/// A zio.Event so the actor's select can wait on it directly.
+pub var test_release_complete_receipt_ack: zio.Event = .init;
 /// Never set / never sent-to: the select branches point here when their
 /// real source is absent or gated, so the select keeps one comptime shape.
-var no_shutdown_event: zio.ResetEvent = .init;
-var no_ack_hold_event: zio.ResetEvent = .init;
+var no_shutdown_event: zio.Event = .init;
+var no_ack_hold_event: zio.Event = .init;
 var hold_dummy_completion_buf: [1]u31 = undefined;
 var hold_dummy_completion_ch: zio.Channel(u31) = .init(&hold_dummy_completion_buf);
 /// Test-only: delay write pump by N ms.
@@ -628,7 +628,7 @@ pub const ConnConfig = struct {
     shutdown_flag: ?*std.atomic.Value(bool) = null,
     /// One-shot: set once at server shutdown, never reset, so selecting on it
     /// is race-free (persistent set, no edge to lose).
-    shutdown_event: ?*zio.ResetEvent = null,
+    shutdown_event: ?*zio.Event = null,
     reaper: ?*ReaperPool = null,
     /// Server-wide stream + reaper reservation (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
@@ -1039,7 +1039,7 @@ const Connection = struct {
     session_mu: std.Io.Mutex = .init,
     /// One-shot teardown event. Set once, never reset. Handlers select on
     /// this OR their work. Same shape as `ConnConfig.shutdown_event`.
-    dead: zio.ResetEvent = .init,
+    dead: zio.Event = .init,
     /// Debug proof that `session_mu` is held where Session or the scheduler is
     /// touched. Written only while the mutex is held, so it needs no atomic.
     ///
@@ -1082,11 +1082,11 @@ const Connection = struct {
     /// Set when a write completion reports failure; actor owns handler terminal transition.
     writer_failed: std.atomic.Value(bool) = .init(false),
     writer_fail_handled: bool = false,
-    /// Capacity waiters: one `zio.ResetEvent` per HandlerSlot (sparse IDs safe).
-    space_events: []zio.ResetEvent = &.{},
+    /// Capacity waiters: one `zio.Event` per HandlerSlot (sparse IDs safe).
+    space_events: []zio.Event = &.{},
     /// Time waiters. Occupancy and time are different waits; do not overload
     /// `space_events`. Cadence is a heap entry, not a handler timer.
-    deadline_events: []zio.ResetEvent = &.{},
+    deadline_events: []zio.Event = &.{},
     /// Actor-owned intent batch — filled by drainIntentsInto (no nested Session drain).
     intent_batch: []session_mod.Intent = &.{},
     rates: rates_mod.RateLimiter = .{},
@@ -1317,10 +1317,10 @@ const Connection = struct {
             config.limits.max_streams_per_connection * complete_receipt_capacity,
         );
         errdefer gpa.free(complete_receipt_sid_storage);
-        const space_events = try gpa.alloc(zio.ResetEvent, config.limits.max_streams_per_connection);
+        const space_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(space_events);
         @memset(space_events, .init);
-        const deadline_events = try gpa.alloc(zio.ResetEvent, config.limits.max_streams_per_connection);
+        const deadline_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(deadline_events);
         @memset(deadline_events, .init);
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
@@ -2512,7 +2512,7 @@ const Connection = struct {
 
     /// Park in ONE `zio.select` until something the actor cares about
     /// happens. Every branch holds persistent evidence (a buffered channel
-    /// item, a set ResetEvent), so there is no reset and no recheck list.
+    /// item, a set Event), so there is no reset and no recheck list.
     ///
     /// Declaration order is the tie-break when several branches are ready:
     /// reads first (matches the hot turn's take order), then acks and
@@ -3652,7 +3652,7 @@ const Connection = struct {
         }
     }
 
-    fn resetHasWaiters(e: *const zio.ResetEvent) bool {
+    fn eventHasWaiters(e: *const zio.Event) bool {
         return e.wait_queue.hasWaiters();
     }
 
@@ -3694,8 +3694,8 @@ const Connection = struct {
         std.debug.assert(in_use != 0);
         for (self.handlers, 0..) |s, i| {
             if (!s.in_use) continue;
-            const space_wait = i < self.space_events.len and resetHasWaiters(&self.space_events[i]);
-            const deadline_wait = i < self.deadline_events.len and resetHasWaiters(&self.deadline_events[i]);
+            const space_wait = i < self.space_events.len and eventHasWaiters(&self.space_events[i]);
+            const deadline_wait = i < self.deadline_events.len and eventHasWaiters(&self.deadline_events[i]);
             diagRawPrint(
                 "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d} awaiting_receipt={d} cause={d} space_wait={d} deadline_wait={d} session_held={d}\n",
                 .{
@@ -3729,7 +3729,7 @@ const Connection = struct {
                 awaiting_n,
                 self.countTicketInUse(),
                 self.countTicketWaiters(),
-                @intFromBool(resetHasWaiters(&self.dead)),
+                @intFromBool(eventHasWaiters(&self.dead)),
                 @intFromBool(self.session_held),
             },
         );
@@ -6638,7 +6638,7 @@ pub fn testTrapR158Parked(io: std.Io) void {
         if (slot_i != ticket_table.no_completion_slot and
             trap.hop.conn.tickets.isWaiting(slot_i) and
             trap.hop.conn.countTicketWaiters() == 1 and
-            Connection.resetHasWaiters(&trap.hop.conn.dead)) break;
+            Connection.eventHasWaiters(&trap.hop.conn.dead)) break;
         spins += 1;
         std.debug.assert(spins < 1_000_000);
         zio.yield() catch std.debug.panic("trap yield canceled before wait", .{});
@@ -6646,10 +6646,10 @@ pub fn testTrapR158Parked(io: std.Io) void {
     std.debug.assert(job.slot.awaiting_receipt.load(.acquire));
     std.debug.assert(trap.hop.conn.tickets.isWaiting(trap_r158_ticket_slot.load(.acquire)));
     std.debug.assert(trap.hop.conn.countTicketWaiters() == 1);
-    std.debug.assert(Connection.resetHasWaiters(&trap.hop.conn.dead));
+    std.debug.assert(Connection.eventHasWaiters(&trap.hop.conn.dead));
     trap.hop.conn.shutdownHandlers();
     std.debug.assert(trap.hop.conn.countTicketWaiters() == 0);
-    std.debug.assert(!Connection.resetHasWaiters(&trap.hop.conn.dead));
+    std.debug.assert(!Connection.eventHasWaiters(&trap.hop.conn.dead));
     trapAssertSweepClean(&trap.hop.conn);
     std.debug.print("r158 parked enroll ok\n", .{});
     std.debug.print("reaper-stuck absent\n", .{});

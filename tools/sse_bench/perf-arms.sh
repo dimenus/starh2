@@ -50,8 +50,15 @@ done
 mkdir -p "$OUT"
 cd "$REPO/tools/sse_bench"
 go build -o "$OUT/sse-client" ./client.go || exit 1
+# zio scheduling is a build option, not a server flag, so an A/B builds two
+# binaries. STARH2_ZIO_SCHEDULING=pinned builds the migration-off arm.
+if [ -n "${STARH2_TASK_MIGRATION:-}" ]; then
+  echo "FAIL: STARH2_TASK_MIGRATION is gone. zio scheduling is the build option -Dzio-scheduling: set STARH2_ZIO_SCHEDULING=pinned for migration off (default work_stealing)." >&2
+  exit 2
+fi
+STARH2_ZIO_SCHEDULING=${STARH2_ZIO_SCHEDULING:-work_stealing}
 cd "$REPO"
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
+./zb build starh2-bench-server -Doptimize=ReleaseFast -Dzio-scheduling="$STARH2_ZIO_SCHEDULING" --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 build_hyper || exit 1
 HYPER="$OUT/hyper/sse-hyper"
@@ -60,13 +67,6 @@ HYPER="$OUT/hyper/sse-hyper"
 EXECUTOR_ARGS=
 if [ "$STARH2_EXECUTORS" != auto ]; then
   EXECUTOR_ARGS="--executors $STARH2_EXECUTORS"
-fi
-# Same knob as mixed.sh: STARH2_TASK_MIGRATION=0 runs the arm with zio task
-# migration off, to separate migration from cross-executor handoff in the
-# context-switch count.
-MIGRATION_ARGS=
-if [ "${STARH2_TASK_MIGRATION:-1}" = 0 ]; then
-  MIGRATION_ARGS=--no-task-migration
 fi
 
 proc_cpu() {
@@ -134,13 +134,13 @@ cleanup() { kill $PIDS 2>/dev/null; wait 2>/dev/null; bench_unlock; }
 trap cleanup EXIT INT TERM
 
 # STARH2_EXTRA_ARGS passes any further bench-server flags (A/B knobs).
-"$STARH2" --mode tls --port 19460 --sse-interval-ms 10 $EXECUTOR_ARGS $MIGRATION_ARGS ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
+"$STARH2" --mode tls --port 19460 --sse-interval-ms 10 $EXECUTOR_ARGS ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
 S_PID=$!; PIDS="$S_PID"
 STARH2_WIDTH=$(starh2_width "$OUT/starh2.log") || exit 1
 WIDTH=$(opponent_width "$STARH2_WIDTH")
 PIN=$(width_env "$WIDTH")
 echo "== perf-arms: $CONNS conns, $ONESHOT_WORKERS workers, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g"
-echo "== starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH) migration=${STARH2_TASK_MIGRATION:-1} extra=[${STARH2_EXTRA_ARGS:-}]  opponents width=$WIDTH  arms: $ARMS"
+echo "== starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH) zio-scheduling=$STARH2_ZIO_SCHEDULING extra=[${STARH2_EXTRA_ARGS:-}]  opponents width=$WIDTH  arms: $ARMS"
 echo "== starh2 ready: $(grep -m1 ready "$OUT/starh2.log")"
 
 for arm in $ARMS; do
