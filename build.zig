@@ -944,7 +944,7 @@ pub fn build(b: *std.Build) void {
     // also hit linux cross targets (`crt_dir may not be empty for linux`) and
     // would miss the nested `readme-doctest` build. Walk the graph so a new
     // Compile step inherits the fix.
-    const macos_apply = applyMacosSdkLibc(b, macos_sdk_override, macos_sdk_extra_root);
+    const macos_apply = applyMacosSdkLibc(b, target, macos_sdk_override, macos_sdk_extra_root);
     if (macos_apply.libc_file) |lp| {
         readme_doctest_run.addArg("--libc");
         readme_doctest_run.addFileArg(lp);
@@ -987,8 +987,18 @@ const MacosSdkSelection = struct {
     guard_msg: ?[]const u8 = null,
 };
 
-fn applyMacosSdkLibc(b: *std.Build, override: ?[]const u8, extra_root: ?[]const u8) MacosLibcApply {
+fn applyMacosSdkLibc(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    override: ?[]const u8,
+    extra_root: ?[]const u8,
+) MacosLibcApply {
     if (builtin.os.tag != .macos) return .{};
+    // Every Compile step here uses `target` (the release cross-targets are
+    // Linux), so a non-macOS `-Dtarget` has no Compile step for this fix to
+    // reach. Returning here keeps the n == 0 fatals below meaning "the walk is
+    // broken", instead of firing on every cross build from a Mac.
+    if (target.result.os.tag != .macos) return .{};
     const sel = selectMacosSdk(b, override, extra_root);
     if (sel.guard_msg) |msg| {
         const fail = b.addFail(msg);
