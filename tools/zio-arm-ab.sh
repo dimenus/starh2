@@ -15,6 +15,13 @@
 # the SAME starh2 commit, built by the same compiler for the same target, so a
 # difference between arms is a difference in zio.
 #
+# A pin move that also needs starh2 source changes (an API rename, a removed
+# option) cannot use one starh2 commit. Then each arm is its own starh2 tree:
+# name it with TREE_<arm>=<path>, and the identity check below also requires
+# the arm's embedded zio package to be the one that tree's build.zig.zon pins.
+# Whoever runs it must show that the starh2 source difference between the
+# trees is mechanical, or the result is not a zio result.
+#
 # Every arm also carries the fork-only `runtime: poll timeouts on a dedicated
 # executor` patch. Nothing upstream replaces it, so an arm without it would
 # measure a missing timer fix instead of the select protocol.
@@ -37,14 +44,33 @@
 #
 # # The instrument checks, before any number is read
 #
-# 1. Each binary must embed EXACTLY ONE `zio-0.17.0-<hash>` package path, and
-#    it must be that arm's. A stale cache silently linking another arm's zio
+# 1. Each binary must embed EXACTLY ONE `zio-<version>-<hash>` package path,
+#    and it must be that arm's (when TREE_<arm> is set, the one its
+#    build.zig.zon pins). A stale cache silently linking another arm's zio
 #    would produce four numbers for one build.
 # 2. All arm hashes must differ; two arms resolving to one package measure the
-#    same thing twice and read as "no difference".
+#    same thing twice and read as "no difference". The one exception is an A/A
+#    run, which measures the noise floor on purpose: SAME_ZIO_OK=1 allows a
+#    shared package only when every arm binary is byte-identical (sha256).
 # 3. Zero rows is a FAILURE, not a pass.
 # 4. The h2load thread count was swept (t=2,4,8,12) at both widths and the rate
 #    is flat, so the one-shot rows are server-bound rather than client-bound.
+#    That sweep was of the h2load nachos had then; a different h2load build
+#    must be swept again before the claim carries over.
+# 5. The load client must exist on the host. A missing h2load exits 127, which
+#    the one-shot row would otherwise record as a server WEDGE-OR-FAIL.
+# 6. Each shipped binary's sha256 is printed here and re-checked on the host,
+#    so the capture names exactly which binary produced each arm's rows.
+# 7. Before each phase the host prints its load, its top processes, and the
+#    cores busy over 2 s. Above IDLE_MAX_CORES the run stops: another job
+#    sharing the machine is not noise this design can cancel.
+#
+# # One-shot latency
+#
+# h2load prints no percentiles. ONESHOT_LAT=1 adds a SECOND one-shot run per
+# width with `--log-file` and reports p50/p99 from its per-request rows. It is
+# a separate run so the rps rows keep the client they were swept with; writing
+# one log line per request is extra client work.
 #
 # # Order
 #
@@ -56,6 +82,8 @@
 #     BURST_ROUNDS=50 tools/zio-arm-ab.sh > rows.txt
 #
 # BIN_ROOT holds out-<arm>/bin/starh2-bench-server for every arm in ARMS.
+# Arm names must be shell identifiers, because TREE_<arm> is looked up by name.
+# PHASES picks the phases to run (default "1 2 3").
 set -eu
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
@@ -79,44 +107,91 @@ ONESHOT_WIDE_N=${ONESHOT_WIDE_N:-4000000}
 SSE_LOW=${SSE_LOW:-200}
 SSE_HIGH=${SSE_HIGH:-500}
 REMOTE_DIR=${REMOTE_DIR:-/tmp/zioab}
+PHASES=${PHASES:-1 2 3}
+H2LOAD=${H2LOAD:-h2load}
+ONESHOT_LAT=${ONESHOT_LAT:-0}
+SAME_ZIO_OK=${SAME_ZIO_OK:-0}
+IDLE_MAX_CORES=${IDLE_MAX_CORES:-1.5}
+CLIENT_BIN=${CLIENT_BIN:-/tmp/zioab-client}
 
 SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1) || true
 export SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-$SOCK}
 
-echo "== arm identity (embedded zio package hash) =="
+echo "== arm identity (embedded zio package hash, binary sha256) =="
 hashes=""
+shas=""
 for arm in $ARMS; do
   bin="$BIN_ROOT/out-$arm/bin/starh2-bench-server"
   [ -f "$bin" ] || { echo "missing binary for arm $arm: $bin" >&2; exit 1; }
-  h=$(strings -a "$bin" | grep -oE 'zio-0\.17\.0-[A-Za-z0-9_-]{20,}' | sort -u)
+  h=$(strings -a "$bin" | grep -oE 'zio-[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9_-]{20,}' | sort -u)
   n=$(printf '%s\n' "$h" | grep -c .)
   [ "$n" = 1 ] || { echo "arm $arm embeds $n zio package paths, expected 1" >&2; exit 1; }
-  echo "  $arm  $h"
+  eval "tree=\${TREE_$arm:-}"
+  if [ -n "$tree" ]; then
+    pinned=$(grep -A2 '\.zio = ' "$tree/build.zig.zon" | sed -n 's/.*\.hash = "\(zio-[^"]*\)".*/\1/p')
+    [ -n "$pinned" ] || { echo "arm $arm: no .zio hash in $tree/build.zig.zon" >&2; exit 1; }
+    [ "$pinned" = "$h" ] || { echo "arm $arm embeds $h but $tree pins $pinned" >&2; exit 1; }
+  fi
+  sha=$(shasum -a 256 "$bin" | cut -d' ' -f1)
+  echo "  $arm  $h  sha256=$sha${tree:+  tree=$tree}"
   hashes="$hashes$h
 "
+  shas="$shas$arm=$sha "
 done
 dupes=$(printf '%s' "$hashes" | sort | uniq -d)
-[ -z "$dupes" ] || { echo "two arms share one zio package: $dupes" >&2; exit 1; }
+if [ -n "$dupes" ]; then
+  [ "$SAME_ZIO_OK" = 1 ] || { echo "two arms share one zio package: $dupes" >&2; exit 1; }
+  distinct=$(printf '%s\n' $shas | cut -d= -f2 | sort -u | grep -c .)
+  [ "$distinct" = 1 ] || { echo "SAME_ZIO_OK=1 is for A/A only, but the arm binaries differ: $shas" >&2; exit 1; }
+  echo "  A/A: every arm is the same binary (SAME_ZIO_OK=1)"
+fi
 
 for f in testdata/cert.pem testdata/key.pem; do
   [ -f "$REPO/$f" ] || { echo "$f is missing; generate it (see tools/README.md)" >&2; exit 1; }
 done
-(cd "$REPO/tools/sse_bench" && GOOS=linux GOARCH=amd64 go build -o /tmp/zioab-client ./client.go)
+(cd "$REPO/tools/sse_bench" && GOOS=linux GOARCH=amd64 go build -o "$CLIENT_BIN" ./client.go)
 ssh "$HOST" "mkdir -p $REMOTE_DIR"
 for arm in $ARMS; do
   scp -q "$BIN_ROOT/out-$arm/bin/starh2-bench-server" "$HOST:$REMOTE_DIR/$arm-server"
 done
-scp -q /tmp/zioab-client "$HOST:$REMOTE_DIR/client"
+scp -q "$CLIENT_BIN" "$HOST:$REMOTE_DIR/client"
 scp -q "$REPO/testdata/cert.pem" "$REPO/testdata/key.pem" "$HOST:$REMOTE_DIR/"
 
 ssh "$HOST" "ARMS='$ARMS' PERF_ROUNDS=$PERF_ROUNDS BURST_ROUNDS=$BURST_ROUNDS CPU_ROUNDS=$CPU_ROUNDS \
   SECONDS_RUN=$SECONDS_RUN INTERVAL=$INTERVAL EXECUTORS=$EXECUTORS \
   WIDE_EXECUTORS=$WIDE_EXECUTORS ONESHOT_N=$ONESHOT_N ONESHOT_WIDE_N=$ONESHOT_WIDE_N \
-  SSE_LOW=$SSE_LOW SSE_HIGH=$SSE_HIGH D=$REMOTE_DIR sh -s" <<'REMOTE'
+  SSE_LOW=$SSE_LOW SSE_HIGH=$SSE_HIGH D=$REMOTE_DIR PHASES='$PHASES' H2LOAD='$H2LOAD' \
+  ONESHOT_LAT=$ONESHOT_LAT IDLE_MAX_CORES=$IDLE_MAX_CORES SHAS='$shas' sh -s" <<'REMOTE'
 set -u
 chmod +x $D/*-server $D/client
 echo "== host =="
 uname -r; echo "cores=$(nproc)"; uptime
+command -v "$H2LOAD" > /dev/null || { echo "load client '$H2LOAD' is missing on $(hostname); a missing client reads as a server wedge" >&2; exit 1; }
+echo "h2load: $(command -v "$H2LOAD") $("$H2LOAD" --version 2>&1 | head -1)"
+for pair in $SHAS; do
+  arm=${pair%%=*}; want=${pair#*=}
+  got=$(sha256sum $D/$arm-server | cut -d' ' -f1)
+  [ "$got" = "$want" ] || { echo "arm $arm: shipped binary sha256 $got, expected $want" >&2; exit 1; }
+  echo "  ran $D/$arm-server sha256=$got"
+done
+
+# The cores busy over 2 s, from /proc/stat. iowait counts as idle: it is a
+# task waiting on a disk, not a task using a core.
+host_check() {
+  echo "-- host check before $1 --"
+  uptime
+  top -bn1 -o %CPU -w 160 < /dev/null | sed -n '7,13p' | cut -c1-160
+  s1=$(awk '/^cpu /{print $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat)
+  sleep 2
+  s2=$(awk '/^cpu /{print $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat)
+  busy=$(echo "$s1 $s2" | awk -v n=$(nproc) '{printf "%.2f", ($3-$1)/($4-$2)*n}')
+  echo "busy_cores=$busy limit=$IDLE_MAX_CORES"
+  if awk -v b=$busy -v m=$IDLE_MAX_CORES 'BEGIN{exit !(b>m)}'; then
+    echo "HOST-BUSY before $1: $busy cores busy, limit $IDLE_MAX_CORES; stopping, not measuring" >&2
+    exit 3
+  fi
+}
+has_phase() { case " $PHASES " in *" $1 "*) return 0;; esac; return 1; }
 
 start_srv() {
   ARM=$1; EXEC=$2
@@ -144,7 +219,52 @@ rotate() {
   done
 }
 
+# One h2load one-shot run. The `requests:` line is kept whole, so a row shows
+# how many requests succeeded, not only a rate.
+oneshot() {
+  ARM=$1; EXEC=$2; N=$3
+  start_srv $ARM $EXEC
+  if [ -n "$SRV_PORT" ]; then
+    out=$(timeout 180 "$H2LOAD" -n $N -c 50 -m 10 -t 4 https://127.0.0.1:$SRV_PORT/ 2>&1)
+    rc=$?
+    if [ $rc -ne 0 ]; then echo "r$r $ARM oneshot-e$EXEC WEDGE-OR-FAIL rc=$rc"
+    else echo "$out" | grep -E 'finished in|requests:' | tr '\n' ' ' | sed "s/^/r$r $ARM oneshot-e$EXEC /"; echo; fi
+    rows=$((rows+1))
+  fi
+  stop_srv
+}
+
+# The same run with a per-request log, for latency. Column 2 is the status
+# (-1 for a failed stream), column 3 the microseconds to end of response.
+oneshot_lat() {
+  ARM=$1; EXEC=$2; N=$3
+  start_srv $ARM $EXEC
+  if [ -n "$SRV_PORT" ]; then
+    rm -f $D/lat.tsv
+    out=$(timeout 180 "$H2LOAD" -n $N -c 50 -m 10 -t 4 --log-file=$D/lat.tsv https://127.0.0.1:$SRV_PORT/ 2>&1)
+    rc=$?
+    if [ $rc -ne 0 ]; then echo "r$r $ARM oneshot-lat-e$EXEC WEDGE-OR-FAIL rc=$rc"
+    else
+      non200=$(awk -F'\t' '$2 != 200' $D/lat.tsv | wc -l)
+      pct=$(awk -F'\t' '$2 == 200 {print $3}' $D/lat.tsv | sort -n | awk '
+        { a[NR] = $1 }
+        END {
+          if (NR == 0) { print "n=0"; exit }
+          i50 = int(NR * 0.50); if (i50 < 1) i50 = 1
+          i99 = int(NR * 0.99); if (i99 < 1) i99 = 1
+          printf "n=%d p50us=%d p99us=%d maxus=%d", NR, a[i50], a[i99], a[NR]
+        }')
+      echo "r$r $ARM oneshot-lat-e$EXEC $pct non200=$non200 $(echo "$out" | grep -E 'finished in|requests:' | tr '\n' ' ')"
+    fi
+    rm -f $D/lat.tsv
+    rows=$((rows+1))
+  fi
+  stop_srv
+}
+
 rows=0
+if has_phase 1; then
+host_check "phase 1"
 echo "== phase 1: perf =="
 r=1
 while [ $r -le $PERF_ROUNDS ]; do
@@ -161,29 +281,19 @@ while [ $r -le $PERF_ROUNDS ]; do
       stop_srv
     done
 
-    start_srv $arm $EXECUTORS
-    if [ -n "$SRV_PORT" ]; then
-      out=$(timeout 180 h2load -n $ONESHOT_N -c 50 -m 10 -t 4 https://127.0.0.1:$SRV_PORT/ 2>&1)
-      rc=$?
-      if [ $rc -ne 0 ]; then echo "r$r $arm oneshot-e$EXECUTORS WEDGE-OR-FAIL rc=$rc"
-      else echo "$out" | grep -E 'finished in|0 failed' | tr '\n' ' ' | sed "s/^/r$r $arm oneshot-e$EXECUTORS /"; echo; fi
-      rows=$((rows+1))
+    oneshot $arm $EXECUTORS $ONESHOT_N
+    oneshot $arm $WIDE_EXECUTORS $ONESHOT_WIDE_N
+    if [ "$ONESHOT_LAT" = 1 ]; then
+      oneshot_lat $arm $EXECUTORS $ONESHOT_N
+      oneshot_lat $arm $WIDE_EXECUTORS $ONESHOT_WIDE_N
     fi
-    stop_srv
-
-    start_srv $arm $WIDE_EXECUTORS
-    if [ -n "$SRV_PORT" ]; then
-      out=$(timeout 180 h2load -n $ONESHOT_WIDE_N -c 50 -m 10 -t 4 https://127.0.0.1:$SRV_PORT/ 2>&1)
-      rc=$?
-      if [ $rc -ne 0 ]; then echo "r$r $arm oneshot-e$WIDE_EXECUTORS WEDGE-OR-FAIL rc=$rc"
-      else echo "$out" | grep -E 'finished in|0 failed' | tr '\n' ' ' | sed "s/^/r$r $arm oneshot-e$WIDE_EXECUTORS /"; echo; fi
-      rows=$((rows+1))
-    fi
-    stop_srv
   done
   r=$((r+1))
 done
+fi
 
+if has_phase 2; then
+host_check "phase 2"
 echo "== phase 2: burst fail-close rate ($BURST_ROUNDS rounds per arm) =="
 b=1
 while [ $b -le $BURST_ROUNDS ]; do
@@ -209,7 +319,10 @@ while [ $b -le $BURST_ROUNDS ]; do
   done
   b=$((b+1))
 done
+fi
 
+if has_phase 3; then
+host_check "phase 3"
 echo "== phase 3: server CPU per event at a FIXED offered load =="
 # Every arm delivers 100% of a 200-stream 1ms offering, so a latency compare
 # puts two servers side by side that are both keeping up. CPU per event does
@@ -235,6 +348,7 @@ while [ $c -le $CPU_ROUNDS ]; do
   done
   c=$((c+1))
 done
+fi
 
 echo "== rows=$rows =="
 [ $rows -gt 0 ] || { echo "zio-arm-ab: produced no rows; that is a failure, not a pass" >&2; exit 1; }

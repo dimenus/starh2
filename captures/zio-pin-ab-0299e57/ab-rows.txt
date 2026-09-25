@@ -1,0 +1,370 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  A  zio-0.17.0-xHbVVKy_KACrmjGRFj5FBs34dw6eCHjsfsj0-0bEMT24  sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/treeA
+  B  zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e  sha256=a0145ed9a8a84de13e36f8fb7f319d382441b1f9a07ef1feb6e2ac1717747068  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/treeB
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 12:14:14 up 1 day,  1:09,  3 users,  load average: 1.77, 1.80, 1.63
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/zio-pin-ab/A-server sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab
+  ran /tmp/zio-pin-ab/B-server sha256=a0145ed9a8a84de13e36f8fb7f319d382441b1f9a07ef1feb6e2ac1717747068
+-- host check before phase 1 --
+ 12:14:14 up 1 day,  1:09,  3 users,  load average: 1.77, 1.80, 1.63
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+      1 root      20   0   21236  16092  11032 S   0.0   0.1   0:02.42 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.04 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-kvfree_rcu_reclaim
+busy_cores=0.05 limit=1.5
+== phase 1: perf ==
+r1 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000068
+r1 A sse200 A            sse latency p50=15µs p99=47µs max=1.226ms
+r1 A sse500 A            streams=500 conns=1 opened=421 delivering=104 failed=79 events=1040043
+r1 A sse500 A            sse latency p50=13µs p99=35µs max=373µs
+r1 A oneshot-e2 finished in 2.42s, 827634.72 req/s, 35.52MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 A oneshot-e8 finished in 867.74ms, 2304845.82 req/s, 98.92MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 A oneshot-lat-e2 n=2000000 p50us=285 p99us=457 maxus=1946 non200=0 finished in 2.40s, 833237.16 req/s, 35.76MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 A oneshot-lat-e8 n=2000000 p50us=149 p99us=386 maxus=6073 non200=0 finished in 1.06s, 1884468.87 req/s, 80.88MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 B sse200 B            streams=200 conns=1 opened=181 delivering=0 failed=19 events=0
+r1 B sse200 B            NO EVENTS — SSE delivered nothing while the connection was live
+r1 B sse500 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000361
+r1 B sse500 B            sse latency p50=17µs p99=91µs max=4.871ms
+r1 B oneshot-e2 finished in 2.57s, 776965.16 req/s, 33.34MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 B oneshot-e8 finished in 865.35ms, 2311206.23 req/s, 99.19MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 B oneshot-lat-e2 n=2000000 p50us=474 p99us=994 maxus=3560 non200=0 finished in 2.71s, 737348.12 req/s, 31.64MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 B oneshot-lat-e8 n=2000000 p50us=152 p99us=353 maxus=10079 non200=0 finished in 1.03s, 1932514.66 req/s, 82.94MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000058
+r2 B sse200 B            sse latency p50=11µs p99=29µs max=1.128ms
+r2 B sse500 B            streams=500 conns=1 opened=471 delivering=244 failed=29 events=2440166
+r2 B sse500 B            sse latency p50=13µs p99=42µs max=2.334ms
+r2 B oneshot-e2 finished in 2.38s, 840659.68 req/s, 36.08MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 B oneshot-e8 finished in 854.02ms, 2341865.53 req/s, 100.51MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 B oneshot-lat-e2 n=2000000 p50us=570 p99us=728 maxus=3001 non200=0 finished in 2.40s, 834243.70 req/s, 35.80MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 B oneshot-lat-e8 n=2000000 p50us=146 p99us=398 maxus=13877 non200=0 finished in 1.03s, 1936299.62 req/s, 83.10MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000053
+r2 A sse200 A            sse latency p50=13µs p99=35µs max=1.371ms
+r2 A sse500 A            streams=500 conns=1 opened=444 delivering=244 failed=56 events=2440152
+r2 A sse500 A            sse latency p50=18µs p99=164µs max=2.126ms
+r2 A oneshot-e2 finished in 2.44s, 820648.84 req/s, 35.22MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A oneshot-e8 finished in 865.69ms, 2310295.83 req/s, 99.15MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A oneshot-lat-e2 n=2000000 p50us=310 p99us=451 maxus=1289460 non200=0 finished in 2.59s, 773248.99 req/s, 33.19MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A oneshot-lat-e8 n=2000000 p50us=149 p99us=369 maxus=8981 non200=0 finished in 1.07s, 1873567.89 req/s, 80.41MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000106
+r3 A sse200 A            sse latency p50=14µs p99=40µs max=1.901ms
+r3 A sse500 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000234
+r3 A sse500 A            sse latency p50=22µs p99=86µs max=4.915ms
+r3 A oneshot-e2 finished in 2.56s, 780520.09 req/s, 33.50MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A oneshot-e8 finished in 868.77ms, 2302107.93 req/s, 98.80MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A oneshot-lat-e2 n=2000000 p50us=315 p99us=531 maxus=1354371 non200=0 finished in 2.74s, 728811.71 req/s, 31.28MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A oneshot-lat-e8 n=2000000 p50us=148 p99us=355 maxus=11872 non200=0 finished in 1.03s, 1944753.44 req/s, 83.46MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000053
+r3 B sse200 B            sse latency p50=11µs p99=26µs max=1.09ms
+r3 B sse500 B            streams=500 conns=1 opened=447 delivering=295 failed=53 events=2950179
+r3 B sse500 B            sse latency p50=13µs p99=62µs max=2.687ms
+r3 B oneshot-e2 finished in 2.56s, 781976.08 req/s, 33.56MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 B oneshot-e8 finished in 826.32ms, 2420358.12 req/s, 103.87MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 B oneshot-lat-e2 n=2000000 p50us=448 p99us=1069 maxus=4350 non200=0 finished in 2.56s, 781271.67 req/s, 33.53MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 B oneshot-lat-e8 n=2000000 p50us=155 p99us=370 maxus=13640 non200=0 finished in 1.02s, 1955391.65 req/s, 83.92MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000107
+r4 B sse200 B            sse latency p50=12µs p99=36µs max=1.44ms
+r4 B sse500 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000357
+r4 B sse500 B            sse latency p50=19µs p99=61µs max=4.186ms
+r4 B oneshot-e2 finished in 2.38s, 839815.66 req/s, 36.04MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 B oneshot-e8 finished in 822.98ms, 2430183.86 req/s, 104.30MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 B oneshot-lat-e2 n=2000000 p50us=495 p99us=978 maxus=3991 non200=0 finished in 2.68s, 745057.66 req/s, 31.98MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 B oneshot-lat-e8 n=2000000 p50us=154 p99us=372 maxus=8967 non200=0 finished in 1.02s, 1953195.57 req/s, 83.83MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000087
+r4 A sse200 A            sse latency p50=13µs p99=44µs max=1.986ms
+r4 A sse500 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000301
+r4 A sse500 A            sse latency p50=21µs p99=80µs max=4.275ms
+r4 A oneshot-e2 finished in 2.53s, 791414.11 req/s, 33.97MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A oneshot-e8 finished in 840.23ms, 2380294.97 req/s, 102.15MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A oneshot-lat-e2 n=2000000 p50us=274 p99us=475 maxus=726594 non200=0 finished in 2.51s, 796685.79 req/s, 34.19MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A oneshot-lat-e8 n=2000000 p50us=144 p99us=362 maxus=17380 non200=0 finished in 1.07s, 1872157.83 req/s, 80.35MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000100
+r5 A sse200 A            sse latency p50=13µs p99=35µs max=819µs
+r5 A sse500 A            streams=500 conns=1 opened=473 delivering=256 failed=27 events=2560137
+r5 A sse500 A            sse latency p50=14µs p99=42µs max=1.641ms
+r5 A oneshot-e2 finished in 2.40s, 834568.84 req/s, 35.82MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A oneshot-e8 finished in 823.22ms, 2429490.12 req/s, 104.27MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A oneshot-lat-e2 n=2000000 p50us=455 p99us=600 maxus=1824785 non200=0 finished in 2.65s, 755634.58 req/s, 32.43MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A oneshot-lat-e8 n=2000000 p50us=150 p99us=372 maxus=14222 non200=0 finished in 1.02s, 1955907.97 req/s, 83.94MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 B sse200 B            streams=200 conns=1 opened=186 delivering=0 failed=14 events=0
+r5 B sse200 B            NO EVENTS — SSE delivered nothing while the connection was live
+r5 B sse500 B            streams=500 conns=1 opened=422 delivering=244 failed=78 events=2440135
+r5 B sse500 B            sse latency p50=14µs p99=102µs max=1.887ms
+r5 B oneshot-e2 finished in 2.40s, 834372.13 req/s, 35.81MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 B oneshot-e8 finished in 847.47ms, 2359954.41 req/s, 101.28MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 B oneshot-lat-e2 n=2000000 p50us=480 p99us=825 maxus=3110 non200=0 finished in 2.40s, 832607.92 req/s, 35.73MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 B oneshot-lat-e8 n=2000000 p50us=144 p99us=389 maxus=8868 non200=0 finished in 1.06s, 1879464.32 req/s, 80.66MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000108
+r6 B sse200 B            sse latency p50=12µs p99=50µs max=1.016ms
+r6 B sse500 B            streams=500 conns=1 opened=480 delivering=354 failed=20 events=3540167
+r6 B sse500 B            sse latency p50=15µs p99=82µs max=3.734ms
+r6 B oneshot-e2 finished in 2.36s, 846882.39 req/s, 36.35MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 B oneshot-e8 finished in 835.92ms, 2392579.18 req/s, 102.68MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 B oneshot-lat-e2 n=2000000 p50us=448 p99us=903 maxus=4479 non200=0 finished in 2.53s, 789096.58 req/s, 33.87MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 B oneshot-lat-e8 n=2000000 p50us=147 p99us=392 maxus=13470 non200=0 finished in 1.03s, 1933192.73 req/s, 82.97MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000112
+r6 A sse200 A            sse latency p50=13µs p99=32µs max=1.275ms
+r6 A sse500 A            streams=500 conns=1 opened=450 delivering=244 failed=50 events=2440161
+r6 A sse500 A            sse latency p50=15µs p99=49µs max=2.346ms
+r6 A oneshot-e2 finished in 2.49s, 804531.44 req/s, 34.53MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A oneshot-e8 finished in 848.24ms, 2357814.92 req/s, 101.19MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A oneshot-lat-e2 n=2000000 p50us=295 p99us=545 maxus=1193073 non200=0 finished in 2.39s, 836520.48 req/s, 35.90MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A oneshot-lat-e8 n=2000000 p50us=146 p99us=366 maxus=8714 non200=0 finished in 1.04s, 1917703.66 req/s, 82.30MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000098
+r7 A sse200 A            sse latency p50=12µs p99=31µs max=903µs
+r7 A sse500 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000286
+r7 A sse500 A            sse latency p50=23µs p99=169µs max=4.654ms
+r7 A oneshot-e2 finished in 2.51s, 796596.30 req/s, 34.19MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 A oneshot-e8 finished in 882.39ms, 2266584.31 req/s, 97.27MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 A oneshot-lat-e2 n=2000000 p50us=286 p99us=439 maxus=1221451 non200=0 finished in 2.49s, 804137.45 req/s, 34.51MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 A oneshot-lat-e8 n=2000000 p50us=148 p99us=404 maxus=5288 non200=0 finished in 1.07s, 1865835.25 req/s, 80.08MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000075
+r7 B sse200 B            sse latency p50=10µs p99=28µs max=1.594ms
+r7 B sse500 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000277
+r7 B sse500 B            sse latency p50=15µs p99=47µs max=5.419ms
+r7 B oneshot-e2 finished in 2.37s, 842680.06 req/s, 36.17MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 B oneshot-e8 finished in 875.84ms, 2283522.10 req/s, 98.00MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 B oneshot-lat-e2 n=2000000 p50us=557 p99us=687 maxus=2667 non200=0 finished in 2.38s, 842043.93 req/s, 36.14MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 B oneshot-lat-e8 n=2000000 p50us=144 p99us=371 maxus=12433 non200=0 finished in 1.06s, 1891950.70 req/s, 81.20MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000088
+r8 B sse200 B            sse latency p50=10µs p99=26µs max=1.45ms
+r8 B sse500 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000336
+r8 B sse500 B            sse latency p50=16µs p99=49µs max=4.449ms
+r8 B oneshot-e2 finished in 2.44s, 820712.82 req/s, 35.22MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 B oneshot-e8 finished in 820.32ms, 2438061.06 req/s, 104.63MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 B oneshot-lat-e2 n=2000000 p50us=475 p99us=1031 maxus=4660 non200=0 finished in 2.60s, 768592.25 req/s, 32.99MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 B oneshot-lat-e8 n=2000000 p50us=146 p99us=357 maxus=4065 non200=0 finished in 1.04s, 1930895.19 req/s, 82.87MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000074
+r8 A sse200 A            sse latency p50=12µs p99=32µs max=919µs
+r8 A sse500 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000186
+r8 A sse500 A            sse latency p50=23µs p99=89µs max=6.326ms
+r8 A oneshot-e2 finished in 2.50s, 800634.10 req/s, 34.36MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 A oneshot-e8 finished in 864.77ms, 2312764.38 req/s, 99.26MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 A oneshot-lat-e2 n=2000000 p50us=287 p99us=480 maxus=327099 non200=0 finished in 2.48s, 805844.95 req/s, 34.58MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 A oneshot-lat-e8 n=2000000 p50us=146 p99us=364 maxus=9525 non200=0 finished in 1.06s, 1890956.12 req/s, 81.15MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000099
+r9 A sse200 A            sse latency p50=13µs p99=35µs max=1.95ms
+r9 A sse500 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000221
+r9 A sse500 A            sse latency p50=23µs p99=119µs max=4.643ms
+r9 A oneshot-e2 finished in 2.39s, 836717.16 req/s, 35.91MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 A oneshot-e8 finished in 862.79ms, 2318066.55 req/s, 99.48MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 A oneshot-lat-e2 n=2000000 p50us=286 p99us=482 maxus=1190121 non200=0 finished in 2.42s, 824934.47 req/s, 35.40MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 A oneshot-lat-e8 n=2000000 p50us=154 p99us=376 maxus=12806 non200=0 finished in 1.03s, 1937130.43 req/s, 83.14MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000095
+r9 B sse200 B            sse latency p50=11µs p99=32µs max=1.465ms
+r9 B sse500 B            streams=500 conns=1 opened=351 delivering=0 failed=149 events=0
+r9 B sse500 B            NO EVENTS — SSE delivered nothing while the connection was live
+r9 B oneshot-e2 finished in 2.39s, 836911.48 req/s, 35.92MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 B oneshot-e8 finished in 829.32ms, 2411625.97 req/s, 103.50MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 B oneshot-lat-e2 n=2000000 p50us=456 p99us=1018 maxus=3561 non200=0 finished in 2.54s, 788066.16 req/s, 33.82MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 B oneshot-lat-e8 n=2000000 p50us=145 p99us=384 maxus=9556 non200=0 finished in 1.06s, 1882694.93 req/s, 80.80MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 B sse200 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000069
+r10 B sse200 B            sse latency p50=11µs p99=37µs max=1.03ms
+r10 B sse500 B            streams=500 conns=1 opened=429 delivering=256 failed=71 events=2560225
+r10 B sse500 B            sse latency p50=12µs p99=44µs max=2.668ms
+r10 B oneshot-e2 finished in 2.55s, 784169.19 req/s, 33.65MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 B oneshot-e8 finished in 828.39ms, 2414318.84 req/s, 103.62MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 B oneshot-lat-e2 n=2000000 p50us=513 p99us=932 maxus=4081 non200=0 finished in 2.49s, 802424.61 req/s, 34.44MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 B oneshot-lat-e8 n=2000000 p50us=148 p99us=347 maxus=8508 non200=0 finished in 1.01s, 1978407.66 req/s, 84.91MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000083
+r10 A sse200 A            sse latency p50=13µs p99=35µs max=1.052ms
+r10 A sse500 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000097
+r10 A sse500 A            sse latency p50=23µs p99=90µs max=3.96ms
+r10 A oneshot-e2 finished in 2.41s, 828285.97 req/s, 35.55MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 A oneshot-e8 finished in 843.44ms, 2371235.96 req/s, 101.77MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 A oneshot-lat-e2 n=2000000 p50us=379 p99us=582 maxus=1516049 non200=0 finished in 2.40s, 832718.51 req/s, 35.74MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 A oneshot-lat-e8 n=2000000 p50us=146 p99us=356 maxus=6608 non200=0 finished in 1.05s, 1902229.22 req/s, 81.64MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+-- host check before phase 2 --
+ 12:24:10 up 1 day,  1:19,  3 users,  load average: 2.58, 2.39, 2.05
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   6385 ryan      20   0 2522664 444524  77164 S   9.8   1.4 117:52.84 CrBrowserMain
+   1320 root      20   0  348156  27280  22684 S   4.9   0.1   0:03.62 NetworkManager
+      1 root      20   0   21236  16092  11032 S   0.0   0.1   0:02.42 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.04 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=0.05 limit=1.5
+== phase 2: burst fail-close rate (60 rounds per arm) ==
+b1 A burst FAIL burst        streams=200 conns=1 opened=166 delivering=39 failed=34 events=78022 overflow=1 stage_failed=0
+b1 A burst-log 
+b1 B burst OK overflow=0 stage_failed=0
+b2 B burst OK overflow=0 stage_failed=0
+b2 A burst OK overflow=0 stage_failed=0
+b3 A burst OK overflow=0 stage_failed=0
+b3 B burst OK overflow=0 stage_failed=0
+b4 B burst OK overflow=0 stage_failed=0
+b4 A burst OK overflow=0 stage_failed=0
+b5 A burst OK overflow=0 stage_failed=0
+b5 B burst OK overflow=0 stage_failed=0
+b6 B burst OK overflow=0 stage_failed=0
+b6 A burst OK overflow=0 stage_failed=0
+b7 A burst OK overflow=0 stage_failed=0
+b7 B burst OK overflow=0 stage_failed=0
+b8 B burst OK overflow=0 stage_failed=0
+b8 A burst OK overflow=0 stage_failed=0
+b9 A burst OK overflow=0 stage_failed=0
+b9 B burst OK overflow=0 stage_failed=0
+b10 B burst OK overflow=0 stage_failed=0
+b10 A burst FAIL burst        streams=200 conns=1 opened=169 delivering=12 failed=31 events=24008 overflow=1 stage_failed=0
+b10 A burst-log 
+b11 A burst OK overflow=0 stage_failed=0
+b11 B burst OK overflow=0 stage_failed=0
+b12 B burst OK overflow=0 stage_failed=0
+b12 A burst OK overflow=0 stage_failed=0
+b13 A burst OK overflow=0 stage_failed=0
+b13 B burst OK overflow=0 stage_failed=0
+b14 B burst OK overflow=0 stage_failed=0
+b14 A burst OK overflow=0 stage_failed=0
+b15 A burst OK overflow=0 stage_failed=0
+b15 B burst OK overflow=0 stage_failed=0
+b16 B burst OK overflow=0 stage_failed=0
+b16 A burst OK overflow=0 stage_failed=0
+b17 A burst OK overflow=0 stage_failed=0
+b17 B burst OK overflow=0 stage_failed=0
+b18 B burst OK overflow=0 stage_failed=0
+b18 A burst OK overflow=0 stage_failed=0
+b19 A burst OK overflow=0 stage_failed=0
+b19 B burst OK overflow=0 stage_failed=0
+b20 B burst OK overflow=0 stage_failed=0
+b20 A burst OK overflow=0 stage_failed=0
+b21 A burst OK overflow=0 stage_failed=0
+b21 B burst FAIL burst        streams=200 conns=1 opened=171 delivering=130 failed=29 events=260015 overflow=1 stage_failed=0
+b21 B burst-log 
+b22 B burst OK overflow=0 stage_failed=0
+b22 A burst OK overflow=0 stage_failed=0
+b23 A burst OK overflow=0 stage_failed=0
+b23 B burst OK overflow=0 stage_failed=0
+b24 B burst OK overflow=0 stage_failed=0
+b24 A burst OK overflow=0 stage_failed=0
+b25 A burst OK overflow=0 stage_failed=0
+b25 B burst OK overflow=0 stage_failed=0
+b26 B burst OK overflow=0 stage_failed=0
+b26 A burst OK overflow=0 stage_failed=0
+b27 A burst OK overflow=0 stage_failed=0
+b27 B burst OK overflow=0 stage_failed=0
+b28 B burst OK overflow=0 stage_failed=0
+b28 A burst OK overflow=0 stage_failed=0
+b29 A burst OK overflow=0 stage_failed=0
+b29 B burst OK overflow=0 stage_failed=0
+b30 B burst FAIL burst        streams=200 conns=1 opened=159 delivering=14 failed=41 events=28003 overflow=1 stage_failed=0
+b30 B burst-log 
+b30 A burst OK overflow=0 stage_failed=0
+b31 A burst OK overflow=0 stage_failed=0
+b31 B burst OK overflow=0 stage_failed=0
+b32 B burst OK overflow=0 stage_failed=0
+b32 A burst OK overflow=0 stage_failed=0
+b33 A burst OK overflow=0 stage_failed=0
+b33 B burst OK overflow=0 stage_failed=0
+b34 B burst OK overflow=0 stage_failed=0
+b34 A burst OK overflow=0 stage_failed=0
+b35 A burst OK overflow=0 stage_failed=0
+b35 B burst OK overflow=0 stage_failed=0
+b36 B burst OK overflow=0 stage_failed=0
+b36 A burst OK overflow=0 stage_failed=0
+b37 A burst OK overflow=0 stage_failed=0
+b37 B burst OK overflow=0 stage_failed=0
+b38 B burst OK overflow=0 stage_failed=0
+b38 A burst FAIL burst        streams=200 conns=1 opened=184 delivering=0 failed=16 events=0 overflow=1 stage_failed=0
+b38 A burst-log 
+b39 A burst OK overflow=0 stage_failed=0
+b39 B burst OK overflow=0 stage_failed=0
+b40 B burst OK overflow=0 stage_failed=0
+b40 A burst OK overflow=0 stage_failed=0
+b41 A burst OK overflow=0 stage_failed=0
+b41 B burst OK overflow=0 stage_failed=0
+b42 B burst OK overflow=0 stage_failed=0
+b42 A burst OK overflow=0 stage_failed=0
+b43 A burst OK overflow=0 stage_failed=0
+b43 B burst OK overflow=0 stage_failed=0
+b44 B burst FAIL burst        streams=200 conns=1 opened=153 delivering=25 failed=47 events=50015 overflow=1 stage_failed=0
+b44 B burst-log 
+b44 A burst OK overflow=0 stage_failed=0
+b45 A burst OK overflow=0 stage_failed=0
+b45 B burst OK overflow=0 stage_failed=0
+b46 B burst OK overflow=0 stage_failed=0
+b46 A burst OK overflow=0 stage_failed=0
+b47 A burst OK overflow=0 stage_failed=0
+b47 B burst OK overflow=0 stage_failed=0
+b48 B burst OK overflow=0 stage_failed=0
+b48 A burst OK overflow=0 stage_failed=0
+b49 A burst OK overflow=0 stage_failed=0
+b49 B burst OK overflow=0 stage_failed=0
+b50 B burst OK overflow=0 stage_failed=0
+b50 A burst OK overflow=0 stage_failed=0
+b51 A burst OK overflow=0 stage_failed=0
+b51 B burst OK overflow=0 stage_failed=0
+b52 B burst OK overflow=0 stage_failed=0
+b52 A burst OK overflow=0 stage_failed=0
+b53 A burst OK overflow=0 stage_failed=0
+b53 B burst OK overflow=0 stage_failed=0
+b54 B burst OK overflow=0 stage_failed=0
+b54 A burst OK overflow=0 stage_failed=0
+b55 A burst OK overflow=0 stage_failed=0
+b55 B burst OK overflow=0 stage_failed=0
+b56 B burst OK overflow=0 stage_failed=0
+b56 A burst OK overflow=0 stage_failed=0
+b57 A burst OK overflow=0 stage_failed=0
+b57 B burst OK overflow=0 stage_failed=0
+b58 B burst OK overflow=0 stage_failed=0
+b58 A burst OK overflow=0 stage_failed=0
+b59 A burst OK overflow=0 stage_failed=0
+b59 B burst OK overflow=0 stage_failed=0
+b60 B burst OK overflow=0 stage_failed=0
+b60 A burst OK overflow=0 stage_failed=0
+-- host check before phase 3 --
+ 12:30:20 up 1 day,  1:25,  3 users,  load average: 1.50, 1.86, 1.91
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2324 libvirt+  20   0    9.9g   5.0g  21540 S   4.9  16.4  52:41.36 qemu-system-x86
+   6359 ryan      20   0 1959336 123508  55616 S   4.9   0.4   6:17.53 xalia.exe
+   6385 ryan      20   0 2522664 444556  77164 S   4.9   1.4 118:20.49 CrBrowserMain
+      1 root      20   0   21236  16092  11032 S   0.0   0.1   0:02.44 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.04 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=0.08 limit=1.5
+== phase 3: server CPU per event at a FIXED offered load ==
+c1 A cpu200 ticks=709 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000103
+c1 A cpu500 ticks=1077 tck=100 A            streams=500 conns=1 opened=452 delivering=363 failed=48 events=3630104
+c1 B cpu200 ticks=860 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000079
+c1 B cpu500 ticks=1041 tck=100 B            streams=500 conns=1 opened=369 delivering=271 failed=131 events=2710097
+c2 B cpu200 ticks=847 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000069
+c2 B cpu500 ticks=993 tck=100 B            streams=500 conns=1 opened=428 delivering=244 failed=72 events=2440155
+c2 A cpu200 ticks=726 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000113
+c2 A cpu500 ticks=789 tck=100 A            streams=500 conns=1 opened=374 delivering=263 failed=126 events=2630156
+c3 A cpu200 ticks=733 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000113
+c3 A cpu500 ticks=896 tck=100 A            streams=500 conns=1 opened=450 delivering=277 failed=50 events=2770183
+c3 B cpu200 ticks=858 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000086
+c3 B cpu500 ticks=1000 tck=100 B            streams=500 conns=1 opened=377 delivering=256 failed=123 events=2560169
+c4 B cpu200 ticks=897 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000058
+c4 B cpu500 ticks=1547 tck=100 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000206
+c4 A cpu200 ticks=725 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000100
+c4 A cpu500 ticks=1249 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000086
+c5 A cpu200 ticks=680 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000071
+c5 A cpu500 ticks=1272 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000281
+c5 B cpu200 ticks=848 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000073
+c5 B cpu500 ticks=1336 tck=100 B            streams=500 conns=1 opened=486 delivering=396 failed=14 events=3960245
+c6 B cpu200 ticks=869 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000089
+c6 B cpu500 ticks=1495 tck=100 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000353
+c6 A cpu200 ticks=152 tck=100 A            streams=200 conns=1 opened=162 delivering=47 failed=38 events=470027
+c6 A cpu500 ticks=1269 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000131
+c7 A cpu200 ticks=713 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000140
+c7 A cpu500 ticks=1324 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000187
+c7 B cpu200 ticks=879 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000087
+c7 B cpu500 ticks=1315 tck=100 B            streams=500 conns=1 opened=436 delivering=386 failed=64 events=3860140
+c8 B cpu200 ticks=861 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000092
+c8 B cpu500 ticks=1181 tck=100 B            streams=500 conns=1 opened=473 delivering=322 failed=27 events=3220213
+c8 A cpu200 ticks=753 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000083
+c8 A cpu500 ticks=1289 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000154
+c9 A cpu200 ticks=707 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000115
+c9 A cpu500 ticks=862 tck=100 A            streams=500 conns=1 opened=452 delivering=256 failed=48 events=2560123
+c9 B cpu200 ticks=0 tck=100 B            streams=200 conns=1 opened=189 delivering=0 failed=11 events=0
+c9 B cpu500 ticks=1559 tck=100 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000337
+c10 B cpu200 ticks=455 tck=100 B            streams=200 conns=1 opened=188 delivering=102 failed=12 events=1020033
+c10 B cpu500 ticks=1540 tck=100 B            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000375
+c10 A cpu200 ticks=722 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000058
+c10 A cpu500 ticks=1276 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000124
+== rows=280 ==
