@@ -948,10 +948,20 @@ pub const Pump = struct {
         return chunk;
     }
 
-    /// True when one more `pushWriteChunk` would return WriteFailed.
-    /// `carried` holds the first overflow chunk; `write_ch` holds the rest.
+    /// The most chunks one scheduler pop can push before the scheduler asks
+    /// `pause`/`pause_control` again. The drain sink flushes a non-empty
+    /// packed batch and then queues an unbatchable frame (unticketed DATA)
+    /// on its own: two pushes for one pop. A pause that fires only at zero
+    /// room lets that second push overflow and fail-close the connection.
+    pub const pushes_per_pop: usize = 2;
+
+    /// True when the stash cannot take `pushes_per_pop` more chunks, so the
+    /// scheduler must stop popping. `carried` holds one chunk; `write_ch`
+    /// holds the rest.
     pub fn stashFull(self: *Pump) bool {
-        return self.carried != null and self.write_ch.isFull();
+        const cap = 1 + self.write_ch.impl.capacity;
+        const used = @as(usize, if (self.carried != null) 1 else 0) + io_queue.chanLen(wire_pump.WireChunk, self.write_ch);
+        return cap - used < pushes_per_pop;
     }
 
     fn stealWrite(self: *Pump) void {
