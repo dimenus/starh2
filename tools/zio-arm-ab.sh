@@ -522,13 +522,17 @@ while [ $c -le $CPU_ROUNDS ]; do
   round_check "cpu round $c"
   rotate $c
   for arm in $ORDER; do
-    for S in $CPU_STREAMS; do
+    # An entry is S (S streams on one TLS connection) or SxC (S streams
+    # spread over C connections, labelled cpuScC).
+    for spec in $CPU_STREAMS; do
+      S=${spec%%x*}; C=1; lbl=cpu$S
+      case "$spec" in *x*) C=${spec#*x}; lbl=cpu${S}c$C ;; esac
       start_srv $arm $EXECUTORS
       if [ -n "$SRV_PORT" ]; then
-        line=$(timeout 180 $D/client -url https://127.0.0.1:$SRV_PORT/sse -streams $S \
+        line=$(timeout 180 $D/client -url https://127.0.0.1:$SRV_PORT/sse -streams $S -conns $C \
           -seconds $SECONDS_RUN -warmup 1 -label $arm 2>&1 | grep 'events=')
         cpu=$(awk '{print $14+$15}' /proc/$SRV_PID/stat 2>/dev/null)
-        echo "c$c $arm cpu$S ticks=${cpu:-absent} tck=$TCK $line"
+        echo "c$c $arm $lbl ticks=${cpu:-absent} tck=$TCK $line"
         rows=$((rows+1))
       fi
       stop_srv
@@ -537,7 +541,7 @@ while [ $c -le $CPU_ROUNDS ]; do
         # per key (the second field), which is the total at the kill.
         grep -E "$LOG_GREP" $D/$arm.log | awk '{ last[$2] = $0; if (!($2 in seen)) { seen[$2] = 1; key[++n] = $2 } }
           END { for (i = 1; i <= n; i++) print last[key[i]]; if (n == 0) print "LOG-GREP-NO-MATCH" }' \
-          | sed "s/^/c$c $arm cpu$S log /"
+          | sed "s/^/c$c $arm $lbl log /"
       fi
     done
   done

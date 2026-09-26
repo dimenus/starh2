@@ -90,7 +90,7 @@ $3 ~ /^oneconn-e[0-9]+$/ {
   }
 }
 
-$3 ~ /^cpu[0-9]+$/ {
+$3 ~ /^cpu[0-9]+(c[0-9]+)?$/ {
   k = $1 SUBSEP arm SUBSEP $3; note(k)
   for (i = 1; i <= NF; i++) {
     if ($i ~ /^ticks=/)  { val = $i; sub(/^ticks=/, "", val);  tk[k] = val + 0 }
