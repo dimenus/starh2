@@ -4,6 +4,8 @@
 # pinned scheduling with --spawn-placement local.
 #
 #   BIN=<probe binary> captures/zio-placement-probe/run.sh > rows.txt
+#   MODE=balance BIN=<probe binary> ... > balance-rows.txt   # N against B
+#     (B = N plus --conn-balance, the load-aware placement experiment)
 #
 # The probe binary is the starh2/zio-placement-probe tree built with
 #   -Doptimize=ReleaseFast -Dzio-scheduling=pinned -Dobserve=true
@@ -43,14 +45,15 @@ ssh "$HOST" "mkdir -p $D"
 scp -q "$BIN" "$HOST:$D/PROBE-server"
 ssh "$HOST" "cp /tmp/zio-placement-recheck/client /tmp/zio-placement-recheck/cert.pem /tmp/zio-placement-recheck/key.pem $D/"
 echo "local sha256 $SHA"
-ssh "$HOST" "D='$D' ROUNDS=$ROUNDS SHA=$SHA sh -s" <<'REMOTE'
+ssh "$HOST" "D='$D' ROUNDS=$ROUNDS SHA=$SHA MODE=${MODE:-probe} sh -s" <<'REMOTE'
 set -u
 chmod +x $D/PROBE-server $D/client
 echo "== host"; uname -r; uptime
 got=$(sha256sum $D/PROBE-server | cut -d' ' -f1)
 [ "$got" = "$SHA" ] || { echo "sha mismatch $got" >&2; exit 1; }
 echo "sha PROBE $got"
-force() { case $1 in N) echo none;; C) echo same;; P) echo split;; esac; }
+force() { case $1 in N|B) echo none;; C) echo same;; P) echo split;; esac; }
+bal() { case $1 in B) echo "--conn-balance";; *) echo "";; esac; }
 
 host_ok() {
   w=0
@@ -81,12 +84,14 @@ sample() {
 run_one() {
   R=$1; A=$2; F=$(force $A); rm -f $D/$A.log
   $D/PROBE-server --mode tls --port 0 --executors 2 --sse-interval-ms 1 \
-    --cert $D/cert.pem --key $D/key.pem --spawn-placement local --probe-conn-placement $F > $D/$A.log 2>&1 &
+    --cert $D/cert.pem --key $D/key.pem --spawn-placement local --probe-conn-placement $F $(bal $A) > $D/$A.log 2>&1 &
   P=$!; i=0; PORT=
   while [ $i -lt 200 ]; do PORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' $D/$A.log | head -1); [ -n "$PORT" ] && break; i=$((i+1)); sleep 0.05; done
   ready=$(grep '"ready"' $D/$A.log | head -1)
   want="\"zio_scheduling\":\"pinned\",\"spawn_placement\":\"local\",\"probe\":1,\"probe_handler_placement\":\"none\",\"probe_conn_placement\":\"$F\""
   case "$ready" in *"$want"*) ;; *) echo "READY-MISMATCH $A: $ready" >&2; kill $P; exit 4;; esac
+  cb='"conn_balance":0'; [ $A = B ] && cb='"conn_balance":1'
+  case "$ready" in *"$cb"*) ;; *) echo "READY-MISMATCH $A (conn_balance): $ready" >&2; kill $P; exit 4;; esac
   S=$D/series-$R-$A
   sample $P $S & SP=$!
   timeout 180 $D/client -url https://127.0.0.1:$PORT/sse -streams 500 -seconds 10 -warmup 1 -label $A > $D/client.out 2>&1 &
@@ -124,6 +129,8 @@ while [ $r -le $ROUNDS ]; do
     case $(( (r / 3 - 1) % 6 )) in
       0) O="N C P";; 1) O="P C N";; 2) O="C P N";; 3) O="N P C";; 4) O="P N C";; 5) O="C N P";; esac
   else O="N"; fi
+  # MODE=balance: natural (N) against --conn-balance (B), alternating order.
+  if [ "$MODE" = balance ]; then if [ $((r % 2)) -eq 1 ]; then O="N B"; else O="B N"; fi; fi
   for a in $O; do run_one $r $a; done
   r=$((r+1))
 done

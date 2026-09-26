@@ -335,6 +335,9 @@ pub const Server = struct {
 
     fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
+        defer if (config.exec_index) |ei| {
+            _ = connection.exec_live_conns[ei].fetchSub(1, .acq_rel);
+        };
         connection.probeNote(.conn_entry);
         if (config.mode == .h1c) return h1.serve(stream, config, null, &.{});
         if (config.mode == .tls) return serveTlsThenBranch(stream, config);
@@ -483,7 +486,9 @@ pub const Server = struct {
                 }
                 handshake_held = true;
             }
+            const balanced = connection.balancePick();
             const config: connection.ConnConfig = .{
+                .exec_index = balanced,
                 .io = self.io,
                 .mode = mode,
                 .limits = self.limits,
@@ -498,6 +503,23 @@ pub const Server = struct {
                 .compression_pool = if (self.compression_pool) |*pool| pool else null,
                 .handshake_held = handshake_held,
             };
+            // EXPERIMENT: load-aware placement (connection.conn_balance, off
+            // by default). Spawned outside connection_group, so shutdown does
+            // not drain it; see connection.balancePick.
+            if (balanced) |ei| {
+                _ = connection.exec_live_conns[ei].fetchAdd(1, .acq_rel);
+                if (zio.spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config })) |handle| {
+                    var h = handle;
+                    h.detach();
+                    continue;
+                } else |_| {
+                    _ = connection.exec_live_conns[ei].fetchSub(1, .acq_rel);
+                    if (handshake_held) self.accounting.releaseHandshake();
+                    _ = self.active_connections.fetchSub(1, .acq_rel);
+                    stream.close(self.io);
+                    continue;
+                }
+            }
             // Placement probe only (observe, pinned builds): place the
             // connection on a chosen executor instead of zio's `.auto`. The
             // task is detached from connection_group, so a probe server does

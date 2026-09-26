@@ -199,6 +199,47 @@ pub fn probeNote(kind: ProbeKind) void {
 /// executor), so the actor's executor is 0 exactly when its tid is the pid.
 pub const ProbeForce = enum { none, same, other };
 
+/// EXPERIMENT (off by default; pinned or single_executor builds only):
+/// load-aware connection placement. Under pinned scheduling a connection and
+/// all its tasks stay on the executor its connEntry lands on, and zio's
+/// `.auto` round-robin ignores load, so two heavy connections can share one
+/// executor while another idles (captures/zio-placement-probe). With
+/// `conn_balance` set, the accept loop puts each new connection on the
+/// executor with the fewest live task handlers, then the fewest live
+/// connections, then the lowest index.
+///
+/// Limits of the experiment: a balanced connection is spawned outside the
+/// server's connection group, so shutdown does not wait for it. The counts
+/// cover task handlers only, not work an actor does inline.
+pub const balance_max_executors = 16;
+pub var conn_balance: bool = false;
+/// Executor count of the runtime. The server cannot read it from std.Io, so
+/// whoever enables `conn_balance` sets it. 0 or 1 disables balancing.
+pub var conn_balance_executors: u32 = 0;
+pub var exec_live_handlers: [balance_max_executors]std.atomic.Value(u32) = std.mem.zeroes([balance_max_executors]std.atomic.Value(u32));
+pub var exec_live_conns: [balance_max_executors]std.atomic.Value(u32) = std.mem.zeroes([balance_max_executors]std.atomic.Value(u32));
+
+pub fn balancePick() ?zio.ExecutorId {
+    if (comptime zio_scheduling == .work_stealing) return null;
+    if (!conn_balance) return null;
+    const n = @min(conn_balance_executors, balance_max_executors);
+    if (n < 2) return null;
+    var best: zio.ExecutorId = 0;
+    var best_h = exec_live_handlers[0].load(.acquire);
+    var best_c = exec_live_conns[0].load(.acquire);
+    var i: zio.ExecutorId = 1;
+    while (i < n) : (i += 1) {
+        const h = exec_live_handlers[i].load(.acquire);
+        const c = exec_live_conns[i].load(.acquire);
+        if (h < best_h or (h == best_h and c < best_c)) {
+            best = i;
+            best_h = h;
+            best_c = c;
+        }
+    }
+    return best;
+}
+
 /// Probe-only placement of whole connections (connEntry): `same` puts every
 /// accepted connection on executor 0; `split` alternates executors 0, 1, 0,
 /// ... in accept order. `none` keeps the server's normal `.auto` spawn.
@@ -732,6 +773,9 @@ pub const trace = struct {
 pub const Mode = enum { h2c, tls, h1c };
 
 pub const ConnConfig = struct {
+    /// Set when the accept loop placed this connection with `balancePick`:
+    /// the executor index its handlers are counted against.
+    exec_index: ?zio.ExecutorId = null,
     io: std.Io,
     mode: Mode,
     limits: limits_mod.Limits,
@@ -5084,6 +5128,7 @@ const Connection = struct {
         // stores the join handle still decrements in finishHandlerJob.
         job.task_counted = true;
         _ = self.live_task_handlers.fetchAdd(1, .acq_rel);
+        if (self.config.exec_index) |ei| _ = exec_live_handlers[ei].fetchAdd(1, .acq_rel);
         // With `.local`, a burst of 13+ spawns fills this executor's queue and
         // zio's `registerTask` yields this actor while it holds `session_mu`:
         // a short convoy behind the new handlers, not a deadlock, because the
@@ -5154,7 +5199,10 @@ const Connection = struct {
             };
         }
         _ = self.live_handlers.fetchSub(1, .acq_rel);
-        if (job.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
+        if (job.task_counted) {
+            _ = self.live_task_handlers.fetchSub(1, .acq_rel);
+            if (self.config.exec_index) |ei| _ = exec_live_handlers[ei].fetchSub(1, .acq_rel);
+        }
         if (comptime test_observe) _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
         _ = job.arena.reset(.retain_capacity);
         self.releaseDispatchRequest(job.owned_request);

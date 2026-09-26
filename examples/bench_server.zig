@@ -666,6 +666,14 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
                 std.debug.print("--spawn-placement takes auto or local, got {s}\n", .{v});
                 return error.InvalidSpawnPlacement;
             }
+        } else if (std.mem.eql(u8, a, "--conn-balance")) {
+            // EXPERIMENT: load-aware connection placement (see
+            // connection.balancePick). Pinned or single_executor builds only.
+            if (conn_mod.zio_scheduling == .work_stealing) {
+                std.debug.print("--conn-balance needs -Dzio-scheduling=pinned or single_executor\n", .{});
+                return error.ConnBalanceNeedsPinnedBuild;
+            }
+            conn_mod.conn_balance = true;
         } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
             // Placement probe: every connection on executor 0 (same), or
             // alternating executors in accept order (split).
@@ -946,6 +954,8 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         sweeper.detach();
     }
     conn_mod.placement_override = args.spawn_placement;
+    // Same count the runtime was built with (`.exact` below in main).
+    conn_mod.conn_balance_executors = args.executors orelse starh2.physical_cpus.executorCount();
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;
@@ -997,7 +1007,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\"}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d}}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1009,6 +1019,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             @as(u8, @intFromBool(conn_mod.placement_check)),
             @tagName(conn_mod.probe_handler_force),
             @tagName(conn_mod.probe_conn_force),
+            @as(u8, @intFromBool(conn_mod.conn_balance)),
         },
     );
     defer gpa.free(ready);
