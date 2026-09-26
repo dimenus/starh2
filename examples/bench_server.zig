@@ -284,6 +284,24 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             conn_mod.test_placement_mismatches.load(.acquire),
         },
     );
+    // Placement probe: per thread (kernel tid), how many units of work each
+    // kind of task ran there. Empty unless placement_check.
+    try w.print("\"probe_pid\":{d},\"probe_overflow\":{d},\"probe\":[", .{
+        if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0,
+        conn_mod.probe_overflow.load(.acquire),
+    });
+    var first_slot = true;
+    for (&conn_mod.probe_tids, 0..) |*slot, i| {
+        const tid = slot.load(.acquire);
+        if (tid == 0) continue;
+        try w.print("{s}{{\"tid\":{d}", .{ if (first_slot) "" else ",", tid });
+        first_slot = false;
+        inline for (@typeInfo(conn_mod.ProbeKind).@"enum".fields) |f| {
+            try w.print(",\"{s}\":{d}", .{ f.name, conn_mod.probe_counts[f.value][i].load(.acquire) });
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("],");
     try w.print(
         "\"encrypt_ns\":{d},\"encrypt_n\":{d},\"encrypt_bytes\":{d}," ++
             "\"decrypt_ns\":{d},\"decrypt_n\":{d},\"decrypt_in\":{d},\"decrypt_plain\":{d}," ++
@@ -422,6 +440,7 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
     var next: i128 = std.Io.Clock.awake.now(g_io).nanoseconds + interval_ns;
     while (true) {
         _ = g_cadence.loops.fetchAdd(1, .monotonic);
+        conn_mod.probeNote(.handler_iter);
         const now_ns: i128 = std.Io.Clock.awake.now(g_io).nanoseconds;
         const deadline = next;
         if (deadline > now_ns) {
@@ -647,6 +666,30 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
                 std.debug.print("--spawn-placement takes auto or local, got {s}\n", .{v});
                 return error.InvalidSpawnPlacement;
             }
+        } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
+            // Placement probe: every connection on executor 0 (same), or
+            // alternating executors in accept order (split).
+            const v = args.next() orelse return error.MissingValue;
+            if (!conn_mod.placement_check) {
+                std.debug.print("--probe-conn-placement needs -Dobserve=true and a pinned build\n", .{});
+                return error.ProbeNeedsObserveBuild;
+            }
+            conn_mod.probe_conn_force = std.meta.stringToEnum(conn_mod.ProbeConnForce, v) orelse {
+                std.debug.print("--probe-conn-placement takes none, same or split, got {s}\n", .{v});
+                return error.InvalidProbePlacement;
+            };
+        } else if (std.mem.eql(u8, a, "--probe-handler-placement")) {
+            // Placement probe: force SSE handlers onto the actor's executor
+            // (same) or the other one (other). Needs an observe, pinned build.
+            const v = args.next() orelse return error.MissingValue;
+            if (!conn_mod.placement_check) {
+                std.debug.print("--probe-handler-placement needs -Dobserve=true and a pinned build\n", .{});
+                return error.ProbeNeedsObserveBuild;
+            }
+            conn_mod.probe_handler_force = std.meta.stringToEnum(conn_mod.ProbeForce, v) orelse {
+                std.debug.print("--probe-handler-placement takes none, same or other, got {s}\n", .{v});
+                return error.InvalidProbePlacement;
+            };
         } else {
             return error.UnknownArgument;
         }
@@ -954,7 +997,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\"}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\"}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -963,6 +1006,9 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             @as(u8, @intFromBool(args.batch_wake_sleepers)),
             @tagName(conn_mod.zio_scheduling),
             @tagName(conn_mod.connPlacement()),
+            @as(u8, @intFromBool(conn_mod.placement_check)),
+            @tagName(conn_mod.probe_handler_force),
+            @tagName(conn_mod.probe_conn_force),
         },
     );
     defer gpa.free(ready);

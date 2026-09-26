@@ -335,6 +335,7 @@ pub const Server = struct {
 
     fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
+        connection.probeNote(.conn_entry);
         if (config.mode == .h1c) return h1.serve(stream, config, null, &.{});
         if (config.mode == .tls) return serveTlsThenBranch(stream, config);
         return connection.serveAccepted(stream, config);
@@ -453,6 +454,7 @@ pub const Server = struct {
     ) std.Io.Cancelable!void {
         const listener = &self.listeners[endpoint_index];
         while (!self.shutdown_flag.load(.acquire)) {
+            connection.probeNote(.accept);
             const stream = listener.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.ConnectionAborted => continue,
@@ -496,6 +498,24 @@ pub const Server = struct {
                 .compression_pool = if (self.compression_pool) |*pool| pool else null,
                 .handshake_held = handshake_held,
             };
+            // Placement probe only (observe, pinned builds): place the
+            // connection on a chosen executor instead of zio's `.auto`. The
+            // task is detached from connection_group, so a probe server does
+            // not drain connections at shutdown; it is killed instead.
+            if (comptime connection.placement_check) {
+                if (connection.probeConnPlacement()) |placement| {
+                    if (zio.spawnInto(placement, connEntry, .{ self, stream, config })) |handle| {
+                        var h = handle;
+                        h.detach();
+                        continue;
+                    } else |_| {
+                        if (handshake_held) self.accounting.releaseHandshake();
+                        _ = self.active_connections.fetchSub(1, .acq_rel);
+                        stream.close(self.io);
+                        continue;
+                    }
+                }
+            }
             connection_group.concurrent(self.io, connEntry, .{ self, stream, config }) catch {
                 if (handshake_held) self.accounting.releaseHandshake();
                 _ = self.active_connections.fetchSub(1, .acq_rel);

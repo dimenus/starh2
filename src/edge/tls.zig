@@ -868,6 +868,7 @@ pub const Pump = struct {
             zio.ev.WriteBuf.fromSlice(self.send_buf[self.send_head..self.send_fill], &self.send_iov),
             .{},
         );
+        @import("connection.zig").probeNote(.tls_send_submit);
         self.cq.submit(&self.send_op.c) catch |err| switch (err) {
             error.Closed => return false,
             error.InvalidCompletion => unreachable,
@@ -1215,6 +1216,7 @@ pub const Pump = struct {
     fn rearmRecv(self: *Pump) bool {
         if (self.recv_armed) return true;
         std.debug.assert(self.pending_cipher == null);
+        @import("connection.zig").probeNote(.tls_recv_submit);
         self.cq.submit(&self.recv_op.c) catch |err| switch (err) {
             error.Closed => return false,
             // The op is ours alone: never grouped, never rearm-flagged.

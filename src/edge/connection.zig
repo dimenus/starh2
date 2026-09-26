@@ -160,6 +160,72 @@ pub fn notePlacement(actor_thread: std.Thread.Id) void {
     }
 }
 
+/// Placement probe (observe builds only; compiled out otherwise): counts, per
+/// OS thread, how often each kind of server task ran a unit of work there.
+/// Threads are keyed by kernel tid in first-seen slots, so a row can be
+/// joined with /proc/<pid>/task/<tid>/stat. Linux only: other targets count
+/// nothing.
+pub const ProbeKind = enum(u8) { accept, conn_entry, actor_start, actor_turn, handler_start, handler_iter, reaper_job, tls_recv_submit, tls_send_submit };
+pub const probe_slots = 8;
+pub var probe_tids: [probe_slots]std.atomic.Value(i32) = std.mem.zeroes([probe_slots]std.atomic.Value(i32));
+pub var probe_counts: [@typeInfo(ProbeKind).@"enum".fields.len][probe_slots]std.atomic.Value(u64) =
+    std.mem.zeroes([@typeInfo(ProbeKind).@"enum".fields.len][probe_slots]std.atomic.Value(u64));
+/// More distinct threads than slots: those notes are dropped, and counted
+/// here, so a full table cannot pass as a complete one.
+pub var probe_overflow: std.atomic.Value(u64) = .init(0);
+
+pub fn probeTid() i32 {
+    if (comptime @import("builtin").os.tag != .linux) return 0;
+    return @intCast(std.os.linux.gettid());
+}
+
+pub fn probeNote(kind: ProbeKind) void {
+    if (comptime !placement_check or @import("builtin").os.tag != .linux) return;
+    const tid = probeTid();
+    for (&probe_tids, 0..) |*slot, i| {
+        var cur = slot.load(.acquire);
+        if (cur == 0) cur = slot.cmpxchgStrong(0, tid, .acq_rel, .acquire) orelse tid;
+        if (cur == tid) {
+            _ = probe_counts[@intFromEnum(kind)][i].fetchAdd(1, .monotonic);
+            return;
+        }
+    }
+    _ = probe_overflow.fetchAdd(1, .monotonic);
+}
+
+/// Probe-only forcing of the handler spawn, to validate the probe: `same`
+/// spawns SSE handlers on the actor's executor, `other` on the other one of
+/// a 2-executor runtime. Executor 0 is the process main thread (zio's main
+/// executor), so the actor's executor is 0 exactly when its tid is the pid.
+pub const ProbeForce = enum { none, same, other };
+
+/// Probe-only placement of whole connections (connEntry): `same` puts every
+/// accepted connection on executor 0; `split` alternates executors 0, 1, 0,
+/// ... in accept order. `none` keeps the server's normal `.auto` spawn.
+pub const ProbeConnForce = enum { none, same, split };
+pub var probe_conn_force: ProbeConnForce = .none;
+var probe_conn_next: std.atomic.Value(u32) = .init(0);
+
+pub fn probeConnPlacement() ?zio.Placement {
+    if (comptime !placement_check) return null;
+    return switch (probe_conn_force) {
+        .none => null,
+        .same => .{ .executor = 0 },
+        .split => .{ .executor = @intCast(probe_conn_next.fetchAdd(1, .monotonic) % 2) },
+    };
+}
+pub var probe_handler_force: ProbeForce = .none;
+
+fn probeHandlerPlacement() zio.Placement {
+    if (comptime !placement_check or @import("builtin").os.tag != .linux) return connPlacement();
+    const actor_exec: zio.ExecutorId = if (probeTid() == std.os.linux.getpid()) 0 else 1;
+    return switch (probe_handler_force) {
+        .none => connPlacement(),
+        .same => .{ .executor = actor_exec },
+        .other => .{ .executor = 1 - actor_exec },
+    };
+}
+
 /// Test-only: when true, task-handler spawn fails closed with REFUSED_STREAM.
 /// Complete handlers never spawn, so this flag does not touch them. Do not
 /// run the task handler on the actor as a fallback — that parks ingest.
@@ -995,6 +1061,7 @@ pub const ReaperPool = struct {
                 error.Closed => return,
                 error.Canceled => return error.Canceled,
             };
+            probeNote(.reaper_job);
             job.owner.store(reaper_running, .release);
             std.debug.assert(job.owner.load(.acquire) == reaper_running);
             job.handle.cancel();
@@ -2837,6 +2904,7 @@ const Connection = struct {
         const io = self.config.io;
         if (diag_task_handle_fn) |f| self.actor_task_h.store(f(), .release);
         if (comptime placement_check) self.actor_thread = std.Thread.getCurrentId();
+        probeNote(.actor_start);
 
         var read_pump: wire_pump.ReadPump = undefined;
         var write_pump: wire_pump.WritePump = undefined;
@@ -2995,6 +3063,7 @@ const Connection = struct {
         // hold they already have; they must not drop and reacquire.
         var leaving = false;
         while (true) {
+            probeNote(.actor_turn);
             _ = self.sched_refilled.swap(false, .acq_rel);
             self.drainWriteAcks();
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
@@ -5022,7 +5091,7 @@ const Connection = struct {
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
-            zio.spawnInto(connPlacement(), runHandlerJob, .{job});
+            zio.spawnInto(probeHandlerPlacement(), runHandlerJob, .{job});
         const h = handle catch {
             // Admission already incremented live_handlers and claimed a slot.
             // Refuse rather than run on the actor: a blocking task handler
@@ -5093,6 +5162,7 @@ const Connection = struct {
 
     fn runHandlerJob(job: *HandlerJob) void {
         notePlacement(job.conn.actor_thread);
+        probeNote(.handler_start);
         defer finishHandlerJob(job);
         runHandlerJobBody(job);
     }
