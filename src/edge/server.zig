@@ -45,6 +45,10 @@ pub const TlsConfig = struct {
     private_key_pem: []const u8,
 };
 
+/// Test-only: TLS handshakes that ended at their own timeout, as opposed to
+/// a peer that broke the handshake. Counted in Debug and `-Dobserve=true`.
+pub var test_handshake_timeouts: std.atomic.Value(usize) = .init(0);
+
 pub const InitError = error{
     OutOfMemory,
     InvalidConfig,
@@ -358,13 +362,14 @@ pub const Server = struct {
             return;
         };
 
-        handshakeWithTimeout(tls_conn, config) catch {
+        handshakeWithTimeout(tls_conn, config) catch |err| {
             tls_conn.deinit();
             config.gpa.destroy(tls_conn);
             if (config.handshake_held) {
                 if (config.accounting) |a| a.releaseHandshake();
             }
             stream.close(config.io);
+            if (err == error.Canceled) return error.Canceled;
             return;
         };
         if (config.handshake_held) {
@@ -406,38 +411,24 @@ pub const Server = struct {
         return h1.serve(stream, cfg, tls_conn, owned);
     }
 
-    fn handshakeWithTimeout(tls_conn: *tls_edge.Conn, config: connection.ConnConfig) !void {
-        const Hs = union(enum) {
-            hs: anyerror!void,
-            timer: std.Io.Cancelable!void,
-        };
-        const Handshake = struct {
-            fn run(conn: *tls_edge.Conn, inner_io: std.Io) anyerror!void {
-                try conn.handshakeAny(inner_io);
-            }
-        };
-        var result_buf: [2]Hs = undefined;
-        var select = std.Io.Select(Hs).init(config.io, &result_buf);
-        errdefer select.cancelDiscard();
-        try select.concurrent(.hs, Handshake.run, .{ tls_conn, config.io });
-        const timeout: std.Io.Timeout = .{ .duration = .{
-            .raw = .fromNanoseconds(@intCast(config.limits.preface_timeout_ns)),
-            .clock = .awake,
-        } };
-        try select.concurrent(.timer, struct {
-            fn run(t: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
-                return t.sleep(io);
-            }
-        }.run, .{ timeout, config.io });
-        const selected = try select.await();
-        defer select.cancelDiscard();
-        switch (selected) {
-            .hs => |result| try result,
-            .timer => |result| {
-                try result;
+    /// The handshake runs on this task, the connection's own, under a
+    /// timeout. zio's socket registry makes the loop that FIRST parks on a
+    /// socket direction its owner for the fd's life (`ev/sockreg.zig`), so a
+    /// handshake in a subtask on another executor would leave that executor
+    /// servicing every later read of this connection.
+    ///
+    /// On timeout the canceled read loses no bytes that matter: the caller
+    /// closes the connection.
+    fn handshakeWithTimeout(tls_conn: *tls_edge.Conn, config: connection.ConnConfig) error{ Canceled, TlsHandshakeFailed, TlsHandshakeTimeout }!void {
+        const timeout: zio.Timeout = .fromNanoseconds(config.limits.preface_timeout_ns);
+        zio.withTimeout(timeout, tls_edge.Conn.handshake, .{ tls_conn, config.io }) catch |err| switch (err) {
+            error.Timeout => {
+                if (comptime connection.test_observe) _ = test_handshake_timeouts.fetchAdd(1, .monotonic);
                 return error.TlsHandshakeTimeout;
             },
-        }
+            error.Canceled => return error.Canceled,
+            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
+        };
     }
 
     /// Accept until shutdown. One loop per endpoint.

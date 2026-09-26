@@ -20,7 +20,8 @@ const starh2 = @import("starh2");
 
 const dummy: u8 = 0;
 
-const trace = starh2.edge.connection.trace;
+const conn_mod = starh2.edge.connection;
+const trace = conn_mod.trace;
 const write_trace = starh2.edge.wire_pump.write_trace;
 
 /// Bench-only counting wrapper. Installed on the server GPA when `--trace` is
@@ -270,6 +271,17 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             write_trace.calls.load(.acquire),
             write_trace.chunks.load(.acquire),
             write_trace.max_chunks.load(.acquire),
+        },
+    );
+    // Both stay 0 unless the build is pinned or single_executor AND Debug or
+    // -Dobserve=true; `placement_check` says which, so a 0 cannot pass for a
+    // check that never ran.
+    try w.print(
+        "\"placement_check\":{d},\"placement_checks\":{d},\"placement_mismatches\":{d},",
+        .{
+            @intFromBool(conn_mod.placement_check),
+            conn_mod.test_placement_checks.load(.acquire),
+            conn_mod.test_placement_mismatches.load(.acquire),
         },
     );
     try w.print(
@@ -577,6 +589,9 @@ const Args = struct {
     /// oneshots on one connection, then shut down. Hyperfine/poop measure the
     /// whole program. Zero is refused: a no-op self-drive is not a result.
     self_drive_oneshots: ?usize = null,
+    /// A/B knob: where a connection spawns its own tasks. Null keeps the
+    /// build's `conn_placement`.
+    spawn_placement: ?zio.Placement = null,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
@@ -615,6 +630,23 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidSelfDriveCount;
             out.self_drive_oneshots = n;
+        } else if (std.mem.eql(u8, a, "--spawn-placement")) {
+            const v = args.next() orelse return error.MissingValue;
+            if (std.mem.eql(u8, v, "auto")) {
+                out.spawn_placement = .auto;
+            } else if (std.mem.eql(u8, v, "local")) {
+                // zio would refuse every spawn with InvalidPlacement, and each
+                // refusal is a REFUSED_STREAM, so the run would look like a
+                // slow server instead of a wrong build.
+                if (conn_mod.zio_scheduling == .work_stealing) {
+                    std.debug.print("--spawn-placement local needs -Dzio-scheduling=pinned or single_executor; this build is work_stealing\n", .{});
+                    return error.PlacementNeedsPinnedBuild;
+                }
+                out.spawn_placement = .local;
+            } else {
+                std.debug.print("--spawn-placement takes auto or local, got {s}\n", .{v});
+                return error.InvalidSpawnPlacement;
+            }
         } else {
             return error.UnknownArgument;
         }
@@ -870,6 +902,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         const sweeper = try std.Thread.spawn(.{}, diagSweeperMain, .{});
         sweeper.detach();
     }
+    conn_mod.placement_override = args.spawn_placement;
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;
@@ -921,8 +954,16 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d}}}\n",
-        .{ if (args.tls) "tls" else "h2c", port, exec_n, @as(u8, @intFromBool(args.announce_running_wakes)), @as(u8, @intFromBool(args.batch_wake_sleepers)) },
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\"}}\n",
+        .{
+            if (args.tls) "tls" else "h2c",
+            port,
+            exec_n,
+            @as(u8, @intFromBool(args.announce_running_wakes)),
+            @as(u8, @intFromBool(args.batch_wake_sleepers)),
+            @tagName(conn_mod.zio_scheduling),
+            @tagName(conn_mod.connPlacement()),
+        },
     );
     defer gpa.free(ready);
     var out = zio.stdout().writer(&.{});

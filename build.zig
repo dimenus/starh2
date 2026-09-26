@@ -614,6 +614,39 @@ pub fn build(b: *std.Build) void {
     const deadline_step = b.step("test-deadlines", "Run actor-deadline heap gates");
     deadline_step.dependOn(&run_deadline_tests.step);
 
+    const placement_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/placement.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_placement_tests = b.addRunArtifact(placement_tests);
+    const placement_step = b.step("test-placement", "Run spawn placement gates (meaningful under -Dzio-scheduling=pinned)");
+    placement_step.dependOn(&run_placement_tests.step);
+
+    const handshake_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/handshake.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_handshake_tests = b.addRunArtifact(handshake_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_handshake_tests.setCwd(b.path("."));
+    const handshake_step = b.step("test-handshake", "Run the TLS handshake timeout gate");
+    handshake_step.dependOn(&run_handshake_tests.step);
+
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/macos_sdk.zig"),
@@ -642,6 +675,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_scheduler_tests.step);
     test_step.dependOn(&run_compression_tests.step);
     test_step.dependOn(&run_deadline_tests.step);
+    test_step.dependOn(&run_placement_tests.step);
+    test_step.dependOn(&run_handshake_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");
@@ -771,6 +806,9 @@ pub fn build(b: *std.Build) void {
         // this runner; ReleaseSafe actually instruments. The 1K cap is the
         // bound; the optimize flag is the one that makes the gate runnable.
         const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "fuzz-" ++ name, "--fuzz=1K", "-Doptimize=ReleaseSafe" });
+        // Forwarded so a `ci` run under one scheduling does not fuzz a
+        // binary built with another.
+        cmd.addArg(b.fmt("-Dzio-scheduling={s}", .{@tagName(zio_scheduling)}));
         cmd.setCwd(b.path("."));
         cmd.has_side_effects = true;
         if (macos_sdk_override) |path| {

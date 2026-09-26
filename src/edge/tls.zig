@@ -308,8 +308,8 @@ fn loadCertificateChain(builder: *boring.ssl.ContextBuilder, pem: []const u8) !v
 
 /// Per-connection TLS stream. Heap-allocated and never moved.
 ///
-/// Production: the server handshake reads the socket on the handshake
-/// subtask (`feedFromSocket`); after it, `Pump` (the CQ driver) is the sole
+/// Production: the server handshake reads the socket on the connection's
+/// own task (`feedFromSocket`); after it, `Pump` (the CQ driver) is the sole
 /// socket reader (via its `ev.NetRecv` completion), the sole SSL owner, and
 /// the sole socket writer. The client loopback path uses both directions on
 /// one task.
@@ -381,14 +381,18 @@ pub const Conn = struct {
         try self.attachSsl(ssl);
     }
 
-    /// Server handshake. This task reads the socket directly
-    /// (`feedFromSocket`); no read task exists yet. The reader is UNBUFFERED
-    /// on purpose: after the handshake the CQ driver reads the raw socket,
-    /// so a buffered Reader here could strand prefetched ciphertext in a
-    /// buffer nothing drains again. Ciphertext beyond the handshake (a
-    /// pipelined preface) lands in the BIO pair and is SSL_read by
-    /// `drainTlsLeftover` on the actor, as before.
-    pub fn handshake(self: *Conn, io: std.Io) !void {
+    /// Server handshake, on the connection's own task. It reads the socket
+    /// directly (`feedFromSocket`); the CQ driver does not exist yet. The
+    /// reader is UNBUFFERED on purpose: after the handshake the CQ driver
+    /// reads the raw socket, so a buffered Reader here could strand
+    /// prefetched ciphertext in a buffer nothing drains again. Ciphertext
+    /// beyond the handshake (a pipelined preface) lands in the BIO pair and
+    /// is SSL_read by the caller.
+    ///
+    /// Returns `error.Canceled` when a socket wait was canceled, so a caller
+    /// under `zio.withTimeout` gets `error.Timeout` for its own deadline.
+    /// Every other failure is `error.TlsHandshakeFailed`.
+    pub fn handshake(self: *Conn, io: std.Io) error{ Canceled, TlsHandshakeFailed }!void {
         std.debug.assert(self.state == .tls);
         self.tcp_reader = self.tcp_stream.reader(io, &.{});
         self.bindWriter(io);
@@ -396,24 +400,34 @@ pub const Conn = struct {
         while (!self.ssl.isHandshakeComplete()) {
             iterations += 1;
             if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
-            self.drainToSocket() catch return error.TlsHandshakeFailed;
+            self.drainToSocket() catch return self.handshakeIoError();
             self.ssl.doHandshake() catch |err| switch (err) {
                 error.WantRead => {
                     // doHandshake may have produced a flight (ServerHello).
                     // Drain it before parking or the peer never replies.
-                    self.drainToSocket() catch return error.TlsHandshakeFailed;
+                    self.drainToSocket() catch return self.handshakeIoError();
                     if (self.ssl.isHandshakeComplete()) break;
-                    self.feedFromSocket() catch return error.TlsHandshakeFailed;
+                    self.feedFromSocket() catch return self.handshakeIoError();
                 },
                 error.WantWrite => {},
                 else => return error.TlsHandshakeFailed,
             };
         }
-        self.drainToSocket() catch return error.TlsHandshakeFailed;
+        self.drainToSocket() catch return self.handshakeIoError();
     }
 
-    pub fn handshakeAny(self: *Conn, io: std.Io) !void {
-        try self.handshake(io);
+    /// The std.Io stream reader and writer report every socket error as one
+    /// generic failure and keep the cause in `err`. Read it back, because a
+    /// canceled wait must stay `error.Canceled` for `zio.withTimeout` to
+    /// tell its own deadline from a peer that broke the handshake.
+    fn handshakeIoError(self: *Conn) error{ Canceled, TlsHandshakeFailed } {
+        if (self.tcp_reader.err) |e| {
+            if (e == error.Canceled) return error.Canceled;
+        }
+        if (self.tcp_writer.err) |e| {
+            if (e == error.Canceled) return error.Canceled;
+        }
+        return error.TlsHandshakeFailed;
     }
 
     /// Drain leftover plaintext after handshake (a pipelined request). Stops
