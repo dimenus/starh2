@@ -61,6 +61,10 @@ for path in sys.argv[1:]:
         d = rows[(rd, arm, metric)]
         f = kv(line)
         if "streams=" in line and "opened=" in line:
+            # Two files that reuse a (round, arm, metric) key (e.g. a paced
+            # and an unpaced `mix-e8`) would merge silently; refuse instead.
+            if "opened" in d:
+                sys.exit(f"duplicate row key {rd} {arm} {metric} in {path}: pass files with distinct metric names separately")
             d.update({k: f[k] for k in ("opened", "delivering", "failed", "events", "ended_early", "scan_err", "ticks", "tck") if k in f})
         elif "sse latency" in line:
             d["p50"], d["p99"] = us(f["p50"]), us(f["p99"])
@@ -71,6 +75,14 @@ for path in sys.argv[1:]:
         elif "sse conns" in line:
             for k in ("heavy_worst_p50us", "heavy_worst_p99us", "light_worst_p99us"):
                 d[k] = float(f[k])
+            # port:kind:delivering/streams:events:p50us:p99us per connection
+            hs = [t.split(":") for t in line.split() if re.match(r"^\d+:h:\d+/\d+:", t)]
+            d["heavy_n"] = len(hs)
+            d["heavy_sat"] = sum(1 for t in hs if int(t[4]) > 200)
+        elif " place " in line and "heavy_execs=" in line:
+            d["place_frac"] = float(f["churn_on_heavy_frac"])
+            d["place_uniform"] = float(f["uniform_frac"])
+            d["heavy_shared"] = int(f["heavy_shared"])
         elif "churn conns" in line:
             d["churn_ok"], d["churn_p99"] = int(f["ok"]), us(f["p99"])
             d["churn_err"] = int(f["err"])
@@ -93,6 +105,12 @@ for path in sys.argv[1:]:
             for k in ("p50us", "p99us", "p999us", "offered", "non200"):
                 if k in f:
                     d[k] = float(f[k])
+
+
+def complete(d):
+    """Every stream opened, delivered, and kept delivering to the end."""
+    return (int(d.get("failed", 0)) == 0 and int(d.get("ended_early", 0)) == 0
+            and int(d.get("delivering", -1)) == int(d.get("opened", -2)) and d.get("stopped", 0) == 0)
 
 
 def classify(d):
@@ -121,6 +139,8 @@ def value(metric, name, d):
         if name == "cpu_us_ev":
             ev = int(d.get("events", 0))
             return d["mix_ticks"] / 100 * 1e6 / ev if ev and "mix_ticks" in d else None
+        if name in ("heavy_sat", "place_frac", "heavy_shared"):
+            return d.get(name)
         if name == "starved":
             return int(d.get("opened", 0)) - int(d.get("delivering", 0)) if "opened" in d else None
         return d.get(name)
@@ -214,10 +234,12 @@ def burst():
 metrics_present = {m for (_, _, m) in rows}
 
 
-def ratio_cell(metric, name):
+def ratio_cell(metric, name, only_complete=False):
     per_arm = defaultdict(dict)
     for (rd, arm, m), d in rows.items():
         if m == metric:
+            if only_complete and not complete(d):
+                continue
             v = value(metric, name, d)
             if v is not None:
                 per_arm[arm][rd] = v
@@ -236,7 +258,7 @@ def ratio_cell(metric, name):
             continue
         m = statistics.median(r)
         out = lo is not None and (m < lo or m > hi)
-        cells[arm] = f"{m:.2f}{'*' if out else ''}"
+        cells[arm] = f"{m:.2f}{'*' if out else ''} (n={len(r)})" if os.environ.get("SHOW_N") else f"{m:.2f}{'*' if out else ''}"
     band = f"{lo:.2f}-{hi:.2f}" if aa else "-"
     base = statistics.median(ref.values()) if ref else None
     return band, base, cells
@@ -274,8 +296,38 @@ def compact(spec):
                 continue
             print(f"| {label} | {t['WS']} | WS2 {t[AA]} | " + " | ".join(str(t[a]) for a in others) + " |")
             continue
+        if name in ("heavy_sat_rounds", "place"):
+            per = defaultdict(list)
+            for (rd, arm, m), d in rows.items():
+                if m == metric:
+                    per[arm].append(d)
+            def cell(a):
+                ds = per.get(a, [])
+                if name == "heavy_sat_rounds":
+                    if not any("heavy_n" in d for d in ds):
+                        return "-"
+                    rounds = sum(1 for d in ds if d.get("heavy_sat", 0) > 0)
+                    part = sum(1 for d in ds if not complete(d))
+                    dead = sum(1 for d in ds if int(d.get("opened", 0)) > 0 and int(d.get("delivering", 0)) == 0)
+                    return (f"{rounds}/{len(ds)} sat ({sum(d.get('heavy_sat', 0) for d in ds)}/{sum(d.get('heavy_n', 0) for d in ds)} conns), {part} partial"
+                            + (f", {dead} ZERO-EVENT collapse" if dead else ""))
+                pd = [d for d in ds if "place_frac" in d]
+                if not pd:
+                    return "-"
+                sh = sum(d.get("heavy_shared", 0) for d in pd)
+                miss = len(ds) - len(pd)
+                return (f"{statistics.median(d['place_frac'] for d in pd):.2f} (uniform {pd[0]['place_uniform']:.2f}), shared {sh}"
+                        + (f", {miss} round(s) with no heavy placement to report" if miss else ""))
+            print(f"| {label} | {cell('WS')} | WS2 {cell(AA)} | " + " | ".join(cell(a) for a in others) + " |")
+            continue
         band, base, cells = ratio_cell(metric, name)
         print(f"| {label} | {base:.1f} | {band} | " + " | ".join(cells.get(a, "-") for a in others) + " |")
+        if os.environ.get("COMPLETE") and metric.startswith("mix"):
+            band, base, cells = ratio_cell(metric, name, only_complete=True)
+            if base is None:
+                print(f"| {label}, complete-delivery pairs | no complete WS row | - | " + " | ".join("-" for a in others) + " |")
+            else:
+                print(f"| {label}, complete-delivery pairs | {base:.1f} | {band} | " + " | ".join(cells.get(a, "-") for a in others) + " |")
 
 
 if os.environ.get("COMPACT"):
