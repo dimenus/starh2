@@ -31,6 +31,13 @@
 #   8 collapse-probe  15 rounds of 200-stream TLS SSE on the io_uring host;
 #                     zero silent collapses (delivered-count gate, t-1028)
 #
+# GATE_SCHEDULING=pinned (or single_executor) runs the zio suite with
+# -Dscheduling and builds every starh2 artifact with -Dzio-scheduling, so a
+# candidate can be qualified in the configuration starh2 will ship. The
+# default is zio's and starh2's default, work_stealing. GATE_SERVER_ARGS is
+# appended to the collapse-probe server (e.g. "--spawn-placement local
+# --conn-balance"). Both are printed in the header.
+#
 # --local-only skips phase 8 and the verdict is loudly INCOMPLETE, never
 # PASS: a missing io_uring host is a broken gate environment, not a pass.
 #
@@ -44,7 +51,9 @@ LOCAL_ONLY=${3:-}
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 HOST=${HOST:-nachos}
 OUT=$(mktemp -d /tmp/zio-pin-gate.XXXXXX)
-echo "== zio-pin-gate candidate=$SHA out=$OUT"
+GATE_SCHEDULING=${GATE_SCHEDULING:-work_stealing}
+GATE_SERVER_ARGS=${GATE_SERVER_ARGS:-}
+echo "== zio-pin-gate candidate=$SHA out=$OUT scheduling=$GATE_SCHEDULING server-args='$GATE_SERVER_ARGS'"
 fail=0; warn=0
 PHASES=${ZIO_GATE_PHASES:-all}
 runs_phase() {
@@ -69,7 +78,7 @@ fi
 
 if runs_phase suite; then
 echo "== phase 2: zio suite"
-( cd "$WT" && zig build test ) > "$OUT/zio-suite.log" 2>&1
+( cd "$WT" && zig build test -Dscheduling="$GATE_SCHEDULING" ) > "$OUT/zio-suite.log" 2>&1
 p1=$(command grep -E '[0-9]+ of [0-9]+ tests passed' "$OUT/zio-suite.log" | tail -1)
 echo "  ${p1:-NO RESULT LINE}"
 case "$p1" in
@@ -183,7 +192,7 @@ s2 = re.sub(r'\.zio = \.\{[^}]*\},', '.zio = .{\n            .path = "deps/zio",
 assert s2 != s, p
 open(p, 'w').write(s2)
 PY
-( cd "$SWT" && ./zb build starh2-conformance-server -Doptimize=ReleaseSafe \
+( cd "$SWT" && ./zb build starh2-conformance-server -Doptimize=ReleaseSafe -Dzio-scheduling="$GATE_SCHEDULING" \
     -Dboringssl-source-path="$HOME/Source/oss/http2-zig-hendrik/boringssl" \
     --prefix "$OUT/conf" ) > "$OUT/conf-build.log" 2>&1 || { echo "  FAIL: conformance build (candidate may lack APIs the starh2 tree requires, e.g. isDrained - see conf-build.log)"; fail=1; }
 if [ -x "$OUT/conf/bin/starh2-conformance-server" ]; then
@@ -217,7 +226,7 @@ if [ "$LOCAL_ONLY" = "--local-only" ]; then
 fi
 
 echo "== phase 8: collapse probe (15 rounds on $HOST)"
-( cd "$SWT" && ./zb build starh2-bench-server -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl \
+( cd "$SWT" && ./zb build starh2-bench-server -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dzio-scheduling="$GATE_SCHEDULING" \
     -Dboringssl-source-path="$HOME/Source/oss/http2-zig-hendrik/boringssl" \
     --prefix "$OUT/bench" ) > "$OUT/bench-build.log" 2>&1 || { echo "  FAIL: bench build (see bench-build.log)"; fail=1; }
 ( cd "$REPO/tools/sse_bench" && GOOS=linux GOARCH=amd64 go build -o "$OUT/client" ./client.go ) || { echo "  FAIL: client build"; fail=1; }
@@ -228,7 +237,7 @@ if [ -x "$OUT/bench/bin/starh2-bench-server" ] && [ -x "$OUT/client" ]; then
   if ssh "$HOST" "mkdir -p $RD"; then
     scp -q "$OUT/bench/bin/starh2-bench-server" "$HOST:$RD/server"
     scp -q "$OUT/client" "$REPO/testdata/cert.pem" "$REPO/testdata/key.pem" "$REPO/tools/zio-pin-gate/collapse-probe.sh" "$HOST:$RD/"
-    ssh "$HOST" "chmod +x $RD/server $RD/client; sh $RD/collapse-probe.sh $RD/server $RD/client $RD/cert.pem $RD/key.pem 15" > "$OUT/probe.log" 2>&1
+    ssh "$HOST" "chmod +x $RD/server $RD/client; sh $RD/collapse-probe.sh $RD/server $RD/client $RD/cert.pem $RD/key.pem 15 '$GATE_SERVER_ARGS'" > "$OUT/probe.log" 2>&1
     prc=$?
     sed 's/^/  /' "$OUT/probe.log"
     [ "$prc" -eq 0 ] || { echo "  FAIL: collapse probe rc=$prc"; fail=1; }
