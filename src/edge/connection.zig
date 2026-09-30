@@ -5979,8 +5979,13 @@ const Connection = struct {
             if (hctx.terminal.getCause()) |c| return response.causeToError(c);
             if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
-            if (nowNs(io) >= deadline_ns) return;
-            const remain = deadline_ns - nowNs(io);
+            // One clock read: with two, the deadline can pass between the
+            // check and the subtraction, and the u64 wraps to a ~584-year
+            // timer that parks the handler for good (its stream goes silent
+            // while the connection lives; Debug panics instead).
+            const now = nowNs(io);
+            if (now >= deadline_ns) return;
+            const remain = deadline_ns - now;
             const winner = zio.select(.{
                 .ev = event,
                 .dead = &self.dead,
