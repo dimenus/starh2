@@ -162,16 +162,17 @@ go back to handlers-first (fails the pile-up gate; same mix results as sum,
 so it buys nothing); a weighted sum with a tuned handler weight (no data to
 tune it, and it is still a count).
 
-The default is **not** switched in this branch: the committed default is
-still `connections_first`, so `test-placement` and `ci` fail on the new
-heavy-executor gate until someone accepts this recommendation. The switch is
-one line (`rank: Rank = .sum` in `src/edge/balancer.zig`).
+**Accepted.** Ryan approved `sum`, and 977cd0a made it the default
+(`rank: Rank = .sum` in `src/edge/balancer.zig`). `test-placement` is 11/11
+under pinned; `ci` is green under pinned and work stealing except the
+unrelated `macos-libcxx-probe` (`ci-pinned-977cd0a.txt`,
+`ci-default-977cd0a.txt`).
 
 ## Summary
 
 1. Connections-first puts churn on the heavy executors (95-96% with paced churn against a 50% blind share) and saturated 24 of 40 heavy connections at 8 executors unpaced; it also fails the new heavy-executor gate.
 2. Handlers-first and sum give the same mix results (within about 0.1 on every row), but handlers-first fails the inline pile-up gate.
-3. Recommendation: make `sum` the default rank; it is the only rank that passes both gates and it is never worse than the others in any measured shape.
+3. Recommendation, since accepted and applied in 977cd0a: make `sum` the default rank; it is the only rank that passes both gates and it is never worse than the others in any measured shape.
 4. The clock fix removes the stopped streams: same session, the pre-fix WS binary stopped streams in 8 of 8 rounds (25 in all), the fixed one in 0 of 8; every arm had 0 in every shape.
 5. PLH collapsed to zero events in 2 of 10 rounds at 12 executors unpaced; no other arm did, but 10 rounds cannot show the others are safe.
 6. Live pile-up: handlers-first halves one-shot throughput (405-412k against 785-798k for PL); sum does not pile up but was 5-17% below PL in 3 of 3 rounds, cause unknown.
