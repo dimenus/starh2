@@ -630,6 +630,24 @@ pub fn build(b: *std.Build) void {
     const placement_step = b.step("test-placement", "Run spawn placement gates (meaningful under -Dzio-scheduling=pinned)");
     placement_step.dependOn(&run_placement_tests.step);
 
+    // Reproductions of the --conn-balance defects (tests/balance_defects.zig).
+    // Not in `ci`: they fail until each defect is fixed.
+    const balance_defect_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/balance_defects.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_balance_defect_tests = b.addRunArtifact(balance_defect_tests);
+    const balance_defect_step = b.step("test-balance-defects", "Run the --conn-balance defect reproductions (needs -Dzio-scheduling=pinned; fails until fixed)");
+    balance_defect_step.dependOn(&run_balance_defect_tests.step);
+
     const handshake_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/handshake.zig"),

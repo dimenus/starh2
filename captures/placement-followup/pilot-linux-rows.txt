@@ -1,0 +1,235 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  WS  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=51b58c148e82dbb5843d9ddd643762dff09a854d0b052905bd2d13a99c051ea4  args=''  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}'
+  WS2  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=51b58c148e82dbb5843d9ddd643762dff09a854d0b052905bd2d13a99c051ea4  args=''  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}'
+  WSH  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=51b58c148e82dbb5843d9ddd643762dff09a854d0b052905bd2d13a99c051ea4  args='--spawn-placement prefer_local'  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"prefer_local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}'
+  PA  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=4c141a85e7a30fe8f656d7532e554931c3b54ac8575e0d16013dc0856328fa5b  args='--spawn-placement auto'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}'
+  PL  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=4c141a85e7a30fe8f656d7532e554931c3b54ac8575e0d16013dc0856328fa5b  args='--spawn-placement local'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}'
+  PLB  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=4c141a85e7a30fe8f656d7532e554931c3b54ac8575e0d16013dc0856328fa5b  args='--spawn-placement local --conn-balance'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1}'
+  shared zio package zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc: allowed (same binary with different args, A/A, or ready-line-checked build options)
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 21:09:39 up 1 day,  4:56,  2 users,  load average: 0.20, 0.10, 0.09
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/starh2-placement-followup/WS-server sha256=51b58c148e82dbb5843d9ddd643762dff09a854d0b052905bd2d13a99c051ea4
+  ran /tmp/starh2-placement-followup/WS2-server sha256=51b58c148e82dbb5843d9ddd643762dff09a854d0b052905bd2d13a99c051ea4
+  ran /tmp/starh2-placement-followup/WSH-server sha256=51b58c148e82dbb5843d9ddd643762dff09a854d0b052905bd2d13a99c051ea4
+  ran /tmp/starh2-placement-followup/PA-server sha256=4c141a85e7a30fe8f656d7532e554931c3b54ac8575e0d16013dc0856328fa5b
+  ran /tmp/starh2-placement-followup/PL-server sha256=4c141a85e7a30fe8f656d7532e554931c3b54ac8575e0d16013dc0856328fa5b
+  ran /tmp/starh2-placement-followup/PLB-server sha256=4c141a85e7a30fe8f656d7532e554931c3b54ac8575e0d16013dc0856328fa5b
+-- host check before phase 1 --
+ 21:09:39 up 1 day,  4:56,  2 users,  load average: 0.20, 0.10, 0.09
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2312 libvirt+  20   0    9.9g   4.1g  22948 S   4.9  13.7  50:51.80 qemu-system-x86
+      1 root      20   0   21128  15708  11128 S   0.0   0.0   0:02.80 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.06 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+busy_cores=0.09 limit=0.5 top_process_cores=0.03 (2312 qemu-system-x86) limit=0.3 before phase 1
+== phase 1: perf ==
+busy_cores=0.07 limit=0.5 top_process_cores=0.03 (2312 qemu-system-x86) limit=0.3 before perf round 1
+  ready WS args='' {"ready":true,"mode":"tls","port":37779,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+r1 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000182 ended_early=0 scan_err=0
+r1 WS sse500 WS           sse latency p50=18µs p99=64µs max=3.091ms
+r1 WS sse500 WS           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=4.688ms
+r1 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=19 heavy_worst_p99us=68 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 43422:h:256/256:2560095:19:68 43438:h:244/244:2440087:16:58
+r1 WS oneshot-e2 finished in 2.43s, 824463.48 req/s, 35.38MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS oneshot-e8 finished in 1.76s, 2274395.59 req/s, 97.61MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS oneshot-lat-e2 n=2000000 p50us=629 p99us=850 p999us=871 maxus=3251 non200=0 finished in 2.61s, 766177.55 req/s, 32.88MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS oneshot-lat-e8 n=4000000 p50us=176 p99us=356 p999us=571 maxus=13584 non200=0 finished in 2.06s, 1938938.94 req/s, 83.21MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready WS2 args='' {"ready":true,"mode":"tls","port":40837,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+r1 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000283 ended_early=0 scan_err=0
+r1 WS2 sse500 WS2          sse latency p50=17µs p99=52µs max=4.755ms
+r1 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.903ms
+r1 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=54 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 48014:h:256/256:2560163:15:47 48028:h:244/244:2440120:18:54
+r1 WS2 oneshot-e2 finished in 2.53s, 791623.67 req/s, 33.97MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS2 oneshot-e8 finished in 1.63s, 2451509.15 req/s, 105.21MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS2 oneshot-lat-e2 n=2000000 p50us=460 p99us=922 p999us=949 maxus=1971 non200=0 finished in 2.47s, 809670.38 req/s, 34.75MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS2 oneshot-lat-e8 n=4000000 p50us=166 p99us=388 p999us=772 maxus=12798 non200=0 finished in 2.06s, 1940586.05 req/s, 83.28MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready WSH args='--spawn-placement prefer_local' {"ready":true,"mode":"tls","port":36007,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"prefer_local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+r1 WSH sse500 WSH          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000162 ended_early=0 scan_err=0
+r1 WSH sse500 WSH          sse latency p50=17µs p99=53µs max=4.408ms
+r1 WSH sse500 WSH          sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=4.903ms
+r1 WSH sse500 WSH          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=54 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 34206:h:256/256:2560078:18:54 34212:h:244/244:2440084:16:51
+r1 WSH oneshot-e2 finished in 2.41s, 829192.55 req/s, 35.59MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WSH oneshot-e8 finished in 1.64s, 2442287.23 req/s, 104.81MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WSH oneshot-lat-e2 n=2000000 p50us=453 p99us=1108 p999us=1128 maxus=2394 non200=0 finished in 2.63s, 759154.74 req/s, 32.58MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WSH oneshot-lat-e8 n=4000000 p50us=161 p99us=399 p999us=770 maxus=6837 non200=0 finished in 2.08s, 1920402.21 req/s, 82.42MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready PA args='--spawn-placement auto' {"ready":true,"mode":"tls","port":39829,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+r1 PA sse500 PA           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000312 ended_early=0 scan_err=0
+r1 PA sse500 PA           sse latency p50=19µs p99=128µs max=5.203ms
+r1 PA sse500 PA           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.27ms
+r1 PA sse500 PA           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=21 heavy_worst_p99us=157 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 60892:h:256/256:2560159:21:157 60906:h:244/244:2440153:17:82
+r1 PA oneshot-e2 finished in 2.45s, 816162.96 req/s, 35.03MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PA oneshot-e8 finished in 1.77s, 2259501.49 req/s, 96.97MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PA oneshot-lat-e2 n=2000000 p50us=618 p99us=706 p999us=760 maxus=1908 non200=0 finished in 2.57s, 778348.52 req/s, 33.40MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PA oneshot-lat-e8 n=4000000 p50us=165 p99us=378 p999us=700 maxus=5609 non200=0 finished in 2.10s, 1900334.13 req/s, 81.56MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready PL args='--spawn-placement local' {"ready":true,"mode":"tls","port":42907,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+r1 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000326 ended_early=0 scan_err=0
+r1 PL sse500 PL           sse latency p50=12µs p99=33µs max=5.39ms
+r1 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.933ms
+r1 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=32 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 51914:h:256/256:2560162:12:32 51916:h:244/244:2440164:12:32
+r1 PL oneshot-e2 finished in 2.53s, 791719.25 req/s, 33.98MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PL oneshot-e8 finished in 1.81s, 2209357.62 req/s, 94.82MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PL oneshot-lat-e2 n=2000000 p50us=602 p99us=730 p999us=773 maxus=1821 non200=0 finished in 2.50s, 798657.62 req/s, 34.28MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PL oneshot-lat-e8 n=4000000 p50us=164 p99us=360 p999us=615 maxus=8552 non200=0 finished in 2.12s, 1890543.22 req/s, 81.13MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready PLB args='--spawn-placement local --conn-balance' {"ready":true,"mode":"tls","port":42949,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1}
+r1 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000352 ended_early=0 scan_err=0
+r1 PLB sse500 PLB          sse latency p50=13µs p99=45µs max=5.944ms
+r1 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.304ms
+r1 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=49 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 55224:h:256/256:2560191:13:49 55236:h:244/244:2440161:12:32
+r1 PLB oneshot-e2 finished in 2.80s, 714316.33 req/s, 30.66MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PLB oneshot-e8 finished in 1.75s, 2279320.47 req/s, 97.82MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PLB oneshot-lat-e2 n=2000000 p50us=620 p99us=762 p999us=846 maxus=2027 non200=0 finished in 2.57s, 778115.96 req/s, 33.39MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PLB oneshot-lat-e8 n=4000000 p50us=169 p99us=357 p999us=632 maxus=6569 non200=0 finished in 2.12s, 1884156.41 req/s, 80.86MB/s requests: 4000000 total, 4000000 started, 4000000 done, 4000000 succeeded, 0 failed, 0 errored, 0 timeout 
+-- host check before phase 2 --
+ 21:12:10 up 1 day,  4:59,  2 users,  load average: 3.66, 1.64, 0.68
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2312 libvirt+  20   0    9.9g   4.1g  22948 S   4.9  13.7  50:54.94 qemu-system-x86
+      1 root      20   0   21128  15708  11128 S   0.0   0.0   0:02.80 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.06 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+busy_cores=0.09 limit=0.5 top_process_cores=0.04 (2312 qemu-system-x86) limit=0.3 before phase 2
+== phase 2: burst fail-close rate (1 rounds per arm, arms: WS WS2 WSH PA PL PLB) ==
+b1 WS burst OK overflow=0 stage_failed=0
+b1 WS2 burst OK overflow=0 stage_failed=0
+b1 WSH burst OK overflow=0 stage_failed=0
+b1 PA burst OK overflow=0 stage_failed=0
+b1 PL burst OK overflow=0 stage_failed=0
+b1 PLB burst OK overflow=0 stage_failed=0
+-- host check before phase 3 --
+ 21:12:35 up 1 day,  4:59,  2 users,  load average: 2.64, 1.55, 0.67
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2312 libvirt+  20   0    9.9g   4.1g  22948 S   4.9  13.7  50:55.48 qemu-system-x86
+      1 root      20   0   21128  15708  11128 S   0.0   0.0   0:02.80 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.06 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+busy_cores=0.09 limit=0.5 top_process_cores=0.03 (2312 qemu-system-x86) limit=0.3 before phase 3
+== phase 3: server CPU per event at a FIXED offered load ==
+busy_cores=0.09 limit=0.5 top_process_cores=0.03 (2312 qemu-system-x86) limit=0.3 before cpu round 1
+c1 WS cpu200 ticks=854 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000097 ended_early=0 scan_err=0
+c1 WS cpu200c10 ticks=918 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000012 ended_early=0 scan_err=0
+c1 WS2 cpu200 ticks=837 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000067 ended_early=0 scan_err=0
+c1 WS2 cpu200c10 ticks=830 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000009 ended_early=0 scan_err=0
+c1 WSH cpu200 ticks=828 tck=100 WSH          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000216 ended_early=0 scan_err=0
+c1 WSH cpu200c10 ticks=838 tck=100 WSH          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000016 ended_early=0 scan_err=0
+c1 PA cpu200 ticks=635 tck=100 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000081 ended_early=0 scan_err=0
+c1 PA cpu200c10 ticks=808 tck=100 PA           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000006 ended_early=0 scan_err=0
+c1 PL cpu200 ticks=427 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000061 ended_early=0 scan_err=0
+c1 PL cpu200c10 ticks=633 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000007 ended_early=0 scan_err=0
+c1 PLB cpu200 ticks=462 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000096 ended_early=0 scan_err=0
+c1 PLB cpu200c10 ticks=641 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000038 ended_early=0 scan_err=0
+-- host check before phase 5 --
+ 21:15:01 up 1 day,  5:02,  2 users,  load average: 1.26, 1.38, 0.74
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+      1 root      20   0   21128  15708  11128 S   0.0   0.0   0:02.81 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.06 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-kvfree_rcu_reclaim
+busy_cores=0.09 limit=0.5 top_process_cores=0.04 (2312 qemu-system-x86) limit=0.3 before phase 5
+== phase 5: open-loop latency at 2 executors, offered totals: 320000 590000 ==
+busy_cores=0.07 limit=0.5 top_process_cores=0.03 (2312 qemu-system-x86) limit=0.3 before open round 1
+r1 WS open320k-e2 n=1920010 p50us=128 p99us=450 p999us=597 maxus=1010 non200=0 offered=320000 finished in 7.00s, 320001.67 req/s, 13.73MB/s requests: 1920010 total, 1920030 started, 1920010 done, 1920010 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS open590k-e2 n=3540041 p50us=330 p99us=825 p999us=999 maxus=1643 non200=0 offered=590000 finished in 7.00s, 590006.83 req/s, 25.32MB/s requests: 3540041 total, 3540071 started, 3540041 done, 3540041 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS2 open320k-e2 n=1919962 p50us=74 p99us=259 p999us=389 maxus=697 non200=0 offered=320000 finished in 7.00s, 319993.67 req/s, 13.73MB/s requests: 1919962 total, 1919962 started, 1919962 done, 1919962 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS2 open590k-e2 n=3540085 p50us=234 p99us=669 p999us=852 maxus=1437 non200=0 offered=590000 finished in 7.00s, 590014.17 req/s, 25.32MB/s requests: 3540085 total, 3540105 started, 3540085 done, 3540085 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WSH open320k-e2 n=1919998 p50us=152 p99us=411 p999us=658 maxus=999 non200=0 offered=320000 finished in 7.00s, 319999.67 req/s, 13.73MB/s requests: 1919998 total, 1919998 started, 1919998 done, 1919998 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WSH open590k-e2 n=3540079 p50us=270 p99us=743 p999us=879 maxus=1224 non200=0 offered=590000 finished in 7.00s, 590013.17 req/s, 25.32MB/s requests: 3540079 total, 3540089 started, 3540079 done, 3540079 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PA open320k-e2 n=1919994 p50us=112 p99us=357 p999us=443 maxus=754 non200=0 offered=320000 finished in 7.00s, 319999.00 req/s, 13.73MB/s requests: 1919994 total, 1919994 started, 1919994 done, 1919994 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PA open590k-e2 n=3540043 p50us=247 p99us=465 p999us=538 maxus=690 non200=0 offered=590000 finished in 7.00s, 590007.17 req/s, 25.32MB/s requests: 3540043 total, 3540063 started, 3540043 done, 3540043 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PL open320k-e2 n=1919975 p50us=206 p99us=510 p999us=682 maxus=958 non200=0 offered=320000 finished in 7.00s, 319995.83 req/s, 13.73MB/s requests: 1919975 total, 1919975 started, 1919975 done, 1919975 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PL open590k-e2 n=3540284 p50us=281 p99us=566 p999us=669 maxus=1075 non200=0 offered=590000 finished in 7.00s, 590047.33 req/s, 25.32MB/s requests: 3540284 total, 3540294 started, 3540284 done, 3540284 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PLB open320k-e2 n=1919995 p50us=163 p99us=411 p999us=609 maxus=998 non200=0 offered=320000 finished in 7.00s, 319999.17 req/s, 13.73MB/s requests: 1919995 total, 1920025 started, 1919995 done, 1919995 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PLB open590k-e2 n=3540075 p50us=231 p99us=500 p999us=599 maxus=921 non200=0 offered=590000 finished in 7.00s, 590012.50 req/s, 25.32MB/s requests: 3540075 total, 3540039 started, 3540075 done, 3540075 succeeded, 0 failed, 0 errored, 0 timeout 
+-- host check before phase 6 --
+ 21:16:50 up 1 day,  5:03,  2 users,  load average: 1.48, 1.43, 0.83
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+      1 root      20   0   21128  15708  11128 S   0.0   0.0   0:02.81 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.06 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-kvfree_rcu_reclaim
+busy_cores=0.09 limit=0.5 top_process_cores=0.03 (2312 qemu-system-x86) limit=0.3 before phase 6
+== phase 6: heavy/light/churn mix, widths: 8 prod ==
+busy_cores=0.10 limit=0.5 top_process_cores=0.03 (3909 qmdsync-tasks) limit=0.3 before mix round 1
+x1 WS mix-e8 WS           streams=1080 conns=12 opened=1080 delivering=1079 failed=0 events=10766673 ended_early=0 scan_err=0
+x1 WS mix-e8 WS           sse latency p50=811µs p99=1.84ms max=13.56ms
+x1 WS mix-e8 WS           sse fair ev_min=0 ev_p50=10000 ev_max=10002 expected=10000 gap_max=14.3ms
+x1 WS mix-e8 WS           sse conns n=12 heavy=4 light=8 heavy_worst_p50us=873 heavy_worst_p99us=1868 light_worst_p99us=350 [port:kind:delivering/streams:events:p50us:p99us] 33202:l:10/10:100000:34:346 35096:l:10/10:100000:32:346 39972:h:249/250:2490119:827:1852 42476:h:250/250:2484347:868:1847 44738:h:250/250:2492205:850:1857 47044:h:250/250:2499997:873:1868 49018:l:10/10:100000:34:348 51228:l:10/10:100000:28:325 53270:l:10/10:100000:34:350 55368:l:10/10:100005:32:337 57420:l:10/10:100000:31:350 59480:l:10/10:100000:38:319
+x1 WS mix-e8 WS           churn conns=51681 ok=222995 err=0 p50=54µs p99=848µs max=10.881ms
+x1 WS mix-e8 cpu executors=8 heavy=4 light=8 ticks=8147 threads=1027,1024,1021,1016,1011,1007,1001,994,3,3,3,2,2,2,2,2,2,2,2,2,2,2,2,1
+x1 WS mix-eprod WS           streams=1620 conns=18 opened=1620 delivering=1619 failed=0 events=16147998 ended_early=0 scan_err=0
+x1 WS mix-eprod WS           sse latency p50=1.034ms p99=2.309ms max=16.073ms
+x1 WS mix-eprod WS           sse fair ev_min=0 ev_p50=9999 ev_max=10004 expected=10000 gap_max=16.897ms
+x1 WS mix-eprod WS           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1089 heavy_worst_p99us=2349 light_worst_p99us=473 [port:kind:delivering/streams:events:p50us:p99us] 33162:l:10/10:100000:43:446 35130:l:10/10:100000:38:473 37132:l:10/10:99998:48:420 38946:h:250/250:2491889:1081:2332 39062:l:10/10:100000:43:449 40924:l:10/10:100000:38:410 41168:h:250/250:2482770:1078:2346 42832:l:10/10:100000:45:442 43612:h:250/250:2499184:1089:2343 44598:l:10/10:100000:44:405 45814:h:249/250:2488456:1084:2326 47918:h:250/250:2500107:1089:2349 49800:h:250/250:2485594:1080:2319 51916:l:10/10:100000:32:453 53784:l:10/10:100000:35:438 55682:l:10/10:100000:33:468 57614:l:10/10:99999:43:455 59622:l:10/10:100001:44:431
+x1 WS mix-eprod WS           churn conns=47116 ok=197030 err=0 p50=60µs p99=972µs max=11.438ms
+x1 WS mix-eprod cpu executors=12 heavy=6 light=12 ticks=12168 threads=1043,1037,1033,1028,1023,1015,1011,1001,992,987,976,965,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
+x1 WS2 mix-e8 WS2          streams=1080 conns=12 opened=1080 delivering=1079 failed=0 events=10773559 ended_early=0 scan_err=0
+x1 WS2 mix-e8 WS2          sse latency p50=836µs p99=1.848ms max=14.22ms
+x1 WS2 mix-e8 WS2          sse fair ev_min=0 ev_p50=10000 ev_max=10002 expected=10000 gap_max=13.942ms
+x1 WS2 mix-e8 WS2          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=895 heavy_worst_p99us=1884 light_worst_p99us=370 [port:kind:delivering/streams:events:p50us:p99us] 33780:l:10/10:99993:31:350 35924:l:10/10:100007:36:338 37852:l:10/10:100000:32:331 39702:l:10/10:99997:34:345 41720:l:10/10:100000:29:334 43674:l:10/10:99996:35:359 45500:l:10/10:100000:34:370 50512:h:250/250:2499985:881:1884 52940:h:249/250:2479618:846:1837 55474:h:250/250:2499963:895:1868 57920:h:250/250:2494005:894:1859 59802:l:10/10:99995:32:367
+x1 WS2 mix-e8 WS2          churn conns=51253 ok=221089 err=0 p50=55µs p99=853µs max=12.473ms
+x1 WS2 mix-e8 cpu executors=8 heavy=4 light=8 ticks=8160 threads=1028,1025,1021,1017,1013,1008,1002,997,3,3,3,2,2,2,2,2,2,2,2,2,2,2,2,1
+x1 WS2 mix-eprod WS2          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16153918 ended_early=0 scan_err=0
+x1 WS2 mix-eprod WS2          sse latency p50=1.03ms p99=2.253ms max=17.16ms
+x1 WS2 mix-eprod WS2          sse fair ev_min=1208 ev_p50=10000 ev_max=10004 expected=10000 gap_max=17.002ms
+x1 WS2 mix-eprod WS2          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1085 heavy_worst_p99us=2317 light_worst_p99us=440 [port:kind:delivering/streams:events:p50us:p99us] 33408:l:10/10:100000:45:408 34328:h:250/250:2479455:1074:2249 35276:l:10/10:100000:36:406 36654:h:250/250:2495917:1081:2276 38886:h:250/250:2495338:1079:2271 40804:h:250/250:2490813:1078:2267 42794:l:10/10:100000:34:418 44734:l:10/10:100000:34:423 46596:l:10/10:100000:42:440 48628:l:10/10:100002:44:419 50512:l:10/10:100001:42:404 52350:l:10/10:100000:40:403 54216:l:10/10:100000:33:393 56024:l:10/10:100000:38:398 57730:l:10/10:100001:42:420 57888:h:250/250:2492597:1080:2272 59650:l:10/10:100000:47:396 60224:h:250/250:2499794:1085:2317
+x1 WS2 mix-eprod WS2          churn conns=47436 ok=198497 err=0 p50=59µs p99=960µs max=9.382ms
+x1 WS2 mix-eprod cpu executors=12 heavy=6 light=12 ticks=12192 threads=1042,1040,1034,1030,1024,1016,1012,1005,996,988,979,970,3,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0
+x1 WSH mix-e8 WSH          streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10786606 ended_early=0 scan_err=0
+x1 WSH mix-e8 WSH          sse latency p50=870µs p99=1.876ms max=14.467ms
+x1 WSH mix-e8 WSH          sse fair ev_min=2800 ev_p50=10000 ev_max=10002 expected=10000 gap_max=14.72ms
+x1 WSH mix-e8 WSH          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=918 heavy_worst_p99us=1899 light_worst_p99us=364 [port:kind:delivering/streams:events:p50us:p99us] 33558:l:10/10:100002:29:354 35564:l:10/10:100006:35:364 37734:l:10/10:100003:29:356 39880:l:10/10:100000:34:344 41848:l:10/10:100003:32:344 43694:l:10/10:100003:31:351 48540:h:250/250:2499948:910:1899 50918:h:250/250:2486765:908:1884 53536:h:250/250:2499938:918:1886 55792:h:250/250:2499938:907:1899 57724:l:10/10:100000:30:346 59810:l:10/10:100000:30:356
+x1 WSH mix-e8 WSH          churn conns=50788 ok=219041 err=0 p50=55µs p99=855µs max=14.261ms
+x1 WSH mix-e8 cpu executors=8 heavy=4 light=8 ticks=8197 threads=1032,1028,1026,1023,1018,1012,1007,1001,4,3,3,3,2,2,2,2,2,2,2,2,2,1,1,0
+x1 WSH mix-eprod WSH          streams=1620 conns=18 opened=1620 delivering=1618 failed=0 events=16122903 ended_early=0 scan_err=0
+x1 WSH mix-eprod WSH          sse latency p50=1.035ms p99=2.326ms max=14.519ms
+x1 WSH mix-eprod WSH          sse fair ev_min=0 ev_p50=10000 ev_max=10003 expected=10000 gap_max=15.062ms
+x1 WSH mix-eprod WSH          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1096 heavy_worst_p99us=2381 light_worst_p99us=471 [port:kind:delivering/streams:events:p50us:p99us] 32976:l:10/10:100001:32:430 35012:l:10/10:100000:32:471 36810:l:10/10:100001:32:464 38704:l:10/10:100001:38:466 40662:l:10/10:100003:44:453 42540:l:10/10:100002:43:449 44490:l:10/10:100000:33:414 46406:l:10/10:100003:40:421 48116:h:249/250:2482895:1079:2377 48178:l:10/10:100000:41:416 49998:l:10/10:100000:43:465 50448:h:250/250:2481427:1084:2358 51852:l:10/10:100000:40:440 52778:h:250/250:2486705:1084:2316 53576:l:10/10:100001:43:442 55170:h:249/250:2482977:1080:2330 57180:h:250/250:2489216:1090:2367 59296:h:250/250:2499671:1096:2381
+x1 WSH mix-eprod WSH          churn conns=47250 ok=197645 err=0 p50=60µs p99=969µs max=10.009ms
+x1 WSH mix-eprod cpu executors=12 heavy=6 light=12 ticks=12187 threads=1044,1040,1035,1030,1023,1018,1011,1003,996,987,977,967,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0
+x1 PA mix-e8 PA           streams=1080 conns=12 opened=1080 delivering=1075 failed=0 events=10665823 ended_early=0 scan_err=0
+x1 PA mix-e8 PA           sse latency p50=1.254ms p99=3.182ms max=12.914ms
+x1 PA mix-e8 PA           sse fair ev_min=0 ev_p50=9999 ev_max=10002 expected=10000 gap_max=13.062ms
+x1 PA mix-e8 PA           sse conns n=12 heavy=4 light=8 heavy_worst_p50us=1356 heavy_worst_p99us=3247 light_worst_p99us=470 [port:kind:delivering/streams:events:p50us:p99us] 33652:l:10/10:100005:27:315 35700:l:10/10:100000:95:470 37628:l:10/10:100001:25:318 39764:l:10/10:100003:25:292 41864:l:10/10:100002:24:305 46252:h:250/250:2473724:1335:3247 48728:h:248/250:2464151:1320:3163 51072:h:247/250:2436603:1305:3207 53328:h:250/250:2491326:1356:3247 55564:l:10/10:100005:25:287 57690:l:10/10:100003:83:440 59840:l:10/10:100000:95:461
+x1 PA mix-e8 PA           churn conns=52685 ok=227662 err=0 p50=43µs p99=938µs max=7.112ms
+x1 PA mix-e8 cpu executors=8 heavy=4 light=8 ticks=6645 threads=1010,976,974,959,724,696,637,620,5,5,5,5,5,5,5,5,0,0,0
+x1 PA mix-eprod PA           streams=1620 conns=18 opened=1620 delivering=1616 failed=0 events=16056397 ended_early=0 scan_err=0
+x1 PA mix-eprod PA           sse latency p50=1.508ms p99=3.987ms max=18.517ms
+x1 PA mix-eprod PA           sse fair ev_min=0 ev_p50=9999 ev_max=10003 expected=10000 gap_max=18.44ms
+x1 PA mix-eprod PA           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1940 heavy_worst_p99us=4491 light_worst_p99us=839 [port:kind:delivering/streams:events:p50us:p99us] 33662:l:10/10:100002:28:341 35386:l:10/10:99996:236:839 36510:h:248/250:2476482:1477:3640 37238:l:10/10:100000:75:443 38664:h:249/250:2444500:1460:3556 38966:l:10/10:100002:30:342 40756:l:10/10:100004:26:330 41084:h:250/250:2494689:1940:4491 43408:h:250/250:2475653:1493:3637 45378:h:249/250:2465406:1510:3724 47340:h:250/250:2499662:1869:4209 49134:l:10/10:100000:205:791 51012:l:10/10:100000:76:462 52906:l:10/10:100004:85:495 54590:l:10/10:100002:28:311 56364:l:10/10:100000:82:481 58232:l:10/10:99993:213:795 60032:l:10/10:100002:29:332
+x1 PA mix-eprod PA           churn conns=45807 ok=191577 err=0 p50=51µs p99=1.279ms max=11.738ms
+x1 PA mix-eprod cpu executors=12 heavy=6 light=12 ticks=9568 threads=1118,1004,1004,992,952,752,661,655,598,596,591,590,3,3,3,3,3,3,3,3,3,3,3,2,0,0,0,0,0,0
+x1 PL mix-e8 PL           streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10800102 ended_early=0 scan_err=0
+x1 PL mix-e8 PL           sse latency p50=321µs p99=1.434ms max=8.775ms
+x1 PL mix-e8 PL           sse fair ev_min=9998 ev_p50=10000 ev_max=10002 expected=10000 gap_max=9.178ms
+x1 PL mix-e8 PL           sse conns n=12 heavy=4 light=8 heavy_worst_p50us=642 heavy_worst_p99us=1557 light_worst_p99us=480 [port:kind:delivering/streams:events:p50us:p99us] 33074:h:250/250:2499936:223:1352 35804:h:250/250:2499963:642:1557 38064:h:250/250:2499945:624:1499 40112:l:10/10:100000:94:409 42016:l:10/10:100000:95:480 44162:l:10/10:100007:81:356 46034:l:10/10:100005:22:214 47990:l:10/10:100000:62:429 49998:l:10/10:100000:21:295 52068:l:10/10:100000:23:296 54042:l:10/10:99999:91:414 58696:h:250/250:2500247:66:1125
+x1 PL mix-e8 PL           churn conns=49799 ok=213608 err=0 p50=77µs p99=970µs max=7.978ms
+x1 PL mix-e8 cpu executors=8 heavy=4 light=8 ticks=5116 threads=1082,1081,1026,984,269,229,201,197,5,5,5,4,4,4,3,3,1,0,0,0
+x1 PL mix-eprod PL           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199246 ended_early=0 scan_err=0
+x1 PL mix-eprod PL           sse latency p50=924µs p99=3.326ms max=18.149ms
+x1 PL mix-eprod PL           sse fair ev_min=9997 ev_p50=10000 ev_max=10002 expected=10000 gap_max=18.536ms
+x1 PL mix-eprod PL           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1652 heavy_worst_p99us=3697 light_worst_p99us=750 [port:kind:delivering/streams:events:p50us:p99us] 33558:l:10/10:100000:75:325 34698:h:250/250:2499862:1507:3362 36894:h:250/250:2499557:1510:3304 38824:h:250/250:2500089:129:1295 40850:h:250/250:2499917:433:1447 42642:l:10/10:100000:20:147 44390:l:10/10:100000:22:158 46054:l:10/10:100000:97:351 47882:l:10/10:100000:104:410 49670:l:10/10:100000:23:147 51468:l:10/10:100000:21:155 53298:l:10/10:100000:83:358 55058:l:10/10:100002:224:750 56658:l:10/10:100000:22:219 57964:h:250/250:2499885:1646:3652 58470:l:10/10:100000:24:170 60206:l:10/10:100000:66:306 60542:h:250/250:2499934:1652:3697
+x1 PL mix-eprod PL           churn conns=43886 ok=183336 err=0 p50=48µs p99=1.588ms max=14.227ms
+x1 PL mix-eprod cpu executors=12 heavy=6 light=12 ticks=5618 threads=1141,1134,1063,995,221,209,165,163,125,122,118,113,3,3,3,3,3,3,3,2,2,2,2,1,0,0,0,0,0,0
+x1 PLB mix-e8 PLB          streams=1080 conns=12 opened=1080 delivering=1079 failed=0 events=10790618 ended_early=0 scan_err=0
+x1 PLB mix-e8 PLB          sse latency p50=28µs p99=620µs max=9.21ms
+x1 PLB mix-e8 PLB          sse fair ev_min=0 ev_p50=10001 ev_max=10002 expected=10000 gap_max=10.323ms
+x1 PLB mix-e8 PLB          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=30 heavy_worst_p99us=745 light_worst_p99us=197 [port:kind:delivering/streams:events:p50us:p99us] 34040:l:10/10:100001:28:167 35092:h:250/250:2500159:25:461 37774:h:250/250:2500098:28:745 40766:h:250/250:2500173:30:691 43626:h:249/250:2490176:29:606 46272:l:10/10:100001:27:196 48802:l:10/10:100000:23:165 51078:l:10/10:100000:25:197 52882:l:10/10:100000:23:179 55520:l:10/10:100007:22:141 57976:l:10/10:100003:24:189 60394:l:10/10:100000:27:163
+x1 PLB mix-e8 PLB          churn conns=68546 ok=297583 err=0 p50=37µs p99=610µs max=7.891ms
+x1 PLB mix-e8 cpu executors=8 heavy=4 light=8 ticks=6137 threads=886,882,866,861,760,662,638,517,8,8,8,7,7,7,6,3,0,0,0,0
+x1 PLB mix-eprod PLB          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200531 ended_early=0 scan_err=0
+x1 PLB mix-eprod PLB          sse latency p50=188µs p99=1.28ms max=12.409ms
+x1 PLB mix-eprod PLB          sse fair ev_min=9999 ev_p50=10000 ev_max=10003 expected=10000 gap_max=13.164ms
+x1 PLB mix-eprod PLB          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=579 heavy_worst_p99us=1362 light_worst_p99us=451 [port:kind:delivering/streams:events:p50us:p99us] 34032:l:10/10:100000:19:389 36532:l:10/10:100002:27:317 38850:l:10/10:100000:27:297 41128:l:10/10:100002:30:311 43194:l:10/10:100000:30:291 44930:l:10/10:100000:27:301 46608:h:250/250:2500097:307:1305 47590:l:10/10:100000:27:266 49170:h:250/250:2500078:54:1233 50014:l:10/10:100000:23:377 51888:h:250/250:2500074:145:1229 52372:l:10/10:100000:33:404 54662:l:10/10:100000:26:362 54666:h:250/250:2500134:171:1265 56890:l:10/10:100000:31:406 57334:h:250/250:2500088:189:1279 58534:l:10/10:100000:23:451 59930:h:250/250:2500056:579:1362
+x1 PLB mix-eprod PLB          churn conns=62173 ok=261897 err=0 p50=42µs p99=743µs max=7.896ms
+x1 PLB mix-eprod cpu executors=12 heavy=6 light=12 ticks=9141 threads=1094,1051,1028,1003,1003,1000,617,602,581,532,377,179,12,8,7,7,6,6,5,4,1,0,0,0,0,0,0,0,0
+== rows=72 ==

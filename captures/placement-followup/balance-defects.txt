@@ -1,0 +1,42 @@
+# ./zb build test-balance-defects -Dzio-scheduling=pinned (Mac, kqueue, Debug)
+# commit: d41c705 + tests/balance_defects.zig (this commit)
+# date: 2026-09-30T02:34:51Z
+test-balance-defects
++- run test 1 pass, 6 fail (7 total)
+error: 'balance_defects.test.balance: serve waits for balanced connections at shutdown' failed:
+       shutdown: balance=false connection on executor auto: serve returned after 2504 ms with 0 live connection(s)
+       shutdown: balance=false connection on executor auto: serve returned after 2503 ms with 0 live connection(s)
+       shutdown: balance=false connection on executor auto: serve returned after 2504 ms with 0 live connection(s)
+       shutdown: balance=false connection on executor auto: serve returned after 2505 ms with 0 live connection(s)
+       shutdown: balance=true connection on executor 0: serve returned after 1300 ms with 1 live connection(s)
+       shutdown: balance=true connection on executor 1: serve returned after 1300 ms with 1 live connection(s)
+       shutdown: balance=true connection on executor 2: serve returned after 1300 ms with 1 live connection(s)
+       shutdown: balance=true connection on executor 3: serve returned after 1300 ms with 1 live connection(s)
+       expected 0, found 1
+error: 'balance_defects.test.balance: the pick can reach executors above 16' failed:
+       width: 24 executors, 0..15 busy, pick=0
+error: 'balance_defects.test.balance: a runtime narrower than the configured width still serves every connection' failed:
+       narrow runtime: executors=1 configured=2 streams open=1 (want 2)
+error: 'balance_defects.test.balance: inline-only connections do not pile behind one idle task handler' failed:
+       inline pile-up: connections per executor = [1, 100]
+error: 'balance_defects.test.balance: an HTTP/1.1 task handler counts toward its executor's load' failed:
+       h1: live H1 task handlers=1, counted by the balancer=0, balanced connections=1
+       expected 1, found 0
+error: 'balance_defects.test.balance: load on one runtime does not steer placement on another' failed:
+       two runtimes: runtime B is empty; its first connection ran on its executor 1 (steered by runtime A's load)
+failed command: ./.zig-cache/o/f00f3a2246bbee8c23a1104ee9128061/test --cache-dir=./.zig-cache --seed=0x9c9c2ed7 --listen=-
+Build Summary: 9/11 steps succeeded (1 failed); 1/7 tests passed (6 failed)
+test-balance-defects transitive failure
++- run test 1 pass, 6 fail (7 total)
+   +- compile test Debug native cached 35ms MaxRSS:32M
+      +- WriteFile cached
+      +- compile lib brotli_enc Debug native cached 32ms MaxRSS:30M
+      +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+      +- options cached
+      +- options cached
+      +- options cached
+      +- translate-c cached 40ms MaxRSS:30M
+      +- build boringssl cached
+      +- build boringssl (reused)
+error: the following build command failed with exit code 1:
+.zig-cache/o/a22cdd153e3c6a2e01390de175acdeda/build /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/zig /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib /Users/rsaunderson/Source/mine/starh2-wt-placement-bench .zig-cache /Users/rsaunderson/.cache/zig --seed 0x9c9c2ed7 -Z44468e4701c334f8 test-balance-defects -Dzio-scheduling=pinned --summary all
