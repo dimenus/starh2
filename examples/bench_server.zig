@@ -612,7 +612,8 @@ const Args = struct {
     /// build's `conn_placement`.
     spawn_placement: ?zio.Placement = null,
     conn_balance: bool = false,
-    balance_rank: starh2.Balancer.Rank = .connections_first,
+    /// Null keeps the Balancer's default rank.
+    balance_rank: ?starh2.Balancer.Rank = null,
     placement_log: bool = false,
 };
 
@@ -990,7 +991,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     var balancer_storage: ?starh2.Balancer = if (args.conn_balance) try starh2.Balancer.init(gpa, rt) else null;
     defer if (balancer_storage) |*b| b.deinit(gpa);
     if (balancer_storage) |*b| {
-        b.rank = args.balance_rank;
+        if (args.balance_rank) |r| b.rank = r;
         if (args.placement_log) b.trace = .{ .ctx = @constCast(&dummy), .placed = placementLogLine };
     }
     trace.enabled = args.trace;

@@ -4,9 +4,9 @@
 //! on the executor its `connEntry` lands on, and zio's `.auto` is a
 //! round-robin that ignores load, so two heavy connections can share one
 //! executor while another idles. With a `Balancer` in `ServerConfig`, the
-//! accept loop places each new connection on the executor with the fewest
-//! live connections, then the fewest live task handlers, then the lowest
-//! index.
+//! accept loop places each new connection on the executor with the lowest
+//! live connections + live task handlers, then the fewest connections, then
+//! the lowest index (`Rank.sum`, the default; see `Rank`).
 //!
 //! # Contract
 //!
@@ -33,13 +33,16 @@ const zio = @import("zio");
 pub const Balancer = struct {
     conns: []std.atomic.Value(u32),
     handlers: []std.atomic.Value(u32),
-    rank: Rank = .connections_first,
+    rank: Rank = .sum,
     /// Called after a connection is placed; for measurement only.
     trace: ?Trace = null,
 
     /// How `reserve` orders executors. Lowest wins; ties go to the lower
-    /// index. Each has a known failure, which the gates in tests/balance.zig
-    /// pin down:
+    /// index. `sum` is the default: it is the only rank that passes both
+    /// gates in tests/balance.zig, and in the nachos rank A/B
+    /// (captures/placement-followup/rank-ab-summary.md) it matched or beat
+    /// the other two in every mixed shape. The other two stay selectable for
+    /// measurement. Each has a known failure:
     /// - `connections_first`: (connections, handlers). A connection with 250
     ///   SSE handlers counts as 1, so an executor holding one heavy connection
     ///   looks emptier than one holding two light ones, and new connections
