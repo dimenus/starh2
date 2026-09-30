@@ -2,11 +2,12 @@
 //!
 //! # Why this exists, and why it is not a Zig test
 //!
-//! `zig build test` never executes the TLS edge. No test binds a `tls`
-//! endpoint, so `handshakeTls`, `TlsPump`, and leftover-preface drain are
-//! unreachable from the suite. That was proven, not assumed: an always-false
-//! assert placed inside the TLS handshake left the suite green, and aborted
-//! the process on the first curl request.
+//! `zig build test` reaches only part of the TLS edge. The server handshake
+//! runs under the suite (a panic in `tls_edge.Conn.handshake` fails
+//! `tests/handshake.zig` and `tests/h1_battery.zig`), but whether the suite
+//! reaches the HTTP/2 TLS `Pump` and the leftover-preface ingest has not
+//! been re-measured. This gate covers them with a client that shares no code
+//! with the server.
 //!
 //! # Why curl, and not a Zig client
 //!

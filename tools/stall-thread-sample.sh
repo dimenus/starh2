@@ -4,7 +4,7 @@
 # PROTOCOL
 #
 #   tools/stall-thread-sample.sh [--mode tls|h2c] [--rounds R] [--after SEC]
-#     [-n N] [-c C] [-m M] [-t T] [--bin PATH] [--out DIR] [--no-task-migration]
+#     [-n N] [-c C] [-m M] [-t T] [--bin PATH] [--out DIR]
 #
 # It runs h2load rounds until one round passes --after seconds, then samples
 # the server's threads, the client's threads and the sockets, and stops.
@@ -41,7 +41,6 @@ n=100000
 c=50
 m=10
 t=4
-migrate=1
 bin=${STARH2_BENCH_BIN:-/tmp/starh2-stall-delta/bin/starh2-bench-server}
 out=/tmp/starh2-thread-sample
 
@@ -56,7 +55,7 @@ while [ $# -gt 0 ]; do
     -t) t=$2; shift 2 ;;
     --bin) bin=$2; shift 2 ;;
     --out) out=$2; shift 2 ;;
-    --no-task-migration) migrate=0; shift ;;
+    --no-task-migration) echo "FAIL: --no-task-migration is gone. zio scheduling is the build option -Dzio-scheduling: for migration off, build the server with -Dzio-scheduling=pinned and pass --bin." >&2; exit 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -68,7 +67,6 @@ command -v h2load >/dev/null 2>&1 || { echo "FAIL: h2load is not on PATH" >&2; e
 rm -rf "$out"; mkdir -p "$out"
 
 server_args="--mode $mode --port 0 --cert $ROOT/testdata/cert.pem --key $ROOT/testdata/key.pem"
-[ "$migrate" -eq 1 ] && server_args="$server_args --task-migration"
 
 "$bin" $server_args >"$out/server.log" 2>&1 &
 spid=$!

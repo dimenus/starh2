@@ -1,0 +1,23 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  PL  zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e  sha256=dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/tree-PL  args='--spawn-placement local'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"auto"'
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 14:39:00 up 1 day,  3:34,  3 users,  load average: 3.38, 2.63, 2.17
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/zio-placement-ab/PL-server sha256=dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806
+-- host check before phase 3 --
+ 14:39:00 up 1 day,  3:34,  3 users,  load average: 3.38, 2.63, 2.17
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 6693408   3.1g 385144 R 161.7  10.3  37:29.86 WowB.exe
+   6385 ryan      20   0 2522664 432808  76088 S  14.7   1.4 128:30.03 CrBrowserMain
+   6403 ryan      20   0 2174704 112752  42420 S   4.9   0.4   3:47.09 Agent.exe
+   6788 ryan      20   0 2016592 344876  34484 S   4.9   1.1   0:59.09 CrRendererMain
+   6799 ryan      20   0 2013044 264916  26804 S   4.9   0.8   0:22.50 CrRendererMain
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.91 systemd
+busy_cores=1.93 limit=99 top_process_cores=1.80 (324294 WowB.exe) limit=99 before phase 3
+== phase 3: server CPU per event at a FIXED offered load ==
+busy_cores=1.82 limit=99 top_process_cores=1.72 (324294 WowB.exe) limit=99 before cpu round 1
+  ready PL args='--spawn-placement local' {"ready":true,"mode":"tls","port":37771,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local"}
+READY-MISMATCH arm=PL expected '"zio_scheduling":"pinned","spawn_placement":"auto"' in: {"ready":true,"mode":"tls","port":37771,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local"}
+exit=4

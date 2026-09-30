@@ -1,0 +1,109 @@
+== host
+7.2.5-3-omarchy
+ 21:48:22 up 1 day, 10:43,  4 users,  load average: 1.27, 0.46, 0.17
+sha PL dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806
+sha PA dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806
+sha WSL 73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915
+host busy_cores=0.04 blocking=[] before round 1
+k1 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000417 | p50=14µs p99=48µs max=4.918ms | threads 808879:main:mean=54:peak=64:ge95=0/54 808885:PL-server:mean=52:peak=59:ge95=0/54 808886:iou-wrk-808879:mean=0:peak=0:ge95=0/54 
+k1 PA failclosed streams=500 conns=1 opened=426 delivering=288 failed=74 events=2880142 | p50=12µs p99=62µs max=2.082ms | threads 809905:main:mean=63:peak=68:ge95=0/53 809911:PA-server:mean=26:peak=34:ge95=0/53 809912:iou-wrk-809905:mean=0:peak=0:ge95=0/53 809964:iou-wrk-809911:mean=0:peak=0:ge95=0/52 
+host busy_cores=0.04 blocking=[] before round 2
+k2 PA ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000392 | p50=18µs p99=125µs max=6.885ms | threads 811177:main:mean=67:peak=83:ge95=0/55 811183:PA-server:mean=64:peak=83:ge95=0/55 811184:iou-wrk-811177:mean=0:peak=0:ge95=0/55 
+k2 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000394 | p50=13µs p99=37µs max=4.437ms | threads 812225:main:mean=54:peak=59:ge95=0/54 812231:PL-server:mean=50:peak=59:ge95=0/54 812232:iou-wrk-812225:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 3
+k3 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000378 | p50=12µs p99=37µs max=4.047ms | threads 813246:main:mean=55:peak=63:ge95=0/54 813252:PL-server:mean=53:peak=59:ge95=0/54 813253:iou-wrk-813246:mean=0:peak=0:ge95=0/54 
+k3 PA failclosed streams=500 conns=1 opened=400 delivering=256 failed=100 events=2560120 | p50=16µs p99=69µs max=2.306ms | threads 814248:main:mean=54:peak=63:ge95=0/53 814254:PA-server:mean=19:peak=34:ge95=0/53 814255:iou-wrk-814248:mean=0:peak=0:ge95=0/53 814309:iou-wrk-814254:mean=0:peak=0:ge95=0/52 
+k3 WSL failclosed streams=500 conns=1 opened=446 delivering=261 failed=54 events=2610117 | p50=13µs p99=65µs max=1.471ms | threads 815531:main:mean=48:peak=58:ge95=0/53 815537:WSL-server:mean=44:peak=53:ge95=0/53 815538:iou-wrk-815537:mean=0:peak=0:ge95=0/53 815591:iou-wrk-815531:mean=0:peak=0:ge95=0/52 
+host busy_cores=0.07 blocking=[] before round 4
+k4 PA failclosed streams=500 conns=1 opened=475 delivering=331 failed=25 events=3310215 | p50=16µs p99=56µs max=3.748ms | threads 816793:main:mean=21:peak=29:ge95=0/54 816799:PA-server:mean=69:peak=78:ge95=0/54 816800:iou-wrk-816793:mean=0:peak=0:ge95=0/54 
+k4 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000352 | p50=13µs p99=41µs max=5.77ms | threads 817818:main:mean=55:peak=59:ge95=0/54 817824:PL-server:mean=56:peak=64:ge95=0/54 817825:iou-wrk-817818:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.05 blocking=[] before round 5
+k5 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000224 | p50=13µs p99=69µs max=3.676ms | threads 818840:main:mean=55:peak=59:ge95=0/54 818846:PL-server:mean=51:peak=58:ge95=0/54 818847:iou-wrk-818840:mean=0:peak=0:ge95=0/54 
+k5 PA failclosed streams=500 conns=1 opened=493 delivering=354 failed=7 events=3540135 | p50=14µs p99=44µs max=3.301ms | threads 819995:main:mean=74:peak=78:ge95=0/54 820001:PA-server:mean=22:peak=24:ge95=0/54 820002:iou-wrk-819995:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 6
+k6 WSL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000156 | p50=18µs p99=61µs max=3.472ms | threads 821008:main:mean=70:peak=73:ge95=0/54 821014:WSL-server:mean=69:peak=73:ge95=0/54 821015:iou-wrk-821008:mean=0:peak=0:ge95=0/54 
+k6 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999729 | p50=915µs p99=2.01ms max=7.003ms | threads 822037:main:mean=96:peak=107:ge95=49/55 822043:PA-server:mean=24:peak=29:ge95=0/55 822044:iou-wrk-822037:mean=0:peak=0:ge95=0/55 
+k6 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000374 | p50=13µs p99=36µs max=5.489ms | threads 823061:main:mean=58:peak=64:ge95=0/54 823067:PL-server:mean=54:peak=64:ge95=0/54 823068:iou-wrk-823061:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.09 blocking=[] before round 7
+k7 PL knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999851 | p50=855µs p99=1.704ms max=4.48ms | threads 824101:main:mean=95:peak=102:ge95=46/55 824107:PL-server:mean=0:peak=5:ge95=0/55 824108:iou-wrk-824101:mean=0:peak=0:ge95=0/55 824162:iou-wrk-824107:mean=0:peak=0:ge95=0/54 
+k7 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999769 | p50=916µs p99=1.922ms max=6.094ms | threads 825400:main:mean=95:peak=102:ge95=52/55 825406:PA-server:mean=23:peak=29:ge95=0/55 825407:iou-wrk-825400:mean=0:peak=0:ge95=0/55 825461:iou-wrk-825406:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.07 blocking=[] before round 8
+k8 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999845 | p50=904µs p99=1.906ms max=4.707ms | threads 826731:main:mean=96:peak=107:ge95=48/55 826737:PA-server:mean=24:peak=29:ge95=0/55 826738:iou-wrk-826731:mean=0:peak=0:ge95=0/55 
+k8 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000368 | p50=13µs p99=38µs max=4.249ms | threads 827762:main:mean=53:peak=59:ge95=0/54 827768:PL-server:mean=51:peak=58:ge95=0/54 827769:iou-wrk-827762:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 9
+k9 PA ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000370 | p50=15µs p99=56µs max=3.583ms | threads 828777:main:mean=69:peak=78:ge95=0/54 828783:PA-server:mean=66:peak=73:ge95=0/54 828784:iou-wrk-828777:mean=0:peak=0:ge95=0/54 
+k9 WSL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000157 | p50=17µs p99=69µs max=4.752ms | threads 829808:main:mean=72:peak=82:ge95=0/54 829814:WSL-server:mean=70:peak=82:ge95=0/54 829815:iou-wrk-829808:mean=0:peak=0:ge95=0/54 829865:iou-wrk-829814:mean=0:peak=0:ge95=0/53 
+k9 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000192 | p50=12µs p99=30µs max=3.822ms | threads 831084:main:mean=55:peak=64:ge95=0/54 831090:PL-server:mean=52:peak=59:ge95=0/54 831091:iou-wrk-831084:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 10
+k10 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999836 | p50=910µs p99=1.948ms max=5.589ms | threads 832120:main:mean=96:peak=103:ge95=46/55 832126:PA-server:mean=24:peak=29:ge95=0/55 832127:iou-wrk-832120:mean=0:peak=0:ge95=0/55 
+k10 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000287 | p50=12µs p99=45µs max=4.707ms | threads 833142:main:mean=50:peak=58:ge95=0/54 833148:PL-server:mean=53:peak=59:ge95=0/54 833149:iou-wrk-833142:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.06 blocking=[] before round 11
+k11 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000171 | p50=12µs p99=40µs max=2.668ms | threads 834188:main:mean=53:peak=59:ge95=0/54 834194:PL-server:mean=52:peak=59:ge95=0/54 834195:iou-wrk-834188:mean=0:peak=0:ge95=0/54 
+k11 PA ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000259 | p50=17µs p99=135µs max=5.297ms | threads 835194:main:mean=67:peak=83:ge95=0/55 835200:PA-server:mean=65:peak=83:ge95=0/55 835201:iou-wrk-835194:mean=0:peak=0:ge95=0/55 
+host busy_cores=0.06 blocking=[] before round 12
+k12 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000235 | p50=12µs p99=27µs max=3.954ms | threads 836249:main:mean=53:peak=59:ge95=0/54 836255:PL-server:mean=52:peak=58:ge95=0/54 836256:iou-wrk-836249:mean=0:peak=0:ge95=0/54 
+k12 WSL failclosed streams=500 conns=1 opened=434 delivering=256 failed=66 events=2560111 | p50=12µs p99=34µs max=1.965ms | threads 837263:main:mean=49:peak=53:ge95=0/53 837269:WSL-server:mean=45:peak=49:ge95=0/53 837270:iou-wrk-837269:mean=0:peak=0:ge95=0/53 837324:iou-wrk-837263:mean=0:peak=0:ge95=0/52 
+k12 PA failclosed streams=500 conns=1 opened=454 delivering=256 failed=46 events=2560109 | p50=11µs p99=52µs max=1.793ms | threads 838514:main:mean=62:peak=68:ge95=0/53 838520:PA-server:mean=19:peak=24:ge95=0/53 838521:iou-wrk-838514:mean=0:peak=0:ge95=0/53 838574:iou-wrk-838520:mean=0:peak=0:ge95=0/52 
+host busy_cores=0.04 blocking=[] before round 13
+k13 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000347 | p50=14µs p99=76µs max=6.759ms | threads 839809:main:mean=53:peak=64:ge95=0/55 839815:PL-server:mean=55:peak=64:ge95=0/54 839816:iou-wrk-839809:mean=0:peak=0:ge95=0/54 
+k13 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999868 | p50=905µs p99=1.93ms max=5.179ms | threads 840825:main:mean=96:peak=107:ge95=48/55 840831:PA-server:mean=24:peak=34:ge95=0/55 840832:iou-wrk-840825:mean=0:peak=0:ge95=0/55 
+host busy_cores=0.04 blocking=[] before round 14
+k14 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999665 | p50=933µs p99=1.994ms max=5.243ms | threads 841888:main:mean=96:peak=103:ge95=46/55 841894:PA-server:mean=24:peak=39:ge95=0/55 841895:iou-wrk-841888:mean=0:peak=0:ge95=0/55 
+k14 PL knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999674 | p50=851µs p99=1.664ms max=5.349ms | threads 842912:main:mean=95:peak=102:ge95=49/55 842918:PL-server:mean=0:peak=5:ge95=0/55 842919:iou-wrk-842912:mean=0:peak=0:ge95=0/55 842972:iou-wrk-842918:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 15
+k15 WSL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000121 | p50=17µs p99=68µs max=3.29ms | threads 844247:main:mean=72:peak=83:ge95=0/54 844253:WSL-server:mean=71:peak=83:ge95=0/54 844254:iou-wrk-844253:mean=0:peak=0:ge95=0/54 
+k15 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000329 | p50=12µs p99=30µs max=5.66ms | threads 845251:main:mean=55:peak=63:ge95=0/54 845257:PL-server:mean=53:peak=59:ge95=0/54 845258:iou-wrk-845251:mean=0:peak=0:ge95=0/54 
+k15 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999743 | p50=892µs p99=1.903ms max=5.84ms | threads 846275:main:mean=95:peak=102:ge95=51/55 846281:PA-server:mean=24:peak=29:ge95=0/55 846282:iou-wrk-846275:mean=0:peak=0:ge95=0/55 846334:iou-wrk-846281:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 16
+k16 PA failclosed streams=500 conns=1 opened=435 delivering=323 failed=65 events=3230165 | p50=16µs p99=63µs max=2.795ms | threads 847594:main:mean=64:peak=73:ge95=0/54 847600:PA-server:mean=20:peak=24:ge95=0/54 847601:iou-wrk-847594:mean=0:peak=0:ge95=0/54 847655:iou-wrk-847600:mean=0:peak=0:ge95=0/53 
+k16 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000248 | p50=13µs p99=47µs max=2.73ms | threads 848865:main:mean=56:peak=64:ge95=0/54 848871:PL-server:mean=51:peak=59:ge95=0/54 848872:iou-wrk-848865:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.03 blocking=[] before round 17
+k17 PL failclosed streams=500 conns=1 opened=357 delivering=256 failed=143 events=2560169 | p50=11µs p99=24µs max=1.784ms | threads 849909:main:mean=53:peak=58:ge95=0/53 849915:PL-server:mean=0:peak=5:ge95=0/53 849916:iou-wrk-849909:mean=0:peak=0:ge95=0/53 849968:iou-wrk-849915:mean=0:peak=0:ge95=0/52 
+k17 PA ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000206 | p50=17µs p99=136µs max=3.422ms | threads 851157:main:mean=64:peak=68:ge95=0/54 851163:PA-server:mean=62:peak=68:ge95=0/54 851164:iou-wrk-851157:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 18
+k18 PA failclosed streams=500 conns=1 opened=438 delivering=244 failed=62 events=2440093 | p50=14µs p99=136µs max=2.171ms | threads 852210:main:mean=13:peak=20:ge95=0/54 852216:PA-server:mean=49:peak=54:ge95=0/54 852217:iou-wrk-852210:mean=0:peak=0:ge95=0/54 
+k18 PL failclosed streams=500 conns=1 opened=467 delivering=244 failed=33 events=2440072 | p50=13µs p99=31µs max=1.274ms | threads 853215:main:mean=0:peak=0:ge95=0/54 853221:PL-server:mean=49:peak=54:ge95=0/54 853222:iou-wrk-853215:mean=0:peak=0:ge95=0/54 
+k18 WSL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000221 | p50=17µs p99=60µs max=3.109ms | threads 854240:main:mean=70:peak=78:ge95=0/54 854246:WSL-server:mean=69:peak=78:ge95=0/54 854247:iou-wrk-854240:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 19
+k19 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000364 | p50=12µs p99=35µs max=4.343ms | threads 855560:main:mean=54:peak=59:ge95=0/54 855566:PL-server:mean=51:peak=58:ge95=0/54 855567:iou-wrk-855560:mean=0:peak=0:ge95=0/54 
+k19 PA ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000409 | p50=17µs p99=93µs max=5.119ms | threads 856593:main:mean=66:peak=78:ge95=0/54 856599:PA-server:mean=64:peak=78:ge95=0/54 856600:iou-wrk-856593:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 20
+k20 PA ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000409 | p50=19µs p99=113µs max=5.355ms | threads 857612:main:mean=71:peak=87:ge95=0/55 857618:PA-server:mean=68:peak=83:ge95=0/55 857619:iou-wrk-857612:mean=0:peak=0:ge95=0/55 
+k20 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000314 | p50=12µs p99=47µs max=4.465ms | threads 858655:main:mean=55:peak=59:ge95=0/54 858661:PL-server:mean=52:peak=59:ge95=0/54 858662:iou-wrk-858655:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 21
+k21 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000159 | p50=12µs p99=53µs max=2.978ms | threads 859677:main:mean=52:peak=59:ge95=0/54 859683:PL-server:mean=54:peak=63:ge95=0/54 859684:iou-wrk-859677:mean=0:peak=0:ge95=0/54 
+k21 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999992 | p50=894µs p99=1.884ms max=5.87ms | threads 860678:main:mean=95:peak=102:ge95=50/55 860684:PA-server:mean=23:peak=29:ge95=0/55 860685:iou-wrk-860678:mean=0:peak=0:ge95=0/55 860739:iou-wrk-860684:mean=0:peak=0:ge95=0/54 
+k21 WSL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000303 | p50=18µs p99=71µs max=4.384ms | threads 862003:main:mean=69:peak=73:ge95=0/54 862009:WSL-server:mean=68:peak=73:ge95=0/54 862010:iou-wrk-862009:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.05 blocking=[] before round 22
+k22 PA failclosed streams=500 conns=1 opened=329 delivering=260 failed=171 events=2600113 | p50=13µs p99=36µs max=1.302ms | threads 863028:main:mean=59:peak=64:ge95=0/54 863034:PA-server:mean=18:peak=24:ge95=0/54 863035:iou-wrk-863028:mean=0:peak=0:ge95=0/54 
+k22 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000314 | p50=12µs p99=35µs max=4.522ms | threads 864063:main:mean=58:peak=64:ge95=0/54 864069:PL-server:mean=54:peak=63:ge95=0/54 864070:iou-wrk-864063:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.04 blocking=[] before round 23
+k23 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000229 | p50=13µs p99=45µs max=4.915ms | threads 865079:main:mean=56:peak=68:ge95=0/54 865085:PL-server:mean=54:peak=63:ge95=0/54 865086:iou-wrk-865079:mean=0:peak=0:ge95=0/54 
+k23 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999713 | p50=901µs p99=1.923ms max=6.872ms | threads 866106:main:mean=96:peak=103:ge95=48/55 866112:PA-server:mean=24:peak=34:ge95=0/55 866113:iou-wrk-866106:mean=0:peak=0:ge95=0/55 
+host busy_cores=0.41 blocking=[] before round 24
+k24 WSL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000353 | p50=16µs p99=58µs max=5.236ms | threads 867146:main:mean=71:peak=78:ge95=0/54 867152:WSL-server:mean=70:peak=78:ge95=0/54 867153:iou-wrk-867152:mean=0:peak=0:ge95=0/54 
+k24 PA failclosed streams=500 conns=1 opened=396 delivering=84 failed=104 events=840027 | p50=11µs p99=28µs max=329µs | threads 868171:main:mean=20:peak=24:ge95=0/58 868177:PA-server:mean=6:peak=10:ge95=0/58 868178:iou-wrk-868171:mean=0:peak=0:ge95=0/58 868232:iou-wrk-868177:mean=0:peak=0:ge95=0/57 
+k24 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000313 | p50=13µs p99=39µs max=5.184ms | threads 869532:main:mean=57:peak=64:ge95=0/54 869538:PL-server:mean=53:peak=59:ge95=0/54 869539:iou-wrk-869532:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.06 blocking=[] before round 25
+k25 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000318 | p50=14µs p99=64µs max=3.754ms | threads 870575:main:mean=54:peak=59:ge95=0/54 870581:PL-server:mean=52:peak=59:ge95=0/54 870582:iou-wrk-870575:mean=0:peak=0:ge95=0/54 
+k25 PA failclosed streams=500 conns=1 opened=425 delivering=68 failed=75 events=680006 | p50=10µs p99=50µs max=533µs | threads 871581:main:mean=3:peak=10:ge95=0/53 871587:PA-server:mean=15:peak=19:ge95=0/53 871588:iou-wrk-871581:mean=0:peak=0:ge95=0/53 
+host busy_cores=0.06 blocking=[] before round 26
+k26 PA knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999857 | p50=918µs p99=1.946ms max=5.283ms | threads 872608:main:mean=96:peak=103:ge95=44/55 872614:PA-server:mean=24:peak=29:ge95=0/55 872615:iou-wrk-872608:mean=0:peak=0:ge95=0/55 
+k26 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000327 | p50=12µs p99=30µs max=3.579ms | threads 873632:main:mean=53:peak=58:ge95=0/54 873638:PL-server:mean=51:peak=54:ge95=0/54 873639:iou-wrk-873632:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.05 blocking=[] before round 27
+k27 PA ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000371 | p50=16µs p99=91µs max=3.875ms | threads 874647:main:mean=66:peak=78:ge95=0/54 874653:PA-server:mean=61:peak=73:ge95=0/54 874654:iou-wrk-874647:mean=0:peak=0:ge95=0/54 
+k27 WSL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000347 | p50=18µs p99=79µs max=4.845ms | threads 875672:main:mean=68:peak=73:ge95=0/54 875678:WSL-server:mean=67:peak=73:ge95=0/54 875679:iou-wrk-875672:mean=0:peak=0:ge95=0/54 
+k27 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000330 | p50=13µs p99=46µs max=3.576ms | threads 876681:main:mean=56:peak=64:ge95=0/54 876687:PL-server:mean=54:peak=59:ge95=0/54 876688:iou-wrk-876681:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.06 blocking=[] before round 28
+k28 PA failclosed streams=500 conns=1 opened=460 delivering=378 failed=40 events=3780182 | p50=19µs p99=89µs max=3.102ms | threads 877723:main:mean=74:peak=83:ge95=0/54 877729:PA-server:mean=24:peak=34:ge95=0/54 877730:iou-wrk-877723:mean=0:peak=0:ge95=0/54 
+k28 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000388 | p50=12µs p99=29µs max=2.546ms | threads 878734:main:mean=56:peak=63:ge95=0/54 878740:PL-server:mean=52:peak=59:ge95=0/54 878741:iou-wrk-878734:mean=0:peak=0:ge95=0/54 
+host busy_cores=0.06 blocking=[] before round 29
+k29 PL ok streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000345 | p50=13µs p99=45µs max=4.058ms | threads 879771:main:mean=57:peak=63:ge95=0/54 879777:PL-server:mean=53:peak=59:ge95=0/54 879778:iou-wrk-879771:mean=0:peak=0:ge95=0/54 
+k29 PA failclosed streams=500 conns=1 opened=421 delivering=267 failed=79 events=2670115 | p50=14µs p99=43µs max=2.508ms | threads 880780:main:mean=58:peak=68:ge95=0/54 880786:PA-server:mean=19:peak=24:ge95=0/53 880787:iou-wrk-880780:mean=0:peak=0:ge95=0/53 880840:iou-wrk-880786:mean=0:peak=0:ge95=0/52 
+host busy_cores=0.07 blocking=[] before round 30
+k30 PL knee streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999741 | p50=827µs p99=1.595ms max=6.119ms | threads 882084:main:mean=95:peak=102:ge95=50/55 882090:PL-server:mean=0:peak=5:ge95=0/55 882091:iou-wrk-882084:mean=0:peak=0:ge95=0/55 882138:iou-wrk-882090:mean=0:peak=0:ge95=0/54 
+k30 WSL failclosed streams=500 conns=1 opened=447 delivering=244 failed=53 events=2440128 | p50=13µs p99=39µs max=976µs | threads 883378:main:mean=44:peak=49:ge95=0/54 883384:WSL-server:mean=41:peak=44:ge95=0/54 883385:iou-wrk-883384:mean=0:peak=0:ge95=0/54 
+k30 PA failclosed streams=500 conns=1 opened=479 delivering=244 failed=21 events=2440174 | p50=13µs p99=62µs max=1.58ms | threads 884381:main:mean=16:peak=20:ge95=0/54 884387:PA-server:mean=53:peak=59:ge95=0/54 884388:iou-wrk-884381:mean=0:peak=0:ge95=0/54 
+== done
+series copied:       70
+exit=0

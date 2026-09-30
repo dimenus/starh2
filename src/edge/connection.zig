@@ -88,6 +88,16 @@
 //! One counter cannot express both, because a byte is briefly present as
 //! pending body AND as framed wire. `deinit` asserts that the two parts sum to
 //! the total and that both reach zero, which is the leak check.
+//!
+//! # Placement
+//!
+//! Every task a connection spawns for itself (h2c pumps, task handlers, the
+//! HTTP/1.1 handler job) is spawned with `connPlacement()`. Only server-wide
+//! tasks (accept loops, `connEntry`, reaper workers) use `.auto`. Without
+//! task migration, `.auto` homes each new task round-robin, so one
+//! connection's tasks scatter over executors by spawn-time luck and a bad
+//! draw lasts for the connection's life. With migration there is no fixed
+//! home to choose, and zio refuses any placement but `.auto`.
 const std = @import("std");
 // Direct zio dependency: the actor parks in one `zio.select`; TLS adds
 // the CompletionQueue. The h2c pumps stay std.Io-pure.
@@ -95,6 +105,7 @@ const zio = @import("zio");
 const session_mod = @import("../core/session.zig");
 const hpack = @import("../core/hpack.zig");
 const limits_mod = @import("../core/limits.zig");
+const bound_shapes = @import("../core/bound_shapes.zig");
 const frame = @import("../core/frame.zig");
 const request = @import("../http/request.zig");
 const response = @import("../http/response.zig");
@@ -113,6 +124,149 @@ const io_queue = @import("io_queue.zig");
 const slab_pool = @import("slab_pool.zig");
 const flow = @import("../core/flow.zig");
 
+pub const zio_scheduling = @import("build_options").zio_scheduling;
+
+/// `.local` is the connection's own executor, because every per-connection
+/// spawn runs on a task of that connection. zio fails `.local` with
+/// `error.InvalidPlacement` under work_stealing, so this must be decided at
+/// comptime.
+pub const conn_placement: zio.Placement = if (zio_scheduling == .work_stealing) .auto else .local;
+
+/// Bench and test override of `conn_placement`, so one pinned binary can run
+/// both arms of the placement A/B. Set it before the server starts.
+pub var placement_override: ?zio.Placement = null;
+
+pub fn connPlacement() zio.Placement {
+    return placement_override orelse conn_placement;
+}
+
+/// The placement check needs tasks that never change thread, so it is off
+/// under work_stealing. Off in release unless `-Dobserve=true`.
+pub const placement_check = test_observe and zio_scheduling != .work_stealing;
+/// Per-connection task starts that compared their thread with the actor's.
+/// Counted so a zero mismatch count can be told apart from a check that
+/// never ran.
+pub var test_placement_checks: std.atomic.Value(usize) = .init(0);
+/// Per-connection task starts that ran on a thread other than the actor's.
+pub var test_placement_mismatches: std.atomic.Value(usize) = .init(0);
+
+/// Called first by every per-connection task. `actor_thread` is the thread
+/// the connection's actor recorded when it started.
+pub fn notePlacement(actor_thread: std.Thread.Id) void {
+    if (comptime !placement_check) return;
+    _ = test_placement_checks.fetchAdd(1, .monotonic);
+    if (std.Thread.getCurrentId() != actor_thread) {
+        _ = test_placement_mismatches.fetchAdd(1, .monotonic);
+    }
+}
+
+/// Placement probe (observe builds only; compiled out otherwise): counts, per
+/// OS thread, how often each kind of server task ran a unit of work there.
+/// Threads are keyed by kernel tid in first-seen slots, so a row can be
+/// joined with /proc/<pid>/task/<tid>/stat. Linux only: other targets count
+/// nothing.
+pub const ProbeKind = enum(u8) { accept, conn_entry, actor_start, actor_turn, handler_start, handler_iter, reaper_job, tls_recv_submit, tls_send_submit };
+pub const probe_slots = 8;
+pub var probe_tids: [probe_slots]std.atomic.Value(i32) = std.mem.zeroes([probe_slots]std.atomic.Value(i32));
+pub var probe_counts: [@typeInfo(ProbeKind).@"enum".fields.len][probe_slots]std.atomic.Value(u64) =
+    std.mem.zeroes([@typeInfo(ProbeKind).@"enum".fields.len][probe_slots]std.atomic.Value(u64));
+/// More distinct threads than slots: those notes are dropped, and counted
+/// here, so a full table cannot pass as a complete one.
+pub var probe_overflow: std.atomic.Value(u64) = .init(0);
+
+pub fn probeTid() i32 {
+    if (comptime @import("builtin").os.tag != .linux) return 0;
+    return @intCast(std.os.linux.gettid());
+}
+
+pub fn probeNote(kind: ProbeKind) void {
+    if (comptime !placement_check or @import("builtin").os.tag != .linux) return;
+    const tid = probeTid();
+    for (&probe_tids, 0..) |*slot, i| {
+        var cur = slot.load(.acquire);
+        if (cur == 0) cur = slot.cmpxchgStrong(0, tid, .acq_rel, .acquire) orelse tid;
+        if (cur == tid) {
+            _ = probe_counts[@intFromEnum(kind)][i].fetchAdd(1, .monotonic);
+            return;
+        }
+    }
+    _ = probe_overflow.fetchAdd(1, .monotonic);
+}
+
+/// Probe-only forcing of the handler spawn, to validate the probe: `same`
+/// spawns SSE handlers on the actor's executor, `other` on the other one of
+/// a 2-executor runtime. Executor 0 is the process main thread (zio's main
+/// executor), so the actor's executor is 0 exactly when its tid is the pid.
+pub const ProbeForce = enum { none, same, other };
+
+/// EXPERIMENT (off by default; pinned or single_executor builds only):
+/// load-aware connection placement. Under pinned scheduling a connection and
+/// all its tasks stay on the executor its connEntry lands on, and zio's
+/// `.auto` round-robin ignores load, so two heavy connections can share one
+/// executor while another idles (captures/zio-placement-probe). With
+/// `conn_balance` set, the accept loop puts each new connection on the
+/// executor with the fewest live task handlers, then the fewest live
+/// connections, then the lowest index.
+///
+/// Limits of the experiment: a balanced connection is spawned outside the
+/// server's connection group, so shutdown does not wait for it. The counts
+/// cover task handlers only, not work an actor does inline.
+pub const balance_max_executors = 16;
+pub var conn_balance: bool = false;
+/// Executor count of the runtime. The server cannot read it from std.Io, so
+/// whoever enables `conn_balance` sets it. 0 or 1 disables balancing.
+pub var conn_balance_executors: u32 = 0;
+pub var exec_live_handlers: [balance_max_executors]std.atomic.Value(u32) = std.mem.zeroes([balance_max_executors]std.atomic.Value(u32));
+pub var exec_live_conns: [balance_max_executors]std.atomic.Value(u32) = std.mem.zeroes([balance_max_executors]std.atomic.Value(u32));
+
+pub fn balancePick() ?zio.ExecutorId {
+    if (comptime zio_scheduling == .work_stealing) return null;
+    if (!conn_balance) return null;
+    const n = @min(conn_balance_executors, balance_max_executors);
+    if (n < 2) return null;
+    var best: zio.ExecutorId = 0;
+    var best_h = exec_live_handlers[0].load(.acquire);
+    var best_c = exec_live_conns[0].load(.acquire);
+    var i: zio.ExecutorId = 1;
+    while (i < n) : (i += 1) {
+        const h = exec_live_handlers[i].load(.acquire);
+        const c = exec_live_conns[i].load(.acquire);
+        if (h < best_h or (h == best_h and c < best_c)) {
+            best = i;
+            best_h = h;
+            best_c = c;
+        }
+    }
+    return best;
+}
+
+/// Probe-only placement of whole connections (connEntry): `same` puts every
+/// accepted connection on executor 0; `split` alternates executors 0, 1, 0,
+/// ... in accept order. `none` keeps the server's normal `.auto` spawn.
+pub const ProbeConnForce = enum { none, same, split };
+pub var probe_conn_force: ProbeConnForce = .none;
+var probe_conn_next: std.atomic.Value(u32) = .init(0);
+
+pub fn probeConnPlacement() ?zio.Placement {
+    if (comptime !placement_check) return null;
+    return switch (probe_conn_force) {
+        .none => null,
+        .same => .{ .executor = 0 },
+        .split => .{ .executor = @intCast(probe_conn_next.fetchAdd(1, .monotonic) % 2) },
+    };
+}
+pub var probe_handler_force: ProbeForce = .none;
+
+fn probeHandlerPlacement() zio.Placement {
+    if (comptime !placement_check or @import("builtin").os.tag != .linux) return connPlacement();
+    const actor_exec: zio.ExecutorId = if (probeTid() == std.os.linux.getpid()) 0 else 1;
+    return switch (probe_handler_force) {
+        .none => connPlacement(),
+        .same => .{ .executor = actor_exec },
+        .other => .{ .executor = 1 - actor_exec },
+    };
+}
+
 /// Test-only: when true, task-handler spawn fails closed with REFUSED_STREAM.
 /// Complete handlers never spawn, so this flag does not touch them. Do not
 /// run the task handler on the actor as a fallback — that parks ingest.
@@ -128,12 +282,12 @@ pub var test_hold_complete_receipt_ack: std.atomic.Value(bool) = .init(false);
 /// Test-only: true while a complete-batch write ack is stashed unapplied.
 pub var test_complete_receipt_ack_held: std.atomic.Value(bool) = .init(false);
 /// Test-only: wakes a parked actor that has a live complete-batch stash.
-/// A zio.ResetEvent so the actor's select can wait on it directly.
-pub var test_release_complete_receipt_ack: zio.ResetEvent = .init;
+/// A zio.Event so the actor's select can wait on it directly.
+pub var test_release_complete_receipt_ack: zio.Event = .init;
 /// Never set / never sent-to: the select branches point here when their
 /// real source is absent or gated, so the select keeps one comptime shape.
-var no_shutdown_event: zio.ResetEvent = .init;
-var no_ack_hold_event: zio.ResetEvent = .init;
+var no_shutdown_event: zio.Event = .init;
+var no_ack_hold_event: zio.Event = .init;
 var hold_dummy_completion_buf: [1]u31 = undefined;
 var hold_dummy_completion_ch: zio.Channel(u31) = .init(&hold_dummy_completion_buf);
 /// Test-only: delay write pump by N ms.
@@ -619,6 +773,9 @@ pub const trace = struct {
 pub const Mode = enum { h2c, tls, h1c };
 
 pub const ConnConfig = struct {
+    /// Set when the accept loop placed this connection with `balancePick`:
+    /// the executor index its handlers are counted against.
+    exec_index: ?zio.ExecutorId = null,
     io: std.Io,
     mode: Mode,
     limits: limits_mod.Limits,
@@ -628,7 +785,7 @@ pub const ConnConfig = struct {
     shutdown_flag: ?*std.atomic.Value(bool) = null,
     /// One-shot: set once at server shutdown, never reset, so selecting on it
     /// is race-free (persistent set, no edge to lose).
-    shutdown_event: ?*zio.ResetEvent = null,
+    shutdown_event: ?*zio.Event = null,
     reaper: ?*ReaperPool = null,
     /// Server-wide stream + reaper reservation (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
@@ -750,7 +907,7 @@ pub const GlobalAccounting = struct {
 /// - `live` (0): the handler is running and will report itself.
 /// - `reaper_owned` (1): the join is in the reaper queue; no worker has it yet.
 /// - `reported` (2): the completion is posted or queued. Also the free state.
-/// - `reaper_running` (3): a worker dequeued the job and is in `Future.cancel`.
+/// - `reaper_running` (3): a worker dequeued the job and is in `JoinHandle.cancel`.
 pub const HandlerSlot = struct {
     terminal: response.SlotTerminal = .{},
     completion_owner: std.atomic.Value(u8) = .init(2), // start reported/free
@@ -865,7 +1022,7 @@ comptime {
 }
 
 pub const ReaperJob = struct {
-    handle: std.Io.Future(void),
+    handle: zio.JoinHandle(void),
     owner: *std.atomic.Value(u8),
     /// The actor selects on this channel; the post IS the wake.
     completion: *zio.Channel(u31),
@@ -884,6 +1041,13 @@ comptime {
             .{@sizeOf(HandlerJob)},
         ));
     }
+    const join_elem = std.meta.Elem(@FieldType(Connection, "handler_joins"));
+    if (@sizeOf(join_elem) != bound_shapes.JOIN_HANDLE_SIZE) {
+        @compileError(std.fmt.comptimePrint(
+            "JOIN_HANDLE_SIZE must match the handler_joins element (got {d})",
+            .{@sizeOf(join_elem)},
+        ));
+    }
     if (@sizeOf(ReaperJob) != limits_mod.REAPER_JOB_SIZE) {
         @compileError(std.fmt.comptimePrint(
             "REAPER_JOB_SIZE must match @sizeOf(ReaperJob) (got {d})",
@@ -894,7 +1058,7 @@ comptime {
 
 /// Cancellation happens off the actor, and this pool is why.
 ///
-/// `Future.cancel` BLOCKS until the target task actually stops. If the actor
+/// `JoinHandle.cancel` BLOCKS until the target task actually stops. If the actor
 /// called it directly, one handler that is slow to notice cancellation would
 /// stall the whole connection — including the reads and the writes that might
 /// be what lets the handler finish. So the actor hands the join handle to a
@@ -925,10 +1089,12 @@ pub const ReaperPool = struct {
     /// The worker's order is fixed and load-bearing:
     ///
     /// 1. Mark `reaper_running` so a stall dump can tell queued from cancel.
-    /// 2. `std.Io.Future.cancel` requests cancel, then waits until the task
-    ///    actually stops (`zio` `awaitOrCancel`). A handler in an uncancelable
-    ///    wait (lockUncancelable, or Futex's no_cancel handshake after a
-    ///    racing wake) never returns, so this worker never posts.
+    /// 2. `zio.JoinHandle.cancel` requests cancel, then waits until the task
+    ///    actually stops (`waitUntilComplete`). The handler may live on
+    ///    another executor; its completion wakes this worker cross-thread.
+    ///    A handler in an uncancelable wait (lockUncancelable, or Futex's
+    ///    no_cancel handshake after a racing wake) never returns, so this
+    ///    worker never posts.
     /// 3. `swap(reported)` — claim the right to report. If the previous value
     ///    is not `reaper_running`, the handler already reported; stay silent.
     /// 4. post the completion. The actor selects on the channel, so the post
@@ -939,9 +1105,10 @@ pub const ReaperPool = struct {
                 error.Closed => return,
                 error.Canceled => return error.Canceled,
             };
+            probeNote(.reaper_job);
             job.owner.store(reaper_running, .release);
             std.debug.assert(job.owner.load(.acquire) == reaper_running);
-            job.handle.cancel(self.io);
+            job.handle.cancel();
             const prev = job.owner.swap(reported, .acq_rel);
             if (prev == reaper_running) {
                 if (job.completion.trySend(job.stream_id)) |_| {
@@ -1039,7 +1206,7 @@ const Connection = struct {
     session_mu: std.Io.Mutex = .init,
     /// One-shot teardown event. Set once, never reset. Handlers select on
     /// this OR their work. Same shape as `ConnConfig.shutdown_event`.
-    dead: zio.ResetEvent = .init,
+    dead: zio.Event = .init,
     /// Debug proof that `session_mu` is held where Session or the scheduler is
     /// touched. Written only while the mutex is held, so it needs no atomic.
     ///
@@ -1070,8 +1237,8 @@ const Connection = struct {
     ticket_slots: []ticket_table.TicketWait = &.{},
     tickets: ticket_table.TicketTable = undefined,
     /// Indexed parallel to handlers; only valid while slot.in_use.
-    handler_joins: []?std.Io.Future(void) = &.{},
-    handshake_deadline: ?std.Io.Timestamp = null,
+    handler_joins: []?zio.JoinHandle(void) = &.{},
+    preface_deadline: ?std.Io.Timestamp = null,
     /// Connection-local outbound/request reservations — actor applies write acks under atomics.
     outbound_held: std.atomic.Value(usize) = .init(0),
     pending_outbound_held: std.atomic.Value(usize) = .init(0),
@@ -1082,11 +1249,11 @@ const Connection = struct {
     /// Set when a write completion reports failure; actor owns handler terminal transition.
     writer_failed: std.atomic.Value(bool) = .init(false),
     writer_fail_handled: bool = false,
-    /// Capacity waiters: one `zio.ResetEvent` per HandlerSlot (sparse IDs safe).
-    space_events: []zio.ResetEvent = &.{},
+    /// Capacity waiters: one `zio.Event` per HandlerSlot (sparse IDs safe).
+    space_events: []zio.Event = &.{},
     /// Time waiters. Occupancy and time are different waits; do not overload
     /// `space_events`. Cadence is a heap entry, not a handler timer.
-    deadline_events: []zio.ResetEvent = &.{},
+    deadline_events: []zio.Event = &.{},
     /// Actor-owned intent batch — filled by drainIntentsInto (no nested Session drain).
     intent_batch: []session_mod.Intent = &.{},
     rates: rates_mod.RateLimiter = .{},
@@ -1119,6 +1286,9 @@ const Connection = struct {
     /// Diag: opaque zio task handles for the actor and the pump.
     actor_task_h: std.atomic.Value(usize) = .init(0),
     tls_pump_task_h: std.atomic.Value(usize) = .init(0),
+    /// Written by `run` before its first spawn and never again, so the tasks
+    /// it spawns read it without a race. Only `notePlacement` reads it.
+    actor_thread: std.Thread.Id = 0,
     frame_pool: slab_pool.SlabPool = undefined,
     read_pool_n: u32 = 0,
     /// Preallocated scratch for stream-id sweeps (no hot-path ArrayList).
@@ -1141,9 +1311,6 @@ const Connection = struct {
     /// `released` counts in-use → free transitions only, never a stale SID.
     teardown_wait_expected: usize = 0,
     teardown_wait_released: usize = 0,
-    /// Successful reaper `tryPut` and `trySend` publications on this connection.
-    reaper_queue_ok: std.atomic.Value(usize) = .init(0),
-    reaper_post_ok: std.atomic.Value(usize) = .init(0),
     /// Actor-owned batches whose drain-turn receipt is attached but not yet
     /// consumed. Separate from `inline_sids`, which is the ready queue.
     complete_receipt_sid_storage: []u31 = &.{},
@@ -1273,7 +1440,7 @@ const Connection = struct {
         const header_lease_sid = try gpa.alloc(u31, config.limits.max_streams_per_connection);
         errdefer gpa.free(header_lease_sid);
         @memset(header_lease_sid, 0);
-        const handler_joins = try gpa.alloc(?std.Io.Future(void), config.limits.max_streams_per_connection);
+        const handler_joins = try gpa.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_joins);
         const completion_ch_buf = try gpa.alloc(u31, config.limits.max_streams_per_connection);
         errdefer gpa.free(completion_ch_buf);
@@ -1317,10 +1484,10 @@ const Connection = struct {
             config.limits.max_streams_per_connection * complete_receipt_capacity,
         );
         errdefer gpa.free(complete_receipt_sid_storage);
-        const space_events = try gpa.alloc(zio.ResetEvent, config.limits.max_streams_per_connection);
+        const space_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(space_events);
         @memset(space_events, .init);
-        const deadline_events = try gpa.alloc(zio.ResetEvent, config.limits.max_streams_per_connection);
+        const deadline_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(deadline_events);
         @memset(deadline_events, .init);
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
@@ -1873,7 +2040,7 @@ const Connection = struct {
     }
 
     /// Sole owner of leftover write-ack apply on teardown. `run`'s defer
-    /// calls this after `Future.cancel`, which waits until the pump has
+    /// calls this after `JoinHandle.cancel`, which waits until the pump has
     /// exited, so every completion the pump posted is already in the channel.
     /// `deinit` asserts the channel is then empty (t-894); a second drain
     /// there absorbed skipping this one.
@@ -2393,10 +2560,6 @@ const Connection = struct {
         return next;
     }
 
-    fn waitTimer(timeout: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
-        return timeout.sleep(io);
-    }
-
     fn traceParkSnapshot(self: *Connection) void {
         const acc: usize = 0;
         const complete = false;
@@ -2512,7 +2675,7 @@ const Connection = struct {
 
     /// Park in ONE `zio.select` until something the actor cares about
     /// happens. Every branch holds persistent evidence (a buffered channel
-    /// item, a set ResetEvent), so there is no reset and no recheck list.
+    /// item, a set Event), so there is no reset and no recheck list.
     ///
     /// Declaration order is the tie-break when several branches are ready:
     /// reads first (matches the hot turn's take order), then acks and
@@ -2738,12 +2901,12 @@ const Connection = struct {
     /// The actor. One task, one connection, from first byte to close.
     ///
     /// ## Startup sequence
-    /// 1. TLS, if any: handshake on the actor's handshake subtask, which
-    ///    reads the socket itself (BoringSSL over memory BIOs; no HTTP/2
-    ///    yet). Drain leftover plaintext (a pipelined preface) into Session,
-    ///    then arm the CQ driver on this same task: sole SSL_read/SSL_write
-    ///    owner and sole socket reader from here on; flush is SSL_write +
-    ///    BIO_read + NetSend.
+    /// 1. TLS, if any: the handshake already ran on this same task, in
+    ///    `Server.serveTlsThenBranch`, which hands over `tls_ready` and the
+    ///    leftover plaintext (a pipelined preface). Ingest that into
+    ///    Session, then arm the CQ driver: sole SSL_read/SSL_write owner and
+    ///    sole socket reader from here on; flush is SSL_write + BIO_read +
+    ///    NetSend.
     /// 2. h2c: spawn ReadPump and WritePump on the raw socket.
     /// 3. Flush the server preface that `Session.init` already queued.
     /// 4. For h2c, wait for the client preface under the preface deadline.
@@ -2770,7 +2933,7 @@ const Connection = struct {
     /// ## Teardown sequence (the `defer` block, then the tail)
     /// 1. Tell the live pump(s) to stop. h2c: push a sentinel so a writer
     ///    parked on an empty queue wakes. TLS: close the unused overflow
-    ///    channel, then `shutdownCq` on this task (no pump Future).
+    ///    channel, then `shutdownCq` on this task (no pump task).
     /// 2. `shutdown` the socket. A read parked in the kernel does not observe a
     ///    flag, so this is what unblocks it; task cancellation is the
     ///    authoritative backstop.
@@ -2784,12 +2947,14 @@ const Connection = struct {
         const gpa = self.config.gpa;
         const io = self.config.io;
         if (diag_task_handle_fn) |f| self.actor_task_h.store(f(), .release);
+        if (comptime placement_check) self.actor_thread = std.Thread.getCurrentId();
+        probeNote(.actor_start);
 
         var read_pump: wire_pump.ReadPump = undefined;
         var write_pump: wire_pump.WritePump = undefined;
         var tls_pump: tls_edge.Pump = undefined;
-        var read_handle: ?std.Io.Future(void) = null;
-        var write_handle: ?std.Io.Future(void) = null;
+        var read_handle: ?zio.JoinHandle(void) = null;
+        var write_handle: ?zio.JoinHandle(void) = null;
         var tls_started = false;
         var h2c_started = false;
         var torn_down = false;
@@ -2820,8 +2985,8 @@ const Connection = struct {
                 self.tls_driver = null;
                 tls_pump.shutdownCq();
             }
-            if (write_handle) |*h| h.cancel(io);
-            if (read_handle) |*h| h.cancel(io);
+            if (write_handle) |*h| h.cancel();
+            if (read_handle) |*h| h.cancel();
             self.drainWriteAcksForced();
             if (!self.socket_closed.swap(true, .acq_rel)) {
                 self.stream.close(io);
@@ -2829,23 +2994,19 @@ const Connection = struct {
         }
 
         if (self.config.mode == .tls) {
-            if (self.config.tls_ready) |ready| {
-                self.tls = ready;
-                if (self.config.tls_leftover.len != 0) {
-                    self.lockSessionUncancelable(io);
-                    defer self.unlockSession(io);
-                    try self.session.ingest(self.config.tls_leftover);
-                    if (self.session.terminal != .none) return error.ConnectionClosed;
-                }
-                if (self.handshake_held) {
-                    if (self.config.accounting) |a| a.releaseHandshake();
-                    self.handshake_held = false;
-                }
-            } else {
-                try self.prepareTls();
-                // Handshake first: the actor-side handshake subtask reads the
-                // socket itself now; no read task exists before the driver.
-                try self.handshakeTls();
+            // One handshake site, `Server.serveTlsThenBranch`: it must pick
+            // HTTP/2 or HTTP/1.1 from ALPN before a Connection exists.
+            self.tls = self.config.tls_ready orelse
+                @panic("tls mode needs tls_ready: the handshake runs in Server.serveTlsThenBranch");
+            if (self.config.tls_leftover.len != 0) {
+                self.lockSessionUncancelable(io);
+                defer self.unlockSession(io);
+                try self.session.ingest(self.config.tls_leftover);
+                if (self.session.terminal != .none) return error.ConnectionClosed;
+            }
+            if (self.handshake_held) {
+                if (self.config.accounting) |a| a.releaseHandshake();
+                self.handshake_held = false;
             }
             tls_pump = .{
                 .io = io,
@@ -2917,8 +3078,8 @@ const Connection = struct {
                 .test_delay_ms = test_write_delay_ms,
                 .test_fail_after = test_write_fail_after,
             };
-            read_handle = try io.concurrent(wire_pump.ReadPump.run, .{&read_pump});
-            write_handle = try io.concurrent(wire_pump.WritePump.run, .{&write_pump});
+            read_handle = try zio.spawnInto(connPlacement(), runReadPump, .{ self, &read_pump });
+            write_handle = try zio.spawnInto(connPlacement(), runWritePump, .{ self, &write_pump });
             h2c_started = true;
         }
 
@@ -2933,7 +3094,7 @@ const Connection = struct {
 
         if (close_probe) diagRawPrint("t1002 conn={x} sess={x} start peer={d} parked={d}\n", .{ @intFromPtr(self), @intFromPtr(&self.session), closeProbePeerPort(self.stream.socket.handle), close_probe_parked.load(.acquire) });
         if (self.config.mode == .h2c) {
-            self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
+            self.preface_deadline = std.Io.Timestamp.fromNanoseconds(
                 @as(i96, nowNs(io) +% self.config.limits.preface_timeout_ns),
             );
             try self.waitH2cPreface();
@@ -2946,6 +3107,7 @@ const Connection = struct {
         // hold they already have; they must not drop and reacquire.
         var leaving = false;
         while (true) {
+            probeNote(.actor_turn);
             _ = self.sched_refilled.swap(false, .acq_rel);
             self.drainWriteAcks();
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
@@ -3128,10 +3290,10 @@ const Connection = struct {
 
     fn receiveUntilDeadline(self: *Connection) !wire_pump.WireChunk {
         const io = self.config.io;
-        const timeout: zio.Timeout = if (self.handshake_deadline) |deadline| blk: {
+        const timeout: zio.Timeout = if (self.preface_deadline) |deadline| blk: {
             const deadline_ns: u64 = @intCast(deadline.nanoseconds);
             const now = nowNs(io);
-            if (now >= deadline_ns) return error.TlsHandshakeTimeout;
+            if (now >= deadline_ns) return error.PrefaceTimeout;
             break :blk .{ .duration = .fromNanoseconds(deadline_ns - now) };
         } else .none;
         const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
@@ -3143,81 +3305,8 @@ const Connection = struct {
         return switch (winner) {
             .read => |result| result catch error.ConnectionClosed,
             .shutdown => error.ConnectionClosed,
-            .timer => error.TlsHandshakeTimeout,
+            .timer => error.PrefaceTimeout,
         };
-    }
-
-    /// Handshake TLS on the actor, then ingest leftover plaintext (a client
-    /// that pipelines the h2 preface into the handshake flight). The CQ is
-    /// not armed yet, so this is the sole SSL_read; the handshake subtask
-    /// is the sole socket reader for its lifetime.
-    fn handshakeTls(self: *Connection) !void {
-        const io = self.config.io;
-        const tls_conn = self.tls orelse return error.InvalidConfig;
-
-        self.handshake_deadline = std.Io.Timestamp.fromNanoseconds(
-            @as(i96, nowNs(io) +% 5 * std.time.ns_per_s),
-        );
-        const Hs = union(enum) {
-            hs: anyerror!void,
-            timer: std.Io.Cancelable!void,
-        };
-        const Handshake = struct {
-            fn run(conn: *tls_edge.Conn, inner_io: std.Io) anyerror!void {
-                // The subtask reads the socket itself (feedFromSocket); the
-                // reader is bound on the subtask so the wait context is its
-                // own.
-                try conn.handshake(inner_io);
-            }
-        };
-        var result_buf: [2]Hs = undefined;
-        var select = std.Io.Select(Hs).init(io, &result_buf);
-        errdefer select.cancelDiscard();
-        try select.concurrent(.hs, Handshake.run, .{ tls_conn, io });
-        const timeout: std.Io.Timeout = .{ .deadline = .{
-            .raw = self.handshake_deadline.?,
-            .clock = .awake,
-        } };
-        try select.concurrent(.timer, waitTimer, .{ timeout, io });
-        const selected = try select.await();
-        defer select.cancelDiscard();
-        switch (selected) {
-            .hs => |result| try result,
-            .timer => |result| {
-                try result;
-                return error.TlsHandshakeTimeout;
-            },
-        }
-        try self.drainTlsLeftover(tls_conn);
-        self.handshake_deadline = null;
-        if (self.handshake_held) {
-            if (self.config.accounting) |a| a.releaseHandshake();
-            self.handshake_held = false;
-        }
-    }
-
-    fn prepareTls(self: *Connection) !void {
-        const acceptor = self.config.tls_acceptor orelse return error.InvalidConfig;
-        const tls_conn = try self.config.gpa.create(tls_edge.Conn);
-        errdefer self.config.gpa.destroy(tls_conn);
-        tls_conn.initTcp(self.stream);
-        errdefer tls_conn.deinit();
-        try tls_conn.setupAccept(acceptor);
-        self.tls = tls_conn;
-    }
-
-    fn drainTlsLeftover(self: *Connection, tls_conn: *tls_edge.Conn) !void {
-        var buf: [limits_mod.WIRE_CHUNK_SIZE]u8 = undefined;
-        while (true) {
-            const n = tls_conn.ssl.read(&buf) catch break;
-            if (n == 0) break;
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
-            try self.session.ingest(buf[0..n]);
-            // Do not processIntents/queueWire here: the CQ is not armed yet.
-            // Ingest only; emit after Pump.start.
-            if (self.session.terminal != .none) return error.ConnectionClosed;
-        }
     }
 
     fn recycleReadChunk(self: *Connection, chunk: wire_pump.WireChunk) void {
@@ -3233,10 +3322,7 @@ const Connection = struct {
 
     fn waitH2cPreface(self: *Connection) !void {
         while (self.session.parser.expecting_preface) {
-            const chunk = self.receiveUntilDeadline() catch |err| {
-                if (err == error.TlsHandshakeTimeout) return error.PrefaceTimeout;
-                return err;
-            };
+            const chunk = try self.receiveUntilDeadline();
             defer self.recycleReadChunk(chunk);
             if (chunk.len == 0) return error.ConnectionClosed;
             self.lockSessionUncancelable(self.config.io);
@@ -3247,7 +3333,7 @@ const Connection = struct {
                 if (self.session.terminal != .none) return error.ConnectionClosed;
             }
         }
-        self.handshake_deadline = null;
+        self.preface_deadline = null;
     }
 
     /// Claim a handler slot. Actor-only, so the linear scan needs no lock and
@@ -3359,7 +3445,7 @@ const Connection = struct {
 
     /// Free a slot after its handler has finished. Actor-only.
     ///
-    /// The `await` is the memory-safety barrier and not bookkeeping. The
+    /// The `join` is the memory-safety barrier and not bookkeeping. The
     /// handler's arena is destroyed when the handler task returns, so the slot
     /// may only be reused after this task confirms it has really stopped.
     ///
@@ -3387,7 +3473,7 @@ const Connection = struct {
             std.debug.assert(n == 0);
             self.slots_rolled_back += 1;
         }
-        if (self.handler_joins[i]) |*handle| handle.await(self.config.io);
+        if (self.handler_joins[i]) |*handle| handle.join();
         self.handler_joins[i] = null;
         if (slot.reaper_reserved) {
             if (self.config.accounting) |a| a.releaseReaper();
@@ -3402,43 +3488,12 @@ const Connection = struct {
         return true;
     }
 
-    fn enqueueReaperOrFail(self: *Connection, slot: *HandlerSlot, handle: std.Io.Future(void), stream_id: u31) void {
-        if (self.reaper) |pool| {
-            var owned_handle = handle;
-            const queued = io_queue.tryPut(ReaperJob, &pool.jobs, self.config.io, .{
-                .handle = owned_handle,
-                .owner = &slot.completion_owner,
-                .completion = &self.completion_ch,
-                .stream_id = stream_id,
-                .post_ok = &self.reaper_post_ok,
-            });
-            if (queued) {
-                _ = self.reaper_queue_ok.fetchAdd(1, .acq_rel);
-            } else {
-                // Invariant: reserved capacity must make this impossible.
-                std.debug.assert(false);
-                owned_handle.cancel(self.config.io);
-                slot.completion_owner.store(reported, .release);
-                // This invariant-failure path already owns connection and slot teardown.
-                self.session.applyCommand(.{ .goaway = .{ .code = .internal_error, .last_stream_id = self.session.last_processed_stream } }) catch {};
-                // No wire recovery is possible after the reserved reaper queue rejected the job.
-                self.processIntents() catch {};
-                std.debug.assert(self.releaseSlot(stream_id));
-            }
-        } else {
-            var h = handle;
-            h.cancel(self.config.io);
-            slot.completion_owner.store(reported, .release);
-            std.debug.assert(self.releaseSlot(stream_id));
-        }
-    }
-
     /// Stop a handler because its stream is over — a peer RST, or a local
     /// reset. Actor-only.
     ///
     /// Publish the terminal cause and wake every wait this stream owns.
     /// The handler returns on its next Response call or wait, then posts.
-    /// There is no Future.cancel: that path cannot reclaim an uncancelable
+    /// There is no JoinHandle.cancel: that path cannot reclaim an uncancelable
     /// wait, and it is the Futex handshake that hung teardown.
     fn cancelHandler(self: *Connection, stream_id: u31, cause: response.TerminalCause) void {
         const i = self.slotIndex(stream_id) orelse {
@@ -3652,7 +3707,7 @@ const Connection = struct {
         }
     }
 
-    fn resetHasWaiters(e: *const zio.ResetEvent) bool {
+    fn eventHasWaiters(e: *const zio.Event) bool {
         return e.wait_queue.hasWaiters();
     }
 
@@ -3694,8 +3749,8 @@ const Connection = struct {
         std.debug.assert(in_use != 0);
         for (self.handlers, 0..) |s, i| {
             if (!s.in_use) continue;
-            const space_wait = i < self.space_events.len and resetHasWaiters(&self.space_events[i]);
-            const deadline_wait = i < self.deadline_events.len and resetHasWaiters(&self.deadline_events[i]);
+            const space_wait = i < self.space_events.len and eventHasWaiters(&self.space_events[i]);
+            const deadline_wait = i < self.deadline_events.len and eventHasWaiters(&self.deadline_events[i]);
             diagRawPrint(
                 "teardown stall sid={d} owner={d} join={d} admitted={d} finalize={d} reaper={d} awaiting_receipt={d} cause={d} space_wait={d} deadline_wait={d} session_held={d}\n",
                 .{
@@ -3714,7 +3769,7 @@ const Connection = struct {
             );
         }
         std.debug.panic(
-            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} queue_ok={d} post_ok={d} awaiting_receipt={d} ticket_in_use={d} ticket_wait={d} dead_wait={d} session_held={d}",
+            "teardown wait exceeded 5s no progress: live_handlers={d} slots={d} reaper={d} owner_live={d} expected={d} released={d} reaper_queued={d} reaper_running={d} awaiting_receipt={d} ticket_in_use={d} ticket_wait={d} dead_wait={d} session_held={d}",
             .{
                 self.live_handlers.load(.acquire),
                 in_use,
@@ -3724,12 +3779,10 @@ const Connection = struct {
                 self.teardown_wait_released,
                 reaper_queued,
                 reaper_run,
-                self.reaper_queue_ok.load(.acquire),
-                self.reaper_post_ok.load(.acquire),
                 awaiting_n,
                 self.countTicketInUse(),
                 self.countTicketWaiters(),
-                @intFromBool(resetHasWaiters(&self.dead)),
+                @intFromBool(eventHasWaiters(&self.dead)),
                 @intFromBool(self.session_held),
             },
         );
@@ -5075,10 +5128,15 @@ const Connection = struct {
         // stores the join handle still decrements in finishHandlerJob.
         job.task_counted = true;
         _ = self.live_task_handlers.fetchAdd(1, .acq_rel);
+        if (self.config.exec_index) |ei| _ = exec_live_handlers[ei].fetchAdd(1, .acq_rel);
+        // With `.local`, a burst of 13+ spawns fills this executor's queue and
+        // zio's `registerTask` yields this actor while it holds `session_mu`:
+        // a short convoy behind the new handlers, not a deadlock, because the
+        // yield reschedules the actor and a handler blocked on the mutex parks.
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
-            self.config.io.concurrent(runHandlerJob, .{job});
+            zio.spawnInto(probeHandlerPlacement(), runHandlerJob, .{job});
         const h = handle catch {
             // Admission already incremented live_handlers and claimed a slot.
             // Refuse rather than run on the actor: a blocking task handler
@@ -5141,15 +5199,32 @@ const Connection = struct {
             };
         }
         _ = self.live_handlers.fetchSub(1, .acq_rel);
-        if (job.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
+        if (job.task_counted) {
+            _ = self.live_task_handlers.fetchSub(1, .acq_rel);
+            if (self.config.exec_index) |ei| _ = exec_live_handlers[ei].fetchSub(1, .acq_rel);
+        }
         if (comptime test_observe) _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
         _ = job.arena.reset(.retain_capacity);
         self.releaseDispatchRequest(job.owned_request);
     }
 
     fn runHandlerJob(job: *HandlerJob) void {
+        notePlacement(job.conn.actor_thread);
+        probeNote(.handler_start);
         defer finishHandlerJob(job);
         runHandlerJobBody(job);
+    }
+
+    // The pumps are thin on purpose and know nothing of the connection, so
+    // the placement check lives in these wrappers and not in wire_pump.zig.
+    fn runReadPump(self: *Connection, pump: *wire_pump.ReadPump) void {
+        notePlacement(self.actor_thread);
+        pump.run();
+    }
+
+    fn runWritePump(self: *Connection, pump: *wire_pump.WritePump) void {
+        notePlacement(self.actor_thread);
+        pump.run();
     }
 
     fn runHandlerJobBody(job: *HandlerJob) void {
@@ -5261,7 +5336,7 @@ const Connection = struct {
     /// run here with the lock released. Encode one drain-turn, attach one
     /// receipt, return to the actor loop. The actor consumes that receipt only
     /// after `drainWriteAcks` reports it ready — it does not `waitTicket` here.
-    /// SSE and any handler that can wait still go through `io.concurrent`.
+    /// SSE and any handler that can wait are still spawned (`connPlacement`).
     fn runPendingInline(self: *Connection) void {
         // Do not assert `!session_held`: that flag means SOMEBODY holds the
         // mutex, often a task handler's sendCb, not this actor. Taking the
@@ -6553,13 +6628,13 @@ pub fn testTrapWatchdogNoProgress(io: std.Io) void {
 
 fn trapParkForever() void {
     while (true) {
-        // Swallow Canceled so Future.cancel cannot finish: the next sleep is
+        // Swallow Canceled so JoinHandle.cancel cannot finish: the next sleep is
         // not a cancel point (zio consumes one Canceled per request).
         zio.sleep(.fromSeconds(30)) catch {};
     }
 }
 
-/// Axis D arm: a running reaper whose `Future.cancel` never returns. A worker
+/// Axis D arm: a running reaper whose `JoinHandle.cancel` never returns. A worker
 /// must be live: a pool with nobody home only arms `reaper_queued`, not
 /// `reaper_running`.
 pub fn testTrapWatchdogReaperNoPost(io: std.Io) void {
@@ -6574,7 +6649,7 @@ pub fn testTrapWatchdogReaperNoPost(io: std.Io) void {
     slot.reaper_reserved = true;
     const i = trap.hop.conn.slotIndex(1) orelse std.debug.panic("trap slotIndex failed", .{});
     std.debug.assert(trap.hop.conn.handler_joins[i] == null);
-    const handle = io.concurrent(trapParkForever, .{}) catch std.debug.panic("trap park spawn failed", .{});
+    const handle = zio.spawnInto(connPlacement(), trapParkForever, .{}) catch std.debug.panic("trap park spawn failed", .{});
     trap.hop.conn.handler_joins[i] = handle;
     std.debug.assert(slot.completion_owner.load(.acquire) == live);
     std.debug.assert(trap.hop.conn.live_handlers.load(.acquire) == 1);
@@ -6610,12 +6685,9 @@ fn trapAssertSweepClean(conn: *Connection) void {
         std.debug.panic("reaper-stuck leftover reaper_running={d}", .{running_n});
     }
     std.debug.assert(conn.countInUseSlots() == 0);
-    if (conn.reaper_queue_ok.load(.acquire) != 0) {
-        std.debug.panic("teardown used Future.cancel queue_ok={d}", .{conn.reaper_queue_ok.load(.acquire)});
-    }
 }
 
-/// A2 gate: a handler parked in `tickets.wait` returns with no Future.cancel.
+/// A2 gate: a handler parked in `tickets.wait` returns with no JoinHandle.cancel.
 /// Ready signal is `TicketTable.isWaiting`. Handshake hang is t-1946, not armed.
 pub fn testTrapR158Parked(io: std.Io) void {
     const gpa = std.heap.page_allocator;
@@ -6629,7 +6701,7 @@ pub fn testTrapR158Parked(io: std.Io) void {
     const job = trapAdmitJob(&trap.hop.conn, 1);
     job.slot.reaper_reserved = true;
     const i = trap.hop.conn.slotIndex(1) orelse std.debug.panic("trap slotIndex failed", .{});
-    const handle = io.concurrent(trapR158ParkedHolder, .{job}) catch std.debug.panic("trap holder spawn failed", .{});
+    const handle = zio.spawnInto(connPlacement(), trapR158ParkedHolder, .{job}) catch std.debug.panic("trap holder spawn failed", .{});
     trap.hop.conn.handler_joins[i] = handle;
     std.debug.assert(job.slot.completion_owner.load(.acquire) == live);
     var spins: usize = 0;
@@ -6638,7 +6710,7 @@ pub fn testTrapR158Parked(io: std.Io) void {
         if (slot_i != ticket_table.no_completion_slot and
             trap.hop.conn.tickets.isWaiting(slot_i) and
             trap.hop.conn.countTicketWaiters() == 1 and
-            Connection.resetHasWaiters(&trap.hop.conn.dead)) break;
+            Connection.eventHasWaiters(&trap.hop.conn.dead)) break;
         spins += 1;
         std.debug.assert(spins < 1_000_000);
         zio.yield() catch std.debug.panic("trap yield canceled before wait", .{});
@@ -6646,10 +6718,10 @@ pub fn testTrapR158Parked(io: std.Io) void {
     std.debug.assert(job.slot.awaiting_receipt.load(.acquire));
     std.debug.assert(trap.hop.conn.tickets.isWaiting(trap_r158_ticket_slot.load(.acquire)));
     std.debug.assert(trap.hop.conn.countTicketWaiters() == 1);
-    std.debug.assert(Connection.resetHasWaiters(&trap.hop.conn.dead));
+    std.debug.assert(Connection.eventHasWaiters(&trap.hop.conn.dead));
     trap.hop.conn.shutdownHandlers();
     std.debug.assert(trap.hop.conn.countTicketWaiters() == 0);
-    std.debug.assert(!Connection.resetHasWaiters(&trap.hop.conn.dead));
+    std.debug.assert(!Connection.eventHasWaiters(&trap.hop.conn.dead));
     trapAssertSweepClean(&trap.hop.conn);
     std.debug.print("r158 parked enroll ok\n", .{});
     std.debug.print("reaper-stuck absent\n", .{});

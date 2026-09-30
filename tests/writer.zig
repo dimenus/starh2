@@ -123,7 +123,6 @@ test "two-task barrier: failAll at preclaim/postclaim returns WriteFailed" {
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 8, .prewarm = 8 },
         .executors = .exact(2),
-        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(runTwoTaskBarrier, .{ rt, gpa });

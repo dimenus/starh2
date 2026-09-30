@@ -1,10 +1,11 @@
 {
   "zig": "0.16.0",
   "zio": {
-    "tag": "v0.17.0",
+    "tag": "none. A commit on main after v0.18.0 (v0.18.0-18-g0299e57), not the tag.",
     "repo": "https://github.com/lalinsky/zio",
-    "commit": "3786083e5cb1ef1b60c076270f67ca34be4786b9",
-    "hash": "zio-0.17.0-xHbVVKy_KACrmjGRFj5FBs34dw6eCHjsfsj0-0bEMT24",
+    "commit": "0299e5771b8c042ca42077af0748771fca27d38e",
+    "hash": "zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e",
+    "scheduling": "-Dzio-scheduling, default work_stealing, passed to every zio dependency in build.zig",
     "fork_patches": "none. Upstream main carries every patch this repo needed: #709 (select conservation), #711 (post-backend-poll snapshot refresh), #713 (CompletionQueue producer claims)."
   },
   "datastar-sdk.zig": {

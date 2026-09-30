@@ -1,0 +1,2307 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  A  zio-0.17.0-xHbVVKy_KACrmjGRFj5FBs34dw6eCHjsfsj0-0bEMT24  sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/tree-A  args=''
+  WS  zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e  sha256=73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/tree-WS  args=''  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"auto"'
+  PL  zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e  sha256=dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/tree-PL  args='--spawn-placement local'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"local"'
+  PA  zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e  sha256=dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/tree-PA  args='--spawn-placement auto'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"auto"'
+  WSN  zio-0.18.0-xHbVVIaiKgDezISI3ldxsInJLXvTstkunFphdkji2nYl  sha256=1cb4a7d3eaefb9bc07b26ffd5780e6dc6e1bf010c788cd04e4ef6c511deff5b5  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work2/tree-WSN  args=''  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"auto"'
+  shared zio package zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e: allowed (same binary with different args, A/A, or ready-line-checked build options)
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 14:47:45 up 1 day,  3:42,  3 users,  load average: 2.05, 2.39, 2.36
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/zio-placement-ab/A-server sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab
+  ran /tmp/zio-placement-ab/WS-server sha256=73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915
+  ran /tmp/zio-placement-ab/PL-server sha256=dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806
+  ran /tmp/zio-placement-ab/PA-server sha256=dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806
+  ran /tmp/zio-placement-ab/WSN-server sha256=1cb4a7d3eaefb9bc07b26ffd5780e6dc6e1bf010c788cd04e4ef6c511deff5b5
+-- host check before phase 1 --
+ 14:47:45 up 1 day,  3:42,  3 users,  load average: 2.05, 2.39, 2.36
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7121808   3.4g 385356 R 186.0  11.2  49:52.01 WowB.exe
+   6385 ryan      20   0 2522664 352560  76080 S   9.8   1.1 129:13.93 CrBrowserMain
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:00.72 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  54:54.95 qemu-system-x86
+ 324396 root      20   0       0      0      0 I   4.9   0.0   0:02.83 kworker/u96:4-gfx_0.1.0
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:17.04 WowVoiceProxyT.
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.21 limit=0.5 top_process_cores=2.12 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.21 cores busy; waiting 30 s (waited 0s so far)
+-- host check before phase 1 --
+ 14:48:21 up 1 day,  3:43,  3 users,  load average: 2.44, 2.43, 2.38
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7143888   3.4g 385400 R 181.1  11.3  51:04.01 WowB.exe
+   2342 ryan      20   0 1155980 138284 108372 S   4.9   0.4   0:35.43 Xwayland
+   6385 ryan      20   0 2522664 352560  76080 R   4.9   1.1 129:16.52 CrBrowserMain
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.91 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.38 limit=0.5 top_process_cores=2.26 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.38 cores busy; waiting 30 s (waited 30s so far)
+-- host check before phase 1 --
+ 14:48:56 up 1 day,  3:43,  3 users,  load average: 2.50, 2.47, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7069256   3.3g 385412 S  68.7  11.0  52:00.64 WowB.exe
+   6282 ryan      20   0   29492  24952   2712 S  14.7   0.1  19:17.31 wineserver
+   6385 ryan      20   0 2522664 352560  76080 S   4.9   1.1 129:18.40 CrBrowserMain
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.91 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.36 limit=0.5 top_process_cores=0.24 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.36 cores busy; waiting 30 s (waited 60s so far)
+-- host check before phase 1 --
+ 14:49:32 up 1 day,  3:44,  3 users,  load average: 2.13, 2.36, 2.36
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7077008   3.4g 385412 R 180.8  11.1  52:37.89 WowB.exe
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  54:56.82 qemu-system-x86
+   2342 ryan      20   0 1155980 138284 108372 S   4.9   0.4   0:35.79 Xwayland
+ 319713 ryan      20   0 1905804 324456   7056 S   4.9   1.0   1:45.01 qmdsync-tasks
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.91 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+busy_cores=2.30 limit=0.5 top_process_cores=2.02 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.30 cores busy; waiting 30 s (waited 90s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 14:50:07 up 1 day,  3:45,  3 users,  load average: 2.56, 2.45, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7074912   3.3g 385412 R 186.0  11.1  53:47.49 WowB.exe
+   6385 ryan      20   0 2522664 352560  76080 S  19.6   1.1 129:23.42 CrBrowserMain
+   2536 ryan      20   0 2567932 253304  60432 S   4.9   0.8   0:52.57 dropbox
+   4000 openbao   20   0  203.1g  79796  19696 S   4.9   0.3   0:59.89 bao
+   6403 ryan      20   0 2174704  94580  42420 S   4.9   0.3   3:48.86 Agent.exe
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.91 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.11 limit=0.5 top_process_cores=2.03 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.11 cores busy; waiting 30 s (waited 120s so far)
+-- host check before phase 1 --
+ 14:50:43 up 1 day,  3:45,  3 users,  load average: 2.99, 2.56, 2.43
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7042064   3.3g 385416 R 190.9  11.0  54:57.42 WowB.exe
+   6385 ryan      20   0 2522664 352560  76080 S  14.7   1.1 129:27.89 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  54:58.13 qemu-system-x86
+   6359 ryan      20   0 1957816  99752  55616 S   4.9   0.3   6:58.06 xalia.exe
+   6403 ryan      20   0 2174704  94580  42420 S   4.9   0.3   3:48.96 Agent.exe
+ 324983 ryan      20   0 1452.3g 436496 144228 S   4.9   1.4   0:10.28 chromium
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.17 limit=0.5 top_process_cores=2.00 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.17 cores busy; waiting 30 s (waited 150s so far)
+-- host check before phase 1 --
+ 14:51:18 up 1 day,  3:46,  3 users,  load average: 2.61, 2.51, 2.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7130232   3.4g 385416 R 249.4  11.2  56:05.70 WowB.exe
+   6282 ryan      20   0   29492  24952   2712 S  14.7   0.1  19:22.12 wineserver
+   6385 ryan      20   0 2522664 352560  76080 S   4.9   1.1 129:31.71 CrBrowserMain
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.91 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.20 limit=0.5 top_process_cores=2.09 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.20 cores busy; waiting 30 s (waited 180s so far)
+-- host check before phase 1 --
+ 14:51:54 up 1 day,  3:46,  3 users,  load average: 3.05, 2.63, 2.46
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7079240   3.4g 385416 R 185.9  11.1  57:17.41 WowB.exe
+   6385 ryan      20   0 2522664 352552  76080 S   9.8   1.1 129:34.88 CrBrowserMain
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:08.47 Hyprland
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:18.96 WowVoiceProxyT.
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.92 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.05 limit=0.5 top_process_cores=1.99 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.05 cores busy; waiting 30 s (waited 210s so far)
+-- host check before phase 1 --
+ 14:52:30 up 1 day,  3:47,  3 users,  load average: 3.43, 2.79, 2.52
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7078080   3.4g 385416 R 205.8  11.1  58:26.41 WowB.exe
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:09.72 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:00.09 qemu-system-x86
+   4822 ryan      20   0 5642904 302476  72896 S   4.9   1.0   4:46.35 claude
+   6385 ryan      20   0 2522664 352552  76080 S   4.9   1.1 129:37.34 CrBrowserMain
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.92 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.24 limit=0.5 top_process_cores=2.08 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.24 cores busy; waiting 30 s (waited 240s so far)
+-- host check before phase 1 --
+ 14:53:05 up 1 day,  3:48,  3 users,  load average: 3.21, 2.82, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7073224   3.4g 385416 R 191.0  11.1  59:36.86 WowB.exe
+   2064 ryan      20   0 2244740 170908 110268 S   9.8   0.5   2:11.04 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:00.74 qemu-system-x86
+   6282 ryan      20   0   29492  24952   2712 S   4.9   0.1  19:26.08 wineserver
+   6385 ryan      20   0 2522664 352552  76080 S   4.9   1.1 129:39.11 CrBrowserMain
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.92 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.23 limit=0.5 top_process_cores=2.14 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.23 cores busy; waiting 30 s (waited 270s so far)
+-- host check before phase 1 --
+ 14:53:41 up 1 day,  3:48,  3 users,  load average: 3.95, 3.02, 2.62
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7144544   3.4g 385448 R 176.1  11.3  60:44.91 WowB.exe
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:01.37 qemu-system-x86
+   6282 ryan      20   0   29492  24952   2712 S   4.9   0.1  19:27.42 wineserver
+   6328 ryan      20   0 1488916  70696  64284 S   4.9   0.2   0:11.54 explorer.exe
+   6385 ryan      20   0 2522664 352552  76080 S   4.9   1.1 129:40.13 CrBrowserMain
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.92 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.01 limit=0.5 top_process_cores=1.90 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.01 cores busy; waiting 30 s (waited 300s so far)
+-- host check before phase 1 --
+ 14:54:16 up 1 day,  3:49,  3 users,  load average: 3.31, 2.95, 2.61
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7148004   3.4g 385548 R 171.5  11.3  61:51.50 WowB.exe
+   6385 ryan      20   0 2522664 352552  76080 S  14.7   1.1 129:44.71 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:02.00 qemu-system-x86
+   4000 openbao   20   0  203.1g  79872  19696 S   4.9   0.3   1:00.34 bao
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:20.11 WowVoiceProxyT.
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.93 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.05 limit=0.5 top_process_cores=2.00 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.05 cores busy; waiting 30 s (waited 330s so far)
+-- host check before phase 1 --
+ 14:54:52 up 1 day,  3:49,  3 users,  load average: 3.77, 3.10, 2.68
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7155924   3.4g 385548 S 176.4  11.3  63:02.20 WowB.exe
+   6385 ryan      20   0 2522664 352552  76080 S   9.8   1.1 129:49.06 CrBrowserMain
+   1524 ryan      20   0  111260  17864   8720 S   4.9   0.1   0:41.25 pipewire
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:14.82 Hyprland
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.10 limit=0.5 top_process_cores=2.03 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.10 cores busy; waiting 30 s (waited 360s so far)
+-- host check before phase 1 --
+ 14:55:27 up 1 day,  3:50,  3 users,  load average: 2.90, 2.96, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7174640   3.4g 385548 R 141.4  11.4  64:07.08 WowB.exe
+   6385 ryan      20   0 2522664 352552  76080 S   9.8   1.1 129:52.72 CrBrowserMain
+   1535 ryan      25   5 1549592  75748  52004 S   4.9   0.2   0:01.06 llama-server
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:16.03 Hyprland
+   2342 ryan      20   0 1155980 138284 108372 S   4.9   0.4   0:38.55 Xwayland
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.93 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.94 limit=0.5 top_process_cores=1.78 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.94 cores busy; waiting 30 s (waited 390s so far)
+-- host check before phase 1 --
+ 14:56:03 up 1 day,  3:51,  3 users,  load average: 2.73, 2.92, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7288248   3.6g 385568 S 181.1  11.8  65:09.18 WowB.exe
+   6385 ryan      20   0 2522664 352552  76080 S  14.7   1.1 129:55.73 CrBrowserMain
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:17.37 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:03.95 qemu-system-x86
+   2342 ryan      20   0 1155980 138284 108372 S   4.9   0.4   0:38.95 Xwayland
+   2544 ryan      20   0  394584  30524  20260 S   4.9   0.1   0:03.98 fcitx5
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.21 limit=0.5 top_process_cores=2.13 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.21 cores busy; waiting 30 s (waited 420s so far)
+-- host check before phase 1 --
+ 14:56:38 up 1 day,  3:51,  3 users,  load average: 3.29, 3.04, 2.69
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7184224   3.5g 386388 R 171.6  11.4  66:18.78 WowB.exe
+   2064 ryan      20   0 2244740 170908 110268 S   9.8   0.5   2:18.56 Hyprland
+   6385 ryan      20   0 2522664 352552  76080 S   9.8   1.1 129:58.12 CrBrowserMain
+   6282 ryan      20   0   29492  24952   2712 S   4.9   0.1  19:33.69 wineserver
+ 328588 root      20   0       0      0      0 D   4.9   0.0   0:00.78 kworker/u97:4+events_unbound
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.93 systemd
+busy_cores=2.00 limit=0.5 top_process_cores=1.90 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.00 cores busy; waiting 30 s (waited 450s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 14:57:14 up 1 day,  3:52,  3 users,  load average: 3.37, 3.09, 2.72
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7180816   3.5g 386392 R 171.3  11.4  67:25.86 WowB.exe
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:05.24 qemu-system-x86
+   2342 ryan      20   0 1155980 138284 108372 S   4.9   0.4   0:39.59 Xwayland
+   6385 ryan      20   0 2522664 352560  76080 S   4.9   1.1 129:59.84 CrBrowserMain
+ 318760 root      20   0       0      0      0 I   4.9   0.0   0:00.50 kworker/u98:2-events_unbound
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.93 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.79 limit=0.5 top_process_cores=1.63 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.79 cores busy; waiting 30 s (waited 480s so far)
+-- host check before phase 1 --
+ 14:57:50 up 1 day,  3:52,  3 users,  load average: 3.34, 3.12, 2.74
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7209408   3.5g 386396 R 215.8  11.5  68:27.61 WowB.exe
+   6385 ryan      20   0 2522664 352560  76080 S  14.7   1.1 130:00.92 CrBrowserMain
+   1534 ryan      30  10   19448  12952   7424 S   4.9   0.0   0:53.39 python3
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:21.04 Hyprland
+   6282 ryan      20   0   29492  24952   2712 S   4.9   0.1  19:36.38 wineserver
+   6403 ryan      20   0 2174704  94580  42420 S   4.9   0.3   3:50.26 Agent.exe
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.82 limit=0.5 top_process_cores=1.76 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.82 cores busy; waiting 30 s (waited 510s so far)
+-- host check before phase 1 --
+ 14:58:25 up 1 day,  3:53,  3 users,  load average: 3.00, 3.05, 2.74
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7199960   3.5g 386400 R 244.5  11.5  69:31.07 WowB.exe
+   6385 ryan      20   0 2522664 352560  76080 S  14.7   1.1 130:05.82 CrBrowserMain
+   6282 ryan      20   0   29492  24952   2712 S   4.9   0.1  19:37.64 wineserver
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.28 limit=0.5 top_process_cores=2.17 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.28 cores busy; waiting 30 s (waited 540s so far)
+-- host check before phase 1 --
+ 14:59:01 up 1 day,  3:54,  3 users,  load average: 2.93, 3.03, 2.74
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7208296   3.5g 386416 S 205.9  11.5  70:39.29 WowB.exe
+   6385 ryan      20   0 2522664 352560  76080 S   9.8   1.1 130:09.52 CrBrowserMain
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:23.74 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:07.16 qemu-system-x86
+   6282 ryan      20   0   29492  24952   2712 S   4.9   0.1  19:39.09 wineserver
+      1 root      20   0   22136  16868  11048 S   0.0   0.1   0:02.93 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.25 limit=0.5 top_process_cores=2.07 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.25 cores busy; waiting 30 s (waited 570s so far)
+-- host check before phase 1 --
+ 14:59:36 up 1 day,  3:54,  3 users,  load average: 2.54, 2.92, 2.71
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7220848   3.5g 386516 S 112.7  11.5  71:37.43 WowB.exe
+   2064 ryan      20   0 2244740 170908 110268 S   4.9   0.5   2:24.92 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:07.81 qemu-system-x86
+   6282 ryan      20   0   29492  24952   2712 S   4.9   0.1  19:40.53 wineserver
+   6328 ryan      20   0 1488916  70696  64284 S   4.9   0.2   0:12.35 explorer.exe
+   6359 ryan      20   0 1957816  99752  55616 S   4.9   0.3   7:01.17 xalia.exe
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.53 limit=0.5 top_process_cores=1.40 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.53 cores busy; waiting 30 s (waited 600s so far)
+-- host check before phase 1 --
+ 15:00:12 up 1 day,  3:55,  3 users,  load average: 2.34, 2.83, 2.69
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7211536   3.5g 386508 S 122.5  11.4  72:23.95 WowB.exe
+   6385 ryan      20   0 2522664 343484  75940 S   9.8   1.1 130:13.65 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:25.78 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:08.42 qemu-system-x86
+   6359 ryan      20   0 1957816  97468  55616 S   4.9   0.3   7:01.35 xalia.exe
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.77 limit=0.5 top_process_cores=1.34 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.77 cores busy; waiting 30 s (waited 630s so far)
+-- host check before phase 1 --
+ 15:00:47 up 1 day,  3:55,  3 users,  load average: 2.20, 2.75, 2.67
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7332480   3.6g 386508 R 166.4  11.8  73:21.80 WowB.exe
+   6385 ryan      20   0 2522664 343484  75940 S  14.7   1.1 130:18.09 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:26.77 Hyprland
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  19:42.93 wineserver
+ 319713 ryan      20   0 1906764 325756   7628 S   4.9   1.0   1:57.72 qmdsync-tasks
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+busy_cores=2.02 limit=0.5 top_process_cores=1.76 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.02 cores busy; waiting 30 s (waited 660s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:01:23 up 1 day,  3:56,  3 users,  load average: 1.96, 2.63, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7219920   3.5g 386508 S  98.0  11.4  74:13.32 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   9.8   0.5   2:27.63 Hyprland
+   6385 ryan      20   0 2522664 343484  75940 S   4.9   1.1 130:21.29 CrBrowserMain
+ 319713 ryan      20   0 1906764 325768   7628 S   4.9   1.0   1:58.07 qmdsync-tasks
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.18 limit=0.5 top_process_cores=1.07 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.18 cores busy; waiting 30 s (waited 690s so far)
+-- host check before phase 1 --
+ 15:01:58 up 1 day,  3:56,  3 users,  load average: 2.40, 2.66, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7216496   3.5g 386508 S 166.3  11.4  74:50.34 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S  24.5   0.1  19:45.37 wineserver
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:10.26 qemu-system-x86
+   6385 ryan      20   0 2522664 343484  75940 S   4.9   1.1 130:23.33 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.21 limit=0.5 top_process_cores=1.06 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.21 cores busy; waiting 30 s (waited 720s so far)
+-- host check before phase 1 --
+ 15:02:34 up 1 day,  3:57,  3 users,  load average: 2.77, 2.70, 2.66
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7219552   3.5g 386508 S  97.9  11.4  75:36.94 WowB.exe
+   6385 ryan      20   0 2522664 343484  75940 S   9.8   1.1 130:25.43 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:29.60 Hyprland
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  19:46.49 wineserver
+   6359 ryan      20   0 1957816  97468  55616 S   4.9   0.3   7:02.12 xalia.exe
+ 319713 ryan      20   0 1906764 325768   7628 S   4.9   1.0   1:58.75 qmdsync-tasks
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.48 limit=0.5 top_process_cores=1.32 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.48 cores busy; waiting 30 s (waited 750s so far)
+-- host check before phase 1 --
+ 15:03:10 up 1 day,  3:58,  3 users,  load average: 2.20, 2.56, 2.61
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7218936   3.5g 386508 S 107.8  11.4  76:15.34 WowB.exe
+   6385 ryan      20   0 2522664 343484  75940 S   9.8   1.1 130:29.68 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:30.32 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:11.45 qemu-system-x86
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  19:47.79 wineserver
+ 371263 root      20   0       0      0      0 I   4.9   0.0   0:00.15 kworker/u98:6-events_unbound
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.15 limit=0.5 top_process_cores=1.02 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.15 cores busy; waiting 30 s (waited 780s so far)
+-- host check before phase 1 --
+ 15:03:45 up 1 day,  3:58,  3 users,  load average: 2.74, 2.66, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7229480   3.5g 386508 R  88.1  11.4  76:52.82 WowB.exe
+   6385 ryan      20   0 2522664 343484  75940 S   9.8   1.1 130:32.92 CrBrowserMain
+     56 root      rt   0       0      0      0 S   4.9   0.0   0:01.17 migration/6
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.22 limit=0.5 top_process_cores=1.12 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.22 cores busy; waiting 30 s (waited 810s so far)
+-- host check before phase 1 --
+ 15:04:21 up 1 day,  3:59,  3 users,  load average: 2.83, 2.69, 2.65
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7272984   3.5g 386516 S  93.0  11.6  77:28.53 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:32.22 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:12.64 qemu-system-x86
+   6328 ryan      20   0 1488916  70684  64280 S   4.9   0.2   0:12.92 explorer.exe
+   6385 ryan      20   0 2522664 343484  75940 S   4.9   1.1 130:35.08 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.08 limit=0.5 top_process_cores=0.96 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.08 cores busy; waiting 30 s (waited 840s so far)
+-- host check before phase 1 --
+ 15:04:56 up 1 day,  3:59,  3 users,  load average: 3.68, 2.92, 2.73
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7230152   3.5g 386516 S 107.8  11.5  78:03.77 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:33.08 Hyprland
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:43.38 Xwayland
+   6385 ryan      20   0 2522664 343484  75940 S   4.9   1.1 130:36.22 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.07 limit=0.5 top_process_cores=0.97 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.07 cores busy; waiting 30 s (waited 870s so far)
+-- host check before phase 1 --
+ 15:05:32 up 1 day,  4:00,  3 users,  load average: 2.94, 2.82, 2.71
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7221280   3.5g 386516 R 107.7  11.5  78:40.78 WowB.exe
+   6385 ryan      20   0 2522664 343484  75940 S   9.8   1.1 130:40.84 CrBrowserMain
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:43.64 Xwayland
+   6359 ryan      20   0 1957816  97468  55616 S   4.9   0.3   7:03.06 xalia.exe
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.32 limit=0.5 top_process_cores=1.05 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.32 cores busy; waiting 30 s (waited 900s so far)
+-- host check before phase 1 --
+ 15:06:07 up 1 day,  4:01,  3 users,  load average: 2.23, 2.66, 2.66
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7275912   3.5g 386516 R 176.5  11.6  79:18.10 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S  14.7   0.1  19:53.96 wineserver
+   6385 ryan      20   0 2522664 343484  75940 S   9.8   1.1 130:44.48 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.12 limit=0.5 top_process_cores=1.02 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.12 cores busy; waiting 30 s (waited 930s so far)
+-- host check before phase 1 --
+ 15:06:43 up 1 day,  4:01,  3 users,  load average: 2.09, 2.60, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7226768   3.5g 386516 R  97.8  11.5  79:55.75 WowB.exe
+   6385 ryan      20   0 2522664 343564  75940 S   9.8   1.1 130:47.19 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:35.78 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:15.05 qemu-system-x86
+   4822 ryan      20   0 5642904 305472  72896 S   4.9   1.0   4:49.35 claude
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.93 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.16 limit=0.5 top_process_cores=0.95 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.16 cores busy; waiting 30 s (waited 960s so far)
+-- host check before phase 1 --
+ 15:07:19 up 1 day,  4:02,  3 users,  load average: 2.09, 2.55, 2.62
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238808   3.5g 386516 S  93.2  11.5  80:42.17 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  19:56.45 wineserver
+   6385 ryan      20   0 2522664 343564  75940 S   4.9   1.1 130:48.97 CrBrowserMain
+   6403 ryan      20   0 2174704  90884  42420 S   4.9   0.3   3:51.70 Agent.exe
+ 319713 ryan      20   0 1907724 326716   7628 S   4.9   1.0   2:01.61 qmdsync-tasks
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:26.05 WowVoiceProxyT.
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.21 limit=0.5 top_process_cores=1.07 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.21 cores busy; waiting 30 s (waited 990s so far)
+-- host check before phase 1 --
+ 15:07:54 up 1 day,  4:02,  3 users,  load average: 1.99, 2.46, 2.58
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7275984   3.5g 386516 S 127.4  11.6  81:27.57 WowB.exe
+   6385 ryan      20   0 2522664 343476  75940 S  14.7   1.1 130:51.23 CrBrowserMain
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  19:57.74 wineserver
+ 341491 root      20   0       0      0      0 D   4.9   0.0   0:00.80 kworker/u97:2+events_unbound
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.59 limit=0.5 top_process_cores=1.39 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.59 cores busy; waiting 30 s (waited 1020s so far)
+-- host check before phase 1 --
+ 15:08:30 up 1 day,  4:03,  3 users,  load average: 1.90, 2.38, 2.55
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7240248   3.5g 386516 S 112.7  11.5  82:08.96 WowB.exe
+   6385 ryan      20   0 2522664 343476  75940 S   9.8   1.1 130:55.63 CrBrowserMain
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:45.23 Xwayland
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  19:58.84 wineserver
+ 319713 ryan      20   0 1907724 326716   7628 S   4.9   1.0   2:02.29 qmdsync-tasks
+ 324236 root      20   0       0      0      0 D   4.9   0.0   0:01.58 kworker/u97:11+events_unbound
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.49 limit=0.5 top_process_cores=1.36 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.49 cores busy; waiting 30 s (waited 1050s so far)
+-- host check before phase 1 --
+ 15:09:05 up 1 day,  4:04,  3 users,  load average: 1.99, 2.35, 2.53
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7241660   3.5g 386520 R  93.1  11.5  82:52.97 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   9.8   0.5   2:39.98 Hyprland
+   6385 ryan      20   0 2522664 343476  75940 S   9.8   1.1 130:59.12 CrBrowserMain
+   3050 ryan      20   0 1051312  64752  49912 S   4.9   0.2   0:30.15 voxtype-osd-gtk
+ 319713 ryan      20   0 1907724 326716   7628 S   4.9   1.0   2:02.62 qmdsync-tasks
+ 341491 root      20   0       0      0      0 D   4.9   0.0   0:00.92 kworker/u97:2+events_unbound
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.19 limit=0.5 top_process_cores=1.01 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.19 cores busy; waiting 30 s (waited 1080s so far)
+-- host check before phase 1 --
+ 15:09:41 up 1 day,  4:04,  3 users,  load average: 2.27, 2.38, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7232100   3.5g 386524 S  83.3  11.5  83:30.07 WowB.exe
+   1520 ryan      20   0 2578668  48248  12588 S   4.9   0.2   0:09.31 bao
+   6385 ryan      20   0 2522664 343740  75940 S   4.9   1.1 131:01.67 CrBrowserMain
+ 319713 ryan      20   0 1907724 326716   7628 S   4.9   1.0   2:03.05 qmdsync-tasks
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.24 limit=0.5 top_process_cores=1.10 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.24 cores busy; waiting 30 s (waited 1110s so far)
+-- host check before phase 1 --
+ 15:10:16 up 1 day,  4:05,  3 users,  load average: 2.00, 2.30, 2.51
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7244972   3.5g 386524 R  83.2  11.5  84:06.04 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:41.73 Hyprland
+   6385 ryan      20   0 2522664 343572  75940 S   4.9   1.1 131:03.27 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.11 limit=0.5 top_process_cores=0.96 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.11 cores busy; waiting 30 s (waited 1140s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:10:52 up 1 day,  4:05,  3 users,  load average: 2.01, 2.27, 2.49
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7247220   3.5g 386524 S  83.4  11.5  84:41.37 WowB.exe
+   6385 ryan      20   0 2522664 343500  75940 S   9.8   1.1 131:05.35 CrBrowserMain
+   4822 ryan      20   0 5642904 303016  72896 S   4.9   1.0   4:50.44 claude
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:27.67 WowVoiceProxyT.
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.08 limit=0.5 top_process_cores=1.00 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.08 cores busy; waiting 30 s (waited 1170s so far)
+-- host check before phase 1 --
+ 15:11:27 up 1 day,  4:06,  3 users,  load average: 1.96, 2.21, 2.46
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7245388   3.5g 386524 R  78.5  11.5  85:17.17 WowB.exe
+   6385 ryan      20   0 2522664 343500  75940 S   9.8   1.1 131:09.82 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:19.79 qemu-system-x86
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:46.64 Xwayland
+   6359 ryan      20   0 1957816  97468  55616 S   4.9   0.3   7:04.96 xalia.exe
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:27.92 WowVoiceProxyT.
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.23 limit=0.5 top_process_cores=1.11 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.23 cores busy; waiting 30 s (waited 1200s so far)
+-- host check before phase 1 --
+ 15:12:03 up 1 day,  4:07,  3 users,  load average: 1.98, 2.20, 2.44
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7334652   3.6g 386524 S 102.9  11.8  85:56.35 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   9.8   0.5   2:44.50 Hyprland
+   6385 ryan      20   0 2522664 343500  75940 S   9.8   1.1 131:13.42 CrBrowserMain
+ 324235 root      20   0       0      0      0 D   4.9   0.0   0:02.28 kworker/u97:8+events_unbound
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.24 limit=0.5 top_process_cores=1.06 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.24 cores busy; waiting 30 s (waited 1230s so far)
+-- host check before phase 1 --
+ 15:12:39 up 1 day,  4:07,  3 users,  load average: 2.56, 2.31, 2.47
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7246228   3.5g 386528 R 117.3  11.5  86:39.96 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S   9.8   0.1  20:07.44 wineserver
+   6385 ryan      20   0 2522664 343500  75940 S   9.8   1.1 131:16.21 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.11 limit=0.5 top_process_cores=0.97 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.11 cores busy; waiting 30 s (waited 1260s so far)
+-- host check before phase 1 --
+ 15:13:14 up 1 day,  4:08,  3 users,  load average: 2.70, 2.36, 2.48
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7246244   3.5g 386528 S  98.1  11.5  87:14.50 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:46.31 Hyprland
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:47.51 Xwayland
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:08.67 wineserver
+   6385 ryan      20   0 2522664 343500  75940 S   4.9   1.1 131:18.09 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.11 limit=0.5 top_process_cores=0.98 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.11 cores busy; waiting 30 s (waited 1290s so far)
+-- host check before phase 1 --
+ 15:13:50 up 1 day,  4:08,  3 users,  load average: 2.09, 2.25, 2.44
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7245812   3.5g 386528 S 132.1  11.5  87:48.79 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:47.14 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21180 S   4.9  16.4  55:22.17 qemu-system-x86
+ 214783 root      20   0       0      0      0 I   4.9   0.0   0:07.11 kworker/13:1-events
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.94 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.02 limit=0.5 top_process_cores=0.92 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.02 cores busy; waiting 30 s (waited 1320s so far)
+-- host check before phase 1 --
+ 15:14:25 up 1 day,  4:09,  3 users,  load average: 1.82, 2.16, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7236388   3.5g 386528 R 132.3  11.5  88:28.75 WowB.exe
+   6385 ryan      20   0 2522664 343500  75940 S  14.7   1.1 131:23.73 CrBrowserMain
+   1531 ryan      20   0  114976  25024   8632 S   4.9   0.1   1:09.03 pipewire-pulse
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:48.00 Xwayland
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:11.01 wineserver
+   6328 ryan      20   0 1488916  70684  64280 S   4.9   0.2   0:14.41 explorer.exe
+busy_cores=1.51 limit=0.5 top_process_cores=1.42 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.51 cores busy; waiting 30 s (waited 1350s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:15:01 up 1 day,  4:10,  3 users,  load average: 3.01, 2.42, 2.48
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7236428   3.5g 386528 S 147.0  11.5  89:13.45 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S   9.8   0.1  20:12.24 wineserver
+   6385 ryan      20   0 2522664 343500  75940 R   9.8   1.1 131:27.73 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:49.06 Hyprland
+ 396493 root      20   0       0      0      0 D   4.9   0.0   0:00.25 kworker/u97:7+events_unbound
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.95 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.32 limit=0.5 top_process_cores=1.17 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.32 cores busy; waiting 30 s (waited 1380s so far)
+-- host check before phase 1 --
+ 15:15:36 up 1 day,  4:10,  3 users,  load average: 3.33, 2.57, 2.53
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7247412   3.5g 386556 R 136.8  11.5  89:56.85 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   9.8   0.5   2:50.17 Hyprland
+   6385 ryan      20   0 2522664 339312  75940 S   9.8   1.1 131:30.95 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.96 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.69 limit=0.5 top_process_cores=1.53 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.69 cores busy; waiting 30 s (waited 1410s so far)
+-- host check before phase 1 --
+ 15:16:12 up 1 day,  4:11,  3 users,  load average: 2.41, 2.42, 2.48
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7370676   3.6g 386556 R 176.3  11.9  90:40.94 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 R   4.9   0.5   2:51.15 Hyprland
+   6385 ryan      20   0 2522664 339312  75940 S   4.9   1.1 131:33.35 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.96 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.35 limit=0.5 top_process_cores=1.25 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.35 cores busy; waiting 30 s (waited 1440s so far)
+-- host check before phase 1 --
+ 15:16:48 up 1 day,  4:11,  3 users,  load average: 1.91, 2.30, 2.43
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7370484   3.6g 386556 S  83.3  11.9  91:26.12 WowB.exe
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:25.19 qemu-system-x86
+   4822 ryan      20   0 5642904 303748  72896 S   4.9   1.0   4:51.61 claude
+   6312 ryan      20   0  725028  22616  20572 S   4.9   0.1   3:33.33 winedevice.exe
+   6385 ryan      20   0 2522664 339312  75940 S   4.9   1.1 131:34.88 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.96 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.31 limit=0.5 top_process_cores=1.12 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.31 cores busy; waiting 30 s (waited 1470s so far)
+-- host check before phase 1 --
+ 15:17:23 up 1 day,  4:12,  3 users,  load average: 1.78, 2.23, 2.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238940   3.5g 386556 S 137.1  11.5  92:04.53 WowB.exe
+   6385 ryan      20   0 2522664 339312  75940 S  14.7   1.1 131:37.23 CrBrowserMain
+   6282 ryan      20   0   29492  24944   2712 S   9.8   0.1  20:17.23 wineserver
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:53.13 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:25.78 qemu-system-x86
+   2544 ryan      20   0  394584  30464  20200 S   4.9   0.1   0:05.56 fcitx5
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.99 limit=0.5 top_process_cores=0.88 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.99 cores busy; waiting 30 s (waited 1500s so far)
+-- host check before phase 1 --
+ 15:17:59 up 1 day,  4:12,  3 users,  load average: 2.13, 2.27, 2.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7243004   3.5g 386556 R 102.7  11.5  92:39.21 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   9.8   0.5   2:54.03 Hyprland
+   6385 ryan      20   0 2522664 339312  75940 S   9.8   1.1 131:41.67 CrBrowserMain
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:18.57 wineserver
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.96 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.34 limit=0.5 top_process_cores=1.08 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.34 cores busy; waiting 30 s (waited 1530s so far)
+-- host check before phase 1 --
+ 15:18:34 up 1 day,  4:13,  3 users,  load average: 2.04, 2.23, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7234044   3.5g 386556 S  78.4  11.5  93:11.83 WowB.exe
+   6385 ryan      20   0 2522664 339312  75940 S  14.7   1.1 131:45.33 CrBrowserMain
+   4322 ryan      20   0 2535020 197676 123364 S   4.9   0.6   0:47.64 ghostty
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:19.70 wineserver
+ 214783 root      20   0       0      0      0 I   4.9   0.0   0:07.53 kworker/13:1-events
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.96 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.00 limit=0.5 top_process_cores=0.85 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.00 cores busy; waiting 30 s (waited 1560s so far)
+-- host check before phase 1 --
+ 15:19:10 up 1 day,  4:14,  3 users,  load average: 1.89, 2.18, 2.37
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7237764   3.5g 386556 S 122.3  11.5  93:41.40 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S  14.7   0.1  20:20.88 wineserver
+   6385 ryan      20   0 2522664 339312  75940 S   9.8   1.1 131:48.18 CrBrowserMain
+   1320 root      20   0  348156  26232  21636 S   4.9   0.1   0:04.04 NetworkManager
+ 326793 root      20   0       0      0      0 D   4.9   0.0   0:01.65 kworker/u97:13+events_unbound
+ 393369 root      20   0       0      0      0 I   4.9   0.0   0:00.96 kworker/u96:2-gfx_0.0.0
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.94 limit=0.5 top_process_cores=0.81 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.94 cores busy; waiting 30 s (waited 1590s so far)
+-- host check before phase 1 --
+ 15:19:45 up 1 day,  4:14,  3 users,  load average: 1.96, 2.14, 2.35
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7234388   3.5g 386556 R 107.7  11.5  94:13.45 WowB.exe
+   1534 ryan      30  10   19448  12952   7424 S   4.9   0.0   0:53.79 python3
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:21.96 wineserver
+   6385 ryan      20   0 2522664 339312  75940 S   4.9   1.1 131:50.31 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.18 limit=0.5 top_process_cores=1.07 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.18 cores busy; waiting 30 s (waited 1620s so far)
+-- host check before phase 1 --
+ 15:20:21 up 1 day,  4:15,  3 users,  load average: 1.94, 2.13, 2.34
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7242316   3.5g 386556 S 102.9  11.5  94:54.77 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:57.62 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:29.04 qemu-system-x86
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:23.25 wineserver
+   6385 ryan      20   0 2522664 339312  75940 S   4.9   1.1 131:51.65 CrBrowserMain
+   6799 ryan      20   0 2013044 200316  26260 S   4.9   0.6   0:23.07 CrRendererMain
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.28 limit=0.5 top_process_cores=1.10 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.28 cores busy; waiting 30 s (waited 1650s so far)
+-- host check before phase 1 --
+ 15:20:56 up 1 day,  4:15,  3 users,  load average: 1.56, 2.02, 2.29
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7255752   3.5g 386556 R 161.7  11.6  95:28.05 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S  19.6   0.1  20:24.55 wineserver
+   6385 ryan      20   0 2522664 339312  75940 S  14.7   1.1 131:54.73 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   2:58.52 Hyprland
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:51.18 Xwayland
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:32.10 WowVoiceProxyT.
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.98 limit=0.5 top_process_cores=0.88 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.98 cores busy; waiting 30 s (waited 1680s so far)
+-- host check before phase 1 --
+ 15:21:32 up 1 day,  4:16,  3 users,  load average: 1.76, 2.02, 2.28
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7213224   3.5g 386556 S  83.4  11.4  95:56.72 WowB.exe
+   6385 ryan      20   0 2522664 339392  75940 S   9.8   1.1 131:59.02 CrBrowserMain
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:51.36 Xwayland
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.04 limit=0.5 top_process_cores=0.85 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.04 cores busy; waiting 30 s (waited 1710s so far)
+-- host check before phase 1 --
+ 15:22:08 up 1 day,  4:17,  3 users,  load average: 1.44, 1.92, 2.24
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7254348   3.5g 386556 S  78.4  11.6  96:32.60 WowB.exe
+   6385 ryan      20   0 2522664 339304  75940 S   9.8   1.1 132:02.58 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.44 limit=0.5 top_process_cores=1.29 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.44 cores busy; waiting 30 s (waited 1740s so far)
+-- host check before phase 1 --
+ 15:22:43 up 1 day,  4:17,  3 users,  load average: 1.65, 1.91, 2.22
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7245524   3.5g 386564 S  93.0  11.5  97:10.43 WowB.exe
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:31.34 qemu-system-x86
+   6385 ryan      20   0 2522664 339304  75940 S   4.9   1.1 132:05.37 CrBrowserMain
+ 319713 ryan      20   0 1909580 328552   7628 S   4.9   1.0   2:16.60 qmdsync-tasks
+ 324710 ryan      20   0   53.4g 210008 138104 S   4.9   0.7   0:07.00 chromium
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.09 limit=0.5 top_process_cores=1.00 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.09 cores busy; waiting 30 s (waited 1770s so far)
+-- host check before phase 1 --
+ 15:23:19 up 1 day,  4:18,  3 users,  load average: 2.09, 1.97, 2.23
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7249356   3.5g 386568 S 122.6  11.5  97:49.38 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 R   4.9   0.1  20:29.21 wineserver
+   6385 ryan      20   0 2522664 339304  75940 S   4.9   1.1 132:07.39 CrBrowserMain
+ 318968 root      20   0       0      0      0 I   4.9   0.0   0:05.48 kworker/u96:0-gfx_0.0.0
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.45 limit=0.5 top_process_cores=1.36 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.45 cores busy; waiting 30 s (waited 1800s so far)
+-- host check before phase 1 --
+ 15:23:54 up 1 day,  4:18,  3 users,  load average: 1.94, 1.95, 2.21
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238940   3.5g 386568 R 107.8  11.5  98:32.97 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   3:03.08 Hyprland
+   6385 ryan      20   0 2522664 339304  75940 S   4.9   1.1 132:08.73 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.47 limit=0.5 top_process_cores=1.27 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.47 cores busy; waiting 30 s (waited 1830s so far)
+-- host check before phase 1 --
+ 15:24:30 up 1 day,  4:19,  3 users,  load average: 1.73, 1.90, 2.18
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7250536   3.5g 386568 S 151.9  11.5  99:19.62 WowB.exe
+   6385 ryan      20   0 2522664 339304  75940 S   9.8   1.1 132:12.05 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   3:04.23 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:33.15 qemu-system-x86
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:52.87 Xwayland
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:31.67 wineserver
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.64 limit=0.5 top_process_cores=1.49 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.64 cores busy; waiting 30 s (waited 1860s so far)
+-- host check before phase 1 --
+ 15:25:05 up 1 day,  4:20,  3 users,  load average: 2.14, 1.98, 2.19
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7249872   3.5g 386568 S 122.3  11.5 100:11.37 WowB.exe
+   6385 ryan      20   0 2522664 339304  75940 S  14.7   1.1 132:16.42 CrBrowserMain
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   3:05.26 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:33.87 qemu-system-x86
+   2544 ryan      20   0  394584  30464  20200 S   4.9   0.1   0:05.97 fcitx5
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:33.97 WowVoiceProxyT.
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.66 limit=0.5 top_process_cores=1.38 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.66 cores busy; waiting 30 s (waited 1890s so far)
+-- host check before phase 1 --
+ 15:25:41 up 1 day,  4:20,  3 users,  load average: 1.98, 1.95, 2.18
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7248752   3.5g 386568 S  93.2  11.5 100:54.63 WowB.exe
+   2064 ryan      20   0 2244740 170708 110208 S   4.9   0.5   3:06.20 Hyprland
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:53.34 Xwayland
+   6385 ryan      20   0 2522664 339304  75940 S   4.9   1.1 132:19.98 CrBrowserMain
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.26 limit=0.5 top_process_cores=1.07 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.26 cores busy; waiting 30 s (waited 1920s so far)
+-- host check before phase 1 --
+ 15:26:17 up 1 day,  4:21,  3 users,  load average: 1.93, 1.94, 2.16
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7247224   3.5g 386568 R  83.4  11.5 101:29.57 WowB.exe
+   6385 ryan      20   0 2522664 339304  75940 S   9.8   1.1 132:22.77 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:35.08 qemu-system-x86
+ 319713 ryan      20   0 1909580 328552   7628 S   4.9   1.0   2:18.72 qmdsync-tasks
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.97 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.10 limit=0.5 top_process_cores=1.00 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.10 cores busy; waiting 30 s (waited 1950s so far)
+-- host check before phase 1 --
+ 15:26:52 up 1 day,  4:21,  3 users,  load average: 1.59, 1.85, 2.13
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7247140   3.5g 386568 S  14.7  11.5 101:49.62 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:07.69 Hyprland
+   6385 ryan      20   0 2522664 339312  75940 S   4.9   1.1 132:24.82 CrBrowserMain
+ 214783 root      20   0       0      0      0 I   4.9   0.0   0:08.31 kworker/13:1-events
+ 319713 ryan      20   0 1909580 328552   7628 S   4.9   1.0   2:19.02 qmdsync-tasks
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.98 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.38 limit=0.5 top_process_cores=0.17 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.38 cores busy; waiting 30 s (waited 1980s so far)
+-- host check before phase 1 --
+ 15:27:28 up 1 day,  4:22,  3 users,  load average: 1.66, 1.84, 2.11
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7244676   3.5g 386568 S 137.2  11.5 102:23.45 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S   9.8   0.1  20:37.31 wineserver
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.32 limit=0.5 top_process_cores=1.11 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.32 cores busy; waiting 30 s (waited 2010s so far)
+-- host check before phase 1 --
+ 15:28:03 up 1 day,  4:23,  3 users,  load average: 1.32, 1.73, 2.06
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7249636   3.5g 386568 S 181.1  11.6 103:01.41 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S  19.6   0.1  20:38.45 wineserver
+   6385 ryan      20   0 2522664 339312  75940 S  14.7   1.1 132:29.26 CrBrowserMain
+   1531 ryan      20   0  114976  25024   8632 S   4.9   0.1   1:11.57 pipewire-pulse
+   1534 ryan      30  10   19448  12952   7424 S   4.9   0.0   0:53.95 python3
+ 328655 root      20   0       0      0      0 D   4.9   0.0   0:00.26 kworker/u98:3+events_unbound
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.24 limit=0.5 top_process_cores=1.12 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.24 cores busy; waiting 30 s (waited 2040s so far)
+-- host check before phase 1 --
+ 15:28:39 up 1 day,  4:23,  3 users,  load average: 1.41, 1.70, 2.04
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7243060   3.5g 386568 S  78.4  11.5 103:35.46 WowB.exe
+   6385 ryan      20   0 2522664 339312  75940 S  19.6   1.1 132:33.58 CrBrowserMain
+   4000 openbao   20   0  203.1g  80744  20276 S   4.9   0.3   1:03.55 bao
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.00 limit=0.5 top_process_cores=0.86 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.00 cores busy; waiting 30 s (waited 2070s so far)
+-- host check before phase 1 --
+ 15:29:14 up 1 day,  4:24,  3 users,  load average: 1.42, 1.67, 2.01
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7248676   3.5g 386568 R  73.4  11.6 104:08.64 WowB.exe
+   6385 ryan      20   0 2522664 339312  75940 S   9.8   1.1 132:37.14 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:37.93 qemu-system-x86
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:40.85 wineserver
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.95 limit=0.5 top_process_cores=0.80 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.95 cores busy; waiting 30 s (waited 2100s so far)
+-- host check before phase 1 --
+ 15:29:50 up 1 day,  4:24,  3 users,  load average: 1.66, 1.71, 2.02
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7228956   3.5g 386568 R  73.5  11.5 104:36.54 WowB.exe
+   6282 ryan      20   0   29492  24944   2712 S   4.9   0.1  20:42.02 wineserver
+   6385 ryan      20   0 2522664 339312  75940 S   4.9   1.1 132:39.95 CrBrowserMain
+ 319364 root      20   0       0      0      0 I   4.9   0.0   0:00.06 kworker/4:0-events
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.97 limit=0.5 top_process_cores=0.83 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.97 cores busy; waiting 30 s (waited 2130s so far)
+-- host check before phase 1 --
+ 15:30:25 up 1 day,  4:25,  3 users,  load average: 2.34, 1.88, 2.06
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7245932   3.5g 386568 R 161.0  11.6 105:19.69 WowB.exe
+ 319713 ryan      20   0 1933300 344376   7628 S  39.0   1.1   2:26.14 qmdsync-tasks
+   6385 ryan      20   0 2522664 339312  75940 S   4.9   1.1 132:42.11 CrBrowserMain
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:36.18 WowVoiceProxyT.
+      1 root      20   0   22136  16852  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=2.15 limit=0.5 top_process_cores=1.88 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 2.15 cores busy; waiting 30 s (waited 2160s so far)
+-- host check before phase 1 --
+ 15:31:01 up 1 day,  4:26,  3 users,  load average: 2.72, 2.05, 2.11
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7247396   3.5g 386572 S  93.1  11.6 106:10.58 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:14.17 Hyprland
+   6385 ryan      20   0 2522664 321604  74956 S   4.9   1.0 132:43.53 CrBrowserMain
+ 318968 root      20   0       0      0      0 I   4.9   0.0   0:06.13 kworker/u96:0-gfx_0.0.0
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+busy_cores=1.27 limit=0.5 top_process_cores=1.15 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.27 cores busy; waiting 30 s (waited 2190s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:31:37 up 1 day,  4:26,  3 users,  load average: 2.90, 2.15, 2.14
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7234540   3.5g 386572 R  93.1  11.5 106:46.66 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   9.8   0.5   3:15.12 Hyprland
+   6385 ryan      20   0 2522664 321604  74956 S   9.8   1.0 132:46.26 CrBrowserMain
+ 427473 root      20   0       0      0      0 D   4.9   0.0   0:00.38 kworker/u97:12+events_unbound
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.61 limit=0.5 top_process_cores=1.52 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.61 cores busy; waiting 30 s (waited 2220s so far)
+-- host check before phase 1 --
+ 15:32:12 up 1 day,  4:27,  3 users,  load average: 2.57, 2.15, 2.14
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7242964   3.5g 386572 S  73.4  11.5 107:19.96 WowB.exe
+   6385 ryan      20   0 2522664 321604  74956 S   9.8   1.0 132:50.68 CrBrowserMain
+   1531 ryan      20   0  114976  20768   8636 S   4.9   0.1   1:12.39 pipewire-pulse
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:40.91 qemu-system-x86
+   6359 ryan      20   0 1957816  90132  55612 S   4.9   0.3   7:11.54 xalia.exe
+ 319713 ryan      20   0 1909644 328604   7628 S   4.9   1.0   2:27.88 qmdsync-tasks
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.00 limit=0.5 top_process_cores=0.88 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.00 cores busy; waiting 30 s (waited 2250s so far)
+-- host check before phase 1 --
+ 15:32:48 up 1 day,  4:27,  3 users,  load average: 2.46, 2.18, 2.15
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7275820   3.5g 386572 R 161.6  11.7 107:52.15 WowB.exe
+   6385 ryan      20   0 2522664 321604  74956 S   4.9   1.0 132:54.25 CrBrowserMain
+ 319713 ryan      20   0 1909644 328604   7628 S   4.9   1.0   2:28.31 qmdsync-tasks
+ 324710 ryan      20   0   53.4g 211764 138324 S   4.9   0.7   0:08.59 chromium
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.98 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.98 limit=0.5 top_process_cores=1.82 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.98 cores busy; waiting 30 s (waited 2280s so far)
+-- host check before phase 1 --
+ 15:33:23 up 1 day,  4:28,  3 users,  load average: 2.47, 2.21, 2.16
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7245372   3.5g 386572 R 112.5  11.5 108:44.84 WowB.exe
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:42.11 qemu-system-x86
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  20:49.52 wineserver
+   6328 ryan      20   0 1488916  70316  64176 S   4.9   0.2   0:16.92 explorer.exe
+   6385 ryan      20   0 2522664 321604  74956 S   4.9   1.0 132:56.79 CrBrowserMain
+ 324544 ryan      20   0  692376  75008  28544 S   4.9   0.2   0:37.54 WowVoiceProxyT.
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.52 limit=0.5 top_process_cores=1.41 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.52 cores busy; waiting 30 s (waited 2310s so far)
+-- host check before phase 1 --
+ 15:33:59 up 1 day,  4:28,  3 users,  load average: 2.58, 2.29, 2.19
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7227828   3.5g 386580 R 107.7  11.5 109:29.79 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:19.25 Hyprland
+   3050 ryan      20   0 1051312  64752  49912 S   4.9   0.2   0:31.04 voxtype-osd-gtk
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.55 limit=0.5 top_process_cores=1.22 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.55 cores busy; waiting 30 s (waited 2340s so far)
+-- host check before phase 1 --
+ 15:34:35 up 1 day,  4:29,  3 users,  load average: 2.62, 2.35, 2.21
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7230916   3.5g 386580 S  88.1  11.5 110:06.34 WowB.exe
+   6385 ryan      20   0 2522664 321604  74956 S  14.7   1.0 133:02.20 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:20.21 Hyprland
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  20:52.00 wineserver
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.06 limit=0.5 top_process_cores=0.93 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.06 cores busy; waiting 30 s (waited 2370s so far)
+-- host check before phase 1 --
+ 15:35:10 up 1 day,  4:30,  3 users,  load average: 2.55, 2.39, 2.23
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7234460   3.5g 386584 S 117.6  11.5 110:41.86 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S  14.7   0.1  20:53.09 wineserver
+   6385 ryan      20   0 2522664 321604  74956 S   9.8   1.0 133:05.87 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:21.15 Hyprland
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+busy_cores=1.28 limit=0.5 top_process_cores=1.11 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.28 cores busy; waiting 30 s (waited 2400s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:35:46 up 1 day,  4:30,  3 users,  load average: 2.00, 2.27, 2.20
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7232604   3.5g 386584 S  83.2  11.5 111:16.62 WowB.exe
+   2536 ryan      20   0 2568276 253744  60432 S   4.9   0.8   0:54.60 dropbox
+   6385 ryan      20   0 2522664 321604  74956 S   4.9   1.0 133:08.49 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.07 limit=0.5 top_process_cores=0.96 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.07 cores busy; waiting 30 s (waited 2430s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:36:21 up 1 day,  4:31,  3 users,  load average: 2.73, 2.41, 2.25
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7292852   3.5g 386584 S  93.2  11.7 111:49.85 WowB.exe
+   1531 ryan      20   0  114976  20768   8636 S   4.9   0.1   1:13.20 pipewire-pulse
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:22.93 Hyprland
+ 319713 ryan      20   0 1910028 328944   7756 S   4.9   1.0   2:30.49 qmdsync-tasks
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.34 limit=0.5 top_process_cores=1.16 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.34 cores busy; waiting 30 s (waited 2460s so far)
+-- host check before phase 1 --
+ 15:36:57 up 1 day,  4:31,  3 users,  load average: 3.51, 2.66, 2.34
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7244484   3.5g 386584 R  78.4  11.6 112:24.59 WowB.exe
+   6385 ryan      20   0 2522664 321676  74956 S  14.7   1.0 133:13.08 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:45.64 qemu-system-x86
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  20:56.67 wineserver
+   6312 ryan      20   0  725028  22276  20572 S   4.9   0.1   3:37.08 winedevice.exe
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.01 limit=0.5 top_process_cores=0.89 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.01 cores busy; waiting 30 s (waited 2490s so far)
+-- host check before phase 1 --
+ 15:37:32 up 1 day,  4:32,  3 users,  load average: 2.87, 2.59, 2.33
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7243476   3.5g 386584 S  73.5  11.6 112:54.10 WowB.exe
+   6385 ryan      20   0 2522664 321596  74956 S   9.8   1.0 133:17.11 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:46.20 qemu-system-x86
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  20:57.97 wineserver
+ 435655 root      20   0       0      0      0 I   4.9   0.0   0:01.00 kworker/u96:1-comp_1.1.0
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.01 limit=0.5 top_process_cores=0.84 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.01 cores busy; waiting 30 s (waited 2520s so far)
+-- host check before phase 1 --
+ 15:38:08 up 1 day,  4:33,  3 users,  load average: 2.51, 2.54, 2.32
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7232708   3.5g 386584 S 117.4  11.5 113:22.02 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S  14.7   0.1  20:58.99 wineserver
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:25.84 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:46.78 qemu-system-x86
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:59.08 Xwayland
+   4822 ryan      20   0 5642904 306024  72896 S   4.9   1.0   4:55.95 claude
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.97 limit=0.5 top_process_cores=0.87 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.97 cores busy; waiting 30 s (waited 2550s so far)
+-- host check before phase 1 --
+ 15:38:43 up 1 day,  4:33,  3 users,  load average: 2.02, 2.42, 2.29
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7230748   3.5g 386588 R  73.4  11.5 113:51.16 WowB.exe
+     16 root      -2   0       0      0      0 I   4.9   0.0   0:17.68 rcu_preempt
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:59.41 Xwayland
+   3605 root      20   0  546268  18584  13556 S   4.9   0.1   0:28.27 udisksd
+   6359 ryan      20   0 1957816  90132  55612 S   4.9   0.3   7:13.62 xalia.exe
+   6385 ryan      20   0 2522664 321596  74956 S   4.9   1.0 133:22.28 CrBrowserMain
+busy_cores=1.03 limit=0.5 top_process_cores=0.87 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.03 cores busy; waiting 30 s (waited 2580s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:39:19 up 1 day,  4:34,  3 users,  load average: 2.99, 2.59, 2.35
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7400788   3.6g 386588 S  93.1  12.0 114:25.76 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:27.82 Hyprland
+   6385 ryan      20   0 2522664 321596  74956 S   4.9   1.0 133:23.42 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.17 limit=0.5 top_process_cores=1.06 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.17 cores busy; waiting 30 s (waited 2610s so far)
+-- host check before phase 1 --
+ 15:39:55 up 1 day,  4:34,  3 users,  load average: 2.50, 2.51, 2.33
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7289548   3.5g 386588 R 127.3  11.7 115:05.38 WowB.exe
+   6385 ryan      20   0 2522664 321596  74956 S   9.8   1.0 133:27.93 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:28.78 Hyprland
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   0:59.98 Xwayland
+ 379107 root      20   0       0      0      0 I   4.9   0.0   0:03.31 kworker/u96:5-gfx_0.0.0
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.41 limit=0.5 top_process_cores=1.27 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.41 cores busy; waiting 30 s (waited 2640s so far)
+-- host check before phase 1 --
+ 15:40:30 up 1 day,  4:35,  3 users,  load average: 3.40, 2.73, 2.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7240652   3.5g 386588 S  88.3  11.5 115:43.38 WowB.exe
+   6385 ryan      20   0 2522664 321596  74956 S   9.8   1.0 133:31.70 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:29.66 Hyprland
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  21:03.86 wineserver
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.08 limit=0.5 top_process_cores=0.94 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.08 cores busy; waiting 30 s (waited 2670s so far)
+-- host check before phase 1 --
+ 15:41:06 up 1 day,  4:36,  3 users,  load average: 2.85, 2.65, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7240852   3.5g 386588 S 215.7  11.5 116:31.73 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S  19.6   0.1  21:04.95 wineserver
+   6385 ryan      20   0 2522664 321604  74956 S   9.8   1.0 133:34.57 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:30.74 Hyprland
+   6359 ryan      20   0 1957816  90132  55612 S   4.9   0.3   7:14.39 xalia.exe
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.63 limit=0.5 top_process_cores=1.55 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.63 cores busy; waiting 30 s (waited 2700s so far)
+-- host check before phase 1 --
+ 15:41:41 up 1 day,  4:36,  3 users,  load average: 3.26, 2.79, 2.45
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7237132   3.5g 386588 R  88.2  11.5 117:17.68 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:31.80 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:50.34 qemu-system-x86
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.10 limit=0.5 top_process_cores=0.97 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.10 cores busy; waiting 30 s (waited 2730s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:42:17 up 1 day,  4:37,  3 users,  load average: 2.55, 2.67, 2.42
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7237036   3.5g 386588 R  93.1  11.5 117:50.21 WowB.exe
+ 319713 ryan      20   0 1910924 330076   7756 S  44.1   1.0   2:34.05 qmdsync-tasks
+   6385 ryan      20   0 2522664 321604  74956 S  14.7   1.0 133:37.91 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   9.8   0.5   3:32.79 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:50.91 qemu-system-x86
+   4322 ryan      20   0 2535020 197676 123364 S   4.9   0.6   0:49.83 ghostty
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.22 limit=0.5 top_process_cores=1.12 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.22 cores busy; waiting 30 s (waited 2760s so far)
+-- host check before phase 1 --
+ 15:42:52 up 1 day,  4:37,  3 users,  load average: 2.10, 2.54, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238228   3.5g 386588 S 127.4  11.5 118:25.42 WowB.exe
+   6385 ryan      20   0 2522664 321604  74956 S   9.8   1.0 133:42.50 CrBrowserMain
+     50 root      rt   0       0      0      0 S   4.9   0.0   0:02.38 migration/5
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   1:01.47 Xwayland
+   6282 ryan      20   0   29492  24584   2688 R   4.9   0.1  21:08.55 wineserver
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.08 limit=0.5 top_process_cores=0.96 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.08 cores busy; waiting 30 s (waited 2790s so far)
+-- host check before phase 1 --
+ 15:43:28 up 1 day,  4:38,  3 users,  load average: 1.76, 2.40, 2.35
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7277316   3.5g 386588 S 166.5  11.7 118:58.84 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S  14.7   0.1  21:09.83 wineserver
+   6385 ryan      20   0 2522664 321604  74956 S   9.8   1.0 133:46.19 CrBrowserMain
+   1531 ryan      20   0  114976  20768   8636 S   4.9   0.1   1:14.56 pipewire-pulse
+ 319713 ryan      20   0 1910924 330076   7756 S   4.9   1.0   2:34.73 qmdsync-tasks
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.42 limit=0.5 top_process_cores=1.33 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.42 cores busy; waiting 30 s (waited 2820s so far)
+-- host check before phase 1 --
+ 15:44:03 up 1 day,  4:39,  3 users,  load average: 1.87, 2.36, 2.33
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7371868   3.6g 386596 S  83.3  12.0 119:41.11 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S   9.8   0.1  21:11.02 wineserver
+   6385 ryan      20   0 2522664 321604  74956 S   9.8   1.0 133:49.03 CrBrowserMain
+   2536 ryan      20   0 2568276 253744  60432 S   4.9   0.8   0:54.92 dropbox
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.23 limit=0.5 top_process_cores=1.09 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.23 cores busy; waiting 30 s (waited 2850s so far)
+-- host check before phase 1 --
+ 15:44:39 up 1 day,  4:39,  3 users,  load average: 1.95, 2.33, 2.33
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238804   3.5g 386596 S 112.6  11.5 120:30.07 WowB.exe
+   1531 ryan      20   0  114976  20768   8636 S   4.9   0.1   1:14.79 pipewire-pulse
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:53.25 qemu-system-x86
+   4000 openbao   20   0  203.1g  80856  20280 S   4.9   0.3   1:05.09 bao
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  21:12.30 wineserver
+   6385 ryan      20   0 2522664 321604  74956 S   4.9   1.0 133:51.01 CrBrowserMain
+busy_cores=1.15 limit=0.5 top_process_cores=1.00 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.15 cores busy; waiting 30 s (waited 2880s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:45:15 up 1 day,  4:40,  3 users,  load average: 1.88, 2.27, 2.30
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 319713 ryan      20   0 1921680 340640   7756 S  68.6   1.1   2:35.98 qmdsync-tasks
+ 324294 ryan      20   0 7241188   3.5g 386596 S  68.6  11.6 120:58.96 WowB.exe
+   6385 ryan      20   0 2522664 321604  74956 S  14.7   1.0 133:52.13 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:37.81 Hyprland
+   4322 ryan      20   0 2535020 197676 123364 S   4.9   0.6   0:50.10 ghostty
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  21:13.44 wineserver
+busy_cores=1.41 limit=0.5 top_process_cores=0.81 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+awk: warning: escape sequence `\.' treated as plain `.'
+HOST-BUSY-WAIT before phase 1: 1.41 cores busy; waiting 30 s (waited 2910s so far)
+-- host check before phase 1 --
+ 15:45:50 up 1 day,  4:40,  3 users,  load average: 2.19, 2.30, 2.31
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7242876   3.5g 386596 S  63.5  11.6 121:27.74 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   9.8   0.5   3:38.84 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:54.41 qemu-system-x86
+   6385 ryan      20   0 2522664 321604  74956 S   4.9   1.0 133:56.85 CrBrowserMain
+ 318968 root      20   0       0      0      0 I   4.9   0.0   0:06.72 kworker/u96:0-gfx_0.1.0
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:02.99 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.04 limit=0.5 top_process_cores=0.81 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.04 cores busy; waiting 30 s (waited 2940s so far)
+-- host check before phase 1 --
+ 15:46:26 up 1 day,  4:41,  3 users,  load average: 2.03, 2.25, 2.29
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7242156   3.5g 386596 S  53.8  11.6 121:57.22 WowB.exe
+ 479828 ryan      30  10   13.6g 603440 306912 S  29.4   1.9   0:03.45 bun
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:39.80 Hyprland
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  21:15.89 wineserver
+   6385 ryan      20   0 2522664 321604  74956 S   4.9   1.0 134:00.63 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.00 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.09 limit=0.5 top_process_cores=0.67 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.09 cores busy; waiting 30 s (waited 2970s so far)
+-- host check before phase 1 --
+ 15:47:01 up 1 day,  4:42,  3 users,  load average: 2.09, 2.23, 2.29
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7242796   3.5g 386596 R  63.7  11.6 122:24.02 WowB.exe
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.00 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.93 limit=0.5 top_process_cores=0.81 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.93 cores busy; waiting 30 s (waited 3000s so far)
+-- host check before phase 1 --
+ 15:47:37 up 1 day,  4:42,  3 users,  load average: 2.24, 2.26, 2.29
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7244268   3.5g 386596 S  78.4  11.6 122:53.39 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   9.8   0.5   3:41.74 Hyprland
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  21:18.28 wineserver
+ 324544 ryan      20   0  692376  75004  28540 S   4.9   0.2   0:43.92 WowVoiceProxyT.
+ 435655 root      20   0       0      0      0 I   4.9   0.0   0:01.88 kworker/u96:1-gfx_0.1.0
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.98 limit=0.5 top_process_cores=0.82 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.98 cores busy; waiting 30 s (waited 3030s so far)
+-- host check before phase 1 --
+ 15:48:12 up 1 day,  4:43,  3 users,  load average: 1.99, 2.19, 2.27
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7253132   3.5g 386596 R 117.4  11.6 123:20.83 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S   9.8   0.1  21:19.30 wineserver
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:42.71 Hyprland
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.06 limit=0.5 top_process_cores=0.77 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.06 cores busy; waiting 30 s (waited 3060s so far)
+-- host check before phase 1 --
+ 15:48:48 up 1 day,  4:43,  3 users,  load average: 1.99, 2.17, 2.26
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238124   3.5g 386596 S  83.3  11.5 123:48.94 WowB.exe
+   6385 ryan      20   0 2522664 321672  74956 S  19.6   1.0 134:10.64 CrBrowserMain
+   6282 ryan      20   0   29492  24584   2688 S   4.9   0.1  21:20.68 wineserver
+   6328 ryan      20   0 1488916  70316  64176 S   4.9   0.2   0:19.40 explorer.exe
+   7229 ryan      20   0 2003688 168888  22728 S   4.9   0.5   0:19.48 CrRendererMain
+ 319713 ryan      20   0 1911628 330784   7756 S   4.9   1.0   2:43.29 qmdsync-tasks
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.94 limit=0.5 top_process_cores=0.82 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.94 cores busy; waiting 30 s (waited 3090s so far)
+-- host check before phase 1 --
+ 15:49:23 up 1 day,  4:44,  3 users,  load average: 1.86, 2.12, 2.24
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7236980   3.5g 386596 S  73.5  11.5 124:16.99 WowB.exe
+   6385 ryan      20   0 2522664 321672  74956 S   9.8   1.0 134:14.67 CrBrowserMain
+   1524 ryan      20   0  111260  18012   8720 S   4.9   0.1   0:47.56 pipewire
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:44.40 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:57.75 qemu-system-x86
+ 214783 root      20   0       0      0      0 I   4.9   0.0   0:10.28 kworker/13:1-events
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.07 limit=0.5 top_process_cores=0.96 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.07 cores busy; waiting 30 s (waited 3120s so far)
+-- host check before phase 1 --
+ 15:49:59 up 1 day,  4:44,  3 users,  load average: 1.60, 2.03, 2.20
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7237684   3.5g 386596 R  93.0  11.5 124:45.09 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S   9.8   0.1  21:23.05 wineserver
+   6385 ryan      20   0 2522664 321672  74956 S   9.8   1.0 134:17.87 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:45.39 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  55:58.31 qemu-system-x86
+   6359 ryan      20   0 1957816  90132  55612 S   4.9   0.3   7:17.21 xalia.exe
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.96 limit=0.5 top_process_cores=0.79 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.96 cores busy; waiting 30 s (waited 3150s so far)
+-- host check before phase 1 --
+ 15:50:35 up 1 day,  4:45,  3 users,  load average: 1.74, 2.02, 2.19
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7250100   3.5g 386596 R  78.3  11.6 125:14.14 WowB.exe
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   1:05.47 Xwayland
+   6385 ryan      20   0 2522664 321672  74956 S   4.9   1.0 134:20.22 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.94 limit=0.5 top_process_cores=0.81 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.94 cores busy; waiting 30 s (waited 3180s so far)
+-- host check before phase 1 --
+ 15:51:10 up 1 day,  4:46,  3 users,  load average: 1.70, 1.97, 2.17
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7228896   3.5g 386600 S  73.4  11.5 125:42.98 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:47.30 Hyprland
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.99 limit=0.5 top_process_cores=0.82 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.99 cores busy; waiting 30 s (waited 3210s so far)
+-- host check before phase 1 --
+ 15:51:46 up 1 day,  4:46,  3 users,  load average: 1.67, 1.93, 2.14
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7217976   3.5g 386600 R  92.7  11.5 126:12.99 WowB.exe
+   4822 ryan      20   0 5642904 303508  72896 S   9.8   1.0   4:58.70 claude
+   6385 ryan      20   0 2522664 321752  74956 S   9.8   1.0 134:24.19 CrBrowserMain
+     20 root      rt   0       0      0      0 S   4.9   0.0   0:02.24 migration/0
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:48.29 Hyprland
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.92 limit=0.5 top_process_cores=0.82 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.92 cores busy; waiting 30 s (waited 3240s so far)
+-- host check before phase 1 --
+ 15:52:21 up 1 day,  4:47,  3 users,  load average: 2.28, 2.06, 2.18
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238132   3.5g 386600 S 122.3  11.5 126:40.74 WowB.exe
+   6282 ryan      20   0   29492  24584   2688 S  14.7   0.1  21:27.70 wineserver
+   6385 ryan      20   0 2522664 321664  74956 S  14.7   1.0 134:28.60 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:49.34 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:00.60 qemu-system-x86
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   1:06.43 Xwayland
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.00 limit=0.5 top_process_cores=0.89 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.00 cores busy; waiting 30 s (waited 3270s so far)
+-- host check before phase 1 --
+ 15:52:57 up 1 day,  4:47,  3 users,  load average: 2.21, 2.06, 2.17
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238060   3.5g 386600 S  88.2  11.5 127:10.64 WowB.exe
+   1324 root      20   0   17872  10876   7156 S   4.9   0.0   0:06.64 python3
+   1531 ryan      20   0  114976  20768   8636 S   4.9   0.1   1:16.30 pipewire-pulse
+   2342 ryan      20   0 1155980 138132 108372 S   4.9   0.4   1:06.69 Xwayland
+   6385 ryan      20   0 2522664 321664  74956 S   4.9   1.0 134:32.14 CrBrowserMain
+ 421477 root      20   0       0      0      0 D   4.9   0.0   0:01.54 kworker/u97:4+events_unbound
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.15 limit=0.5 top_process_cores=0.84 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.15 cores busy; waiting 30 s (waited 3300s so far)
+-- host check before phase 1 --
+ 15:53:32 up 1 day,  4:48,  3 users,  load average: 2.30, 2.08, 2.18
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7287428   3.5g 386600 S 117.4  11.7 127:40.73 WowB.exe
+     38 root      rt   0       0      0      0 S   4.9   0.0   0:01.44 migration/3
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:01.72 qemu-system-x86
+   6385 ryan      20   0 2522664 321664  74956 S   4.9   1.0 134:34.89 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.08 limit=0.5 top_process_cores=0.84 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.08 cores busy; waiting 30 s (waited 3330s so far)
+-- host check before phase 1 --
+ 15:54:08 up 1 day,  4:49,  3 users,  load average: 2.23, 2.09, 2.18
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7287460   3.5g 386600 S  73.5  11.7 128:09.80 WowB.exe
+   6385 ryan      20   0 2522664 321664  74956 S   4.9   1.0 134:36.79 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.94 limit=0.5 top_process_cores=0.82 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.94 cores busy; waiting 30 s (waited 3360s so far)
+-- host check before phase 1 --
+ 15:54:44 up 1 day,  4:49,  3 users,  load average: 2.40, 2.14, 2.19
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7287460   3.5g 386600 R  63.7  11.7 128:40.67 WowB.exe
+   6385 ryan      20   0 2522664 321664  74956 S   9.8   1.0 134:37.84 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.95 limit=0.5 top_process_cores=0.83 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.95 cores busy; waiting 30 s (waited 3390s so far)
+-- host check before phase 1 --
+ 15:55:19 up 1 day,  4:50,  3 users,  load average: 2.12, 2.10, 2.17
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7285876   3.5g 386600 S  73.5  11.7 129:09.24 WowB.exe
+   6385 ryan      20   0 2522664 321664  74956 S  14.7   1.0 134:42.11 CrBrowserMain
+ 318968 root      20   0       0      0      0 I   4.9   0.0   0:07.14 kworker/u96:0-gfx_0.0.0
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.93 limit=0.5 top_process_cores=0.79 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.93 cores busy; waiting 30 s (waited 3420s so far)
+-- host check before phase 1 --
+ 15:55:55 up 1 day,  4:50,  3 users,  load average: 2.17, 2.10, 2.17
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7247516   3.5g 386604 S 102.9  11.6 129:38.85 WowB.exe
+   6385 ryan      20   0 2522664 321668  74960 S   9.8   1.0 134:46.05 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:55.28 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:04.01 qemu-system-x86
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:34.87 wineserver
+   6403 ryan      20   0 2174704  85600  42400 S   4.9   0.3   3:58.38 Agent.exe
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.00 limit=0.5 top_process_cores=0.90 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.00 cores busy; waiting 30 s (waited 3450s so far)
+-- host check before phase 1 --
+ 15:56:30 up 1 day,  4:51,  3 users,  load average: 2.04, 2.10, 2.17
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7248728   3.5g 386604 R 107.8  11.6 130:05.60 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:56.07 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:04.58 qemu-system-x86
+   6385 ryan      20   0 2522664 321668  74960 S   4.9   1.0 134:49.18 CrBrowserMain
+ 393369 root      20   0       0      0      0 I   4.9   0.0   0:03.63 kworker/u96:2-gfx_0.0.0
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.53 limit=0.5 top_process_cores=1.31 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.53 cores busy; waiting 30 s (waited 3480s so far)
+-- host check before phase 1 --
+ 15:57:06 up 1 day,  4:52,  3 users,  load average: 1.62, 1.99, 2.13
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7248648   3.5g 386604 R  63.7  11.6 130:35.91 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:56.92 Hyprland
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:37.02 wineserver
+   6385 ryan      20   0 2522664 321668  74960 S   4.9   1.0 134:51.52 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+busy_cores=0.92 limit=0.5 top_process_cores=0.80 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.92 cores busy; waiting 30 s (waited 3510s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:57:41 up 1 day,  4:52,  3 users,  load average: 1.67, 1.96, 2.12
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7250184   3.5g 386604 R 122.2  11.6 131:16.77 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:57.92 Hyprland
+   6385 ryan      20   0 2522664 321676  74960 S   4.9   1.0 134:53.12 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.51 limit=0.5 top_process_cores=1.35 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.51 cores busy; waiting 30 s (waited 3540s so far)
+-- host check before phase 1 --
+ 15:58:17 up 1 day,  4:53,  3 users,  load average: 1.74, 1.95, 2.10
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7239184   3.5g 386620 R 112.4  11.6 132:03.48 WowB.exe
+   6385 ryan      20   0 2522664 321676  74960 S   9.8   1.0 134:55.48 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=1.43 limit=0.5 top_process_cores=1.31 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.43 cores busy; waiting 30 s (waited 3570s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:58:52 up 1 day,  4:53,  3 users,  load average: 2.32, 2.04, 2.13
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7239872   3.5g 386620 S 170.9  11.6 132:46.49 WowB.exe
+   6282 ryan      20   0   29492  24588   2692 S   9.8   0.1  21:40.62 wineserver
+   6385 ryan      20   0 2522664 321676  74960 S   9.8   1.0 134:59.96 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   3:59.81 Hyprland
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+busy_cores=1.10 limit=0.5 top_process_cores=0.99 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.10 cores busy; waiting 30 s (waited 3600s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 15:59:28 up 1 day,  4:54,  3 users,  load average: 2.48, 2.09, 2.14
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7234736   3.5g 386620 S  93.1  11.6 133:22.08 WowB.exe
+   2342 ryan      20   0 1155980 138132 108372 S   9.8   0.4   1:09.51 Xwayland
+   4322 ryan      20   0 2535020 197676 123364 S   4.9   0.6   0:51.26 ghostty
+   6385 ryan      20   0 2522664 321676  74960 S   4.9   1.0 135:03.59 CrBrowserMain
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.18 limit=0.5 top_process_cores=1.06 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.18 cores busy; waiting 30 s (waited 3630s so far)
+-- host check before phase 1 --
+ 16:00:04 up 1 day,  4:55,  3 users,  load average: 2.00, 2.01, 2.11
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7234952   3.5g 386620 S  73.5  11.6 134:01.38 WowB.exe
+   6385 ryan      20   0 2522664 321676  74960 S  14.7   1.0 135:06.44 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:01.53 Hyprland
+   6359 ryan      20   0 1957816  90132  55612 S   4.9   0.3   7:20.35 xalia.exe
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.01 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.96 limit=0.5 top_process_cores=0.83 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 0.96 cores busy; waiting 30 s (waited 3660s so far)
+-- host check before phase 1 --
+ 16:00:39 up 1 day,  4:55,  3 users,  load average: 2.11, 2.04, 2.11
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7243888   3.5g 386620 S  68.6  11.6 134:31.09 WowB.exe
+   1408 root      20   0 3136280 108212  18016 S   4.9   0.3   1:29.06 tailscaled
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:02.52 Hyprland
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:44.35 wineserver
+   6312 ryan      20   0  725028  22276  20572 S   4.9   0.1   3:41.46 winedevice.exe
+   6385 ryan      20   0 2522664 321676  74960 S   4.9   1.0 135:08.46 CrBrowserMain
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.02 limit=0.5 top_process_cores=0.82 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.02 cores busy; waiting 30 s (waited 3690s so far)
+-- host check before phase 1 --
+ 16:01:15 up 1 day,  4:56,  3 users,  load average: 2.51, 2.16, 2.15
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7243088   3.5g 386620 R 152.0  11.6 135:06.76 WowB.exe
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:45.50 wineserver
+      1 root      20   0   22136  16392  11032 S   0.0   0.1   0:03.02 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.95 limit=0.5 top_process_cores=1.71 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.95 cores busy; waiting 30 s (waited 3720s so far)
+-- host check before phase 1 --
+ 16:01:50 up 1 day,  4:56,  3 users,  load average: 2.04, 2.09, 2.13
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7242320   3.5g 386620 S 112.7  11.6 135:36.30 WowB.exe
+ 513417 ryan      30  10   13.5g 529012 305948 R  29.4   1.7   0:01.59 bun
+    176 root      20   0       0      0      0 S  19.6   0.0   0:02.74 kcompactd0
+   6385 ryan      20   0 2522664 321676  74960 S  14.7   1.0 135:13.46 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:09.93 qemu-system-x86
+ 319713 ryan      20   0 1912844 332080   7756 S   4.9   1.0   2:56.46 qmdsync-tasks
+busy_cores=1.49 limit=0.5 top_process_cores=1.05 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.49 cores busy; waiting 30 s (waited 3750s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 16:02:26 up 1 day,  4:57,  3 users,  load average: 1.57, 1.96, 2.08
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7232240   3.5g 386620 S 122.0  11.6 136:17.62 WowB.exe
+   6385 ryan      20   0 2522664 321676  74960 S   9.8   1.0 135:17.61 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:10.50 qemu-system-x86
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:47.71 wineserver
+ 318968 root      20   0       0      0      0 I   4.9   0.0   0:07.74 kworker/u96:0-gfx_0.0.0
+ 324544 ryan      20   0  692376  75004  28540 S   4.9   0.2   0:50.28 WowVoiceProxyT.
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.65 limit=0.5 top_process_cores=1.50 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.65 cores busy; waiting 30 s (waited 3780s so far)
+-- host check before phase 1 --
+ 16:03:01 up 1 day,  4:58,  3 users,  load average: 1.45, 1.88, 2.05
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7233624   3.5g 386620 S 107.7  11.6 137:02.27 WowB.exe
+   6359 ryan      20   0 1957816  90132  55612 S   9.8   0.3   7:21.28 xalia.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:05.99 Hyprland
+   6385 ryan      20   0 2522664 321676  74960 S   4.9   1.0 135:20.96 CrBrowserMain
+ 435655 root      20   0       0      0      0 I   4.9   0.0   0:03.00 kworker/u96:1-comp_1.2.1
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.36 limit=0.5 top_process_cores=1.21 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.36 cores busy; waiting 30 s (waited 3810s so far)
+-- host check before phase 1 --
+ 16:03:37 up 1 day,  4:58,  3 users,  load average: 1.72, 1.92, 2.06
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7238328   3.5g 386620 S 102.9  11.6 137:49.13 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:07.07 Hyprland
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:50.13 wineserver
+   6385 ryan      20   0 2522664 321676  74960 S   4.9   1.0 135:23.53 CrBrowserMain
+ 414999 root      20   0       0      0      0 D   4.9   0.0   0:02.20 kworker/u97:2+events_unbound
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.30 limit=0.5 top_process_cores=1.19 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.30 cores busy; waiting 30 s (waited 3840s so far)
+-- host check before phase 1 --
+ 16:04:13 up 1 day,  4:59,  3 users,  load average: 1.83, 1.92, 2.05
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7239416   3.5g 386620 S 122.4  11.6 138:36.72 WowB.exe
+   1531 ryan      20   0  114976  20768   8636 S   4.9   0.1   1:18.41 pipewire-pulse
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:08.12 Hyprland
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:51.45 wineserver
+   6312 ryan      20   0  725028  22276  20572 S   4.9   0.1   3:42.15 winedevice.exe
+   6328 ryan      20   0 1488916  70316  64176 S   4.9   0.2   0:21.43 explorer.exe
+busy_cores=1.23 limit=0.5 top_process_cores=1.08 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.23 cores busy; waiting 30 s (waited 3870s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 16:04:48 up 1 day,  4:59,  3 users,  load average: 2.18, 2.00, 2.07
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7239384   3.5g 386620 S  98.0  11.6 139:16.18 WowB.exe
+   6385 ryan      20   0 2522664 321676  74960 S  14.7   1.0 135:26.78 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:09.14 Hyprland
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:12.86 qemu-system-x86
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.16 limit=0.5 top_process_cores=1.06 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.16 cores busy; waiting 30 s (waited 3900s so far)
+-- host check before phase 1 --
+ 16:05:24 up 1 day,  5:00,  3 users,  load average: 2.02, 1.97, 2.06
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7239944   3.5g 386620 S 132.1  11.6 140:01.65 WowB.exe
+   6385 ryan      20   0 2522664 321676  74960 S  14.7   1.0 135:31.42 CrBrowserMain
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  21:53.90 wineserver
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.38 limit=0.5 top_process_cores=1.25 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.38 cores busy; waiting 30 s (waited 3930s so far)
+-- host check before phase 1 --
+ 16:05:59 up 1 day,  5:00,  3 users,  load average: 2.03, 1.98, 2.06
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7244288   3.5g 386620 S 107.6  11.6 140:39.96 WowB.exe
+   6385 ryan      20   0 2522664 321676  74960 S   9.8   1.0 135:35.23 CrBrowserMain
+   1408 root      20   0 3136280 108016  18016 S   4.9   0.3   1:29.24 tailscaled
+   1520 ryan      20   0 2578668  48348  12680 S   4.9   0.2   0:09.67 bao
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:14.06 qemu-system-x86
+ 325104 root      20   0       0      0      0 D   4.9   0.0   0:00.75 kworker/u98:15+events_unbound
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.49 limit=0.5 top_process_cores=1.43 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.49 cores busy; waiting 30 s (waited 3960s so far)
+-- host check before phase 1 --
+ 16:06:35 up 1 day,  5:01,  3 users,  load average: 2.14, 2.00, 2.06
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7244576   3.5g 386624 R 137.0  11.6 141:30.12 WowB.exe
+   6385 ryan      20   0 2522664 321784  74964 S   9.8   1.0 135:38.31 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:14.66 qemu-system-x86
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.37 limit=0.5 top_process_cores=1.23 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.37 cores busy; waiting 30 s (waited 3990s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before phase 1 --
+ 16:07:10 up 1 day,  5:02,  3 users,  load average: 2.80, 2.16, 2.11
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7245840   3.5g 386624 S 142.0  11.6 142:24.32 WowB.exe
+   6385 ryan      20   0 2522664 321784  74964 S   4.9   1.0 135:40.66 CrBrowserMain
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.65 limit=0.5 top_process_cores=1.56 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.65 cores busy; waiting 30 s (waited 4020s so far)
+-- host check before phase 1 --
+ 16:07:46 up 1 day,  5:02,  3 users,  load average: 2.56, 2.17, 2.12
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7237724   3.5g 386624 R  98.1  11.6 143:08.18 WowB.exe
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:14.21 Hyprland
+   6385 ryan      20   0 2522664 321696  74964 S   4.9   1.0 135:42.20 CrBrowserMain
+ 319713 ryan      20   0 1913420 332456   7756 S   4.9   1.0   3:00.08 qmdsync-tasks
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.26 limit=0.5 top_process_cores=1.08 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.26 cores busy; waiting 30 s (waited 4050s so far)
+-- host check before phase 1 --
+ 16:08:22 up 1 day,  5:03,  3 users,  load average: 2.27, 2.15, 2.11
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7325196   3.6g 386624 S 136.9  11.8 143:50.47 WowB.exe
+   6385 ryan      20   0 2522664 321696  74964 S   9.8   1.0 135:44.59 CrBrowserMain
+   2064 ryan      20   0 2244752 170736 110236 S   4.9   0.5   4:15.26 Hyprland
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  22:00.44 wineserver
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.39 limit=0.5 top_process_cores=1.26 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.39 cores busy; waiting 30 s (waited 4080s so far)
+-- host check before phase 1 --
+ 16:08:57 up 1 day,  5:03,  3 users,  load average: 2.30, 2.17, 2.11
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 324294 ryan      20   0 7250092   3.5g 386624 S  98.0  11.6 144:42.59 WowB.exe
+   2324 libvirt+  20   0    9.9g   5.0g  21156 S   4.9  16.4  56:17.09 qemu-system-x86
+   6385 ryan      20   0 2522664 321696  74964 S   4.9   1.0 135:49.15 CrBrowserMain
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=1.22 limit=0.5 top_process_cores=1.11 (324294 WowB.exe) limit=0.3 blocking=WowB.exe(324294) before phase 1
+HOST-BUSY-WAIT before phase 1: 1.22 cores busy; waiting 30 s (waited 4110s so far)
+-- host check before phase 1 --
+ 16:09:33 up 1 day,  5:04,  3 users,  load average: 1.51, 1.99, 2.05
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   6282 ryan      20   0   29492  24588   2692 S   4.9   0.1  22:02.72 wineserver
+   6385 ryan      20   0 2522664 321800  74912 S   4.9   1.0 135:50.86 CrBrowserMain
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.03 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.15 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before phase 1
+== phase 1: perf ==
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.08 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before perf round 1
+  ready A args='' {"ready":true,"mode":"tls","port":40991,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1}
+r1 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000105
+r1 A sse200 A            sse latency p50=14µs p99=37µs max=845µs
+r1 A oneshot-e2 finished in 2.40s, 834540.98 req/s, 35.82MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 A oneshot-e8 finished in 845.13ms, 2366499.83 req/s, 101.56MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 A oneshot-lat-e2 n=2000000 p50us=445 p99us=538 maxus=1623241 non200=0 threads=233,230,0,0,0,0 finished in 2.43s, 824371.73 req/s, 35.38MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready WS args='' {"ready":true,"mode":"tls","port":38593,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto"}
+r1 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000087
+r1 WS sse200 WS           sse latency p50=11µs p99=35µs max=1.36ms
+r1 WS oneshot-e2 finished in 2.54s, 788151.87 req/s, 33.83MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS oneshot-e8 finished in 824.51ms, 2425671.37 req/s, 104.10MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WS oneshot-lat-e2 n=2000000 p50us=505 p99us=1179 maxus=2353 non200=0 threads=271,265,0,0,0 finished in 2.84s, 705053.29 req/s, 30.26MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready PL args='--spawn-placement local' {"ready":true,"mode":"tls","port":37391,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local"}
+r1 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000103
+r1 PL sse200 PL           sse latency p50=11µs p99=24µs max=2.104ms
+r1 PL oneshot-e2 finished in 2.51s, 797129.06 req/s, 34.21MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PL oneshot-e8 finished in 956.92ms, 2090036.69 req/s, 89.70MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PL oneshot-lat-e2 n=2000000 p50us=628 p99us=924 maxus=2489 non200=0 threads=254,248,0,0,0 finished in 2.66s, 753248.01 req/s, 32.33MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready PA args='--spawn-placement auto' {"ready":true,"mode":"tls","port":38259,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"auto"}
+r1 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000074
+r1 PA sse200 PA           sse latency p50=10µs p99=28µs max=1.709ms
+r1 PA oneshot-e2 finished in 2.60s, 769785.90 req/s, 33.04MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PA oneshot-e8 finished in 923.64ms, 2165348.15 req/s, 92.93MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 PA oneshot-lat-e2 n=2000000 p50us=599 p99us=693 maxus=2036 non200=0 threads=239,236,0,0,0 finished in 2.48s, 806925.68 req/s, 34.63MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+  ready WSN args='' {"ready":true,"mode":"tls","port":44213,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto"}
+r1 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000058
+r1 WSN sse200 WSN          sse latency p50=11µs p99=51µs max=1.356ms
+r1 WSN oneshot-e2 finished in 2.62s, 763644.71 req/s, 32.77MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WSN oneshot-e8 finished in 851.35ms, 2349207.32 req/s, 100.82MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 WSN oneshot-lat-e2 n=2000000 p50us=439 p99us=911 maxus=1804 non200=0 threads=238,238,0,0,0 finished in 2.49s, 804685.52 req/s, 34.53MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.08 limit=0.5 top_process_cores=0.01 (2324 qemu-system-x86) limit=0.3 before perf round 2
+r2 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000080
+r2 WS sse200 WS           sse latency p50=10µs p99=26µs max=1.148ms
+r2 WS oneshot-e2 finished in 2.53s, 790847.37 req/s, 33.94MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 WS oneshot-e8 finished in 858.89ms, 2328597.74 req/s, 99.94MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 WS oneshot-lat-e2 n=2000000 p50us=404 p99us=880 maxus=1908 non200=0 threads=232,232,0,0,0,0 finished in 2.43s, 824591.97 req/s, 35.39MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000062
+r2 PL sse200 PL           sse latency p50=10µs p99=21µs max=1.351ms
+r2 PL oneshot-e2 finished in 2.49s, 804023.01 req/s, 34.51MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 PL oneshot-e8 finished in 950.28ms, 2104640.63 req/s, 90.32MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 PL oneshot-lat-e2 n=2000000 p50us=613 p99us=769 maxus=2462 non200=0 threads=241,238,0,0,0,0 finished in 2.51s, 797813.03 req/s, 34.24MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000136
+r2 PA sse200 PA           sse latency p50=11µs p99=32µs max=1.193ms
+r2 PA oneshot-e2 finished in 2.52s, 795029.48 req/s, 34.12MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 PA oneshot-e8 finished in 932.41ms, 2144983.74 req/s, 92.06MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 PA oneshot-lat-e2 n=2000000 p50us=624 p99us=711 maxus=1954 non200=0 threads=245,245,0,0,0,0 finished in 2.57s, 778946.63 req/s, 33.43MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 WSN sse200 WSN          streams=200 conns=1 opened=189 delivering=0 failed=11 events=0
+r2 WSN sse200 WSN          NO EVENTS — SSE delivered nothing while the connection was live
+r2 WSN oneshot-e2 finished in 2.52s, 794890.76 req/s, 34.11MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 WSN oneshot-e8 finished in 887.02ms, 2254738.05 req/s, 96.77MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 WSN oneshot-lat-e2 n=2000000 p50us=511 p99us=870 maxus=1596 non200=0 threads=239,238,0,0,0,0 finished in 2.49s, 802054.22 req/s, 34.42MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000106
+r2 A sse200 A            sse latency p50=13µs p99=35µs max=1.235ms
+r2 A oneshot-e2 finished in 2.73s, 732114.80 req/s, 31.42MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A oneshot-e8 finished in 890.83ms, 2245094.75 req/s, 96.35MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A oneshot-lat-e2 n=2000000 p50us=303 p99us=454 maxus=1043440 non200=0 threads=256,251,0,0,0 finished in 2.67s, 748815.47 req/s, 32.14MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.25 limit=0.5 top_process_cores=0.17 (535888 ghostty) limit=0.3 before perf round 3
+r3 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000074
+r3 PL sse200 PL           sse latency p50=11µs p99=25µs max=1.502ms
+r3 PL oneshot-e2 finished in 2.65s, 755152.69 req/s, 32.41MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 PL oneshot-e8 finished in 953.72ms, 2097044.95 req/s, 90.00MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 PL oneshot-lat-e2 n=2000000 p50us=589 p99us=718 maxus=1767 non200=0 threads=239,235,0,0,0,0 finished in 2.48s, 807434.21 req/s, 34.65MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000103
+r3 PA sse200 PA           sse latency p50=11µs p99=36µs max=1.895ms
+r3 PA oneshot-e2 finished in 2.50s, 800022.72 req/s, 34.33MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 PA oneshot-e8 finished in 956.58ms, 2090790.49 req/s, 89.73MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 PA oneshot-lat-e2 n=2000000 p50us=591 p99us=733 maxus=2139 non200=0 threads=240,232,0,0,0,0,0 finished in 2.50s, 800321.09 req/s, 34.35MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000089
+r3 WSN sse200 WSN          sse latency p50=11µs p99=30µs max=882µs
+r3 WSN oneshot-e2 finished in 2.62s, 761912.89 req/s, 32.70MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 WSN oneshot-e8 finished in 852.56ms, 2345881.45 req/s, 100.68MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 WSN oneshot-lat-e2 n=2000000 p50us=446 p99us=893 maxus=1964 non200=0 threads=237,237,0,0,0 finished in 2.47s, 809220.58 req/s, 34.73MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000144
+r3 A sse200 A            sse latency p50=13µs p99=35µs max=1.698ms
+r3 A oneshot-e2 finished in 2.54s, 786018.92 req/s, 33.73MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A oneshot-e8 finished in 886.52ms, 2256012.27 req/s, 96.82MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A oneshot-lat-e2 n=2000000 p50us=448 p99us=745 maxus=1641718 non200=0 threads=237,237,0,0,0 finished in 2.50s, 801341.77 req/s, 34.39MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000048
+r3 WS sse200 WS           sse latency p50=12µs p99=37µs max=1.694ms
+r3 WS oneshot-e2 finished in 2.50s, 798413.07 req/s, 34.27MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 WS oneshot-e8 finished in 864.01ms, 2314788.02 req/s, 99.34MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 WS oneshot-lat-e2 n=2000000 p50us=456 p99us=1063 maxus=2396 non200=0 threads=242,242,0,0,0,0 finished in 2.53s, 789518.98 req/s, 33.88MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+busy_cores=0.68 limit=0.5 top_process_cores=0.51 (535888 ghostty) limit=0.3 before perf round 4
+HOST-BUSY-WAIT before perf round 4: 0.68 cores busy; waiting 30 s (waited 0s so far)
+awk: warning: escape sequence `\.' treated as plain `.'
+-- host check before perf round 4 --
+ 16:14:53 up 1 day,  5:09,  3 users,  load average: 2.22, 2.34, 2.18
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   6385 ryan      20   0 2522664 320956  74912 S   4.9   1.0 135:54.12 CrBrowserMain
+   6403 ryan      20   0 2174704  85872  42404 S   4.9   0.3   4:04.59 Agent.exe
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.04 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=0.09 limit=0.5 top_process_cores=0.02 (319713 qmdsync-tasks) limit=0.3 before perf round 4
+awk: warning: escape sequence `\.' treated as plain `.'
+r4 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000065
+r4 PA sse200 PA           sse latency p50=11µs p99=38µs max=1.3ms
+r4 PA oneshot-e2 finished in 2.82s, 708359.03 req/s, 30.40MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 PA oneshot-e8 finished in 894.71ms, 2235358.68 req/s, 95.93MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 PA oneshot-lat-e2 n=2000000 p50us=635 p99us=905 maxus=2139 non200=0 threads=245,245,0,0,0 finished in 2.62s, 763486.12 req/s, 32.77MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000101
+r4 WSN sse200 WSN          sse latency p50=11µs p99=37µs max=1.351ms
+r4 WSN oneshot-e2 finished in 2.44s, 819114.86 req/s, 35.15MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 WSN oneshot-e8 finished in 835.52ms, 2393727.48 req/s, 102.73MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 WSN oneshot-lat-e2 n=2000000 p50us=460 p99us=884 maxus=2049 non200=0 threads=235,235,0,0,0 finished in 2.45s, 814676.23 req/s, 34.96MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000104
+r4 A sse200 A            sse latency p50=13µs p99=34µs max=1.077ms
+r4 A oneshot-e2 finished in 2.43s, 823377.67 req/s, 35.34MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A oneshot-e8 finished in 824.59ms, 2425453.68 req/s, 104.09MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A oneshot-lat-e2 n=2000000 p50us=297 p99us=412 maxus=1173921 non200=0 threads=243,239,0,0,0,0 finished in 2.62s, 762333.99 req/s, 32.72MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000072
+r4 WS sse200 WS           sse latency p50=11µs p99=27µs max=919µs
+r4 WS oneshot-e2 finished in 2.42s, 827663.84 req/s, 35.52MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 WS oneshot-e8 finished in 850.96ms, 2350300.54 req/s, 100.87MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 WS oneshot-lat-e2 n=2000000 p50us=454 p99us=1089 maxus=2379 non200=0 threads=261,258,0,0,0,0 finished in 2.76s, 725645.70 req/s, 31.14MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000027
+r4 PL sse200 PL           sse latency p50=9µs p99=19µs max=1.663ms
+r4 PL oneshot-e2 finished in 2.45s, 815653.70 req/s, 35.01MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 PL oneshot-e8 finished in 960.21ms, 2082875.53 req/s, 89.39MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 PL oneshot-lat-e2 n=2000000 p50us=588 p99us=713 maxus=1667 non200=0 threads=239,228,0,0,0 finished in 2.47s, 809275.27 req/s, 34.73MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.09 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before perf round 5
+r5 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000084
+r5 WSN sse200 WSN          sse latency p50=11µs p99=37µs max=1.332ms
+r5 WSN oneshot-e2 finished in 2.47s, 809826.43 req/s, 34.76MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 WSN oneshot-e8 finished in 846.71ms, 2362089.41 req/s, 101.37MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 WSN oneshot-lat-e2 n=2000000 p50us=430 p99us=889 maxus=1813 non200=0 threads=235,235,0,0,0,0 finished in 2.46s, 813933.57 req/s, 34.93MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000065
+r5 A sse200 A            sse latency p50=12µs p99=33µs max=977µs
+r5 A oneshot-e2 finished in 2.64s, 757234.72 req/s, 32.50MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A oneshot-e8 finished in 825.29ms, 2423381.76 req/s, 104.00MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A oneshot-lat-e2 n=2000000 p50us=381 p99us=596 maxus=1528261 non200=0 threads=252,249,0,0,0,0 finished in 2.65s, 755035.52 req/s, 32.40MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000075
+r5 WS sse200 WS           sse latency p50=11µs p99=26µs max=1.145ms
+r5 WS oneshot-e2 finished in 2.59s, 772828.28 req/s, 33.17MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 WS oneshot-e8 finished in 869.68ms, 2299699.08 req/s, 98.70MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 WS oneshot-lat-e2 n=2000000 p50us=459 p99us=976 maxus=2239 non200=0 threads=239,239,0,0,0,0 finished in 2.57s, 777297.02 req/s, 33.36MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000065
+r5 PL sse200 PL           sse latency p50=11µs p99=23µs max=1.538ms
+r5 PL oneshot-e2 finished in 2.94s, 680160.60 req/s, 29.19MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 PL oneshot-e8 finished in 892.66ms, 2240499.72 req/s, 96.16MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 PL oneshot-lat-e2 n=2000000 p50us=636 p99us=958 maxus=1564 non200=0 threads=250,247,0,0,0 finished in 2.66s, 753133.13 req/s, 32.32MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000072
+r5 PA sse200 PA           sse latency p50=11µs p99=37µs max=1.337ms
+r5 PA oneshot-e2 finished in 2.60s, 768644.83 req/s, 32.99MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 PA oneshot-e8 finished in 938.85ms, 2130256.67 req/s, 91.42MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 PA oneshot-lat-e2 n=2000000 p50us=601 p99us=744 maxus=2298 non200=0 threads=240,237,0,0,0 finished in 2.48s, 806212.35 req/s, 34.60MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before perf round 6
+r6 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000079
+r6 A sse200 A            sse latency p50=13µs p99=33µs max=1.517ms
+r6 A oneshot-e2 finished in 2.63s, 761227.05 req/s, 32.67MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A oneshot-e8 finished in 870.22ms, 2298258.84 req/s, 98.63MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A oneshot-lat-e2 n=2000000 p50us=339 p99us=442 maxus=1434507 non200=0 threads=240,239,0,0,0,0 finished in 2.53s, 791799.18 req/s, 33.98MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000111
+r6 WS sse200 WS           sse latency p50=11µs p99=36µs max=1.49ms
+r6 WS oneshot-e2 finished in 2.71s, 738543.16 req/s, 31.70MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 WS oneshot-e8 finished in 836.02ms, 2392281.54 req/s, 102.67MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 WS oneshot-lat-e2 n=2000000 p50us=475 p99us=809 maxus=1990 non200=0 threads=228,227,0,0,0,0 finished in 2.38s, 841820.64 req/s, 36.13MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000086
+r6 PL sse200 PL           sse latency p50=9µs p99=19µs max=1.411ms
+r6 PL oneshot-e2 finished in 2.74s, 730369.23 req/s, 31.35MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 PL oneshot-e8 finished in 908.93ms, 2200394.31 req/s, 94.43MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 PL oneshot-lat-e2 n=2000000 p50us=665 p99us=1023 maxus=1895 non200=0 threads=264,253,0,0,0 finished in 2.77s, 722211.99 req/s, 31.00MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000028
+r6 PA sse200 PA           sse latency p50=12µs p99=42µs max=1.123ms
+r6 PA oneshot-e2 finished in 2.48s, 805948.55 req/s, 34.59MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 PA oneshot-e8 finished in 918.09ms, 2178438.04 req/s, 93.49MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 PA oneshot-lat-e2 n=2000000 p50us=602 p99us=716 maxus=1522 non200=0 threads=239,237,0,0,0,0 finished in 2.49s, 801787.67 req/s, 34.41MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000041
+r6 WSN sse200 WSN          sse latency p50=11µs p99=29µs max=1.242ms
+r6 WSN oneshot-e2 finished in 2.43s, 823236.68 req/s, 35.33MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 WSN oneshot-e8 finished in 837.38ms, 2388404.77 req/s, 102.50MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 WSN oneshot-lat-e2 n=2000000 p50us=439 p99us=876 maxus=2248 non200=0 threads=234,234,0,0,0,0 finished in 2.45s, 816938.40 req/s, 35.06MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before perf round 7
+r7 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000126
+r7 WS sse200 WS           sse latency p50=11µs p99=29µs max=2.075ms
+r7 WS oneshot-e2 finished in 2.62s, 763498.95 req/s, 32.77MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 WS oneshot-e8 finished in 875.68ms, 2283934.12 req/s, 98.02MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 WS oneshot-lat-e2 n=2000000 p50us=693 p99us=813 maxus=2422 non200=0 threads=258,255,0,0,0 finished in 2.75s, 726260.19 req/s, 31.17MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000150
+r7 PL sse200 PL           sse latency p50=10µs p99=27µs max=781µs
+r7 PL oneshot-e2 finished in 2.75s, 728081.03 req/s, 31.25MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 PL oneshot-e8 finished in 910.53ms, 2196520.49 req/s, 94.27MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 PL oneshot-lat-e2 n=2000000 p50us=607 p99us=741 maxus=1689 non200=0 threads=245,238,0,0,0,0 finished in 2.55s, 785388.01 req/s, 33.71MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000086
+r7 PA sse200 PA           sse latency p50=10µs p99=27µs max=1.676ms
+r7 PA oneshot-e2 finished in 2.77s, 722921.01 req/s, 31.03MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 PA oneshot-e8 finished in 952.39ms, 2099988.87 req/s, 90.13MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 PA oneshot-lat-e2 n=2000000 p50us=612 p99us=713 maxus=2334 non200=0 threads=246,239,0,0,0,0 finished in 2.57s, 777641.86 req/s, 33.37MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000059
+r7 WSN sse200 WSN          sse latency p50=10µs p99=27µs max=980µs
+r7 WSN oneshot-e2 finished in 2.57s, 778500.62 req/s, 33.41MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 WSN oneshot-e8 finished in 856.61ms, 2334787.52 req/s, 100.20MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 WSN oneshot-lat-e2 n=2000000 p50us=523 p99us=824 maxus=1958 non200=0 threads=238,238,0,0,0,0 finished in 2.48s, 806067.43 req/s, 34.59MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000094
+r7 A sse200 A            sse latency p50=14µs p99=37µs max=996µs
+r7 A oneshot-e2 finished in 2.48s, 807958.72 req/s, 34.68MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 A oneshot-e8 finished in 821.99ms, 2433119.62 req/s, 104.42MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r7 A oneshot-lat-e2 n=2000000 p50us=287 p99us=390 maxus=86587 non200=0 threads=229,229,0,0,0 finished in 2.40s, 833921.60 req/s, 35.79MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before perf round 8
+r8 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000113
+r8 PL sse200 PL           sse latency p50=10µs p99=20µs max=1.775ms
+r8 PL oneshot-e2 finished in 2.65s, 755679.69 req/s, 32.43MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 PL oneshot-e8 finished in 949.34ms, 2106722.34 req/s, 90.41MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 PL oneshot-lat-e2 n=2000000 p50us=641 p99us=746 maxus=1981 non200=0 threads=247,247,0,0,0,0 finished in 2.65s, 753334.82 req/s, 32.33MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 PA sse200 PA           streams=200 conns=1 opened=181 delivering=0 failed=19 events=0
+r8 PA sse200 PA           NO EVENTS — SSE delivered nothing while the connection was live
+r8 PA oneshot-e2 finished in 2.58s, 774489.55 req/s, 33.24MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 PA oneshot-e8 finished in 893.16ms, 2239235.44 req/s, 96.10MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 PA oneshot-lat-e2 n=2000000 p50us=608 p99us=740 maxus=2180 non200=0 threads=239,239,0,0,0,0 finished in 2.50s, 800532.51 req/s, 34.36MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000083
+r8 WSN sse200 WSN          sse latency p50=10µs p99=24µs max=1.888ms
+r8 WSN oneshot-e2 finished in 2.60s, 769882.80 req/s, 33.04MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 WSN oneshot-e8 finished in 888.42ms, 2251177.37 req/s, 96.61MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 WSN oneshot-lat-e2 n=2000000 p50us=505 p99us=1053 maxus=2170 non200=0 threads=273,270,0,0,0,0 finished in 2.88s, 694373.32 req/s, 29.80MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000060
+r8 A sse200 A            sse latency p50=14µs p99=37µs max=956µs
+r8 A oneshot-e2 finished in 2.61s, 767012.92 req/s, 32.92MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 A oneshot-e8 finished in 829.18ms, 2412036.06 req/s, 103.52MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 A oneshot-lat-e2 n=2000000 p50us=374 p99us=495 maxus=1546135 non200=0 threads=236,235,0,0,0 finished in 2.51s, 796778.15 req/s, 34.20MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 WS sse200 WS           streams=200 conns=1 opened=163 delivering=0 failed=37 events=0
+r8 WS sse200 WS           NO EVENTS — SSE delivered nothing while the connection was live
+r8 WS oneshot-e2 finished in 2.40s, 834310.87 req/s, 35.81MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 WS oneshot-e8 finished in 828.27ms, 2414668.63 req/s, 103.63MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r8 WS oneshot-lat-e2 n=2000000 p50us=395 p99us=905 maxus=2212 non200=0 threads=233,231,0,0,0,0 finished in 2.42s, 826716.16 req/s, 35.48MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.01 (2324 qemu-system-x86) limit=0.3 before perf round 9
+r9 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000076
+r9 PA sse200 PA           sse latency p50=10µs p99=24µs max=1.027ms
+r9 PA oneshot-e2 finished in 2.54s, 787002.50 req/s, 33.78MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 PA oneshot-e8 finished in 905.67ms, 2208314.75 req/s, 94.77MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 PA oneshot-lat-e2 n=2000000 p50us=592 p99us=738 maxus=1982 non200=0 threads=239,237,0,0,0 finished in 2.48s, 805561.92 req/s, 34.57MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000107
+r9 WSN sse200 WSN          sse latency p50=11µs p99=40µs max=1.888ms
+r9 WSN oneshot-e2 finished in 2.65s, 755642.86 req/s, 32.43MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 WSN oneshot-e8 finished in 839.20ms, 2383224.96 req/s, 102.28MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 WSN oneshot-lat-e2 n=2000000 p50us=465 p99us=948 maxus=1866 non200=0 threads=245,244,0,0 finished in 2.56s, 779991.05 req/s, 33.47MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000067
+r9 A sse200 A            sse latency p50=14µs p99=38µs max=1.245ms
+r9 A oneshot-e2 finished in 2.51s, 795367.78 req/s, 34.13MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 A oneshot-e8 finished in 839.19ms, 2383256.20 req/s, 102.28MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 A oneshot-lat-e2 n=2000000 p50us=283 p99us=390 maxus=1106452 non200=0 threads=232,231,0,0,0,0 finished in 2.42s, 827707.34 req/s, 35.52MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 WS sse200 WS           streams=200 conns=1 opened=184 delivering=0 failed=16 events=0
+r9 WS sse200 WS           NO EVENTS — SSE delivered nothing while the connection was live
+r9 WS oneshot-e2 finished in 2.40s, 833271.53 req/s, 35.76MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 WS oneshot-e8 finished in 849.59ms, 2354090.53 req/s, 101.03MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 WS oneshot-lat-e2 n=2000000 p50us=456 p99us=784 maxus=1941 non200=0 threads=230,230,0,0,0 finished in 2.40s, 833724.14 req/s, 35.78MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000094
+r9 PL sse200 PL           sse latency p50=11µs p99=23µs max=1.694ms
+r9 PL oneshot-e2 finished in 2.49s, 803424.52 req/s, 34.48MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 PL oneshot-e8 finished in 890.43ms, 2246108.34 req/s, 96.40MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r9 PL oneshot-lat-e2 n=2000000 p50us=599 p99us=687 maxus=1997 non200=0 threads=239,232,0,0,0 finished in 2.49s, 804244.48 req/s, 34.52MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.08 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before perf round 10
+r10 WSN sse200 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000070
+r10 WSN sse200 WSN          sse latency p50=10µs p99=29µs max=797µs
+r10 WSN oneshot-e2 finished in 2.56s, 780582.85 req/s, 33.50MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 WSN oneshot-e8 finished in 842.55ms, 2373740.73 req/s, 101.87MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 WSN oneshot-lat-e2 n=2000000 p50us=576 p99us=747 maxus=2341 non200=0 threads=234,233,0,0,0,0 finished in 2.44s, 820165.91 req/s, 35.20MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 A sse200 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000069
+r10 A sse200 A            sse latency p50=12µs p99=32µs max=1.049ms
+r10 A oneshot-e2 finished in 2.59s, 773408.66 req/s, 33.19MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 A oneshot-e8 finished in 837.70ms, 2387486.70 req/s, 102.46MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 A oneshot-lat-e2 n=2000000 p50us=294 p99us=408 maxus=1371812 non200=0 threads=234,234,0,0,0 finished in 2.45s, 817229.15 req/s, 35.07MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 WS sse200 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000071
+r10 WS sse200 WS           sse latency p50=11µs p99=44µs max=1.415ms
+r10 WS oneshot-e2 finished in 2.45s, 817227.82 req/s, 35.07MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 WS oneshot-e8 finished in 844.90ms, 2367138.44 req/s, 101.59MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 WS oneshot-lat-e2 n=2000000 p50us=473 p99us=894 maxus=2071 non200=0 threads=234,232,0,0,0,0 finished in 2.44s, 820189.46 req/s, 35.20MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 PL sse200 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000072
+r10 PL sse200 PL           sse latency p50=11µs p99=22µs max=850µs
+r10 PL oneshot-e2 finished in 2.49s, 802696.10 req/s, 34.45MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 PL oneshot-e8 finished in 905.77ms, 2208068.50 req/s, 94.76MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 PL oneshot-lat-e2 n=2000000 p50us=617 p99us=837 maxus=2327 non200=0 threads=248,245,0,0,0 finished in 2.61s, 766616.02 req/s, 32.90MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 PA sse200 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000076
+r10 PA sse200 PA           sse latency p50=11µs p99=34µs max=1.187ms
+r10 PA oneshot-e2 finished in 2.76s, 724132.62 req/s, 31.08MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 PA oneshot-e8 finished in 898.78ms, 2225231.23 req/s, 95.50MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r10 PA oneshot-lat-e2 n=2000000 p50us=597 p99us=742 maxus=1660 non200=0 threads=238,237,0,0,0,0 finished in 2.48s, 807049.09 req/s, 34.64MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+-- host check before phase 2 --
+ 16:25:37 up 1 day,  5:20,  2 users,  load average: 1.86, 1.98, 2.07
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+    149 root      20   0       0      0      0 S   4.9   0.0   0:00.08 ksoftirqd/21
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.06 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before phase 2
+== phase 2: burst fail-close rate (60 rounds per arm, arms: WS PL PA) ==
+b1 WS burst OK overflow=0 stage_failed=0
+b1 PL burst OK overflow=0 stage_failed=0
+b1 PA burst OK overflow=0 stage_failed=0
+b2 PL burst OK overflow=0 stage_failed=0
+b2 PA burst OK overflow=0 stage_failed=0
+b2 WS burst OK overflow=0 stage_failed=0
+b3 PA burst OK overflow=0 stage_failed=0
+b3 WS burst OK overflow=0 stage_failed=0
+b3 PL burst OK overflow=0 stage_failed=0
+b4 WS burst OK overflow=0 stage_failed=0
+b4 PL burst OK overflow=0 stage_failed=0
+b4 PA burst OK overflow=0 stage_failed=0
+b5 PL burst OK overflow=0 stage_failed=0
+b5 PA burst OK overflow=0 stage_failed=0
+b5 WS burst OK overflow=0 stage_failed=0
+b6 PA burst OK overflow=0 stage_failed=0
+b6 WS burst OK overflow=0 stage_failed=0
+b6 PL burst OK overflow=0 stage_failed=0
+b7 WS burst OK overflow=0 stage_failed=0
+b7 PL burst OK overflow=0 stage_failed=0
+b7 PA burst OK overflow=0 stage_failed=0
+b8 PL burst OK overflow=0 stage_failed=0
+b8 PA burst OK overflow=0 stage_failed=0
+b8 WS burst OK overflow=0 stage_failed=0
+b9 PA burst OK overflow=0 stage_failed=0
+b9 WS burst FAIL burst        streams=200 conns=1 opened=186 delivering=44 failed=14 events=88022 overflow=1 stage_failed=0
+b9 WS burst-log 
+b9 PL burst OK overflow=0 stage_failed=0
+b10 WS burst OK overflow=0 stage_failed=0
+b10 PL burst OK overflow=0 stage_failed=0
+b10 PA burst FAIL burst        streams=200 conns=1 opened=150 delivering=0 failed=50 events=0 overflow=1 stage_failed=0
+b10 PA burst-log 
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before burst round 11
+b11 PL burst OK overflow=0 stage_failed=0
+b11 PA burst OK overflow=0 stage_failed=0
+b11 WS burst OK overflow=0 stage_failed=0
+b12 PA burst OK overflow=0 stage_failed=0
+b12 WS burst OK overflow=0 stage_failed=0
+b12 PL burst OK overflow=0 stage_failed=0
+b13 WS burst OK overflow=0 stage_failed=0
+b13 PL burst OK overflow=0 stage_failed=0
+b13 PA burst OK overflow=0 stage_failed=0
+b14 PL burst OK overflow=0 stage_failed=0
+b14 PA burst OK overflow=0 stage_failed=0
+b14 WS burst OK overflow=0 stage_failed=0
+b15 PA burst FAIL burst        streams=200 conns=1 opened=186 delivering=0 failed=14 events=0 overflow=1 stage_failed=0
+b15 PA burst-log 
+b15 WS burst OK overflow=0 stage_failed=0
+b15 PL burst OK overflow=0 stage_failed=0
+b16 WS burst OK overflow=0 stage_failed=0
+b16 PL burst OK overflow=0 stage_failed=0
+b16 PA burst OK overflow=0 stage_failed=0
+b17 PL burst OK overflow=0 stage_failed=0
+b17 PA burst OK overflow=0 stage_failed=0
+b17 WS burst FAIL burst        streams=200 conns=1 opened=178 delivering=0 failed=22 events=0 overflow=1 stage_failed=0
+b17 WS burst-log 
+b18 PA burst OK overflow=0 stage_failed=0
+b18 WS burst OK overflow=0 stage_failed=0
+b18 PL burst OK overflow=0 stage_failed=0
+b19 WS burst OK overflow=0 stage_failed=0
+b19 PL burst OK overflow=0 stage_failed=0
+b19 PA burst OK overflow=0 stage_failed=0
+b20 PL burst OK overflow=0 stage_failed=0
+b20 PA burst FAIL burst        streams=200 conns=1 opened=158 delivering=0 failed=42 events=0 overflow=1 stage_failed=0
+b20 PA burst-log 
+b20 WS burst OK overflow=0 stage_failed=0
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before burst round 21
+b21 PA burst OK overflow=0 stage_failed=0
+b21 WS burst OK overflow=0 stage_failed=0
+b21 PL burst OK overflow=0 stage_failed=0
+b22 WS burst OK overflow=0 stage_failed=0
+b22 PL burst OK overflow=0 stage_failed=0
+b22 PA burst OK overflow=0 stage_failed=0
+b23 PL burst OK overflow=0 stage_failed=0
+b23 PA burst OK overflow=0 stage_failed=0
+b23 WS burst OK overflow=0 stage_failed=0
+b24 PA burst OK overflow=0 stage_failed=0
+b24 WS burst FAIL burst        streams=200 conns=1 opened=182 delivering=70 failed=18 events=140030 overflow=1 stage_failed=0
+b24 WS burst-log 
+b24 PL burst OK overflow=0 stage_failed=0
+b25 WS burst OK overflow=0 stage_failed=0
+b25 PL burst OK overflow=0 stage_failed=0
+b25 PA burst OK overflow=0 stage_failed=0
+b26 PL burst OK overflow=0 stage_failed=0
+b26 PA burst FAIL burst        streams=200 conns=1 opened=144 delivering=0 failed=56 events=0 overflow=1 stage_failed=0
+b26 PA burst-log 
+b26 WS burst FAIL burst        streams=200 conns=1 opened=173 delivering=0 failed=27 events=0 overflow=1 stage_failed=0
+b26 WS burst-log 
+b27 PA burst OK overflow=0 stage_failed=0
+b27 WS burst OK overflow=0 stage_failed=0
+b27 PL burst OK overflow=0 stage_failed=0
+b28 WS burst OK overflow=0 stage_failed=0
+b28 PL burst OK overflow=0 stage_failed=0
+b28 PA burst OK overflow=0 stage_failed=0
+b29 PL burst OK overflow=0 stage_failed=0
+b29 PA burst OK overflow=0 stage_failed=0
+b29 WS burst OK overflow=0 stage_failed=0
+b30 PA burst OK overflow=0 stage_failed=0
+b30 WS burst OK overflow=0 stage_failed=0
+b30 PL burst OK overflow=0 stage_failed=0
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.43 limit=0.5 top_process_cores=0.38 (319713 qmdsync-tasks) limit=0.3 before burst round 31
+HOST-BUSY-WAIT before burst round 31: 0.43 cores busy; waiting 30 s (waited 0s so far)
+-- host check before burst round 31 --
+ 16:30:48 up 1 day,  5:25,  2 users,  load average: 0.84, 1.33, 1.76
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.07 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-kvfree_rcu_reclaim
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before burst round 31
+b31 WS burst OK overflow=0 stage_failed=0
+b31 PL burst OK overflow=0 stage_failed=0
+b31 PA burst OK overflow=0 stage_failed=0
+b32 PL burst OK overflow=0 stage_failed=0
+b32 PA burst OK overflow=0 stage_failed=0
+b32 WS burst OK overflow=0 stage_failed=0
+b33 PA burst OK overflow=0 stage_failed=0
+b33 WS burst OK overflow=0 stage_failed=0
+b33 PL burst OK overflow=0 stage_failed=0
+b34 WS burst OK overflow=0 stage_failed=0
+b34 PL burst OK overflow=0 stage_failed=0
+b34 PA burst OK overflow=0 stage_failed=0
+b35 PL burst OK overflow=0 stage_failed=0
+b35 PA burst OK overflow=0 stage_failed=0
+b35 WS burst OK overflow=0 stage_failed=0
+b36 PA burst OK overflow=0 stage_failed=0
+b36 WS burst OK overflow=0 stage_failed=0
+b36 PL burst OK overflow=0 stage_failed=0
+b37 WS burst OK overflow=0 stage_failed=0
+b37 PL burst OK overflow=0 stage_failed=0
+b37 PA burst OK overflow=0 stage_failed=0
+b38 PL burst OK overflow=0 stage_failed=0
+b38 PA burst FAIL burst        streams=200 conns=1 opened=170 delivering=0 failed=30 events=0 overflow=1 stage_failed=0
+b38 PA burst-log 
+b38 WS burst OK overflow=0 stage_failed=0
+b39 PA burst OK overflow=0 stage_failed=0
+b39 WS burst OK overflow=0 stage_failed=0
+b39 PL burst OK overflow=0 stage_failed=0
+b40 WS burst OK overflow=0 stage_failed=0
+b40 PL burst OK overflow=0 stage_failed=0
+b40 PA burst OK overflow=0 stage_failed=0
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before burst round 41
+b41 PL burst OK overflow=0 stage_failed=0
+b41 PA burst OK overflow=0 stage_failed=0
+b41 WS burst FAIL burst        streams=200 conns=1 opened=162 delivering=12 failed=38 events=24006 overflow=1 stage_failed=0
+b41 WS burst-log 
+b42 PA burst OK overflow=0 stage_failed=0
+b42 WS burst OK overflow=0 stage_failed=0
+b42 PL burst OK overflow=0 stage_failed=0
+b43 WS burst OK overflow=0 stage_failed=0
+b43 PL burst OK overflow=0 stage_failed=0
+b43 PA burst OK overflow=0 stage_failed=0
+b44 PL burst OK overflow=0 stage_failed=0
+b44 PA burst OK overflow=0 stage_failed=0
+b44 WS burst OK overflow=0 stage_failed=0
+b45 PA burst OK overflow=0 stage_failed=0
+b45 WS burst OK overflow=0 stage_failed=0
+b45 PL burst OK overflow=0 stage_failed=0
+b46 WS burst OK overflow=0 stage_failed=0
+b46 PL burst OK overflow=0 stage_failed=0
+b46 PA burst OK overflow=0 stage_failed=0
+b47 PL burst OK overflow=0 stage_failed=0
+b47 PA burst OK overflow=0 stage_failed=0
+b47 WS burst OK overflow=0 stage_failed=0
+b48 PA burst OK overflow=0 stage_failed=0
+b48 WS burst OK overflow=0 stage_failed=0
+b48 PL burst OK overflow=0 stage_failed=0
+b49 WS burst OK overflow=0 stage_failed=0
+b49 PL burst OK overflow=0 stage_failed=0
+b49 PA burst OK overflow=0 stage_failed=0
+b50 PL burst OK overflow=0 stage_failed=0
+b50 PA burst OK overflow=0 stage_failed=0
+b50 WS burst OK overflow=0 stage_failed=0
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.08 limit=0.5 top_process_cores=0.02 (319713 qmdsync-tasks) limit=0.3 before burst round 51
+b51 PA burst OK overflow=0 stage_failed=0
+b51 WS burst OK overflow=0 stage_failed=0
+b51 PL burst OK overflow=0 stage_failed=0
+b52 WS burst OK overflow=0 stage_failed=0
+b52 PL burst OK overflow=0 stage_failed=0
+b52 PA burst OK overflow=0 stage_failed=0
+b53 PL burst OK overflow=0 stage_failed=0
+b53 PA burst OK overflow=0 stage_failed=0
+b53 WS burst OK overflow=0 stage_failed=0
+b54 PA burst OK overflow=0 stage_failed=0
+b54 WS burst OK overflow=0 stage_failed=0
+b54 PL burst OK overflow=0 stage_failed=0
+b55 WS burst OK overflow=0 stage_failed=0
+b55 PL burst OK overflow=0 stage_failed=0
+b55 PA burst OK overflow=0 stage_failed=0
+b56 PL burst OK overflow=0 stage_failed=0
+b56 PA burst OK overflow=0 stage_failed=0
+b56 WS burst OK overflow=0 stage_failed=0
+b57 PA burst OK overflow=0 stage_failed=0
+b57 WS burst OK overflow=0 stage_failed=0
+b57 PL burst OK overflow=0 stage_failed=0
+b58 WS burst FAIL burst        streams=200 conns=1 opened=123 delivering=0 failed=77 events=0 overflow=1 stage_failed=0
+b58 WS burst-log 
+b58 PL burst OK overflow=0 stage_failed=0
+b58 PA burst OK overflow=0 stage_failed=0
+b59 PL burst OK overflow=0 stage_failed=0
+b59 PA burst OK overflow=0 stage_failed=0
+b59 WS burst OK overflow=0 stage_failed=0
+b60 PA burst OK overflow=0 stage_failed=0
+b60 WS burst OK overflow=0 stage_failed=0
+b60 PL burst OK overflow=0 stage_failed=0
+-- host check before phase 3 --
+ 16:35:36 up 1 day,  5:30,  2 users,  load average: 1.55, 1.39, 1.67
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   1322 avahi     20   0    7424   5800   4112 S   4.9   0.0   0:15.30 avahi-daemon
+      1 root      20   0   22136  16388  11032 S   0.0   0.1   0:03.07 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.05 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.01 (2324 qemu-system-x86) limit=0.3 before phase 3
+== phase 3: server CPU per event at a FIXED offered load ==
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.06 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before cpu round 1
+c1 A cpu200 ticks=705 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000070
+c1 A cpu500 ticks=1302 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000309
+c1 WS cpu200 ticks=868 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000087
+c1 WS cpu500 ticks=1608 tck=100 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000393
+c1 PL cpu200 ticks=473 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000059
+c1 PL cpu500 ticks=1185 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000346
+c1 PA cpu200 ticks=635 tck=100 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000093
+c1 PA cpu500 ticks=1366 tck=100 PA           streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999767
+c1 WSN cpu200 ticks=864 tck=100 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000093
+c1 WSN cpu500 ticks=1001 tck=100 WSN          streams=500 conns=1 opened=438 delivering=244 failed=62 events=2440108
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.06 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before cpu round 2
+c2 WS cpu200 ticks=862 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000057
+c2 WS cpu500 ticks=1052 tck=100 WS           streams=500 conns=1 opened=482 delivering=256 failed=18 events=2560138
+c2 PL cpu200 ticks=494 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000057
+c2 PL cpu500 ticks=1147 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000130
+c2 PA cpu200 ticks=731 tck=100 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000145
+c2 PA cpu500 ticks=822 tck=100 PA           streams=500 conns=1 opened=335 delivering=256 failed=165 events=2560136
+c2 WSN cpu200 ticks=896 tck=100 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000072
+c2 WSN cpu500 ticks=1524 tck=100 WSN          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000154
+c2 A cpu200 ticks=653 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000092
+c2 A cpu500 ticks=936 tck=100 A            streams=500 conns=1 opened=449 delivering=295 failed=51 events=2950085
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before cpu round 3
+c3 PL cpu200 ticks=469 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000090
+c3 PL cpu500 ticks=1079 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999809
+c3 PA cpu200 ticks=125 tck=100 PA           streams=200 conns=1 opened=166 delivering=36 failed=34 events=360021
+c3 PA cpu500 ticks=1414 tck=100 PA           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000202
+c3 WSN cpu200 ticks=934 tck=100 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000108
+c3 WSN cpu500 ticks=938 tck=100 WSN          streams=500 conns=1 opened=428 delivering=244 failed=72 events=2440050
+c3 A cpu200 ticks=702 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000080
+c3 A cpu500 ticks=1291 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000349
+c3 WS cpu200 ticks=860 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000102
+c3 WS cpu500 ticks=1474 tck=100 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000087
+busy_cores=0.11 limit=0.5 top_process_cores=0.02 (319713 qmdsync-tasks) limit=0.3 before cpu round 4
+awk: warning: escape sequence `\.' treated as plain `.'
+c4 PA cpu200 ticks=754 tck=100 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000089
+c4 PA cpu500 ticks=1390 tck=100 PA           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000316
+c4 WSN cpu200 ticks=811 tck=100 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000103
+c4 WSN cpu500 ticks=1498 tck=100 WSN          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000190
+c4 A cpu200 ticks=759 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000118
+c4 A cpu500 ticks=1249 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000179
+c4 WS cpu200 ticks=849 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000098
+c4 WS cpu500 ticks=1223 tck=100 WS           streams=500 conns=1 opened=451 delivering=328 failed=49 events=3280101
+c4 PL cpu200 ticks=474 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000083
+c4 PL cpu500 ticks=1250 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000364
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.16 limit=0.5 top_process_cores=0.02 (319713 qmdsync-tasks) limit=0.3 before cpu round 5
+c5 WSN cpu200 ticks=0 tck=100 WSN          streams=200 conns=1 opened=175 delivering=0 failed=25 events=0
+c5 WSN cpu500 ticks=1551 tck=100 WSN          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000366
+c5 A cpu200 ticks=0 tck=100 A            streams=200 conns=1 opened=197 delivering=0 failed=3 events=0
+c5 A cpu500 ticks=1253 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000168
+c5 WS cpu200 ticks=901 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000070
+c5 WS cpu500 ticks=111 tck=100 WS           streams=500 conns=1 opened=354 delivering=22 failed=146 events=220003
+c5 PL cpu200 ticks=492 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000067
+c5 PL cpu500 ticks=1194 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000192
+c5 PA cpu200 ticks=710 tck=100 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000068
+c5 PA cpu500 ticks=1458 tck=100 PA           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000324
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before cpu round 6
+c6 A cpu200 ticks=703 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000103
+c6 A cpu500 ticks=1301 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000357
+c6 WS cpu200 ticks=0 tck=100 WS           streams=200 conns=1 opened=146 delivering=0 failed=54 events=0
+c6 WS cpu500 ticks=1037 tck=100 WS           streams=500 conns=1 opened=402 delivering=256 failed=98 events=2560124
+c6 PL cpu200 ticks=506 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000078
+c6 PL cpu500 ticks=1225 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000192
+c6 PA cpu200 ticks=700 tck=100 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000113
+c6 PA cpu500 ticks=978 tck=100 PA           streams=500 conns=1 opened=429 delivering=319 failed=71 events=3190162
+c6 WSN cpu200 ticks=913 tck=100 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000054
+c6 WSN cpu500 ticks=1562 tck=100 WSN          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000362
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2324 qemu-system-x86) limit=0.3 before cpu round 7
+awk: warning: escape sequence `\.' treated as plain `.'
+c7 WS cpu200 ticks=897 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000128
+c7 WS cpu500 ticks=1234 tck=100 WS           streams=500 conns=1 opened=479 delivering=338 failed=21 events=3380190
+c7 PL cpu200 ticks=497 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000093
+c7 PL cpu500 ticks=1163 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000308
+c7 PA cpu200 ticks=719 tck=100 PA           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000122
+c7 PA cpu500 ticks=1358 tck=100 PA           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000266
+c7 WSN cpu200 ticks=887 tck=100 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000091
+c7 WSN cpu500 ticks=1048 tck=100 WSN          streams=500 conns=1 opened=468 delivering=254 failed=32 events=2540122
+c7 A cpu200 ticks=698 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000096
+c7 A cpu500 ticks=1289 tck=100 A            streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000200
+awk: warning: escape sequence `\.' treated as plain `.'
+busy_cores=0.08 limit=0.5 top_process_cores=0.01 (2324 qemu-system-x86) limit=0.3 before cpu round 8
+c8 PL cpu200 ticks=513 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000070
+c8 PL cpu500 ticks=1080 tck=100 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999696
+c8 PA cpu200 ticks=0 tck=100 PA           streams=200 conns=1 opened=172 delivering=0 failed=28 events=0
+c8 PA cpu500 ticks=77 tck=100 PA           streams=500 conns=1 opened=357 delivering=12 failed=143 events=120003
+c8 WSN cpu200 ticks=880 tck=100 WSN          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000103
+c8 WSN cpu500 ticks=1229 tck=100 WSN          streams=500 conns=1 opened=470 delivering=329 failed=30 events=3290084
+c8 A cpu200 ticks=696 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000091
+c8 A cpu500 ticks=841 tck=100 A            streams=500 conns=1 opened=409 delivering=282 failed=91 events=2820101
+c8 WS cpu200 ticks=851 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000069
+c8 WS cpu500 ticks=1531 tck=100 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000303
+== rows=460 ==
+exit=0

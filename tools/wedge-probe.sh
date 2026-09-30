@@ -85,7 +85,7 @@ trap cleanup EXIT INT TERM
 bench_lock
 : >"$OUT/server.log"
 # SERVER_ARGS holds extra bench-server flags for A/B arms
-# (for example: SERVER_ARGS="--no-task-migration"). Word splitting is intended.
+# (for example: SERVER_ARGS="--diag"). Word splitting is intended.
 "$STARH2" --mode tls --port 0 --executors "$STARH2_EXECUTORS" \
   --cert "$REPO/testdata/cert.pem" --key "$REPO/testdata/key.pem" \
   ${SERVER_ARGS:-} \

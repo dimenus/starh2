@@ -1,0 +1,7 @@
+warning: overwriting existing dependency named 'zio'
+macos-sdk: no rejected SDK to probe
+arm zb79bb22: base=treeA src=git+https://github.com/lalinsky/zio#b79bb22e96ece0d408698cc5c3cf94ad707657c2
+arm zb79bb22: zio-0.17.0-xHbVVC_8KACqE5YMsydhHNVSPuBfYXhDaOStdq9WkvTR
+arm zb79bb22: pub const task_migration: bool = true;
+arm zb79bb22: sha256=847d4d8ee1a9edc45a6024102eea7a80332710d325f4b4769ad0f98b98af1235
+exit=0

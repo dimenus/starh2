@@ -1,0 +1,39 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  A  zio-0.17.0-xHbVVKy_KACrmjGRFj5FBs34dw6eCHjsfsj0-0bEMT24  sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/treeA
+  zc8732b4  zio-0.18.0-xHbVVH7hKQCpf4Fg4sdx6rAkhKYEpFMCrQCdOXOAxTKg  sha256=396444a67c5afeeebbf9c8a99ba0a2e9deed2a66f18f8cd1f3819dbca6ab654c  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/tree-zc8732b4
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 13:09:57 up 1 day,  2:04,  3 users,  load average: 0.60, 1.30, 1.43
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/zio-pin-bisect/A-server sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab
+  ran /tmp/zio-pin-bisect/zc8732b4-server sha256=396444a67c5afeeebbf9c8a99ba0a2e9deed2a66f18f8cd1f3819dbca6ab654c
+-- host check before phase 3 --
+ 13:09:57 up 1 day,  2:04,  3 users,  load average: 0.60, 1.30, 1.43
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2324 libvirt+  20   0    9.9g   5.0g  21540 S   4.9  16.4  53:17.58 qemu-system-x86
+      1 root      20   0   21236  16092  11032 S   0.0   0.1   0:02.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.04 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+busy_cores=0.07 limit=1.5
+== phase 3: server CPU per event at a FIXED offered load ==
+c1 A cpu200 ticks=708 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000099
+c1 zc8732b4 cpu200 ticks=868 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000142
+c2 zc8732b4 cpu200 ticks=855 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000094
+c2 A cpu200 ticks=732 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000113
+c3 A cpu200 ticks=700 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000054
+c3 zc8732b4 cpu200 ticks=894 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000065
+c4 zc8732b4 cpu200 ticks=886 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000059
+c4 A cpu200 ticks=699 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000055
+c5 A cpu200 ticks=719 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000092
+c5 zc8732b4 cpu200 ticks=881 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000093
+c6 zc8732b4 cpu200 ticks=841 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000035
+c6 A cpu200 ticks=766 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000084
+c7 A cpu200 ticks=718 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000074
+c7 zc8732b4 cpu200 ticks=913 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000057
+c8 zc8732b4 cpu200 ticks=869 tck=100 zc8732b4     streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000050
+c8 A cpu200 ticks=669 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000083
+== rows=16 ==
+exit=0

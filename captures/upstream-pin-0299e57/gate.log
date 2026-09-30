@@ -1,0 +1,41 @@
+== zio-pin-gate candidate=0299e5771b8c042ca42077af0748771fca27d38e out=/tmp/zio-pin-gate.tOE3Lh
+== phase 1: zig fmt --check
+  fmt clean
+== phase 2: zio suite
+  687 of 687 tests passed
+== phase 3: examples cross-target build
+  native: 18 artifacts
+  x86_64-windows-gnu: 36 artifacts
+== phase 4: two-driver misuse death test
+./tools/zio-pin-gate/gate.sh: line 137: 31089 Abort trap: 6           timeout 60 "$OUT/misuse-repro/zig-out/bin/cq-misuse-repro" > "$OUT/misuse-run.log" 2>&1
+  misuse: DETECTED (panic at the point of misuse - the single-driver contract holds)
+== phase 5: conservation repros
+  select-cancel: clean
+  select-clobber: clean
+== phase 6: cq spurious-win repro (3 runs, 8 workers)
+  run1 rc=0
+  run2 rc=0
+  run3 rc=0
+  cq-repro: CLEAN (protocol race not observed - upstream-drop bar met)
+== phase 7: h2spec x2 (Darwin h2c, ReleaseSafe)
+  95 tests, 89 passed, 0 skipped, 6 failed
+  95 tests, 88 passed, 0 skipped, 7 failed
+  5.1/12 passed 2/2
+== phase 8: collapse probe (15 rounds on ryan@100.113.184.27)
+  round 1: OK events=2000114 failed=0
+  round 2: OK events=2000113 failed=0
+  round 3: OK events=2000081 failed=0
+  round 4: OK events=2000059 failed=0
+  round 5: OK events=2000074 failed=0
+  round 6: OK events=2000161 failed=0
+  round 7: OK events=2000082 failed=0
+  round 8: OK events=2000081 failed=0
+  round 9: OK events=2000122 failed=0
+  round 10: OK events=2000061 failed=0
+  round 11: OK events=2000065 failed=0
+  round 12: FAILCLOSED events=270014 failed=51
+  round 13: OK events=2000105 failed=0
+  round 14: OK events=2000129 failed=0
+  round 15: OK events=2000068 failed=0
+  PROBE-SUMMARY rounds=15 silent=0 visible_failclosed=1
+== VERDICT: PASS-CLEAN

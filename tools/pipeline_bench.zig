@@ -815,7 +815,6 @@ pub fn main(init: std.process.Init) !void {
             .prewarm = 256,
         },
         .executors = .auto,
-        .enable_task_migration = true,
     });
     defer rt.deinit();
     var handle = try rt.spawn(runMain, .{ rt, init.minimal.args, init.gpa });

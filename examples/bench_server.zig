@@ -20,7 +20,8 @@ const starh2 = @import("starh2");
 
 const dummy: u8 = 0;
 
-const trace = starh2.edge.connection.trace;
+const conn_mod = starh2.edge.connection;
+const trace = conn_mod.trace;
 const write_trace = starh2.edge.wire_pump.write_trace;
 
 /// Bench-only counting wrapper. Installed on the server GPA when `--trace` is
@@ -272,6 +273,35 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             write_trace.max_chunks.load(.acquire),
         },
     );
+    // Both stay 0 unless the build is pinned or single_executor AND Debug or
+    // -Dobserve=true; `placement_check` says which, so a 0 cannot pass for a
+    // check that never ran.
+    try w.print(
+        "\"placement_check\":{d},\"placement_checks\":{d},\"placement_mismatches\":{d},",
+        .{
+            @intFromBool(conn_mod.placement_check),
+            conn_mod.test_placement_checks.load(.acquire),
+            conn_mod.test_placement_mismatches.load(.acquire),
+        },
+    );
+    // Placement probe: per thread (kernel tid), how many units of work each
+    // kind of task ran there. Empty unless placement_check.
+    try w.print("\"probe_pid\":{d},\"probe_overflow\":{d},\"probe\":[", .{
+        if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0,
+        conn_mod.probe_overflow.load(.acquire),
+    });
+    var first_slot = true;
+    for (&conn_mod.probe_tids, 0..) |*slot, i| {
+        const tid = slot.load(.acquire);
+        if (tid == 0) continue;
+        try w.print("{s}{{\"tid\":{d}", .{ if (first_slot) "" else ",", tid });
+        first_slot = false;
+        inline for (@typeInfo(conn_mod.ProbeKind).@"enum".fields) |f| {
+            try w.print(",\"{s}\":{d}", .{ f.name, conn_mod.probe_counts[f.value][i].load(.acquire) });
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("],");
     try w.print(
         "\"encrypt_ns\":{d},\"encrypt_n\":{d},\"encrypt_bytes\":{d}," ++
             "\"decrypt_ns\":{d},\"decrypt_n\":{d},\"decrypt_in\":{d},\"decrypt_plain\":{d}," ++
@@ -410,6 +440,7 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
     var next: i128 = std.Io.Clock.awake.now(g_io).nanoseconds + interval_ns;
     while (true) {
         _ = g_cadence.loops.fetchAdd(1, .monotonic);
+        conn_mod.probeNote(.handler_iter);
         const now_ns: i128 = std.Io.Clock.awake.now(g_io).nanoseconds;
         const deadline = next;
         if (deadline > now_ns) {
@@ -567,10 +598,6 @@ const Args = struct {
     trace: bool = false,
     trace_every: u64 = 1024,
     executors: ?u8 = null,
-    // Default ON since the two-OS t-853 gate: both 60-round stall runs were
-    // clean with migration on, and migration off is the home of the bimodal
-    // placement bands. --no-task-migration keeps the A/B arm reachable.
-    task_migration: bool = true,
     // A/B knob (zio fork announce-ab): whether a wake from a running task
     // onto an empty ring wakes a parked executor. Needs a zio pin that
     // exports `setAnnounceRunningWakes`; the flag fails loud otherwise.
@@ -581,6 +608,9 @@ const Args = struct {
     /// oneshots on one connection, then shut down. Hyperfine/poop measure the
     /// whole program. Zero is refused: a no-op self-drive is not a result.
     self_drive_oneshots: ?usize = null,
+    /// A/B knob: where a connection spawns its own tasks. Null keeps the
+    /// build's `conn_placement`.
+    spawn_placement: ?zio.Placement = null,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
@@ -605,10 +635,6 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.trace_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--executors")) {
             out.executors = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
-        } else if (std.mem.eql(u8, a, "--task-migration")) {
-            out.task_migration = true;
-        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
-            out.task_migration = false;
         } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
             out.announce_running_wakes = true;
         } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
@@ -623,6 +649,55 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidSelfDriveCount;
             out.self_drive_oneshots = n;
+        } else if (std.mem.eql(u8, a, "--spawn-placement")) {
+            const v = args.next() orelse return error.MissingValue;
+            if (std.mem.eql(u8, v, "auto")) {
+                out.spawn_placement = .auto;
+            } else if (std.mem.eql(u8, v, "local")) {
+                // zio would refuse every spawn with InvalidPlacement, and each
+                // refusal is a REFUSED_STREAM, so the run would look like a
+                // slow server instead of a wrong build.
+                if (conn_mod.zio_scheduling == .work_stealing) {
+                    std.debug.print("--spawn-placement local needs -Dzio-scheduling=pinned or single_executor; this build is work_stealing\n", .{});
+                    return error.PlacementNeedsPinnedBuild;
+                }
+                out.spawn_placement = .local;
+            } else {
+                std.debug.print("--spawn-placement takes auto or local, got {s}\n", .{v});
+                return error.InvalidSpawnPlacement;
+            }
+        } else if (std.mem.eql(u8, a, "--conn-balance")) {
+            // EXPERIMENT: load-aware connection placement (see
+            // connection.balancePick). Pinned or single_executor builds only.
+            if (conn_mod.zio_scheduling == .work_stealing) {
+                std.debug.print("--conn-balance needs -Dzio-scheduling=pinned or single_executor\n", .{});
+                return error.ConnBalanceNeedsPinnedBuild;
+            }
+            conn_mod.conn_balance = true;
+        } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
+            // Placement probe: every connection on executor 0 (same), or
+            // alternating executors in accept order (split).
+            const v = args.next() orelse return error.MissingValue;
+            if (!conn_mod.placement_check) {
+                std.debug.print("--probe-conn-placement needs -Dobserve=true and a pinned build\n", .{});
+                return error.ProbeNeedsObserveBuild;
+            }
+            conn_mod.probe_conn_force = std.meta.stringToEnum(conn_mod.ProbeConnForce, v) orelse {
+                std.debug.print("--probe-conn-placement takes none, same or split, got {s}\n", .{v});
+                return error.InvalidProbePlacement;
+            };
+        } else if (std.mem.eql(u8, a, "--probe-handler-placement")) {
+            // Placement probe: force SSE handlers onto the actor's executor
+            // (same) or the other one (other). Needs an observe, pinned build.
+            const v = args.next() orelse return error.MissingValue;
+            if (!conn_mod.placement_check) {
+                std.debug.print("--probe-handler-placement needs -Dobserve=true and a pinned build\n", .{});
+                return error.ProbeNeedsObserveBuild;
+            }
+            conn_mod.probe_handler_force = std.meta.stringToEnum(conn_mod.ProbeForce, v) orelse {
+                std.debug.print("--probe-handler-placement takes none, same or other, got {s}\n", .{v});
+                return error.InvalidProbePlacement;
+            };
         } else {
             return error.UnknownArgument;
         }
@@ -632,7 +707,6 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 
 const RuntimeArgs = struct {
     executors: ?u8 = null,
-    task_migration: bool = true,
     announce_running_wakes: bool = true,
     batch_wake_sleepers: bool = true,
 };
@@ -647,10 +721,6 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
             const n = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidExecutorCount;
             out.executors = n;
-        } else if (std.mem.eql(u8, a, "--task-migration")) {
-            out.task_migration = true;
-        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
-            out.task_migration = false;
         } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
             out.announce_running_wakes = true;
         } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
@@ -883,6 +953,9 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         const sweeper = try std.Thread.spawn(.{}, diagSweeperMain, .{});
         sweeper.detach();
     }
+    conn_mod.placement_override = args.spawn_placement;
+    // Same count the runtime was built with (`.exact` below in main).
+    conn_mod.conn_balance_executors = args.executors orelse starh2.physical_cpus.executorCount();
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;
@@ -934,8 +1007,20 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d}}}\n",
-        .{ if (args.tls) "tls" else "h2c", port, exec_n, @as(u8, @intFromBool(args.announce_running_wakes)), @as(u8, @intFromBool(args.batch_wake_sleepers)) },
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d}}}\n",
+        .{
+            if (args.tls) "tls" else "h2c",
+            port,
+            exec_n,
+            @as(u8, @intFromBool(args.announce_running_wakes)),
+            @as(u8, @intFromBool(args.batch_wake_sleepers)),
+            @tagName(conn_mod.zio_scheduling),
+            @tagName(conn_mod.connPlacement()),
+            @as(u8, @intFromBool(conn_mod.placement_check)),
+            @tagName(conn_mod.probe_handler_force),
+            @tagName(conn_mod.probe_conn_force),
+            @as(u8, @intFromBool(conn_mod.conn_balance)),
+        },
     );
     defer gpa.free(ready);
     var out = zio.stdout().writer(&.{});
@@ -964,10 +1049,6 @@ pub fn main(init: std.process.Init) !void {
             .prewarm = 256,
         },
         .executors = .exact(if (runtime_args.executors) |n| n else starh2.physical_cpus.executorCount()),
-        // zio a2b134a can strand a migrated socket task while both directions
-        // have queued kernel data. Keep I/O tasks on their home executor; the
-        // opt-in flag exists only to preserve the upstream reproducer.
-        .enable_task_migration = runtime_args.task_migration,
     });
     defer rt.deinit();
     // The knob is a process-wide switch in the zio fork (announce-ab); a pin

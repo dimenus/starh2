@@ -15,6 +15,7 @@
 //! capacity formula at known inputs. If a Zig upgrade changes the layout, fix
 //! it here — do not widen the bound to hide the difference.
 const std = @import("std");
+const zio = @import("zio");
 const ticket_table = @import("../edge/ticket_table.zig");
 const wire_pump = @import("../edge/wire_pump.zig");
 const stream_mod = @import("stream.zig");
@@ -76,7 +77,9 @@ pub fn hashMapBytes(comptime K: type, comptime V: type, n: usize) error{Overflow
     return hashMapBytesForCapacity(K, V, cap);
 }
 
-pub const JOIN_HANDLE_SIZE: usize = @sizeOf(std.Io.Future(void));
+/// The element of `Connection.handler_joins`, optional included: the optional
+/// adds a tag word, and counting the bare handle undercounts by that much.
+pub const JOIN_HANDLE_SIZE: usize = @sizeOf(?zio.JoinHandle(void));
 pub const WIRE_CHUNK_DESC_SIZE: usize = @sizeOf(wire_pump.WireChunk);
 pub const WRITE_COMPLETION_SIZE: usize = @sizeOf(wire_pump.WriteCompletion);
 pub const TICKET_WAIT_SIZE: usize = @sizeOf(ticket_table.TicketWait);

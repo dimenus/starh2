@@ -1,0 +1,35 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  A  zio-0.17.0-xHbVVKy_KACrmjGRFj5FBs34dw6eCHjsfsj0-0bEMT24  sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/treeA
+  zeaa9823  zio-0.17.0-xHbVVKMMKQAMfvIB1ODsKRqDUojUhhfGQzPg-sFTiaZn  sha256=1be1fb10f16128e325be60a7b0e695c48b06190189ac0a83e66edca9b8e6642d  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/tree-zeaa9823
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 13:17:38 up 1 day,  2:12,  3 users,  load average: 1.62, 1.43, 1.43
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/zio-pin-bisect/A-server sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab
+  ran /tmp/zio-pin-bisect/zeaa9823-server sha256=1be1fb10f16128e325be60a7b0e695c48b06190189ac0a83e66edca9b8e6642d
+-- host check before phase 1 --
+ 13:17:38 up 1 day,  2:12,  3 users,  load average: 1.62, 1.43, 1.43
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+      1 root      20   0   21236  16092  11032 S   0.0   0.1   0:02.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.04 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+      5 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-sync_wq
+      6 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-kvfree_rcu_reclaim
+busy_cores=0.06 limit=1.5
+== phase 1: perf ==
+r1 A oneshot-lat-e2 n=2000000 p50us=283 p99us=432 maxus=205622 non200=0 finished in 2.39s, 836418.67 req/s, 35.90MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 zeaa9823 oneshot-lat-e2 n=2000000 p50us=410 p99us=935 maxus=3581 non200=0 finished in 2.42s, 826297.07 req/s, 35.46MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 zeaa9823 oneshot-lat-e2 n=2000000 p50us=442 p99us=889 maxus=3495 non200=0 finished in 2.42s, 827509.39 req/s, 35.51MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A oneshot-lat-e2 n=2000000 p50us=283 p99us=685 maxus=41618 non200=0 finished in 2.41s, 829523.40 req/s, 35.60MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A oneshot-lat-e2 n=2000000 p50us=279 p99us=383 maxus=1091523 non200=0 finished in 2.37s, 842958.87 req/s, 36.18MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 zeaa9823 oneshot-lat-e2 n=2000000 p50us=462 p99us=825 maxus=3341 non200=0 finished in 2.40s, 833652.90 req/s, 35.78MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 zeaa9823 oneshot-lat-e2 n=2000000 p50us=468 p99us=904 maxus=3111 non200=0 finished in 2.44s, 818665.24 req/s, 35.13MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A oneshot-lat-e2 n=2000000 p50us=376 p99us=507 maxus=1561811 non200=0 finished in 2.40s, 831674.84 req/s, 35.69MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A oneshot-lat-e2 n=2000000 p50us=415 p99us=535 maxus=1685 non200=0 finished in 2.72s, 733979.43 req/s, 31.50MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 zeaa9823 oneshot-lat-e2 n=2000000 p50us=560 p99us=900 maxus=4339 non200=0 finished in 2.61s, 767649.41 req/s, 32.95MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 zeaa9823 oneshot-lat-e2 n=2000000 p50us=434 p99us=966 maxus=3370 non200=0 finished in 2.42s, 826046.91 req/s, 35.45MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A oneshot-lat-e2 n=2000000 p50us=279 p99us=419 maxus=1190117 non200=0 finished in 2.40s, 833750.90 req/s, 35.78MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+== rows=12 ==
+exit=0

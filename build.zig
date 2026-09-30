@@ -10,6 +10,19 @@ comptime {
     }
 }
 
+/// zio's scheduling discipline. The tags equal zio's `Scheduling`
+/// (`src/options.zig`); zio does not let build.zig import that type.
+///
+/// zio fixes this at compile time, so `-Dzio-scheduling` is the A/B lever: an
+/// A/B builds two binaries. The value goes explicitly to EVERY
+/// `b.dependency("zio", ...)`, because the build option, not a root
+/// `zio_options` declaration, also reaches test binaries, whose root module
+/// is the test runner. starh2 code reads the same value as
+/// `build_options.zio_scheduling`, so it can choose a spawn placement at
+/// comptime. A consumer's own zio dependency must pass the same value, or the
+/// build holds two zio modules and fails to compile.
+const ZioScheduling = enum { single_executor, pinned, work_stealing };
+
 const brotli_common_sources = [_][]const u8{
     "common/constants.c",
     "common/context.c",
@@ -129,9 +142,10 @@ fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *st
     mod.linkLibrary(lib);
 }
 
-fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool) void {
+fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, zio_scheduling: ZioScheduling) void {
     const opts = b.addOptions();
     opts.addOption(bool, "observe", observe);
+    opts.addOption(ZioScheduling, "zio_scheduling", zio_scheduling);
     mod.addOptions("build_options", opts);
 }
 
@@ -197,6 +211,13 @@ pub fn build(b: *std.Build) void {
         "observe",
         "Keep test-only hot counters in non-Debug artifacts (A/B the counter tax)",
     ) orelse false;
+    // Default work_stealing: measured faster and without the bimodal oneshot
+    // bands of pinned placement on nachos (27ff454, t-853).
+    const zio_scheduling = b.option(
+        ZioScheduling,
+        "zio-scheduling",
+        "zio scheduling discipline: work_stealing (default), pinned or single_executor",
+    ) orelse .work_stealing;
     const macos_sdk_override = b.option(
         []const u8,
         "macos-sdk",
@@ -216,6 +237,7 @@ pub fn build(b: *std.Build) void {
     const zio_dep = b.dependency("zio", .{
         .target = target,
         .optimize = optimize,
+        .scheduling = zio_scheduling,
     });
     // Lazy: the core `starh2` module does not use the Datastar SDK, so a
     // consumer of an HTTP/2 server must not be made to fetch and compile a
@@ -242,7 +264,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, starh2_mod, observe_hot);
+    attachStarh2Options(b, starh2_mod, observe_hot, zio_scheduling);
     // Encoder only on the production module (static lib — see brotliEncLib).
     // Decoder is linked only into test artifacts that round-trip.
     const brotli_enc = brotliEncLib(b, brotli_dep, target, optimize, "brotli_enc");
@@ -286,7 +308,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, lib_test_mod, true);
+    attachStarh2Options(b, lib_test_mod, true, zio_scheduling);
     linkBrotliEnc(lib_test_mod, brotli_dep, brotli_enc);
     linkBrotliDec(lib_test_mod, brotli_dep, brotli_dec);
     const lib_tests = b.addTest(.{
@@ -592,6 +614,39 @@ pub fn build(b: *std.Build) void {
     const deadline_step = b.step("test-deadlines", "Run actor-deadline heap gates");
     deadline_step.dependOn(&run_deadline_tests.step);
 
+    const placement_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/placement.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_placement_tests = b.addRunArtifact(placement_tests);
+    const placement_step = b.step("test-placement", "Run spawn placement gates (meaningful under -Dzio-scheduling=pinned)");
+    placement_step.dependOn(&run_placement_tests.step);
+
+    const handshake_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/handshake.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_handshake_tests = b.addRunArtifact(handshake_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_handshake_tests.setCwd(b.path("."));
+    const handshake_step = b.step("test-handshake", "Run the TLS handshake timeout gate");
+    handshake_step.dependOn(&run_handshake_tests.step);
+
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/macos_sdk.zig"),
@@ -620,6 +675,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_scheduler_tests.step);
     test_step.dependOn(&run_compression_tests.step);
     test_step.dependOn(&run_deadline_tests.step);
+    test_step.dependOn(&run_placement_tests.step);
+    test_step.dependOn(&run_handshake_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");
@@ -695,7 +752,7 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "ReleaseSafe build of shipped binaries for every deploy target");
     inline for (release_queries) |rq| {
         const rt = b.resolveTargetQuery(rq.query);
-        const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .ReleaseSafe });
+        const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .ReleaseSafe, .scheduling = zio_scheduling });
         const datastar_rt = b.lazyDependency("datastar", .{ .target = rt, .optimize = .ReleaseSafe });
         const boring_rt = boringModule(b, rt, .ReleaseSafe, boringssl_source_path);
         const brotli_rt = b.dependency("brotli", .{ .target = rt, .optimize = .ReleaseSafe });
@@ -709,7 +766,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zio", .module = zio_rt.module("zio") },
             },
         });
-        attachStarh2Options(b, starh2_rt, false);
+        attachStarh2Options(b, starh2_rt, false, zio_scheduling);
         const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .ReleaseSafe, b.fmt("brotli_enc_{s}", .{rq.name}));
         linkBrotliEnc(starh2_rt, brotli_rt, brotli_enc_rt);
         const datastar_mod_rt = b.createModule(.{
@@ -749,6 +806,9 @@ pub fn build(b: *std.Build) void {
         // this runner; ReleaseSafe actually instruments. The 1K cap is the
         // bound; the optimize flag is the one that makes the gate runnable.
         const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "fuzz-" ++ name, "--fuzz=1K", "-Doptimize=ReleaseSafe" });
+        // Forwarded so a `ci` run under one scheduling does not fuzz a
+        // binary built with another.
+        cmd.addArg(b.fmt("-Dzio-scheduling={s}", .{@tagName(zio_scheduling)}));
         cmd.setCwd(b.path("."));
         cmd.has_side_effects = true;
         if (macos_sdk_override) |path| {
@@ -922,7 +982,7 @@ pub fn build(b: *std.Build) void {
     // also hit linux cross targets (`crt_dir may not be empty for linux`) and
     // would miss the nested `readme-doctest` build. Walk the graph so a new
     // Compile step inherits the fix.
-    const macos_apply = applyMacosSdkLibc(b, macos_sdk_override, macos_sdk_extra_root);
+    const macos_apply = applyMacosSdkLibc(b, target, macos_sdk_override, macos_sdk_extra_root);
     if (macos_apply.libc_file) |lp| {
         readme_doctest_run.addArg("--libc");
         readme_doctest_run.addFileArg(lp);
@@ -965,8 +1025,18 @@ const MacosSdkSelection = struct {
     guard_msg: ?[]const u8 = null,
 };
 
-fn applyMacosSdkLibc(b: *std.Build, override: ?[]const u8, extra_root: ?[]const u8) MacosLibcApply {
+fn applyMacosSdkLibc(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    override: ?[]const u8,
+    extra_root: ?[]const u8,
+) MacosLibcApply {
     if (builtin.os.tag != .macos) return .{};
+    // Every Compile step here uses `target` (the release cross-targets are
+    // Linux), so a non-macOS `-Dtarget` has no Compile step for this fix to
+    // reach. Returning here keeps the n == 0 fatals below meaning "the walk is
+    // broken", instead of firing on every cross build from a Mac.
+    if (target.result.os.tag != .macos) return .{};
     const sel = selectMacosSdk(b, override, extra_root);
     if (sel.guard_msg) |msg| {
         const fail = b.addFail(msg);

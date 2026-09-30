@@ -1,0 +1,47 @@
+--- zio-orig/src/ev/backends/linux/io_uring.zig	2026-09-25 06:37:44
++++ zio-instr-r747/src/ev/backends/linux/io_uring.zig	2026-09-25 16:54:25
+@@ -331,6 +331,10 @@
+ /// plain counter suffices. Read by hasInflight() to skip the enter syscall
+ /// when nothing can arrive.
+ inflight: usize = 0,
++stat_polls: u64 = 0,
++stat_zero: u64 = 0,
++stat_zero_empty: u64 = 0,
++stat_cqes: u64 = 0,
+ 
+ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
+     var flags: u32 = 0;
+@@ -1282,18 +1286,12 @@
+         },
+     };
+     const flags: u32 = linux.IORING_ENTER_GETEVENTS | linux.IORING_ENTER_EXT_ARG;
+-
+-    // Waits for one completion, or the timeout. A zero timeout waits for none:
+-    // GETEVENTS still runs the deferred task work that posts completions, but
+-    // the kernel then returns instead of arming a timer for a deadline that
+-    // has already passed and scheduling out until it fires.
+-    const min_complete: u32 = if (effective_timeout.value == 0) 0 else 1;
+ 
+     // Submit and wait using io_uring_enter2 with timeout
+     _ = linux_os.io_uring_enter2(
+         self.ring.fd,
+         to_submit,
+-        min_complete,
++        1, // min_complete = 1 to wait for at least one completion or timeout
+         flags,
+         &arg,
+         @sizeOf(linux_os.io_uring_getevents_arg),
+@@ -1304,6 +1302,13 @@
+ 
+     // Process all available completions
+     const count = try self.ring.copy_cqes(&self.cqe_buf, 0);
++    self.stat_polls += 1;
++    self.stat_cqes += count;
++    if (effective_timeout.value == 0) {
++        self.stat_zero += 1;
++        if (count == 0) self.stat_zero_empty += 1;
++    }
++    if (self.stat_polls % 1024 == 0) std.debug.print("iouring-stats loop={x} polls={d} zero={d} zero_empty={d} cqes={d}\n", .{ @intFromPtr(self), self.stat_polls, self.stat_zero, self.stat_zero_empty, self.stat_cqes });
+ 
+     if (count == 0) {
+         self.drainPending(state);

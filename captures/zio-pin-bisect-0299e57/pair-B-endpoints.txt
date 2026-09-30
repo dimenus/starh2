@@ -1,0 +1,62 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  A  zio-0.17.0-xHbVVKy_KACrmjGRFj5FBs34dw6eCHjsfsj0-0bEMT24  sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/treeA
+  B  zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e  sha256=a0145ed9a8a84de13e36f8fb7f319d382441b1f9a07ef1feb6e2ac1717747068  tree=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/treeB
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 12:56:42 up 1 day,  1:51,  3 users,  load average: 0.19, 0.80, 1.37
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/zio-pin-bisect/A-server sha256=69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab
+  ran /tmp/zio-pin-bisect/B-server sha256=a0145ed9a8a84de13e36f8fb7f319d382441b1f9a07ef1feb6e2ac1717747068
+-- host check before phase 1 --
+ 12:56:42 up 1 day,  1:51,  3 users,  load average: 0.19, 0.80, 1.37
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   3953 ryan      20   0 2013872 429816   5756 S  44.1   1.4  20:41.83 qmdsync-tasks
+   2324 libvirt+  20   0    9.9g   5.0g  21540 S   4.9  16.4  53:05.49 qemu-system-x86
+   6312 ryan      20   0  725028  29244  20532 S   4.9   0.1   3:10.15 winedevice.exe
+      1 root      20   0   21236  16092  11032 S   0.0   0.1   0:02.46 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.04 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=0.09 limit=1.5
+== phase 1: perf ==
+r1 A oneshot-lat-e2 n=2000000 p50us=291 p99us=476 maxus=1267524 non200=0 finished in 2.39s, 838290.78 req/s, 35.98MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r1 B oneshot-lat-e2 n=2000000 p50us=469 p99us=834 maxus=3198 non200=0 finished in 2.40s, 832298.16 req/s, 35.72MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 B oneshot-lat-e2 n=2000000 p50us=433 p99us=869 maxus=3274 non200=0 finished in 2.36s, 846041.23 req/s, 36.31MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r2 A oneshot-lat-e2 n=2000000 p50us=471 p99us=676 maxus=1755032 non200=0 finished in 2.40s, 834486.66 req/s, 35.81MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 A oneshot-lat-e2 n=2000000 p50us=283 p99us=418 maxus=1150207 non200=0 finished in 2.55s, 783877.83 req/s, 33.64MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r3 B oneshot-lat-e2 n=2000000 p50us=557 p99us=767 maxus=3139 non200=0 finished in 2.40s, 833253.83 req/s, 35.76MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 B oneshot-lat-e2 n=2000000 p50us=568 p99us=800 maxus=3014 non200=0 finished in 2.41s, 831531.34 req/s, 35.69MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r4 A oneshot-lat-e2 n=2000000 p50us=482 p99us=690 maxus=1724762 non200=0 finished in 2.58s, 776399.02 req/s, 33.32MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 A oneshot-lat-e2 n=2000000 p50us=368 p99us=496 maxus=65832 non200=0 finished in 2.40s, 832289.85 req/s, 35.72MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r5 B oneshot-lat-e2 n=2000000 p50us=492 p99us=977 maxus=3239 non200=0 finished in 2.59s, 771387.99 req/s, 33.11MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 B oneshot-lat-e2 n=2000000 p50us=447 p99us=946 maxus=3426 non200=0 finished in 2.48s, 806330.66 req/s, 34.61MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+r6 A oneshot-lat-e2 n=2000000 p50us=561 p99us=733 maxus=3252 non200=0 finished in 2.65s, 754912.12 req/s, 32.40MB/s requests: 2000000 total, 2000000 started, 2000000 done, 2000000 succeeded, 0 failed, 0 errored, 0 timeout 
+-- host check before phase 3 --
+ 12:57:25 up 1 day,  1:52,  3 users,  load average: 1.36, 1.01, 1.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   6385 ryan      20   0 2522664 444632  77164 S  14.7   1.4 120:25.96 CrBrowserMain
+   2324 libvirt+  20   0    9.9g   5.0g  21540 S   4.9  16.4  53:06.14 qemu-system-x86
+      1 root      20   0   21236  16092  11032 S   0.0   0.1   0:02.46 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.04 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=0.05 limit=1.5
+== phase 3: server CPU per event at a FIXED offered load ==
+c1 A cpu200 ticks=677 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000106
+c1 B cpu200 ticks=842 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000107
+c2 B cpu200 ticks=845 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000068
+c2 A cpu200 ticks=712 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000055
+c3 A cpu200 ticks=740 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000099
+c3 B cpu200 ticks=866 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000072
+c4 B cpu200 ticks=866 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000071
+c4 A cpu200 ticks=682 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000069
+c5 A cpu200 ticks=702 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000085
+c5 B cpu200 ticks=810 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000044
+c6 B cpu200 ticks=0 tck=100 B            streams=200 conns=1 opened=149 delivering=0 failed=51 events=0
+c6 A cpu200 ticks=700 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000085
+c7 A cpu200 ticks=682 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000090
+c7 B cpu200 ticks=882 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000050
+c8 B cpu200 ticks=831 tck=100 B            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000088
+c8 A cpu200 ticks=748 tck=100 A            streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000132
+== rows=28 ==
+exit=0
