@@ -1,3 +1,5 @@
+// Diagnostic copy of tools/sse_bench/client.go used for starved-probe.txt: prints a STARVED line per stream that delivered no event in the window.
+
 // SSE load client: N concurrent long-lived streams, delivery latency measured
 // per event. Optional oneshots on the SAME connection(s).
 //
@@ -72,7 +74,10 @@ type result struct {
 	endedEarly bool
 	scanErr    error
 	maxGap     time.Duration
+	preEvents  int
 	lastRecv   int64
+	lastSent   int64
+	headersAt  int64
 }
 
 func main() {
@@ -258,6 +263,7 @@ func main() {
 				results[i] = r
 				return
 			}
+			r.headersAt = time.Now().UnixNano()
 			ready.Done()
 			readyReported = true
 			if r.stalled {
@@ -280,7 +286,9 @@ func main() {
 				if err != nil {
 					continue
 				}
+				r.lastRecv, r.lastSent = now, sent
 				if sent < measurementStart.Load() {
+					r.preEvents++
 					continue
 				}
 				r.events++
@@ -290,7 +298,6 @@ func main() {
 				}
 				last = now
 			}
-			r.lastRecv = last
 			// The body ends at our cancel when the window closes. Ending, or
 			// erroring, while the context is still live is the server
 			// dropping a stream that had already opened.
@@ -401,6 +408,13 @@ func main() {
 		return samples[i]
 	}
 
+	ms := measurementStart.Load()
+	for _, r := range results {
+		if r.err == nil && !r.stalled && r.events == 0 {
+			fmt.Printf("%-12s STARVED stream=%d transport=%d light=%v port=%d headers_at=%+dms pre_window_events=%d last_recv=%+dms last_sent=%+dms (relative to window start)\n",
+				*label, r.stream, r.transport, r.light, r.port, (r.headersAt-ms)/1e6, r.preEvents, (r.lastRecv-ms)/1e6, (r.lastSent-ms)/1e6)
+		}
+	}
 	if total > 0 {
 		fmt.Printf("%-12s streams=%d conns=%d opened=%d delivering=%d failed=%d events=%d ended_early=%d scan_err=%d\n",
 			*label, total, *conns+*lightConns, opened, delivered, failed, totalEvents, endedEarly, scanErrs)
@@ -410,7 +424,7 @@ func main() {
 		}
 		fmt.Printf("%-12s sse latency p50=%v p99=%v max=%v\n",
 			*label, pct(all, 0.50).Round(time.Microsecond), pct(all, 0.99).Round(time.Microsecond), all[len(all)-1].Round(time.Microsecond))
-		printFairness(*label, results, *seconds, *intervalMs, measurementStart.Load()+int64(*seconds)*int64(time.Second))
+		printFairness(*label, results, *seconds, *intervalMs)
 	} else {
 		fmt.Printf("%-12s oneshot-only conns=%d workers=%d\n", *label, *conns, *oneshotWorkers)
 	}
@@ -442,15 +456,9 @@ func main() {
 
 // printFairness reports the slowest stream and each TCP connection, over the
 // streams that opened and were read (the stalled one is excluded).
-func printFairness(label string, results []result, seconds, intervalMs int, windowEnd int64) {
+func printFairness(label string, results []result, seconds, intervalMs int) {
 	var evs []int
 	var gapMax time.Duration
-	// A stream that goes silent has no later event to close a gap, so the
-	// silence from its last event (or from the window start, if it never
-	// delivered) to the window end counts as a gap too. `stopped` counts the
-	// streams that were silent for the last second or more of the window.
-	stopped := 0
-	windowStart := windowEnd - int64(seconds)*int64(time.Second)
 	type connAgg struct {
 		light                  bool
 		streams, deliv, events int
@@ -465,13 +473,6 @@ func printFairness(label string, results []result, seconds, intervalMs int, wind
 		evs = append(evs, r.events)
 		if r.maxGap > gapMax {
 			gapMax = r.maxGap
-		}
-		from := max(r.lastRecv, windowStart)
-		if tail := time.Duration(windowEnd - from); tail > gapMax {
-			gapMax = tail
-		}
-		if windowEnd-from >= int64(time.Second) {
-			stopped++
 		}
 		c := conns[r.port]
 		if c == nil {
@@ -494,8 +495,8 @@ func printFairness(label string, results []result, seconds, intervalMs int, wind
 	if intervalMs > 0 {
 		expected = strconv.Itoa(seconds * 1000 / intervalMs)
 	}
-	fmt.Printf("%-12s sse fair ev_min=%d ev_p50=%d ev_max=%d expected=%s gap_max=%v stopped=%d\n",
-		label, evs[0], evs[len(evs)/2], evs[len(evs)-1], expected, gapMax.Round(time.Microsecond), stopped)
+	fmt.Printf("%-12s sse fair ev_min=%d ev_p50=%d ev_max=%d expected=%s gap_max=%v\n",
+		label, evs[0], evs[len(evs)/2], evs[len(evs)-1], expected, gapMax.Round(time.Microsecond))
 	sort.Ints(order)
 	var b strings.Builder
 	var heavyP50, heavyP99, lightP99 time.Duration

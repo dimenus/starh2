@@ -1,0 +1,42 @@
+# zio 0299e57 + prefer-local.diff, Mac, ReleaseFast. Test appended temporarily to src/runtime.zig (not committed to the zio branch):
+#   parent task spawns a child with the given placement, joins it, and counts children whose first run was on the parent's executor; 2000 spawns.
+#   It fails on purpose (error.ProbeDone) so the runner prints its stderr.
+probe scheduling=work_stealing executors=2 placement=auto: child first ran on the parent's executor 1873/2000
+probe scheduling=work_stealing executors=2 placement=prefer_local: child first ran on the parent's executor 1973/2000
+probe scheduling=work_stealing executors=8 placement=auto: child first ran on the parent's executor 810/2000
+probe scheduling=work_stealing executors=8 placement=prefer_local: child first ran on the parent's executor 1923/2000
+probe scheduling=pinned executors=2 placement=auto: child first ran on the parent's executor 1000/2000
+probe scheduling=pinned executors=2 placement=prefer_local: child first ran on the parent's executor 2000/2000
+probe scheduling=pinned executors=8 placement=auto: child first ran on the parent's executor 250/2000
+probe scheduling=pinned executors=8 placement=prefer_local: child first ran on the parent's executor 2000/2000
+
+# the probe test source
+test "probe: where does a spawned child first run" {
+    if (!multi_executor) return error.SkipZigTest;
+    const H = struct {
+        fn child(out: *?ExecutorId) void {
+            out.* = getCurrentExecutor().id;
+        }
+        fn parent(rt: *Runtime, placement: Placement, same: *u32, total: u32) !void {
+            var i: u32 = 0;
+            while (i < total) : (i += 1) {
+                const me = getCurrentExecutor().id;
+                var got: ?ExecutorId = null;
+                var h = try rt.spawnInto(placement, child, .{&got});
+                h.join();
+                if (got.? == me) same.* += 1;
+            }
+        }
+    };
+    for ([_]u8{ 2, 8 }) |n| {
+        const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(n) });
+        defer runtime.deinit();
+        for ([_]Placement{ .auto, .prefer_local }) |p| {
+            var same: u32 = 0;
+            var h = try runtime.spawn(H.parent, .{ runtime, p, &same, 2000 });
+            try h.join();
+            std.debug.print("probe scheduling={s} executors={d} placement={s}: child first ran on the parent's executor {d}/2000\n", .{ @tagName(zio_options.scheduling), n, @tagName(p), same });
+        }
+    }
+    return error.ProbeDone;
+}

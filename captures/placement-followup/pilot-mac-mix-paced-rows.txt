@@ -1,0 +1,93 @@
+== arm identity ==
+  WS sha256=ce56aa3e1273d461b9758fd02b3b315ead4ce2844369edc02b0532f0a36bf356 args=''
+  WS2 sha256=ce56aa3e1273d461b9758fd02b3b315ead4ce2844369edc02b0532f0a36bf356 args=''
+  WSH sha256=ce56aa3e1273d461b9758fd02b3b315ead4ce2844369edc02b0532f0a36bf356 args='--spawn-placement prefer_local'
+  PA sha256=72c3932a289155b7606b65dc921ee5e6291ca1683309c8fd42b7eb9e23e6119c args='--spawn-placement auto'
+  PL sha256=72c3932a289155b7606b65dc921ee5e6291ca1683309c8fd42b7eb9e23e6119c args='--spawn-placement local'
+  PLB sha256=72c3932a289155b7606b65dc921ee5e6291ca1683309c8fd42b7eb9e23e6119c args='--spawn-placement local --conn-balance'
+== host ==
+25.6.0
+physical_cpus=18 Apple M5 Pro
+21:52  up 15 days, 20:23, 10 users, load averages: 2.20 3.54 3.40
+h2load: /opt/homebrew/bin/h2load h2load nghttp2/1.70.0
+== phase 6: heavy/light/churn mix, widths: 8 prod ==
+busy_cores=0.95 limit=1.5 top_process=19.6 20274 /Applications/Grok limit_pct=50 load='2.10 3.50 3.39' before mix round 1
+  ready WS args='' {"ready":true,"mode":"tls","port":56577,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+x1 WS mix-e8 WS           streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10793355 ended_early=0 scan_err=0
+x1 WS mix-e8 WS           sse latency p50=1.207ms p99=2.94ms max=10.975ms
+x1 WS mix-e8 WS           sse fair ev_min=3755 ev_p50=10000 ev_max=10003 expected=10000 gap_max=11.27ms
+x1 WS mix-e8 WS           sse conns n=12 heavy=4 light=8 heavy_worst_p50us=1281 heavy_worst_p99us=2980 light_worst_p99us=519 [port:kind:delivering/streams:events:p50us:p99us] 56579:h:250/250:2500129:1281:2975 56591:h:250/250:2493573:1276:2980 56601:h:250/250:2499737:1271:2965 56610:h:250/250:2499914:1275:2950 56623:l:10/10:99998:83:514 56632:l:10/10:100000:78:481 56641:l:10/10:99999:74:510 56654:l:10/10:100000:74:519 56663:l:10/10:100005:75:484 56673:l:10/10:100001:77:494 56689:l:10/10:99997:79:484 56698:l:10/10:100002:78:489
+x1 WS mix-e8 WS           churn conns=2160 ok=9328 err=0 p50=108µs p99=1.42ms max=2.766ms
+x1 WS mix-e8 cpu executors=8 heavy=4 light=8 ticks=6445 threads=828,824,822,820,790,789,786,786,0
+x1 WS mix-eprod WS           streams=2430 conns=27 opened=2430 delivering=2428 failed=0 events=24227214 ended_early=0 scan_err=0
+x1 WS mix-eprod WS           sse latency p50=2.476ms p99=18.149ms max=77.508ms
+x1 WS mix-eprod WS           sse fair ev_min=0 ev_p50=9999 ev_max=10005 expected=10000 gap_max=66.854ms
+x1 WS mix-eprod WS           sse conns n=27 heavy=9 light=18 heavy_worst_p50us=2732 heavy_worst_p99us=21559 light_worst_p99us=6699 [port:kind:delivering/streams:events:p50us:p99us] 58818:h:250/250:2500049:2585:14390 58829:h:250/250:2488610:2577:17320 58838:h:250/250:2498220:2572:20796 58847:h:250/250:2483485:2564:17948 58860:h:249/250:2484950:2678:17742 58869:h:249/250:2485065:2730:17144 58878:h:250/250:2499760:2732:21274 58891:h:250/250:2492029:2688:20348 58900:h:250/250:2495143:2728:21559 58912:l:10/10:100000:218:6477 58922:l:10/10:99999:277:5969 58931:l:10/10:99993:232:6137 58942:l:10/10:99963:280:5381 58953:l:10/10:100000:206:5264 58966:l:10/10:99995:265:5549 58975:l:10/10:99997:264:4720 58988:l:10/10:99983:300:5865 58997:l:10/10:100000:313:6552 59006:l:10/10:99998:296:5414 59015:l:10/10:100000:262:4519 59028:l:10/10:99999:246:6056 59037:l:10/10:99970:272:5193 59046:l:10/10:100002:311:6699 59056:l:10/10:100004:263:5539 59068:l:10/10:100000:261:5416 59078:l:10/10:100001:248:5890 59087:l:10/10:99999:296:4155
+x1 WS mix-eprod WS           churn conns=2200 ok=8905 err=0 p50=174µs p99=3.949ms max=20.562ms
+x1 WS mix-eprod cpu executors=18 heavy=9 light=18 ticks=13286 threads=749,749,749,747,744,743,740,739,738,738,736,736,734,732,731,729,727,724,0
+  ready WS2 args='' {"ready":true,"mode":"tls","port":61113,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+x1 WS2 mix-e8 WS2          streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10799903 ended_early=0 scan_err=0
+x1 WS2 mix-e8 WS2          sse latency p50=1.187ms p99=2.861ms max=8.572ms
+x1 WS2 mix-e8 WS2          sse fair ev_min=9997 ev_p50=10000 ev_max=10003 expected=10000 gap_max=8.492ms
+x1 WS2 mix-e8 WS2          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=1264 heavy_worst_p99us=2909 light_worst_p99us=520 [port:kind:delivering/streams:events:p50us:p99us] 61115:h:250/250:2500086:1253:2900 61127:h:250/250:2499898:1264:2899 61136:h:250/250:2499994:1262:2909 61145:h:250/250:2499933:1239:2842 61158:l:10/10:100000:76:474 61168:l:10/10:99996:86:488 61180:l:10/10:100000:80:511 61191:l:10/10:99996:81:505 61200:l:10/10:100000:66:471 61216:l:10/10:100000:83:520 61228:l:10/10:100000:86:509 61237:l:10/10:100000:67:453
+x1 WS2 mix-e8 WS2          churn conns=2159 ok=9335 err=0 p50=106µs p99=1.45ms max=2.565ms
+x1 WS2 mix-e8 cpu executors=8 heavy=4 light=8 ticks=6451 threads=825,821,819,819,793,792,791,789,0
+x1 WS2 mix-eprod WS2          streams=2430 conns=27 opened=2430 delivering=2428 failed=0 events=24214847 ended_early=0 scan_err=0
+x1 WS2 mix-eprod WS2          sse latency p50=2.53ms p99=20.753ms max=101.227ms
+x1 WS2 mix-eprod WS2          sse fair ev_min=0 ev_p50=9997 ev_max=10006 expected=10000 gap_max=96.928ms
+x1 WS2 mix-eprod WS2          sse conns n=28 heavy=10 light=18 heavy_worst_p50us=2804 heavy_worst_p99us=27432 light_worst_p99us=7910 [port:kind:delivering/streams:events:p50us:p99us] 63385:h:235/235:2350095:2554:18852 63388:h:15/15:144359:395:6554 63398:h:250/250:2489845:2804:26972 63407:h:250/250:2491195:2745:22723 63416:h:249/250:2487536:2724:17599 63429:h:250/250:2489578:2715:18365 63438:h:249/250:2484042:2738:27432 63447:h:250/250:2499529:2688:16915 63460:h:250/250:2482928:2725:20958 63469:h:250/250:2495794:2794:24032 63479:l:10/10:100005:249:6282 63491:l:10/10:99997:296:6337 63500:l:10/10:99999:323:6593 63509:l:10/10:100001:304:6144 63525:l:10/10:100006:270:7910 63535:l:10/10:99975:296:7143 63544:l:10/10:100000:210:6790 63555:l:10/10:100001:274:4578 63565:l:10/10:99999:306:6267 63575:l:10/10:100005:274:5969 63584:l:10/10:100004:264:6608 63595:l:10/10:99995:319:7073 63606:l:10/10:99999:313:6463 63615:l:10/10:99999:316:5857 63626:l:10/10:99980:289:5421 63635:l:10/10:100001:305:6844 63646:l:10/10:99979:283:5314 63655:l:10/10:100001:298:5568
+x1 WS2 mix-eprod WS2          churn conns=2154 ok=8690 err=0 p50=185µs p99=6.004ms max=29.054ms
+x1 WS2 mix-eprod cpu executors=18 heavy=9 light=18 ticks=13225 threads=755,749,745,745,743,743,738,736,736,734,731,730,727,724,724,724,721,719,0
+  ready WSH args='--spawn-placement prefer_local' {"ready":true,"mode":"tls","port":49273,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"prefer_local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+x1 WSH mix-e8 WSH          streams=1080 conns=12 opened=1080 delivering=1079 failed=0 events=10782982 ended_early=0 scan_err=0
+x1 WSH mix-e8 WSH          sse latency p50=1.185ms p99=2.896ms max=9.163ms
+x1 WSH mix-e8 WSH          sse fair ev_min=0 ev_p50=10000 ev_max=10003 expected=10000 gap_max=9.783ms
+x1 WSH mix-e8 WSH          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=1265 heavy_worst_p99us=2958 light_worst_p99us=522 [port:kind:delivering/streams:events:p50us:p99us] 49275:h:249/250:2484689:1237:2909 49287:h:250/250:2499910:1263:2889 49297:h:250/250:2498430:1245:2958 49306:h:250/250:2499940:1265:2945 49319:l:10/10:100000:70:499 49328:l:10/10:100000:74:517 49341:l:10/10:100003:76:517 49350:l:10/10:100000:71:453 49363:l:10/10:100004:69:484 49375:l:10/10:100005:76:516 49385:l:10/10:99998:75:522 49394:l:10/10:100003:72:504
+x1 WSH mix-e8 WSH          churn conns=2159 ok=9335 err=0 p50=104µs p99=1.463ms max=4.606ms
+x1 WSH mix-e8 cpu executors=8 heavy=4 light=8 ticks=6429 threads=847,825,818,791,790,786,786,786,0
+x1 WSH mix-eprod WSH          streams=2430 conns=27 opened=2430 delivering=2426 failed=0 events=24216596 ended_early=0 scan_err=0
+x1 WSH mix-eprod WSH          sse latency p50=2.302ms p99=17.223ms max=106.467ms
+x1 WSH mix-eprod WSH          sse fair ev_min=0 ev_p50=9998 ev_max=10005 expected=10000 gap_max=94.601ms
+x1 WSH mix-eprod WSH          sse conns n=27 heavy=9 light=18 heavy_worst_p50us=2535 heavy_worst_p99us=34836 light_worst_p99us=8567 [port:kind:delivering/streams:events:p50us:p99us] 51516:h:250/250:2486500:2373:15984 51528:h:248/250:2473404:2429:34836 51537:h:250/250:2499517:2438:13550 51546:h:250/250:2498859:2476:18206 51559:h:250/250:2499576:2475:16141 51569:h:250/250:2499435:2506:18588 51578:h:250/250:2497567:2432:17731 51591:h:250/250:2492023:2429:15523 51600:h:250/250:2495727:2535:17858 51609:l:9/10:89991:151:5973 51622:l:10/10:99990:246:6309 51631:l:10/10:99999:243:4618 51644:l:10/10:100002:226:8567 51656:l:10/10:99992:186:7809 51666:l:10/10:100013:185:6765 51675:l:10/10:100000:198:5241 51684:l:10/10:100004:248:5721 51695:l:10/10:99992:239:7519 51706:l:10/10:99989:177:5650 51715:l:10/10:94035:191:5659 51726:l:10/10:99996:176:4574 51736:l:10/10:100009:200:5956 51746:l:10/10:99987:225:4679 51756:l:10/10:100000:175:4847 51765:l:9/10:90000:208:6332 51775:l:10/10:99999:217:8168 51786:l:10/10:99990:228:5273
+x1 WSH mix-eprod WSH          churn conns=2186 ok=8844 err=0 p50=173µs p99=4.49ms max=23.893ms
+x1 WSH mix-eprod cpu executors=18 heavy=9 light=18 ticks=13435 threads=776,767,765,763,759,758,752,750,747,745,743,740,738,736,734,731,721,710,0
+  ready PA args='--spawn-placement auto' {"ready":true,"mode":"tls","port":53793,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+x1 PA mix-e8 PA           streams=1080 conns=12 opened=1080 delivering=1079 failed=0 events=10773034 ended_early=0 scan_err=0
+x1 PA mix-e8 PA           sse latency p50=1.815ms p99=4.372ms max=10.433ms
+x1 PA mix-e8 PA           sse fair ev_min=0 ev_p50=9999 ev_max=10004 expected=10000 gap_max=10.091ms
+x1 PA mix-e8 PA           sse conns n=12 heavy=4 light=8 heavy_worst_p50us=2036 heavy_worst_p99us=4521 light_worst_p99us=413 [port:kind:delivering/streams:events:p50us:p99us] 53796:h:250/250:2499784:2024:4479 53807:h:250/250:2493476:1854:4228 53816:h:250/250:2499588:2036:4521 53825:h:249/250:2480164:1844:4271 53838:l:10/10:100014:58:180 53847:l:10/10:100008:84:413 53864:l:10/10:99999:66:202 53873:l:10/10:100000:70:231 53882:l:10/10:100000:63:189 53895:l:10/10:100000:68:213 53904:l:10/10:99999:65:195 53913:l:10/10:100002:72:243
+x1 PA mix-e8 PA           churn conns=2166 ok=9364 err=0 p50=114µs p99=1.335ms max=4.98ms
+x1 PA mix-e8 cpu executors=8 heavy=4 light=8 ticks=6688 threads=1051,939,901,805,796,769,739,686,0
+x1 PA mix-eprod PA           streams=2430 conns=27 opened=2430 delivering=2427 failed=0 events=24182560 ended_early=0 scan_err=0
+x1 PA mix-eprod PA           sse latency p50=3.37ms p99=35.495ms max=227.307ms
+x1 PA mix-eprod PA           sse fair ev_min=0 ev_p50=9998 ev_max=10012 expected=10000 gap_max=222.475ms
+x1 PA mix-eprod PA           sse conns n=27 heavy=9 light=18 heavy_worst_p50us=3918 heavy_worst_p99us=79676 light_worst_p99us=65442 [port:kind:delivering/streams:events:p50us:p99us] 56040:h:250/250:2485940:3713:27133 56049:h:250/250:2498518:3013:79676 56058:h:250/250:2499570:3918:49464 56067:h:250/250:2497728:3603:33003 56080:h:250/250:2486104:3851:60059 56090:h:250/250:2491880:3577:31382 56099:h:247/250:2454213:3577:30553 56109:h:250/250:2486375:3786:29471 56121:h:250/250:2490324:3712:33261 56132:l:10/10:99997:280:9502 56148:l:10/10:99999:96:33761 56157:l:10/10:99997:102:7650 56167:l:10/10:99994:194:12378 56179:l:10/10:100000:114:65442 56189:l:10/10:100001:101:3655 56199:l:10/10:99992:312:11143 56211:l:10/10:99956:113:17405 56221:l:10/10:100001:116:9286 56230:l:10/10:99998:103:13085 56242:l:10/10:92005:100:1640 56252:l:10/10:99985:105:6988 56261:l:10/10:100002:103:25457 56271:l:10/10:100000:126:60177 56283:l:10/10:100000:107:27978 56293:l:10/10:100002:99:9302 56302:l:10/10:99981:106:16546 56312:l:10/10:99998:106:9063
+x1 PA mix-eprod PA           churn conns=2137 ok=8598 err=0 p50=175µs p99=6.764ms max=106.644ms
+x1 PA mix-eprod cpu executors=18 heavy=9 light=18 ticks=13797 threads=876,858,857,846,794,761,747,744,743,742,740,740,739,734,734,733,714,699,0
+  ready PL args='--spawn-placement local' {"ready":true,"mode":"tls","port":58282,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0}
+x1 PL mix-e8 PL           streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10791655 ended_early=0 scan_err=0
+x1 PL mix-e8 PL           sse latency p50=835µs p99=4.643ms max=16.482ms
+x1 PL mix-e8 PL           sse fair ev_min=1935 ev_p50=10000 ev_max=10005 expected=10000 gap_max=27.837ms
+x1 PL mix-e8 PL           sse conns n=12 heavy=4 light=8 heavy_worst_p50us=1986 heavy_worst_p99us=5631 light_worst_p99us=227 [port:kind:delivering/streams:events:p50us:p99us] 58283:h:250/250:2499807:1977:5438 58298:h:250/250:2500087:570:1452 58307:h:250/250:2500026:489:1367 58320:h:250/250:2491728:1986:5631 58333:l:10/10:100000:60:178 58342:l:10/10:99998:93:227 58354:l:10/10:100009:45:123 58364:l:10/10:100000:52:143 58373:l:10/10:100000:62:165 58386:l:10/10:100000:48:145 58395:l:10/10:100000:50:128 58405:l:10/10:100000:55:132
+x1 PL mix-e8 PL           churn conns=2159 ok=9326 err=0 p50=93µs p99=2.277ms max=13.247ms
+x1 PL mix-e8 cpu executors=8 heavy=4 light=8 ticks=3663 threads=1022,985,969,255,188,139,94,9,0
+x1 PL mix-eprod PL           streams=2430 conns=27 opened=2430 delivering=2430 failed=0 events=24277213 ended_early=0 scan_err=0
+x1 PL mix-eprod PL           sse latency p50=2.81ms p99=36.804ms max=180.821ms
+x1 PL mix-eprod PL           sse fair ev_min=2541 ev_p50=9998 ev_max=10023 expected=10000 gap_max=201.672ms
+x1 PL mix-eprod PL           sse conns n=27 heavy=9 light=18 heavy_worst_p50us=9124 heavy_worst_p99us=64359 light_worst_p99us=1279 [port:kind:delivering/streams:events:p50us:p99us] 60531:h:250/250:2491120:8968:64359 60540:h:250/250:2499901:9124:40159 60549:h:250/250:2490613:8918:61567 60558:h:250/250:2497718:8937:45297 60571:h:250/250:2499530:2262:5153 60580:h:250/250:2499312:2291:5287 60593:h:250/250:2499926:1476:3406 60601:h:250/250:2499542:2454:6943 60614:h:250/250:2499549:1928:5358 60626:l:10/10:100000:77:236 60636:l:10/10:100000:87:247 60647:l:10/10:99999:259:786 60656:l:10/10:99998:193:652 60664:l:10/10:100000:77:219 60673:l:10/10:100000:62:215 60685:l:10/10:100000:74:203 60693:l:10/10:100003:82:252 60701:l:10/10:100000:208:696 60710:l:10/10:100000:210:790 60720:l:10/10:100000:45:115 60729:l:10/10:100004:81:235 60738:l:10/10:100008:47:150 60749:l:10/10:99991:209:1279 60757:l:10/10:100000:46:117 60765:l:10/10:100000:65:199 60776:l:10/10:100000:175:945 60785:l:10/10:99999:212:1167
+x1 PL mix-eprod PL           churn conns=2062 ok=8348 err=0 p50=190µs p99=12.826ms max=125.425ms
+x1 PL mix-eprod cpu executors=18 heavy=9 light=18 ticks=8684 threads=1005,1002,1001,994,993,984,978,384,297,296,203,198,183,142,6,6,6,6,0
+  ready PLB args='--spawn-placement local --conn-balance' {"ready":true,"mode":"tls","port":62687,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1}
+x1 PLB mix-e8 PLB          streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10800344 ended_early=0 scan_err=0
+x1 PLB mix-e8 PLB          sse latency p50=690µs p99=1.74ms max=13.148ms
+x1 PLB mix-e8 PLB          sse fair ev_min=9998 ev_p50=10000 ev_max=10003 expected=10000 gap_max=13ms
+x1 PLB mix-e8 PLB          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=793 heavy_worst_p99us=2817 light_worst_p99us=153 [port:kind:delivering/streams:events:p50us:p99us] 62689:h:250/250:2500056:712:1567 62701:h:250/250:2500150:730:1622 62710:h:250/250:2500035:724:1625 62721:h:250/250:2500098:793:2817 62732:l:10/10:100000:51:137 62745:l:10/10:100000:62:153 62758:l:10/10:100001:56:148 62767:l:10/10:100000:45:129 62777:l:10/10:100000:55:147 62789:l:10/10:100000:46:126 62798:l:10/10:100000:46:113 62811:l:10/10:100004:32:82
+x1 PLB mix-e8 PLB          churn conns=2184 ok=9440 err=0 p50=88µs p99=1.092ms max=4.63ms
+x1 PLB mix-e8 cpu executors=8 heavy=4 light=8 ticks=4892 threads=995,992,986,964,267,254,229,203,0
+x1 PLB mix-eprod PLB          streams=2430 conns=27 opened=2430 delivering=2428 failed=0 events=24139470 ended_early=0 scan_err=0
+x1 PLB mix-eprod PLB          sse latency p50=3.029ms p99=96.023ms max=263.558ms
+x1 PLB mix-eprod PLB          sse fair ev_min=0 ev_p50=9999 ev_max=10013 expected=10000 gap_max=263.02ms
+x1 PLB mix-eprod PLB          sse conns n=27 heavy=9 light=18 heavy_worst_p50us=3618 heavy_worst_p99us=137047 light_worst_p99us=317 [port:kind:delivering/streams:events:p50us:p99us] 64949:h:249/250:2491061:3240:101492 64959:h:250/250:2483833:3265:97718 64968:h:250/250:2475076:3205:103191 64977:h:250/250:2485900:3618:137047 64990:h:250/250:2484224:3313:83446 64999:h:250/250:2490897:3237:92873 65008:h:250/250:2486292:3487:91877 65021:h:249/250:2453539:3556:76755 65030:h:250/250:2488584:3266:96883 65043:l:10/10:100001:68:305 65052:l:10/10:100000:53:274 65065:l:10/10:100006:100:271 65078:l:10/10:100001:78:295 65087:l:10/10:100006:85:261 65096:l:10/10:100002:44:171 65109:l:10/10:100006:85:269 65118:l:10/10:100008:105:279 65129:l:10/10:100005:101:278 65140:l:10/10:100005:90:281 65149:l:10/10:100006:100:275 65162:l:10/10:100002:82:276 65171:l:10/10:100000:105:314 65180:l:10/10:100000:69:256 65193:l:10/10:100006:86:276 65202:l:10/10:100004:112:317 65211:l:10/10:100003:87:278 65224:l:10/10:100003:77:311
+x1 PLB mix-eprod PLB          churn conns=2312 ok=9400 err=0 p50=114µs p99=955µs max=6.037ms
+x1 PLB mix-eprod cpu executors=18 heavy=9 light=18 ticks=9443 threads=777,777,777,768,761,760,759,754,747,413,396,386,357,351,343,312,0,0,0
+== done ==

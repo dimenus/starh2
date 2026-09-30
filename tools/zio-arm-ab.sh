@@ -188,6 +188,11 @@ MIX_LIGHT_PER_EXEC=${MIX_LIGHT_PER_EXEC:-1}
 MIX_LIGHT_STREAMS=${MIX_LIGHT_STREAMS:-10}
 MIX_CHURN=${MIX_CHURN:-4}
 MIX_STAGGER_MS=${MIX_STAGGER_MS:-50}
+# 0 is unpaced churn (as the first nachos session ran); a pause per short
+# connection keeps TIME_WAIT sockets from exhausting the client's ports.
+MIX_CHURN_PAUSE_MS=${MIX_CHURN_PAUSE_MS:-0}
+# Names the rows, so two load levels (e.g. mix and mixm) share one file.
+MIX_LABEL=${MIX_LABEL:-mix}
 
 # Per-arm server arguments and ready-line expectations: ARGS_<arm> is appended
 # to that arm's server command line, and EXPECT_<arm>, when set, must appear in
@@ -279,7 +284,7 @@ ssh "$HOST" "ARMS='$ARMS' BURST_ARMS='$BURST_ARMS' ONESHOT_LAT_WIDTHS='$ONESHOT_
   OPEN_WARMUP=$OPEN_WARMUP OPEN_THREADS=$OPEN_THREADS OPEN_CLOSED=$OPEN_CLOSED \
   MIX_ROUNDS=$MIX_ROUNDS MIX_WIDTHS='$MIX_WIDTHS' MIX_HEAVY_DIV=$MIX_HEAVY_DIV \
   MIX_HEAVY_STREAMS=$MIX_HEAVY_STREAMS MIX_LIGHT_PER_EXEC=$MIX_LIGHT_PER_EXEC \
-  MIX_LIGHT_STREAMS=$MIX_LIGHT_STREAMS MIX_CHURN=$MIX_CHURN MIX_STAGGER_MS=$MIX_STAGGER_MS \
+  MIX_LIGHT_STREAMS=$MIX_LIGHT_STREAMS MIX_CHURN=$MIX_CHURN MIX_STAGGER_MS=$MIX_STAGGER_MS MIX_CHURN_PAUSE_MS=$MIX_CHURN_PAUSE_MS MIX_LABEL=$MIX_LABEL \
   PERF_ROUNDS=$PERF_ROUNDS BURST_ROUNDS=$BURST_ROUNDS CPU_ROUNDS=$CPU_ROUNDS \
   SECONDS_RUN=$SECONDS_RUN INTERVAL=$INTERVAL EXECUTORS=$EXECUTORS \
   WIDE_EXECUTORS=$WIDE_EXECUTORS ONESHOT_N=$ONESHOT_N ONESHOT_WIDE_N=$ONESHOT_WIDE_N \
@@ -617,7 +622,7 @@ fi
 
 if has_phase 6; then
 host_check "phase 6"
-echo "== phase 6: heavy/light/churn mix, widths: $MIX_WIDTHS =="
+echo "== phase 6: heavy/light/churn mix ($MIX_LABEL, heavy = executors / $MIX_HEAVY_DIV, churn pause $MIX_CHURN_PAUSE_MS ms), widths: $MIX_WIDTHS =="
 x=1
 while [ $x -le $MIX_ROUNDS ]; do
   round_check "mix round $x"
@@ -630,12 +635,12 @@ while [ $x -le $MIX_ROUNDS ]; do
         H=$((E / MIX_HEAVY_DIV)); [ $H -lt 1 ] && H=1
         L=$((E * MIX_LIGHT_PER_EXEC))
         out=$(timeout 180 $D/client -url https://127.0.0.1:$SRV_PORT/sse -streams $((H * MIX_HEAVY_STREAMS)) -conns $H \
-          -light-conns $L -light-streams $MIX_LIGHT_STREAMS -churn-workers $MIX_CHURN -churn-url https://127.0.0.1:$SRV_PORT/ \
+          -light-conns $L -light-streams $MIX_LIGHT_STREAMS -churn-workers $MIX_CHURN -churn-pause-ms $MIX_CHURN_PAUSE_MS -churn-url https://127.0.0.1:$SRV_PORT/ \
           -stagger-ms $MIX_STAGGER_MS -interval-ms $INTERVAL -seconds $SECONDS_RUN -warmup 1 -label $arm 2>&1)
         thr=$(for t in /proc/$SRV_PID/task/*; do sed 's/^.*) //' $t/stat 2>/dev/null | awk '{print $12+$13}'; done | sort -rn | tr '\n' ',' | sed 's/,$//')
         cpu=$(awk '{print $14+$15}' /proc/$SRV_PID/stat 2>/dev/null)
-        echo "$out" | grep -E 'streams=|sse latency|NO EVENTS|sse fair|sse conns|churn conns|ended early|failed:' | sed "s/^/x$x $arm mix-e$W /"
-        echo "x$x $arm mix-e$W cpu executors=$E heavy=$H light=$L ticks=${cpu:-absent} threads=$thr"
+        echo "$out" | grep -E 'streams=|sse latency|NO EVENTS|sse fair|sse conns|churn conns|ended early|failed:' | sed "s/^/x$x $arm $MIX_LABEL-e$W /"
+        echo "x$x $arm $MIX_LABEL-e$W cpu executors=$E heavy=$H light=$L ticks=${cpu:-absent} threads=$thr"
         rows=$((rows+1))
       fi
       stop_srv
