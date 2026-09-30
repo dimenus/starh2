@@ -212,6 +212,79 @@ def burst():
 
 
 metrics_present = {m for (_, _, m) in rows}
+
+
+def ratio_cell(metric, name):
+    per_arm = defaultdict(dict)
+    for (rd, arm, m), d in rows.items():
+        if m == metric:
+            v = value(metric, name, d)
+            if v is not None:
+                per_arm[arm][rd] = v
+    ref = per_arm.get("WS", {})
+    def rs(arm):
+        return [per_arm[arm][r] / ref[r] for r in per_arm.get(arm, {}) if r in ref and ref[r] > 0]
+    aa = rs(AA)
+    lo, hi = (min(aa), max(aa)) if aa else (None, None)
+    cells = {}
+    for arm in arms:
+        if arm in ("WS", AA):
+            continue
+        r = rs(arm)
+        if not r:
+            cells[arm] = "-"
+            continue
+        m = statistics.median(r)
+        out = lo is not None and (m < lo or m > hi)
+        cells[arm] = f"{m:.2f}{'*' if out else ''}"
+    band = f"{lo:.2f}-{hi:.2f}" if aa else "-"
+    base = statistics.median(ref.values()) if ref else None
+    return band, base, cells
+
+
+def compact(spec):
+    others = [a for a in arms if a not in ("WS", AA)]
+    print("| shape / metric | WS median | A/A WS2/WS range | " + " | ".join(others) + " |")
+    print("|---|---:|---|" + "---:|" * len(others))
+    for metric, name, label in spec:
+        if metric not in metrics_present:
+            continue
+        if name == "classes":
+            c = defaultdict(lambda: defaultdict(int))
+            for (rd, arm, m), d in rows.items():
+                if m == metric:
+                    c[arm][classify(d)] += 1
+            def kn(a):
+                n = sum(c[a].values())
+                word = "p50>200us" if metric.startswith("mix") else "knee"
+                return f"{c[a]['knee']}/{n} {word}" + (f", {c[a]['partial']} partial" if c[a]['partial'] else "") + (f", {c[a]['failclosed']} failclosed" if c[a]['failclosed'] else "")
+            print(f"| {label} | {kn('WS')} | WS2 {kn(AA)} | " + " | ".join(kn(a) for a in others) + " |")
+            continue
+        if name == "stopped":
+            t = defaultdict(int)
+            seen = False
+            for (rd, arm, m), d in rows.items():
+                if m == metric:
+                    t[arm] += d.get("stopped", 0)
+                    seen = seen or "stopped" in d
+            if not seen:
+                # Rows from before the client printed `stopped=`: not
+                # measured, which is not the same as zero.
+                print(f"| {label} | not measured | - | " + " | ".join("-" for a in others) + " |")
+                continue
+            print(f"| {label} | {t['WS']} | WS2 {t[AA]} | " + " | ".join(str(t[a]) for a in others) + " |")
+            continue
+        band, base, cells = ratio_cell(metric, name)
+        print(f"| {label} | {base:.1f} | {band} | " + " | ".join(cells.get(a, "-") for a in others) + " |")
+
+
+if os.environ.get("COMPACT"):
+    spec = []
+    for line in os.environ["COMPACT"].split(";"):
+        m, n, l = line.split("|")
+        spec.append((m, n, l))
+    compact(spec)
+    sys.exit(0)
 classes("sse500")
 table("sse500", "p50", "p50 us")
 table("sse500", "p99", "p99 us")
