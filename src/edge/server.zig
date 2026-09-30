@@ -71,6 +71,10 @@ pub const ServerConfig = struct {
     routes: []const router_mod.Route,
     tls: ?TlsConfig,
     limits: limits_mod.Limits = .defaults,
+    /// Load-aware connection placement (pinned scheduling). The balancer
+    /// belongs to the runtime this server runs on and may be shared by every
+    /// server on it; it must outlive the server. See `balancer.zig`.
+    balancer: ?*connection.Balancer = null,
 };
 
 /// Observable progress of `serve` startup.
@@ -113,6 +117,7 @@ pub const Server = struct {
     /// Server-wide brotli encoder contexts. Present only when
     /// `limits.response_compression` is on; handlers borrow through ConnConfig.
     compression_pool: ?brotli.Pool = null,
+    balancer: ?*connection.Balancer = null,
     listeners_bound: usize = 0,
     bind_state: std.atomic.Value(BindState) = .init(.pending),
     bind_event: std.Io.Event = .unset,
@@ -221,6 +226,7 @@ pub const Server = struct {
             .reaper = reaper,
             .slabs = slabs,
             .compression_pool = compression_pool,
+            .balancer = config.balancer,
         };
         self.router = .{ .routes = self.routes };
         return self;
@@ -335,9 +341,7 @@ pub const Server = struct {
 
     fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
         defer _ = self.active_connections.fetchSub(1, .acq_rel);
-        defer if (config.exec_index) |ei| {
-            _ = connection.exec_live_conns[ei].fetchSub(1, .acq_rel);
-        };
+        defer if (config.balancer) |b| b.releaseConn(config.exec_index.?);
         connection.probeNote(.conn_entry);
         if (config.mode == .h1c) return h1.serve(stream, config, null, &.{});
         if (config.mode == .tls) return serveTlsThenBranch(stream, config);
@@ -486,9 +490,7 @@ pub const Server = struct {
                 }
                 handshake_held = true;
             }
-            const balanced = connection.balancePick();
-            const config: connection.ConnConfig = .{
-                .exec_index = balanced,
+            var config: connection.ConnConfig = .{
                 .io = self.io,
                 .mode = mode,
                 .limits = self.limits,
@@ -503,39 +505,32 @@ pub const Server = struct {
                 .compression_pool = if (self.compression_pool) |*pool| pool else null,
                 .handshake_held = handshake_held,
             };
-            // EXPERIMENT: load-aware placement (connection.conn_balance, off
-            // by default). Spawned outside connection_group, so shutdown does
-            // not drain it; see connection.balancePick.
-            if (balanced) |ei| {
-                _ = connection.exec_live_conns[ei].fetchAdd(1, .acq_rel);
-                if (zio.spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config })) |handle| {
-                    var h = handle;
-                    h.detach();
-                    continue;
-                } else |_| {
-                    _ = connection.exec_live_conns[ei].fetchSub(1, .acq_rel);
-                    if (handshake_held) self.accounting.releaseHandshake();
-                    _ = self.active_connections.fetchSub(1, .acq_rel);
-                    stream.close(self.io);
-                    continue;
+            // A placed connection joins connection_group like any other, so
+            // serve's drain and cancel cover it. Any spawn error (a placement
+            // the runtime refuses, a runtime shutting down) falls through to
+            // the plain group spawn below: a placement must never be the
+            // reason an accepted connection is closed.
+            if (self.balancer) |b| {
+                if (b.reserve()) |ei| {
+                    config.balancer = b;
+                    config.exec_index = ei;
+                    if (zio.Group.fromStd(connection_group).spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config })) |_| {
+                        continue;
+                    } else |_| {
+                        b.releaseConn(ei);
+                        config.balancer = null;
+                        config.exec_index = null;
+                    }
                 }
             }
             // Placement probe only (observe, pinned builds): place the
-            // connection on a chosen executor instead of zio's `.auto`. The
-            // task is detached from connection_group, so a probe server does
-            // not drain connections at shutdown; it is killed instead.
+            // connection on a chosen executor instead of zio's `.auto`, in
+            // the same group and with the same fallback.
             if (comptime connection.placement_check) {
                 if (connection.probeConnPlacement()) |placement| {
-                    if (zio.spawnInto(placement, connEntry, .{ self, stream, config })) |handle| {
-                        var h = handle;
-                        h.detach();
+                    if (zio.Group.fromStd(connection_group).spawnInto(placement, connEntry, .{ self, stream, config })) |_| {
                         continue;
-                    } else |_| {
-                        if (handshake_held) self.accounting.releaseHandshake();
-                        _ = self.active_connections.fetchSub(1, .acq_rel);
-                        stream.close(self.io);
-                        continue;
-                    }
+                    } else |_| {}
                 }
             }
             connection_group.concurrent(self.io, connEntry, .{ self, stream, config }) catch {

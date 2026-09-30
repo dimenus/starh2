@@ -611,6 +611,7 @@ const Args = struct {
     /// A/B knob: where a connection spawns its own tasks. Null keeps the
     /// build's `conn_placement`.
     spawn_placement: ?zio.Placement = null,
+    conn_balance: bool = false,
 };
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
@@ -672,13 +673,13 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
                 return error.InvalidSpawnPlacement;
             }
         } else if (std.mem.eql(u8, a, "--conn-balance")) {
-            // EXPERIMENT: load-aware connection placement (see
-            // connection.balancePick). Pinned or single_executor builds only.
+            // Load-aware connection placement (src/edge/balancer.zig).
+            // Pinned or single_executor builds only.
             if (conn_mod.zio_scheduling == .work_stealing) {
                 std.debug.print("--conn-balance needs -Dzio-scheduling=pinned or single_executor\n", .{});
                 return error.ConnBalanceNeedsPinnedBuild;
             }
-            conn_mod.conn_balance = true;
+            out.conn_balance = true;
         } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
             // Placement probe: every connection on executor 0 (same), or
             // alternating executors in accept order (split).
@@ -959,8 +960,9 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         sweeper.detach();
     }
     conn_mod.placement_override = args.spawn_placement;
-    // Same count the runtime was built with (`.exact` below in main).
-    conn_mod.conn_balance_executors = args.executors orelse starh2.physical_cpus.executorCount();
+    // One balancer for this runtime, sized by the runtime itself.
+    var balancer_storage: ?starh2.Balancer = if (args.conn_balance) try starh2.Balancer.init(gpa, rt) else null;
+    defer if (balancer_storage) |*b| b.deinit(gpa);
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;
@@ -999,6 +1001,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .endpoints = &.{ep},
         .routes = &routes,
         .tls = tls_cfg,
+        .balancer = if (balancer_storage) |*b| b else null,
     });
     defer server.deinit(server_gpa);
 
@@ -1009,7 +1012,9 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     // the moment it reads this, so it must never be printed on a timer. Port 0
     // binds a free port, and this line is how the harness learns which.
     const port = server.localAddress(0).getPort();
-    const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
+    // The runtime's real width: a single_executor build resolves any
+    // requested width to 1, and the harness sizes its shapes from this.
+    const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
         "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d}}}\n",
@@ -1024,7 +1029,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             @as(u8, @intFromBool(conn_mod.placement_check)),
             @tagName(conn_mod.probe_handler_force),
             @tagName(conn_mod.probe_conn_force),
-            @as(u8, @intFromBool(conn_mod.conn_balance)),
+            @as(u8, @intFromBool(balancer_storage != null)),
         },
     );
     defer gpa.free(ready);

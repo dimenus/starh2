@@ -925,11 +925,18 @@ fn dispatch(
         fn run(conn: *H1Conn) void {
             connection.notePlacement(conn.actor_thread);
             defer finishSlotFromTask(conn);
+            // Runs before finishSlotFromTask: after that the connection may
+            // reuse the slot, and the count belongs to this job.
+            defer if (conn.config.balancer) |b| b.noteHandlerEnd(conn.config.exec_index.?);
             runTaskBody(conn);
         }
     };
     self.offload_tls_io = self.tls_pump != null;
+    // Counted before the spawn, so a job that finishes at once still finds
+    // its count to release.
+    if (self.config.balancer) |b| b.noteHandlerStart(self.config.exec_index.?);
     const handle = zio.spawnInto(connection.connPlacement(), Job.run, .{self}) catch {
+        if (self.config.balancer) |b| b.noteHandlerEnd(self.config.exec_index.?);
         self.offload_tls_io = false;
         if (reaper_reserved) {
             if (self.config.accounting) |a| a.releaseReaper();

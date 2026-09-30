@@ -1,17 +1,13 @@
-//! Gates for the `--conn-balance` experiment (connection.balancePick).
+//! Gates for load-aware connection placement (src/edge/balancer.zig).
 //!
-//! Each test states the behaviour the balancer must have before it can be a
-//! default. At the time of writing every one of them FAILS: they are the
-//! reproductions of the defects the t-2502 reviews found, and
-//! captures/placement-followup/balance-defects.txt holds the run. They are a
-//! separate step (`test-balance-defects`), not part of `ci`, for that reason;
-//! when a fix lands, its test goes green and moves into `test-placement`.
+//! Each test states a behaviour the balancer must keep. They began as the
+//! reproductions of the defects the t-2502 reviews found (all six failed on
+//! 25b7192's experiment); they run in `test-placement`, which `ci` runs.
+//! "control: serve waits for connections when balancing is off" proves the
+//! shutdown instrument can tell the two states apart.
 //!
-//! The one control, "serve waits for connections when balancing is off",
-//! passes, so the shutdown instrument is shown to tell the two states apart.
-//!
-//! Needs `-Dzio-scheduling=pinned`: balancePick is compiled to `null` under
-//! work_stealing, and every test skips there.
+//! Needs `-Dzio-scheduling=pinned`: a Balancer refuses work stealing, and
+//! every test skips there.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -33,11 +29,23 @@ fn writeAll(stream: zio.net.Stream, bytes: []const u8) !void {
     }
 }
 
-fn resetBalance() void {
-    conn_mod.conn_balance = false;
-    conn_mod.conn_balance_executors = 0;
-    for (&conn_mod.exec_live_handlers) |*h| h.store(0, .release);
-    for (&conn_mod.exec_live_conns) |*c| c.store(0, .release);
+const Balancer = starh2.Balancer;
+
+/// A balancer with a chosen width, for the tests that exercise the pick
+/// itself or a width the runtime does not have. `Balancer.init` always takes
+/// the width from the runtime.
+fn widthBalancer(gpa: std.mem.Allocator, n: usize) !Balancer {
+    const conns = try gpa.alloc(std.atomic.Value(u32), n);
+    const handlers = try gpa.alloc(std.atomic.Value(u32), n);
+    for (conns) |*c| c.* = .init(0);
+    for (handlers) |*h| h.* = .init(0);
+    return .{ .conns = conns, .handlers = handlers };
+}
+
+fn sum(xs: []std.atomic.Value(u32)) u32 {
+    var t: u32 = 0;
+    for (xs) |*x| t += x.load(.acquire);
+    return t;
 }
 
 /// Records the thread each handler first ran on, per route owner.
@@ -120,13 +128,11 @@ fn testRuntime(gpa: std.mem.Allocator, executors: u8) !*zio.Runtime {
 /// busy-spins the actor (t-2652) and stalls every task on its executor,
 /// including the reaper workers `serve` waits for last, so a connection that
 /// ends with the drain holds `serve` up by accident. `target` pre-loads the
-/// handler counts of executors below it, so the balanced connection lands on
-/// executor `target`; every placement runs.
+/// connection counts of executors below it, so the balanced connection lands
+/// on executor `target`; every placement runs.
 fn runShutdownWaits(rt: *zio.Runtime, gpa: std.mem.Allocator, balance: bool, target: u8) !usize {
-    resetBalance();
-    defer resetBalance();
-    conn_mod.conn_balance = balance;
-    conn_mod.conn_balance_executors = shutdown_executors;
+    var bal = try Balancer.init(gpa, rt);
+    defer bal.deinit(gpa);
 
     var st: Stubborn = .{};
     const routes = [_]starh2.Route{
@@ -141,16 +147,17 @@ fn runShutdownWaits(rt: *zio.Runtime, gpa: std.mem.Allocator, balance: bool, tar
         .routes = &routes,
         .tls = null,
         .limits = limits,
+        .balancer = if (balance) &bal else null,
     });
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
-    for (conn_mod.exec_live_handlers[0..target]) |*h| _ = h.fetchAdd(1, .acq_rel);
+    for (bal.conns[0..target]) |*c| _ = c.fetchAdd(1, .acq_rel);
     var client = try openH2cSse(gpa, server.localAddress(0).getPort());
     defer client.close();
     try waitStreams(&server, 1, 5000);
-    for (conn_mod.exec_live_handlers[0..target]) |*h| _ = h.fetchSub(1, .acq_rel);
+    for (bal.conns[0..target]) |*c| _ = c.fetchSub(1, .acq_rel);
 
     const hold_ms = 2500;
     var releaser = try rt.spawn(releaseAfter, .{ &st.release, hold_ms });
@@ -203,15 +210,27 @@ test "balance: serve waits for balanced connections at shutdown" {
 
 test "balance: the pick can reach executors above 16" {
     if (!pinned) return error.SkipZigTest;
-    resetBalance();
-    defer resetBalance();
-    conn_mod.conn_balance = true;
-    conn_mod.conn_balance_executors = 24;
-    // Executors 0..15 each carry one task handler; 16..23 are empty.
-    for (conn_mod.exec_live_handlers[0..@min(16, conn_mod.exec_live_handlers.len)]) |*h| h.store(1, .release);
-    const pick = conn_mod.balancePick().?;
+    const gpa = std.testing.allocator;
+    var bal = try widthBalancer(gpa, 24);
+    defer bal.deinit(gpa);
+    // Executors 0..15 each carry one connection; 16..23 are empty.
+    for (bal.conns[0..16]) |*c| c.store(1, .release);
+    const pick = bal.reserve().?;
     std.debug.print("width: 24 executors, 0..15 busy, pick={d}\n", .{pick});
+    bal.releaseConn(pick);
+    for (bal.conns[0..16]) |*c| c.store(0, .release);
     try std.testing.expect(pick >= 16);
+}
+
+test "balance: the width is the runtime's" {
+    if (!pinned) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try testRuntime(gpa, 3);
+    defer rt.deinit();
+    var bal = try Balancer.init(gpa, rt);
+    defer bal.deinit(gpa);
+    try std.testing.expectEqual(rt.executors.items.len, bal.conns.len);
+    try std.testing.expectEqual(rt.executors.items.len, bal.handlers.len);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,11 +239,12 @@ test "balance: the pick can reach executors above 16" {
 // caller that sets conn_balance_executors by hand.
 // ---------------------------------------------------------------------------
 
+/// `bal` is two wide on a one-executor runtime, so the second connection's
+/// placement is refused by zio (InvalidPlacement): the server must fall back
+/// to its normal spawn and serve it.
 fn runNarrowRuntime(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    resetBalance();
-    defer resetBalance();
-    conn_mod.conn_balance = true;
-    conn_mod.conn_balance_executors = 2;
+    var bal = try widthBalancer(gpa, 2);
+    defer bal.deinit(gpa);
 
     var spot: HandlerSpot = .{};
     const routes = [_]starh2.Route{
@@ -234,6 +254,7 @@ fn runNarrowRuntime(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
         .routes = &routes,
         .tls = null,
+        .balancer = &bal,
     });
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
@@ -244,13 +265,13 @@ fn runNarrowRuntime(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var c1_open = true;
     defer if (c1_open) c1.close();
     try waitStreams(&server, 1, 5000);
-    // Executor 0 now has a handler, so the pick for the next connection is
+    // Executor 0 now has a connection, so the pick for the next one is
     // executor 1, which this runtime does not have.
     var c2 = try openH2cSse(gpa, port);
     var c2_open = true;
     defer if (c2_open) c2.close();
     const second = waitStreams(&server, 2, 3000);
-    std.debug.print("narrow runtime: executors=1 configured=2 streams open={d} (want 2)\n", .{server.accounting.active_streams.load(.acquire)});
+    std.debug.print("refused placement: runtime executors=1, balancer width=2, streams open={d} (want 2)\n", .{server.accounting.active_streams.load(.acquire)});
 
     c1.close();
     c1_open = false;
@@ -265,7 +286,7 @@ fn runNarrowRuntime(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try second;
 }
 
-test "balance: a runtime narrower than the configured width still serves every connection" {
+test "balance: a refused placement falls back and still serves the connection" {
     if (!pinned) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const rt = try testRuntime(gpa, 1);
@@ -281,20 +302,18 @@ test "balance: a runtime narrower than the configured width still serves every c
 
 test "balance: inline-only connections do not pile behind one idle task handler" {
     if (!pinned) return error.SkipZigTest;
-    resetBalance();
-    defer resetBalance();
-    conn_mod.conn_balance = true;
-    conn_mod.conn_balance_executors = 2;
+    const gpa = std.testing.allocator;
+    var bal = try widthBalancer(gpa, 2);
+    defer bal.deinit(gpa);
     // Executor 0: one connection with one mostly-sleeping SSE handler.
-    conn_mod.exec_live_handlers[0].store(1, .release);
-    conn_mod.exec_live_conns[0].store(1, .release);
+    bal.handlers[0].store(1, .release);
+    bal.conns[0].store(1, .release);
     // 100 connections that only ever run complete (inline) handlers arrive.
-    for (0..100) |_| {
-        const p = conn_mod.balancePick().?;
-        _ = conn_mod.exec_live_conns[p].fetchAdd(1, .acq_rel);
-    }
-    const c0 = conn_mod.exec_live_conns[0].load(.acquire);
-    const c1 = conn_mod.exec_live_conns[1].load(.acquire);
+    for (0..100) |_| _ = bal.reserve().?;
+    const c0 = bal.conns[0].load(.acquire);
+    const c1 = bal.conns[1].load(.acquire);
+    for (bal.conns) |*c| c.store(0, .release);
+    bal.handlers[0].store(0, .release);
     std.debug.print("inline pile-up: connections per executor = [{d}, {d}]\n", .{ c0, c1 });
     const spread = if (c0 > c1) c0 - c1 else c1 - c0;
     try std.testing.expect(spread <= 10);
@@ -305,10 +324,8 @@ test "balance: inline-only connections do not pile behind one idle task handler"
 // ---------------------------------------------------------------------------
 
 fn runH1Counted(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    resetBalance();
-    defer resetBalance();
-    conn_mod.conn_balance = true;
-    conn_mod.conn_balance_executors = 2;
+    var bal = try Balancer.init(gpa, rt);
+    defer bal.deinit(gpa);
 
     var spot: HandlerSpot = .{};
     const routes = [_]starh2.Route{
@@ -318,6 +335,7 @@ fn runH1Counted(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
         .routes = &routes,
         .tls = null,
+        .balancer = &bal,
     });
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
@@ -333,10 +351,8 @@ fn runH1Counted(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         if (nowNs() >= deadline) return error.HandlerNeverStarted;
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    var counted: u32 = 0;
-    for (&conn_mod.exec_live_handlers) |*h| counted += h.load(.acquire);
-    var conns: u32 = 0;
-    for (&conn_mod.exec_live_conns) |*c| conns += c.load(.acquire);
+    const counted = sum(bal.handlers);
+    const conns = sum(bal.conns);
     std.debug.print("h1: live H1 task handlers=1, counted by the balancer={d}, balanced connections={d}\n", .{ counted, conns });
 
     client.close();
@@ -376,6 +392,8 @@ const ServerB = struct {
 };
 
 fn serveB(rt: *zio.Runtime, gpa: std.mem.Allocator, b: *ServerB) !void {
+    var bal = try Balancer.init(gpa, rt);
+    defer bal.deinit(gpa);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = &b.spot, .runFn = hangSse } } },
     };
@@ -383,6 +401,7 @@ fn serveB(rt: *zio.Runtime, gpa: std.mem.Allocator, b: *ServerB) !void {
         .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
         .routes = &routes,
         .tls = null,
+        .balancer = &bal,
     });
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
@@ -420,10 +439,8 @@ fn runtimeBThread(gpa: std.mem.Allocator, b: *ServerB) void {
 }
 
 fn runTwoRuntimes(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    resetBalance();
-    defer resetBalance();
-    conn_mod.conn_balance = true;
-    conn_mod.conn_balance_executors = 2;
+    var bal = try Balancer.init(gpa, rt);
+    defer bal.deinit(gpa);
 
     var spot: HandlerSpot = .{};
     const routes = [_]starh2.Route{
@@ -433,6 +450,7 @@ fn runTwoRuntimes(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
         .routes = &routes,
         .tls = null,
+        .balancer = &bal,
     });
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
