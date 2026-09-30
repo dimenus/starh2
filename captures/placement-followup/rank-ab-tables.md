@@ -92,25 +92,25 @@
 
 | shape / metric | WS median | A/A WS2/WS range | PLC | PLH | PLS |
 |---|---:|---|---:|---:|---:|
-| mixm-e8 heavy saturation, rounds and conns with p50 over 200us | 0/7 sat (0/14 conns), 0 partial | WS2 0/7 sat (0/14 conns), 0 partial | 0/7 sat (0/14 conns), 0 partial | 0/7 sat (0/14 conns), 0 partial | 0/7 sat (0/14 conns), 0 partial |
+| mixm-e8 heavy saturation, rounds and conns with p50 over 200us | 0/10 sat (0/20 conns), 0 partial | WS2 0/10 sat (0/20 conns), 0 partial | 0/10 sat (0/20 conns), 0 partial | 0/10 sat (0/20 conns), 0 partial | 0/10 sat (0/20 conns), 0 partial |
 | mixm-e8 churn on heavy executors, median share | - | WS2 - | 0.00 (uniform 0.25), shared 0 | 0.00 (uniform 0.25), shared 0 | 0.00 (uniform 0.25), shared 0 |
-| mixm-e8 worst heavy conn p99 | 95.0 | 0.59-4.42 | 0.50* (n=7) | 0.50* (n=7) | 0.51* (n=7) |
-| mixm-e8 worst heavy conn p99, complete-delivery pairs | 95.0 | 0.59-4.42 | 0.50* (n=7) | 0.50* (n=7) | 0.51* (n=7) |
-| mixm-e8 worst light conn p99 | 57.0 | 0.80-1.36 | 0.68* (n=7) | 0.71* (n=7) | 0.78* (n=7) |
-| mixm-e8 worst light conn p99, complete-delivery pairs | 57.0 | 0.80-1.36 | 0.68* (n=7) | 0.71* (n=7) | 0.78* (n=7) |
-| mixm-e8 CPU/event | 6.9 | 0.84-1.23 | 0.43* (n=7) | 0.43* (n=7) | 0.42* (n=7) |
-| mixm-e8 CPU/event, complete-delivery pairs | 6.9 | 0.84-1.23 | 0.43* (n=7) | 0.43* (n=7) | 0.42* (n=7) |
-| mixm-e8 churn requests (higher better) | 9660.0 | 1.00-1.01 | 1.00 (n=7) | 1.00 (n=7) | 1.00 (n=7) |
-| mixm-e8 churn requests (higher better), complete-delivery pairs | 9660.0 | 1.00-1.01 | 1.00 (n=7) | 1.00 (n=7) | 1.00 (n=7) |
+| mixm-e8 worst heavy conn p99 | 410.0 | 0.32-4.42 | 0.15* (n=10) | 0.15* (n=10) | 0.12* (n=10) |
+| mixm-e8 worst heavy conn p99, complete-delivery pairs | 410.0 | 0.32-4.42 | 0.15* (n=10) | 0.15* (n=10) | 0.12* (n=10) |
+| mixm-e8 worst light conn p99 | 59.0 | 0.77-1.36 | 0.70* (n=10) | 0.74* (n=10) | 0.64* (n=10) |
+| mixm-e8 worst light conn p99, complete-delivery pairs | 59.0 | 0.77-1.36 | 0.70* (n=10) | 0.74* (n=10) | 0.64* (n=10) |
+| mixm-e8 CPU/event | 7.4 | 0.84-1.23 | 0.40* (n=10) | 0.39* (n=10) | 0.39* (n=10) |
+| mixm-e8 CPU/event, complete-delivery pairs | 7.4 | 0.84-1.23 | 0.40* (n=10) | 0.39* (n=10) | 0.39* (n=10) |
+| mixm-e8 churn requests (higher better) | 9660.0 | 1.00-1.01 | 1.00 (n=10) | 1.00 (n=10) | 1.00 (n=10) |
+| mixm-e8 churn requests (higher better), complete-delivery pairs | 9660.0 | 1.00-1.01 | 1.00 (n=10) | 1.00 (n=10) | 1.00 (n=10) |
 | mixm-e8 stopped streams (sum) | 0 | WS2 0 | 0 | 0 | 0 |
-| mixm-eprod heavy saturation, rounds and conns with p50 over 200us | 5/7 sat (10/21 conns), 0 partial | WS2 3/7 sat (9/21 conns), 0 partial | 0/7 sat (0/21 conns), 0 partial | 0/7 sat (0/21 conns), 0 partial | 0/7 sat (0/21 conns), 0 partial |
-| mixm-eprod churn on heavy executors, median share | - | WS2 - | 0.00 (uniform 0.25), shared 0 | 0.01 (uniform 0.25), shared 0 | 0.00 (uniform 0.25), shared 0 |
-| mixm-eprod worst heavy conn p99 | 1354.0 | 0.89-1.11 | 0.07* (n=7) | 0.07* (n=7) | 0.07* (n=7) |
-| mixm-eprod worst heavy conn p99, complete-delivery pairs | 1354.0 | 0.89-1.11 | 0.07* (n=7) | 0.07* (n=7) | 0.07* (n=7) |
-| mixm-eprod worst light conn p99 | 119.0 | 0.61-1.65 | 0.51* (n=7) | 0.61* (n=7) | 0.54* (n=7) |
-| mixm-eprod worst light conn p99, complete-delivery pairs | 119.0 | 0.61-1.65 | 0.51* (n=7) | 0.61* (n=7) | 0.54* (n=7) |
-| mixm-eprod CPU/event | 8.1 | 0.99-1.02 | 0.41* (n=7) | 0.40* (n=7) | 0.40* (n=7) |
-| mixm-eprod CPU/event, complete-delivery pairs | 8.1 | 0.99-1.02 | 0.41* (n=7) | 0.40* (n=7) | 0.40* (n=7) |
-| mixm-eprod churn requests (higher better) | 9640.0 | 1.00-1.00 | 1.00* (n=7) | 1.01* (n=7) | 1.01* (n=7) |
-| mixm-eprod churn requests (higher better), complete-delivery pairs | 9640.0 | 1.00-1.00 | 1.00* (n=7) | 1.01* (n=7) | 1.01* (n=7) |
+| mixm-eprod heavy saturation, rounds and conns with p50 over 200us | 8/10 sat (19/30 conns), 0 partial | WS2 6/10 sat (15/30 conns), 0 partial | 0/10 sat (0/30 conns), 0 partial | 0/10 sat (0/30 conns), 0 partial | 0/10 sat (0/30 conns), 0 partial |
+| mixm-eprod churn on heavy executors, median share | - | WS2 - | 0.00 (uniform 0.25), shared 0 | 0.00 (uniform 0.25), shared 0 | 0.00 (uniform 0.25), shared 0 |
+| mixm-eprod worst heavy conn p99 | 1377.0 | 0.89-1.11 | 0.07* (n=10) | 0.06* (n=10) | 0.06* (n=10) |
+| mixm-eprod worst heavy conn p99, complete-delivery pairs | 1377.0 | 0.89-1.11 | 0.07* (n=10) | 0.06* (n=10) | 0.06* (n=10) |
+| mixm-eprod worst light conn p99 | 121.0 | 0.61-1.65 | 0.52* (n=10) | 0.53* (n=10) | 0.54* (n=10) |
+| mixm-eprod worst light conn p99, complete-delivery pairs | 121.0 | 0.61-1.65 | 0.52* (n=10) | 0.53* (n=10) | 0.54* (n=10) |
+| mixm-eprod CPU/event | 8.1 | 0.99-1.02 | 0.41* (n=10) | 0.39* (n=10) | 0.40* (n=10) |
+| mixm-eprod CPU/event, complete-delivery pairs | 8.1 | 0.99-1.02 | 0.41* (n=10) | 0.39* (n=10) | 0.40* (n=10) |
+| mixm-eprod churn requests (higher better) | 9630.0 | 1.00-1.00 | 1.00* (n=10) | 1.01* (n=10) | 1.01* (n=10) |
+| mixm-eprod churn requests (higher better), complete-delivery pairs | 9630.0 | 1.00-1.00 | 1.00* (n=10) | 1.01* (n=10) | 1.01* (n=10) |
 | mixm-eprod stopped streams (sum) | 0 | WS2 0 | 0 | 0 | 0 |

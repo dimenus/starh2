@@ -2942,3 +2942,1107 @@ HOST-BUSY-WAIT before mix round 8: 1.57 cores busy; waiting 30 s (waited 4350s s
       1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.46 systemd
       2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
       3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.25 limit=0.5 top_process_cores=1.05 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.25 cores busy; waiting 30 s (waited 4380s so far)
+-- host check before mix round 8 --
+ 16:31:22 up 2 days, 18 min,  2 users,  load average: 2.47, 2.52, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7450336   3.6g 401532 S 132.3  12.0 103:42.91 WowB.exe
+1213911 ryan      20   0 2284072 321088  37740 S  14.7   1.0  11:37.16 CrBrowserMain
+1213008 ryan      20   0   26896  23708   2700 S   4.9   0.1   6:14.35 wineserver
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.46 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.65 limit=0.5 top_process_cores=1.45 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.65 cores busy; waiting 30 s (waited 4410s so far)
+-- host check before mix round 8 --
+ 16:31:58 up 2 days, 19 min,  2 users,  load average: 2.50, 2.53, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7406528   3.6g 401532 S 185.6  11.9 104:31.42 WowB.exe
+1213008 ryan      20   0   26896  23708   2700 S  14.7   0.1   6:16.07 wineserver
+1213911 ryan      20   0 2284072 321168  37740 S   9.8   1.0  11:41.28 CrBrowserMain
+   1413 root      20   0 3127660 111368  25812 S   4.9   0.4   2:55.23 tailscaled
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:03.78 qemu-system-x86
+   2331 ryan      20   0 1215204 127160  93708 S   4.9   0.4   1:17.17 Xwayland
+busy_cores=1.93 limit=0.5 top_process_cores=1.73 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.93 cores busy; waiting 30 s (waited 4440s so far)
+-- host check before mix round 8 --
+ 16:32:33 up 2 days, 19 min,  2 users,  load average: 2.49, 2.52, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7400992   3.6g 401532 S 107.7  11.9 105:24.70 WowB.exe
+1213008 ryan      20   0   26896  23708   2700 S   4.9   0.1   6:17.59 wineserver
+1213911 ryan      20   0 2284072 321080  37740 S   4.9   1.0  11:44.11 CrBrowserMain
+1214107 ryan      20   0 2541888 207352  35704 S   4.9   0.7   2:31.41 CrGpuMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.46 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.68 limit=0.5 top_process_cores=1.44 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.68 cores busy; waiting 30 s (waited 4470s so far)
+-- host check before mix round 8 --
+ 16:33:09 up 2 days, 20 min,  2 users,  load average: 2.43, 2.50, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7406344   3.6g 401596 R 219.9  11.9 106:10.13 WowB.exe
+1213008 ryan      20   0   26896  23708   2700 R  14.7   0.1   6:19.34 wineserver
+1213911 ryan      20   0 2284072 321080  37740 S  14.7   1.0  11:45.76 CrBrowserMain
+1213209 ryan      20   0 1893280  90360  46340 S   4.9   0.3   0:46.50 xalia.exe
+1214655 ryan      20   0 2008616 223064  15252 S   4.9   0.7   4:59.65 CrRendererMain
+1331162 ryan      20   0  823448  75352  28460 S   4.9   0.2   0:40.91 WowVoiceProxyT.
+busy_cores=2.09 limit=0.5 top_process_cores=1.89 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.09 cores busy; waiting 30 s (waited 4500s so far)
+-- host check before mix round 8 --
+ 16:33:44 up 2 days, 20 min,  2 users,  load average: 2.68, 2.54, 2.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7607784   3.8g 401612 S 191.1  12.4 107:08.49 WowB.exe
+1213911 ryan      20   0 2284072 321080  37740 S   9.8   1.0  11:50.33 CrBrowserMain
+   1216 systemd+  20   0    9684   5940   5296 S   4.9   0.0   1:12.45 systemd-oomd
+1213209 ryan      20   0 1893280  90360  46340 S   4.9   0.3   0:46.71 xalia.exe
+1214655 ryan      20   0 2008616 225688  15252 S   4.9   0.7   5:01.09 CrRendererMain
+1265308 root      20   0       0      0      0 D   4.9   0.0   0:00.88 kworker/u98:7+events_unbound
+busy_cores=1.75 limit=0.5 top_process_cores=1.53 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.75 cores busy; waiting 30 s (waited 4530s so far)
+-- host check before mix round 8 --
+ 16:34:20 up 2 days, 21 min,  2 users,  load average: 2.75, 2.59, 2.43
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7550232   3.7g 401612 S 278.7  12.3 108:06.07 WowB.exe
+1213008 ryan      20   0   26896  23708   2700 S  14.7   0.1   6:22.53 wineserver
+   2036 ryan      20   0 2244704 180676 117644 R   4.9   0.6   4:30.74 Hyprland
+1213038 ryan      20   0  659492  20076  17656 S   4.9   0.1   0:27.05 winedevice.exe
+1213911 ryan      20   0 2284072 321080  37740 S   4.9   1.0  11:53.53 CrBrowserMain
+1214655 ryan      20   0 2008616 222960  15252 S   4.9   0.7   5:02.55 CrRendererMain
+busy_cores=2.35 limit=0.5 top_process_cores=2.13 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.35 cores busy; waiting 30 s (waited 4560s so far)
+-- host check before mix round 8 --
+ 16:34:55 up 2 days, 21 min,  2 users,  load average: 4.01, 2.89, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7555968   3.7g 401616 R 195.9  12.4 109:19.57 WowB.exe
+   2036 ryan      20   0 2244704 180676 117644 S   9.8   0.6   4:31.78 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:07.37 qemu-system-x86
+1213008 ryan      20   0   26896  23708   2700 S   4.9   0.1   6:24.27 wineserver
+1345601 root      20   0       0      0      0 I   4.9   0.0   0:07.85 kworker/13:2-events
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.46 systemd
+busy_cores=2.46 limit=0.5 top_process_cores=2.10 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.46 cores busy; waiting 30 s (waited 4590s so far)
+-- host check before mix round 8 --
+ 16:35:31 up 2 days, 22 min,  2 users,  load average: 3.12, 2.81, 2.53
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7389640   3.6g 401620 R 151.8  11.8 110:11.06 WowB.exe
+1213911 ryan      20   0 2284072 321080  37740 S  14.7   1.0  11:59.33 CrBrowserMain
+1213008 ryan      20   0   26896  23708   2700 S   9.8   0.1   6:25.79 wineserver
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:08.12 qemu-system-x86
+   3909 ryan      20   0 2033204 373524   4716 S   4.9   1.2  51:18.39 qmdsync-tasks
+1213209 ryan      20   0 1893280  90360  46340 S   4.9   0.3   0:47.33 xalia.exe
+busy_cores=1.63 limit=0.5 top_process_cores=1.45 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.63 cores busy; waiting 30 s (waited 4620s so far)
+-- host check before mix round 8 --
+ 16:36:07 up 2 days, 23 min,  2 users,  load average: 2.62, 2.72, 2.51
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7411752   3.6g 401620 R 190.5  11.9 111:07.78 WowB.exe
+1213911 ryan      20   0 2284072 321080  37740 S   9.8   1.0  12:03.06 CrBrowserMain
+1214655 ryan      20   0 2008616 224028  15252 S   9.8   0.7   5:06.85 CrRendererMain
+   2036 ryan      20   0 2244704 180676 117644 S   4.9   0.6   4:34.04 Hyprland
+   2331 ryan      20   0 1215204 127160  93708 S   4.9   0.4   1:19.57 Xwayland
+1213008 ryan      20   0   26896  23708   2700 S   4.9   0.1   6:27.62 wineserver
+busy_cores=2.37 limit=0.5 top_process_cores=2.16 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.37 cores busy; waiting 30 s (waited 4650s so far)
+-- host check before mix round 8 --
+ 16:36:42 up 2 days, 23 min,  2 users,  load average: 2.46, 2.67, 2.50
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7449880   3.6g 401620 S  93.1  12.0 112:02.19 WowB.exe
+   2036 ryan      20   0 2244704 180676 117644 S   4.9   0.6   4:35.21 Hyprland
+   2607 ryan      20   0  395096  34204  21868 S   4.9   0.1   0:07.78 fcitx5
+1214107 ryan      20   0 2541888 207352  35704 S   4.9   0.7   2:36.15 CrGpuMain
+1214655 ryan      20   0 2008616 225720  15252 S   4.9   0.7   5:08.25 CrRendererMain
+1367984 ryan      20   0 1448.5g 265048 145176 S   4.9   0.8   0:32.91 chromium
+busy_cores=1.39 limit=0.5 top_process_cores=1.18 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.39 cores busy; waiting 30 s (waited 4680s so far)
+-- host check before mix round 8 --
+ 16:37:18 up 2 days, 24 min,  2 users,  load average: 2.42, 2.63, 2.49
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7475816   3.7g 401624 S 191.1  12.1 112:54.81 WowB.exe
+1213911 ryan      20   0 2284072 321152  37740 S  14.7   1.0  12:08.21 CrBrowserMain
+   1326 root      20   0   17872  11172   7456 S   4.9   0.0   0:28.79 python3
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:10.32 qemu-system-x86
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:30.96 wineserver
+1214655 ryan      20   0 2008616 223408  15256 S   4.9   0.7   5:09.67 CrRendererMain
+busy_cores=1.89 limit=0.5 top_process_cores=1.74 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.89 cores busy; waiting 30 s (waited 4710s so far)
+-- host check before mix round 8 --
+ 16:37:53 up 2 days, 24 min,  2 users,  load average: 2.89, 2.75, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7605088   3.8g 401624 S 122.4  12.5 113:53.94 WowB.exe
+1213911 ryan      20   0 2284072 321152  37740 S  14.7   1.0  12:12.42 CrBrowserMain
+   2036 ryan      20   0 2244704 180676 117644 S   4.9   0.6   4:37.15 Hyprland
+   2617 ryan      20   0 1737012 167708  11488 S   4.9   0.5   1:38.57 voxtype
+   3617 root      20   0  480796  18684  14244 S   4.9   0.1   0:13.94 udisksd
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:32.62 wineserver
+busy_cores=1.93 limit=0.5 top_process_cores=1.79 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.93 cores busy; waiting 30 s (waited 4740s so far)
+-- host check before mix round 8 --
+ 16:38:29 up 2 days, 25 min,  2 users,  load average: 2.77, 2.73, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7495056   3.7g 401628 R 200.8  12.1 115:14.32 WowB.exe
+   2036 ryan      20   0 2244704 180676 117644 S   4.9   0.6   4:38.25 Hyprland
+   2331 ryan      20   0 1215204 127160  93708 S   4.9   0.4   1:20.82 Xwayland
+   2607 ryan      20   0  395096  34204  21868 S   4.9   0.1   0:07.83 fcitx5
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:34.20 wineserver
+1213911 ryan      20   0 2284072 321152  37740 S   4.9   1.0  12:15.33 CrBrowserMain
+busy_cores=2.46 limit=0.5 top_process_cores=2.27 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.46 cores busy; waiting 30 s (waited 4770s so far)
+-- host check before mix round 8 --
+ 16:39:04 up 2 days, 26 min,  2 users,  load average: 2.86, 2.77, 2.56
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7628072   3.8g 401684 R 283.6  12.6 116:35.49 WowB.exe
+1213911 ryan      20   0 2284072 321152  37740 S  14.7   1.0  12:17.07 CrBrowserMain
+   2036 ryan      20   0 2244704 180676 117644 S   4.9   0.6   4:39.62 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:12.56 qemu-system-x86
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:36.05 wineserver
+1214655 ryan      20   0 2008616 223720  15256 S   4.9   0.7   5:14.15 CrRendererMain
+busy_cores=3.36 limit=0.5 top_process_cores=3.21 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 3.36 cores busy; waiting 30 s (waited 4800s so far)
+-- host check before mix round 8 --
+ 16:39:40 up 2 days, 26 min,  2 users,  load average: 3.49, 2.96, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7497376   3.7g 401684 R 239.8  12.1 118:00.43 WowB.exe
+1213911 ryan      20   0 2284072 321152  37740 S   9.8   1.0  12:21.84 CrBrowserMain
+   1528 ryan      20   0  118060  25552   8700 S   4.9   0.1   0:40.40 pipewire-pulse
+   2036 ryan      20   0 2244704 180676 117644 S   4.9   0.6   4:40.94 Hyprland
+1214107 ryan      20   0 2541888 207352  35704 S   4.9   0.7   2:39.66 CrGpuMain
+1214655 ryan      20   0 2008616 225868  15256 S   4.9   0.7   5:15.70 CrRendererMain
+busy_cores=2.62 limit=0.5 top_process_cores=2.43 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.62 cores busy; waiting 30 s (waited 4830s so far)
+-- host check before mix round 8 --
+ 16:40:16 up 2 days, 27 min,  2 users,  load average: 3.07, 2.93, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7523688   3.7g 401684 S 141.7  12.2 118:59.94 WowB.exe
+   2036 ryan      20   0 2245600 180676 117644 S   4.9   0.6   4:41.86 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:14.05 qemu-system-x86
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:39.43 wineserver
+1213209 ryan      20   0 1893280  90360  46340 S   4.9   0.3   0:49.02 xalia.exe
+1213911 ryan      20   0 2284072 321156  37744 S   4.9   1.0  12:25.18 CrBrowserMain
+busy_cores=1.30 limit=0.5 top_process_cores=1.12 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.30 cores busy; waiting 30 s (waited 4860s so far)
+-- host check before mix round 8 --
+ 16:40:51 up 2 days, 27 min,  2 users,  load average: 3.13, 2.96, 2.66
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7459328   3.6g 401684 S 102.9  12.0 119:46.76 WowB.exe
+   1290 root      20   0       0      0      0 S   4.9   0.0   0:10.40 xfsaild/nvme1n1p1
+1213911 ryan      20   0 2284072 321156  37744 S   4.9   1.0  12:27.07 CrBrowserMain
+1214107 ryan      20   0 2541888 207352  35704 S   4.9   0.7   2:40.96 CrGpuMain
+1214655 ryan      20   0 2008616 224152  15256 S   4.9   0.7   5:18.45 CrRendererMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+busy_cores=1.63 limit=0.5 top_process_cores=1.34 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.63 cores busy; waiting 30 s (waited 4890s so far)
+-- host check before mix round 8 --
+ 16:41:27 up 2 days, 28 min,  2 users,  load average: 2.62, 2.85, 2.63
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7452992   3.6g 401684 R 102.9  12.0 120:32.54 WowB.exe
+1213911 ryan      20   0 2284072 321156  37744 S   9.8   1.0  12:30.77 CrBrowserMain
+   2036 ryan      20   0 2243552 180676 117644 S   4.9   0.6   4:43.66 Hyprland
+1326751 root      20   0       0      0      0 D   4.9   0.0   0:02.93 kworker/u97:12+events_unbound
+1331162 ryan      20   0  823448  75352  28460 S   4.9   0.2   0:44.80 WowVoiceProxyT.
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+busy_cores=1.46 limit=0.5 top_process_cores=1.32 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.46 cores busy; waiting 30 s (waited 4920s so far)
+-- host check before mix round 8 --
+ 16:42:02 up 2 days, 29 min,  2 users,  load average: 2.41, 2.78, 2.62
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7503464   3.7g 401688 S 107.6  12.2 121:17.09 WowB.exe
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:44.07 wineserver
+1213274 ryan      20   0 2174332  74336  27680 S   4.9   0.2   0:37.98 Agent.exe
+1213911 ryan      20   0 2284072 321156  37744 S   4.9   1.0  12:34.40 CrBrowserMain
+1214655 ryan      20   0 2008616 223116  15256 S   4.9   0.7   5:21.10 CrRendererMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+busy_cores=1.39 limit=0.5 top_process_cores=1.20 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.39 cores busy; waiting 30 s (waited 4950s so far)
+-- host check before mix round 8 --
+ 16:42:38 up 2 days, 29 min,  2 users,  load average: 3.03, 2.90, 2.66
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7538904   3.7g 401688 R  92.9  12.3 121:57.58 WowB.exe
+   1521 ryan      20   0  111628  21032   8920 S   4.9   0.1   0:14.21 pipewire
+1213911 ryan      20   0 2284072 321156  37744 S   4.9   1.0  12:36.69 CrBrowserMain
+1214282 ryan      20   0 2013072 226836  15176 S   4.9   0.7   0:15.31 CrRendererMain
+1525186 root      20   0       0      0      0 I   4.9   0.0   0:00.85 kworker/u96:3-gfx_0.0.0
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+busy_cores=1.40 limit=0.5 top_process_cores=1.13 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.40 cores busy; waiting 30 s (waited 4980s so far)
+-- host check before mix round 8 --
+ 16:43:13 up 2 days, 30 min,  2 users,  load average: 3.02, 2.91, 2.68
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7453328   3.6g 401688 R  98.0  12.0 122:35.62 WowB.exe
+   2036 ryan      20   0 2243552 180676 117644 S   9.8   0.6   4:46.09 Hyprland
+1213008 ryan      20   0   26896  23712   2704 S   9.8   0.1   6:47.10 wineserver
+1213911 ryan      20   0 2284072 321156  37744 S   9.8   1.0  12:39.31 CrBrowserMain
+1213209 ryan      20   0 1893280  90360  46340 S   4.9   0.3   0:49.96 xalia.exe
+1214655 ryan      20   0 2008616 222620  15256 S   4.9   0.7   5:23.72 CrRendererMain
+busy_cores=1.34 limit=0.5 top_process_cores=1.20 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.34 cores busy; waiting 30 s (waited 5010s so far)
+-- host check before mix round 8 --
+ 16:43:49 up 2 days, 30 min,  2 users,  load average: 3.09, 2.93, 2.69
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7600936   3.8g 401688 R 156.7  12.4 123:29.62 WowB.exe
+1213911 ryan      20   0 2284072 321156  37744 S  14.7   1.0  12:43.42 CrBrowserMain
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:18.23 qemu-system-x86
+   2331 ryan      20   0 1215204 127160  93708 S   4.9   0.4   1:23.42 Xwayland
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:48.68 wineserver
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+busy_cores=1.85 limit=0.5 top_process_cores=1.64 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.85 cores busy; waiting 30 s (waited 5040s so far)
+-- host check before mix round 8 --
+ 16:44:25 up 2 days, 31 min,  2 users,  load average: 2.84, 2.87, 2.68
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7470512   3.6g 401688 R 107.7  12.1 124:22.02 WowB.exe
+   2036 ryan      20   0 2243552 180676 117644 S   4.9   0.6   4:48.00 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:18.95 qemu-system-x86
+1214655 ryan      20   0 2008616 223160  15256 S   4.9   0.7   5:26.51 CrRendererMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.66 limit=0.5 top_process_cores=1.43 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.66 cores busy; waiting 30 s (waited 5070s so far)
+-- host check before mix round 8 --
+ 16:45:00 up 2 days, 32 min,  2 users,  load average: 2.61, 2.81, 2.66
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7460856   3.6g 401688 R 132.0  12.0 125:10.92 WowB.exe
+1213911 ryan      20   0 2284072 321156  37744 S  19.6   1.0  12:47.89 CrBrowserMain
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:19.66 qemu-system-x86
+   3909 ryan      20   0 2033204 373524   4716 S   4.9   1.2  51:25.23 qmdsync-tasks
+1213008 ryan      20   0   26896  23712   2704 S   4.9   0.1   6:51.82 wineserver
+1214655 ryan      20   0 2008616 224140  15256 S   4.9   0.7   5:27.83 CrRendererMain
+busy_cores=1.59 limit=0.5 top_process_cores=1.44 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.59 cores busy; waiting 30 s (waited 5100s so far)
+-- host check before mix round 8 --
+ 16:45:36 up 2 days, 32 min,  2 users,  load average: 3.33, 2.96, 2.72
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7473632   3.6g 401688 S 117.4  12.1 125:55.36 WowB.exe
+   3909 ryan      20   0 2048684 388132   4716 S  39.1   1.2  51:29.06 qmdsync-tasks
+1213911 ryan      20   0 2284072 321156  37744 S  14.7   1.0  12:52.43 CrBrowserMain
+   2036 ryan      20   0 2243552 180676 117644 S   4.9   0.6   4:49.80 Hyprland
+   2331 ryan      20   0 1215204 127160  93708 S   4.9   0.4   1:24.29 Xwayland
+1214655 ryan      20   0 2008616 223668  15256 S   4.9   0.7   5:29.16 CrRendererMain
+busy_cores=1.94 limit=0.5 top_process_cores=1.35 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.94 cores busy; waiting 30 s (waited 5130s so far)
+-- host check before mix round 8 --
+ 16:46:11 up 2 days, 33 min,  2 users,  load average: 2.83, 2.87, 2.70
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7465056   3.6g 401688 R  78.4  12.0 126:39.75 WowB.exe
+1558876 ryan      30  10   13.5g 530776 306120 S  34.3   1.7   0:01.59 bun
+   3153 ryan      20   0 2001320 122908  96400 S   4.9   0.4   2:39.48 voxtype-osd-gtk
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   6:54.97 wineserver
+1213911 ryan      20   0 2284072 319664  37652 S   4.9   1.0  12:55.66 CrBrowserMain
+1214655 ryan      20   0 2008616 222604  15200 S   4.9   0.7   5:30.48 CrRendererMain
+busy_cores=1.46 limit=0.5 top_process_cores=0.94 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.46 cores busy; waiting 30 s (waited 5160s so far)
+-- host check before mix round 8 --
+ 16:46:47 up 2 days, 33 min,  2 users,  load average: 2.13, 2.69, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7460520   3.6g 401688 S  98.0  12.0 127:17.24 WowB.exe
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   4:51.58 Hyprland
+   3909 ryan      20   0 2033268 324444   4716 S   4.9   1.0  51:32.95 qmdsync-tasks
+1213209 ryan      20   0 1893280  89368  46340 S   4.9   0.3   0:51.11 xalia.exe
+1214655 ryan      20   0 2008616 224112  15200 S   4.9   0.7   5:31.78 CrRendererMain
+1539535 root      20   0       0      0      0 I   4.9   0.0   0:00.85 kworker/u96:0-gfx_0.0.0
+busy_cores=1.55 limit=0.5 top_process_cores=1.28 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.55 cores busy; waiting 30 s (waited 5190s so far)
+-- host check before mix round 8 --
+ 16:47:22 up 2 days, 34 min,  2 users,  load average: 2.11, 2.63, 2.62
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7465560   3.7g 401688 S  98.0  12.1 127:56.75 WowB.exe
+1213911 ryan      20   0 2284072 319656  37652 S   9.8   1.0  13:01.27 CrBrowserMain
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   4:52.42 Hyprland
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.50 limit=0.5 top_process_cores=1.23 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.50 cores busy; waiting 30 s (waited 5220s so far)
+-- host check before mix round 8 --
+ 16:47:58 up 2 days, 35 min,  2 users,  load average: 2.68, 2.75, 2.66
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7474032   3.7g 401688 S 112.7  12.1 128:38.40 WowB.exe
+   2036 ryan      20   0 2243552 174056 117644 S   9.8   0.5   4:53.39 Hyprland
+1213911 ryan      20   0 2284072 319656  37652 S   9.8   1.0  13:04.78 CrBrowserMain
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:23.15 qemu-system-x86
+1213274 ryan      20   0 2174332  73964  27672 S   4.9   0.2   0:38.78 Agent.exe
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.48 systemd
+busy_cores=1.37 limit=0.5 top_process_cores=1.21 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.37 cores busy; waiting 30 s (waited 5250s so far)
+-- host check before mix round 8 --
+ 16:48:34 up 2 days, 35 min,  2 users,  load average: 2.37, 2.66, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7466688   3.7g 401688 S 127.4  12.1 129:24.23 WowB.exe
+   1216 systemd+  20   0    9684   5940   5296 S   4.9   0.0   1:12.84 systemd-oomd
+1210684 ryan      20   0 1632120 465240 173568 S   4.9   1.5   0:04.32 quickshell
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:00.95 wineserver
+1213911 ryan      20   0 2284072 319656  37652 S   4.9   1.0  13:06.99 CrBrowserMain
+1214107 ryan      20   0 2541888 206336  35700 S   4.9   0.7   2:49.13 CrGpuMain
+busy_cores=1.69 limit=0.5 top_process_cores=1.48 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.69 cores busy; waiting 30 s (waited 5280s so far)
+-- host check before mix round 8 --
+ 16:49:09 up 2 days, 36 min,  2 users,  load average: 2.48, 2.66, 2.64
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7478856   3.7g 401688 S 117.5  12.2 130:15.76 WowB.exe
+1213911 ryan      20   0 2284072 319656  37652 S  14.7   1.0  13:09.88 CrBrowserMain
+1213209 ryan      20   0 1893280  89368  46340 S   4.9   0.3   0:51.88 xalia.exe
+1214655 ryan      20   0 2008616 222732  15200 S   4.9   0.7   5:37.05 CrRendererMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.44 limit=0.5 top_process_cores=1.25 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.44 cores busy; waiting 30 s (waited 5310s so far)
+-- host check before mix round 8 --
+ 16:49:45 up 2 days, 36 min,  2 users,  load average: 2.45, 2.64, 2.63
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7514720   3.7g 401688 R  93.1  12.3 130:59.80 WowB.exe
+1213911 ryan      20   0 2284072 319656  37652 S   9.8   1.0  13:13.85 CrBrowserMain
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:25.26 qemu-system-x86
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:04.08 wineserver
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.43 limit=0.5 top_process_cores=1.18 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.43 cores busy; waiting 30 s (waited 5340s so far)
+-- host check before mix round 8 --
+ 16:50:20 up 2 days, 37 min,  2 users,  load average: 2.16, 2.54, 2.60
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7477768   3.7g 401700 S  88.1  12.2 131:38.41 WowB.exe
+1214655 ryan      20   0 2008616 222392  15200 R   9.8   0.7   5:39.70 CrRendererMain
+ 208250 ryan      20   0  105092  24080  14176 S   4.9   0.1   1:41.09 herdr
+1213911 ryan      20   0 2284072 319656  37652 S   4.9   1.0  13:16.46 CrBrowserMain
+1214107 ryan      20   0 2541888 206336  35700 R   4.9   0.7   2:51.01 CrGpuMain
+1558786 root      20   0       0      0      0 I   4.9   0.0   0:00.35 kworker/u97:3-events_unbound
+busy_cores=1.27 limit=0.5 top_process_cores=1.02 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.27 cores busy; waiting 30 s (waited 5370s so far)
+-- host check before mix round 8 --
+ 16:50:56 up 2 days, 37 min,  2 users,  load average: 2.03, 2.46, 2.57
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7484248   3.7g 401700 S 107.7  12.2 132:14.09 WowB.exe
+1213911 ryan      20   0 2284072 319656  37652 S  14.7   1.0  13:18.41 CrBrowserMain
+   1528 ryan      20   0  118060  25552   8700 S   4.9   0.1   0:42.72 pipewire-pulse
+   2331 ryan      20   0 1215204 125044  93708 S   4.9   0.4   1:26.67 Xwayland
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:07.31 wineserver
+1214107 ryan      20   0 2541888 206336  35700 S   4.9   0.7   2:51.63 CrGpuMain
+busy_cores=1.20 limit=0.5 top_process_cores=1.07 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.20 cores busy; waiting 30 s (waited 5400s so far)
+-- host check before mix round 8 --
+ 16:51:31 up 2 days, 38 min,  2 users,  load average: 1.98, 2.39, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7490448   3.7g 401700 S 107.8  12.3 132:54.93 WowB.exe
+1213911 ryan      20   0 2284072 319664  37652 S  14.7   1.0  13:22.79 CrBrowserMain
+1214655 ryan      20   0 2008616 223016  15200 S   9.8   0.7   5:42.28 CrRendererMain
+   1216 systemd+  20   0    9684   5940   5296 S   4.9   0.0   1:12.91 systemd-oomd
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:27.32 qemu-system-x86
+1213038 ryan      20   0  659492  19952  17656 S   4.9   0.1   0:30.36 winedevice.exe
+busy_cores=1.32 limit=0.5 top_process_cores=1.21 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.32 cores busy; waiting 30 s (waited 5430s so far)
+-- host check before mix round 8 --
+ 16:52:07 up 2 days, 39 min,  2 users,  load average: 2.21, 2.40, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7538296   3.8g 401700 S 107.9  12.5 133:35.91 WowB.exe
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:10.28 wineserver
+1213911 ryan      20   0 2284072 319664  37652 S   4.9   1.0  13:25.82 CrBrowserMain
+1214655 ryan      20   0 2008616 222920  15200 S   4.9   0.7   5:43.55 CrRendererMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.27 limit=0.5 top_process_cores=1.11 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.27 cores busy; waiting 30 s (waited 5460s so far)
+-- host check before mix round 8 --
+ 16:52:42 up 2 days, 39 min,  2 users,  load average: 2.38, 2.42, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7532760   3.8g 401700 R 122.6  12.5 134:14.10 WowB.exe
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:00.06 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:28.76 qemu-system-x86
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:11.69 wineserver
+1213911 ryan      20   0 2284072 319664  37652 S   4.9   1.0  13:27.38 CrBrowserMain
+1214655 ryan      20   0 2008616 225032  15200 S   4.9   0.7   5:44.85 CrRendererMain
+busy_cores=1.40 limit=0.5 top_process_cores=1.14 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.40 cores busy; waiting 30 s (waited 5490s so far)
+-- host check before mix round 8 --
+ 16:53:18 up 2 days, 40 min,  2 users,  load average: 2.34, 2.41, 2.53
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7566152   3.8g 401700 S 146.8  12.6 135:04.55 WowB.exe
+1213911 ryan      20   0 2284072 319664  37652 S  14.7   1.0  13:31.60 CrBrowserMain
+1213038 ryan      20   0  659492  19952  17656 S   4.9   0.1   0:30.68 winedevice.exe
+1213209 ryan      20   0 1893280  89368  46340 S   4.9   0.3   0:53.16 xalia.exe
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.76 limit=0.5 top_process_cores=1.62 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.76 cores busy; waiting 30 s (waited 5520s so far)
+-- host check before mix round 8 --
+ 16:53:54 up 2 days, 40 min,  2 users,  load average: 2.64, 2.48, 2.55
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7566352   3.8g 401700 S 206.0  12.6 136:03.82 WowB.exe
+1213008 ryan      20   0   26896  23708   2704 S   9.8   0.1   7:14.91 wineserver
+   1413 root      20   0 3127660 102412  25868 S   4.9   0.3   2:56.26 tailscaled
+   1521 ryan      20   0  111628  21016   8904 S   4.9   0.1   0:15.73 pipewire
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:02.04 Hyprland
+   3153 ryan      20   0 2001320 122908  96400 S   4.9   0.4   2:39.79 voxtype-osd-gtk
+busy_cores=2.12 limit=0.5 top_process_cores=1.96 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.12 cores busy; waiting 30 s (waited 5550s so far)
+-- host check before mix round 8 --
+ 16:54:29 up 2 days, 41 min,  2 users,  load average: 3.07, 2.61, 2.59
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7571160   3.8g 401700 S 161.2  12.6 137:06.63 WowB.exe
+   1521 ryan      20   0  111628  21016   8904 S   4.9   0.1   0:15.80 pipewire
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:02.91 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:30.90 qemu-system-x86
+1213911 ryan      20   0 2284072 319664  37652 S   4.9   1.0  13:37.11 CrBrowserMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+busy_cores=2.06 limit=0.5 top_process_cores=1.86 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.06 cores busy; waiting 30 s (waited 5580s so far)
+-- host check before mix round 8 --
+ 16:55:05 up 2 days, 42 min,  2 users,  load average: 2.57, 2.54, 2.57
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7537288   3.8g 401700 R 288.8  12.5 138:11.36 WowB.exe
+1213008 ryan      20   0   26896  23708   2704 S  14.7   0.1   7:18.21 wineserver
+   2036 ryan      20   0 2243552 174056 117644 S   9.8   0.5   5:03.88 Hyprland
+1213911 ryan      20   0 2284072 319664  37652 S   9.8   1.0  13:40.50 CrBrowserMain
+     20 root      rt   0       0      0      0 S   4.9   0.0   0:34.96 migration/0
+   2331 ryan      20   0 1215204 125044  93708 S   4.9   0.4   1:28.32 Xwayland
+busy_cores=1.92 limit=0.5 top_process_cores=1.78 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.92 cores busy; waiting 30 s (waited 5610s so far)
+-- host check before mix round 8 --
+ 16:55:40 up 2 days, 42 min,  2 users,  load average: 2.69, 2.58, 2.58
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7526264   3.8g 401700 S 122.5  12.4 139:12.00 WowB.exe
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:04.96 Hyprland
+   2312 libvirt+  20   0   10.0g   5.4g  16992 S   4.9  17.9  80:32.30 qemu-system-x86
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:19.71 wineserver
+1213911 ryan      20   0 2284072 319664  37652 S   4.9   1.0  13:44.38 CrBrowserMain
+1214655 ryan      20   0 2008616 222192  15200 S   4.9   0.7   5:51.92 CrRendererMain
+busy_cores=1.65 limit=0.5 top_process_cores=1.50 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.65 cores busy; waiting 30 s (waited 5640s so far)
+-- host check before mix round 8 --
+ 16:56:16 up 2 days, 43 min,  2 users,  load average: 2.27, 2.48, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7534224   3.8g 401700 S 122.6  12.5 139:54.66 WowB.exe
+   2036 ryan      20   0 2243552 174056 117644 S   9.8   0.5   5:05.67 Hyprland
+   1413 root      20   0 3127660 102532  25868 S   4.9   0.3   2:56.37 tailscaled
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:32.96 qemu-system-x86
+   3909 ryan      20   0 2033332 324628   4716 S   4.9   1.0  51:39.48 qmdsync-tasks
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:21.25 wineserver
+busy_cores=1.33 limit=0.5 top_process_cores=1.10 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.33 cores busy; waiting 30 s (waited 5670s so far)
+-- host check before mix round 8 --
+ 16:56:51 up 2 days, 43 min,  2 users,  load average: 2.16, 2.44, 2.53
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7513624   3.8g 401700 S  88.2  12.4 140:32.16 WowB.exe
+1213911 ryan      20   0 2284072 319672  37652 S  19.6   1.0  13:49.22 CrBrowserMain
+   2036 ryan      20   0 2243552 174056 117644 S   9.8   0.5   5:06.41 Hyprland
+   3909 ryan      20   0 2033524 324688   4716 S   4.9   1.0  51:40.00 qmdsync-tasks
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:22.61 wineserver
+1518070 root      20   0       0      0      0 D   4.9   0.0   0:00.58 kworker/u97:9+events_unbound
+busy_cores=1.23 limit=0.5 top_process_cores=1.09 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.23 cores busy; waiting 30 s (waited 5700s so far)
+-- host check before mix round 8 --
+ 16:57:27 up 2 days, 44 min,  2 users,  load average: 1.96, 2.36, 2.50
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7518992   3.8g 401700 S  98.0  12.4 141:09.97 WowB.exe
+1213911 ryan      20   0 2284072 319672  37652 S   9.8   1.0  13:53.37 CrBrowserMain
+    148 root      rt   0       0      0      0 S   4.9   0.0   0:07.30 migration/21
+   1528 ryan      20   0  118060  25552   8700 S   4.9   0.1   0:44.09 pipewire-pulse
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:07.19 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:34.33 qemu-system-x86
+busy_cores=1.29 limit=0.5 top_process_cores=1.12 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.29 cores busy; waiting 30 s (waited 5730s so far)
+-- host check before mix round 8 --
+ 16:58:02 up 2 days, 45 min,  2 users,  load average: 1.64, 2.24, 2.45
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7554280   3.8g 401700 R 112.7  12.5 141:50.28 WowB.exe
+1214655 ryan      20   0 2008616 223684  15200 S   9.8   0.7   5:57.07 CrRendererMain
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:25.75 wineserver
+1213911 ryan      20   0 2284072 319672  37652 S   4.9   1.0  13:56.18 CrBrowserMain
+1584644 root      20   0       0      0      0 I   4.9   0.0   0:00.01 kworker/u96:4-gfx_0.0.0
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+busy_cores=1.45 limit=0.5 top_process_cores=1.28 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.45 cores busy; waiting 30 s (waited 5760s so far)
+-- host check before mix round 8 --
+ 16:58:38 up 2 days, 45 min,  2 users,  load average: 2.39, 2.34, 2.47
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7521712   3.8g 401700 S 117.7  12.4 142:30.26 WowB.exe
+1213911 ryan      20   0 2284072 319672  37652 S  14.7   1.0  13:57.72 CrBrowserMain
+1213209 ryan      20   0 1893280  89368  46340 S   4.9   0.3   0:54.89 xalia.exe
+1214655 ryan      20   0 2008616 222936  15200 S   4.9   0.7   5:58.42 CrRendererMain
+1539535 root      20   0       0      0      0 I   4.9   0.0   0:01.96 kworker/u96:0-gfx_0.0.0
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+busy_cores=1.32 limit=0.5 top_process_cores=1.11 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.32 cores busy; waiting 30 s (waited 5790s so far)
+-- host check before mix round 8 --
+ 16:59:14 up 2 days, 46 min,  2 users,  load average: 2.02, 2.25, 2.44
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7519584   3.8g 401700 R  98.1  12.4 143:09.35 WowB.exe
+1213911 ryan      20   0 2284072 319672  37652 S   9.8   1.0  14:02.24 CrBrowserMain
+1213008 ryan      20   0   26896  23708   2704 S   4.9   0.1   7:28.78 wineserver
+1214655 ryan      20   0 2008616 222608  15200 S   4.9   0.7   5:59.65 CrRendererMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.21 limit=0.5 top_process_cores=1.05 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.21 cores busy; waiting 30 s (waited 5820s so far)
+-- host check before mix round 8 --
+ 16:59:49 up 2 days, 46 min,  2 users,  load average: 1.85, 2.18, 2.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7508736   3.8g 401700 S  93.2  12.4 143:45.02 WowB.exe
+1213911 ryan      20   0 2284072 319672  37652 S   9.8   1.0  14:05.40 CrBrowserMain
+1214655 ryan      20   0 2008616 224292  15200 S   9.8   0.7   6:00.90 CrRendererMain
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:10.50 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:37.11 qemu-system-x86
+   2558 ryan      20   0 2563556 331840  83708 S   4.9   1.0   2:28.91 dropbox
+busy_cores=1.25 limit=0.5 top_process_cores=1.10 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.25 cores busy; waiting 30 s (waited 5850s so far)
+-- host check before mix round 8 --
+ 17:00:25 up 2 days, 47 min,  2 users,  load average: 1.88, 2.14, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7508488   3.7g 401704 S  93.1  12.4 144:24.07 WowB.exe
+   2036 ryan      20   0 2243552 174056 117644 S   9.8   0.5   5:11.37 Hyprland
+   1528 ryan      20   0  118060  25552   8700 S   4.9   0.1   0:44.65 pipewire-pulse
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   7:31.69 wineserver
+1213911 ryan      20   0 2284072 319676  37656 S   4.9   1.0  14:07.22 CrBrowserMain
+1214655 ryan      20   0 2008616 223388  15204 S   4.9   0.7   6:02.21 CrRendererMain
+busy_cores=1.59 limit=0.5 top_process_cores=1.20 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.59 cores busy; waiting 30 s (waited 5880s so far)
+-- host check before mix round 8 --
+ 17:01:00 up 2 days, 48 min,  2 users,  load average: 2.11, 2.17, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7520440   3.8g 401704 S 107.9  12.4 145:03.63 WowB.exe
+1213911 ryan      20   0 2284072 319676  37656 S   9.8   1.0  14:10.91 CrBrowserMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=1.52 limit=0.5 top_process_cores=1.30 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.52 cores busy; waiting 30 s (waited 5910s so far)
+-- host check before mix round 8 --
+ 17:01:36 up 2 days, 48 min,  2 users,  load average: 2.25, 2.20, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7520232   3.8g 401708 S 117.7  12.4 145:44.75 WowB.exe
+   2312 libvirt+  20   0    9.9g   5.4g  16992 S   4.9  17.9  80:39.20 qemu-system-x86
+1214655 ryan      20   0 2008616 223112  15204 S   4.9   0.7   6:04.81 CrRendererMain
+1558786 root      20   0       0      0      0 D   4.9   0.0   0:00.81 kworker/u97:3+events_unbound
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.49 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=1.34 limit=0.5 top_process_cores=1.21 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.34 cores busy; waiting 30 s (waited 5940s so far)
+-- host check before mix round 8 --
+ 17:02:11 up 2 days, 49 min,  2 users,  load average: 2.60, 2.30, 2.41
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7526296   3.8g 401580 R  88.2  12.4 146:22.96 WowB.exe
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:39.90 qemu-system-x86
+   2331 ryan      20   0 1215204 125040  93704 S   4.9   0.4   1:31.22 Xwayland
+1213274 ryan      20   0 2174332  73952  27660 S   4.9   0.2   0:40.61 Agent.exe
+1213911 ryan      20   0 2284072 319668  37640 S   4.9   1.0  14:16.78 CrBrowserMain
+1214107 ryan      20   0 2541888 206320  35684 S   4.9   0.7   3:03.48 CrGpuMain
+busy_cores=1.32 limit=0.5 top_process_cores=1.11 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.32 cores busy; waiting 30 s (waited 5970s so far)
+-- host check before mix round 8 --
+ 17:02:47 up 2 days, 49 min,  2 users,  load average: 2.85, 2.39, 2.44
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7526248   3.8g 401644 S 107.8  12.4 147:02.38 WowB.exe
+1213911 ryan      20   0 2284072 319668  37640 S  14.7   1.0  14:19.60 CrBrowserMain
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:14.73 Hyprland
+   3909 ryan      20   0 2033524 271384   4716 S   4.9   0.9  51:50.39 qmdsync-tasks
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   7:37.90 wineserver
+1214655 ryan      20   0 2008616 225064  15204 S   4.9   0.7   6:07.37 CrRendererMain
+busy_cores=1.47 limit=0.5 top_process_cores=1.27 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.47 cores busy; waiting 30 s (waited 6000s so far)
+-- host check before mix round 8 --
+ 17:03:22 up 2 days, 50 min,  2 users,  load average: 2.53, 2.37, 2.43
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7642608   3.9g 401644 S 137.1  12.8 147:48.48 WowB.exe
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:15.66 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:41.28 qemu-system-x86
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   7:39.48 wineserver
+1213911 ryan      20   0 2284072 319668  37640 S   4.9   1.0  14:23.59 CrBrowserMain
+1214655 ryan      20   0 2008616 222200  15204 S   4.9   0.7   6:08.72 CrRendererMain
+busy_cores=1.69 limit=0.5 top_process_cores=1.48 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.69 cores busy; waiting 30 s (waited 6030s so far)
+-- host check before mix round 8 --
+ 17:03:58 up 2 days, 51 min,  2 users,  load average: 2.12, 2.28, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7515016   3.8g 401644 S 112.6  12.4 148:35.01 WowB.exe
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   7:40.96 wineserver
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.51 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=1.44 limit=0.5 top_process_cores=1.26 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.44 cores busy; waiting 30 s (waited 6060s so far)
+-- host check before mix round 8 --
+ 17:04:34 up 2 days, 51 min,  2 users,  load average: 2.29, 2.31, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7562192   3.8g 401644 S 107.6  12.5 149:18.89 WowB.exe
+1213911 ryan      20   0 2284072 319668  37640 S  14.7   1.0  14:28.16 CrBrowserMain
+   2036 ryan      20   0 2243552 174056 117644 S   9.8   0.5   5:17.29 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:42.79 qemu-system-x86
+1214107 ryan      20   0 2541888 206320  35684 S   4.9   0.7   3:05.96 CrGpuMain
+1586514 root      20   0       0      0      0 D   4.9   0.0   0:00.20 kworker/u97:12+events_unbound
+busy_cores=1.33 limit=0.5 top_process_cores=1.20 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.33 cores busy; waiting 30 s (waited 6090s so far)
+-- host check before mix round 8 --
+ 17:05:09 up 2 days, 52 min,  2 users,  load average: 2.76, 2.45, 2.45
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7534888   3.8g 401644 S 127.3  12.4 149:58.00 WowB.exe
+1213911 ryan      20   0 2284072 319668  37640 S  14.7   1.0  14:32.50 CrBrowserMain
+1214107 ryan      20   0 2541888 206320  35684 S  14.7   0.7   3:06.59 CrGpuMain
+1213008 ryan      20   0   26896  23712   2708 R   9.8   0.1   7:44.16 wineserver
+1214655 ryan      20   0 2008616 223024  15204 R   9.8   0.7   6:12.68 CrRendererMain
+1213209 ryan      20   0 1893280  89352  46324 S   4.9   0.3   0:56.93 xalia.exe
+busy_cores=1.50 limit=0.5 top_process_cores=1.33 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.50 cores busy; waiting 30 s (waited 6120s so far)
+-- host check before mix round 8 --
+ 17:05:45 up 2 days, 52 min,  2 users,  load average: 2.35, 2.37, 2.42
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7526336   3.8g 401644 S 102.9  12.4 150:40.43 WowB.exe
+1213911 ryan      20   0 2284072 319668  37640 S   9.8   1.0  14:35.52 CrBrowserMain
+1214655 ryan      20   0 2008616 223496  15204 R   9.8   0.7   6:14.04 CrRendererMain
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:44.18 qemu-system-x86
+   3909 ryan      20   0 2033524 271384   4716 S   4.9   0.9  51:52.48 qmdsync-tasks
+1214107 ryan      20   0 2541888 206320  35684 R   4.9   0.7   3:07.24 CrGpuMain
+busy_cores=1.38 limit=0.5 top_process_cores=1.25 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.38 cores busy; waiting 30 s (waited 6150s so far)
+-- host check before mix round 8 --
+ 17:06:20 up 2 days, 53 min,  2 users,  load average: 2.19, 2.33, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7522880   3.8g 401644 S 171.6  12.4 151:25.68 WowB.exe
+   3909 ryan      20   0 2033524 271384   4716 S  68.6   0.9  51:53.00 qmdsync-tasks
+   2036 ryan      20   0 2243552 174056 117644 S   9.8   0.5   5:19.91 Hyprland
+1213008 ryan      20   0   26896  23712   2708 S   9.8   0.1   7:47.15 wineserver
+   1413 root      20   0 3127660 101336  25900 S   4.9   0.3   2:56.82 tailscaled
+1214107 ryan      20   0 2541888 206320  35684 S   4.9   0.7   3:07.85 CrGpuMain
+busy_cores=1.58 limit=0.5 top_process_cores=1.31 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.58 cores busy; waiting 30 s (waited 6180s so far)
+-- host check before mix round 8 --
+ 17:06:56 up 2 days, 53 min,  2 users,  load average: 2.25, 2.32, 2.40
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7525920   3.8g 401644 R 122.3  12.4 152:09.67 WowB.exe
+1213911 ryan      20   0 2284072 319676  37640 S   9.8   1.0  14:41.39 CrBrowserMain
+   2036 ryan      20   0 2243552 174056 117644 S   4.9   0.5   5:20.75 Hyprland
+   2331 ryan      20   0 1215204 125040  93704 S   4.9   0.4   1:33.35 Xwayland
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   7:48.49 wineserver
+1569502 root      20   0       0      0      0 I   4.9   0.0   0:01.59 kworker/u96:2-gfx_0.1.0
+busy_cores=1.24 limit=0.5 top_process_cores=1.06 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.24 cores busy; waiting 30 s (waited 6210s so far)
+-- host check before mix round 8 --
+ 17:07:31 up 2 days, 54 min,  2 users,  load average: 1.67, 2.17, 2.35
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1605899 ryan      20   0 1448.5g 362272 133720 R  48.9   1.1   0:02.28 chromium
+1330689 ryan      20   0 7574224   3.8g 401644 S  19.6  12.6 152:23.20 WowB.exe
+1605471 ryan      20   0 1448.5g 177096 121672 S  14.7   0.6   0:00.42 chromium
+   1324 avahi     20   0    6872   5216   4040 S   4.9   0.0   0:32.17 avahi-daemon
+   2036 ryan      20   0 2246752 174056 117644 S   4.9   0.5   5:21.36 Hyprland
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   7:49.95 wineserver
+busy_cores=0.78 limit=0.5 top_process_cores=0.42 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 0.78 cores busy; waiting 30 s (waited 6240s so far)
+-- host check before mix round 8 --
+ 17:08:07 up 2 days, 55 min,  2 users,  load average: 1.43, 2.05, 2.30
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7528776   3.8g 401644 R 117.6  12.4 152:42.47 WowB.exe
+1213911 ryan      20   0 2284072 319676  37640 S   4.9   1.0  14:46.47 CrBrowserMain
+1214655 ryan      20   0 2008616 223140  15204 S   4.9   0.7   6:18.92 CrRendererMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.51 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.78 limit=0.5 top_process_cores=1.54 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.78 cores busy; waiting 30 s (waited 6270s so far)
+-- host check before mix round 8 --
+ 17:08:43 up 2 days, 55 min,  2 users,  load average: 1.89, 2.10, 2.31
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7604784   3.8g 401644 S 107.7  12.7 153:31.78 WowB.exe
+1213911 ryan      20   0 2284072 319756  37640 S   9.8   1.0  14:49.88 CrBrowserMain
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:47.92 qemu-system-x86
+1213209 ryan      20   0 1893280  89352  46324 S   4.9   0.3   0:58.03 xalia.exe
+1214655 ryan      20   0 2008616 224084  15204 S   4.9   0.7   6:20.28 CrRendererMain
+1331162 ryan      20   0  823448  75352  28460 R   4.9   0.2   0:56.19 WowVoiceProxyT.
+busy_cores=1.46 limit=0.5 top_process_cores=1.29 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.46 cores busy; waiting 30 s (waited 6300s so far)
+-- host check before mix round 8 --
+ 17:09:18 up 2 days, 56 min,  2 users,  load average: 1.70, 2.04, 2.27
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7557320   3.8g 401644 S  88.2  12.5 154:15.72 WowB.exe
+1213911 ryan      20   0 2284072 319668  37640 S   9.8   1.0  14:53.85 CrBrowserMain
+   3153 ryan      20   0 2001320 122908  96400 S   4.9   0.4   2:40.38 voxtype-osd-gtk
+1214655 ryan      20   0 2008616 222912  15204 S   4.9   0.7   6:21.58 CrRendererMain
+1331162 ryan      20   0  823448  75352  28460 S   4.9   0.2   0:56.42 WowVoiceProxyT.
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.51 systemd
+busy_cores=1.35 limit=0.5 top_process_cores=1.17 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.35 cores busy; waiting 30 s (waited 6330s so far)
+-- host check before mix round 8 --
+ 17:09:54 up 2 days, 56 min,  2 users,  load average: 1.96, 2.05, 2.27
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7549392   3.8g 401644 S  97.9  12.5 154:54.57 WowB.exe
+   2036 ryan      20   0 2244704 174056 117644 S   4.9   0.5   5:24.03 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:49.32 qemu-system-x86
+   3909 ryan      20   0 2033524 271404   4716 S   4.9   0.9  51:55.36 qmdsync-tasks
+1213911 ryan      20   0 2284072 319668  37640 S   4.9   1.0  14:56.70 CrBrowserMain
+1214655 ryan      20   0 2008616 225524  15204 S   4.9   0.7   6:22.84 CrRendererMain
+busy_cores=1.31 limit=0.5 top_process_cores=1.12 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.31 cores busy; waiting 30 s (waited 6360s so far)
+-- host check before mix round 8 --
+ 17:10:29 up 2 days, 57 min,  2 users,  load average: 1.84, 2.01, 2.25
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7530080   3.8g 401644 S  98.0  12.5 155:32.91 WowB.exe
+1214655 ryan      20   0 2008616 223252  15204 S   9.8   0.7   6:24.15 CrRendererMain
+1605877 root      20   0       0      0      0 D   4.9   0.0   0:00.52 kworker/u97:1+events_unbound
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.51 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.27 limit=0.5 top_process_cores=1.04 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.27 cores busy; waiting 30 s (waited 6390s so far)
+-- host check before mix round 8 --
+ 17:11:05 up 2 days, 58 min,  2 users,  load average: 1.69, 1.96, 2.22
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7524520   3.8g 401644 S  88.2  12.4 156:08.52 WowB.exe
+1213911 ryan      20   0 2284072 319668  37640 S   9.8   1.0  15:01.84 CrBrowserMain
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   7:58.82 wineserver
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.51 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.10 limit=0.5 top_process_cores=0.97 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.10 cores busy; waiting 30 s (waited 6420s so far)
+-- host check before mix round 8 --
+ 17:11:40 up 2 days, 58 min,  2 users,  load average: 1.93, 2.00, 2.23
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7672448   3.9g 401644 R 298.2  12.9 157:07.13 WowB.exe
+   2331 ryan      20   0 1215204 125040  93704 S   9.8   0.4   1:34.81 Xwayland
+1213911 ryan      20   0 2284072 319680  37640 S   9.8   1.0  15:05.87 CrBrowserMain
+   2036 ryan      20   0 2244704 174056 117644 S   4.9   0.5   5:26.54 Hyprland
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   8:00.49 wineserver
+1214655 ryan      20   0 2008616 223176  15204 S   4.9   0.7   6:26.84 CrRendererMain
+busy_cores=3.12 limit=0.5 top_process_cores=2.99 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 3.12 cores busy; waiting 30 s (waited 6450s so far)
+-- host check before mix round 8 --
+ 17:12:16 up 2 days, 59 min,  2 users,  load average: 2.68, 2.21, 2.29
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7644768   3.9g 401644 S 196.0  12.7 158:32.62 WowB.exe
+1213911 ryan      20   0 2284072 319680  37640 S   9.8   1.0  15:08.83 CrBrowserMain
+1214655 ryan      20   0 2008616 222548  15204 S   9.8   0.7   6:28.39 CrRendererMain
+   1521 ryan      20   0  111628  20984   8872 S   4.9   0.1   0:18.17 pipewire
+   2036 ryan      20   0 2244704 174056 117644 S   4.9   0.5   5:27.93 Hyprland
+   2607 ryan      20   0  395096  31988  21700 S   4.9   0.1   0:08.82 fcitx5
+busy_cores=2.35 limit=0.5 top_process_cores=2.18 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.35 cores busy; waiting 30 s (waited 6480s so far)
+-- host check before mix round 8 --
+ 17:12:52 up 2 days, 59 min,  2 users,  load average: 2.84, 2.31, 2.32
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7603128   3.8g 401644 S 122.4  12.6 159:43.45 WowB.exe
+1214655 ryan      20   0 2008616 224740  15204 S   9.8   0.7   6:29.83 CrRendererMain
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:52.89 qemu-system-x86
+1213911 ryan      20   0 2284072 319680  37640 S   4.9   1.0  15:10.54 CrBrowserMain
+1570801 root      20   0       0      0      0 D   4.9   0.0   0:00.48 kworker/u97:2+events_unbound
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.51 systemd
+busy_cores=1.86 limit=0.5 top_process_cores=1.56 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.86 cores busy; waiting 30 s (waited 6510s so far)
+-- host check before mix round 8 --
+ 17:13:27 up 2 days,  1:00,  2 users,  load average: 3.47, 2.53, 2.39
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7597768   3.8g 401644 S 122.5  12.6 160:40.18 WowB.exe
+1213911 ryan      20   0 2284072 319952  37640 S  14.7   1.0  15:14.45 CrBrowserMain
+1213008 ryan      20   0   26896  23712   2708 S   9.8   0.1   8:05.67 wineserver
+   1528 ryan      20   0  118060  25552   8700 S   4.9   0.1   0:47.31 pipewire-pulse
+   2036 ryan      20   0 2244704 174056 117644 S   4.9   0.5   5:30.07 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:53.60 qemu-system-x86
+busy_cores=1.28 limit=0.5 top_process_cores=1.16 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.28 cores busy; waiting 30 s (waited 6540s so far)
+-- host check before mix round 8 --
+ 17:14:03 up 2 days,  1:01,  2 users,  load average: 3.26, 2.59, 2.42
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 8018136   4.2g 401716 R 156.6  13.7 161:36.66 WowB.exe
+   2036 ryan      20   0 2244704 174056 117644 S   4.9   0.5   5:31.13 Hyprland
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   8:07.31 wineserver
+1213911 ryan      20   0 2284072 319768  37640 S   4.9   1.0  15:18.34 CrBrowserMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.51 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=2.43 limit=0.5 top_process_cores=2.19 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.43 cores busy; waiting 30 s (waited 6570s so far)
+-- host check before mix round 8 --
+ 17:14:38 up 2 days,  1:01,  2 users,  load average: 3.21, 2.66, 2.45
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7852504   3.9g 401732 R 225.2  13.0 162:46.16 WowB.exe
+1213008 ryan      20   0   26896  23712   2708 S   9.8   0.1   8:09.14 wineserver
+1213911 ryan      20   0 2284072 319688  37640 S   9.8   1.0  15:21.07 CrBrowserMain
+   2036 ryan      20   0 2244704 174056 117644 S   4.9   0.5   5:32.41 Hyprland
+1214107 ryan      20   0 2541888 206320  35684 S   4.9   0.7   3:16.90 CrGpuMain
+1214655 ryan      20   0 2008616 222804  15204 S   4.9   0.7   6:34.18 CrRendererMain
+busy_cores=1.83 limit=0.5 top_process_cores=1.70 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.83 cores busy; waiting 30 s (waited 6600s so far)
+-- host check before mix round 8 --
+ 17:15:14 up 2 days,  1:02,  2 users,  load average: 2.58, 2.57, 2.43
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7873904   4.0g 401732 R 141.7  13.1 163:44.27 WowB.exe
+1213911 ryan      20   0 2284072 319688  37640 R  14.7   1.0  15:22.59 CrBrowserMain
+   3909 ryan      20   0 2033524 271404   4716 S   9.8   0.9  51:59.13 qmdsync-tasks
+   2331 ryan      20   0 1215204 125040  93704 S   4.9   0.4   1:36.90 Xwayland
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   8:10.64 wineserver
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.52 systemd
+busy_cores=2.05 limit=0.5 top_process_cores=1.92 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.05 cores busy; waiting 30 s (waited 6630s so far)
+-- host check before mix round 8 --
+ 17:15:50 up 2 days,  1:02,  2 users,  load average: 2.92, 2.65, 2.46
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7856664   3.9g 401732 R 200.4  13.0 164:58.60 WowB.exe
+1213911 ryan      20   0 2284072 319688  37640 S   9.8   1.0  15:27.40 CrBrowserMain
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:56.55 qemu-system-x86
+1213008 ryan      20   0   26896  23712   2708 S   4.9   0.1   8:12.44 wineserver
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.52 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+busy_cores=2.23 limit=0.5 top_process_cores=2.06 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 2.23 cores busy; waiting 30 s (waited 6660s so far)
+-- host check before mix round 8 --
+ 17:16:25 up 2 days,  1:03,  2 users,  load average: 3.23, 2.76, 2.50
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7889704   4.0g 401736 R 176.2  13.1 165:57.01 WowB.exe
+   2036 ryan      20   0 2244704 174056 117644 S   9.8   0.5   5:35.58 Hyprland
+1213008 ryan      20   0   26896  23720   2716 S   4.9   0.1   8:14.40 wineserver
+1213911 ryan      20   0 2284072 319688  37640 S   4.9   1.0  15:30.90 CrBrowserMain
+1214107 ryan      20   0 2541888 206320  35684 S   4.9   0.7   3:18.95 CrGpuMain
+1214655 ryan      20   0 2008616 222928  15208 S   4.9   0.7   6:38.54 CrRendererMain
+busy_cores=1.92 limit=0.5 top_process_cores=1.73 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.92 cores busy; waiting 30 s (waited 6690s so far)
+-- host check before mix round 8 --
+ 17:17:01 up 2 days,  1:04,  2 users,  load average: 3.34, 2.84, 2.54
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7858464   3.9g 401736 R 137.0  13.0 166:53.38 WowB.exe
+   2036 ryan      20   0 2244704 174056 117644 S   4.9   0.5   5:36.66 Hyprland
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  80:58.01 qemu-system-x86
+   3909 ryan      20   0 2033588 272196   4932 S   4.9   0.9  52:07.26 qmdsync-tasks
+1213008 ryan      20   0   27236  23980   2716 S   4.9   0.1   8:16.07 wineserver
+1213911 ryan      20   0 2284072 321736  37640 S   4.9   1.0  15:33.54 CrBrowserMain
+busy_cores=1.72 limit=0.5 top_process_cores=1.51 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.72 cores busy; waiting 30 s (waited 6720s so far)
+-- host check before mix round 8 --
+ 17:17:36 up 2 days,  1:04,  2 users,  load average: 3.62, 2.97, 2.60
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7736600   3.8g 401484 S  97.8  12.6 167:34.68 WowB.exe
+1213008 ryan      20   0   27236  23972   2708 S   9.8   0.1   8:17.72 wineserver
+1213911 ryan      20   0 2284072 282996  37220 S   9.8   0.9  15:36.18 CrBrowserMain
+1214107 ryan      20   0 2541888 205952  35652 S   9.8   0.6   3:20.29 CrGpuMain
+   3617 root      20   0  480732  18068  13628 S   4.9   0.1   0:14.60 udisksd
+1213015 ryan      20   0  551300  17152   7568 S   4.9   0.1   0:00.92 winedevice.exe
+busy_cores=1.28 limit=0.5 top_process_cores=1.13 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.28 cores busy; waiting 30 s (waited 6750s so far)
+-- host check before mix round 8 --
+ 17:18:12 up 2 days,  1:05,  2 users,  load average: 2.76, 2.83, 2.56
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7755192   3.8g 401596 S 107.6  12.7 168:13.28 WowB.exe
+1629986 ryan      20   0 7022392  63972  37912 R  39.1   0.2   0:00.08 bun
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   9.8  17.7  80:59.46 qemu-system-x86
+   1521 ryan      20   0  111628  20984   8872 S   4.9   0.1   0:19.00 pipewire
+1213008 ryan      20   0   27236  23972   2708 S   4.9   0.1   8:19.15 wineserver
+1213911 ryan      20   0 2284072 282996  37220 S   4.9   0.9  15:40.39 CrBrowserMain
+busy_cores=1.40 limit=0.5 top_process_cores=1.18 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.40 cores busy; waiting 30 s (waited 6780s so far)
+-- host check before mix round 8 --
+ 17:18:47 up 2 days,  1:05,  2 users,  load average: 2.47, 2.75, 2.55
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1330689 ryan      20   0 7746624   3.8g 401604 S  97.9  12.7 168:54.03 WowB.exe
+   1528 ryan      20   0  118060  25552   8700 S   4.9   0.1   0:48.47 pipewire-pulse
+1213911 ryan      20   0 2284072 282996  37220 S   4.9   0.9  15:43.31 CrBrowserMain
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.52 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=1.32 limit=0.5 top_process_cores=1.12 (1330689 WowB.exe) limit=0.3 blocking=WowB.exe(1330689) before mix round 8
+HOST-BUSY-WAIT before mix round 8: 1.32 cores busy; waiting 30 s (waited 6810s so far)
+-- host check before mix round 8 --
+ 17:19:23 up 2 days,  1:06,  2 users,  load average: 2.07, 2.64, 2.52
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2312 libvirt+  20   0    9.9g   5.4g  16948 S   4.9  17.7  81:00.93 qemu-system-x86
+   2617 ryan      20   0 1737012 161448  11372 S   4.9   0.5   1:39.60 voxtype
+      1 root      20   0   22092  16768  11112 S   0.0   0.1   0:04.52 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.10 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=0.14 limit=0.5 top_process_cores=0.03 (3909 qmdsync-tasks) limit=0.3 before mix round 8
+x8 WS2 mixm-e8 WS2          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800333 ended_early=0 scan_err=0
+x8 WS2 mixm-e8 WS2          sse latency p50=25µs p99=144µs max=3.029ms
+x8 WS2 mixm-e8 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.52ms stopped=0
+x8 WS2 mixm-e8 WS2          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=26 heavy_worst_p99us=201 light_worst_p99us=55 [port:kind:delivering/streams:events:p50us:p99us] 39272:h:250/250:2500149:26:201 39414:h:250/250:2500170:26:113 39524:l:10/10:100007:18:52 39640:l:10/10:100002:16:47 39704:l:10/10:100000:19:54 39796:l:10/10:100000:18:55 39944:l:10/10:100004:18:51 40022:l:10/10:100001:17:49 40132:l:10/10:100000:17:51 40210:l:10/10:100000:14:37
+x8 WS2 mixm-e8 WS2          churn conns=2217 ok=9680 err=0 p50=40µs p99=568µs max=2.135ms
+x8 WS2 mixm-e8 cpu executors=8 heavy=2 light=8 ticks=4255 threads=816,765,700,619,516,385,260,186,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x8 WS2 mixm-eprod WS2          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8699939 ended_early=0 scan_err=0
+x8 WS2 mixm-eprod WS2          sse latency p50=649µs p99=1.401ms max=10.521ms
+x8 WS2 mixm-eprod WS2          sse fair ev_min=9999 ev_p50=10000 ev_max=10001 expected=10000 gap_max=11.358ms stopped=0
+x8 WS2 mixm-eprod WS2          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=736 heavy_worst_p99us=1428 light_worst_p99us=110 [port:kind:delivering/streams:events:p50us:p99us] 47048:h:250/250:2499956:736:1428 47176:h:250/250:2500028:727:1414 47250:h:250/250:2499937:716:1413 47352:l:10/10:100001:18:77 47402:l:10/10:100003:21:110 47482:l:10/10:100000:20:103 47590:l:10/10:100003:18:102 47692:l:10/10:100007:19:93 47808:l:10/10:100002:19:91 47878:l:10/10:100002:18:97 47952:l:10/10:100000:18:93 48052:l:10/10:100000:19:80 48140:l:10/10:100000:17:81 48268:l:10/10:100000:18:81 48362:l:10/10:100000:19:99
+x8 WS2 mixm-eprod WS2          churn conns=2252 ok=9620 err=0 p50=44µs p99=648µs max=7.864ms
+x8 WS2 mixm-eprod cpu executors=12 heavy=3 light=12 ticks=7171 threads=941,911,873,827,764,682,587,480,369,282,235,208,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x8 WS mixm-e8 WS           streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800333 ended_early=0 scan_err=0
+x8 WS mixm-e8 WS           sse latency p50=23µs p99=559µs max=4.246ms
+x8 WS mixm-e8 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.069ms stopped=0
+x8 WS mixm-e8 WS           sse conns n=10 heavy=2 light=8 heavy_worst_p50us=24 heavy_worst_p99us=636 light_worst_p99us=60 [port:kind:delivering/streams:events:p50us:p99us] 60050:h:250/250:2500158:24:598 60150:h:250/250:2500159:24:636 60238:l:10/10:100000:18:52 60352:l:10/10:100000:16:53 60430:l:10/10:100000:18:56 60468:l:10/10:100000:17:52 60582:l:10/10:100006:17:60 60662:l:10/10:100010:18:54 60790:l:10/10:100000:20:59 60898:l:10/10:100000:14:41
+x8 WS mixm-e8 WS           churn conns=2212 ok=9660 err=0 p50=40µs p99=598µs max=3.284ms
+x8 WS mixm-e8 cpu executors=8 heavy=2 light=8 ticks=4286 threads=810,763,702,629,530,398,260,186,0,0,0,0,0,0,0,0,0,0,0,0
+x8 WS mixm-eprod WS           streams=870 conns=15 opened=870 delivering=870 failed=0 events=8699933 ended_early=0 scan_err=0
+x8 WS mixm-eprod WS           sse latency p50=480µs p99=1.39ms max=9.882ms
+x8 WS mixm-eprod WS           sse fair ev_min=9998 ev_p50=10000 ev_max=10002 expected=10000 gap_max=10.243ms stopped=0
+x8 WS mixm-eprod WS           sse conns n=15 heavy=3 light=12 heavy_worst_p50us=632 heavy_worst_p99us=1425 light_worst_p99us=129 [port:kind:delivering/streams:events:p50us:p99us] 37596:h:250/250:2499999:632:1425 37706:h:250/250:2499949:585:1399 37784:h:250/250:2499960:543:1401 37900:l:10/10:100000:22:129 38004:l:10/10:100002:20:121 38086:l:10/10:100000:21:115 38196:l:10/10:100000:23:119 38286:l:10/10:100007:16:86 38382:l:10/10:100003:18:98 38454:l:10/10:100003:20:112 38568:l:10/10:100009:19:74 38622:l:10/10:100002:20:120 38708:l:10/10:100000:21:129 38848:l:10/10:100000:20:106 38944:l:10/10:99999:20:106
+x8 WS mixm-eprod WS           churn conns=2252 ok=9620 err=0 p50=46µs p99=670µs max=2.012ms
+x8 WS mixm-eprod cpu executors=12 heavy=3 light=12 ticks=7128 threads=932,903,866,819,753,670,571,460,359,294,256,231,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x8 PLS mixm-e8 PLS          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800396 ended_early=0 scan_err=0
+x8 PLS mixm-e8 PLS          sse latency p50=12µs p99=35µs max=3.301ms
+x8 PLS mixm-e8 PLS          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.369ms stopped=0
+x8 PLS mixm-e8 PLS          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=12 heavy_worst_p99us=38 light_worst_p99us=35 [port:kind:delivering/streams:events:p50us:p99us] 32828:l:10/10:100000:11:28 32888:l:10/10:100000:13:35 32974:l:10/10:100000:11:29 33072:l:10/10:100000:12:33 33156:l:10/10:100000:12:27 33258:l:10/10:100000:14:29 33308:l:10/10:100000:9:22 60736:h:250/250:2500207:12:38 60836:h:250/250:2500189:12:29 60928:l:10/10:100000:15:35
+x8 PLS mixm-e8 PLS          churn conns=2228 ok=9720 err=0 p50=26µs p99=513µs max=1.679ms
+x8 PLS mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1636 threads=673,633,77,61,59,51,42,31,0,0,0,0,0,0,0,0,0,0,0
+x8 PLS mixm-e8 place heavy_execs=0,1 heavy_shared=0 heavy_exec_set=2/8 churn=2228 churn_on_heavy=5 churn_on_heavy_frac=0.002 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=0,5,16,20,1114,563,486,24
+x8 PLS mixm-eprod PLS          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700779 ended_early=0 scan_err=0
+x8 PLS mixm-eprod PLS          sse latency p50=15µs p99=62µs max=8.206ms
+x8 PLS mixm-eprod PLS          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=8.601ms stopped=0
+x8 PLS mixm-eprod PLS          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=15 heavy_worst_p99us=76 light_worst_p99us=69 [port:kind:delivering/streams:events:p50us:p99us] 46088:h:250/250:2500271:14:76 46204:h:250/250:2500228:15:55 46264:h:250/250:2500228:14:49 46390:l:10/10:100007:14:43 46478:l:10/10:100010:14:61 46570:l:10/10:100003:14:60 46666:l:10/10:100005:14:37 46764:l:10/10:100000:15:50 46882:l:10/10:100005:13:57 46978:l:10/10:100010:14:49 47088:l:10/10:100010:15:50 47178:l:10/10:100002:14:69 47266:l:10/10:100000:14:48 47358:l:10/10:100000:15:56 47428:l:10/10:100000:13:33
+x8 PLS mixm-eprod PLS          churn conns=2269 ok=9685 err=0 p50=31µs p99=560µs max=1.65ms
+x8 PLS mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2552 threads=732,669,652,70,70,69,62,61,55,35,35,31,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x8 PLS mixm-eprod place heavy_execs=0,1,2 heavy_shared=0 heavy_exec_set=3/12 churn=2271 churn_on_heavy=12 churn_on_heavy_frac=0.005 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=0,5,7,16,18,25,1067,544,515,47,14,13
+x8 PLH mixm-e8 PLH          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800393 ended_early=0 scan_err=0
+x8 PLH mixm-e8 PLH          sse latency p50=15µs p99=47µs max=2.831ms
+x8 PLH mixm-e8 PLH          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=3.856ms stopped=0
+x8 PLH mixm-e8 PLH          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=15 heavy_worst_p99us=49 light_worst_p99us=49 [port:kind:delivering/streams:events:p50us:p99us] 32786:l:10/10:100003:19:48 32918:l:10/10:100010:14:36 33012:l:10/10:100009:15:43 33100:l:10/10:100003:15:41 33184:l:10/10:100000:15:42 33246:l:10/10:100000:15:40 33362:l:10/10:100000:19:49 33428:l:10/10:100000:9:28 60788:h:250/250:2500194:14:49 60924:h:250/250:2500174:15:45
+x8 PLH mixm-e8 PLH          churn conns=2224 ok=9700 err=0 p50=31µs p99=517µs max=1.293ms
+x8 PLH mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1671 threads=671,618,86,69,66,55,49,45,0,0,0,0,0,0,0,0,0,0,0
+x8 PLH mixm-e8 place heavy_execs=1,0 heavy_shared=0 heavy_exec_set=2/8 churn=2226 churn_on_heavy=5 churn_on_heavy_frac=0.002 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=5,0,14,18,1029,594,422,144
+x8 PLH mixm-eprod PLH          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700506 ended_early=0 scan_err=0
+x8 PLH mixm-eprod PLH          sse latency p50=13µs p99=52µs max=9.123ms
+x8 PLH mixm-eprod PLH          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=10.554ms stopped=0
+x8 PLH mixm-eprod PLH          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=14 heavy_worst_p99us=59 light_worst_p99us=54 [port:kind:delivering/streams:events:p50us:p99us] 40148:h:250/250:2500241:14:59 40282:h:250/250:2500079:13:49 40376:h:250/250:2500173:13:46 40486:l:10/10:100000:15:54 40558:l:10/10:100000:12:35 40632:l:10/10:100000:9:27 40754:l:10/10:100000:8:32 40854:l:10/10:100000:13:50 40968:l:10/10:100000:14:51 41030:l:10/10:100007:15:54 41158:l:10/10:100000:13:44 41262:l:10/10:100004:12:44 41336:l:10/10:100000:15:51 41430:l:10/10:100000:14:54 41498:l:10/10:100002:9:25
+x8 PLH mixm-eprod PLH          churn conns=2265 ok=9685 err=0 p50=34µs p99=590µs max=2.737ms
+x8 PLH mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2661 threads=711,696,693,108,89,65,63,55,48,43,42,35,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x8 PLH mixm-eprod place heavy_execs=1,0,2 heavy_shared=0 heavy_exec_set=3/12 churn=2266 churn_on_heavy=8 churn_on_heavy_frac=0.004 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=3,0,5,10,15,17,820,552,502,310,13,19
+x8 PLC mixm-e8 PLC          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800286 ended_early=0 scan_err=0
+x8 PLC mixm-e8 PLC          sse latency p50=14µs p99=45µs max=4.141ms
+x8 PLC mixm-e8 PLC          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=5.905ms stopped=0
+x8 PLC mixm-e8 PLC          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=14 heavy_worst_p99us=48 light_worst_p99us=48 [port:kind:delivering/streams:events:p50us:p99us] 41524:h:250/250:2500146:14:48 41618:h:250/250:2500138:13:40 41716:l:10/10:100000:22:48 41838:l:10/10:100001:13:32 41942:l:10/10:100001:16:40 42030:l:10/10:100000:15:36 42134:l:10/10:100000:12:37 42218:l:10/10:100000:13:34 42338:l:10/10:100000:18:45 42436:l:10/10:100000:10:27
+x8 PLC mixm-e8 PLC          churn conns=2228 ok=9720 err=0 p50=31µs p99=507µs max=2.652ms
+x8 PLC mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1722 threads=687,670,76,65,65,61,45,43,0,0,0,0,0,0,0,0,0,0
+x8 PLC mixm-e8 place heavy_execs=1,0 heavy_shared=0 heavy_exec_set=2/8 churn=2230 churn_on_heavy=3 churn_on_heavy_frac=0.001 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=3,0,14,18,1139,564,326,166
+x8 PLC mixm-eprod PLC          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700557 ended_early=0 scan_err=0
+x8 PLC mixm-eprod PLC          sse latency p50=13µs p99=50µs max=5.698ms
+x8 PLC mixm-eprod PLC          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=6.634ms stopped=0
+x8 PLC mixm-eprod PLC          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=13 heavy_worst_p99us=56 light_worst_p99us=41 [port:kind:delivering/streams:events:p50us:p99us] 45016:h:250/250:2500084:12:56 45152:h:250/250:2500182:13:49 45214:h:250/250:2500263:13:44 45350:l:10/10:100010:11:29 45446:l:10/10:100003:12:32 45508:l:10/10:100003:12:33 45626:l:10/10:100000:13:41 45698:l:10/10:100006:12:39 45822:l:10/10:100000:11:40 45900:l:10/10:100006:11:35 46036:l:10/10:100000:13:33 46100:l:10/10:100000:11:29 46180:l:10/10:100000:13:33 46268:l:10/10:100000:10:29 46376:l:10/10:100000:11:32
+x8 PLC mixm-eprod PLC          churn conns=2268 ok=9680 err=0 p50=32µs p99=585µs max=4.763ms
+x8 PLC mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2641 threads=760,686,684,80,80,64,59,54,48,46,39,29,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x8 PLC mixm-eprod place heavy_execs=2,0,1 heavy_shared=0 heavy_exec_set=3/12 churn=2269 churn_on_heavy=8 churn_on_heavy_frac=0.004 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=3,5,0,8,15,17,952,696,364,173,17,19
+busy_cores=0.09 limit=0.5 top_process_cores=0.03 (2312 qemu-system-x86) limit=0.3 before mix round 9
+x9 PLC mixm-e8 PLC          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800390 ended_early=0 scan_err=0
+x9 PLC mixm-e8 PLC          sse latency p50=13µs p99=47µs max=2.707ms
+x9 PLC mixm-e8 PLC          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=3.816ms stopped=0
+x9 PLC mixm-e8 PLC          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=14 heavy_worst_p99us=50 light_worst_p99us=34 [port:kind:delivering/streams:events:p50us:p99us] 51534:h:250/250:2500170:13:50 51658:h:250/250:2500208:14:45 51734:l:10/10:100000:11:30 51856:l:10/10:100008:12:27 51940:l:10/10:100000:10:34 52032:l:10/10:100003:10:31 52124:l:10/10:100001:10:32 52190:l:10/10:100000:9:26 52290:l:10/10:100000:12:32 52396:l:10/10:100000:10:29
+x9 PLC mixm-e8 PLC          churn conns=2225 ok=9705 err=0 p50=27µs p99=521µs max=1.237ms
+x9 PLC mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1652 threads=660,629,75,65,59,55,52,46,0,0,0,0,0,0,0,0,0,0
+x9 PLC mixm-e8 place heavy_execs=1,0 heavy_shared=0 heavy_exec_set=2/8 churn=2225 churn_on_heavy=3 churn_on_heavy_frac=0.001 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=3,0,10,15,1004,562,487,144
+x9 PLC mixm-eprod PLC          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700611 ended_early=0 scan_err=0
+x9 PLC mixm-eprod PLC          sse latency p50=19µs p99=121µs max=10.404ms
+x9 PLC mixm-eprod PLC          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=11.562ms stopped=0
+x9 PLC mixm-eprod PLC          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=19 heavy_worst_p99us=155 light_worst_p99us=71 [port:kind:delivering/streams:events:p50us:p99us] 46082:h:250/250:2500240:18:118 46216:h:250/250:2500189:19:155 46302:h:250/250:2500161:18:147 46428:l:10/10:100000:27:71 46500:l:10/10:100000:18:50 46580:l:10/10:100000:19:58 46694:l:10/10:100000:17:60 46776:l:10/10:100000:18:67 46890:l:10/10:100000:20:64 46970:l:10/10:100000:20:65 47100:l:10/10:100000:18:62 47182:l:10/10:100006:22:57 47252:l:10/10:100009:22:65 47368:l:10/10:100006:18:54 47440:l:10/10:100000:16:39
+x9 PLC mixm-eprod PLC          churn conns=2264 ok=9660 err=0 p50=38µs p99=587µs max=3.539ms
+x9 PLC mixm-eprod cpu executors=12 heavy=3 light=12 ticks=3008 threads=789,777,775,97,95,91,83,72,66,60,47,44,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x9 PLC mixm-eprod place heavy_execs=0,1,2 heavy_shared=0 heavy_exec_set=3/12 churn=2264 churn_on_heavy=14 churn_on_heavy_frac=0.006 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=0,5,9,13,20,19,796,553,490,332,13,14
+x9 WS2 mixm-e8 WS2          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800410 ended_early=0 scan_err=0
+x9 WS2 mixm-e8 WS2          sse latency p50=22µs p99=455µs max=3.863ms
+x9 WS2 mixm-e8 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.859ms stopped=0
+x9 WS2 mixm-e8 WS2          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=23 heavy_worst_p99us=518 light_worst_p99us=47 [port:kind:delivering/streams:events:p50us:p99us] 35496:h:250/250:2500183:23:510 35646:h:250/250:2500179:22:518 35730:l:10/10:100000:14:43 35848:l:10/10:100008:16:46 35940:l:10/10:100007:17:47 36044:l:10/10:100009:17:45 36140:l:10/10:100009:17:47 36212:l:10/10:100009:15:42 36324:l:10/10:100006:16:45 36410:l:10/10:100000:16:46
+x9 WS2 mixm-e8 WS2          churn conns=2213 ok=9665 err=0 p50=40µs p99=590µs max=1.823ms
+x9 WS2 mixm-e8 cpu executors=8 heavy=2 light=8 ticks=4043 threads=787,735,670,594,490,361,237,160,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x9 WS2 mixm-eprod WS2          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700028 ended_early=0 scan_err=0
+x9 WS2 mixm-eprod WS2          sse latency p50=152µs p99=1.375ms max=11.028ms
+x9 WS2 mixm-eprod WS2          sse fair ev_min=9998 ev_p50=10000 ev_max=10002 expected=10000 gap_max=11.383ms stopped=0
+x9 WS2 mixm-eprod WS2          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=492 heavy_worst_p99us=1405 light_worst_p99us=125 [port:kind:delivering/streams:events:p50us:p99us] 33972:h:250/250:2500056:397:1405 34112:h:250/250:2499978:86:1372 34204:h:250/250:2499973:492:1404 34322:l:10/10:100000:22:112 34410:l:10/10:100000:22:107 34478:l:10/10:100009:23:117 34606:l:10/10:100000:23:105 34698:l:10/10:100000:24:117 34790:l:10/10:100000:23:118 34860:l:10/10:100000:21:110 34962:l:10/10:100009:26:125 35064:l:10/10:100003:24:122 35146:l:10/10:100000:21:103 35252:l:10/10:100000:25:122 35330:l:10/10:100000:17:70
+x9 WS2 mixm-eprod WS2          churn conns=2252 ok=9620 err=0 p50=47µs p99=682µs max=4.529ms
+x9 WS2 mixm-eprod cpu executors=12 heavy=3 light=12 ticks=6987 threads=922,892,854,805,739,657,550,434,339,288,257,236,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x9 WS mixm-e8 WS           streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800313 ended_early=0 scan_err=0
+x9 WS mixm-e8 WS           sse latency p50=25µs p99=768µs max=4.439ms
+x9 WS mixm-e8 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.027ms stopped=0
+x9 WS mixm-e8 WS           sse conns n=10 heavy=2 light=8 heavy_worst_p50us=27 heavy_worst_p99us=820 light_worst_p99us=61 [port:kind:delivering/streams:events:p50us:p99us] 41418:h:250/250:2500152:25:820 41554:h:250/250:2500149:27:798 41632:l:10/10:100000:17:56 41740:l:10/10:100001:16:55 41808:l:10/10:100008:18:57 41870:l:10/10:100000:17:50 41972:l:10/10:100000:17:54 42086:l:10/10:100003:17:56 42216:l:10/10:100000:19:61 42278:l:10/10:100000:13:38
+x9 WS mixm-e8 WS           churn conns=2212 ok=9660 err=0 p50=43µs p99=621µs max=2.291ms
+x9 WS mixm-e8 cpu executors=8 heavy=2 light=8 ticks=4344 threads=816,767,711,636,539,405,267,192,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x9 WS mixm-eprod WS           streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700033 ended_early=0 scan_err=0
+x9 WS mixm-eprod WS           sse latency p50=521µs p99=1.399ms max=6.326ms
+x9 WS mixm-eprod WS           sse fair ev_min=9999 ev_p50=10000 ev_max=10002 expected=10000 gap_max=5.675ms stopped=0
+x9 WS mixm-eprod WS           sse conns n=15 heavy=3 light=12 heavy_worst_p50us=686 heavy_worst_p99us=1438 light_worst_p99us=128 [port:kind:delivering/streams:events:p50us:p99us] 59356:h:250/250:2500041:568:1410 59450:h:250/250:2499992:593:1401 59522:h:250/250:2499995:686:1438 59640:l:10/10:100005:18:75 59722:l:10/10:100000:21:123 59772:l:10/10:100000:20:121 59876:l:10/10:100000:23:128 59958:l:10/10:100000:21:125 60064:l:10/10:100000:20:100 60132:l:10/10:100000:26:128 60210:l:10/10:100000:28:122 60324:l:10/10:100000:21:109 60396:l:10/10:100000:20:112 60518:l:10/10:100000:23:124 60596:l:10/10:100000:16:77
+x9 WS mixm-eprod WS           churn conns=2252 ok=9620 err=0 p50=46µs p99=669µs max=3.658ms
+x9 WS mixm-eprod cpu executors=12 heavy=3 light=12 ticks=7087 threads=928,899,861,813,749,666,565,452,352,294,259,235,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x9 PLS mixm-e8 PLS          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800398 ended_early=0 scan_err=0
+x9 PLS mixm-e8 PLS          sse latency p50=13µs p99=46µs max=3.464ms
+x9 PLS mixm-e8 PLS          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.088ms stopped=0
+x9 PLS mixm-e8 PLS          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=13 heavy_worst_p99us=50 light_worst_p99us=41 [port:kind:delivering/streams:events:p50us:p99us] 49004:h:250/250:2500173:13:50 49138:h:250/250:2500199:13:40 49218:l:10/10:100004:13:34 49350:l:10/10:100006:13:36 49434:l:10/10:100010:13:41 49516:l:10/10:100004:12:41 49658:l:10/10:100002:14:39 49732:l:10/10:100000:12:39 49856:l:10/10:100000:11:34 49942:l:10/10:100000:12:29
+x9 PLS mixm-e8 PLS          churn conns=2224 ok=9700 err=0 p50=31µs p99=539µs max=2.064ms
+x9 PLS mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1686 threads=681,649,74,61,60,56,50,46,0,0,0,0,0,0,0,0,0,0,0
+x9 PLS mixm-e8 place heavy_execs=0,1 heavy_shared=0 heavy_exec_set=2/8 churn=2224 churn_on_heavy=3 churn_on_heavy_frac=0.001 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=0,3,8,13,765,632,438,365
+x9 PLS mixm-eprod PLS          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700618 ended_early=0 scan_err=0
+x9 PLS mixm-eprod PLS          sse latency p50=15µs p99=55µs max=5.361ms
+x9 PLS mixm-eprod PLS          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.49ms stopped=0
+x9 PLS mixm-eprod PLS          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=15 heavy_worst_p99us=62 light_worst_p99us=47 [port:kind:delivering/streams:events:p50us:p99us] 35430:h:250/250:2500207:14:62 35550:h:250/250:2500207:15:53 35590:h:250/250:2500193:15:50 35722:l:10/10:100000:16:42 35808:l:10/10:100000:15:40 35910:l:10/10:100005:14:46 35974:l:10/10:100000:17:47 36054:l:10/10:100000:14:43 36172:l:10/10:100000:14:40 36244:l:10/10:100000:14:42 36376:l:10/10:100000:12:33 36466:l:10/10:100000:14:38 36544:l:10/10:100000:14:35 36678:l:10/10:100006:15:39 36796:l:10/10:100000:17:42
+x9 PLS mixm-eprod PLS          churn conns=2268 ok=9680 err=0 p50=34µs p99=551µs max=4.255ms
+x9 PLS mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2779 threads=755,741,714,86,83,75,72,58,56,53,41,34,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x9 PLS mixm-eprod place heavy_execs=0,1,2 heavy_shared=0 heavy_exec_set=3/12 churn=2269 churn_on_heavy=14 churn_on_heavy_frac=0.006 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=0,5,9,12,17,21,1255,542,279,102,14,13
+x9 PLH mixm-e8 PLH          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800406 ended_early=0 scan_err=0
+x9 PLH mixm-e8 PLH          sse latency p50=13µs p99=55µs max=4.86ms
+x9 PLH mixm-e8 PLH          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.623ms stopped=0
+x9 PLH mixm-e8 PLH          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=13 heavy_worst_p99us=63 light_worst_p99us=38 [port:kind:delivering/streams:events:p50us:p99us] 41296:l:10/10:100006:13:37 41416:l:10/10:100000:12:37 41494:l:10/10:100007:12:38 41644:l:10/10:100002:14:35 41746:l:10/10:100000:9:23 55626:h:250/250:2500173:12:41 55758:h:250/250:2500208:13:63 55832:l:10/10:100007:13:36 55952:l:10/10:100000:11:34 56042:l:10/10:100003:11:34
+x9 PLH mixm-e8 PLH          churn conns=2223 ok=9695 err=0 p50=31µs p99=544µs max=1.737ms
+x9 PLH mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1695 threads=678,657,82,61,56,53,51,48,0,0,0,0,0,0,0,0,0,0,0
+x9 PLH mixm-e8 place heavy_execs=0,1 heavy_shared=0 heavy_exec_set=2/8 churn=2225 churn_on_heavy=3 churn_on_heavy_frac=0.001 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=0,3,9,13,734,594,472,400
+x9 PLH mixm-eprod PLH          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700616 ended_early=0 scan_err=0
+x9 PLH mixm-eprod PLH          sse latency p50=15µs p99=71µs max=6.127ms
+x9 PLH mixm-eprod PLH          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=8.105ms stopped=0
+x9 PLH mixm-eprod PLH          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=18 heavy_worst_p99us=89 light_worst_p99us=43 [port:kind:delivering/streams:events:p50us:p99us] 41394:h:250/250:2500185:18:89 41488:h:250/250:2500195:14:49 41564:h:250/250:2500188:14:52 41706:l:10/10:100000:15:39 41756:l:10/10:100000:14:35 41834:l:10/10:100000:12:32 41942:l:10/10:100003:14:43 42026:l:10/10:100001:12:36 42130:l:10/10:100010:14:36 42200:l:10/10:100010:12:32 42316:l:10/10:100010:12:31 42388:l:10/10:100004:10:31 42464:l:10/10:100009:13:33 42570:l:10/10:100001:15:36 42654:l:10/10:100000:13:32
+x9 PLH mixm-eprod PLH          churn conns=2268 ok=9680 err=0 p50=34µs p99=538µs max=3.557ms
+x9 PLH mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2722 threads=740,725,685,79,77,75,74,73,53,49,43,36,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x9 PLH mixm-eprod place heavy_execs=4,0,1 heavy_shared=0 heavy_exec_set=3/12 churn=2269 churn_on_heavy=8 churn_on_heavy_frac=0.004 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=3,5,12,17,0,17,1191,523,327,142,13,19
+busy_cores=0.25 limit=0.5 top_process_cores=0.12 (1636698 ghostty) limit=0.3 before mix round 10
+x10 PLH mixm-e8 PLH          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800416 ended_early=0 scan_err=0
+x10 PLH mixm-e8 PLH          sse latency p50=13µs p99=56µs max=4.21ms
+x10 PLH mixm-e8 PLH          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.715ms stopped=0
+x10 PLH mixm-e8 PLH          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=13 heavy_worst_p99us=66 light_worst_p99us=45 [port:kind:delivering/streams:events:p50us:p99us] 47736:h:250/250:2500174:12:45 47816:l:10/10:100007:11:32 47932:l:10/10:100004:12:38 47998:l:10/10:100000:11:38 48056:l:10/10:100008:15:45 48196:l:10/10:100003:13:42 48288:l:10/10:100000:12:41 48438:l:10/10:100000:13:38 48520:l:10/10:100000:11:30 59324:h:250/250:2500220:13:66
+x10 PLH mixm-e8 PLH          churn conns=2220 ok=9700 err=0 p50=31µs p99=588µs max=3.24ms
+x10 PLH mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1643 threads=650,633,71,67,56,54,52,50,0,0,0,0,0,0,0,0,0,0
+x10 PLH mixm-e8 place heavy_execs=0,1 heavy_shared=0 heavy_exec_set=2/8 churn=2220 churn_on_heavy=5 churn_on_heavy_frac=0.002 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=0,5,11,14,600,549,545,496
+x10 PLH mixm-eprod PLH          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700407 ended_early=0 scan_err=0
+x10 PLH mixm-eprod PLH          sse latency p50=19µs p99=84µs max=9.103ms
+x10 PLH mixm-eprod PLH          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=10.272ms stopped=0
+x10 PLH mixm-eprod PLH          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=19 heavy_worst_p99us=98 light_worst_p99us=67 [port:kind:delivering/streams:events:p50us:p99us] 54900:h:250/250:2500066:17:98 55006:h:250/250:2500139:19:85 55114:h:250/250:2500162:19:76 55246:l:10/10:100003:21:66 55342:l:10/10:100003:23:63 55438:l:10/10:100000:19:59 55534:l:10/10:100008:19:61 55624:l:10/10:100010:22:63 55762:l:10/10:100001:16:51 55836:l:10/10:100003:20:65 55930:l:10/10:100001:14:41 56012:l:10/10:100000:16:47 56090:l:10/10:100005:25:67 56216:l:10/10:100006:25:65 56294:l:10/10:100000:17:41
+x10 PLH mixm-eprod PLH          churn conns=2264 ok=9674 err=0 p50=38µs p99=582µs max=1.893ms
+x10 PLH mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2992 threads=827,780,743,92,88,83,72,70,67,64,53,37,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x10 PLH mixm-eprod place heavy_execs=0,1,2 heavy_shared=0 heavy_exec_set=3/12 churn=2266 churn_on_heavy=10 churn_on_heavy_frac=0.004 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=0,4,6,11,14,16,630,581,504,468,13,19
+x10 PLC mixm-e8 PLC          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800311 ended_early=0 scan_err=0
+x10 PLC mixm-e8 PLC          sse latency p50=13µs p99=43µs max=3.478ms
+x10 PLC mixm-e8 PLC          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=3.864ms stopped=0
+x10 PLC mixm-e8 PLC          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=13 heavy_worst_p99us=45 light_worst_p99us=42 [port:kind:delivering/streams:events:p50us:p99us] 36288:h:250/250:2500144:13:45 36434:h:250/250:2500153:12:39 36534:l:10/10:100000:14:40 36628:l:10/10:100000:13:37 36708:l:10/10:100000:12:40 36782:l:10/10:100005:9:35 36906:l:10/10:100004:15:42 36982:l:10/10:100004:14:41 37082:l:10/10:100001:10:33 37164:l:10/10:100000:11:30
+x10 PLC mixm-e8 PLC          churn conns=2224 ok=9710 err=0 p50=28µs p99=555µs max=3.555ms
+x10 PLC mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1673 threads=667,639,70,69,66,63,50,40,0,0,0,0,0,0,0,0,0
+x10 PLC mixm-e8 place heavy_execs=0,1 heavy_shared=0 heavy_exec_set=2/8 churn=2225 churn_on_heavy=3 churn_on_heavy_frac=0.001 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=0,3,11,15,914,552,545,185
+x10 PLC mixm-eprod PLC          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700568 ended_early=0 scan_err=0
+x10 PLC mixm-eprod PLC          sse latency p50=17µs p99=77µs max=4.782ms
+x10 PLC mixm-eprod PLC          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.698ms stopped=0
+x10 PLC mixm-eprod PLC          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=17 heavy_worst_p99us=89 light_worst_p99us=64 [port:kind:delivering/streams:events:p50us:p99us] 40232:h:250/250:2500211:17:89 40352:h:250/250:2500196:16:81 40420:h:250/250:2500154:16:64 40542:l:10/10:100002:19:58 40610:l:10/10:100000:28:63 40676:l:10/10:100000:20:53 40794:l:10/10:100000:18:58 40882:l:10/10:100000:16:49 40978:l:10/10:100000:18:46 41066:l:10/10:100002:16:55 41220:l:10/10:100003:18:49 41298:l:10/10:100000:17:48 41384:l:10/10:100000:20:55 41506:l:10/10:100000:25:64 41576:l:10/10:100000:12:31
+x10 PLC mixm-eprod PLC          churn conns=2268 ok=9680 err=0 p50=36µs p99=544µs max=1.295ms
+x10 PLC mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2894 threads=774,757,748,102,81,74,72,69,56,55,47,45,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x10 PLC mixm-eprod place heavy_execs=0,1,2 heavy_shared=0 heavy_exec_set=3/12 churn=2269 churn_on_heavy=9 churn_on_heavy_frac=0.004 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=0,4,5,13,16,16,1019,633,367,168,13,15
+x10 WS2 mixm-e8 WS2          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800366 ended_early=0 scan_err=0
+x10 WS2 mixm-e8 WS2          sse latency p50=23µs p99=273µs max=6.189ms
+x10 WS2 mixm-e8 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.801ms stopped=0
+x10 WS2 mixm-e8 WS2          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=25 heavy_worst_p99us=416 light_worst_p99us=55 [port:kind:delivering/streams:events:p50us:p99us] 53290:h:250/250:2500166:25:289 53392:h:250/250:2500163:24:416 53476:l:10/10:100008:18:51 53610:l:10/10:100005:16:51 58680:l:10/10:100000:15:47 58758:l:10/10:100002:18:55 58868:l:10/10:100008:17:44 58962:l:10/10:100005:16:41 59064:l:10/10:100007:14:37 59142:l:10/10:100002:15:40
+x10 WS2 mixm-e8 WS2          churn conns=2216 ok=9669 err=0 p50=40µs p99=589µs max=3.97ms
+x10 WS2 mixm-e8 cpu executors=8 heavy=2 light=8 ticks=4304 threads=814,765,702,629,524,403,273,185,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x10 WS2 mixm-eprod WS2          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700464 ended_early=0 scan_err=0
+x10 WS2 mixm-eprod WS2          sse latency p50=57µs p99=1.334ms max=11.458ms
+x10 WS2 mixm-eprod WS2          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=10.877ms stopped=0
+x10 WS2 mixm-eprod WS2          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=273 heavy_worst_p99us=1379 light_worst_p99us=92 [port:kind:delivering/streams:events:p50us:p99us] 45698:h:250/250:2500196:61:1311 45826:h:250/250:2500064:84:1365 45892:h:250/250:2500186:273:1379 45990:l:10/10:100006:19:76 46060:l:10/10:100001:20:86 46152:l:10/10:100004:19:83 46264:l:10/10:100004:22:92 46334:l:10/10:100000:19:86 46440:l:10/10:100000:18:78 46504:l:10/10:100000:19:73 46600:l:10/10:100002:18:73 46674:l:10/10:100000:21:79 46758:l:10/10:100000:21:81 46894:l:10/10:100000:21:74 46990:l:10/10:100001:20:64
+x10 WS2 mixm-eprod WS2          churn conns=2256 ok=9640 err=0 p50=46µs p99=644µs max=4.432ms
+x10 WS2 mixm-eprod cpu executors=12 heavy=3 light=12 ticks=7126 threads=931,903,866,821,760,681,583,471,362,287,238,210,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x10 WS mixm-e8 WS           streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800312 ended_early=0 scan_err=0
+x10 WS mixm-e8 WS           sse latency p50=25µs p99=350µs max=6.127ms
+x10 WS mixm-e8 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=7.124ms stopped=0
+x10 WS mixm-e8 WS           sse conns n=10 heavy=2 light=8 heavy_worst_p50us=26 heavy_worst_p99us=452 light_worst_p99us=58 [port:kind:delivering/streams:events:p50us:p99us] 45554:h:250/250:2500150:26:452 45662:h:250/250:2500134:26:405 45752:l:10/10:100007:16:46 45876:l:10/10:100001:16:52 45950:l:10/10:100002:19:58 46066:l:10/10:100005:16:45 46188:l:10/10:100004:19:58 46262:l:10/10:100007:17:49 46370:l:10/10:100002:16:54 46450:l:10/10:100000:15:51
+x10 WS mixm-e8 WS           churn conns=2216 ok=9650 err=0 p50=41µs p99=581µs max=2.446ms
+x10 WS mixm-e8 cpu executors=8 heavy=2 light=8 ticks=4387 threads=825,775,716,639,538,404,278,204,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x10 WS mixm-eprod WS           streams=870 conns=15 opened=870 delivering=870 failed=0 events=8699979 ended_early=0 scan_err=0
+x10 WS mixm-eprod WS           sse latency p50=85µs p99=1.33ms max=6.019ms
+x10 WS mixm-eprod WS           sse fair ev_min=9999 ev_p50=10000 ev_max=10002 expected=10000 gap_max=6.153ms stopped=0
+x10 WS mixm-eprod WS           sse conns n=15 heavy=3 light=12 heavy_worst_p50us=402 heavy_worst_p99us=1363 light_worst_p99us=80 [port:kind:delivering/streams:events:p50us:p99us] 53038:h:250/250:2500001:262:1339 53178:h:250/250:2499984:300:1340 53246:h:250/250:2499986:402:1363 53362:l:10/10:100007:19:64 53450:l:10/10:100001:19:72 53542:l:10/10:100000:22:76 53640:l:10/10:100000:22:78 53718:l:10/10:100000:20:69 53814:l:10/10:100000:20:77 53906:l:10/10:100000:19:77 53966:l:10/10:100000:19:74 54090:l:10/10:100000:19:80 54186:l:10/10:100000:19:71 54298:l:10/10:100000:21:72 54378:l:10/10:100000:20:77
+x10 WS mixm-eprod WS           churn conns=2256 ok=9640 err=0 p50=45µs p99=628µs max=1.515ms
+x10 WS mixm-eprod cpu executors=12 heavy=3 light=12 ticks=7120 threads=932,903,868,821,757,679,580,470,367,289,238,206,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x10 PLS mixm-e8 PLS          streams=580 conns=10 opened=580 delivering=580 failed=0 events=5800147 ended_early=0 scan_err=0
+x10 PLS mixm-e8 PLS          sse latency p50=12µs p99=40µs max=2.381ms
+x10 PLS mixm-e8 PLS          sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=3.519ms stopped=0
+x10 PLS mixm-e8 PLS          sse conns n=10 heavy=2 light=8 heavy_worst_p50us=12 heavy_worst_p99us=42 light_worst_p99us=35 [port:kind:delivering/streams:events:p50us:p99us] 56280:h:250/250:2500096:12:42 56388:h:250/250:2500028:12:38 56476:l:10/10:100009:12:32 56608:l:10/10:100001:10:27 56686:l:10/10:100008:12:35 56762:l:10/10:100002:10:25 56896:l:10/10:100003:12:35 56982:l:10/10:100000:11:32 57096:l:10/10:100000:12:32 57186:l:10/10:100000:10:29
+x10 PLS mixm-e8 PLS          churn conns=2224 ok=9700 err=0 p50=29µs p99=555µs max=1.843ms
+x10 PLS mixm-e8 cpu executors=8 heavy=2 light=8 ticks=1643 threads=654,638,75,64,53,50,50,47,0,0,0,0,0,0,0,0,0,0,0
+x10 PLS mixm-e8 place heavy_execs=1,0 heavy_shared=0 heavy_exec_set=2/8 churn=2224 churn_on_heavy=3 churn_on_heavy_frac=0.001 uniform_frac=0.250 light_on_heavy=0/8 churn_per_exec=3,0,8,13,550,551,549,550
+x10 PLS mixm-eprod PLS          streams=870 conns=15 opened=870 delivering=870 failed=0 events=8700622 ended_early=0 scan_err=0
+x10 PLS mixm-eprod PLS          sse latency p50=14µs p99=53µs max=9.154ms
+x10 PLS mixm-eprod PLS          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=10.09ms stopped=0
+x10 PLS mixm-eprod PLS          sse conns n=15 heavy=3 light=12 heavy_worst_p50us=14 heavy_worst_p99us=59 light_worst_p99us=54 [port:kind:delivering/streams:events:p50us:p99us] 32808:l:10/10:100000:15:49 32894:l:10/10:100000:16:46 32994:l:10/10:100007:13:52 33062:l:10/10:100010:14:54 33186:l:10/10:100000:10:43 33262:l:10/10:100000:10:41 33372:l:10/10:100000:10:42 33454:l:10/10:100000:11:32 33514:l:10/10:100000:12:31 33634:l:10/10:100000:14:49 33704:l:10/10:100000:13:49 60616:h:250/250:2500203:14:53 60742:h:250/250:2500208:13:59 60828:h:250/250:2500194:13:49 60972:l:10/10:100000:12:27
+x10 PLS mixm-eprod PLS          churn conns=2268 ok=9700 err=0 p50=33µs p99=574µs max=1.959ms
+x10 PLS mixm-eprod cpu executors=12 heavy=3 light=12 ticks=2652 threads=698,692,689,77,77,71,67,63,62,56,53,33,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+x10 PLS mixm-eprod place heavy_execs=0,1,2 heavy_shared=0 heavy_exec_set=3/12 churn=2268 churn_on_heavy=10 churn_on_heavy_frac=0.004 uniform_frac=0.250 light_on_heavy=0/12 churn_per_exec=0,3,7,13,15,14,936,547,450,251,13,19
+== rows=100 ==
