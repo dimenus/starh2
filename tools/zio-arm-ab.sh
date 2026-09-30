@@ -193,6 +193,15 @@ MIX_STAGGER_MS=${MIX_STAGGER_MS:-50}
 MIX_CHURN_PAUSE_MS=${MIX_CHURN_PAUSE_MS:-0}
 # Names the rows, so two load levels (e.g. mix and mixm) share one file.
 MIX_LABEL=${MIX_LABEL:-mix}
+# PLACE_LOG=1: after each mix run, join the server's `PLACE port= exec=`
+# lines (bench_server --placement-log, balanced arms only) with the client's
+# `sse conns` ports, which tag heavy (h) and light (l) connections; every
+# other placed port is a churn connection. One `place` row per run: the
+# executor of each heavy connection, how many heavy connections share an
+# executor with another, and how many churn connections landed on an
+# executor holding a heavy one (with that set's share of all executors, the
+# fraction a uniform spread would give).
+PLACE_LOG=${PLACE_LOG:-0}
 
 # Per-arm server arguments and ready-line expectations: ARGS_<arm> is appended
 # to that arm's server command line, and EXPECT_<arm>, when set, must appear in
@@ -284,7 +293,7 @@ ssh "$HOST" "ARMS='$ARMS' BURST_ARMS='$BURST_ARMS' ONESHOT_LAT_WIDTHS='$ONESHOT_
   OPEN_WARMUP=$OPEN_WARMUP OPEN_THREADS=$OPEN_THREADS OPEN_CLOSED=$OPEN_CLOSED \
   MIX_ROUNDS=$MIX_ROUNDS MIX_WIDTHS='$MIX_WIDTHS' MIX_HEAVY_DIV=$MIX_HEAVY_DIV \
   MIX_HEAVY_STREAMS=$MIX_HEAVY_STREAMS MIX_LIGHT_PER_EXEC=$MIX_LIGHT_PER_EXEC \
-  MIX_LIGHT_STREAMS=$MIX_LIGHT_STREAMS MIX_CHURN=$MIX_CHURN MIX_STAGGER_MS=$MIX_STAGGER_MS MIX_CHURN_PAUSE_MS=$MIX_CHURN_PAUSE_MS MIX_LABEL=$MIX_LABEL \
+  MIX_LIGHT_STREAMS=$MIX_LIGHT_STREAMS MIX_CHURN=$MIX_CHURN MIX_STAGGER_MS=$MIX_STAGGER_MS MIX_CHURN_PAUSE_MS=$MIX_CHURN_PAUSE_MS MIX_LABEL=$MIX_LABEL PLACE_LOG=$PLACE_LOG \
   PERF_ROUNDS=$PERF_ROUNDS BURST_ROUNDS=$BURST_ROUNDS CPU_ROUNDS=$CPU_ROUNDS \
   SECONDS_RUN=$SECONDS_RUN INTERVAL=$INTERVAL EXECUTORS=$EXECUTORS \
   WIDE_EXECUTORS=$WIDE_EXECUTORS ONESHOT_N=$ONESHOT_N ONESHOT_WIDE_N=$ONESHOT_WIDE_N \
@@ -644,6 +653,26 @@ while [ $x -le $MIX_ROUNDS ]; do
         rows=$((rows+1))
       fi
       stop_srv
+      if [ "$PLACE_LOG" = 1 ] && [ -n "$SRV_PORT" ] && grep -q '^PLACE ' $D/$arm.log; then
+        echo "$out" | grep 'sse conns' | tr ' ' '\n' | grep -E '^[0-9]+:[hl]:' | awk -F: '{ print $1, $2 }' > $D/kinds.txt
+        awk -v E="$E" 'NR == FNR { kind[$1] = $2; next }
+          /^PLACE / { split($2, pp, "="); split($3, ee, "="); port = pp[2]; ex = ee[2]
+            k = (port in kind) ? kind[port] : "c"
+            if (k == "h") { hn++; hx[hn] = ex; hcount[ex]++ }
+            else if (k == "l") { ln++; lx[ln] = ex }
+            else { cn++; cx[cn] = ex; cper[ex]++ } }
+          END {
+            if (hn == 0) { print "place no-heavy-placed"; exit }
+            list = ""; shared = 0; nset = 0
+            for (i = 1; i <= hn; i++) { list = list (i > 1 ? "," : "") hx[i]; if (hcount[hx[i]] > 1) shared++ }
+            for (e in hcount) nset++
+            onheavy = 0; for (i = 1; i <= cn; i++) if (cx[i] in hcount) onheavy++
+            lh = 0; for (i = 1; i <= ln; i++) if (lx[i] in hcount) lh++
+            cp = ""; for (e = 0; e < E; e++) cp = cp (e > 0 ? "," : "") (cper[e] + 0)
+            printf "place heavy_execs=%s heavy_shared=%d heavy_exec_set=%d/%d churn=%d churn_on_heavy=%d churn_on_heavy_frac=%.3f uniform_frac=%.3f light_on_heavy=%d/%d churn_per_exec=%s\n",
+              list, shared, nset, E, cn, onheavy, cn ? onheavy / cn : 0, nset / E, lh, ln, cp }' $D/kinds.txt $D/$arm.log \
+          | sed "s/^/x$x $arm $MIX_LABEL-e$W /"
+      fi
     done
   done
   x=$((x+1))

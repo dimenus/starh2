@@ -1,0 +1,49 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  WS  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=83b4e4e2b43f70c9bea5cebfb7e3b1cf8579f80e68b4dee31a8a1a05509324df  args=''  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}'
+  PLC  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=bb21c699b57344bf803eac2cd7723017140bed370c29efd1978f8bb154ca89c6  args='--spawn-placement local --conn-balance --placement-log --balance-rank connections_first'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1,"balance_rank":"connections_first","placement_log":1}'
+  PLS  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=bb21c699b57344bf803eac2cd7723017140bed370c29efd1978f8bb154ca89c6  args='--spawn-placement local --conn-balance --placement-log --balance-rank sum'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1,"balance_rank":"sum","placement_log":1}'
+  shared zio package zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc: allowed (same binary with different args, A/A, or ready-line-checked build options)
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 12:27:05 up 1 day, 20:14,  2 users,  load average: 0.04, 1.85, 5.28
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/starh2-rank-ab/WS-server sha256=83b4e4e2b43f70c9bea5cebfb7e3b1cf8579f80e68b4dee31a8a1a05509324df
+  ran /tmp/starh2-rank-ab/PLC-server sha256=bb21c699b57344bf803eac2cd7723017140bed370c29efd1978f8bb154ca89c6
+  ran /tmp/starh2-rank-ab/PLS-server sha256=bb21c699b57344bf803eac2cd7723017140bed370c29efd1978f8bb154ca89c6
+-- host check before phase 6 --
+ 12:27:05 up 1 day, 20:14,  2 users,  load average: 0.04, 1.85, 5.28
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+   2312 libvirt+  20   0    9.9g   5.4g  22948 S   4.9  17.7  74:44.34 qemu-system-x86
+   3909 ryan      20   0 2023348 441672   7840 S   4.9   1.4  46:34.76 qmdsync-tasks
+      1 root      20   0   21260  15712  11128 S   0.0   0.0   0:03.92 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.09 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=0.06 limit=0.5 top_process_cores=0.02 (2312 qemu-system-x86) limit=0.3 before phase 6
+== phase 6: heavy/light/churn mix (mix, heavy = executors / 2, churn pause 0 ms), widths: 8 ==
+busy_cores=0.07 limit=0.5 top_process_cores=0.02 (2312 qemu-system-x86) limit=0.3 before mix round 1
+  ready WS args='' {"ready":true,"mode":"tls","port":46401,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}
+x1 WS mix-e8 WS           streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10799666 ended_early=0 scan_err=0
+x1 WS mix-e8 WS           sse latency p50=931µs p99=2.044ms max=13.242ms
+x1 WS mix-e8 WS           sse fair ev_min=9998 ev_p50=10000 ev_max=10002 expected=10000 gap_max=13.483ms stopped=0
+x1 WS mix-e8 WS           sse conns n=12 heavy=4 light=8 heavy_worst_p50us=1019 heavy_worst_p99us=2141 light_worst_p99us=402 [port:kind:delivering/streams:events:p50us:p99us] 34412:l:10/10:100000:39:388 36382:l:10/10:100000:40:393 38328:l:10/10:100006:35:398 40266:l:10/10:100000:32:378 45878:h:250/250:2500006:1012:2139 48144:h:250/250:2499814:1019:2141 50420:h:250/250:2499853:937:1951 52536:h:250/250:2499976:938:1951 54498:l:10/10:100000:36:351 56494:l:10/10:100002:34:400 58618:l:10/10:100000:41:402 60576:l:10/10:100009:34:374
+x1 WS mix-e8 WS           churn conns=49065 ok=211602 err=0 p50=58µs p99=906µs max=9.702ms
+x1 WS mix-e8 cpu executors=8 heavy=4 light=8 ticks=8144 threads=1025,1021,1017,1014,1012,1007,1003,998,3,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1
+  ready PLC args='--spawn-placement local --conn-balance --placement-log --balance-rank connections_first' {"ready":true,"mode":"tls","port":35529,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1,"balance_rank":"connections_first","placement_log":1}
+x1 PLC mix-e8 PLC          streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10800239 ended_early=0 scan_err=0
+x1 PLC mix-e8 PLC          sse latency p50=194µs p99=1.309ms max=11.525ms
+x1 PLC mix-e8 PLC          sse fair ev_min=9999 ev_p50=10000 ev_max=10002 expected=10000 gap_max=11.634ms stopped=0
+x1 PLC mix-e8 PLC          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=490 heavy_worst_p99us=1364 light_worst_p99us=256 [port:kind:delivering/streams:events:p50us:p99us] 34394:l:10/10:100000:19:173 36678:l:10/10:100010:22:175 39136:l:10/10:100000:17:230 41200:l:10/10:100001:22:180 43398:l:10/10:100000:35:256 43776:h:250/250:2500031:278:1336 46292:h:250/250:2499998:490:1353 49178:h:250/250:2500000:479:1364 52002:h:250/250:2500194:27:725 54680:l:10/10:100004:27:175 57278:l:10/10:100000:23:224 59902:l:10/10:100001:20:200
+x1 PLC mix-e8 PLC          churn conns=57316 ok=246233 err=0 p50=52µs p99=808µs max=10.729ms
+x1 PLC mix-e8 cpu executors=8 heavy=4 light=8 ticks=5672 threads=1073,1068,1057,885,674,378,329,156,8,8,5,5,5,5,1,0,0,0,0
+x1 PLC mix-e8 place heavy_execs=1,5,6,7 heavy_shared=0 heavy_exec_set=4/8 churn=57317 churn_on_heavy=20191 churn_on_heavy_frac=0.352 uniform_frac=0.500 light_on_heavy=1/8 churn_per_exec=21744,7366,8611,5320,1451,6351,6337,137
+  ready PLS args='--spawn-placement local --conn-balance --placement-log --balance-rank sum' {"ready":true,"mode":"tls","port":42877,"executors":8,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1,"balance_rank":"sum","placement_log":1}
+x1 PLS mix-e8 PLS          streams=1080 conns=12 opened=1080 delivering=1080 failed=0 events=10800683 ended_early=0 scan_err=0
+x1 PLS mix-e8 PLS          sse latency p50=31µs p99=867µs max=8.398ms
+x1 PLS mix-e8 PLS          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=8.875ms stopped=0
+x1 PLS mix-e8 PLS          sse conns n=12 heavy=4 light=8 heavy_worst_p50us=38 heavy_worst_p99us=927 light_worst_p99us=188 [port:kind:delivering/streams:events:p50us:p99us] 34704:h:250/250:2500190:26:807 37442:h:250/250:2500192:31:855 40298:h:250/250:2500157:38:916 42910:l:10/10:100000:24:166 45524:l:10/10:100000:26:177 47916:l:10/10:100000:29:188 49928:l:10/10:100000:28:178 52706:l:10/10:100000:26:169 55466:l:10/10:100000:28:179 58018:l:10/10:100000:33:188 59754:l:10/10:100001:20:159 60182:h:250/250:2500143:36:927
+x1 PLS mix-e8 PLS          churn conns=68158 ok=295883 err=0 p50=38µs p99=614µs max=5.732ms
+x1 PLS mix-e8 cpu executors=8 heavy=4 light=8 ticks=6215 threads=898,893,889,883,750,733,555,550,9,8,7,7,6,6,5,5,0,0,0,0
+x1 PLS mix-e8 place heavy_execs=1,6,2,7 heavy_shared=0 heavy_exec_set=4/8 churn=68159 churn_on_heavy=221 churn_on_heavy_frac=0.003 uniform_frac=0.500 light_on_heavy=0/8 churn_per_exec=21666,0,115,19285,14009,12978,23,83
+== rows=3 ==
