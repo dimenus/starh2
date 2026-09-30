@@ -300,23 +300,58 @@ test "balance: a refused placement falls back and still serves the connection" {
 // connection onto the other executor.
 // ---------------------------------------------------------------------------
 
-test "balance: inline-only connections do not pile behind one idle task handler" {
-    if (!pinned) return error.SkipZigTest;
-    const gpa = std.testing.allocator;
+/// One idle SSE handler on executor 0, then 100 inline-only connections:
+/// returns |c0 - c1| after they are placed under `rank`.
+fn pileUpSpread(gpa: std.mem.Allocator, rank: Balancer.Rank) !u32 {
     var bal = try widthBalancer(gpa, 2);
     defer bal.deinit(gpa);
-    // Executor 0: one connection with one mostly-sleeping SSE handler.
+    bal.rank = rank;
     bal.handlers[0].store(1, .release);
     bal.conns[0].store(1, .release);
-    // 100 connections that only ever run complete (inline) handlers arrive.
     for (0..100) |_| _ = bal.reserve().?;
     const c0 = bal.conns[0].load(.acquire);
     const c1 = bal.conns[1].load(.acquire);
     for (bal.conns) |*c| c.store(0, .release);
     bal.handlers[0].store(0, .release);
-    std.debug.print("inline pile-up: connections per executor = [{d}, {d}]\n", .{ c0, c1 });
-    const spread = if (c0 > c1) c0 - c1 else c1 - c0;
-    try std.testing.expect(spread <= 10);
+    std.debug.print("inline pile-up, rank={s}: connections per executor = [{d}, {d}]\n", .{ @tagName(rank), c0, c1 });
+    return if (c0 > c1) c0 - c1 else c1 - c0;
+}
+
+/// Executor 0 holds one heavy connection (250 live handlers); executor 1
+/// holds two light ones (20 handlers). Returns the executor a new connection
+/// is placed on under `rank`.
+fn heavyPick(gpa: std.mem.Allocator, rank: Balancer.Rank) !zio.ExecutorId {
+    var bal = try widthBalancer(gpa, 2);
+    defer bal.deinit(gpa);
+    bal.rank = rank;
+    bal.conns[0].store(1, .release);
+    bal.handlers[0].store(250, .release);
+    bal.conns[1].store(2, .release);
+    bal.handlers[1].store(20, .release);
+    const pick = bal.reserve().?;
+    for (bal.conns) |*c| c.store(0, .release);
+    for (bal.handlers) |*h| h.store(0, .release);
+    std.debug.print("heavy executor, rank={s}: new connection placed on executor {d} (0 holds 1 conn / 250 handlers, 1 holds 2 conns / 20 handlers)\n", .{ @tagName(rank), pick });
+    return pick;
+}
+
+// The two rank gates run for every rank and print each result, so one run
+// shows which ranks pass both; each asserts only for the default rank.
+
+test "balance: inline-only connections do not pile behind one idle task handler" {
+    if (!pinned) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    for (std.enums.values(Balancer.Rank)) |r| _ = try pileUpSpread(gpa, r);
+    const default_rank = (Balancer{ .conns = &.{}, .handlers = &.{} }).rank;
+    try std.testing.expect(try pileUpSpread(gpa, default_rank) <= 10);
+}
+
+test "balance: an executor with one heavy connection is not picked as the emptiest" {
+    if (!pinned) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    for (std.enums.values(Balancer.Rank)) |r| _ = try heavyPick(gpa, r);
+    const default_rank = (Balancer{ .conns = &.{}, .handlers = &.{} }).rank;
+    try std.testing.expectEqual(@as(zio.ExecutorId, 1), try heavyPick(gpa, default_rank));
 }
 
 // ---------------------------------------------------------------------------

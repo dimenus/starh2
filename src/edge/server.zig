@@ -515,6 +515,7 @@ pub const Server = struct {
                     config.balancer = b;
                     config.exec_index = ei;
                     if (zio.Group.fromStd(connection_group).spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config })) |_| {
+                        b.notePlaced(ei, stream.socket.address.getPort());
                         continue;
                     } else |_| {
                         b.releaseConn(ei);

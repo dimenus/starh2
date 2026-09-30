@@ -612,7 +612,23 @@ const Args = struct {
     /// build's `conn_placement`.
     spawn_placement: ?zio.Placement = null,
     conn_balance: bool = false,
+    balance_rank: starh2.Balancer.Rank = .connections_first,
+    placement_log: bool = false,
 };
+
+/// `--placement-log`: one line per placed connection, with the peer port (so
+/// a client can tag it) and every executor's counts after the reservation.
+/// Written with std.debug.print, which takes stderr's lock: a cost every
+/// balanced arm pays equally, and none of the unbalanced ones.
+fn placementLogLine(_: *anyopaque, b: *const starh2.Balancer, ei: zio.ExecutorId, peer_port: u16) void {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("PLACE port={d} exec={d} conns=", .{ peer_port, ei }) catch return;
+    for (b.conns, 0..) |*c, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", c.load(.monotonic) }) catch return;
+    w.writeAll(" handlers=") catch return;
+    for (b.handlers, 0..) |*h, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", h.load(.monotonic) }) catch return;
+    std.debug.print("{s}\n", .{w.buffered()});
+}
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
     var out: Args = .{};
@@ -680,6 +696,16 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
                 return error.ConnBalanceNeedsPinnedBuild;
             }
             out.conn_balance = true;
+        } else if (std.mem.eql(u8, a, "--balance-rank")) {
+            // Measurement: which Balancer.Rank --conn-balance uses.
+            const v = args.next() orelse return error.MissingValue;
+            out.balance_rank = std.meta.stringToEnum(starh2.Balancer.Rank, v) orelse {
+                std.debug.print("--balance-rank takes connections_first, handlers_first or sum, got {s}\n", .{v});
+                return error.InvalidBalanceRank;
+            };
+        } else if (std.mem.eql(u8, a, "--placement-log")) {
+            // Measurement: one PLACE line per balanced connection on stderr.
+            out.placement_log = true;
         } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
             // Placement probe: every connection on executor 0 (same), or
             // alternating executors in accept order (split).
@@ -963,6 +989,10 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     // One balancer for this runtime, sized by the runtime itself.
     var balancer_storage: ?starh2.Balancer = if (args.conn_balance) try starh2.Balancer.init(gpa, rt) else null;
     defer if (balancer_storage) |*b| b.deinit(gpa);
+    if (balancer_storage) |*b| {
+        b.rank = args.balance_rank;
+        if (args.placement_log) b.trace = .{ .ctx = @constCast(&dummy), .placed = placementLogLine };
+    }
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;
@@ -1017,7 +1047,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d}}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d}}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1030,6 +1060,8 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             @tagName(conn_mod.probe_handler_force),
             @tagName(conn_mod.probe_conn_force),
             @as(u8, @intFromBool(balancer_storage != null)),
+            if (balancer_storage) |*b| @tagName(b.rank) else "none",
+            @as(u8, @intFromBool(balancer_storage != null and balancer_storage.?.trace != null)),
         },
     );
     defer gpa.free(ready);

@@ -21,9 +21,10 @@
 //!   `.auto` spawn. A placement error never closes a connection.
 //! - Connections are counted from admission to `connEntry` exit. Task
 //!   handlers (HTTP/2 and HTTP/1.1) are counted while they run. Inline
-//!   (complete) handlers are not, which is why connections come first:
-//!   ranking by handlers first let one mostly-sleeping SSE handler steer every
-//!   inline-only connection onto the other executors.
+//!   (complete) handlers are not counted.
+//! - `rank` says how the two counts are combined (see `Rank`). Every rank is
+//!   a count, not a measure of work: an idle SSE handler weighs the same as a
+//!   busy one.
 //! - Placement is decided once, at accept. A connection that becomes hot
 //!   later is not moved; nothing under pinned scheduling can move it.
 const std = @import("std");
@@ -32,6 +33,37 @@ const zio = @import("zio");
 pub const Balancer = struct {
     conns: []std.atomic.Value(u32),
     handlers: []std.atomic.Value(u32),
+    rank: Rank = .connections_first,
+    /// Called after a connection is placed; for measurement only.
+    trace: ?Trace = null,
+
+    /// How `reserve` orders executors. Lowest wins; ties go to the lower
+    /// index. Each has a known failure, which the gates in tests/balance.zig
+    /// pin down:
+    /// - `connections_first`: (connections, handlers). A connection with 250
+    ///   SSE handlers counts as 1, so an executor holding one heavy connection
+    ///   looks emptier than one holding two light ones, and new connections
+    ///   (churn) land on the heavy executors.
+    /// - `handlers_first`: (handlers, connections). One mostly-sleeping SSE
+    ///   handler steers every inline-only connection onto the other
+    ///   executors.
+    /// - `sum`: connections + handlers, then connections. Bounds both cases,
+    ///   but a connection with N idle handlers still pushes up to N inline
+    ///   connections elsewhere before the scores meet.
+    pub const Rank = enum { connections_first, handlers_first, sum };
+
+    pub const Trace = struct {
+        ctx: *anyopaque,
+        placed: *const fn (ctx: *anyopaque, b: *const Balancer, ei: zio.ExecutorId, peer_port: u16) void,
+    };
+
+    fn better(rank: Rank, c: u32, h: u32, best_c: u32, best_h: u32) bool {
+        return switch (rank) {
+            .connections_first => c < best_c or (c == best_c and h < best_h),
+            .handlers_first => h < best_h or (h == best_h and c < best_c),
+            .sum => c + h < best_c + best_h or (c + h == best_c + best_h and c < best_c),
+        };
+    }
 
     pub const InitError = error{ OutOfMemory, TasksMigrate };
 
@@ -60,10 +92,10 @@ pub const Balancer = struct {
         self.* = undefined;
     }
 
-    /// Choose an executor for a new connection and count it there. Null when
-    /// there is nothing to choose (one executor). The count is reserved with
-    /// a compare-exchange, so two accept loops that read the same minimum do
-    /// not both place onto it.
+    /// Choose an executor for a new connection by `rank` and count it there.
+    /// Null when there is nothing to choose (one executor). The count is
+    /// reserved with a compare-exchange, so two accept loops that read the
+    /// same minimum do not both place onto it.
     pub fn reserve(self: *Balancer) ?zio.ExecutorId {
         if (self.conns.len < 2) return null;
         while (true) {
@@ -73,7 +105,7 @@ pub const Balancer = struct {
             for (self.conns[1..], self.handlers[1..], 1..) |*cv, *hv, i| {
                 const c = cv.load(.acquire);
                 const h = hv.load(.acquire);
-                if (c < best_c or (c == best_c and h < best_h)) {
+                if (better(self.rank, c, h, best_c, best_h)) {
                     best = i;
                     best_c = c;
                     best_h = h;
@@ -83,6 +115,12 @@ pub const Balancer = struct {
                 return @intCast(best);
             }
         }
+    }
+
+    /// Report a completed placement to `trace`, if any. The counts it reads
+    /// are after this connection's reservation.
+    pub fn notePlaced(self: *const Balancer, ei: zio.ExecutorId, peer_port: u16) void {
+        if (self.trace) |t| t.placed(t.ctx, self, ei, peer_port);
     }
 
     pub fn releaseConn(self: *Balancer, ei: zio.ExecutorId) void {
