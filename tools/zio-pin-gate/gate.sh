@@ -61,6 +61,18 @@ runs_phase() {
   case ",$PHASES," in *",$1,"*) return 0 ;; *) return 1 ;; esac
 }
 
+# Preflight. A missing tool made a phase report FAIL for work that never
+# ran: macOS has no `timeout`, so the misuse and cq repros exited 127, and a
+# fresh worktree has no tools/h2spec/h2spec (gitignored). Stop before any
+# phase and name the tool instead.
+TIMEOUT_BIN=$(command -v timeout || command -v gtimeout || true)
+if runs_phase misuse || runs_phase cq-repro; then
+  [ -n "$TIMEOUT_BIN" ] || { echo "PREFLIGHT FAIL: no timeout or gtimeout on PATH (macOS: brew install coreutils)"; exit 2; }
+fi
+if runs_phase h2spec; then
+  [ -x "$REPO/tools/h2spec/h2spec" ] || { echo "PREFLIGHT FAIL: $REPO/tools/h2spec/h2spec is missing (tools/README.md names the v2.6.0 release)"; exit 2; }
+fi
+
 WT="$OUT/zio-wt"
 git -C "$ZIO" worktree add --detach "$WT" "$SHA" > /dev/null 2>&1 || { echo "FAIL: cannot check out $SHA in $ZIO"; exit 1; }
 cleanup() { git -C "$ZIO" worktree remove --force "$WT" > /dev/null 2>&1; }
@@ -125,7 +137,7 @@ echo "== phase 4: two-driver misuse death test"
 stage_repro tools/cq-misuse-repro misuse-repro
 ( cd "$OUT/misuse-repro" && zig build ) > "$OUT/misuse-build.log" 2>&1 || { echo "  FAIL: build"; fail=1; }
 if [ -x "$OUT/misuse-repro/zig-out/bin/cq-misuse-repro" ]; then
-  timeout 60 "$OUT/misuse-repro/zig-out/bin/cq-misuse-repro" > "$OUT/misuse-run.log" 2>&1
+  "$TIMEOUT_BIN" 60 "$OUT/misuse-repro/zig-out/bin/cq-misuse-repro" > "$OUT/misuse-run.log" 2>&1
   rc=$?
   # The ONLY pass is the deliberate panic AT the point of misuse. An abort
   # without that message is a crash far from the cause (the pre-claims
@@ -163,7 +175,7 @@ stage_repro tools/cq-spurious-repro cq-repro
 if [ -x "$OUT/cq-repro/zig-out/bin/cq-spurious-repro" ]; then
   worst=0
   for i in 1 2 3; do
-    timeout 90 "$OUT/cq-repro/zig-out/bin/cq-spurious-repro" 8 20000 64 > "$OUT/cq-run-$i.log" 2>&1
+    "$TIMEOUT_BIN" 90 "$OUT/cq-repro/zig-out/bin/cq-spurious-repro" 8 20000 64 > "$OUT/cq-run-$i.log" 2>&1
     rc=$?
     echo "  run$i rc=$rc"
     [ "$rc" -gt "$worst" ] && worst=$rc
