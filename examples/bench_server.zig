@@ -662,8 +662,13 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
                     return error.PlacementNeedsPinnedBuild;
                 }
                 out.spawn_placement = .local;
+            } else if (std.mem.eql(u8, v, "prefer_local")) {
+                // EXPERIMENT: needs the patched zio this branch pins. A start
+                // hint, valid under every scheduling: under work_stealing the
+                // task may still migrate.
+                out.spawn_placement = .prefer_local;
             } else {
-                std.debug.print("--spawn-placement takes auto or local, got {s}\n", .{v});
+                std.debug.print("--spawn-placement takes auto, local or prefer_local, got {s}\n", .{v});
                 return error.InvalidSpawnPlacement;
             }
         } else if (std.mem.eql(u8, a, "--conn-balance")) {

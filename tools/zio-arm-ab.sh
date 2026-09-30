@@ -170,6 +170,24 @@ OPEN_SECONDS=${OPEN_SECONDS:-6}
 OPEN_WARMUP=${OPEN_WARMUP:-1}
 OPEN_THREADS=${OPEN_THREADS:-12}
 OPEN_CLOSED=${OPEN_CLOSED:-1}
+# Phase 6: many connections of uneven weight at several widths. Per width,
+# MIX_HEAVY_DIV sets the heavy connections to executors / MIX_HEAVY_DIV, each
+# with MIX_HEAVY_STREAMS SSE streams; MIX_LIGHT_PER_EXEC light connections per
+# executor carry MIX_LIGHT_STREAMS streams each; MIX_CHURN workers loop short
+# one-shot connections for the whole run, so the server's accept order
+# interleaves them with the long-lived ones (round-robin placement then
+# shifts); long-lived opens are MIX_STAGGER_MS apart. A width of `prod` omits
+# --executors, so the server sizes itself (physical_cpus.executorCount), and
+# the row reads the width back from the ready line. Each row also carries the
+# per-thread CPU ticks of the server, largest first, read before the kill.
+MIX_ROUNDS=${MIX_ROUNDS:-6}
+MIX_WIDTHS=${MIX_WIDTHS:-8 prod}
+MIX_HEAVY_DIV=${MIX_HEAVY_DIV:-2}
+MIX_HEAVY_STREAMS=${MIX_HEAVY_STREAMS:-250}
+MIX_LIGHT_PER_EXEC=${MIX_LIGHT_PER_EXEC:-1}
+MIX_LIGHT_STREAMS=${MIX_LIGHT_STREAMS:-10}
+MIX_CHURN=${MIX_CHURN:-4}
+MIX_STAGGER_MS=${MIX_STAGGER_MS:-50}
 
 # Per-arm server arguments and ready-line expectations: ARGS_<arm> is appended
 # to that arm's server command line, and EXPECT_<arm>, when set, must appear in
@@ -259,6 +277,9 @@ ssh "$HOST" "ARMS='$ARMS' BURST_ARMS='$BURST_ARMS' ONESHOT_LAT_WIDTHS='$ONESHOT_
   ONECONN_WORKERS=$ONECONN_WORKERS ONECONN_SECONDS=$ONECONN_SECONDS \
   OPEN_ROUNDS=$OPEN_ROUNDS OPEN_RATES='$OPEN_RATES' OPEN_SECONDS=$OPEN_SECONDS \
   OPEN_WARMUP=$OPEN_WARMUP OPEN_THREADS=$OPEN_THREADS OPEN_CLOSED=$OPEN_CLOSED \
+  MIX_ROUNDS=$MIX_ROUNDS MIX_WIDTHS='$MIX_WIDTHS' MIX_HEAVY_DIV=$MIX_HEAVY_DIV \
+  MIX_HEAVY_STREAMS=$MIX_HEAVY_STREAMS MIX_LIGHT_PER_EXEC=$MIX_LIGHT_PER_EXEC \
+  MIX_LIGHT_STREAMS=$MIX_LIGHT_STREAMS MIX_CHURN=$MIX_CHURN MIX_STAGGER_MS=$MIX_STAGGER_MS \
   PERF_ROUNDS=$PERF_ROUNDS BURST_ROUNDS=$BURST_ROUNDS CPU_ROUNDS=$CPU_ROUNDS \
   SECONDS_RUN=$SECONDS_RUN INTERVAL=$INTERVAL EXECUTORS=$EXECUTORS \
   WIDE_EXECUTORS=$WIDE_EXECUTORS ONESHOT_N=$ONESHOT_N ONESHOT_WIDE_N=$ONESHOT_WIDE_N \
@@ -337,7 +358,9 @@ start_srv() {
   ARM=$1; EXEC=$2
   eval "extra=\${ARGS_$ARM:-}; expect=\${EXPECT_$ARM:-}"
   rm -f $D/$ARM.log
-  $D/$ARM-server --mode tls --port 0 --executors $EXEC --sse-interval-ms $INTERVAL \
+  # `prod` leaves the width to the server (physical_cpus.executorCount).
+  execarg="--executors $EXEC"; [ "$EXEC" = prod ] && execarg=""
+  $D/$ARM-server --mode tls --port 0 $execarg --sse-interval-ms $INTERVAL \
     --cert $D/cert.pem --key $D/key.pem $extra > $D/$ARM.log 2>&1 &
   SRV_PID=$!
   i=0; SRV_PORT=
@@ -458,8 +481,8 @@ while [ $r -le $PERF_ROUNDS ]; do
       start_srv $arm $EXECUTORS
       if [ -n "$SRV_PORT" ]; then
         out=$(timeout 180 $D/client -url https://127.0.0.1:$SRV_PORT/sse -streams $S \
-          -seconds $SECONDS_RUN -warmup 1 -label $arm 2>&1)
-        echo "$out" | grep -E 'streams=|sse latency|NO EVENTS' | sed "s/^/r$r $arm sse$S /"
+          -seconds $SECONDS_RUN -warmup 1 -interval-ms $INTERVAL -label $arm 2>&1)
+        echo "$out" | grep -E 'streams=|sse latency|NO EVENTS|sse fair|sse conns|ended early|failed:' | sed "s/^/r$r $arm sse$S /"
         rows=$((rows+1))
       fi
       stop_srv
@@ -494,7 +517,7 @@ while [ $b -le $BURST_ROUNDS ]; do
       ov=$(echo "$tr" | sed -n 's/.*"tls_write_overflow":\([0-9]*\).*/\1/p')
       st=$(echo "$tr" | sed -n 's/.*"tls_stage_failed":\([0-9]*\).*/\1/p')
       case "$line" in
-        *"opened=$SSE_LOW "*"delivering=$SSE_LOW "*"failed=0 "*)
+        *"opened=$SSE_LOW "*"delivering=$SSE_LOW "*"failed=0 "*"ended_early=0 "*)
           echo "b$b $arm burst OK overflow=${ov:-absent} stage_failed=${st:-absent}" ;;
         *)
           echo "b$b $arm burst FAIL $line overflow=${ov:-absent} stage_failed=${st:-absent}"
@@ -589,6 +612,36 @@ while [ $r -le $OPEN_ROUNDS ]; do
     [ "$OPEN_CLOSED" = 1 ] && oneshot_lat $arm $EXECUTORS $ONESHOT_N
   done
   r=$((r+1))
+done
+fi
+
+if has_phase 6; then
+host_check "phase 6"
+echo "== phase 6: heavy/light/churn mix, widths: $MIX_WIDTHS =="
+x=1
+while [ $x -le $MIX_ROUNDS ]; do
+  round_check "mix round $x"
+  rotate $x
+  for arm in $ORDER; do
+    for W in $MIX_WIDTHS; do
+      start_srv $arm $W
+      if [ -n "$SRV_PORT" ]; then
+        E=$(grep '"ready"' $D/$arm.log | head -1 | sed -n 's/.*"executors":\([0-9]*\).*/\1/p')
+        H=$((E / MIX_HEAVY_DIV)); [ $H -lt 1 ] && H=1
+        L=$((E * MIX_LIGHT_PER_EXEC))
+        out=$(timeout 180 $D/client -url https://127.0.0.1:$SRV_PORT/sse -streams $((H * MIX_HEAVY_STREAMS)) -conns $H \
+          -light-conns $L -light-streams $MIX_LIGHT_STREAMS -churn-workers $MIX_CHURN -churn-url https://127.0.0.1:$SRV_PORT/ \
+          -stagger-ms $MIX_STAGGER_MS -interval-ms $INTERVAL -seconds $SECONDS_RUN -warmup 1 -label $arm 2>&1)
+        thr=$(for t in /proc/$SRV_PID/task/*; do sed 's/^.*) //' $t/stat 2>/dev/null | awk '{print $12+$13}'; done | sort -rn | tr '\n' ',' | sed 's/,$//')
+        cpu=$(awk '{print $14+$15}' /proc/$SRV_PID/stat 2>/dev/null)
+        echo "$out" | grep -E 'streams=|sse latency|NO EVENTS|sse fair|sse conns|churn conns|ended early|failed:' | sed "s/^/x$x $arm mix-e$W /"
+        echo "x$x $arm mix-e$W cpu executors=$E heavy=$H light=$L ticks=${cpu:-absent} threads=$thr"
+        rows=$((rows+1))
+      fi
+      stop_srv
+    done
+  done
+  x=$((x+1))
 done
 fi
 
