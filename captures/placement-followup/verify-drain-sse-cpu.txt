@@ -1,0 +1,386 @@
+== arm identity (embedded zio package hash, binary sha256) ==
+  WS  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=04bd58821f40135f0e724b05b221a2fafe02fa929b4d493e8ea1fff203460d72  args=''  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}'
+  WS2  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=04bd58821f40135f0e724b05b221a2fafe02fa929b4d493e8ea1fff203460d72  args=''  expect-ready='"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}'
+  PL  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=b28af559af89ab6c2dfdb203562754208e0665a1c16fa9193114573e305fac31  args='--spawn-placement local'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}'
+  PLB  zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc  sha256=b28af559af89ab6c2dfdb203562754208e0665a1c16fa9193114573e305fac31  args='--spawn-placement local --conn-balance'  expect-ready='"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1,"balance_rank":"sum","placement_log":0}'
+  shared zio package zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc: allowed (same binary with different args, A/A, or ready-line-checked build options)
+== host ==
+7.2.5-3-omarchy
+cores=24
+ 13:33:39 up 2 days, 21:20,  2 users,  load average: 0.16, 3.30, 6.21
+h2load: /home/ryan/.local/opt/nghttp2-1.70.0/bin/h2load h2load nghttp2/1.70.0
+  ran /tmp/starh2-verify/WS-server sha256=04bd58821f40135f0e724b05b221a2fafe02fa929b4d493e8ea1fff203460d72
+  ran /tmp/starh2-verify/WS2-server sha256=04bd58821f40135f0e724b05b221a2fafe02fa929b4d493e8ea1fff203460d72
+  ran /tmp/starh2-verify/PL-server sha256=b28af559af89ab6c2dfdb203562754208e0665a1c16fa9193114573e305fac31
+  ran /tmp/starh2-verify/PLB-server sha256=b28af559af89ab6c2dfdb203562754208e0665a1c16fa9193114573e305fac31
+-- host check before phase 1 --
+ 13:33:39 up 2 days, 21:20,  2 users,  load average: 0.16, 3.30, 6.21
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1706305 ryan      20   0 1972176 393452   7844 S   4.9   1.2  14:22.98 qmdsync-tasks
+1818122 ryan      20   0 2011416 274292  25556 S   4.9   0.9   0:57.68 CrRendererMain
+      1 root      20   0   22092  16612  11112 S   0.0   0.1   0:06.09 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.14 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+      4 root       0 -20       0      0      0 I   0.0   0.0   0:00.00 kworker/R-rcu_gp
+busy_cores=0.11 limit=0.5 top_process_cores=0.04 (1817699 CrBrowserMain) limit=0.3 before phase 1
+== phase 1: perf ==
+busy_cores=0.15 limit=0.5 top_process_cores=0.03 (1817699 CrBrowserMain) limit=0.3 before perf round 1
+  ready WS args='' {"ready":true,"mode":"tls","port":46455,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}
+r1 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000335 ended_early=0 scan_err=0
+r1 WS sse500 WS           sse latency p50=16µs p99=51µs max=5.587ms
+r1 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.313ms stopped=0
+r1 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=16 heavy_worst_p99us=53 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 40992:h:256/256:2560163:16:53 41006:h:244/244:2440172:15:45
+  ready WS2 args='' {"ready":true,"mode":"tls","port":38269,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"work_stealing","spawn_placement":"auto","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}
+r1 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000266 ended_early=0 scan_err=0
+r1 WS2 sse500 WS2          sse latency p50=21µs p99=170µs max=4.564ms
+r1 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.299ms stopped=0
+r1 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=22 heavy_worst_p99us=183 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 54896:h:256/256:2560155:20:156 54908:h:244/244:2440111:22:183
+  ready PL args='--spawn-placement local' {"ready":true,"mode":"tls","port":36617,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":0,"balance_rank":"none","placement_log":0}
+r1 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000372 ended_early=0 scan_err=0
+r1 PL sse500 PL           sse latency p50=12µs p99=40µs max=5.241ms
+r1 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.081ms stopped=0
+r1 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=44 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 53728:h:256/256:2560192:11:32 53732:h:244/244:2440180:12:44
+  ready PLB args='--spawn-placement local --conn-balance' {"ready":true,"mode":"tls","port":40143,"executors":2,"announce_running_wakes":1,"batch_wake_sleepers":1,"zio_scheduling":"pinned","spawn_placement":"local","probe":0,"probe_handler_placement":"none","probe_conn_placement":"none","conn_balance":1,"balance_rank":"sum","placement_log":0}
+r1 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000235 ended_early=0 scan_err=0
+r1 PLB sse500 PLB          sse latency p50=12µs p99=31µs max=3.679ms
+r1 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=4.855ms stopped=0
+r1 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=33 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 59168:h:256/256:2560126:12:33 59184:h:244/244:2440109:12:27
+busy_cores=0.09 limit=0.5 top_process_cores=0.11 (1817699 CrBrowserMain) limit=0.3 before perf round 2
+r2 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000252 ended_early=0 scan_err=0
+r2 WS2 sse500 WS2          sse latency p50=17µs p99=69µs max=5.194ms
+r2 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=6.058ms stopped=0
+r2 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=74 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 50720:h:256/256:2560142:16:51 50730:h:244/244:2440110:17:74
+r2 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999757 ended_early=0 scan_err=0
+r2 PL sse500 PL           sse latency p50=814µs p99=1.563ms max=4.256ms
+r2 PL sse500 PL           sse fair ev_min=9998 ev_p50=10000 ev_max=10001 expected=10000 gap_max=4.392ms stopped=0
+r2 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=828 heavy_worst_p99us=1566 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 52780:h:256/256:2559891:828:1566 52804:h:244/244:2439866:797:1558
+r2 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000273 ended_early=0 scan_err=0
+r2 PLB sse500 PLB          sse latency p50=12µs p99=39µs max=4.943ms
+r2 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.215ms stopped=0
+r2 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=42 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 54434:h:256/256:2560131:11:28 54444:h:244/244:2440142:12:42
+r2 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000195 ended_early=0 scan_err=0
+r2 WS sse500 WS           sse latency p50=15µs p99=48µs max=4.363ms
+r2 WS sse500 WS           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=5.061ms stopped=0
+r2 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=15 heavy_worst_p99us=48 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 44340:h:256/256:2560095:15:47 44350:h:244/244:2440100:14:48
+busy_cores=0.12 limit=0.5 top_process_cores=0.06 (1817699 CrBrowserMain) limit=0.3 before perf round 3
+r3 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000222 ended_early=0 scan_err=0
+r3 PL sse500 PL           sse latency p50=13µs p99=41µs max=2.908ms
+r3 PL sse500 PL           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=3.62ms stopped=0
+r3 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=41 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 46978:h:256/256:2560109:13:40 46984:h:244/244:2440113:12:41
+r3 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000262 ended_early=0 scan_err=0
+r3 PLB sse500 PLB          sse latency p50=12µs p99=29µs max=2.644ms
+r3 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10001 expected=10000 gap_max=4.065ms stopped=0
+r3 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=29 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 47268:h:256/256:2560138:12:29 47284:h:244/244:2440124:11:29
+r3 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000340 ended_early=0 scan_err=0
+r3 WS sse500 WS           sse latency p50=21µs p99=95µs max=3.718ms
+r3 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.613ms stopped=0
+r3 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=22 heavy_worst_p99us=107 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 58810:h:256/256:2560181:22:107 58820:h:244/244:2440159:18:76
+r3 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000282 ended_early=0 scan_err=0
+r3 WS2 sse500 WS2          sse latency p50=17µs p99=59µs max=4.485ms
+r3 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.163ms stopped=0
+r3 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=60 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 36934:h:256/256:2560148:15:60 36944:h:244/244:2440134:18:58
+busy_cores=0.14 limit=0.5 top_process_cores=0.12 (1817699 CrBrowserMain) limit=0.3 before perf round 4
+r4 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000314 ended_early=0 scan_err=0
+r4 PLB sse500 PLB          sse latency p50=13µs p99=53µs max=5.825ms
+r4 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.914ms stopped=0
+r4 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=14 heavy_worst_p99us=60 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 49822:h:256/256:2560160:14:60 49828:h:244/244:2440154:12:37
+r4 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000378 ended_early=0 scan_err=0
+r4 WS sse500 WS           sse latency p50=17µs p99=64µs max=4.911ms
+r4 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.074ms stopped=0
+r4 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=65 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 47422:h:256/256:2560203:17:62 47430:h:244/244:2440175:16:65
+r4 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000191 ended_early=0 scan_err=0
+r4 WS2 sse500 WS2          sse latency p50=16µs p99=67µs max=3.687ms
+r4 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=5.1ms stopped=0
+r4 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=16 heavy_worst_p99us=73 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 42014:h:256/256:2560092:15:73 42024:h:244/244:2440099:16:57
+r4 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000237 ended_early=0 scan_err=0
+r4 PL sse500 PL           sse latency p50=13µs p99=47µs max=3.741ms
+r4 PL sse500 PL           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=4.352ms stopped=0
+r4 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=50 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 39660:h:256/256:2560126:12:37 39672:h:244/244:2440111:13:50
+busy_cores=0.11 limit=0.5 top_process_cores=0.10 (1817699 CrBrowserMain) limit=0.3 before perf round 5
+r5 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000221 ended_early=0 scan_err=0
+r5 PLB sse500 PLB          sse latency p50=12µs p99=43µs max=6.523ms
+r5 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=6.363ms stopped=0
+r5 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=46 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 33278:h:256/256:2560063:12:46 33288:h:244/244:2440158:12:39
+r5 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=4999766 ended_early=0 scan_err=0
+r5 PL sse500 PL           sse latency p50=815µs p99=1.57ms max=5.824ms
+r5 PL sse500 PL           sse fair ev_min=9998 ev_p50=9999 ev_max=10001 expected=10000 gap_max=6.228ms stopped=0
+r5 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=829 heavy_worst_p99us=1599 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 50658:h:256/256:2559846:829:1599 50676:h:244/244:2439920:799:1544
+r5 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000336 ended_early=0 scan_err=0
+r5 WS2 sse500 WS2          sse latency p50=18µs p99=60µs max=3.58ms
+r5 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.975ms stopped=0
+r5 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=62 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 48360:h:256/256:2560174:17:56 48376:h:244/244:2440162:18:62
+r5 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000348 ended_early=0 scan_err=0
+r5 WS sse500 WS           sse latency p50=15µs p99=52µs max=5.484ms
+r5 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.297ms stopped=0
+r5 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=16 heavy_worst_p99us=54 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 44938:h:256/256:2560178:14:49 44950:h:244/244:2440170:16:54
+busy_cores=0.14 limit=0.5 top_process_cores=0.03 (1817699 CrBrowserMain) limit=0.3 before perf round 6
+r6 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000350 ended_early=0 scan_err=0
+r6 WS sse500 WS           sse latency p50=18µs p99=89µs max=4.498ms
+r6 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.137ms stopped=0
+r6 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=90 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 57200:h:256/256:2560180:18:90 57214:h:244/244:2440170:18:87
+r6 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000322 ended_early=0 scan_err=0
+r6 PLB sse500 PLB          sse latency p50=13µs p99=42µs max=5.938ms
+r6 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.042ms stopped=0
+r6 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=44 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 50784:h:256/256:2560158:13:44 50790:h:244/244:2440164:12:37
+r6 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000316 ended_early=0 scan_err=0
+r6 PL sse500 PL           sse latency p50=14µs p99=70µs max=6.79ms
+r6 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=7.104ms stopped=0
+r6 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=15 heavy_worst_p99us=76 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 57304:h:256/256:2560171:15:76 57320:h:244/244:2440145:13:40
+r6 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000262 ended_early=0 scan_err=0
+r6 WS2 sse500 WS2          sse latency p50=21µs p99=85µs max=5.027ms
+r6 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.804ms stopped=0
+r6 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=21 heavy_worst_p99us=90 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 39500:h:256/256:2560155:21:90 39506:h:244/244:2440107:20:77
+busy_cores=0.10 limit=0.5 top_process_cores=0.09 (1817699 CrBrowserMain) limit=0.3 before perf round 7
+r7 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000357 ended_early=0 scan_err=0
+r7 WS2 sse500 WS2          sse latency p50=16µs p99=56µs max=4.421ms
+r7 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.322ms stopped=0
+r7 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=15 heavy_worst_p99us=57 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 47674:h:256/256:2560209:15:57 47684:h:244/244:2440148:15:53
+r7 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000397 ended_early=0 scan_err=0
+r7 WS sse500 WS           sse latency p50=17µs p99=67µs max=5.185ms
+r7 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.741ms stopped=0
+r7 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=68 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 42476:h:256/256:2560208:16:68 42480:h:244/244:2440189:18:66
+r7 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000363 ended_early=0 scan_err=0
+r7 PLB sse500 PLB          sse latency p50=13µs p99=39µs max=5.916ms
+r7 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.596ms stopped=0
+r7 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=43 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 50898:h:256/256:2560182:11:28 50904:h:244/244:2440181:13:43
+r7 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000390 ended_early=0 scan_err=0
+r7 PL sse500 PL           sse latency p50=12µs p99=37µs max=6.048ms
+r7 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.416ms stopped=0
+r7 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=41 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 50274:h:256/256:2560195:12:41 50284:h:244/244:2440195:11:30
+busy_cores=0.13 limit=0.5 top_process_cores=0.11 (1817699 CrBrowserMain) limit=0.3 before perf round 8
+r8 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000346 ended_early=0 scan_err=0
+r8 PL sse500 PL           sse latency p50=14µs p99=47µs max=6.421ms
+r8 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=7.399ms stopped=0
+r8 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=14 heavy_worst_p99us=48 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 39146:h:256/256:2560233:13:48 39156:h:244/244:2440113:14:46
+r8 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000356 ended_early=0 scan_err=0
+r8 WS2 sse500 WS2          sse latency p50=16µs p99=49µs max=5.7ms
+r8 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.944ms stopped=0
+r8 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=15 heavy_worst_p99us=49 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 57240:h:256/256:2560173:15:49 57246:h:244/244:2440183:15:47
+r8 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000207 ended_early=0 scan_err=0
+r8 WS sse500 WS           sse latency p50=18µs p99=63µs max=3.344ms
+r8 WS sse500 WS           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=4.611ms stopped=0
+r8 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=65 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 53632:h:256/256:2560083:16:57 53634:h:244/244:2440124:18:65
+r8 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000331 ended_early=0 scan_err=0
+r8 PLB sse500 PLB          sse latency p50=14µs p99=52µs max=6.365ms
+r8 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.936ms stopped=0
+r8 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=57 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 60868:h:256/256:2560184:13:57 60876:h:244/244:2440147:13:40
+busy_cores=0.09 limit=0.5 top_process_cores=0.08 (1817699 CrBrowserMain) limit=0.3 before perf round 9
+r9 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000309 ended_early=0 scan_err=0
+r9 WS sse500 WS           sse latency p50=18µs p99=110µs max=5.083ms
+r9 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.123ms stopped=0
+r9 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=121 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 48154:h:256/256:2560168:17:95 48166:h:244/244:2440141:18:121
+r9 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000224 ended_early=0 scan_err=0
+r9 WS2 sse500 WS2          sse latency p50=17µs p99=77µs max=5.998ms
+r9 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=7.039ms stopped=0
+r9 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=78 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 43918:h:256/256:2560175:16:74 43920:h:244/244:2440049:17:78
+r9 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000247 ended_early=0 scan_err=0
+r9 PL sse500 PL           sse latency p50=14µs p99=51µs max=4.604ms
+r9 PL sse500 PL           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=5.216ms stopped=0
+r9 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=53 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 46940:h:256/256:2560144:13:53 46952:h:244/244:2440103:13:46
+r9 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000199 ended_early=0 scan_err=0
+r9 PLB sse500 PLB          sse latency p50=13µs p99=34µs max=4.476ms
+r9 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=5.638ms stopped=0
+r9 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=34 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 59274:h:256/256:2560104:12:34 59280:h:244/244:2440095:12:32
+busy_cores=0.10 limit=0.5 top_process_cores=0.14 (1817699 CrBrowserMain) limit=0.3 before perf round 10
+r10 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000359 ended_early=0 scan_err=0
+r10 WS2 sse500 WS2          sse latency p50=16µs p99=59µs max=4.299ms
+r10 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.389ms stopped=0
+r10 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=16 heavy_worst_p99us=59 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 39662:h:256/256:2560194:14:59 39670:h:244/244:2440165:16:59
+r10 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000276 ended_early=0 scan_err=0
+r10 PL sse500 PL           sse latency p50=13µs p99=36µs max=4.443ms
+r10 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10001 expected=10000 gap_max=5.184ms stopped=0
+r10 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=36 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 53240:h:256/256:2560154:13:36 53254:h:244/244:2440122:12:35
+r10 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000426 ended_early=0 scan_err=0
+r10 PLB sse500 PLB          sse latency p50=12µs p99=45µs max=4.414ms
+r10 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.063ms stopped=0
+r10 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=50 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 44750:h:256/256:2560221:12:50 44766:h:244/244:2440205:12:32
+r10 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000241 ended_early=0 scan_err=0
+r10 WS sse500 WS           sse latency p50=20µs p99=145µs max=6.116ms
+r10 WS sse500 WS           sse fair ev_min=10000 ev_p50=10000 ev_max=10002 expected=10000 gap_max=6.655ms stopped=0
+r10 WS sse500 WS           sse conns n=3 heavy=3 light=0 heavy_worst_p50us=21 heavy_worst_p99us=154 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 50474:h:256/256:2560127:21:137 50488:h:190/190:1900091:20:154 50500:h:54/54:540023:13:88
+busy_cores=0.16 limit=0.5 top_process_cores=0.07 (1817699 CrBrowserMain) limit=0.3 before perf round 11
+r11 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000436 ended_early=0 scan_err=0
+r11 PL sse500 PL           sse latency p50=14µs p99=39µs max=4.379ms
+r11 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.386ms stopped=0
+r11 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=40 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 57610:h:256/256:2560242:13:40 57626:h:244/244:2440194:13:36
+r11 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000369 ended_early=0 scan_err=0
+r11 PLB sse500 PLB          sse latency p50=12µs p99=34µs max=3.554ms
+r11 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.614ms stopped=0
+r11 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=11 heavy_worst_p99us=34 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 54320:h:256/256:2560199:11:34 54330:h:244/244:2440170:11:32
+r11 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000368 ended_early=0 scan_err=0
+r11 WS sse500 WS           sse latency p50=16µs p99=86µs max=4.887ms
+r11 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.934ms stopped=0
+r11 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=93 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 35566:h:256/256:2560188:14:76 35572:h:244/244:2440180:17:93
+r11 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000295 ended_early=0 scan_err=0
+r11 WS2 sse500 WS2          sse latency p50=18µs p99=97µs max=4.97ms
+r11 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.452ms stopped=0
+r11 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=18 heavy_worst_p99us=102 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 41882:h:256/256:2560148:17:79 41890:h:244/244:2440147:18:102
+busy_cores=0.10 limit=0.5 top_process_cores=0.14 (1817699 CrBrowserMain) limit=0.3 before perf round 12
+r12 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000200 ended_early=0 scan_err=0
+r12 PLB sse500 PLB          sse latency p50=13µs p99=41µs max=5.753ms
+r12 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=6.416ms stopped=0
+r12 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=45 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 44194:h:256/256:2560090:13:45 44212:h:244/244:2440110:12:29
+r12 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000348 ended_early=0 scan_err=0
+r12 WS sse500 WS           sse latency p50=17µs p99=73µs max=4.937ms
+r12 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.027ms stopped=0
+r12 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=77 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 54616:h:256/256:2560175:17:77 54620:h:244/244:2440173:16:68
+r12 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000319 ended_early=0 scan_err=0
+r12 WS2 sse500 WS2          sse latency p50=17µs p99=65µs max=4.767ms
+r12 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.24ms stopped=0
+r12 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=67 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 34400:h:256/256:2560161:17:60 34416:h:244/244:2440158:16:67
+r12 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000387 ended_early=0 scan_err=0
+r12 PL sse500 PL           sse latency p50=12µs p99=40µs max=5.145ms
+r12 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.173ms stopped=0
+r12 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=42 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 45874:h:256/256:2560202:11:42 45882:h:244/244:2440185:12:34
+busy_cores=0.11 limit=0.5 top_process_cores=0.08 (1817699 CrBrowserMain) limit=0.3 before perf round 13
+r13 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000356 ended_early=0 scan_err=0
+r13 PLB sse500 PLB          sse latency p50=13µs p99=38µs max=5.85ms
+r13 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.065ms stopped=0
+r13 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=38 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 44624:h:256/256:2560179:12:38 44632:h:244/244:2440177:13:38
+r13 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000263 ended_early=0 scan_err=0
+r13 PL sse500 PL           sse latency p50=12µs p99=34µs max=3.914ms
+r13 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.13ms stopped=0
+r13 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=36 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 41274:h:256/256:2560159:11:36 41290:h:244/244:2440104:12:30
+r13 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000361 ended_early=0 scan_err=0
+r13 WS2 sse500 WS2          sse latency p50=17µs p99=66µs max=4.615ms
+r13 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.699ms stopped=0
+r13 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=73 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 39244:h:256/256:2560220:17:54 39260:h:244/244:2440141:16:73
+r13 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000340 ended_early=0 scan_err=0
+r13 WS sse500 WS           sse latency p50=23µs p99=165µs max=4.327ms
+r13 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.839ms stopped=0
+r13 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=28 heavy_worst_p99us=184 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 34646:h:256/256:2560191:28:184 34652:h:244/244:2440149:21:103
+busy_cores=0.08 limit=0.5 top_process_cores=0.14 (1817699 CrBrowserMain) limit=0.3 before perf round 14
+r14 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000347 ended_early=0 scan_err=0
+r14 WS sse500 WS           sse latency p50=18µs p99=57µs max=5.4ms
+r14 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.75ms stopped=0
+r14 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=57 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 33696:h:256/256:2560190:17:57 33712:h:244/244:2440157:17:55
+r14 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000375 ended_early=0 scan_err=0
+r14 PLB sse500 PLB          sse latency p50=13µs p99=42µs max=4.21ms
+r14 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.661ms stopped=0
+r14 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=13 heavy_worst_p99us=48 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 44336:h:256/256:2560192:13:48 44338:h:244/244:2440183:12:34
+r14 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000198 ended_early=0 scan_err=0
+r14 PL sse500 PL           sse latency p50=12µs p99=47µs max=4.08ms
+r14 PL sse500 PL           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=5.115ms stopped=0
+r14 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=47 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 44174:h:256/256:2560089:12:47 44190:h:244/244:2440109:12:47
+r14 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000390 ended_early=0 scan_err=0
+r14 WS2 sse500 WS2          sse latency p50=19µs p99=69µs max=4.247ms
+r14 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.146ms stopped=0
+r14 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=20 heavy_worst_p99us=70 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 37634:h:256/256:2560186:20:66 37638:h:244/244:2440204:18:70
+busy_cores=0.10 limit=0.5 top_process_cores=0.08 (1817699 CrBrowserMain) limit=0.3 before perf round 15
+r15 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000382 ended_early=0 scan_err=0
+r15 WS2 sse500 WS2          sse latency p50=17µs p99=54µs max=4.608ms
+r15 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.784ms stopped=0
+r15 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=17 heavy_worst_p99us=55 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 54694:h:256/256:2560212:17:52 54710:h:244/244:2440170:17:55
+r15 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000308 ended_early=0 scan_err=0
+r15 WS sse500 WS           sse latency p50=15µs p99=44µs max=4.232ms
+r15 WS sse500 WS           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.653ms stopped=0
+r15 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=14 heavy_worst_p99us=45 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 54964:h:256/256:2560173:14:45 54996:h:244/244:2440135:14:42
+r15 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000410 ended_early=0 scan_err=0
+r15 PLB sse500 PLB          sse latency p50=14µs p99=47µs max=4.131ms
+r15 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.16ms stopped=0
+r15 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=14 heavy_worst_p99us=52 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 32770:h:256/256:2560220:14:52 32786:h:244/244:2440190:13:36
+r15 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000371 ended_early=0 scan_err=0
+r15 PL sse500 PL           sse latency p50=14µs p99=53µs max=4.839ms
+r15 PL sse500 PL           sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=6.127ms stopped=0
+r15 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=14 heavy_worst_p99us=58 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 51548:h:256/256:2560206:12:41 51564:h:244/244:2440165:14:58
+busy_cores=0.19 limit=0.5 top_process_cores=0.02 (2312 qemu-system-x86) limit=0.3 before perf round 16
+r16 PL sse500 PL           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000177 ended_early=0 scan_err=0
+r16 PL sse500 PL           sse latency p50=12µs p99=46µs max=5.36ms
+r16 PL sse500 PL           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=5.499ms stopped=0
+r16 PL sse500 PL           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=50 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 46248:h:256/256:2560040:12:50 46250:h:244/244:2440137:12:33
+r16 WS2 sse500 WS2          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000256 ended_early=0 scan_err=0
+r16 WS2 sse500 WS2          sse latency p50=20µs p99=104µs max=5ms
+r16 WS2 sse500 WS2          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=4.859ms stopped=0
+r16 WS2 sse500 WS2          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=20 heavy_worst_p99us=107 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 46614:h:256/256:2560127:19:107 46624:h:244/244:2440129:20:99
+r16 WS sse500 WS           streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000157 ended_early=0 scan_err=0
+r16 WS sse500 WS           sse latency p50=16µs p99=48µs max=3.135ms
+r16 WS sse500 WS           sse fair ev_min=10000 ev_p50=10000 ev_max=10001 expected=10000 gap_max=4.429ms stopped=0
+r16 WS sse500 WS           sse conns n=2 heavy=2 light=0 heavy_worst_p50us=16 heavy_worst_p99us=50 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 55488:h:256/256:2560070:16:50 55514:h:244/244:2440087:15:45
+r16 PLB sse500 PLB          streams=500 conns=1 opened=500 delivering=500 failed=0 events=5000378 ended_early=0 scan_err=0
+r16 PLB sse500 PLB          sse latency p50=12µs p99=33µs max=4.289ms
+r16 PLB sse500 PLB          sse fair ev_min=10000 ev_p50=10001 ev_max=10002 expected=10000 gap_max=5.44ms stopped=0
+r16 PLB sse500 PLB          sse conns n=2 heavy=2 light=0 heavy_worst_p50us=12 heavy_worst_p99us=35 light_worst_p99us=0 [port:kind:delivering/streams:events:p50us:p99us] 54470:h:256/256:2560174:12:35 54472:h:244/244:2440204:11:29
+-- host check before phase 3 --
+ 13:47:34 up 2 days, 21:34,  2 users,  load average: 2.20, 2.40, 3.81
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+1655594 ryan      20   0 2571252 317608  97176 S   4.9   1.0   0:51.39 dropbox
+1816822 ryan      20   0 1893024 147124  56452 S   4.9   0.5   0:22.50 xalia.exe
+1817699 ryan      20   0 2280380 419392  57652 S   4.9   1.3   4:19.35 CrBrowserMain
+      1 root      20   0   22092  16632  11112 S   0.0   0.1   0:06.13 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:00.15 kthreadd
+      3 root      20   0       0      0      0 S   0.0   0.0   0:00.00 pool_workqueue_release
+busy_cores=0.12 limit=0.5 top_process_cores=0.09 (1817699 CrBrowserMain) limit=0.3 before phase 3
+== phase 3: server CPU per event at a FIXED offered load ==
+busy_cores=0.18 limit=0.5 top_process_cores=0.08 (1817699 CrBrowserMain) limit=0.3 before cpu round 1
+c1 WS cpu200 ticks=828 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000060 ended_early=0 scan_err=0
+c1 WS cpu200c10 ticks=878 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000001 ended_early=0 scan_err=0
+c1 WS2 cpu200 ticks=839 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000099 ended_early=0 scan_err=0
+c1 WS2 cpu200c10 ticks=897 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000016 ended_early=0 scan_err=0
+c1 PL cpu200 ticks=484 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000078 ended_early=0 scan_err=0
+c1 PL cpu200c10 ticks=622 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000017 ended_early=0 scan_err=0
+c1 PLB cpu200 ticks=504 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000063 ended_early=0 scan_err=0
+c1 PLB cpu200c10 ticks=563 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000022 ended_early=0 scan_err=0
+busy_cores=0.10 limit=0.5 top_process_cores=0.11 (1817699 CrBrowserMain) limit=0.3 before cpu round 2
+c2 WS2 cpu200 ticks=873 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000080 ended_early=0 scan_err=0
+c2 WS2 cpu200c10 ticks=812 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000045 ended_early=0 scan_err=0
+c2 PL cpu200 ticks=492 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000105 ended_early=0 scan_err=0
+c2 PL cpu200c10 ticks=605 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000018 ended_early=0 scan_err=0
+c2 PLB cpu200 ticks=460 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000089 ended_early=0 scan_err=0
+c2 PLB cpu200c10 ticks=560 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000009 ended_early=0 scan_err=0
+c2 WS cpu200 ticks=846 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000054 ended_early=0 scan_err=0
+c2 WS cpu200c10 ticks=825 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000018 ended_early=0 scan_err=0
+busy_cores=0.09 limit=0.5 top_process_cores=0.13 (1817699 CrBrowserMain) limit=0.3 before cpu round 3
+c3 PL cpu200 ticks=452 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000129 ended_early=0 scan_err=0
+c3 PL cpu200c10 ticks=666 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000029 ended_early=0 scan_err=0
+c3 PLB cpu200 ticks=488 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000098 ended_early=0 scan_err=0
+c3 PLB cpu200c10 ticks=642 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000009 ended_early=0 scan_err=0
+c3 WS cpu200 ticks=860 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000110 ended_early=0 scan_err=0
+c3 WS cpu200c10 ticks=861 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000009 ended_early=0 scan_err=0
+c3 WS2 cpu200 ticks=837 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000089 ended_early=0 scan_err=0
+c3 WS2 cpu200c10 ticks=897 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000009 ended_early=0 scan_err=0
+busy_cores=0.14 limit=0.5 top_process_cores=0.03 (1817699 CrBrowserMain) limit=0.3 before cpu round 4
+c4 PLB cpu200 ticks=470 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000084 ended_early=0 scan_err=0
+c4 PLB cpu200c10 ticks=603 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000010 ended_early=0 scan_err=0
+c4 WS cpu200 ticks=846 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000133 ended_early=0 scan_err=0
+c4 WS cpu200c10 ticks=855 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000019 ended_early=0 scan_err=0
+c4 WS2 cpu200 ticks=894 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000080 ended_early=0 scan_err=0
+c4 WS2 cpu200c10 ticks=847 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000006 ended_early=0 scan_err=0
+c4 PL cpu200 ticks=540 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000092 ended_early=0 scan_err=0
+c4 PL cpu200c10 ticks=583 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000035 ended_early=0 scan_err=0
+busy_cores=0.13 limit=0.5 top_process_cores=0.06 (1817699 CrBrowserMain) limit=0.3 before cpu round 5
+c5 PLB cpu200 ticks=521 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000085 ended_early=0 scan_err=0
+c5 PLB cpu200c10 ticks=642 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000014 ended_early=0 scan_err=0
+c5 PL cpu200 ticks=513 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000093 ended_early=0 scan_err=0
+c5 PL cpu200c10 ticks=634 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000006 ended_early=0 scan_err=0
+c5 WS2 cpu200 ticks=830 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000095 ended_early=0 scan_err=0
+c5 WS2 cpu200c10 ticks=719 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000022 ended_early=0 scan_err=0
+c5 WS cpu200 ticks=865 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000154 ended_early=0 scan_err=0
+c5 WS cpu200c10 ticks=869 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000011 ended_early=0 scan_err=0
+busy_cores=0.09 limit=0.5 top_process_cores=0.08 (1817699 CrBrowserMain) limit=0.3 before cpu round 6
+c6 WS cpu200 ticks=846 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000110 ended_early=0 scan_err=0
+c6 WS cpu200c10 ticks=834 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000006 ended_early=0 scan_err=0
+c6 PLB cpu200 ticks=534 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000075 ended_early=0 scan_err=0
+c6 PLB cpu200c10 ticks=608 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000015 ended_early=0 scan_err=0
+c6 PL cpu200 ticks=538 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000096 ended_early=0 scan_err=0
+c6 PL cpu200c10 ticks=618 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000008 ended_early=0 scan_err=0
+c6 WS2 cpu200 ticks=783 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000060 ended_early=0 scan_err=0
+c6 WS2 cpu200c10 ticks=899 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000012 ended_early=0 scan_err=0
+busy_cores=0.10 limit=0.5 top_process_cores=0.11 (1817699 CrBrowserMain) limit=0.3 before cpu round 7
+c7 WS2 cpu200 ticks=850 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000092 ended_early=0 scan_err=0
+c7 WS2 cpu200c10 ticks=843 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000025 ended_early=0 scan_err=0
+c7 WS cpu200 ticks=847 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000076 ended_early=0 scan_err=0
+c7 WS cpu200c10 ticks=857 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000020 ended_early=0 scan_err=0
+c7 PLB cpu200 ticks=435 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000125 ended_early=0 scan_err=0
+c7 PLB cpu200c10 ticks=565 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000008 ended_early=0 scan_err=0
+c7 PL cpu200 ticks=508 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000095 ended_early=0 scan_err=0
+c7 PL cpu200c10 ticks=574 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000016 ended_early=0 scan_err=0
+busy_cores=0.10 limit=0.5 top_process_cores=0.14 (1817699 CrBrowserMain) limit=0.3 before cpu round 8
+c8 PL cpu200 ticks=510 tck=100 PL           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000055 ended_early=0 scan_err=0
+c8 PL cpu200c10 ticks=676 tck=100 PL           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000002 ended_early=0 scan_err=0
+c8 WS2 cpu200 ticks=859 tck=100 WS2          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000064 ended_early=0 scan_err=0
+c8 WS2 cpu200c10 ticks=879 tck=100 WS2          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000010 ended_early=0 scan_err=0
+c8 WS cpu200 ticks=875 tck=100 WS           streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000098 ended_early=0 scan_err=0
+c8 WS cpu200c10 ticks=881 tck=100 WS           streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000022 ended_early=0 scan_err=0
+c8 PLB cpu200 ticks=522 tck=100 PLB          streams=200 conns=1 opened=200 delivering=200 failed=0 events=2000096 ended_early=0 scan_err=0
+c8 PLB cpu200c10 ticks=587 tck=100 PLB          streams=200 conns=10 opened=200 delivering=200 failed=0 events=2000018 ended_early=0 scan_err=0
+== rows=128 ==
