@@ -2754,7 +2754,15 @@ const Connection = struct {
         defer if (probe_deadline_park) {
             _ = close_probe_parked.fetchSub(1, .acq_rel);
         };
-        const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
+        // The server's shutdown event stays set once fired. After this actor
+        // has seen it (`shutting_down`), selecting on it again wins at once on
+        // every turn, so the actor never parks and holds its executor for the
+        // whole drain (t-2652). The drain still wakes on its own deadlines
+        // (`grace_deadline` is in nextDeadlineNs) and on peer activity.
+        const shutdown_ev = if (self.shutting_down)
+            &no_shutdown_event
+        else
+            self.config.shutdown_event orelse &no_shutdown_event;
         // The hold leaves completions buffered in the channel, exactly as the
         // gated drain leaves them queued.
         const comps_ch = if (test_hold_completion_drain.load(.acquire))
