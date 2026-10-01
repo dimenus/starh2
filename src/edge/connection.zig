@@ -148,6 +148,12 @@ pub const placement_check = test_observe and zio_scheduling != .work_stealing;
 /// Counted so a zero mismatch count can be told apart from a check that
 /// never ran.
 pub var test_placement_checks: std.atomic.Value(usize) = .init(0);
+/// Diagnosis counters (always on, one atomic add per task handler): task
+/// handlers that reached the spawn, and spawns zio accepted. Compared with a
+/// handler's own entry count they tell "never spawned" from "spawned, never
+/// ran" (t-2655).
+pub var diag_task_spawn_attempts: std.atomic.Value(u64) = .init(0);
+pub var diag_task_spawned: std.atomic.Value(u64) = .init(0);
 /// Per-connection task starts that ran on a thread other than the actor's.
 pub var test_placement_mismatches: std.atomic.Value(usize) = .init(0);
 
@@ -5103,10 +5109,12 @@ const Connection = struct {
         // zio's `registerTask` yields this actor while it holds `session_mu`:
         // a short convoy behind the new handlers, not a deadlock, because the
         // yield reschedules the actor and a handler blocked on the mutex parks.
+        _ = diag_task_spawn_attempts.fetchAdd(1, .monotonic);
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
             zio.spawnInto(probeHandlerPlacement(), runHandlerJob, .{job});
+        if (handle) |_| _ = diag_task_spawned.fetchAdd(1, .monotonic) else |_| {}
         const h = handle catch {
             // Admission already incremented live_handlers and claimed a slot.
             // Refuse rather than run on the actor: a blocking task handler

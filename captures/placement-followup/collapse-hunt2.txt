@@ -1,0 +1,70 @@
+ 11:45:30 up 2 days, 19:32,  2 users,  load average: 4.15, 6.82, 3.92
+r1 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200792 ended_early=0 scan_err=0
+r1 rank=none: normal opened=1620 delivering=1620 failed=0 events=16200188 ended_early=0 scan_err=0
+r1 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200372 ended_early=0 scan_err=0
+r2 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200706 ended_early=0 scan_err=0
+r2 rank=none: normal opened=1620 delivering=1620 failed=0 events=16200206 ended_early=0 scan_err=0
+r2 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16201008 ended_early=0 scan_err=0
+r3 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200738 ended_early=0 scan_err=0
+r3 rank=none: normal opened=1620 delivering=1620 failed=0 events=16200494 ended_early=0 scan_err=0
+r3 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16201025 ended_early=0 scan_err=0
+r4 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200331 ended_early=0 scan_err=0
+r4 rank=none: normal opened=1620 delivering=1620 failed=0 events=16200237 ended_early=0 scan_err=0
+r4 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16201027 ended_early=0 scan_err=0
+r5 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200084 ended_early=0 scan_err=0
+r5 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199726 ended_early=0 scan_err=0
+r5 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200929 ended_early=0 scan_err=0
+r6 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200443 ended_early=0 scan_err=0
+r6 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199193 ended_early=0 scan_err=0
+r6 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200267 ended_early=0 scan_err=0
+r7 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200620 ended_early=0 scan_err=0
+r7 rank=none: normal opened=1620 delivering=1620 failed=0 events=16200623 ended_early=0 scan_err=0
+r7 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200746 ended_early=0 scan_err=0
+r8 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200707 ended_early=0 scan_err=0
+r8 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199580 ended_early=0 scan_err=0
+r8 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200782 ended_early=0 scan_err=0
+r9 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200243 ended_early=0 scan_err=0
+r9 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199574 ended_early=0 scan_err=0
+r9 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200657 ended_early=0 scan_err=0
+r10 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200123 ended_early=0 scan_err=0
+r10 rank=none: normal opened=1620 delivering=1620 failed=0 events=16200331 ended_early=0 scan_err=0
+r10 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16201012 ended_early=0 scan_err=0
+r11 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200142 ended_early=0 scan_err=0
+r11 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199307 ended_early=0 scan_err=0
+r11 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200666 ended_early=0 scan_err=0
+r12 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200281 ended_early=0 scan_err=0
+r12 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199014 ended_early=0 scan_err=0
+r12 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200050 ended_early=0 scan_err=0
+r13 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200217 ended_early=0 scan_err=0
+r13 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199588 ended_early=0 scan_err=0
+r13 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200583 ended_early=0 scan_err=0
+r14 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200216 ended_early=0 scan_err=0
+r14 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199496 ended_early=0 scan_err=0
+r14 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200435 ended_early=0 scan_err=0
+r15 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200205 ended_early=0 scan_err=0
+r15 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199561 ended_early=0 scan_err=0
+r15 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200668 ended_early=0 scan_err=0
+r16 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16201487 ended_early=0 scan_err=0
+r16 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199671 ended_early=0 scan_err=0
+r16 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200409 ended_early=0 scan_err=0
+r17 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200196 ended_early=0 scan_err=0
+r17 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199807 ended_early=0 scan_err=0
+r17 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200199 ended_early=0 scan_err=0
+r18 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200474 ended_early=0 scan_err=0
+r18 rank=none: normal opened=1620 delivering=1620 failed=0 events=16201149 ended_early=0 scan_err=0
+r18 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200539 ended_early=0 scan_err=0
+r19 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200490 ended_early=0 scan_err=0
+r19 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199960 ended_early=0 scan_err=0
+r19 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200267 ended_early=0 scan_err=0
+r20 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200340 ended_early=0 scan_err=0
+r20 rank=none: normal opened=1620 delivering=1620 failed=0 events=16199567 ended_early=0 scan_err=0
+r20 rank=handlers_first: normal opened=1620 delivering=1620 failed=0 events=16200455 ended_early=0 scan_err=0
+r21 rank=sum: normal opened=1620 delivering=1620 failed=0 events=16200801 ended_early=0 scan_err=0
+r21 rank=none: normal opened=1620 delivering=1620 failed=0 events=16198598 ended_early=0 scan_err=0
+r21 rank=handlers_first: COLLAPSE (client still waiting at 20 s)
+threads=1798321:1941 1798327:1816 1798313:1802 1798322:1780 1798320:1774 1798323:1744 1798324:1020 1798318:1012 1798319:941 1798325:864 1798328:785 1798329:644 1798371:17 1798378:14 
+cadence-1: {"loops":27274557,"sleeps":27260962,"skipped":13595,"writes":27272942,"first_n":1596,"inter_n":27271346,"late_n":26156269,"late_ge1ms":13017,"sleep_req_ns":0,"sleep_ns":0,"late_ns":849561202634,"write_ns":0,"yield_ns":0,"skip_behind_ns":6794677164,"first_ns":1697018525,"inter_ns":27271336596355,"start_sse_n":1615,"start_sse_ns":141053507,"start_sse_max":5821591}
+cadence-2: {"loops":30021946,"sleeps":30006394,"skipped":15552,"writes":30020331,"first_n":1596,"inter_n":30018735,"late_n":28803375,"late_ge1ms":14974,"sleep_req_ns":0,"sleep_ns":0,"late_ns":941550655358,"write_ns":0,"yield_ns":0,"skip_behind_ns":7560971237,"first_ns":1697018525,"inter_ns":30018716430048,"start_sse_n":1615,"start_sse_ns":141053507,"start_sse_max":5821591}
+stacks: /tmp/starh2-collapse/stacks-r21-handlers_first.txt (29 threads)
+r21          streams=1620 conns=18 opened=1613 delivering=0 failed=7 events=0 ended_early=0 scan_err=0
+r21          NO EVENTS — SSE delivered nothing while the connection was live

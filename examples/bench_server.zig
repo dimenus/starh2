@@ -395,6 +395,12 @@ const Cadence = struct {
     start_sse_n: std.atomic.Value(u64) = .init(0),
     start_sse_ns: std.atomic.Value(u64) = .init(0),
     start_sse_max: std.atomic.Value(u64) = .init(0),
+    /// Stage counters for a stuck-stream diagnosis: handlers that entered,
+    /// and handlers that entered / returned from their FIRST waitUntil.
+    /// With start_sse_n and first_n they show where a handler stopped.
+    entered_n: std.atomic.Value(u64) = .init(0),
+    first_wait_in_n: std.atomic.Value(u64) = .init(0),
+    first_wait_out_n: std.atomic.Value(u64) = .init(0),
 
     fn reset(self: *Cadence) void {
         inline for (.{
@@ -404,7 +410,8 @@ const Cadence = struct {
             &self.sleep_ns,      &self.late_ns,        &self.write_ns,
             &self.yield_ns,      &self.skip_behind_ns, &self.first_ns,
             &self.inter_ns,      &self.start_sse_n,    &self.start_sse_ns,
-            &self.start_sse_max,
+            &self.start_sse_max, &self.entered_n,     &self.first_wait_in_n,
+            &self.first_wait_out_n,
         }) |f| f.store(0, .release);
     }
 };
@@ -412,6 +419,7 @@ const Cadence = struct {
 var g_cadence: Cadence = .{};
 
 fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = g_cadence.entered_n.fetchAdd(1, .monotonic);
     const t_enter = zio.Timestamp.now(.realtime).toNanoseconds();
     var body = try resp.startSse(&.{});
     const t_ready = zio.Timestamp.now(.realtime).toNanoseconds();
@@ -449,10 +457,13 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
             // on the actor-owned deadline heap; waitForActivity is the idle
             // arm of the same heap.
             const ts = std.Io.Timestamp.fromNanoseconds(@intCast(deadline));
+            const first_wait = prev_write == null;
+            if (first_wait) _ = g_cadence.first_wait_in_n.fetchAdd(1, .monotonic);
             body.waitUntil(ts) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 return err;
             };
+            if (first_wait) _ = g_cadence.first_wait_out_n.fetchAdd(1, .monotonic);
         } else {
             _ = g_cadence.skipped.fetchAdd(1, .monotonic);
             _ = g_cadence.skip_behind_ns.fetchAdd(@intCast(now_ns - deadline), .monotonic);
@@ -493,7 +504,9 @@ fn cadenceJson(w: *std.Io.Writer) !void {
             "\"sleep_req_ns\":{d},\"sleep_ns\":{d},\"late_ns\":{d}," ++
             "\"write_ns\":{d},\"yield_ns\":{d},\"skip_behind_ns\":{d}," ++
             "\"first_ns\":{d},\"inter_ns\":{d}," ++
-            "\"start_sse_n\":{d},\"start_sse_ns\":{d},\"start_sse_max\":{d}}}\n",
+            "\"start_sse_n\":{d},\"start_sse_ns\":{d},\"start_sse_max\":{d}," ++
+            "\"entered_n\":{d},\"first_wait_in_n\":{d},\"first_wait_out_n\":{d}," ++
+            "\"task_spawn_attempts\":{d},\"task_spawned\":{d}}}\n",
         .{
             g_cadence.loops.load(.acquire),
             g_cadence.sleeps.load(.acquire),
@@ -514,12 +527,17 @@ fn cadenceJson(w: *std.Io.Writer) !void {
             g_cadence.start_sse_n.load(.acquire),
             g_cadence.start_sse_ns.load(.acquire),
             g_cadence.start_sse_max.load(.acquire),
+            g_cadence.entered_n.load(.acquire),
+            g_cadence.first_wait_in_n.load(.acquire),
+            g_cadence.first_wait_out_n.load(.acquire),
+            conn_mod.diag_task_spawn_attempts.load(.acquire),
+            conn_mod.diag_task_spawned.load(.acquire),
         },
     );
 }
 
 fn cadenceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
-    var buf: [768]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try cadenceJson(&w);
     try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
@@ -615,6 +633,7 @@ const Args = struct {
     /// Null keeps the Balancer's default rank.
     balance_rank: ?starh2.Balancer.Rank = null,
     placement_log: bool = false,
+    allow_ptrace: bool = false,
 };
 
 /// `--placement-log`: one line per placed connection, with the peer port (so
@@ -707,6 +726,12 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
         } else if (std.mem.eql(u8, a, "--placement-log")) {
             // Measurement: one PLACE line per balanced connection on stderr.
             out.placement_log = true;
+        } else if (std.mem.eql(u8, a, "--allow-ptrace")) {
+            // Diagnosis: let any process of this user attach a debugger
+            // (Linux yama ptrace_scope=1 otherwise allows only an ancestor),
+            // so a wedged server can be inspected live without being started
+            // under gdb, which changes its timing.
+            out.allow_ptrace = true;
         } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
             // Placement probe: every connection on executor 0 (same), or
             // alternating executors in accept order (split).
@@ -988,6 +1013,12 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     }
     conn_mod.placement_override = args.spawn_placement;
     // One balancer for this runtime, sized by the runtime itself.
+    if (args.allow_ptrace) {
+        if (comptime @import("builtin").os.tag != .linux) return error.AllowPtraceIsLinuxOnly;
+        const linux = std.os.linux;
+        const rc = linux.prctl(@intFromEnum(linux.PR.SET_PTRACER), linux.PR.SET_PTRACER_ANY, 0, 0, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.PrctlSetPtracerFailed;
+    }
     var balancer_storage: ?starh2.Balancer = if (args.conn_balance) try starh2.Balancer.init(gpa, rt) else null;
     defer if (balancer_storage) |*b| b.deinit(gpa);
     if (balancer_storage) |*b| {
