@@ -39,6 +39,14 @@ MIX_LABEL=${MIX_LABEL:-mix}
 # rates the client holds (p50 104 us at 100k; 544 us at 200k is the client).
 OPEN_THREADS=${OPEN_THREADS:-4}
 IDLE_MAX_CORES=${IDLE_MAX_CORES:-1.5}
+# A round starts only when the 1-minute load average is also under LOAD_MAX.
+LOAD_MAX=${LOAD_MAX:-1.5}
+# During each round a sampler sums the CPU of every process that is not the
+# bench server, the client or h2load, every 3 s; above OTHER_MAX_PCT in total
+# or PROC_MAX_PCT for one process the round is dirty: its rows are dropped
+# and the same round runs again, so only idle rounds are kept and the
+# rotation stays balanced.
+OTHER_MAX_PCT=${OTHER_MAX_PCT:-150}
 PROC_MAX_PCT=${PROC_MAX_PCT:-50}
 HOST_WAIT_MAX=${HOST_WAIT_MAX:-14400}
 SECONDS_RUN=10
@@ -49,12 +57,15 @@ D=${D:-$WORK/mac-run}
 ARGS_WS='' ARGS_WS2='' ARGS_WSH='--spawn-placement prefer_local' ARGS_PA='--spawn-placement auto'
 ARGS_PL='--spawn-placement local' ARGS_PLB='--spawn-placement local --conn-balance'
 tail_='"probe":0,"probe_handler_placement":"none","probe_conn_placement":"none"'
-EXPECT_WS='"zio_scheduling":"work_stealing","spawn_placement":"auto",'"$tail_"',"conn_balance":0}'
+# Ready lines of the current tree end with balance_rank and placement_log;
+# PLB runs the default rank (sum).
+nb='"conn_balance":0,"balance_rank":"none","placement_log":0}'
+EXPECT_WS='"zio_scheduling":"work_stealing","spawn_placement":"auto",'"$tail_,$nb"
 EXPECT_WS2=$EXPECT_WS
-EXPECT_WSH='"zio_scheduling":"work_stealing","spawn_placement":"prefer_local",'"$tail_"',"conn_balance":0}'
-EXPECT_PA='"zio_scheduling":"pinned","spawn_placement":"auto",'"$tail_"',"conn_balance":0}'
-EXPECT_PL='"zio_scheduling":"pinned","spawn_placement":"local",'"$tail_"',"conn_balance":0}'
-EXPECT_PLB='"zio_scheduling":"pinned","spawn_placement":"local",'"$tail_"',"conn_balance":1}'
+EXPECT_WSH='"zio_scheduling":"work_stealing","spawn_placement":"prefer_local",'"$tail_,$nb"
+EXPECT_PA='"zio_scheduling":"pinned","spawn_placement":"auto",'"$tail_,$nb"
+EXPECT_PL='"zio_scheduling":"pinned","spawn_placement":"local",'"$tail_,$nb"
+EXPECT_PLB='"zio_scheduling":"pinned","spawn_placement":"local",'"$tail_"',"conn_balance":1,"balance_rank":"sum","placement_log":0}'
 bin_for() { case "$1" in WS|WS2|WSH) echo "$WORK/$T-work_stealing/bin/starh2-bench-server";; *) echo "$WORK/$T-pinned/bin/starh2-bench-server";; esac; }
 
 mkdir -p "$D"
@@ -83,12 +94,42 @@ host_check() {
     busy=$(awk -v i="$idle" -v n="$ncpu" 'BEGIN { printf "%.2f", (100 - i) / 100 * n }')
     top1=$(ps -Ao pcpu=,pid=,comm= -r | head -1 | awk '{ printf "%s %s %s", $1, $2, $3 }')
     tp=${top1%% *}
-    echo "busy_cores=$busy limit=$IDLE_MAX_CORES top_process=$top1 limit_pct=$PROC_MAX_PCT load='$(uptime | sed 's/.*load averages*: //')' before $1"
-    if ! awk -v b="$busy" -v m="$IDLE_MAX_CORES" -v p="$tp" -v pm="$PROC_MAX_PCT" 'BEGIN { exit !(b > m || p > pm) }'; then return 0; fi
+    load1=$(sysctl -n vm.loadavg | awk '{ print $2 }')
+    echo "busy_cores=$busy limit=$IDLE_MAX_CORES top_process=$top1 limit_pct=$PROC_MAX_PCT load1=$load1 limit=$LOAD_MAX before $1"
+    if ! awk -v b="$busy" -v m="$IDLE_MAX_CORES" -v p="$tp" -v pm="$PROC_MAX_PCT" -v l="$load1" -v lm="$LOAD_MAX" 'BEGIN { exit !(b > m || p > pm || l > lm) }'; then return 0; fi
     if [ $waited -ge $HOST_WAIT_MAX ]; then echo "HOST-BUSY before $1; stopping, not measuring" >&2; exit 3; fi
     echo "HOST-BUSY-WAIT before $1: waiting 30 s (waited ${waited}s so far)"
     sleep 30; waited=$((waited + 30))
   done
+}
+# Background sampler of the CPU used by everything except this benchmark.
+other_cpu() {
+  ps -Ao pcpu=,comm= | awk -v pm="$PROC_MAX_PCT" '
+    $2 ~ /starh2-bench-server|\/client$|h2load|(^|\/)(ps|awk|sleep|sh|top)$/ { next }
+    { t += $1; if ($1 > m) { m = $1; who = $2 } }
+    END { printf "%.0f %.0f %s\n", t, m, who }'
+}
+round_begin() {
+  host_check "$1"
+  : > "$D/round.dirty"
+  touch "$D/sampling"
+  (
+    while [ -f "$D/sampling" ]; do
+      set -- $(other_cpu)
+      if [ "${1%.*}" -gt "$OTHER_MAX_PCT" ] || [ "${2%.*}" -gt "$PROC_MAX_PCT" ]; then echo "other_cpu=$1% top=$2% ($3)" >> "$D/round.dirty"; fi
+      sleep 3
+    done
+  ) &
+  SAMPLER=$!
+}
+# True when the round stayed idle; otherwise reports and asks for a rerun.
+round_end() {
+  rm -f "$D/sampling"; wait $SAMPLER 2>/dev/null
+  if [ -s "$D/round.dirty" ]; then
+    echo "DISCARDED-ROUND $1: $(head -1 "$D/round.dirty") (rows dropped; running it again)"
+    return 1
+  fi
+  return 0
 }
 has_phase() { case " $PHASES " in *" $1 "*) return 0;; esac; return 1; }
 
@@ -174,9 +215,9 @@ if has_phase 1; then
 echo "== phase 1: perf =="
 r=1
 while [ $r -le $PERF_ROUNDS ]; do
-  host_check "perf round $r"
+  round_begin "perf round $r"
   rotate $r
-  for arm in $ORDER; do
+  { for arm in $ORDER; do
     start_srv $arm 2
     if [ -n "$SRV_PORT" ]; then
       out=$("$D/client" -url https://127.0.0.1:$SRV_PORT/sse -streams 500 -seconds $SECONDS_RUN -warmup 1 -interval-ms $INTERVAL -label $arm 2>&1) || true
@@ -187,8 +228,8 @@ while [ $r -le $PERF_ROUNDS ]; do
     oneshot $arm 8 ${ONESHOT_WIDE_N:-2000000}
     h2lat $arm 2 oneshot-lat-e2 "" -n ${ONESHOT_N:-1000000} -c 50 -m 10 -t 4
     h2lat $arm 8 oneshot-lat-e8 "" -n ${ONESHOT_WIDE_N:-2000000} -c 50 -m 10 -t 4
-  done
-  r=$((r + 1))
+  done; } > "$D/round.out"
+  if round_end "perf round $r"; then cat "$D/round.out"; r=$((r + 1)); fi
 done
 fi
 
@@ -196,9 +237,9 @@ if has_phase 2; then
 echo "== phase 2: burst =="
 b=1
 while [ $b -le $BURST_ROUNDS ]; do
-  [ $((b % 6)) = 1 ] && host_check "burst round $b"
+  round_begin "burst round $b"
   rotate $b
-  for arm in $ORDER; do
+  { for arm in $ORDER; do
     start_srv $arm 2
     if [ -n "$SRV_PORT" ]; then
       line=$("$D/client" -url https://127.0.0.1:$SRV_PORT/sse -streams 200 -seconds 2 -warmup 1 -label burst 2>&1 | grep 'streams=') || true
@@ -210,8 +251,8 @@ while [ $b -le $BURST_ROUNDS ]; do
       esac
     fi
     stop_srv
-  done
-  b=$((b + 1))
+  done; } > "$D/round.out"
+  if round_end "burst round $b"; then cat "$D/round.out"; b=$((b + 1)); fi
 done
 fi
 
@@ -219,9 +260,9 @@ if has_phase 3; then
 echo "== phase 3: server CPU per event at a FIXED offered load =="
 c=1
 while [ $c -le $CPU_ROUNDS ]; do
-  host_check "cpu round $c"
+  round_begin "cpu round $c"
   rotate $c
-  for arm in $ORDER; do
+  { for arm in $ORDER; do
     for spec in 200 200x10; do
       S=${spec%%x*}; C=1; lbl=cpu$S
       case "$spec" in *x*) C=${spec#*x}; lbl=cpu${S}c$C ;; esac
@@ -232,8 +273,8 @@ while [ $c -le $CPU_ROUNDS ]; do
       fi
       stop_srv
     done
-  done
-  c=$((c + 1))
+  done; } > "$D/round.out"
+  if round_end "cpu round $c"; then cat "$D/round.out"; c=$((c + 1)); fi
 done
 fi
 
@@ -241,15 +282,15 @@ if has_phase 5; then
 echo "== phase 5: open-loop latency at 2 executors, offered totals: $OPEN_RATES =="
 r=1
 while [ $r -le $OPEN_ROUNDS ]; do
-  host_check "open round $r"
+  round_begin "open round $r"
   rotate $r
-  for arm in $ORDER; do
+  { for arm in $ORDER; do
     for total in $OPEN_RATES; do
       per=$((total / 50))
       h2lat $arm 2 "open$((total / 1000))k-e2" " offered=$((per * 50))" -c 50 -m 10 -t $OPEN_THREADS --rps=$per -D 6 --warm-up-time 1
     done
-  done
-  r=$((r + 1))
+  done; } > "$D/round.out"
+  if round_end "open round $r"; then cat "$D/round.out"; r=$((r + 1)); fi
 done
 fi
 
@@ -257,9 +298,9 @@ if has_phase 6; then
 echo "== phase 6: heavy/light/churn mix ($MIX_LABEL, heavy = executors / $MIX_HEAVY_DIV, churn pause ${MIX_CHURN_PAUSE_MS:-20} ms), widths: $MIX_WIDTHS =="
 x=1
 while [ $x -le $MIX_ROUNDS ]; do
-  host_check "mix round $x"
+  round_begin "mix round $x"
   rotate $x
-  for arm in $ORDER; do
+  { for arm in $ORDER; do
     for W in $MIX_WIDTHS; do
       start_srv $arm $W
       if [ -n "$SRV_PORT" ]; then
@@ -274,8 +315,8 @@ while [ $x -le $MIX_ROUNDS ]; do
       fi
       stop_srv
     done
-  done
-  x=$((x + 1))
+  done; } > "$D/round.out"
+  if round_end "mix round $x"; then cat "$D/round.out"; x=$((x + 1)); fi
 done
 fi
 echo "== done =="
