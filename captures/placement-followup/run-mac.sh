@@ -103,10 +103,24 @@ host_check() {
   done
 }
 # Background sampler of the CPU used by everything except this benchmark.
+# "This benchmark" is this script's process group: the server, the client,
+# h2load, and the helpers the harness runs mid-round (the percentile
+# `sort`, `ps`, `awk`). Matching helpers by name instead missed `sort`,
+# which then discarded nearly every round as busy, and would have hidden
+# another job's `sh` or `awk`. The group is only ours when the script runs
+# in its own session (start it with
+# `perl -e 'use POSIX; setsid(); exec @ARGV' sh run-mac.sh`), so a group
+# shared with anything else stops the run instead of hiding that load.
+OWN_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
+if ps -Ao pgid=,comm= | awk -v g="$OWN_PGID" '$1 == g && $2 !~ /(^|\/)(sh|bash|zsh|run-mac[.]sh|overnight[.]sh|perl|ps|awk|tr|nohup)$/ { found = 1 } END { exit !found }'; then
+  echo "run-mac.sh: process group $OWN_PGID holds other processes; start it in its own session (setsid)" >&2
+  ps -Ao pid=,pgid=,comm= | awk -v g="$OWN_PGID" '$2 == g' >&2
+  exit 4
+fi
 other_cpu() {
-  ps -Ao pcpu=,comm= | awk -v pm="$PROC_MAX_PCT" '
-    $2 ~ /starh2-bench-server|\/client$|h2load|(^|\/)(ps|awk|sleep|sh|top)$/ { next }
-    { t += $1; if ($1 > m) { m = $1; who = $2 } }
+  ps -Ao pcpu=,pgid=,comm= | awk -v g="$OWN_PGID" '
+    $2 == g { next }
+    { t += $1; if ($1 > m) { m = $1; who = $3 } }
     END { printf "%.0f %.0f %s\n", t, m, who }'
 }
 round_begin() {
