@@ -1,0 +1,1191 @@
+macos-sdk: using /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+macos-sdk: probe rejected /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk
+macos-sdk: probe rejected /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+std-io-gate: scanned 37 files, 23043 lines under ./src
+std-io-gate: 34 banned usages remain (baseline 34)
+readme-doctest: 8 zig blocks from README.md — build:2 program:1 handler:2 route:1 config:1 snippet:1
+macos-sdk: using /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+macos-sdk: probe rejected /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk
+macos-sdk: probe rejected /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+readme-doctest PASS: 8 blocks compile as an external consumer
+macos-sdk: using /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+macos-sdk: probe rejected /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk
+macos-sdk: probe rejected /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+======= FUZZING REPORT =======
+Step: run test fuzz-hpack
+Fuzz test: "hpack.test.fuzz hpack" (31fabcec47f410e4)
+Runs: 14959 -> 16070
+Unique runs: 428 -> 453
+Coverage: 876/8629 -> 876/8629 (10.15%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+macos-sdk: using /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+macos-sdk: probe rejected /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk
+macos-sdk: probe rejected /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+======= FUZZING REPORT =======
+Step: run test fuzz-session
+Fuzz test: "session.test.fuzz session" (f2de5180e27e1b67)
+Runs: 15538 -> 16639
+Unique runs: 373 -> 399
+Coverage: 1219/10244 -> 1221/10244 (11.92%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+probe: predicate rejects /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk but zig's libcxx now builds it
+macos-sdk: using /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+macos-sdk: probe rejected /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk
+macos-sdk: probe rejected /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+======= FUZZING REPORT =======
+Step: run test fuzz-frame
+Fuzz test: "frame.test.fuzz frame" (a5e6ed791592b7a7)
+Runs: 13573 -> 14610
+Unique runs: 104 -> 111
+Coverage: 687/8575 -> 687/8575 (8.01%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+tls-smoke: server on 127.0.0.1:61784, 8 small + 3 big fresh TLS connections
+tls-smoke PASS: 12 fresh TLS connections, /big=5242880 bytes, clean shutdown
+h1-smoke: tls on 127.0.0.1:61797
+h1-smoke: tls --http1.1 /hello 200
+h1-smoke: tls keep-alive curl n=1 c=200
+n=0 c=200
+
+h1-smoke: tls task POST keep-alive curl n=1 c=200
+n=0 c=200
+
+h1-smoke: h1c on 127.0.0.1:61803
+h1-smoke: keep-alive curl n=1 c=200
+n=0 c=200
+
+h1-smoke: task POST keep-alive curl n=1 c=200
+n=0 c=200
+
+h1-smoke PASS connections=10
+ci
++- macos-libcxx-probe
+   +- run sh failure
+error: process exited with error code 1
+failed command: cd /Users/rsaunderson/Source/mine/starh2-wt-placement-bench && ZIG=/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/zig sh /Users/rsaunderson/Source/mine/starh2-wt-placement-bench/tools/macos-libcxx-probe.sh --expect-no /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+
+probe: predicate rejects /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk but zig's libcxx now builds it
+h1-go-smoke: h1c on 127.0.0.1:61810
+h1-go-smoke PASS keep-alive=1-conn expect-100=ok
+ci
++- macos-libcxx-probe
+   +- run sh failure
+error: process exited with error code 1
+failed command: cd /Users/rsaunderson/Source/mine/starh2-wt-placement-bench && ZIG=/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/zig sh /Users/rsaunderson/Source/mine/starh2-wt-placement-bench/tools/macos-libcxx-probe.sh --expect-no /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk
+
+ci
++- test
+   +- run test w
+h2c placement: scheduling=work_stealing placement=auto checks=0 mismatches=0
+h1 reaper: scheduling=work_stealing reaper_posts=1 saw_cancel=true handler_thread=101735875 reaper_thread=101735836 checks=0 mismatches=0
+failed command: ./.zig-cache/o/868f8e82fae8b263304c1ac7971645a7/test --cache-dir=./.zig-cache --seed=0xc62ada87 --listen=-
+
+ci
++- test
+   +- run test w
+handshake timeout: sent=0 closed_after_ms=301 timeouts=1
+handshake timeout: sent=8 closed_after_ms=301 timeouts=2
+failed command: cd /Users/rsaunderson/Source/mine/starh2-wt-placement-bench && ./.zig-cache/o/6495a36eba277d8483a0882a9edba1c5/test --cache-dir=./.zig-cache --seed=0xc62ada87 --listen=-
+
+ci
++- test-placement
+   +- run test w
+tls backpressure: ended=64/64 body_bytes=33554432 err=null
+failed command: ./.zig-cache/o/c2574a4ccdd9fc397efa089866b96516/test --cache-dir=./.zig-cache --seed=0xc62ada87 --listen=-
+
+ci
++- test
+   +- test-lifecycle
+      +- run test w
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9163 in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9163 in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9163 in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9163 in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9163 in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9b5f in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9b5f in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x1026e113f in unexpectedError__anon_38346 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x1025c5477 in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x1025c5203 in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x1026da003 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x1026d9e13 in submit__anon_77966 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x1026d162f in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x1026d0b9f in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x1025c0e8f in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x1025d5e8f in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x10270c737 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x10267038b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x102667833 in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x102667053 in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x1025f9b5f in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x1025fc367 in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x1025dc2a7 in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x1025dc02b in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x1026c46cb in call__anon_76114 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x1026c44db in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x1026c484f in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+failed command: ./.zig-cache/o/902ea19628c9d062bc836adadb905a4e/test --cache-dir=./.zig-cache --seed=0xc62ada87 --listen=-
+
+ci
++- test
+   +- run test w
+category=accept fixtures=12
+category=reject fixtures=29
+category=frame fixtures=4
+category=resp fixtures=2
+category=sse fixtures=3
+category=limits fixtures=1
+category=keepalive fixtures=3
+category=shape fixtures=1
+category=parity fixtures=1
+category=alpn fixtures=1
+unexpected error: .BADF
+please file a bug report: https://github.com/lalinsky/zio/issues/new
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/base.zig:35:44: 0x104a5ef77 in unexpectedError__anon_38300 (test)
+            std.debug.dumpCurrentStackTrace(.{});
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:992:44: 0x104a56b5f in errnoToShutdownError (test)
+                else => |e| unexpectedError(e),
+                                           ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/os/net.zig:216:62: 0x104a5697b in shutdown (test)
+                    else => |err| return errnoToShutdownError(err),
+                                                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/common.zig:97:21: 0x104a56653 in handleNetShutdown (test)
+    if (net.shutdown(data.handle, data.how)) |_| {
+                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/backends/kqueue.zig:630:37: 0x104a565cf in submit__anon_74387 (test)
+            common.handleNetShutdown(c);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:931:56: 0x104a3e1c3 in addInternal (test)
+                            .yes => self.backend.submit(&self.state, op, completion),
+                                                       ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/ev/loop.zig:835:25: 0x104a3d733 in add (test)
+        self.addInternal(completion);
+                        ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/runtime.zig:664:22: 0x10497670b in loopAdd (test)
+        self.loop.add(c);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/common.zig:646:31: 0x104a709f7 in waitForIo (test)
+    task.getExecutor().loopAdd(c);
+                              ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/io.zig:2668:18: 0x104a8e623 in netShutdownImpl (test)
+    try waitForIo(&op.c);
+                 ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io/net.zig:1253:37: 0x1049dbb6b in shutdown (test)
+        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+                                    ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3946:29: 0x1049d2e2b in shutdownHandlers (test)
+        self.stream.shutdown(self.config.io, .both) catch {};
+                            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3417:30: 0x1049d264b in teardownExhaustive (test)
+        self.shutdownHandlers();
+                             ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:3086:36: 0x10495e9f7 in run (test)
+            self.teardownExhaustive();
+                                   ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/connection.zig:1223:13: 0x104961bfb in serveAccepted (test)
+    conn.run() catch |err| switch (err) {
+            ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/src/edge/server.zig:348:40: 0x104941aef in connEntry (test)
+        return connection.serveAccepted(stream, config);
+                                       ^
+/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266:17: 0x104941763 in start (test)
+                _ = @as(Cancelable!void, @call(.auto, function, args_casted.*)) catch {};
+                ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:76:22: 0x104a31b77 in call__anon_72557 (test)
+                start(context);
+                     ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/task.zig:503:26: 0x104a31987 in startFn (test)
+        self.closure.call(AnyTask, self);
+                         ^
+/Users/rsaunderson/Source/mine/starh2-wt-placement-bench/zig-pkg/zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc/src/coro/coroutines.zig:1579:31: 0x104a31cfb in entrypointFn (test)
+                coro_data.func(coro, coro_data.userdata);
+                              ^
+failed command: cd /Users/rsaunderson/Source/mine/starh2-wt-placement-bench && ./.zig-cache/o/a332be75f36c1db2fd1cc4bc0be3dab3/test --cache-dir=./.zig-cache --seed=0xc62ada87 --listen=-
+
+Build Summary: 138/142 steps succeeded (2 failed); 386/396 tests passed (10 skipped)
+ci transitive failure
++- run bash success 614ms
++- test success
+|  +- run test 204 pass (204 total) 1s MaxRSS:69M
+|  |  +- compile test Debug native success 3s MaxRSS:467M
+|  |     +- WriteFile macos-sdk.libc cached
+|  |     +- WriteFile cached
+|  |     +- compile lib brotli_enc Debug native cached 40ms MaxRSS:30M
+|  |     |  +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile cached
+|  |     +- compile lib brotli_dec Debug native cached 46ms MaxRSS:30M
+|  |     |  +- WriteFile macos-sdk.libc (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_dec Debug native (+1 more reused dependencies)
+|  |     +- options cached
+|  |     +- options cached
+|  |     +- translate-c cached 59ms MaxRSS:30M
+|  |     +- build boringssl success 1s
+|  |     +- build boringssl (reused)
+|  |     +- options cached
+|  +- run test 10 pass (10 total) 545ms MaxRSS:3M
+|  |  +- compile test Debug native success 1s MaxRSS:333M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options cached
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  |     +- options (reused)
+|  +- run test 9 pass (9 total) 389ms MaxRSS:4M
+|  |  +- compile test Debug native success 2s MaxRSS:407M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 45 pass (45 total) 19s MaxRSS:8G
+|  |  +- compile test Debug native success 3s MaxRSS:564M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 10 pass (10 total) 383ms MaxRSS:24M
+|  |  +- compile test Debug native success 4s MaxRSS:531M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 4 pass (4 total) 311ms MaxRSS:2M
+|  |  +- compile test Debug native success 2s MaxRSS:301M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 1 pass (1 total) 191ms MaxRSS:2M
+|  |  +- compile test Debug native success 1s MaxRSS:294M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  |     +- options (reused)
+|  +- run test 3 pass (3 total) 385ms MaxRSS:3M
+|  |  +- compile test Debug native success 2s MaxRSS:313M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  |     +- options (reused)
+|  +- run test 11 pass (11 total) 405ms MaxRSS:12M
+|  |  +- compile test Debug native success 2s MaxRSS:335M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  |     +- options (reused)
+|  +- test-lifecycle success
+|  |  +- run test 17 pass (17 total) 8s MaxRSS:681M
+|  |  |  +- compile test Debug native success 4s MaxRSS:562M
+|  |  |     +- WriteFile macos-sdk.libc (reused)
+|  |  |     +- WriteFile (reused)
+|  |  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |  |     +- options (reused)
+|  |  |     +- options (reused)
+|  |  |     +- options (reused)
+|  |  |     +- translate-c (reused)
+|  |  |     +- build boringssl (reused)
+|  |  |     +- build boringssl (reused)
+|  |  +- run exe teardown-traps success 130ms
+|  |  |  +- compile exe teardown-traps Debug native success 3s MaxRSS:457M
+|  |  |     +- WriteFile macos-sdk.libc (reused)
+|  |  |     +- WriteFile (reused)
+|  |  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |  |     +- options (reused)
+|  |  |     +- options (reused)
+|  |  |     +- options (reused)
+|  |  |     +- translate-c (reused)
+|  |  |     +- build boringssl (reused)
+|  |  |     +- build boringssl (reused)
+|  |  +- run exe teardown-traps success 154ms
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 312ms
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 135ms
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 5s
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 9s
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 5s
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 129ms
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 137ms
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 431ms
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 12ms
+|  |  |  +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  |  +- run exe teardown-traps success 186ms
+|  |     +- compile exe teardown-traps Debug native (+10 more reused dependencies)
+|  +- run test 2 pass (2 total) 2s MaxRSS:277M
+|  |  +- compile test Debug native success 3s MaxRSS:536M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 6 pass (6 total) 5s MaxRSS:548M
+|  |  +- compile test Debug native success 4s MaxRSS:538M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 8 pass (8 total) 279ms MaxRSS:4M
+|  |  +- compile test Debug native success 2s MaxRSS:412M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 8 pass (8 total) 1s MaxRSS:155M
+|  |  +- compile test Debug native success 2s MaxRSS:342M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  |     +- options (reused)
+|  +- run test 14 pass (14 total) 1s MaxRSS:26M
+|  |  +- compile test Debug native success 3s MaxRSS:558M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_dec Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_dec Debug native (+1 more reused dependencies)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 3 pass (3 total) 735ms MaxRSS:277M
+|  |  +- compile test Debug native success 3s MaxRSS:535M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 2 pass (2 total) 696ms MaxRSS:278M
+|  |  +- compile test Debug native success 4s MaxRSS:534M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 1 pass (1 total) 959ms MaxRSS:277M
+|  |  +- compile test Debug native success 3s MaxRSS:528M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 17 pass (17 total) 42ms MaxRSS:6M
+|  |  +- compile test Debug native cached 77ms MaxRSS:31M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  +- run test fuzz-frame 2 pass (2 total) 145ms MaxRSS:2M
+|  |  +- compile test fuzz-frame Debug native success 1s MaxRSS:296M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  |     +- options (reused)
+|  +- run test fuzz-hpack 3 pass (3 total) 517ms MaxRSS:2M
+|  |  +- compile test fuzz-hpack Debug native success 1s MaxRSS:306M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  |     +- options (reused)
+|  +- run test fuzz-session 5 pass (5 total) 536ms MaxRSS:3M
+|     +- compile test fuzz-session Debug native success 1s MaxRSS:320M
+|        +- WriteFile macos-sdk.libc (reused)
+|        +- WriteFile (reused)
+|        +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|        +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|        +- options (reused)
+|        +- options (reused)
+|        +- translate-c (reused)
+|        +- build boringssl (reused)
+|        +- build boringssl (reused)
+|        +- options (reused)
++- test-placement success
+|  +- run test (+1 more reused dependencies)
+|  +- run test 0 pass, 9 skip (9 total) 158ms MaxRSS:2M
+|  |  +- compile test Debug native success 1s MaxRSS:295M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 0 pass, 1 skip (1 total) 282ms MaxRSS:2M
+|  |  +- compile test Debug native success 1s MaxRSS:293M
+|  |     +- WriteFile macos-sdk.libc (reused)
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- run test 1 pass (1 total) 957ms MaxRSS:284M
+|     +- compile test Debug native success 2s MaxRSS:532M
+|        +- WriteFile macos-sdk.libc (reused)
+|        +- WriteFile (reused)
+|        +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|        +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|        +- options (reused)
+|        +- options (reused)
+|        +- options (reused)
+|        +- translate-c (reused)
+|        +- build boringssl (reused)
+|        +- build boringssl (reused)
++- test-exact success
+|  +- run test (+1 more reused dependencies)
++- fuzz-smoke success
+|  +- run /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/zig success 8s
+|  +- run /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/zig success 11s
+|  +- run /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/zig success 11s
++- run exe tls-smoke success 708ms
+|  +- compile exe tls-smoke Debug native cached 76ms MaxRSS:31M
+|  |  +- WriteFile macos-sdk.libc (reused)
+|  +- compile exe starh2-conformance-server Debug native success 3s MaxRSS:788M
+|     +- WriteFile macos-sdk.libc (reused)
+|     +- WriteFile (reused)
+|     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|     +- compile lib brotli_enc Debug native (+1 more reused dependencies)
+|     +- options (reused)
+|     +- options (reused)
+|     +- options (reused)
+|     +- translate-c (reused)
+|     +- build boringssl (reused)
+|     +- build boringssl (reused)
++- run exe h1-smoke success 3s
+|  +- compile exe h1-smoke Debug native cached 81ms MaxRSS:31M
+|  |  +- WriteFile macos-sdk.libc (reused)
+|  +- compile exe starh2-conformance-server Debug native (+10 more reused dependencies)
++- run exe h1-go-smoke success 539ms
+|  +- compile exe h1-go-smoke Debug native cached 77ms MaxRSS:31M
+|  |  +- WriteFile macos-sdk.libc (reused)
+|  +- compile exe starh2-conformance-server Debug native (+10 more reused dependencies)
++- run exe readme-doctest success 1s
+|  +- compile exe readme-doctest Debug native cached 78ms MaxRSS:31M
+|  |  +- WriteFile macos-sdk.libc (reused)
+|  +- WriteFile macos-sdk.libc (reused)
++- release success
+|  +- install example-hello-x86_64-linux-musl success
+|  |  +- compile exe example-hello-x86_64-linux-musl ReleaseSafe x86_64-linux-musl success 16s MaxRSS:647M
+|  |     +- WriteFile cached
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl cached 41ms MaxRSS:30M
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl (reused)
+|  |     +- options cached
+|  |     +- options cached
+|  |     +- options cached
+|  |     +- translate-c cached 44ms MaxRSS:30M
+|  |     +- build boringssl cached
+|  |     +- build boringssl (reused)
+|  +- install example-datastar-sse-x86_64-linux-musl success
+|  |  +- compile exe example-datastar-sse-x86_64-linux-musl ReleaseSafe x86_64-linux-musl success 16s MaxRSS:651M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl (reused)
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install starh2-conformance-server-x86_64-linux-musl success
+|  |  +- compile exe starh2-conformance-server-x86_64-linux-musl ReleaseSafe x86_64-linux-musl success 17s MaxRSS:719M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl (reused)
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install starh2-bench-server-x86_64-linux-musl success
+|  |  +- compile exe starh2-bench-server-x86_64-linux-musl ReleaseSafe x86_64-linux-musl success 18s MaxRSS:741M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl (reused)
+|  |     +- compile lib brotli_enc_x86_64-linux-musl ReleaseSafe x86_64-linux-musl (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install example-hello-aarch64-linux-musl success
+|  |  +- compile exe example-hello-aarch64-linux-musl ReleaseSafe aarch64-linux-musl success 16s MaxRSS:863M
+|  |     +- WriteFile cached
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl cached 45ms MaxRSS:30M
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl (reused)
+|  |     +- options cached
+|  |     +- options cached
+|  |     +- options cached
+|  |     +- translate-c cached 43ms MaxRSS:30M
+|  |     +- build boringssl cached
+|  |     +- build boringssl (reused)
+|  +- install example-datastar-sse-aarch64-linux-musl success
+|  |  +- compile exe example-datastar-sse-aarch64-linux-musl ReleaseSafe aarch64-linux-musl success 16s MaxRSS:864M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install starh2-conformance-server-aarch64-linux-musl success
+|  |  +- compile exe starh2-conformance-server-aarch64-linux-musl ReleaseSafe aarch64-linux-musl success 18s MaxRSS:929M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install starh2-bench-server-aarch64-linux-musl success
+|  |  +- compile exe starh2-bench-server-aarch64-linux-musl ReleaseSafe aarch64-linux-musl success 19s MaxRSS:949M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-musl ReleaseSafe aarch64-linux-musl (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install example-hello-aarch64-linux-gnu success
+|  |  +- compile exe example-hello-aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu success 16s MaxRSS:817M
+|  |     +- WriteFile cached
+|  |     +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu cached 51ms MaxRSS:30M
+|  |     +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu (reused)
+|  |     +- options cached
+|  |     +- options cached
+|  |     +- options cached
+|  |     +- translate-c cached 50ms MaxRSS:30M
+|  |     +- build boringssl cached
+|  |     +- build boringssl (reused)
+|  +- install example-datastar-sse-aarch64-linux-gnu success
+|  |  +- compile exe example-datastar-sse-aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu success 11s MaxRSS:817M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install starh2-conformance-server-aarch64-linux-gnu success
+|  |  +- compile exe starh2-conformance-server-aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu success 13s MaxRSS:884M
+|  |     +- WriteFile (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu (reused)
+|  |     +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- options (reused)
+|  |     +- translate-c (reused)
+|  |     +- build boringssl (reused)
+|  |     +- build boringssl (reused)
+|  +- install starh2-bench-server-aarch64-linux-gnu success
+|     +- compile exe starh2-bench-server-aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu success 18s MaxRSS:915M
+|        +- WriteFile (reused)
+|        +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu (reused)
+|        +- compile lib brotli_enc_aarch64-linux-gnu ReleaseSafe aarch64-linux-gnu (reused)
+|        +- options (reused)
+|        +- options (reused)
+|        +- options (reused)
+|        +- translate-c (reused)
+|        +- build boringssl (reused)
+|        +- build boringssl (reused)
++- macos-libcxx-probe transitive failure
+   +- run sh failure
+   +- run sh failure
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/e4b876be873d362d87892b0949a44768/build /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/zig /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib /Users/rsaunderson/Source/mine/starh2-wt-placement-bench .zig-cache /Users/rsaunderson/.cache/zig --seed 0xc62ada87 -Z84ba9001cf37ee9b ci --summary all
+rc=1
