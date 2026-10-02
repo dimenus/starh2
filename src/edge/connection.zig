@@ -2859,7 +2859,17 @@ const Connection = struct {
             self.diagNoPark(pump, 1);
             return false;
         }
-        if (pump.carried != null or !pump.write_ch.isEmpty()) {
+        // Stashed outbound is a reason to go round again only when the next
+        // turn can write it. With `pending_n > 0` the staging buffer is full
+        // behind an in-flight send, the loop above did not touch the stash,
+        // and only the send completion frees space. That completion arrives
+        // through the CQ, which only the select in `waitForActivity` reaps.
+        // Returning here instead spun the actor without ever yielding. Under
+        // pinned scheduling its executor then never polled again, so the
+        // completion was never delivered and every task on that executor
+        // stopped for good (t-2655: 10M turns with no park, pending_n=6,
+        // carried set).
+        if (pump.pending_n == 0 and (pump.carried != null or !pump.write_ch.isEmpty())) {
             self.diagNoPark(pump, 2);
             return false;
         }

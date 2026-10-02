@@ -653,10 +653,25 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_drain_tests = b.addRunArtifact(drain_tests);
+    const tls_backpressure_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/tls_backpressure.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "boring", .module = boring_mod },
+            },
+        }),
+    });
+    const run_tls_backpressure_tests = b.addRunArtifact(tls_backpressure_tests);
     const placement_step = b.step("test-placement", "Run spawn placement and connection balancer gates (meaningful under -Dzio-scheduling=pinned)");
     placement_step.dependOn(&run_placement_tests.step);
     placement_step.dependOn(&run_balance_tests.step);
     placement_step.dependOn(&run_drain_tests.step);
+    placement_step.dependOn(&run_tls_backpressure_tests.step);
 
     const handshake_tests = b.addTest(.{
         .root_module = b.createModule(.{
