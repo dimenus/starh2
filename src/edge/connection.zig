@@ -923,7 +923,10 @@ pub const DiagWait = enum(u8) {
 /// it before the server starts (bench_server --diag-stuck).
 pub var diag_stuck: bool = false;
 
-pub const DiagActor = enum(u8) { running = 0, loop_lock, select, tls_turn, inline_handlers };
+/// `lk_*` are points inside the actor's `session_mu` section, so a frozen
+/// actor that still holds the lock names the call it stopped in. `lk_spawn`
+/// is set around zio's spawn, which can yield inside the lock.
+pub const DiagActor = enum(u8) { running = 0, loop_lock, select, tls_turn, inline_handlers, lk_checks, lk_materialize, lk_spawn, lk_drain_emit, lk_tail };
 
 fn diagActor(c: *Connection, w: DiagActor) void {
     if (!diag_stuck) return;
@@ -962,6 +965,8 @@ pub const DiagHandlerState = struct {
     tls_recv_armed: bool,
     tls_pending_read: bool,
     tls_pending_cipher: bool,
+    /// The actor's zio task handle (0 if no hook is installed).
+    actor_task: usize,
 };
 
 /// `resp_ctx` is a task handler's `Response.ctx`, valid while that handler
@@ -993,6 +998,7 @@ pub fn diagHandlerState(resp_ctx: *anyopaque) DiagHandlerState {
         .tls_recv_armed = if (c.tls_driver) |pump| pump.recv_armed else false,
         .tls_pending_read = if (c.tls_driver) |pump| pump.pending_read != null else false,
         .tls_pending_cipher = if (c.tls_driver) |pump| pump.pending_cipher != null else false,
+        .actor_task = c.actor_task_h.load(.acquire),
     };
 }
 
@@ -1351,6 +1357,8 @@ const Connection = struct {
     diag_actor_turns: std.atomic.Value(u64) = .init(0),
     /// Diagnosis (t-2655): the actor's current blocking point (`DiagActor`).
     diag_actor_where: std.atomic.Value(u8) = .init(0),
+    /// Diagnosis (t-2655): TLS turns in a row that did not park.
+    diag_no_park_run: u64 = 0,
     /// Diag: this connection is in `diag_reg` and must deregister on teardown.
     diag_registered: bool = false,
     /// Diag: opaque zio task handles for the actor and the pump.
@@ -2769,6 +2777,21 @@ const Connection = struct {
     /// turn still parks in `waitForActivity` which serves handler completions,
     /// deadlines, the doorbell and the slow-consumer kill — only `.io` waits
     /// for the send completion, never the socket.
+    /// Diagnosis (t-2655): count TLS turns in a row that return without
+    /// parking, and print the pump state once the run passes a threshold no
+    /// healthy connection reaches. Printed from the actor itself, because a
+    /// spinning actor starves every other task on its executor.
+    fn diagNoPark(self: *Connection, pump: *tls_edge.Pump, why: u8) void {
+        if (!diag_stuck) return;
+        self.diag_no_park_run += 1;
+        if (self.diag_no_park_run == 100_000 or self.diag_no_park_run == 10_000_000) {
+            diagRawPrint("NOPARK conn={x} run={d} why={d} pending_n={d} carried={} write_ch_empty={} send_armed={} recv_armed={} stash_full={} sched_pending={d}\n", .{
+                @intFromPtr(self) & 0xffff, self.diag_no_park_run, why, pump.pending_n, pump.carried != null,
+                pump.write_ch.isEmpty(),    pump.send_armed,       pump.recv_armed, pump.stashFull(), self.sched.pendingCount(),
+            });
+        }
+    }
+
     fn driveTlsTurn(self: *Connection) !bool {
         diagActor(self, .tls_turn);
         defer diagActor(self, .running);
@@ -2832,8 +2855,15 @@ const Connection = struct {
         // t-866: never wait while pendingInbound(). Also don't park on a
         // stashed cipher suffix (recv is unarmed until it is fed), or while
         // outbound is only stashed (carried / write_ch) and not yet SSL_written.
-        if (pump.conn.pendingInbound() or pump.pending_read != null or pump.pending_cipher != null) return false;
-        if (pump.carried != null or !pump.write_ch.isEmpty()) return false;
+        if (pump.conn.pendingInbound() or pump.pending_read != null or pump.pending_cipher != null) {
+            self.diagNoPark(pump, 1);
+            return false;
+        }
+        if (pump.carried != null or !pump.write_ch.isEmpty()) {
+            self.diagNoPark(pump, 2);
+            return false;
+        }
+        self.diag_no_park_run = 0;
 
         const maybe_chunk = try self.waitForActivity();
         if (maybe_chunk) |chunk| {
@@ -3203,8 +3233,9 @@ const Connection = struct {
             {
                 diagActor(self, .loop_lock);
                 self.lockSessionUncancelable(io);
-                diagActor(self, .running);
+                diagActor(self, .lk_checks);
                 defer self.unlockSession(io);
+                defer diagActor(self, .running);
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
                 if (leaving) {
                     self.freezeAndSweepLocked();
@@ -3228,11 +3259,13 @@ const Connection = struct {
                 // the RST'd streams keep their pending DATA, drain skips them
                 // forever, and the actor parks until slow-consumer. That is
                 // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
+                diagActor(self, .lk_materialize);
                 self.materializeIntents() catch {
                     // Terminal enqueue failure sets writer_failed inside
                     // materializeIntents. Ordinary PoolFull is per-stream.
                     self.failClosedOnIntentError();
                 };
+                diagActor(self, .lk_drain_emit);
                 self.drainEmit() catch {
                     // Fail-closed: Session may already be debited — terminate connection.
                     // A frame that failed after its flow-control debit cannot
@@ -3255,6 +3288,7 @@ const Connection = struct {
                 // read BEFORE the handler count was known to be zero.
                 // The assert travels with the checks: move them back out of the
                 // lock and this fires, instead of the race returning silently.
+                diagActor(self, .lk_tail);
                 self.assertSessionHeld("graceful finish check");
                 if (self.session.terminal != .none) {
                     self.freezeAndSweepLocked();
@@ -5220,10 +5254,13 @@ const Connection = struct {
         // a short convoy behind the new handlers, not a deadlock, because the
         // yield reschedules the actor and a handler blocked on the mutex parks.
         _ = diag_task_spawn_attempts.fetchAdd(1, .monotonic);
+        const where_before = self.diag_actor_where.load(.monotonic);
+        diagActor(self, .lk_spawn);
         const handle = if (test_force_spawn_fail)
             error.OutOfMemory
         else
             zio.spawnInto(probeHandlerPlacement(), runHandlerJob, .{job});
+        diagActor(self, @enumFromInt(where_before));
         if (handle) |_| _ = diag_task_spawned.fetchAdd(1, .monotonic) else |_| {}
         const h = handle catch {
             // Admission already incremented live_handlers and claimed a slot.

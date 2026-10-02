@@ -1,0 +1,80 @@
+diff --git a/src/runtime.zig b/src/runtime.zig
+index 392ef2d..2fb9c00 100644
+--- a/src/runtime.zig
++++ b/src/runtime.zig
+@@ -549,6 +549,11 @@ pub const Executor = struct {
+     // Used by getCurrentTaskOrNull() instead of the TLS current_context chain.
+     current_task: ?*AnyTask,
+ 
++    // DIAG (starh2 t-2655): tasks popped to run, and the last one, read
++    // cross-thread by the debug hooks below.
++    diag_pops: std.atomic.Value(u64) = .init(0),
++    diag_last: std.atomic.Value(usize) = .init(0),
++
+     // Depth of no-suspend regions on this thread; see `beginNoSuspend`. Unlike
+     // clearing `current_task`, this leaves the task identity visible to locks,
+     // user log callbacks and the wake path's "inside the run loop" test.
+@@ -1060,7 +1065,10 @@ pub const Executor = struct {
+ 
+         const node = self.run_queue.pop() orelse return null;
+         self.spendQuantum();
+-        return AnyTask.fromWaitNode(node);
++        const diag_t = AnyTask.fromWaitNode(node);
++        _ = self.diag_pops.fetchAdd(1, .monotonic);
++        self.diag_last.store(@intFromPtr(diag_t), .monotonic);
++        return diag_t;
+     }
+ 
+     /// Schedule a task on this executor's local run queue. MUST run on the owning
+@@ -2896,3 +2904,35 @@ test "runtime: a busy ring still drains cross-thread wakes from the overflow que
+     // The spinner was stopped by the wake, not by its own cap.
+     try std.testing.expect(!hit_cap.load(.acquire));
+ }
++
++
++// DIAG (starh2 t-2655): debug hooks, racy reads, never for control flow.
++pub fn debugCurrentTaskHandle() usize {
++    return @intFromPtr(getCurrentTaskOrNull());
++}
++pub fn debugTaskStateByte(h: usize) u8 {
++    if (h == 0) return 0xff;
++    const t: *AnyTask = @ptrFromInt(h);
++    return @bitCast(t.state.load(.acquire));
++}
++/// exec id | is_current<<8 | ring_len<<16 | overflow_nonempty<<48
++pub fn debugTaskExec(h: usize) u64 {
++    if (h == 0) return 0;
++    const t: *AnyTask = @ptrFromInt(h);
++    const e = Executor.fromCoroutine(&t.coro);
++    const cur = @atomicLoad(?*AnyTask, &e.current_task, .monotonic);
++    const is_cur: u64 = @intFromBool(cur == t);
++    const ovf: u64 = @intFromBool(!e.run_queue.overflow.isEmpty());
++    return @as(u64, e.id) | is_cur << 8 | @as(u64, e.run_queue.len()) << 16 | ovf << 48;
++}
++pub fn debugTaskExecPops(h: usize) u64 {
++    if (h == 0) return 0;
++    const t: *AnyTask = @ptrFromInt(h);
++    return Executor.fromCoroutine(&t.coro).diag_pops.load(.monotonic);
++}
++pub fn debugTaskExecCurrent(h: usize) usize {
++    if (h == 0) return 0;
++    const t: *AnyTask = @ptrFromInt(h);
++    const e = Executor.fromCoroutine(&t.coro);
++    return @intFromPtr(@atomicLoad(?*AnyTask, &e.current_task, .monotonic));
++}
+diff --git a/src/zio.zig b/src/zio.zig
+index da04103..a789ff0 100644
+--- a/src/zio.zig
++++ b/src/zio.zig
+@@ -25,6 +25,11 @@ pub const yield = runtime.yield;
+ pub const maybeYield = runtime.maybeYield;
+ pub const sleep = runtime.sleep;
+ pub const now = runtime.now;
++pub const debugCurrentTaskHandle = runtime.debugCurrentTaskHandle;
++pub const debugTaskStateByte = runtime.debugTaskStateByte;
++pub const debugTaskExec = runtime.debugTaskExec;
++pub const debugTaskExecPops = runtime.debugTaskExecPops;
++pub const debugTaskExecCurrent = runtime.debugTaskExecCurrent;
+ 
+ pub const random = @import("random.zig").random;
+ pub const randomSecure = @import("random.zig").randomSecure;

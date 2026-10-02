@@ -427,6 +427,7 @@ var g_cadence: Cadence = .{};
 const StuckEntry = struct {
     ctx: std.atomic.Value(usize) = .init(0),
     stage: std.atomic.Value(u8) = .init(0),
+    task: std.atomic.Value(usize) = .init(0),
 };
 const stuck_table_len = 16384;
 var g_stuck: [stuck_table_len]StuckEntry = [_]StuckEntry{.{}} ** stuck_table_len;
@@ -440,8 +441,24 @@ fn stuckRegister(ctx: *anyopaque) ?*StuckEntry {
         return null;
     }
     g_stuck[i].stage.store(1, .release);
+    if (comptime @hasDecl(zio, "debugCurrentTaskHandle")) g_stuck[i].task.store(zio.debugCurrentTaskHandle(), .release);
     g_stuck[i].ctx.store(@intFromPtr(ctx), .release);
     return &g_stuck[i];
+}
+
+/// One task's scheduler view, from the diag zio hooks: tag (0 new, 1 ready =
+/// queued or running, 2 waiting = parked, 3 finished), whether it is its
+/// executor's current task, that executor's ring length and overflow, its
+/// pop counter (frozen = the executor runs nothing new), and its current task.
+fn printTaskDiag(w: *std.Io.Writer, label: []const u8, h: usize) !void {
+    if (comptime !@hasDecl(zio, "debugTaskExec")) return;
+    if (h == 0) return;
+    const st = zio.debugTaskStateByte(h);
+    const ex = zio.debugTaskExec(h);
+    try w.print("{s} task=0x{x} tag={d} awaken={d} exec={d} is_current={d} ring={d} overflow={d} exec_pops={d} exec_current=0x{x}\n", .{
+        label,                     h,                     st & 7, (st >> 3) & 1, ex & 0xff, (ex >> 8) & 1,
+        (ex >> 16) & 0xffffffff,   ex >> 48,              zio.debugTaskExecPops(h), zio.debugTaskExecCurrent(h),
+    });
 }
 
 fn stuckHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
@@ -454,7 +471,7 @@ fn stuckHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteR
         const ctx = e.ctx.load(.acquire);
         if (ctx == 0 or stage >= 3) continue;
         listed += 1;
-        if (listed > 200) continue;
+        if (listed > 60) continue;
         const st = conn_mod.diagHandlerState(@ptrFromInt(ctx));
         w.print("stage={d} sid={d} conn=0x{x} wait={s} waited_ms={d} sched_term={d} sched_ord={d} sched_framed={d} sched_pending={d} sched_emits={d} stash_full={?} session_held={} live_task_handlers={d} conn_send_avail={d} actor_turns={d} actor_where={s} tls_carried={} tls_write_ch={d} tls_send_armed={} tls_recv_armed={} tls_pending_read={} tls_pending_cipher={}\n", .{
             stage,                     st.stream_id,          st.conn_addr,        @tagName(st.wait),       st.waited_ms,
@@ -463,6 +480,8 @@ fn stuckHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteR
             st.conn_send_available,    st.actor_turns,        @tagName(st.actor_where), st.tls_carried,      st.tls_write_ch_len,     st.tls_send_armed,
             st.tls_recv_armed,         st.tls_pending_read,   st.tls_pending_cipher,
         }) catch break;
+        printTaskDiag(&w, "  handler", e.task.load(.acquire)) catch break;
+        printTaskDiag(&w, "  actor", st.actor_task) catch break;
     }
     w.print("stuck_listed={d} tracked={d} untracked={d}\n", .{ listed, n, g_stuck_untracked.load(.acquire) }) catch {};
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, w.buffered());
@@ -791,6 +810,11 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             // for /stuck (connection.diag_stuck; off by default because it
             // writes atomics on the hot path).
             conn_mod.diag_stuck = true;
+            // With a zio that exports the debug hooks, /stuck also shows each
+            // stuck task's scheduler state (queued, parked, running).
+            if (comptime @hasDecl(zio, "debugCurrentTaskHandle")) {
+                conn_mod.diag_task_handle_fn = &zio.debugCurrentTaskHandle;
+            }
         } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
             // Placement probe: every connection on executor 0 (same), or
             // alternating executors in accept order (split).

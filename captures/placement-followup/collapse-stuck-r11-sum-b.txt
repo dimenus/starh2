@@ -1,0 +1,4 @@
+stage=1 sid=485 conn=0x7b7790e420e0 wait=start_wait_ticket waited_ms=24024 sched_term=0 sched_ord=0 sched_framed=0 sched_pending=213 sched_emits=1230 stash_full=false session_held=true live_task_handlers=250 conn_send_avail=1073783653 actor_turns=571 actor_where=lk_checks tls_carried=true tls_write_ch=0 tls_send_armed=true tls_recv_armed=true tls_pending_read=false tls_pending_cipher=false
+  handler task=0x7b778bd274b0 tag=2 awaken=0 exec=1 is_current=0 ring=0 overflow=0 exec_pops=3486 exec_current=0x7b779d6c1410
+  actor task=0x7b779d6c1410 tag=1 awaken=0 exec=1 is_current=1 ring=0 overflow=0 exec_pops=3486 exec_current=0x7b779d6c1410
+stuck_listed=1 tracked=1620 untracked=0

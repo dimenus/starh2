@@ -1,0 +1,268 @@
+[New LWP 2046557]
+[New LWP 2046556]
+[New LWP 2046555]
+[New LWP 2046554]
+[New LWP 2046553]
+[New LWP 2046552]
+[New LWP 2046550]
+[New LWP 2046549]
+[New LWP 2046548]
+[New LWP 2046547]
+[New LWP 2046546]
+[New LWP 2046512]
+[New LWP 2046511]
+[New LWP 2046510]
+[New LWP 2046509]
+[New LWP 2046508]
+[New LWP 2046507]
+[New LWP 2046506]
+[New LWP 2046504]
+[New LWP 2046503]
+[New LWP 2046502]
+[New LWP 2046501]
+[New LWP 2046500]
+os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+
+warning: 594	/Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig: No such file or directory
+
+Thread 24 (LWP 2046500 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d08853af7e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d0885404a00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d0885404a00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d0885404a00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0885404080, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0885404080, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d0885404080, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0010) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d08853af9d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 23 (LWP 2046501 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d088436d7e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d0885407100) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d0885407100) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d0885407100) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0885406780, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0885406780, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d0885406780, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0050) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d088436d9d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 22 (LWP 2046502 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d088332b7e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d0885409800) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d0885409800) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d0885409800) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0885408e80, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0885408e80, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d0885408e80, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0090) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d088332b9d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 21 (LWP 2046503 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d08822e97e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d088540bf00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d088540bf00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d088540bf00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d088540b580, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d088540b580, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d088540b580, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f00d0) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d08822e99d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 20 (LWP 2046504 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d08812a77e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d088540e600) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d088540e600) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d088540e600) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d088540dc80, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d088540dc80, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d088540dc80, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0110) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d08812a79d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 19 (LWP 2046506 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d08802617e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d0885410d00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d0885410d00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d0885410d00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0885410380, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0885410380, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d0885410380, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0150) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d08802619d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 18 (LWP 2046507 "server"):
+#0  0x000000000120581d in edge.fair_scheduler.FairScheduler.forEachPending () at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/src/edge/fair_scheduler.zig:720
+#1  edge.connection.Connection.checkSlowConsumers (self=0x7d0859e4c0e0) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/src/edge/connection.zig:2399
+#2  edge.connection.Connection.run (self=0x7d0859e4c0e0) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/src/edge/connection.zig:3231
+#3  0x0000000001209339 in edge.connection.serveAccepted (stream=..., config=...) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/src/edge/connection.zig:1223
+#4  0x00000000011f387f in edge.server.Server.serveTlsThenBranch (stream=..., config=...) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/src/edge/server.zig:402
+#5  edge.server.Server.connEntry (self=0x7d08855507f0, stream=..., config=...) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/src/edge/server.zig:347
+#6  0x00000000011f2d8e in Io.Group.concurrent__anon_41325.TypeErased.start (context=<optimized out>) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Io.zig:1266
+#7  0x000000000126bb9e in task.AnyTask.startFn (coro=0x7d0869cfbc58) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/task.zig:503
+#8  0x000000000126bc36 in coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (context_ptr=0x16) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/coro/coroutines.zig:1579
+#9  0x0000000000000000 in ?? ()
+
+Thread 17 (LWP 2046508 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d087e1d27e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d0885415b00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d0885415b00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d0885415b00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0885415180, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0885415180, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d0885415180, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f01d0) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d087e1d29d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 16 (LWP 2046509 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d087d1877e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d0885418200) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d0885418200) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d0885418200) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0885417880, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0885417880, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d0885417880, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0210) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d087d1879d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 15 (LWP 2046510 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d087c13a7e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d088541a900) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d088541a900) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d088541a900) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0885419f80, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0885419f80, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d0885419f80, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0250) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d087c13a9d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 14 (LWP 2046511 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7d087b0f17e0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d088541d000) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d088541d000) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d088541d000) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d088541c680, check_ready=254) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d088541c680, mode=until_stopped) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x000000000126d16f in runtime.Runtime.runWorker (self=0x7d0895593080, worker=0x7d088541c680, id=<optimized out>) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:1833
+#9  Thread.callFn__anon_74120 (args=...) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:422
+#10 Thread.PosixThreadImpl.spawn__anon_74103.Instance.entryFn (raw_arg=0x7d08853f0290) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/Thread.zig:752
+#11 0x000000000145f0da in start (p=0x7d087b0f19d8) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/pthread_create.c:207
+#12 0x000000000146049c in __clone () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/libc/musl/src/thread/x86_64/clone.s:23
+#13 0x0000000000000000 in ?? ()
+
+Thread 13 (LWP 2046512 "iou-wrk-2046495"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 12 (LWP 2046546 "iou-wrk-2046508"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 11 (LWP 2046547 "iou-wrk-2046509"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 10 (LWP 2046548 "iou-wrk-2046500"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 9 (LWP 2046549 "iou-wrk-2046510"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 8 (LWP 2046550 "iou-wrk-2046501"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 7 (LWP 2046552 "iou-wrk-2046502"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 6 (LWP 2046553 "iou-wrk-2046506"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 5 (LWP 2046554 "iou-wrk-2046504"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 4 (LWP 2046555 "iou-wrk-2046507"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 3 (LWP 2046556 "iou-wrk-2046511"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 2 (LWP 2046557 "iou-wrk-2046503"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 1 (LWP 2046495 "server"):
+#0  os.linux.errno (r=18446744073709551612) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/os/linux.zig:594
+#1  os.system.linux.errno (rc=18446744073709551612) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/system/linux.zig:151
+#2  os.linux.io_uring_enter2 (to_submit=<optimized out>, min_complete=1, flags=9, arg=0x7ffe12eedef0, argsz=24) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/os/linux.zig:97
+#3  ev.backends.linux.io_uring.poll (state=0x7d0895593a00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux/io_uring.zig:1293
+#4  ev.backends.linux.Backend(.auto).poll (self=<optimized out>, state=0x7d0895593a00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/backends/linux.zig:277
+#5  ev.loop.Loop.poll (self=0x7d0895593a00) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/ev/loop.zig:1415
+#6  0x00000000011db833 in runtime.Executor.parkAndSearch (self=0x7d0895593080, check_ready=255) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:874
+#7  runtime.Executor.run (self=0x7d0895593080, mode=until_ready) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:823
+#8  0x00000000011e58e3 in task.AnyTask.yieldFrom__anon_37345 (self=0x7d08955954e0, initial_executor=0x7d0895593080) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/task.zig:298
+#9  task.AnyTask.yield__anon_37343 (self=0x7d08955954e0) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/task.zig:270
+#10 0x00000000011e55d8 in common.Waiter.waitTask__anon_37334 (d=0x7ffe12eee0f8, task=0x7d08955954e0, expected=1) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/common.zig:546
+#11 common.Waiter.wait__anon_31707 (self=0x7ffe12eee0e0, expected=1) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/common.zig:378
+#12 0x00000000011d960a in select.waitInternal__anon_31648 () at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/select.zig:602
+#13 select.waitUntilComplete__anon_29802 (future=0x7d087a0c0030) at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/select.zig:648
+#14 0x00000000011878bb in runtime.JoinHandle(@typeInfo(@typeInfo(@TypeOf(bench_server.serveMain)).@"fn".return_type.?).error_union.error_set!void).join () at /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2-wt-placement-bench/d06db385-d0a3-4a8c-adbf-f5b9a4c4ab41/scratchpad/diag/src/zig-pkg/zio-0.18.0-xHbVVCJaKgDSwsfAepUfgpNdSWPrqeSRTlKDc3bu5YiT/src/runtime.zig:198
+#15 bench_server.main (init=...) at bench_server.zig:1228
+#16 start.callMain () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/start.zig:737
+#17 start.callMainWithArgs () at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/start.zig:638
+#18 start.main (c_argc=15, c_argv=0x7ffe12f41278, c_envp=<optimized out>) at /Users/rsaunderson/.local/share/mise/installs/zig/0.16.0/lib/std/start.zig:663
+[Inferior 1 (process 2046495) detached]
