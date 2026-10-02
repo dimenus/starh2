@@ -1,0 +1,1204 @@
+ 07:29:20 up 3 days, 15:16,  2 users,  load average: 4.06, 1.57, 0.63
+PRE 0873176674880e3362d7e0af142934fae14ca2dce7223414aa96d19525541c3e  /tmp/starh2-wsspin/out-c9ef010/bin/starh2-bench-server
+FIX 593dce7fc72f07e173d9dab275860a86d901e32a6bbabc424adf5021ae7ecae9  /tmp/starh2-wsspin/out-bb1e475/bin/starh2-bench-server
+ROW r=1 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r1           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199474 ended_early=0 scan_err=0
+  r1           sse latency p50=1.003ms p99=2.203ms max=18.073ms
+  r1           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2244 light_worst_p99us=422 
+  r1           churn conns=53586 ok=224540 err=0 p50=55µs p99=843µs max=11.288ms
+ROW r=1 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r1           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199619 ended_early=0 scan_err=0
+  r1           sse latency p50=1.009ms p99=2.218ms max=15.494ms
+  r1           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2257 light_worst_p99us=426 
+  r1           churn conns=53656 ok=224756 err=0 p50=55µs p99=847µs max=10.727ms
+ROW r=2 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.1
+  r2           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200228 ended_early=0 scan_err=0
+  r2           sse latency p50=1.008ms p99=2.255ms max=19.297ms
+  r2           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2308 light_worst_p99us=442 
+  r2           churn conns=53751 ok=224679 err=0 p50=55µs p99=845µs max=14.51ms
+ROW r=2 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r2           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199470 ended_early=0 scan_err=0
+  r2           sse latency p50=1.009ms p99=2.328ms max=23.232ms
+  r2           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2392 light_worst_p99us=469 
+  r2           churn conns=52975 ok=221678 err=0 p50=56µs p99=853µs max=12.866ms
+ROW r=3 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r3           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200307 ended_early=0 scan_err=0
+  r3           sse latency p50=1.02ms p99=2.303ms max=21.853ms
+  r3           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1125 heavy_worst_p99us=2447 light_worst_p99us=431 
+  r3           churn conns=53697 ok=224573 err=0 p50=55µs p99=841µs max=11.021ms
+ROW r=3 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.1
+  r3           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199467 ended_early=0 scan_err=0
+  r3           sse latency p50=1.019ms p99=2.218ms max=17.122ms
+  r3           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2259 light_worst_p99us=385 
+  r3           churn conns=53921 ok=225973 err=0 p50=54µs p99=846µs max=11.856ms
+ROW r=4 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r4           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199623 ended_early=0 scan_err=0
+  r4           sse latency p50=1.006ms p99=2.223ms max=17.438ms
+  r4           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2265 light_worst_p99us=394 
+  r4           churn conns=54257 ok=227078 err=0 p50=54µs p99=837µs max=9.885ms
+ROW r=4 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r4           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199261 ended_early=0 scan_err=0
+  r4           sse latency p50=1.005ms p99=2.195ms max=18.811ms
+  r4           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2241 light_worst_p99us=418 
+  r4           churn conns=53707 ok=224978 err=0 p50=55µs p99=841µs max=16.154ms
+ROW r=5 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r5           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199792 ended_early=0 scan_err=0
+  r5           sse latency p50=1.003ms p99=2.198ms max=18.318ms
+  r5           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1055 heavy_worst_p99us=2231 light_worst_p99us=426 
+  r5           churn conns=53927 ok=225861 err=0 p50=54µs p99=841µs max=12.488ms
+ROW r=5 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r5           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199420 ended_early=0 scan_err=0
+  r5           sse latency p50=1.011ms p99=2.269ms max=18.001ms
+  r5           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2315 light_worst_p99us=449 
+  r5           churn conns=53749 ok=224865 err=0 p50=54µs p99=849µs max=14.036ms
+ROW r=6 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r6           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199060 ended_early=0 scan_err=0
+  r6           sse latency p50=1.015ms p99=2.25ms max=20.852ms
+  r6           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2286 light_worst_p99us=431 
+  r6           churn conns=53520 ok=223996 err=0 p50=55µs p99=848µs max=11.608ms
+ROW r=6 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r6           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199708 ended_early=0 scan_err=0
+  r6           sse latency p50=1.01ms p99=2.241ms max=20.547ms
+  r6           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2281 light_worst_p99us=453 
+  r6           churn conns=53135 ok=222282 err=0 p50=55µs p99=857µs max=16.393ms
+ROW r=7 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r7           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199769 ended_early=0 scan_err=0
+  r7           sse latency p50=999µs p99=2.252ms max=18.565ms
+  r7           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1054 heavy_worst_p99us=2295 light_worst_p99us=437 
+  r7           churn conns=54089 ok=226542 err=0 p50=54µs p99=838µs max=16.025ms
+ROW r=7 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r7           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199393 ended_early=0 scan_err=0
+  r7           sse latency p50=1.017ms p99=2.272ms max=19.704ms
+  r7           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2324 light_worst_p99us=440 
+  r7           churn conns=53132 ok=222144 err=0 p50=55µs p99=857µs max=18.234ms
+ROW r=8 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r8           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199893 ended_early=0 scan_err=0
+  r8           sse latency p50=1.015ms p99=2.267ms max=17.277ms
+  r8           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2304 light_worst_p99us=448 
+  r8           churn conns=53049 ok=222038 err=0 p50=56µs p99=855µs max=13.058ms
+ROW r=8 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r8           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200143 ended_early=0 scan_err=0
+  r8           sse latency p50=1ms p99=2.197ms max=14.836ms
+  r8           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1057 heavy_worst_p99us=2258 light_worst_p99us=412 
+  r8           churn conns=54235 ok=227008 err=0 p50=54µs p99=835µs max=6.483ms
+ROW r=9 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r9           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199634 ended_early=0 scan_err=0
+  r9           sse latency p50=1.008ms p99=2.264ms max=20.642ms
+  r9           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2307 light_worst_p99us=455 
+  r9           churn conns=53660 ok=224411 err=0 p50=55µs p99=847µs max=19.509ms
+ROW r=9 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r9           streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200208 ended_early=0 scan_err=0
+  r9           sse latency p50=1.027ms p99=2.274ms max=16.332ms
+  r9           sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1089 heavy_worst_p99us=2327 light_worst_p99us=445 
+  r9           churn conns=52566 ok=220227 err=0 p50=56µs p99=869µs max=12.659ms
+ROW r=10 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r10          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199402 ended_early=0 scan_err=0
+  r10          sse latency p50=1.006ms p99=2.213ms max=23.107ms
+  r10          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2255 light_worst_p99us=397 
+  r10          churn conns=54400 ok=227815 err=0 p50=53µs p99=830µs max=21.366ms
+ROW r=10 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r10          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199849 ended_early=0 scan_err=0
+  r10          sse latency p50=1.004ms p99=2.246ms max=20.089ms
+  r10          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1066 heavy_worst_p99us=2304 light_worst_p99us=410 
+  r10          churn conns=54106 ok=226637 err=0 p50=54µs p99=833µs max=13ms
+ROW r=11 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r11          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199594 ended_early=0 scan_err=0
+  r11          sse latency p50=1ms p99=2.204ms max=21.694ms
+  r11          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1053 heavy_worst_p99us=2252 light_worst_p99us=382 
+  r11          churn conns=53978 ok=226048 err=0 p50=54µs p99=837µs max=15.836ms
+ROW r=11 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r11          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199335 ended_early=0 scan_err=0
+  r11          sse latency p50=1.014ms p99=2.212ms max=16.269ms
+  r11          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2265 light_worst_p99us=427 
+  r11          churn conns=53736 ok=224851 err=0 p50=55µs p99=849µs max=6.743ms
+ROW r=12 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r12          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199841 ended_early=0 scan_err=0
+  r12          sse latency p50=1.017ms p99=2.241ms max=21.159ms
+  r12          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2274 light_worst_p99us=421 
+  r12          churn conns=53523 ok=224517 err=0 p50=55µs p99=842µs max=16.929ms
+ROW r=12 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r12          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199506 ended_early=0 scan_err=0
+  r12          sse latency p50=1ms p99=2.195ms max=20.826ms
+  r12          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1054 heavy_worst_p99us=2227 light_worst_p99us=432 
+  r12          churn conns=53980 ok=226530 err=0 p50=54µs p99=833µs max=13.966ms
+ROW r=13 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r13          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199817 ended_early=0 scan_err=0
+  r13          sse latency p50=1.006ms p99=2.251ms max=20.554ms
+  r13          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1084 heavy_worst_p99us=2331 light_worst_p99us=450 
+  r13          churn conns=53676 ok=225003 err=0 p50=54µs p99=844µs max=17.403ms
+ROW r=13 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r13          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199951 ended_early=0 scan_err=0
+  r13          sse latency p50=1.017ms p99=2.258ms max=20.691ms
+  r13          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1083 heavy_worst_p99us=2298 light_worst_p99us=437 
+  r13          churn conns=53379 ok=223312 err=0 p50=55µs p99=854µs max=18.823ms
+ROW r=14 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r14          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199311 ended_early=0 scan_err=0
+  r14          sse latency p50=1.013ms p99=2.291ms max=20.704ms
+  r14          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2349 light_worst_p99us=441 
+  r14          churn conns=53718 ok=225049 err=0 p50=54µs p99=845µs max=12.077ms
+ROW r=14 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r14          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199830 ended_early=0 scan_err=0
+  r14          sse latency p50=1.003ms p99=2.267ms max=20.063ms
+  r14          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1055 heavy_worst_p99us=2314 light_worst_p99us=435 
+  r14          churn conns=53682 ok=224756 err=0 p50=55µs p99=848µs max=12.353ms
+ROW r=15 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.1
+  r15          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199670 ended_early=0 scan_err=0
+  r15          sse latency p50=1.002ms p99=2.193ms max=18.402ms
+  r15          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2244 light_worst_p99us=405 
+  r15          churn conns=53533 ok=223978 err=0 p50=55µs p99=845µs max=9.9ms
+ROW r=15 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r15          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199584 ended_early=0 scan_err=0
+  r15          sse latency p50=1.006ms p99=2.18ms max=14.235ms
+  r15          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2217 light_worst_p99us=382 
+  r15          churn conns=54241 ok=227346 err=0 p50=54µs p99=834µs max=7.742ms
+ROW r=16 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r16          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199785 ended_early=0 scan_err=0
+  r16          sse latency p50=1.01ms p99=2.284ms max=22.405ms
+  r16          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2332 light_worst_p99us=455 
+  r16          churn conns=53625 ok=224550 err=0 p50=54µs p99=850µs max=16.619ms
+ROW r=16 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r16          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199350 ended_early=0 scan_err=0
+  r16          sse latency p50=1.018ms p99=2.239ms max=16.671ms
+  r16          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1077 heavy_worst_p99us=2298 light_worst_p99us=414 
+  r16          churn conns=53187 ok=222810 err=0 p50=55µs p99=855µs max=11.327ms
+ROW r=17 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r17          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199248 ended_early=0 scan_err=0
+  r17          sse latency p50=999µs p99=2.166ms max=18.096ms
+  r17          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1050 heavy_worst_p99us=2203 light_worst_p99us=419 
+  r17          churn conns=53842 ok=225621 err=0 p50=54µs p99=840µs max=11.845ms
+ROW r=17 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r17          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199942 ended_early=0 scan_err=0
+  r17          sse latency p50=1.014ms p99=2.219ms max=19.799ms
+  r17          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2252 light_worst_p99us=435 
+  r17          churn conns=52796 ok=220350 err=0 p50=56µs p99=866µs max=14.908ms
+ROW r=18 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r18          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199543 ended_early=0 scan_err=0
+  r18          sse latency p50=1.015ms p99=2.233ms max=19.431ms
+  r18          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2303 light_worst_p99us=407 
+  r18          churn conns=53398 ok=223322 err=0 p50=55µs p99=853µs max=17.785ms
+ROW r=18 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r18          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199437 ended_early=0 scan_err=0
+  r18          sse latency p50=1.006ms p99=2.191ms max=15.554ms
+  r18          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2228 light_worst_p99us=430 
+  r18          churn conns=53991 ok=225769 err=0 p50=54µs p99=841µs max=13.184ms
+ROW r=19 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r19          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199887 ended_early=0 scan_err=0
+  r19          sse latency p50=1.004ms p99=2.232ms max=15.243ms
+  r19          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2278 light_worst_p99us=439 
+  r19          churn conns=53258 ok=222984 err=0 p50=55µs p99=856µs max=7.324ms
+ROW r=19 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r19          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199341 ended_early=0 scan_err=0
+  r19          sse latency p50=1.006ms p99=2.212ms max=19.887ms
+  r19          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2250 light_worst_p99us=420 
+  r19          churn conns=54234 ok=227492 err=0 p50=54µs p99=833µs max=9.095ms
+ROW r=20 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r20          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199555 ended_early=0 scan_err=0
+  r20          sse latency p50=1.016ms p99=2.251ms max=18.679ms
+  r20          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1073 heavy_worst_p99us=2298 light_worst_p99us=456 
+  r20          churn conns=53524 ok=223760 err=0 p50=55µs p99=852µs max=10.777ms
+ROW r=20 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r20          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199767 ended_early=0 scan_err=0
+  r20          sse latency p50=1.037ms p99=2.344ms max=20.896ms
+  r20          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1142 heavy_worst_p99us=2499 light_worst_p99us=443 
+  r20          churn conns=52746 ok=221001 err=0 p50=57µs p99=862µs max=16.827ms
+ROW r=21 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r21          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199121 ended_early=0 scan_err=0
+  r21          sse latency p50=1.006ms p99=2.267ms max=23.791ms
+  r21          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2319 light_worst_p99us=464 
+  r21          churn conns=53377 ok=223392 err=0 p50=55µs p99=850µs max=17.249ms
+ROW r=21 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r21          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199867 ended_early=0 scan_err=0
+  r21          sse latency p50=1.011ms p99=2.245ms max=20.235ms
+  r21          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2290 light_worst_p99us=409 
+  r21          churn conns=53829 ok=225518 err=0 p50=54µs p99=838µs max=12.441ms
+ROW r=22 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r22          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199266 ended_early=0 scan_err=0
+  r22          sse latency p50=1.01ms p99=2.236ms max=21.612ms
+  r22          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2285 light_worst_p99us=421 
+  r22          churn conns=54176 ok=226906 err=0 p50=54µs p99=844µs max=11.338ms
+ROW r=22 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r22          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200179 ended_early=0 scan_err=0
+  r22          sse latency p50=1.003ms p99=2.255ms max=17.277ms
+  r22          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2331 light_worst_p99us=441 
+  r22          churn conns=54047 ok=226355 err=0 p50=54µs p99=834µs max=13.801ms
+ROW r=23 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r23          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199801 ended_early=0 scan_err=0
+  r23          sse latency p50=1.002ms p99=2.227ms max=18.453ms
+  r23          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2292 light_worst_p99us=431 
+  r23          churn conns=53468 ok=223884 err=0 p50=55µs p99=845µs max=13.436ms
+ROW r=23 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r23          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199549 ended_early=0 scan_err=0
+  r23          sse latency p50=1.021ms p99=2.302ms max=18.865ms
+  r23          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1083 heavy_worst_p99us=2371 light_worst_p99us=470 
+  r23          churn conns=53192 ok=222580 err=0 p50=55µs p99=857µs max=14.008ms
+ROW r=24 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r24          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199912 ended_early=0 scan_err=0
+  r24          sse latency p50=1.012ms p99=2.238ms max=16.269ms
+  r24          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2270 light_worst_p99us=403 
+  r24          churn conns=53887 ok=225650 err=0 p50=54µs p99=843µs max=11.031ms
+ROW r=24 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r24          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199745 ended_early=0 scan_err=0
+  r24          sse latency p50=1.008ms p99=2.224ms max=17.39ms
+  r24          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2272 light_worst_p99us=441 
+  r24          churn conns=53516 ok=224555 err=0 p50=55µs p99=845µs max=11.046ms
+ROW r=25 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r25          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199657 ended_early=0 scan_err=0
+  r25          sse latency p50=1.002ms p99=2.217ms max=20.202ms
+  r25          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2255 light_worst_p99us=428 
+  r25          churn conns=53750 ok=225295 err=0 p50=55µs p99=843µs max=19.771ms
+ROW r=25 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.2
+  r25          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199696 ended_early=0 scan_err=0
+  r25          sse latency p50=1.051ms p99=2.388ms max=18.154ms
+  r25          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1166 heavy_worst_p99us=2554 light_worst_p99us=449 
+  r25          churn conns=52657 ok=220199 err=0 p50=56µs p99=869µs max=12.149ms
+ROW r=26 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r26          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199639 ended_early=0 scan_err=0
+  r26          sse latency p50=1.017ms p99=2.274ms max=17.683ms
+  r26          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1075 heavy_worst_p99us=2359 light_worst_p99us=455 
+  r26          churn conns=53492 ok=223820 err=0 p50=55µs p99=855µs max=16.068ms
+ROW r=26 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r26          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199989 ended_early=0 scan_err=0
+  r26          sse latency p50=1.006ms p99=2.226ms max=16.923ms
+  r26          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2300 light_worst_p99us=441 
+  r26          churn conns=53250 ok=222769 err=0 p50=55µs p99=854µs max=9.505ms
+ROW r=27 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r27          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199310 ended_early=0 scan_err=0
+  r27          sse latency p50=1.003ms p99=2.219ms max=18.287ms
+  r27          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2263 light_worst_p99us=398 
+  r27          churn conns=53840 ok=225466 err=0 p50=55µs p99=843µs max=13.729ms
+ROW r=27 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r27          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199786 ended_early=0 scan_err=0
+  r27          sse latency p50=1.015ms p99=2.266ms max=24.627ms
+  r27          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2309 light_worst_p99us=423 
+  r27          churn conns=53973 ok=225822 err=0 p50=54µs p99=843µs max=12.796ms
+ROW r=28 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r28          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199459 ended_early=0 scan_err=0
+  r28          sse latency p50=1.017ms p99=2.276ms max=21.236ms
+  r28          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1076 heavy_worst_p99us=2322 light_worst_p99us=439 
+  r28          churn conns=53638 ok=224514 err=0 p50=54µs p99=852µs max=16.022ms
+ROW r=28 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r28          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199597 ended_early=0 scan_err=0
+  r28          sse latency p50=999µs p99=2.234ms max=21.505ms
+  r28          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2280 light_worst_p99us=420 
+  r28          churn conns=53915 ok=225935 err=0 p50=54µs p99=844µs max=13.754ms
+ROW r=29 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r29          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199359 ended_early=0 scan_err=0
+  r29          sse latency p50=1.003ms p99=2.256ms max=17.721ms
+  r29          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2294 light_worst_p99us=463 
+  r29          churn conns=53438 ok=223850 err=0 p50=55µs p99=852µs max=11.862ms
+ROW r=29 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r29          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199331 ended_early=0 scan_err=0
+  r29          sse latency p50=1.014ms p99=2.242ms max=17.716ms
+  r29          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2282 light_worst_p99us=445 
+  r29          churn conns=53579 ok=224209 err=0 p50=55µs p99=849µs max=12.537ms
+ROW r=30 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.2
+  r30          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199361 ended_early=0 scan_err=0
+  r30          sse latency p50=1.013ms p99=2.241ms max=19.107ms
+  r30          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2276 light_worst_p99us=389 
+  r30          churn conns=54222 ok=227243 err=0 p50=54µs p99=837µs max=15.116ms
+ROW r=30 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r30          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199766 ended_early=0 scan_err=0
+  r30          sse latency p50=1.007ms p99=2.241ms max=28.579ms
+  r30          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2290 light_worst_p99us=417 
+  r30          churn conns=53970 ok=225947 err=0 p50=54µs p99=840µs max=18.672ms
+ROW r=31 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.1
+  r31          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16201155 ended_early=0 scan_err=0
+  r31          sse latency p50=1.009ms p99=2.229ms max=19.586ms
+  r31          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2266 light_worst_p99us=413 
+  r31          churn conns=53506 ok=223943 err=0 p50=55µs p99=845µs max=17.321ms
+ROW r=31 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r31          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199409 ended_early=0 scan_err=0
+  r31          sse latency p50=1.012ms p99=2.271ms max=20.96ms
+  r31          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2332 light_worst_p99us=447 
+  r31          churn conns=53776 ok=225391 err=0 p50=55µs p99=837µs max=19.255ms
+ROW r=32 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r32          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199029 ended_early=0 scan_err=0
+  r32          sse latency p50=1.002ms p99=2.195ms max=18.074ms
+  r32          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2249 light_worst_p99us=398 
+  r32          churn conns=54705 ok=229515 err=0 p50=53µs p99=819µs max=11.173ms
+ROW r=32 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r32          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199558 ended_early=0 scan_err=0
+  r32          sse latency p50=1.008ms p99=2.236ms max=19.229ms
+  r32          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2285 light_worst_p99us=456 
+  r32          churn conns=53372 ok=223351 err=0 p50=55µs p99=850µs max=15.488ms
+ROW r=33 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r33          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199155 ended_early=0 scan_err=0
+  r33          sse latency p50=995µs p99=2.231ms max=19.431ms
+  r33          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1049 heavy_worst_p99us=2282 light_worst_p99us=420 
+  r33          churn conns=54164 ok=226487 err=0 p50=54µs p99=837µs max=16.196ms
+ROW r=33 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r33          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199820 ended_early=0 scan_err=0
+  r33          sse latency p50=1.008ms p99=2.216ms max=21.413ms
+  r33          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1066 heavy_worst_p99us=2257 light_worst_p99us=415 
+  r33          churn conns=54071 ok=226637 err=0 p50=54µs p99=842µs max=15.923ms
+ROW r=34 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r34          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200026 ended_early=0 scan_err=0
+  r34          sse latency p50=1.012ms p99=2.193ms max=16.931ms
+  r34          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2226 light_worst_p99us=401 
+  r34          churn conns=54010 ok=226301 err=0 p50=54µs p99=837µs max=12.604ms
+ROW r=34 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r34          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199801 ended_early=0 scan_err=0
+  r34          sse latency p50=1.007ms p99=2.19ms max=18.8ms
+  r34          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2237 light_worst_p99us=410 
+  r34          churn conns=54133 ok=226961 err=0 p50=54µs p99=831µs max=13.009ms
+ROW r=35 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r35          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200055 ended_early=0 scan_err=0
+  r35          sse latency p50=1.015ms p99=2.278ms max=19.314ms
+  r35          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2326 light_worst_p99us=422 
+  r35          churn conns=53745 ok=224524 err=0 p50=54µs p99=849µs max=17.846ms
+ROW r=35 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r35          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199801 ended_early=0 scan_err=0
+  r35          sse latency p50=1.013ms p99=2.267ms max=19.215ms
+  r35          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2310 light_worst_p99us=450 
+  r35          churn conns=53588 ok=224351 err=0 p50=55µs p99=852µs max=14.919ms
+ROW r=36 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r36          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199712 ended_early=0 scan_err=0
+  r36          sse latency p50=1.015ms p99=2.257ms max=18.356ms
+  r36          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1073 heavy_worst_p99us=2327 light_worst_p99us=447 
+  r36          churn conns=53853 ok=225838 err=0 p50=54µs p99=838µs max=16.862ms
+ROW r=36 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r36          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199881 ended_early=0 scan_err=0
+  r36          sse latency p50=1.009ms p99=2.231ms max=16.03ms
+  r36          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2266 light_worst_p99us=426 
+  r36          churn conns=53789 ok=225318 err=0 p50=54µs p99=845µs max=13.106ms
+ROW r=37 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r37          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199606 ended_early=0 scan_err=0
+  r37          sse latency p50=1.005ms p99=2.23ms max=17.482ms
+  r37          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1056 heavy_worst_p99us=2274 light_worst_p99us=420 
+  r37          churn conns=53689 ok=225126 err=0 p50=54µs p99=842µs max=17.388ms
+ROW r=37 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r37          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199570 ended_early=0 scan_err=0
+  r37          sse latency p50=1.018ms p99=2.237ms max=16.565ms
+  r37          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1079 heavy_worst_p99us=2287 light_worst_p99us=399 
+  r37          churn conns=53478 ok=223780 err=0 p50=55µs p99=848µs max=10.09ms
+ROW r=38 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r38          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199693 ended_early=0 scan_err=0
+  r38          sse latency p50=1.008ms p99=2.258ms max=17.595ms
+  r38          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2319 light_worst_p99us=438 
+  r38          churn conns=53626 ok=224825 err=0 p50=54µs p99=849µs max=13.271ms
+ROW r=38 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=119.9
+  r38          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200086 ended_early=0 scan_err=0
+  r38          sse latency p50=994µs p99=2.161ms max=15.127ms
+  r38          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1054 heavy_worst_p99us=2199 light_worst_p99us=411 
+  r38          churn conns=53514 ok=224191 err=0 p50=55µs p99=849µs max=10.404ms
+ROW r=39 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r39          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199281 ended_early=0 scan_err=0
+  r39          sse latency p50=1.002ms p99=2.174ms max=14.317ms
+  r39          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2210 light_worst_p99us=415 
+  r39          churn conns=53804 ok=225414 err=0 p50=54µs p99=847µs max=7.883ms
+ROW r=39 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r39          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199440 ended_early=0 scan_err=0
+  r39          sse latency p50=1.014ms p99=2.277ms max=22.574ms
+  r39          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2325 light_worst_p99us=447 
+  r39          churn conns=53751 ok=224930 err=0 p50=54µs p99=845µs max=15.004ms
+ROW r=40 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r40          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199393 ended_early=0 scan_err=0
+  r40          sse latency p50=1.03ms p99=2.273ms max=21.298ms
+  r40          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1088 heavy_worst_p99us=2334 light_worst_p99us=421 
+  r40          churn conns=52282 ok=219059 err=0 p50=57µs p99=867µs max=19.591ms
+ROW r=40 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r40          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199680 ended_early=0 scan_err=0
+  r40          sse latency p50=1.003ms p99=2.209ms max=16.35ms
+  r40          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2247 light_worst_p99us=417 
+  r40          churn conns=53987 ok=226052 err=0 p50=54µs p99=845µs max=15.289ms
+ROW r=41 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r41          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199329 ended_early=0 scan_err=0
+  r41          sse latency p50=1.004ms p99=2.275ms max=18.394ms
+  r41          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2321 light_worst_p99us=459 
+  r41          churn conns=53744 ok=224936 err=0 p50=55µs p99=843µs max=14.885ms
+ROW r=41 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r41          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199557 ended_early=0 scan_err=0
+  r41          sse latency p50=1.015ms p99=2.186ms max=15.204ms
+  r41          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1075 heavy_worst_p99us=2224 light_worst_p99us=423 
+  r41          churn conns=53304 ok=223209 err=0 p50=55µs p99=855µs max=9.431ms
+ROW r=42 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r42          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199685 ended_early=0 scan_err=0
+  r42          sse latency p50=1.014ms p99=2.296ms max=21.263ms
+  r42          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2331 light_worst_p99us=457 
+  r42          churn conns=53421 ok=223422 err=0 p50=55µs p99=852µs max=20.516ms
+ROW r=42 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r42          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199444 ended_early=0 scan_err=0
+  r42          sse latency p50=1.006ms p99=2.191ms max=14.238ms
+  r42          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2225 light_worst_p99us=409 
+  r42          churn conns=53590 ok=224527 err=0 p50=55µs p99=844µs max=8.768ms
+ROW r=43 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r43          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199930 ended_early=0 scan_err=0
+  r43          sse latency p50=999µs p99=2.179ms max=16.193ms
+  r43          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1054 heavy_worst_p99us=2225 light_worst_p99us=373 
+  r43          churn conns=54241 ok=227233 err=0 p50=54µs p99=833µs max=6.496ms
+ROW r=43 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r43          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199728 ended_early=0 scan_err=0
+  r43          sse latency p50=1.009ms p99=2.212ms max=18.694ms
+  r43          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2247 light_worst_p99us=416 
+  r43          churn conns=53843 ok=225467 err=0 p50=54µs p99=840µs max=9.201ms
+ROW r=44 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r44          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199597 ended_early=0 scan_err=0
+  r44          sse latency p50=1.012ms p99=2.201ms max=17.164ms
+  r44          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2257 light_worst_p99us=377 
+  r44          churn conns=54145 ok=226752 err=0 p50=54µs p99=841µs max=9.129ms
+ROW r=44 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r44          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199806 ended_early=0 scan_err=0
+  r44          sse latency p50=1.008ms p99=2.275ms max=20.599ms
+  r44          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2318 light_worst_p99us=454 
+  r44          churn conns=53393 ok=223314 err=0 p50=55µs p99=849µs max=14.431ms
+ROW r=45 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r45          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199452 ended_early=0 scan_err=0
+  r45          sse latency p50=1.001ms p99=2.227ms max=17.713ms
+  r45          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1057 heavy_worst_p99us=2278 light_worst_p99us=457 
+  r45          churn conns=53517 ok=223686 err=0 p50=55µs p99=853µs max=10.296ms
+ROW r=45 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r45          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199798 ended_early=0 scan_err=0
+  r45          sse latency p50=1.015ms p99=2.197ms max=16.59ms
+  r45          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2238 light_worst_p99us=413 
+  r45          churn conns=53696 ok=224623 err=0 p50=55µs p99=851µs max=9.609ms
+ROW r=46 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r46          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199045 ended_early=0 scan_err=0
+  r46          sse latency p50=1.017ms p99=2.237ms max=19.84ms
+  r46          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1078 heavy_worst_p99us=2280 light_worst_p99us=405 
+  r46          churn conns=53899 ok=225612 err=0 p50=54µs p99=846µs max=14.151ms
+ROW r=46 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r46          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199695 ended_early=0 scan_err=0
+  r46          sse latency p50=997µs p99=2.232ms max=22.135ms
+  r46          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1057 heavy_worst_p99us=2280 light_worst_p99us=442 
+  r46          churn conns=54075 ok=226713 err=0 p50=54µs p99=829µs max=21.397ms
+ROW r=47 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r47          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199868 ended_early=0 scan_err=0
+  r47          sse latency p50=1.006ms p99=2.203ms max=21.186ms
+  r47          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2261 light_worst_p99us=411 
+  r47          churn conns=53816 ok=225169 err=0 p50=55µs p99=842µs max=18.827ms
+ROW r=47 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r47          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199828 ended_early=0 scan_err=0
+  r47          sse latency p50=1.012ms p99=2.2ms max=17.555ms
+  r47          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2239 light_worst_p99us=420 
+  r47          churn conns=53382 ok=223780 err=0 p50=55µs p99=854µs max=9.367ms
+ROW r=48 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r48          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199135 ended_early=0 scan_err=0
+  r48          sse latency p50=1.01ms p99=2.222ms max=17.789ms
+  r48          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2261 light_worst_p99us=424 
+  r48          churn conns=53700 ok=224798 err=0 p50=55µs p99=847µs max=14.605ms
+ROW r=48 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.0
+  r48          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200981 ended_early=0 scan_err=0
+  r48          sse latency p50=996µs p99=2.15ms max=17.565ms
+  r48          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2206 light_worst_p99us=430 
+  r48          churn conns=54093 ok=226606 err=0 p50=54µs p99=844µs max=8.874ms
+ROW r=49 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r49          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199474 ended_early=0 scan_err=0
+  r49          sse latency p50=1.004ms p99=2.23ms max=18.772ms
+  r49          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2263 light_worst_p99us=426 
+  r49          churn conns=53689 ok=224862 err=0 p50=55µs p99=847µs max=14.044ms
+ROW r=49 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r49          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199908 ended_early=0 scan_err=0
+  r49          sse latency p50=1.013ms p99=2.249ms max=20.489ms
+  r49          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2295 light_worst_p99us=428 
+  r49          churn conns=53803 ok=225523 err=0 p50=55µs p99=841µs max=14.979ms
+ROW r=50 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r50          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200117 ended_early=0 scan_err=0
+  r50          sse latency p50=1.006ms p99=2.264ms max=22.422ms
+  r50          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2306 light_worst_p99us=427 
+  r50          churn conns=54252 ok=227249 err=0 p50=53µs p99=837µs max=20.62ms
+ROW r=50 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r50          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16198951 ended_early=0 scan_err=0
+  r50          sse latency p50=996µs p99=2.176ms max=18.736ms
+  r50          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1049 heavy_worst_p99us=2209 light_worst_p99us=434 
+  r50          churn conns=53813 ok=225086 err=0 p50=55µs p99=841µs max=13.179ms
+ROW r=51 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r51          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199431 ended_early=0 scan_err=0
+  r51          sse latency p50=1.002ms p99=2.163ms max=15.591ms
+  r51          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2209 light_worst_p99us=404 
+  r51          churn conns=54081 ok=226230 err=0 p50=55µs p99=837µs max=11.639ms
+ROW r=51 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r51          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199966 ended_early=0 scan_err=0
+  r51          sse latency p50=1.014ms p99=2.291ms max=19.252ms
+  r51          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1077 heavy_worst_p99us=2345 light_worst_p99us=425 
+  r51          churn conns=53713 ok=224700 err=0 p50=54µs p99=843µs max=15.803ms
+ROW r=52 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r52          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199568 ended_early=0 scan_err=0
+  r52          sse latency p50=1.016ms p99=2.249ms max=18.092ms
+  r52          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2304 light_worst_p99us=429 
+  r52          churn conns=53081 ok=222139 err=0 p50=56µs p99=856µs max=13.885ms
+ROW r=52 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r52          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199880 ended_early=0 scan_err=0
+  r52          sse latency p50=1.009ms p99=2.257ms max=20.702ms
+  r52          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2316 light_worst_p99us=413 
+  r52          churn conns=54035 ok=226435 err=0 p50=54µs p99=836µs max=15.645ms
+ROW r=53 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r53          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199765 ended_early=0 scan_err=0
+  r53          sse latency p50=1.01ms p99=2.251ms max=18.424ms
+  r53          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2306 light_worst_p99us=441 
+  r53          churn conns=53404 ok=223270 err=0 p50=55µs p99=851µs max=12.53ms
+ROW r=53 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r53          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199735 ended_early=0 scan_err=0
+  r53          sse latency p50=1.014ms p99=2.253ms max=21.368ms
+  r53          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2285 light_worst_p99us=445 
+  r53          churn conns=53320 ok=223374 err=0 p50=55µs p99=854µs max=13.3ms
+ROW r=54 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r54          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200111 ended_early=0 scan_err=0
+  r54          sse latency p50=1.013ms p99=2.302ms max=23.401ms
+  r54          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1076 heavy_worst_p99us=2355 light_worst_p99us=440 
+  r54          churn conns=54253 ok=227314 err=0 p50=54µs p99=833µs max=15.814ms
+ROW r=54 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r54          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199358 ended_early=0 scan_err=0
+  r54          sse latency p50=993µs p99=2.167ms max=19.57ms
+  r54          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1048 heavy_worst_p99us=2196 light_worst_p99us=384 
+  r54          churn conns=54318 ok=227491 err=0 p50=54µs p99=834µs max=16.805ms
+ROW r=55 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r55          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199415 ended_early=0 scan_err=0
+  r55          sse latency p50=1.005ms p99=2.191ms max=15.93ms
+  r55          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2236 light_worst_p99us=398 
+  r55          churn conns=54076 ok=226706 err=0 p50=54µs p99=836µs max=13.627ms
+ROW r=55 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r55          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199588 ended_early=0 scan_err=0
+  r55          sse latency p50=1.014ms p99=2.226ms max=17.347ms
+  r55          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1078 heavy_worst_p99us=2265 light_worst_p99us=435 
+  r55          churn conns=53240 ok=222924 err=0 p50=56µs p99=854µs max=9.677ms
+ROW r=56 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r56          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199644 ended_early=0 scan_err=0
+  r56          sse latency p50=1.012ms p99=2.215ms max=15.907ms
+  r56          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2272 light_worst_p99us=431 
+  r56          churn conns=53359 ok=223000 err=0 p50=55µs p99=853µs max=9.541ms
+ROW r=56 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r56          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199777 ended_early=0 scan_err=0
+  r56          sse latency p50=1.006ms p99=2.275ms max=23.059ms
+  r56          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2330 light_worst_p99us=464 
+  r56          churn conns=52952 ok=221357 err=0 p50=56µs p99=856µs max=16.697ms
+ROW r=57 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r57          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199553 ended_early=0 scan_err=0
+  r57          sse latency p50=1.001ms p99=2.207ms max=19.618ms
+  r57          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2257 light_worst_p99us=405 
+  r57          churn conns=54326 ok=227246 err=0 p50=54µs p99=833µs max=10.97ms
+ROW r=57 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r57          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199850 ended_early=0 scan_err=0
+  r57          sse latency p50=1.012ms p99=2.294ms max=23.577ms
+  r57          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2348 light_worst_p99us=436 
+  r57          churn conns=53922 ok=225889 err=0 p50=54µs p99=838µs max=13.037ms
+ROW r=58 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r58          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199277 ended_early=0 scan_err=0
+  r58          sse latency p50=1.015ms p99=2.204ms max=17.71ms
+  r58          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1076 heavy_worst_p99us=2253 light_worst_p99us=427 
+  r58          churn conns=53560 ok=224797 err=0 p50=55µs p99=847µs max=16.234ms
+ROW r=58 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r58          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199509 ended_early=0 scan_err=0
+  r58          sse latency p50=1.004ms p99=2.23ms max=18.32ms
+  r58          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2281 light_worst_p99us=430 
+  r58          churn conns=53712 ok=224793 err=0 p50=55µs p99=841µs max=16.119ms
+ROW r=59 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r59          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199541 ended_early=0 scan_err=0
+  r59          sse latency p50=1.006ms p99=2.222ms max=18.84ms
+  r59          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2270 light_worst_p99us=372 
+  r59          churn conns=54118 ok=226889 err=0 p50=54µs p99=835µs max=16.468ms
+ROW r=59 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r59          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200174 ended_early=0 scan_err=0
+  r59          sse latency p50=1.016ms p99=2.278ms max=19.31ms
+  r59          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1075 heavy_worst_p99us=2335 light_worst_p99us=443 
+  r59          churn conns=53690 ok=224814 err=0 p50=54µs p99=845µs max=11.432ms
+ROW r=60 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r60          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199860 ended_early=0 scan_err=0
+  r60          sse latency p50=1.006ms p99=2.195ms max=17.758ms
+  r60          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2225 light_worst_p99us=428 
+  r60          churn conns=53892 ok=226097 err=0 p50=54µs p99=841µs max=7.333ms
+ROW r=60 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r60          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199860 ended_early=0 scan_err=0
+  r60          sse latency p50=1.009ms p99=2.291ms max=22.269ms
+  r60          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2328 light_worst_p99us=463 
+  r60          churn conns=53301 ok=223358 err=0 p50=55µs p99=845µs max=15.065ms
+ROW r=61 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r61          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199443 ended_early=0 scan_err=0
+  r61          sse latency p50=1.006ms p99=2.202ms max=23.337ms
+  r61          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2234 light_worst_p99us=386 
+  r61          churn conns=53764 ok=224787 err=0 p50=54µs p99=848µs max=13.157ms
+ROW r=61 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r61          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199528 ended_early=0 scan_err=0
+  r61          sse latency p50=1.017ms p99=2.249ms max=17.92ms
+  r61          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1082 heavy_worst_p99us=2316 light_worst_p99us=423 
+  r61          churn conns=53441 ok=223238 err=0 p50=55µs p99=850µs max=17.257ms
+ROW r=62 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r62          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199891 ended_early=0 scan_err=0
+  r62          sse latency p50=1.016ms p99=2.218ms max=15.313ms
+  r62          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2251 light_worst_p99us=419 
+  r62          churn conns=53853 ok=225596 err=0 p50=54µs p99=842µs max=9.072ms
+ROW r=62 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r62          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199850 ended_early=0 scan_err=0
+  r62          sse latency p50=1.02ms p99=2.313ms max=19.503ms
+  r62          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1081 heavy_worst_p99us=2367 light_worst_p99us=444 
+  r62          churn conns=52914 ok=221562 err=0 p50=56µs p99=857µs max=19.573ms
+ROW r=63 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r63          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199590 ended_early=0 scan_err=0
+  r63          sse latency p50=1.021ms p99=2.297ms max=21.395ms
+  r63          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2340 light_worst_p99us=469 
+  r63          churn conns=52379 ok=218935 err=0 p50=57µs p99=871µs max=16.961ms
+ROW r=63 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r63          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199671 ended_early=0 scan_err=0
+  r63          sse latency p50=1.01ms p99=2.217ms max=19.256ms
+  r63          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2250 light_worst_p99us=409 
+  r63          churn conns=53880 ok=225883 err=0 p50=54µs p99=838µs max=14.401ms
+ROW r=64 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r64          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200014 ended_early=0 scan_err=0
+  r64          sse latency p50=1.011ms p99=2.264ms max=19.863ms
+  r64          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2298 light_worst_p99us=460 
+  r64          churn conns=53188 ok=222411 err=0 p50=55µs p99=854µs max=16.604ms
+ROW r=64 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r64          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199600 ended_early=0 scan_err=0
+  r64          sse latency p50=1.003ms p99=2.278ms max=19.405ms
+  r64          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2321 light_worst_p99us=449 
+  r64          churn conns=53702 ok=224985 err=0 p50=54µs p99=843µs max=15.048ms
+ROW r=65 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r65          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199397 ended_early=0 scan_err=0
+  r65          sse latency p50=1.009ms p99=2.174ms max=14.648ms
+  r65          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2230 light_worst_p99us=402 
+  r65          churn conns=53969 ok=225847 err=0 p50=54µs p99=843µs max=10.663ms
+ROW r=65 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r65          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199448 ended_early=0 scan_err=0
+  r65          sse latency p50=1.012ms p99=2.22ms max=20.725ms
+  r65          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2273 light_worst_p99us=410 
+  r65          churn conns=53768 ok=225619 err=0 p50=54µs p99=843µs max=14.744ms
+ROW r=66 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r66          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200141 ended_early=0 scan_err=0
+  r66          sse latency p50=1.015ms p99=2.256ms max=19.106ms
+  r66          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2296 light_worst_p99us=415 
+  r66          churn conns=53698 ok=224666 err=0 p50=54µs p99=844µs max=9.397ms
+ROW r=66 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r66          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199678 ended_early=0 scan_err=0
+  r66          sse latency p50=1.006ms p99=2.253ms max=22.676ms
+  r66          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2320 light_worst_p99us=429 
+  r66          churn conns=54010 ok=225983 err=0 p50=54µs p99=840µs max=14.246ms
+ROW r=67 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r67          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200049 ended_early=0 scan_err=0
+  r67          sse latency p50=1.002ms p99=2.22ms max=18.034ms
+  r67          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1056 heavy_worst_p99us=2251 light_worst_p99us=417 
+  r67          churn conns=53619 ok=224334 err=0 p50=55µs p99=843µs max=12.375ms
+ROW r=67 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.1
+  r67          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199399 ended_early=0 scan_err=0
+  r67          sse latency p50=1.02ms p99=2.318ms max=15.425ms
+  r67          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1075 heavy_worst_p99us=2395 light_worst_p99us=430 
+  r67          churn conns=53461 ok=224098 err=0 p50=54µs p99=849µs max=10.576ms
+ROW r=68 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r68          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199818 ended_early=0 scan_err=0
+  r68          sse latency p50=909µs p99=2.282ms max=21.025ms
+  r68          sse conns n=19 heavy=7 light=12 heavy_worst_p50us=1113 heavy_worst_p99us=2406 light_worst_p99us=438 
+  r68          churn conns=52775 ok=220736 err=0 p50=58µs p99=864µs max=10.334ms
+ROW r=68 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r68          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200319 ended_early=0 scan_err=0
+  r68          sse latency p50=1.006ms p99=2.199ms max=16.768ms
+  r68          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2243 light_worst_p99us=380 
+  r68          churn conns=54387 ok=227537 err=0 p50=54µs p99=835µs max=14.741ms
+ROW r=69 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r69          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199896 ended_early=0 scan_err=0
+  r69          sse latency p50=1.005ms p99=2.198ms max=18.229ms
+  r69          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1056 heavy_worst_p99us=2232 light_worst_p99us=423 
+  r69          churn conns=53535 ok=223978 err=0 p50=55µs p99=851µs max=10.181ms
+ROW r=69 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r69          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199626 ended_early=0 scan_err=0
+  r69          sse latency p50=1.014ms p99=2.256ms max=16.678ms
+  r69          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2298 light_worst_p99us=434 
+  r69          churn conns=54076 ok=226805 err=0 p50=53µs p99=837µs max=11.16ms
+ROW r=70 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r70          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199504 ended_early=0 scan_err=0
+  r70          sse latency p50=1.011ms p99=2.242ms max=19.56ms
+  r70          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2287 light_worst_p99us=430 
+  r70          churn conns=53617 ok=224358 err=0 p50=55µs p99=847µs max=11.528ms
+ROW r=70 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.1
+  r70          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199543 ended_early=0 scan_err=0
+  r70          sse latency p50=1.016ms p99=2.26ms max=22.078ms
+  r70          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2319 light_worst_p99us=437 
+  r70          churn conns=52442 ok=219647 err=0 p50=56µs p99=867µs max=20.506ms
+ROW r=71 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r71          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199187 ended_early=0 scan_err=0
+  r71          sse latency p50=1.003ms p99=2.267ms max=20.182ms
+  r71          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2352 light_worst_p99us=457 
+  r71          churn conns=53791 ok=224834 err=0 p50=54µs p99=840µs max=16.22ms
+ROW r=71 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r71          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199931 ended_early=0 scan_err=0
+  r71          sse latency p50=1.017ms p99=2.241ms max=19.141ms
+  r71          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1073 heavy_worst_p99us=2287 light_worst_p99us=432 
+  r71          churn conns=52911 ok=221502 err=0 p50=56µs p99=863µs max=9.741ms
+ROW r=72 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r72          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199323 ended_early=0 scan_err=0
+  r72          sse latency p50=1.017ms p99=2.201ms max=14.944ms
+  r72          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2238 light_worst_p99us=372 
+  r72          churn conns=53839 ok=225630 err=0 p50=54µs p99=842µs max=6.484ms
+ROW r=72 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r72          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199659 ended_early=0 scan_err=0
+  r72          sse latency p50=1.006ms p99=2.195ms max=20.311ms
+  r72          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2239 light_worst_p99us=402 
+  r72          churn conns=53860 ok=225424 err=0 p50=54µs p99=842µs max=8.184ms
+ROW r=73 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r73          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199853 ended_early=0 scan_err=0
+  r73          sse latency p50=1.004ms p99=2.267ms max=21.327ms
+  r73          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2341 light_worst_p99us=443 
+  r73          churn conns=53982 ok=225995 err=0 p50=54µs p99=834µs max=16.968ms
+ROW r=73 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r73          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199928 ended_early=0 scan_err=0
+  r73          sse latency p50=1.014ms p99=2.259ms max=19.13ms
+  r73          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2297 light_worst_p99us=430 
+  r73          churn conns=53707 ok=224784 err=0 p50=54µs p99=849µs max=13.786ms
+ROW r=74 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.1
+  r74          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199655 ended_early=0 scan_err=0
+  r74          sse latency p50=1.014ms p99=2.21ms max=17.566ms
+  r74          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2264 light_worst_p99us=399 
+  r74          churn conns=54005 ok=226322 err=0 p50=54µs p99=848µs max=6.1ms
+ROW r=74 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r74          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199898 ended_early=0 scan_err=0
+  r74          sse latency p50=1ms p99=2.269ms max=21.278ms
+  r74          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1056 heavy_worst_p99us=2320 light_worst_p99us=443 
+  r74          churn conns=54349 ok=227840 err=0 p50=54µs p99=826µs max=17.401ms
+ROW r=75 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r75          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199482 ended_early=0 scan_err=0
+  r75          sse latency p50=1.007ms p99=2.24ms max=17.304ms
+  r75          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2285 light_worst_p99us=441 
+  r75          churn conns=53816 ok=225324 err=0 p50=54µs p99=841µs max=16.396ms
+ROW r=75 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r75          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199416 ended_early=0 scan_err=0
+  r75          sse latency p50=1.012ms p99=2.233ms max=19.268ms
+  r75          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1080 heavy_worst_p99us=2301 light_worst_p99us=423 
+  r75          churn conns=53930 ok=225794 err=0 p50=54µs p99=840µs max=11.469ms
+ROW r=76 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r76          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199542 ended_early=0 scan_err=0
+  r76          sse latency p50=1.01ms p99=2.245ms max=20.059ms
+  r76          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2288 light_worst_p99us=460 
+  r76          churn conns=53848 ok=225072 err=0 p50=54µs p99=844µs max=17.309ms
+ROW r=76 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r76          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200019 ended_early=0 scan_err=0
+  r76          sse latency p50=1.008ms p99=2.261ms max=24.709ms
+  r76          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2312 light_worst_p99us=454 
+  r76          churn conns=53105 ok=222493 err=0 p50=55µs p99=853µs max=11.403ms
+ROW r=77 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.1
+  r77          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199222 ended_early=0 scan_err=0
+  r77          sse latency p50=1.005ms p99=2.223ms max=15.939ms
+  r77          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2264 light_worst_p99us=439 
+  r77          churn conns=53713 ok=224806 err=0 p50=55µs p99=847µs max=14.106ms
+ROW r=77 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r77          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200290 ended_early=0 scan_err=0
+  r77          sse latency p50=1.023ms p99=2.261ms max=17.428ms
+  r77          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1081 heavy_worst_p99us=2321 light_worst_p99us=393 
+  r77          churn conns=53559 ok=224237 err=0 p50=54µs p99=851µs max=11.862ms
+ROW r=78 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.0
+  r78          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199440 ended_early=0 scan_err=0
+  r78          sse latency p50=1.009ms p99=2.236ms max=18.85ms
+  r78          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2299 light_worst_p99us=438 
+  r78          churn conns=53469 ok=223832 err=0 p50=55µs p99=848µs max=14.246ms
+ROW r=78 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r78          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199381 ended_early=0 scan_err=0
+  r78          sse latency p50=1.006ms p99=2.241ms max=17.866ms
+  r78          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1066 heavy_worst_p99us=2302 light_worst_p99us=436 
+  r78          churn conns=54021 ok=226145 err=0 p50=54µs p99=837µs max=14.875ms
+ROW r=79 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r79          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199493 ended_early=0 scan_err=0
+  r79          sse latency p50=1.008ms p99=2.289ms max=19.647ms
+  r79          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2340 light_worst_p99us=432 
+  r79          churn conns=53815 ok=225158 err=0 p50=54µs p99=838µs max=15.896ms
+ROW r=79 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r79          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199404 ended_early=0 scan_err=0
+  r79          sse latency p50=1.018ms p99=2.237ms max=16.678ms
+  r79          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1075 heavy_worst_p99us=2279 light_worst_p99us=430 
+  r79          churn conns=53183 ok=222189 err=0 p50=55µs p99=862µs max=8.908ms
+ROW r=80 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r80          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199394 ended_early=0 scan_err=0
+  r80          sse latency p50=1.009ms p99=2.232ms max=18.7ms
+  r80          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2279 light_worst_p99us=438 
+  r80          churn conns=53704 ok=224963 err=0 p50=54µs p99=849µs max=12.112ms
+ROW r=80 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r80          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199503 ended_early=0 scan_err=0
+  r80          sse latency p50=1ms p99=2.183ms max=17.699ms
+  r80          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1054 heavy_worst_p99us=2218 light_worst_p99us=406 
+  r80          churn conns=54047 ok=226372 err=0 p50=54µs p99=839µs max=7.164ms
+ROW r=81 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r81          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199826 ended_early=0 scan_err=0
+  r81          sse latency p50=1ms p99=2.236ms max=21.706ms
+  r81          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1053 heavy_worst_p99us=2293 light_worst_p99us=421 
+  r81          churn conns=54226 ok=227093 err=0 p50=54µs p99=832µs max=11.29ms
+ROW r=81 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r81          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199649 ended_early=0 scan_err=0
+  r81          sse latency p50=1.013ms p99=2.244ms max=18.775ms
+  r81          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2290 light_worst_p99us=424 
+  r81          churn conns=53598 ok=224284 err=0 p50=55µs p99=850µs max=12.308ms
+ROW r=82 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r82          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200094 ended_early=0 scan_err=0
+  r82          sse latency p50=1.013ms p99=2.258ms max=17.536ms
+  r82          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1073 heavy_worst_p99us=2303 light_worst_p99us=422 
+  r82          churn conns=53641 ok=224580 err=0 p50=54µs p99=851µs max=14.736ms
+ROW r=82 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r82          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200282 ended_early=0 scan_err=0
+  r82          sse latency p50=1.006ms p99=2.278ms max=20.183ms
+  r82          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2333 light_worst_p99us=440 
+  r82          churn conns=53738 ok=224771 err=0 p50=54µs p99=845µs max=11.323ms
+ROW r=83 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r83          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199546 ended_early=0 scan_err=0
+  r83          sse latency p50=1.002ms p99=2.187ms max=18.31ms
+  r83          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2227 light_worst_p99us=422 
+  r83          churn conns=54029 ok=226879 err=0 p50=54µs p99=840µs max=11.384ms
+ROW r=83 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.1
+  r83          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199650 ended_early=0 scan_err=0
+  r83          sse latency p50=1.018ms p99=2.26ms max=19.528ms
+  r83          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2315 light_worst_p99us=412 
+  r83          churn conns=53753 ok=225119 err=0 p50=54µs p99=848µs max=8.919ms
+ROW r=84 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r84          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199672 ended_early=0 scan_err=0
+  r84          sse latency p50=1.012ms p99=2.191ms max=15.76ms
+  r84          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2217 light_worst_p99us=400 
+  r84          churn conns=53898 ok=225922 err=0 p50=54µs p99=845µs max=11.162ms
+ROW r=84 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r84          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199381 ended_early=0 scan_err=0
+  r84          sse latency p50=1.006ms p99=2.227ms max=16.129ms
+  r84          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1091 heavy_worst_p99us=2313 light_worst_p99us=412 
+  r84          churn conns=54194 ok=226831 err=0 p50=54µs p99=836µs max=9.168ms
+ROW r=85 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r85          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199458 ended_early=0 scan_err=0
+  r85          sse latency p50=1.006ms p99=2.211ms max=20.509ms
+  r85          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2264 light_worst_p99us=440 
+  r85          churn conns=53529 ok=224061 err=0 p50=55µs p99=847µs max=9.852ms
+ROW r=85 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r85          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199874 ended_early=0 scan_err=0
+  r85          sse latency p50=1.006ms p99=2.258ms max=19.589ms
+  r85          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2295 light_worst_p99us=437 
+  r85          churn conns=53882 ok=225488 err=0 p50=54µs p99=847µs max=12.943ms
+ROW r=86 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r86          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199750 ended_early=0 scan_err=0
+  r86          sse latency p50=1.018ms p99=2.273ms max=19.447ms
+  r86          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1079 heavy_worst_p99us=2320 light_worst_p99us=453 
+  r86          churn conns=53634 ok=224627 err=0 p50=54µs p99=845µs max=16.803ms
+ROW r=86 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r86          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199543 ended_early=0 scan_err=0
+  r86          sse latency p50=1ms p99=2.185ms max=16.2ms
+  r86          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1056 heavy_worst_p99us=2246 light_worst_p99us=423 
+  r86          churn conns=53974 ok=226451 err=0 p50=54µs p99=837µs max=8.736ms
+ROW r=87 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r87          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200089 ended_early=0 scan_err=0
+  r87          sse latency p50=1.006ms p99=2.233ms max=18.922ms
+  r87          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2270 light_worst_p99us=416 
+  r87          churn conns=53884 ok=225400 err=0 p50=54µs p99=838µs max=17.402ms
+ROW r=87 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r87          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199535 ended_early=0 scan_err=0
+  r87          sse latency p50=1.013ms p99=2.242ms max=18.973ms
+  r87          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2290 light_worst_p99us=437 
+  r87          churn conns=53226 ok=222630 err=0 p50=56µs p99=855µs max=11.702ms
+ROW r=88 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r88          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199962 ended_early=0 scan_err=0
+  r88          sse latency p50=1.013ms p99=2.29ms max=18.738ms
+  r88          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2336 light_worst_p99us=457 
+  r88          churn conns=53468 ok=223669 err=0 p50=55µs p99=852µs max=13.985ms
+ROW r=88 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r88          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199604 ended_early=0 scan_err=0
+  r88          sse latency p50=1.004ms p99=2.173ms max=15.764ms
+  r88          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2216 light_worst_p99us=385 
+  r88          churn conns=53994 ok=225919 err=0 p50=54µs p99=840µs max=7.347ms
+ROW r=89 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r89          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199509 ended_early=0 scan_err=0
+  r89          sse latency p50=1.003ms p99=2.19ms max=17.151ms
+  r89          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2222 light_worst_p99us=414 
+  r89          churn conns=53813 ok=225279 err=0 p50=55µs p99=844µs max=9.893ms
+ROW r=89 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r89          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199232 ended_early=0 scan_err=0
+  r89          sse latency p50=1.015ms p99=2.291ms max=19.225ms
+  r89          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1074 heavy_worst_p99us=2348 light_worst_p99us=449 
+  r89          churn conns=53864 ok=225628 err=0 p50=54µs p99=842µs max=14.905ms
+ROW r=90 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r90          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199655 ended_early=0 scan_err=0
+  r90          sse latency p50=1.016ms p99=2.242ms max=16.618ms
+  r90          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2281 light_worst_p99us=385 
+  r90          churn conns=53781 ok=225520 err=0 p50=54µs p99=837µs max=14.943ms
+ROW r=90 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r90          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199560 ended_early=0 scan_err=0
+  r90          sse latency p50=1.005ms p99=2.292ms max=24.128ms
+  r90          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2334 light_worst_p99us=454 
+  r90          churn conns=53903 ok=225507 err=0 p50=54µs p99=844µs max=20.53ms
+ROW r=91 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r91          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199713 ended_early=0 scan_err=0
+  r91          sse latency p50=1.004ms p99=2.234ms max=18.53ms
+  r91          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1060 heavy_worst_p99us=2273 light_worst_p99us=433 
+  r91          churn conns=53913 ok=225819 err=0 p50=54µs p99=838µs max=12.102ms
+ROW r=91 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r91          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199764 ended_early=0 scan_err=0
+  r91          sse latency p50=1.014ms p99=2.229ms max=19.864ms
+  r91          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2265 light_worst_p99us=437 
+  r91          churn conns=53087 ok=221890 err=0 p50=56µs p99=868µs max=12.315ms
+ROW r=92 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r92          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199081 ended_early=0 scan_err=0
+  r92          sse latency p50=1.013ms p99=2.208ms max=17.676ms
+  r92          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2234 light_worst_p99us=425 
+  r92          churn conns=53474 ok=223623 err=0 p50=55µs p99=855µs max=14.437ms
+ROW r=92 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r92          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199655 ended_early=0 scan_err=0
+  r92          sse latency p50=1.004ms p99=2.242ms max=19.41ms
+  r92          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2294 light_worst_p99us=447 
+  r92          churn conns=53330 ok=223116 err=0 p50=55µs p99=848µs max=11.957ms
+ROW r=93 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r93          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199454 ended_early=0 scan_err=0
+  r93          sse latency p50=1.005ms p99=2.232ms max=15.08ms
+  r93          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2287 light_worst_p99us=418 
+  r93          churn conns=53753 ok=224987 err=0 p50=54µs p99=849µs max=8.307ms
+ROW r=93 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r93          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199175 ended_early=0 scan_err=0
+  r93          sse latency p50=1.01ms p99=2.241ms max=17.834ms
+  r93          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2284 light_worst_p99us=422 
+  r93          churn conns=53714 ok=224665 err=0 p50=54µs p99=849µs max=16.749ms
+ROW r=94 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r94          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199684 ended_early=0 scan_err=0
+  r94          sse latency p50=1.015ms p99=2.244ms max=17.771ms
+  r94          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2274 light_worst_p99us=425 
+  r94          churn conns=53629 ok=224215 err=0 p50=54µs p99=854µs max=13.314ms
+ROW r=94 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r94          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199446 ended_early=0 scan_err=0
+  r94          sse latency p50=1.021ms p99=2.239ms max=15.764ms
+  r94          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1077 heavy_worst_p99us=2277 light_worst_p99us=420 
+  r94          churn conns=52723 ok=222180 err=0 p50=55µs p99=856µs max=10.553ms
+ROW r=95 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=119.8
+  r95          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199587 ended_early=0 scan_err=0
+  r95          sse latency p50=999µs p99=2.167ms max=15.054ms
+  r95          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1052 heavy_worst_p99us=2207 light_worst_p99us=417 
+  r95          churn conns=53569 ok=224665 err=0 p50=55µs p99=849µs max=9.324ms
+ROW r=95 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r95          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199589 ended_early=0 scan_err=0
+  r95          sse latency p50=1.014ms p99=2.246ms max=15.402ms
+  r95          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2323 light_worst_p99us=418 
+  r95          churn conns=53849 ok=225570 err=0 p50=54µs p99=844µs max=13.472ms
+ROW r=96 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r96          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200020 ended_early=0 scan_err=0
+  r96          sse latency p50=1.015ms p99=2.263ms max=16.336ms
+  r96          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1079 heavy_worst_p99us=2329 light_worst_p99us=447 
+  r96          churn conns=53743 ok=224707 err=0 p50=54µs p99=846µs max=15.65ms
+ROW r=96 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.1
+  r96          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199637 ended_early=0 scan_err=0
+  r96          sse latency p50=1.009ms p99=2.215ms max=17.902ms
+  r96          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2242 light_worst_p99us=437 
+  r96          churn conns=52986 ok=221367 err=0 p50=56µs p99=856µs max=10.486ms
+ROW r=97 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r97          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199350 ended_early=0 scan_err=0
+  r97          sse latency p50=1.011ms p99=2.256ms max=17.306ms
+  r97          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2285 light_worst_p99us=422 
+  r97          churn conns=53812 ok=225456 err=0 p50=54µs p99=841µs max=15.138ms
+ROW r=97 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r97          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199878 ended_early=0 scan_err=0
+  r97          sse latency p50=1.009ms p99=2.241ms max=16.041ms
+  r97          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2295 light_worst_p99us=399 
+  r97          churn conns=53969 ok=226019 err=0 p50=54µs p99=843µs max=11.029ms
+ROW r=98 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.0
+  r98          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199661 ended_early=0 scan_err=0
+  r98          sse latency p50=1.011ms p99=2.301ms max=21.65ms
+  r98          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2349 light_worst_p99us=474 
+  r98          churn conns=53321 ok=222770 err=0 p50=55µs p99=857µs max=14.97ms
+ROW r=98 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r98          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199755 ended_early=0 scan_err=0
+  r98          sse latency p50=1.009ms p99=2.197ms max=18.111ms
+  r98          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2237 light_worst_p99us=391 
+  r98          churn conns=53719 ok=225058 err=0 p50=54µs p99=843µs max=9.122ms
+ROW r=99 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r99          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200241 ended_early=0 scan_err=0
+  r99          sse latency p50=1.005ms p99=2.197ms max=15.23ms
+  r99          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2253 light_worst_p99us=400 
+  r99          churn conns=54051 ok=226282 err=0 p50=54µs p99=840µs max=9.814ms
+ROW r=99 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r99          streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199949 ended_early=0 scan_err=0
+  r99          sse latency p50=1.019ms p99=2.285ms max=22.861ms
+  r99          sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1083 heavy_worst_p99us=2330 light_worst_p99us=465 
+  r99          churn conns=53365 ok=223151 err=0 p50=55µs p99=861µs max=14.573ms
+ROW r=100 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r100         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199571 ended_early=0 scan_err=0
+  r100         sse latency p50=1.013ms p99=2.241ms max=17.18ms
+  r100         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1072 heavy_worst_p99us=2292 light_worst_p99us=437 
+  r100         churn conns=53459 ok=223696 err=0 p50=54µs p99=855µs max=7.881ms
+ROW r=100 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r100         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199891 ended_early=0 scan_err=0
+  r100         sse latency p50=1.006ms p99=2.223ms max=21.377ms
+  r100         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2270 light_worst_p99us=434 
+  r100         churn conns=53562 ok=223838 err=0 p50=55µs p99=848µs max=12.144ms
+ROW r=101 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=119.8
+  r101         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199486 ended_early=0 scan_err=0
+  r101         sse latency p50=1.021ms p99=2.282ms max=21.233ms
+  r101         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1080 heavy_worst_p99us=2314 light_worst_p99us=451 
+  r101         churn conns=52621 ok=220293 err=0 p50=56µs p99=867µs max=18.16ms
+ROW r=101 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r101         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200379 ended_early=0 scan_err=0
+  r101         sse latency p50=1.018ms p99=2.283ms max=23.008ms
+  r101         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1079 heavy_worst_p99us=2360 light_worst_p99us=432 
+  r101         churn conns=53317 ok=223990 err=0 p50=55µs p99=853µs max=15.041ms
+ROW r=102 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r102         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199587 ended_early=0 scan_err=0
+  r102         sse latency p50=1.014ms p99=2.267ms max=21.814ms
+  r102         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1073 heavy_worst_p99us=2303 light_worst_p99us=439 
+  r102         churn conns=53407 ok=223310 err=0 p50=55µs p99=852µs max=16.873ms
+ROW r=102 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.0
+  r102         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199380 ended_early=0 scan_err=0
+  r102         sse latency p50=1.006ms p99=2.226ms max=19.287ms
+  r102         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2285 light_worst_p99us=444 
+  r102         churn conns=52968 ok=221561 err=0 p50=56µs p99=856µs max=16.54ms
+ROW r=103 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r103         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199064 ended_early=0 scan_err=0
+  r103         sse latency p50=1.016ms p99=2.277ms max=20.192ms
+  r103         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1075 heavy_worst_p99us=2315 light_worst_p99us=456 
+  r103         churn conns=53062 ok=222031 err=0 p50=55µs p99=858µs max=18.903ms
+ROW r=103 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r103         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200012 ended_early=0 scan_err=0
+  r103         sse latency p50=1.008ms p99=2.204ms max=19.361ms
+  r103         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2243 light_worst_p99us=381 
+  r103         churn conns=54378 ok=227689 err=0 p50=53µs p99=838µs max=12.056ms
+ROW r=104 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r104         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199688 ended_early=0 scan_err=0
+  r104         sse latency p50=1.008ms p99=2.16ms max=15.665ms
+  r104         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2190 light_worst_p99us=409 
+  r104         churn conns=53953 ok=225744 err=0 p50=55µs p99=843µs max=9.572ms
+ROW r=104 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r104         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199728 ended_early=0 scan_err=0
+  r104         sse latency p50=1.007ms p99=2.211ms max=18.178ms
+  r104         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2251 light_worst_p99us=407 
+  r104         churn conns=53919 ok=225871 err=0 p50=54µs p99=842µs max=9.285ms
+ROW r=105 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r105         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199751 ended_early=0 scan_err=0
+  r105         sse latency p50=1.002ms p99=2.242ms max=19.989ms
+  r105         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1061 heavy_worst_p99us=2291 light_worst_p99us=440 
+  r105         churn conns=53929 ok=225946 err=0 p50=54µs p99=836µs max=15.609ms
+ROW r=105 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r105         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199597 ended_early=0 scan_err=0
+  r105         sse latency p50=1.017ms p99=2.252ms max=19.072ms
+  r105         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2299 light_worst_p99us=410 
+  r105         churn conns=53417 ok=223170 err=0 p50=55µs p99=854µs max=10.627ms
+ROW r=106 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r106         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199754 ended_early=0 scan_err=0
+  r106         sse latency p50=1.012ms p99=2.236ms max=17.835ms
+  r106         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1065 heavy_worst_p99us=2282 light_worst_p99us=438 
+  r106         churn conns=53607 ok=224494 err=0 p50=55µs p99=845µs max=14.925ms
+ROW r=106 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r106         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199952 ended_early=0 scan_err=0
+  r106         sse latency p50=1ms p99=2.204ms max=18.819ms
+  r106         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1055 heavy_worst_p99us=2232 light_worst_p99us=410 
+  r106         churn conns=54383 ok=227751 err=0 p50=54µs p99=830µs max=11.18ms
+ROW r=107 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r107         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199361 ended_early=0 scan_err=0
+  r107         sse latency p50=1.006ms p99=2.203ms max=19.869ms
+  r107         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1066 heavy_worst_p99us=2258 light_worst_p99us=406 
+  r107         churn conns=53750 ok=225052 err=0 p50=54µs p99=846µs max=18.449ms
+ROW r=107 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=119.8
+  r107         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16198906 ended_early=0 scan_err=0
+  r107         sse latency p50=1.05ms p99=2.408ms max=20.712ms
+  r107         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1110 heavy_worst_p99us=2494 light_worst_p99us=447 
+  r107         churn conns=51593 ok=214267 err=0 p50=57µs p99=912µs max=18.425ms
+ROW r=108 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r108         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199711 ended_early=0 scan_err=0
+  r108         sse latency p50=1.016ms p99=2.279ms max=18.107ms
+  r108         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2316 light_worst_p99us=418 
+  r108         churn conns=53675 ok=225267 err=0 p50=54µs p99=844µs max=15.935ms
+ROW r=108 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r108         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199831 ended_early=0 scan_err=0
+  r108         sse latency p50=1.011ms p99=2.219ms max=16.239ms
+  r108         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2264 light_worst_p99us=427 
+  r108         churn conns=53893 ok=225784 err=0 p50=55µs p99=843µs max=10.861ms
+ROW r=109 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r109         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16198967 ended_early=0 scan_err=0
+  r109         sse latency p50=1.01ms p99=2.311ms max=24.37ms
+  r109         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1066 heavy_worst_p99us=2370 light_worst_p99us=445 
+  r109         churn conns=53272 ok=223239 err=0 p50=55µs p99=849µs max=13.033ms
+ROW r=109 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r109         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199821 ended_early=0 scan_err=0
+  r109         sse latency p50=1.009ms p99=2.322ms max=23.653ms
+  r109         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2366 light_worst_p99us=471 
+  r109         churn conns=53501 ok=223950 err=0 p50=55µs p99=849µs max=17.974ms
+ROW r=110 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r110         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199592 ended_early=0 scan_err=0
+  r110         sse latency p50=1.013ms p99=2.19ms max=17.05ms
+  r110         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1068 heavy_worst_p99us=2230 light_worst_p99us=373 
+  r110         churn conns=54084 ok=226346 err=0 p50=54µs p99=846µs max=8.734ms
+ROW r=110 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r110         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199209 ended_early=0 scan_err=0
+  r110         sse latency p50=1.006ms p99=2.242ms max=18.806ms
+  r110         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2284 light_worst_p99us=418 
+  r110         churn conns=53646 ok=224846 err=0 p50=54µs p99=848µs max=15.269ms
+ROW r=111 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r111         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200005 ended_early=0 scan_err=0
+  r111         sse latency p50=1.006ms p99=2.235ms max=18.661ms
+  r111         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2270 light_worst_p99us=427 
+  r111         churn conns=53617 ok=224444 err=0 p50=55µs p99=842µs max=15.361ms
+ROW r=111 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r111         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199312 ended_early=0 scan_err=0
+  r111         sse latency p50=1.012ms p99=2.25ms max=20.373ms
+  r111         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2300 light_worst_p99us=425 
+  r111         churn conns=53583 ok=224421 err=0 p50=55µs p99=848µs max=14.188ms
+ROW r=112 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r112         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199319 ended_early=0 scan_err=0
+  r112         sse latency p50=1.015ms p99=2.236ms max=15.939ms
+  r112         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2275 light_worst_p99us=388 
+  r112         churn conns=53596 ok=224403 err=0 p50=54µs p99=846µs max=7.803ms
+ROW r=112 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r112         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199858 ended_early=0 scan_err=0
+  r112         sse latency p50=1.01ms p99=2.268ms max=19.966ms
+  r112         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2339 light_worst_p99us=425 
+  r112         churn conns=53706 ok=225285 err=0 p50=54µs p99=846µs max=14.68ms
+ROW r=113 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.2
+  r113         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199366 ended_early=0 scan_err=0
+  r113         sse latency p50=1.009ms p99=2.222ms max=16.644ms
+  r113         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2272 light_worst_p99us=408 
+  r113         churn conns=53526 ok=224127 err=0 p50=55µs p99=848µs max=10.304ms
+ROW r=113 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r113         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199866 ended_early=0 scan_err=0
+  r113         sse latency p50=1.011ms p99=2.19ms max=16.287ms
+  r113         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2227 light_worst_p99us=391 
+  r113         churn conns=53730 ok=224746 err=0 p50=55µs p99=852µs max=7.276ms
+ROW r=114 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r114         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199593 ended_early=0 scan_err=0
+  r114         sse latency p50=1.017ms p99=2.266ms max=16.68ms
+  r114         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1082 heavy_worst_p99us=2308 light_worst_p99us=433 
+  r114         churn conns=53364 ok=223361 err=0 p50=54µs p99=860µs max=13.758ms
+ROW r=114 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r114         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200063 ended_early=0 scan_err=0
+  r114         sse latency p50=1.006ms p99=2.227ms max=19.584ms
+  r114         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1062 heavy_worst_p99us=2261 light_worst_p99us=413 
+  r114         churn conns=53759 ok=225011 err=0 p50=55µs p99=840µs max=14.488ms
+ROW r=115 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r115         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199417 ended_early=0 scan_err=0
+  r115         sse latency p50=1.007ms p99=2.202ms max=19.436ms
+  r115         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1067 heavy_worst_p99us=2256 light_worst_p99us=426 
+  r115         churn conns=53946 ok=225902 err=0 p50=54µs p99=840µs max=13.476ms
+ROW r=115 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r115         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199690 ended_early=0 scan_err=0
+  r115         sse latency p50=1.01ms p99=2.204ms max=19.091ms
+  r115         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1063 heavy_worst_p99us=2243 light_worst_p99us=389 
+  r115         churn conns=54075 ok=226730 err=0 p50=54µs p99=835µs max=13.779ms
+ROW r=116 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.8
+  r116         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200147 ended_early=0 scan_err=0
+  r116         sse latency p50=1.011ms p99=2.237ms max=17.217ms
+  r116         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1064 heavy_worst_p99us=2275 light_worst_p99us=445 
+  r116         churn conns=53681 ok=224832 err=0 p50=55µs p99=847µs max=11.009ms
+ROW r=116 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.9
+  r116         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199778 ended_early=0 scan_err=0
+  r116         sse latency p50=1.004ms p99=2.192ms max=19.172ms
+  r116         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1059 heavy_worst_p99us=2224 light_worst_p99us=379 
+  r116         churn conns=53911 ok=226178 err=0 p50=54µs p99=840µs max=15.083ms
+ROW r=117 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.1
+  r117         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199296 ended_early=0 scan_err=0
+  r117         sse latency p50=1.014ms p99=2.216ms max=22.061ms
+  r117         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1071 heavy_worst_p99us=2252 light_worst_p99us=365 
+  r117         churn conns=53824 ok=225574 err=0 p50=54µs p99=838µs max=15.797ms
+ROW r=117 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=121.0
+  r117         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199988 ended_early=0 scan_err=0
+  r117         sse latency p50=1.011ms p99=2.274ms max=20.091ms
+  r117         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1066 heavy_worst_p99us=2328 light_worst_p99us=422 
+  r117         churn conns=54131 ok=226704 err=0 p50=53µs p99=842µs max=17.936ms
+ROW r=118 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r118         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16200024 ended_early=0 scan_err=0
+  r118         sse latency p50=1.011ms p99=2.205ms max=19.789ms
+  r118         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1066 heavy_worst_p99us=2261 light_worst_p99us=436 
+  r118         churn conns=53390 ok=223666 err=0 p50=55µs p99=856µs max=12.925ms
+ROW r=118 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.4
+  r118         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199564 ended_early=0 scan_err=0
+  r118         sse latency p50=1ms p99=2.194ms max=19.387ms
+  r118         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1057 heavy_worst_p99us=2239 light_worst_p99us=418 
+  r118         churn conns=53897 ok=225705 err=0 p50=54µs p99=841µs max=14.267ms
+ROW r=119 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.7
+  r119         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199227 ended_early=0 scan_err=0
+  r119         sse latency p50=1.002ms p99=2.191ms max=18.492ms
+  r119         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1058 heavy_worst_p99us=2242 light_worst_p99us=420 
+  r119         churn conns=54112 ok=226656 err=0 p50=54µs p99=842µs max=11.372ms
+ROW r=119 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.6
+  r119         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199376 ended_early=0 scan_err=0
+  r119         sse latency p50=1.015ms p99=2.303ms max=24.629ms
+  r119         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1079 heavy_worst_p99us=2364 light_worst_p99us=466 
+  r119         churn conns=53488 ok=224072 err=0 p50=54µs p99=849µs max=18.341ms
+ROW r=120 build=FIX sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.5
+  r120         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199809 ended_early=0 scan_err=0
+  r120         sse latency p50=1.014ms p99=2.239ms max=18.01ms
+  r120         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1070 heavy_worst_p99us=2277 light_worst_p99us=441 
+  r120         churn conns=53413 ok=223513 err=0 p50=55µs p99=850µs max=14.971ms
+ROW r=120 build=PRE sched=work_stealing rank=none stalled=0 nopark100k=0 nopark10m=0 server_cpu_s=120.3
+  r120         streams=1620 conns=18 opened=1620 delivering=1620 failed=0 events=16199592 ended_early=0 scan_err=0
+  r120         sse latency p50=1.013ms p99=2.218ms max=18.798ms
+  r120         sse conns n=18 heavy=6 light=12 heavy_worst_p50us=1069 heavy_worst_p99us=2257 light_worst_p99us=429 
+  r120         churn conns=53264 ok=223003 err=0 p50=55µs p99=855µs max=14.106ms
+done 120 rounds
