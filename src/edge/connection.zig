@@ -890,6 +890,11 @@ pub const HandlerSlot = struct {
     /// a fully delivered response returned ConnectionClosed when the peer
     /// closed in the ack's wake-to-run gap (t-537).
     awaiting_receipt: std.atomic.Value(bool) = .init(false),
+    /// Diagnosis (t-2655): where this slot's handler is blocked right now
+    /// (`DiagWait`), and since when (monotonic ns). Written by the handler
+    /// around each wait; read by `diagHandlerState`.
+    diag_wait: std.atomic.Value(u8) = .init(0),
+    diag_since_ns: std.atomic.Value(u64) = .init(0),
     /// Incremented as the first act of every `finishHandlerJob`. Exactly 1 at
     /// `releaseSlot` for an admitted job. Not an idempotency flag: a second
     /// increment panics.
@@ -898,6 +903,98 @@ pub const HandlerSlot = struct {
     /// that point is rollback, not a missing finalize.
     admitted: bool = false,
 };
+
+/// The blocking point a task handler is parked at, for `diagHandlerState`.
+pub const DiagWait = enum(u8) {
+    running = 0,
+    start_reserve_ticket,
+    start_lock,
+    start_wait_ticket,
+    deadline_wait,
+    write_reserve_ticket,
+    write_lock,
+    write_space_or_enqueue,
+    write_wait_ticket,
+};
+
+/// Off by default: the stuck-handler diagnosis (`diagWait`, `diagActor`,
+/// `diag_actor_turns`) writes atomics on every handler wait and actor turn,
+/// which is hot-path cost a measurement must not pay. A diagnosis run sets
+/// it before the server starts (bench_server --diag-stuck).
+pub var diag_stuck: bool = false;
+
+pub const DiagActor = enum(u8) { running = 0, loop_lock, select, tls_turn, inline_handlers };
+
+fn diagActor(c: *Connection, w: DiagActor) void {
+    if (!diag_stuck) return;
+    c.diag_actor_where.store(@intFromEnum(w), .monotonic);
+}
+
+fn diagWait(hctx: *HandlerCtx, w: DiagWait) void {
+    if (!diag_stuck) return;
+    hctx.slot.diag_since_ns.store(if (w == .running) 0 else nowNs(hctx.conn.config.io), .monotonic);
+    hctx.slot.diag_wait.store(@intFromEnum(w), .monotonic);
+}
+
+/// Snapshot for a stuck-handler dump. `wait`/`waited_ms` come from atomics;
+/// the connection fields are plain reads of actor-owned state taken without
+/// the session lock, so they are a racy hint (good enough to see what a
+/// wedged connection holds), never a value to act on.
+pub const DiagHandlerState = struct {
+    stream_id: u31,
+    conn_addr: usize,
+    wait: DiagWait,
+    waited_ms: u64,
+    sched_terminal_len: usize,
+    sched_ordinary_len: usize,
+    sched_framed_len: usize,
+    sched_active_pending: usize,
+    sched_emits_total: usize,
+    tls_stash_full: ?bool,
+    session_held: bool,
+    live_task_handlers: usize,
+    conn_send_available: i64,
+    actor_turns: u64,
+    actor_where: DiagActor,
+    tls_carried: bool,
+    tls_write_ch_len: usize,
+    tls_send_armed: bool,
+    tls_recv_armed: bool,
+    tls_pending_read: bool,
+    tls_pending_cipher: bool,
+};
+
+/// `resp_ctx` is a task handler's `Response.ctx`, valid while that handler
+/// runs.
+pub fn diagHandlerState(resp_ctx: *anyopaque) DiagHandlerState {
+    const hctx: *HandlerCtx = @ptrCast(@alignCast(resp_ctx));
+    const c = hctx.conn;
+    const since = hctx.slot.diag_since_ns.load(.monotonic);
+    const now = nowNs(c.config.io);
+    return .{
+        .stream_id = hctx.stream_id,
+        .conn_addr = @intFromPtr(c),
+        .wait = @enumFromInt(hctx.slot.diag_wait.load(.monotonic)),
+        .waited_ms = if (since == 0 or now < since) 0 else (now - since) / std.time.ns_per_ms,
+        .sched_terminal_len = c.sched.terminal_len,
+        .sched_ordinary_len = c.sched.ordinary_len,
+        .sched_framed_len = c.sched.framed_len,
+        .sched_active_pending = c.sched.active_pending,
+        .sched_emits_total = c.sched.emits_total,
+        .tls_stash_full = if (c.tls_driver) |pump| pump.stashFull() else null,
+        .session_held = c.session_held,
+        .live_task_handlers = c.live_task_handlers.load(.monotonic),
+        .conn_send_available = c.session.connectionSendAvailable(),
+        .actor_turns = c.diag_actor_turns.load(.monotonic),
+        .actor_where = @enumFromInt(c.diag_actor_where.load(.monotonic)),
+        .tls_carried = if (c.tls_driver) |pump| pump.carried != null else false,
+        .tls_write_ch_len = if (c.tls_driver) |pump| io_queue.chanLen(wire_pump.WireChunk, pump.write_ch) else 0,
+        .tls_send_armed = if (c.tls_driver) |pump| pump.send_armed else false,
+        .tls_recv_armed = if (c.tls_driver) |pump| pump.recv_armed else false,
+        .tls_pending_read = if (c.tls_driver) |pump| pump.pending_read != null else false,
+        .tls_pending_cipher = if (c.tls_driver) |pump| pump.pending_cipher != null else false,
+    };
+}
 
 const HandlerCtx = struct {
     conn: *Connection,
@@ -1249,6 +1346,11 @@ const Connection = struct {
     /// 3 acquiring session_mu, 4 putOne(write_ch), 5 waitH2cPreface,
     /// 6 shutdownHandlers.
     actor_site: std.atomic.Value(u8) = .init(0),
+    /// Diagnosis (t-2655): actor waits entered; read twice, it shows whether
+    /// the actor still turns.
+    diag_actor_turns: std.atomic.Value(u64) = .init(0),
+    /// Diagnosis (t-2655): the actor's current blocking point (`DiagActor`).
+    diag_actor_where: std.atomic.Value(u8) = .init(0),
     /// Diag: this connection is in `diag_reg` and must deregister on teardown.
     diag_registered: bool = false,
     /// Diag: opaque zio task handles for the actor and the pump.
@@ -2668,6 +2770,8 @@ const Connection = struct {
     /// deadlines, the doorbell and the slow-consumer kill — only `.io` waits
     /// for the send completion, never the socket.
     fn driveTlsTurn(self: *Connection) !bool {
+        diagActor(self, .tls_turn);
+        defer diagActor(self, .running);
         const pump = self.tls_driver.?;
         if (pump.inbound_eof) return true;
 
@@ -2760,6 +2864,7 @@ const Connection = struct {
         defer if (probe_deadline_park) {
             _ = close_probe_parked.fetchSub(1, .acq_rel);
         };
+        if (diag_stuck) _ = self.diag_actor_turns.fetchAdd(1, .monotonic);
         // The server's shutdown event stays set once fired. After this actor
         // has seen it (`shutting_down`), selecting on it again wins at once on
         // every turn, so the actor never parks and holds its executor for the
@@ -2785,6 +2890,8 @@ const Connection = struct {
             // stashed cipher suffix sit. The recv is unarmed in the last case.
             if (pump.pending_read != null or pump.pending_cipher != null or pump.conn.pendingInbound()) return null;
             std.debug.assert(pump.recv_armed or pump.send_armed);
+            diagActor(self, .select);
+            defer diagActor(self, .tls_turn);
             const winner = try zio.select(.{
                 .io = &pump.cq,
                 .comps = comps_ch.asyncReceive(),
@@ -3090,10 +3197,13 @@ const Connection = struct {
             _ = self.drainCompletions();
             self.drainPendingCompleteReceipts(false);
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
+            diagActor(self, .inline_handlers);
             if (!leaving and !self.writer_failed.load(.acquire)) self.runPendingInline();
 
             {
+                diagActor(self, .loop_lock);
                 self.lockSessionUncancelable(io);
+                diagActor(self, .running);
                 defer self.unlockSession(io);
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
                 if (leaving) {
@@ -5893,6 +6003,8 @@ const Connection = struct {
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
         if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
         const prep = self.prepareCompression(hctx, status, headers, null, sse);
+        diagWait(hctx, .start_reserve_ticket);
+        defer diagWait(hctx, .running);
         const ticket_pair = self.reserveTicket() catch |err| {
             if (hctx.encoder) |enc| {
                 enc.destroy();
@@ -5905,7 +6017,9 @@ const Connection = struct {
         const slot_i = ticket_pair[1];
         {
             errdefer self.tickets.releaseReserved(slot_i);
+            diagWait(hctx, .start_lock);
             try self.lockSession();
+            diagWait(hctx, .running);
             defer self.unlockSession(self.config.io);
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
@@ -5941,6 +6055,7 @@ const Connection = struct {
         }
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
+        diagWait(hctx, .start_wait_ticket);
         try self.waitTicket(stream_id, slot_i, hctx.terminal);
     }
 
@@ -6002,6 +6117,8 @@ const Connection = struct {
             const now = nowNs(io);
             if (now >= deadline_ns) return;
             const remain = deadline_ns - now;
+            diagWait(hctx, .deadline_wait);
+            defer diagWait(hctx, .running);
             const winner = zio.select(.{
                 .ev = event,
                 .dead = &self.dead,
@@ -6073,7 +6190,9 @@ const Connection = struct {
         const need_ticket = end;
         var ticket: u64 = 0;
         var slot_i: u32 = 0;
+        defer diagWait(hctx, .running);
         if (need_ticket) {
+            diagWait(hctx, .write_reserve_ticket);
             const ticket_pair = self.reserveTicket() catch |err| return err;
             ticket = ticket_pair[0];
             slot_i = ticket_pair[1];
@@ -6105,7 +6224,9 @@ const Connection = struct {
         }
         {
             errdefer if (need_ticket) self.tickets.releaseReserved(slot_i);
+            diagWait(hctx, .write_lock);
             try self.lockSession();
+            diagWait(hctx, .write_space_or_enqueue);
             if (traced) t_acquired = nowNs(self.config.io);
             defer self.unlockSession(self.config.io);
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
@@ -6160,6 +6281,7 @@ const Connection = struct {
         if (need_ticket) {
             hctx.slot.awaiting_receipt.store(true, .release);
             defer hctx.slot.awaiting_receipt.store(false, .release);
+            diagWait(hctx, .write_wait_ticket);
             try self.waitTicket(stream_id, slot_i, hctx.terminal);
         }
         if (traced) {

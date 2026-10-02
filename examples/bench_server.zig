@@ -418,10 +418,63 @@ const Cadence = struct {
 
 var g_cadence: Cadence = .{};
 
+/// Stuck-handler registry (t-2655 diagnosis): every SSE handler takes an
+/// entry on entry and clears it on exit. Stage 1 = entered, 2 = past
+/// startSse, 3 = first event written. `/stuck` lists live entries below
+/// stage 3 with the server's view of where each is blocked. Entries are
+/// handed out from a counter, never reused within a run; past the table
+/// size a handler is simply not tracked (counted in `stuck_untracked`).
+const StuckEntry = struct {
+    ctx: std.atomic.Value(usize) = .init(0),
+    stage: std.atomic.Value(u8) = .init(0),
+};
+const stuck_table_len = 16384;
+var g_stuck: [stuck_table_len]StuckEntry = [_]StuckEntry{.{}} ** stuck_table_len;
+var g_stuck_next: std.atomic.Value(usize) = .init(0);
+var g_stuck_untracked: std.atomic.Value(u64) = .init(0);
+
+fn stuckRegister(ctx: *anyopaque) ?*StuckEntry {
+    const i = g_stuck_next.fetchAdd(1, .monotonic);
+    if (i >= stuck_table_len) {
+        _ = g_stuck_untracked.fetchAdd(1, .monotonic);
+        return null;
+    }
+    g_stuck[i].stage.store(1, .release);
+    g_stuck[i].ctx.store(@intFromPtr(ctx), .release);
+    return &g_stuck[i];
+}
+
+fn stuckHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    var buf: [65536]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const n = @min(g_stuck_next.load(.acquire), stuck_table_len);
+    var listed: usize = 0;
+    for (g_stuck[0..n]) |*e| {
+        const stage = e.stage.load(.acquire);
+        const ctx = e.ctx.load(.acquire);
+        if (ctx == 0 or stage >= 3) continue;
+        listed += 1;
+        if (listed > 200) continue;
+        const st = conn_mod.diagHandlerState(@ptrFromInt(ctx));
+        w.print("stage={d} sid={d} conn=0x{x} wait={s} waited_ms={d} sched_term={d} sched_ord={d} sched_framed={d} sched_pending={d} sched_emits={d} stash_full={?} session_held={} live_task_handlers={d} conn_send_avail={d} actor_turns={d} actor_where={s} tls_carried={} tls_write_ch={d} tls_send_armed={} tls_recv_armed={} tls_pending_read={} tls_pending_cipher={}\n", .{
+            stage,                     st.stream_id,          st.conn_addr,        @tagName(st.wait),       st.waited_ms,
+            st.sched_terminal_len,     st.sched_ordinary_len, st.sched_framed_len, st.sched_active_pending, st.sched_emits_total,
+            st.tls_stash_full,         st.session_held,       st.live_task_handlers,
+            st.conn_send_available,    st.actor_turns,        @tagName(st.actor_where), st.tls_carried,      st.tls_write_ch_len,     st.tls_send_armed,
+            st.tls_recv_armed,         st.tls_pending_read,   st.tls_pending_cipher,
+        }) catch break;
+    }
+    w.print("stuck_listed={d} tracked={d} untracked={d}\n", .{ listed, n, g_stuck_untracked.load(.acquire) }) catch {};
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, w.buffered());
+}
+
 fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = g_cadence.entered_n.fetchAdd(1, .monotonic);
+    const stuck = stuckRegister(resp.ctx);
+    defer if (stuck) |e| e.ctx.store(0, .release);
     const t_enter = zio.Timestamp.now(.realtime).toNanoseconds();
     var body = try resp.startSse(&.{});
+    if (stuck) |e| e.stage.store(2, .release);
     const t_ready = zio.Timestamp.now(.realtime).toNanoseconds();
     if (t_ready >= t_enter) {
         const dt: u64 = @intCast(t_ready - t_enter);
@@ -486,6 +539,7 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
                 _ = g_cadence.inter_ns.fetchAdd(@intCast(t_write - p), .monotonic);
             }
         } else {
+            if (stuck) |e| e.stage.store(3, .release);
             _ = g_cadence.first_n.fetchAdd(1, .monotonic);
             if (t_write >= t_start) {
                 _ = g_cadence.first_ns.fetchAdd(@intCast(t_write - t_start), .monotonic);
@@ -732,6 +786,11 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             // so a wedged server can be inspected live without being started
             // under gdb, which changes its timing.
             out.allow_ptrace = true;
+        } else if (std.mem.eql(u8, a, "--diag-stuck")) {
+            // Diagnosis: record each handler's and actor's blocking point
+            // for /stuck (connection.diag_stuck; off by default because it
+            // writes atomics on the hot path).
+            conn_mod.diag_stuck = true;
         } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
             // Placement probe: every connection on executor 0 (same), or
             // alternating executors in accept order (split).
@@ -1045,6 +1104,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .{ .method = .GET, .path = "/trace", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = traceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence-reset", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceResetHandler } } },
+        .{ .method = .GET, .path = "/stuck", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = stuckHandler } } },
     };
 
     var cert_pem: []u8 = &.{};

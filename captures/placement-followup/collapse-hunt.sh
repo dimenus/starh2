@@ -20,7 +20,7 @@ for r in $(seq 1 $ROUNDS); do
   for rank in $RANKS; do
     extra="--spawn-placement local"
     [ "$rank" = none ] || extra="$extra --conn-balance --balance-rank $rank"
-    ./server --mode tls --port 0 --sse-interval-ms 1 --cert cert.pem --key key.pem --allow-ptrace $extra > srv.log 2>&1 &
+    ./server --mode tls --port 0 --sse-interval-ms 1 --cert cert.pem --key key.pem --allow-ptrace --diag-stuck $extra > srv.log 2>&1 &
     P=$!
     for i in $(seq 100); do PORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' srv.log | head -1); [ -n "$PORT" ] && break; sleep 0.05; done
     E=$(sed -n 's/.*"executors":\([0-9]*\).*/\1/p' srv.log | head -1)
@@ -38,6 +38,18 @@ for r in $(seq 1 $ROUNDS); do
       echo "cadence-1: $(curl -sk --http2 --max-time 5 https://127.0.0.1:$PORT/sse-cadence)"
       sleep 2
       echo "cadence-2: $(curl -sk --http2 --max-time 5 https://127.0.0.1:$PORT/sse-cadence)"
+      # Per-handler state: every live SSE handler that has not written its
+      # first event, with where the server says it is blocked.
+      curl -sk --http2 --max-time 5 https://127.0.0.1:$PORT/stuck > stuck-r$r-$rank-a.txt
+      sleep 2
+      curl -sk --http2 --max-time 5 https://127.0.0.1:$PORT/stuck > stuck-r$r-$rank-b.txt
+      echo "stuck dump: $(tail -1 stuck-r$r-$rank-b.txt)"; head -20 stuck-r$r-$rank-b.txt
+      # Kernel view of every TCP connection on the server port: a server
+      # socket with Send-Q 0 while the pump still has a send armed is a lost
+      # completion wake; a full Send-Q with a full client Recv-Q is a client
+      # that stopped reading.
+      ss -tni state established "( sport = :$PORT or dport = :$PORT )" > ss-r$r-$rank.txt
+      echo "ss: $(grep -c . ss-r$r-$rank.txt) lines; nonzero queues:"; awk 'NR > 1 && ($1 != 0 || $2 != 0)' ss-r$r-$rank.txt | head -12
       gdb -batch -p $P -ex "set pagination off" -ex "thread apply all bt 40" > stacks-r$r-$rank.txt 2>&1
       echo "stacks: $D/stacks-r$r-$rank.txt ($(grep -c '^Thread ' stacks-r$r-$rank.txt) threads)"
       sleep 25; wait $C 2>/dev/null; grep -E "streams=|NO EVENTS" client.out

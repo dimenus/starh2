@@ -1,0 +1,11 @@
+ 17:52:54 up 3 days,  1:39,  2 users,  load average: 1.17, 5.69, 7.35
+r1 rank=sum: COLLAPSE (client still waiting at 20 s)
+threads=1952357:1953 1952359:1829 1952365:1828 1952356:1809 1952360:1806 1952350:1781 1952362:1031 1952358:1012 1952361:941 1952363:904 1952364:787 1952366:637 1952433:19 1952423:16 
+cadence-1: {"loops":27221460,"sleeps":27212885,"skipped":8575,"writes":27219841,"first_n":1619,"inter_n":27218222,"late_n":26235787,"late_ge1ms":7986,"sleep_req_ns":0,"sleep_ns":0,"late_ns":934356962512,"write_ns":0,"yield_ns":0,"skip_behind_ns":4798992358,"first_ns":1727167148,"inter_ns":27218243455450,"start_sse_n":1619,"start_sse_ns":110045388,"start_sse_max":6772938,"entered_n":1620,"first_wait_in_n":1619,"first_wait_out_n":1619,"task_spawn_attempts":1620,"task_spawned":1620}
+cadence-2: {"loops":29969020,"sleeps":29960025,"skipped":8995,"writes":29967401,"first_n":1619,"inter_n":29965782,"late_n":28889076,"late_ge1ms":8406,"sleep_req_ns":0,"sleep_ns":0,"late_ns":1027467515410,"write_ns":0,"yield_ns":0,"skip_behind_ns":4982767711,"first_ns":1727167148,"inter_ns":29965811485296,"start_sse_n":1619,"start_sse_ns":110045388,"start_sse_max":6772938,"entered_n":1620,"first_wait_in_n":1619,"first_wait_out_n":1619,"task_spawn_attempts":1620,"task_spawned":1620}
+stuck dump: stuck_listed=1 tracked=1620 untracked=0
+stage=1 sid=469 conn=0x71dc7b57d0e0 wait=start_wait_ticket waited_ms=24005 sched_term=0 sched_ord=0 sched_framed=0 sched_pending=204 sched_emits=1042 stash_full=false session_held=false live_task_handlers=250 conn_send_avail=1073786920 actor_turns=333 tls_carried=true tls_write_ch=0 tls_send_armed=true tls_recv_armed=true tls_pending_read=false tls_pending_cipher=false
+stuck_listed=1 tracked=1620 untracked=0
+stacks: /tmp/starh2-collapse/stacks-r1-sum.txt (30 threads)
+r1           streams=1620 conns=18 opened=1619 delivering=0 failed=1 events=0 ended_early=0 scan_err=0
+r1           NO EVENTS — SSE delivered nothing while the connection was live
