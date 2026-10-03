@@ -1,6 +1,0 @@
-warning: overwriting existing dependency named 'zio'
-macos-sdk: no rejected SDK to probe
-arm rc8732b4: base=treeB src=/private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work/zio-0299e57-minus-c8732b4.tar.gz
-arm rc8732b4: zio-0.18.0-xHbVVECgKgCPCNB5CgYQgKlei1hNb0cuMtepqa7eNaH2
-arm rc8732b4: pub const scheduling: []const u8 = "work_stealing";
-arm rc8732b4: sha256=ff9172738ace899bd970c4bc8d810f0df82841a89b19acd1cc230ae1dab84d97

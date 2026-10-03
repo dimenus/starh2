@@ -1,4 +1,8 @@
 #!/bin/sh
+# The raw rows and logs this script reads or names are no longer in the repo.
+# They are in the off-repo archive ~/Dropbox/starh2-captures/pr14-placement-followup-captures-3a6fad3.tar.gz
+# (every file this branch added under captures/, as of 3a6fad3). Extract it at
+# the repo root to restore them before rerunning.
 # Placement probe: which executor thread runs each kind of server task while
 # SSE 500 streams run on ONE TLS connection (2 executors, 1 ms, 10 s), under
 # pinned scheduling with --spawn-placement local.

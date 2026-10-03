@@ -1,5 +1,10 @@
 # Balancer rank A/B on nachos: connections-first, handlers-first, sum
 
+The raw rows and logs this file names are no longer in the repo. They are in
+the off-repo archive `~/Dropbox/starh2-captures/pr14-placement-followup-captures-3a6fad3.tar.gz`, which holds every file this branch
+added under `captures/` as of commit 3a6fad3. Extract it at the repo root to
+restore them.
+
 Host: nachos (Linux, io_uring, 12 physical cores). One tree (commit 7c6844c,
 build in `rank-ab-build.txt`), one zio package, one pinned binary for all
 three ranks; the rank is a run flag (`--balance-rank`) and the ready line

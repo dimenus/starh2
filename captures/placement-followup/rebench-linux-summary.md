@@ -1,5 +1,10 @@
 # nachos re-bench: PLB with the six balancer fixes
 
+The raw rows and logs this file names are no longer in the repo. They are in
+the off-repo archive `~/Dropbox/starh2-captures/pr14-placement-followup-captures-3a6fad3.tar.gz`, which holds every file this branch
+added under `captures/` as of commit 3a6fad3. Extract it at the repo root to
+restore them.
+
 Host: nachos (Linux, io_uring, 12 physical cores). Commit 0932727 (the
 balancer fixes), binaries in `rebench-build.txt`. Arms: WS, WS2 (same binary
 and arguments as WS: the in-session A/A pair), PL (pinned + `.local`), PLB

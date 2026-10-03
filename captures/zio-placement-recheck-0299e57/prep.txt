@@ -1,5 +1,0 @@
-69031afe5b6827ee2ca2df9cedd4d98b6b2e68863a8763f9f5a52e5d15c18eab  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work4/bins/out-A/bin/starh2-bench-server
-dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work4/bins/out-PA/bin/starh2-bench-server
-dda3fd21a77d233ae3114192ade156dc1ff2822db31b6a01722ecdb5bf6c6806  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work4/bins/out-PL/bin/starh2-bench-server
-73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work4/bins/out-WSL/bin/starh2-bench-server
-73b2a7c1fc88e6769975f19a6f5612dd4d43e6581f6aa9be57374ba8bf0be915  /private/tmp/claude-501/-Users-rsaunderson-Source-mine-starh2/22a9cdb9-fa9e-492c-8935-ce120090b53e/scratchpad/work4/bins/out-WSL2/bin/starh2-bench-server

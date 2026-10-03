@@ -1,4 +1,8 @@
 #!/bin/sh
+# The raw rows and logs this script reads or names are no longer in the repo.
+# They are in the off-repo archive ~/Dropbox/starh2-captures/pr14-placement-followup-captures-3a6fad3.tar.gz
+# (every file this branch added under captures/, as of 3a6fad3). Extract it at
+# the repo root to restore them before rerunning.
 # The placement follow-up session on this Mac (kqueue), t-2502.
 #
 #   WORK=<dir from build.sh with TARGET=native> captures/placement-followup/run-mac.sh > mac-rows.txt
