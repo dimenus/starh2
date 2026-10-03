@@ -7,7 +7,6 @@
 #   tools/tls-stall-delta.sh NAME [options]
 #
 #   --mode tls|h2c        transport under test (default tls)
-#   --task-migration      pass --task-migration to the server
 #   --executors N         pass --executors N to the server
 #   --rounds R            rounds PER ARM (default 8)
 #   -n -c -m -t           h2load request/connection/stream/thread counts
@@ -59,7 +58,6 @@ fi
 name=$1
 shift
 mode=tls
-migrate=0
 executors=""
 rounds=8
 n=100000
@@ -79,7 +77,7 @@ allow_stale=0
 while [ $# -gt 0 ]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
-    --task-migration) migrate=1; shift ;;
+    --task-migration) echo "FAIL $name: --task-migration is gone. zio scheduling is the build option -Dzio-scheduling; the default, work_stealing, is migration on. Build the server with it and pass --bin." >&2; exit 2 ;;
     --executors) executors=$2; shift 2 ;;
     --rounds) rounds=$2; shift 2 ;;
     -n) n=$2; shift 2 ;;
@@ -171,9 +169,6 @@ fi
 server_args="--mode $mode --port 0 --cert $ROOT/testdata/cert.pem --key $ROOT/testdata/key.pem"
 if [ -n "$executors" ]; then
   server_args="$server_args --executors $executors"
-fi
-if [ "$migrate" -eq 1 ]; then
-  server_args="$server_args --task-migration"
 fi
 if [ "${STARH2_DIAG:-0}" = 1 ]; then
   server_args="$server_args --diag"
@@ -394,7 +389,7 @@ run_round() {
 
 # ------------------------------------------------------------------- drive
 
-echo "CASE $name mode=$mode migrate=$migrate executors=${executors:-auto} rounds=$rounds/arm h2load $h2_args"
+echo "CASE $name mode=$mode executors=${executors:-auto} rounds=$rounds/arm h2load $h2_args"
 echo "ARM $label_a sha=$sha_a port=$port_a pid=$pid_a"
 if [ "$compare" -eq 1 ]; then
   echo "ARM $label_b sha=$sha_b port=$port_b pid=$pid_b"
@@ -425,7 +420,7 @@ if [ "$a_rounds" -ne "$rounds" ]; then
 fi
 
 if [ "$compare" -eq 0 ]; then
-  echo "RESULT $name arm=$label_a sha=$sha_a rounds=$a_rounds stalls=$a_stalls notstarted=$a_notstarted other=$a_other slow=$a_slow mixed=$a_mixed migrate=$migrate"
+  echo "RESULT $name arm=$label_a sha=$sha_a rounds=$a_rounds stalls=$a_stalls notstarted=$a_notstarted other=$a_other slow=$a_slow mixed=$a_mixed"
   if [ "$a_stalls" -gt 0 ] || [ "$a_other" -gt 0 ] || [ "$a_notstarted" -gt 0 ]; then
     exit 1
   fi

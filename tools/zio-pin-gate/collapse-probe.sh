@@ -5,7 +5,10 @@
 # and fails the gate. Visible fail-closed rounds (failed>0) are counted but
 # do not fail this phase (t-984 tracks them; they predate every pin).
 #
-# Runs ON the io_uring host. Args: <server-bin> <client-bin> <cert> <key> <rounds>
+# Runs ON the io_uring host. Args: <server-bin> <client-bin> <cert> <key> <rounds> [server-args]
+# server-args are appended to the server command line (for example
+# "--spawn-placement local --conn-balance"); the server's ready line is
+# printed, so the log names the configuration that really ran.
 # Prints one verdict line per round and a final "PROBE-SUMMARY" line;
 # exits 1 on any silent collapse, 2 if fewer rounds ran than asked
 # (scope must be observable - a probe that ran nothing must not pass).
@@ -15,9 +18,10 @@ CLIENT=${2:?client bin}
 CERT=${3:?cert}
 KEY=${4:?key}
 ROUNDS=${5:-15}
+SRV_EXTRA=${6:-}
 D=$(mktemp -d /tmp/zio-pin-gate.XXXXXX)
 "$SRV_BIN" --mode tls --port 0 --executors 2 --sse-interval-ms 1 \
-  --cert "$CERT" --key "$KEY" > "$D/srv.log" 2>&1 &
+  --cert "$CERT" --key "$KEY" $SRV_EXTRA > "$D/srv.log" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 i=0; PORT=
@@ -27,6 +31,7 @@ while [ $i -lt 200 ]; do
   i=$((i+1)); sleep 0.05
 done
 [ -n "$PORT" ] || { echo "PROBE-SUMMARY rounds=0 silent=1 (no ready line)"; exit 2; }
+echo "server: $(grep '"ready"' "$D/srv.log" | head -1)"
 
 silent=0; visible=0; ran=0
 r=1

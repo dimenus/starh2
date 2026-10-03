@@ -239,7 +239,6 @@ test "counting allocator peak under live hello stays under ceiling" {
             .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         // FailingAllocator is not thread-safe; serialize the counting path.
         .executors = .exact(1),
-        .enable_task_migration = false,
     });
     defer rt.deinit();
 

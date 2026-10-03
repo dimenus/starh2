@@ -145,7 +145,6 @@ test "T1: 1 executor, ingest stays ready, waitUntil fires" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{
         .executors = .exact(1),
-        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(struct {
@@ -195,7 +194,6 @@ test "T2: two deadlines keep order; RST of one does not strand the other" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{
         .executors = .exact(2),
-        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(struct {
@@ -257,7 +255,6 @@ test "T3: terminal during waitUntil returns exact error and frees the heap" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{
         .executors = .exact(2),
-        .enable_task_migration = false,
     });
     defer rt.deinit();
     var handle = try rt.spawn(struct {

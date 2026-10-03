@@ -20,7 +20,8 @@ const starh2 = @import("starh2");
 
 const dummy: u8 = 0;
 
-const trace = starh2.edge.connection.trace;
+const conn_mod = starh2.edge.connection;
+const trace = conn_mod.trace;
 const write_trace = starh2.edge.wire_pump.write_trace;
 
 /// Bench-only counting wrapper. Installed on the server GPA when `--trace` is
@@ -272,6 +273,35 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
             write_trace.max_chunks.load(.acquire),
         },
     );
+    // Both stay 0 unless the build is pinned or single_executor AND Debug or
+    // -Dobserve=true; `placement_check` says which, so a 0 cannot pass for a
+    // check that never ran.
+    try w.print(
+        "\"placement_check\":{d},\"placement_checks\":{d},\"placement_mismatches\":{d},",
+        .{
+            @intFromBool(conn_mod.placement_check),
+            conn_mod.test_placement_checks.load(.acquire),
+            conn_mod.test_placement_mismatches.load(.acquire),
+        },
+    );
+    // Placement probe: per thread (kernel tid), how many units of work each
+    // kind of task ran there. Empty unless placement_check.
+    try w.print("\"probe_pid\":{d},\"probe_overflow\":{d},\"probe\":[", .{
+        if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0,
+        conn_mod.probe_overflow.load(.acquire),
+    });
+    var first_slot = true;
+    for (&conn_mod.probe_tids, 0..) |*slot, i| {
+        const tid = slot.load(.acquire);
+        if (tid == 0) continue;
+        try w.print("{s}{{\"tid\":{d}", .{ if (first_slot) "" else ",", tid });
+        first_slot = false;
+        inline for (@typeInfo(conn_mod.ProbeKind).@"enum".fields) |f| {
+            try w.print(",\"{s}\":{d}", .{ f.name, conn_mod.probe_counts[f.value][i].load(.acquire) });
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("],");
     try w.print(
         "\"encrypt_ns\":{d},\"encrypt_n\":{d},\"encrypt_bytes\":{d}," ++
             "\"decrypt_ns\":{d},\"decrypt_n\":{d},\"decrypt_in\":{d},\"decrypt_plain\":{d}," ++
@@ -365,6 +395,12 @@ const Cadence = struct {
     start_sse_n: std.atomic.Value(u64) = .init(0),
     start_sse_ns: std.atomic.Value(u64) = .init(0),
     start_sse_max: std.atomic.Value(u64) = .init(0),
+    /// Stage counters for a stuck-stream diagnosis: handlers that entered,
+    /// and handlers that entered / returned from their FIRST waitUntil.
+    /// With start_sse_n and first_n they show where a handler stopped.
+    entered_n: std.atomic.Value(u64) = .init(0),
+    first_wait_in_n: std.atomic.Value(u64) = .init(0),
+    first_wait_out_n: std.atomic.Value(u64) = .init(0),
 
     fn reset(self: *Cadence) void {
         inline for (.{
@@ -374,16 +410,90 @@ const Cadence = struct {
             &self.sleep_ns,      &self.late_ns,        &self.write_ns,
             &self.yield_ns,      &self.skip_behind_ns, &self.first_ns,
             &self.inter_ns,      &self.start_sse_n,    &self.start_sse_ns,
-            &self.start_sse_max,
+            &self.start_sse_max, &self.entered_n,     &self.first_wait_in_n,
+            &self.first_wait_out_n,
         }) |f| f.store(0, .release);
     }
 };
 
 var g_cadence: Cadence = .{};
 
+/// Stuck-handler registry (t-2655 diagnosis): every SSE handler takes an
+/// entry on entry and clears it on exit. Stage 1 = entered, 2 = past
+/// startSse, 3 = first event written. `/stuck` lists live entries below
+/// stage 3 with the server's view of where each is blocked. Entries are
+/// handed out from a counter, never reused within a run; past the table
+/// size a handler is simply not tracked (counted in `stuck_untracked`).
+const StuckEntry = struct {
+    ctx: std.atomic.Value(usize) = .init(0),
+    stage: std.atomic.Value(u8) = .init(0),
+    task: std.atomic.Value(usize) = .init(0),
+};
+const stuck_table_len = 16384;
+var g_stuck: [stuck_table_len]StuckEntry = [_]StuckEntry{.{}} ** stuck_table_len;
+var g_stuck_next: std.atomic.Value(usize) = .init(0);
+var g_stuck_untracked: std.atomic.Value(u64) = .init(0);
+
+fn stuckRegister(ctx: *anyopaque) ?*StuckEntry {
+    const i = g_stuck_next.fetchAdd(1, .monotonic);
+    if (i >= stuck_table_len) {
+        _ = g_stuck_untracked.fetchAdd(1, .monotonic);
+        return null;
+    }
+    g_stuck[i].stage.store(1, .release);
+    if (comptime @hasDecl(zio, "debugCurrentTaskHandle")) g_stuck[i].task.store(zio.debugCurrentTaskHandle(), .release);
+    g_stuck[i].ctx.store(@intFromPtr(ctx), .release);
+    return &g_stuck[i];
+}
+
+/// One task's scheduler view, from the diag zio hooks: tag (0 new, 1 ready =
+/// queued or running, 2 waiting = parked, 3 finished), whether it is its
+/// executor's current task, that executor's ring length and overflow, its
+/// pop counter (frozen = the executor runs nothing new), and its current task.
+fn printTaskDiag(w: *std.Io.Writer, label: []const u8, h: usize) !void {
+    if (comptime !@hasDecl(zio, "debugTaskExec")) return;
+    if (h == 0) return;
+    const st = zio.debugTaskStateByte(h);
+    const ex = zio.debugTaskExec(h);
+    try w.print("{s} task=0x{x} tag={d} awaken={d} exec={d} is_current={d} ring={d} overflow={d} exec_pops={d} exec_current=0x{x}\n", .{
+        label,                     h,                     st & 7, (st >> 3) & 1, ex & 0xff, (ex >> 8) & 1,
+        (ex >> 16) & 0xffffffff,   ex >> 48,              zio.debugTaskExecPops(h), zio.debugTaskExecCurrent(h),
+    });
+}
+
+fn stuckHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    var buf: [65536]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const n = @min(g_stuck_next.load(.acquire), stuck_table_len);
+    var listed: usize = 0;
+    for (g_stuck[0..n]) |*e| {
+        const stage = e.stage.load(.acquire);
+        const ctx = e.ctx.load(.acquire);
+        if (ctx == 0 or stage >= 3) continue;
+        listed += 1;
+        if (listed > 60) continue;
+        const st = conn_mod.diagHandlerState(@ptrFromInt(ctx));
+        w.print("stage={d} sid={d} conn=0x{x} wait={s} waited_ms={d} sched_term={d} sched_ord={d} sched_framed={d} sched_pending={d} sched_emits={d} stash_full={?} session_held={} live_task_handlers={d} conn_send_avail={d} actor_turns={d} actor_where={s} tls_carried={} tls_write_ch={d} tls_send_armed={} tls_recv_armed={} tls_pending_read={} tls_pending_cipher={}\n", .{
+            stage,                     st.stream_id,          st.conn_addr,        @tagName(st.wait),       st.waited_ms,
+            st.sched_terminal_len,     st.sched_ordinary_len, st.sched_framed_len, st.sched_active_pending, st.sched_emits_total,
+            st.tls_stash_full,         st.session_held,       st.live_task_handlers,
+            st.conn_send_available,    st.actor_turns,        @tagName(st.actor_where), st.tls_carried,      st.tls_write_ch_len,     st.tls_send_armed,
+            st.tls_recv_armed,         st.tls_pending_read,   st.tls_pending_cipher,
+        }) catch break;
+        printTaskDiag(&w, "  handler", e.task.load(.acquire)) catch break;
+        printTaskDiag(&w, "  actor", st.actor_task) catch break;
+    }
+    w.print("stuck_listed={d} tracked={d} untracked={d}\n", .{ listed, n, g_stuck_untracked.load(.acquire) }) catch {};
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, w.buffered());
+}
+
 fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = g_cadence.entered_n.fetchAdd(1, .monotonic);
+    const stuck = stuckRegister(resp.ctx);
+    defer if (stuck) |e| e.ctx.store(0, .release);
     const t_enter = zio.Timestamp.now(.realtime).toNanoseconds();
     var body = try resp.startSse(&.{});
+    if (stuck) |e| e.stage.store(2, .release);
     const t_ready = zio.Timestamp.now(.realtime).toNanoseconds();
     if (t_ready >= t_enter) {
         const dt: u64 = @intCast(t_ready - t_enter);
@@ -410,6 +520,7 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
     var next: i128 = std.Io.Clock.awake.now(g_io).nanoseconds + interval_ns;
     while (true) {
         _ = g_cadence.loops.fetchAdd(1, .monotonic);
+        conn_mod.probeNote(.handler_iter);
         const now_ns: i128 = std.Io.Clock.awake.now(g_io).nanoseconds;
         const deadline = next;
         if (deadline > now_ns) {
@@ -418,10 +529,13 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
             // on the actor-owned deadline heap; waitForActivity is the idle
             // arm of the same heap.
             const ts = std.Io.Timestamp.fromNanoseconds(@intCast(deadline));
+            const first_wait = prev_write == null;
+            if (first_wait) _ = g_cadence.first_wait_in_n.fetchAdd(1, .monotonic);
             body.waitUntil(ts) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 return err;
             };
+            if (first_wait) _ = g_cadence.first_wait_out_n.fetchAdd(1, .monotonic);
         } else {
             _ = g_cadence.skipped.fetchAdd(1, .monotonic);
             _ = g_cadence.skip_behind_ns.fetchAdd(@intCast(now_ns - deadline), .monotonic);
@@ -444,6 +558,7 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
                 _ = g_cadence.inter_ns.fetchAdd(@intCast(t_write - p), .monotonic);
             }
         } else {
+            if (stuck) |e| e.stage.store(3, .release);
             _ = g_cadence.first_n.fetchAdd(1, .monotonic);
             if (t_write >= t_start) {
                 _ = g_cadence.first_ns.fetchAdd(@intCast(t_write - t_start), .monotonic);
@@ -462,7 +577,9 @@ fn cadenceJson(w: *std.Io.Writer) !void {
             "\"sleep_req_ns\":{d},\"sleep_ns\":{d},\"late_ns\":{d}," ++
             "\"write_ns\":{d},\"yield_ns\":{d},\"skip_behind_ns\":{d}," ++
             "\"first_ns\":{d},\"inter_ns\":{d}," ++
-            "\"start_sse_n\":{d},\"start_sse_ns\":{d},\"start_sse_max\":{d}}}\n",
+            "\"start_sse_n\":{d},\"start_sse_ns\":{d},\"start_sse_max\":{d}," ++
+            "\"entered_n\":{d},\"first_wait_in_n\":{d},\"first_wait_out_n\":{d}," ++
+            "\"task_spawn_attempts\":{d},\"task_spawned\":{d}}}\n",
         .{
             g_cadence.loops.load(.acquire),
             g_cadence.sleeps.load(.acquire),
@@ -483,12 +600,17 @@ fn cadenceJson(w: *std.Io.Writer) !void {
             g_cadence.start_sse_n.load(.acquire),
             g_cadence.start_sse_ns.load(.acquire),
             g_cadence.start_sse_max.load(.acquire),
+            g_cadence.entered_n.load(.acquire),
+            g_cadence.first_wait_in_n.load(.acquire),
+            g_cadence.first_wait_out_n.load(.acquire),
+            conn_mod.diag_task_spawn_attempts.load(.acquire),
+            conn_mod.diag_task_spawned.load(.acquire),
         },
     );
 }
 
 fn cadenceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
-    var buf: [768]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try cadenceJson(&w);
     try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
@@ -567,10 +689,6 @@ const Args = struct {
     trace: bool = false,
     trace_every: u64 = 1024,
     executors: ?u8 = null,
-    // Default ON since the two-OS t-853 gate: both 60-round stall runs were
-    // clean with migration on, and migration off is the home of the bimodal
-    // placement bands. --no-task-migration keeps the A/B arm reachable.
-    task_migration: bool = true,
     // A/B knob (zio fork announce-ab): whether a wake from a running task
     // onto an empty ring wakes a parked executor. Needs a zio pin that
     // exports `setAnnounceRunningWakes`; the flag fails loud otherwise.
@@ -581,7 +699,29 @@ const Args = struct {
     /// oneshots on one connection, then shut down. Hyperfine/poop measure the
     /// whole program. Zero is refused: a no-op self-drive is not a result.
     self_drive_oneshots: ?usize = null,
+    /// A/B knob: where a connection spawns its own tasks. Null keeps the
+    /// build's `conn_placement`.
+    spawn_placement: ?zio.Placement = null,
+    conn_balance: bool = false,
+    /// Null keeps the Balancer's default rank.
+    balance_rank: ?starh2.Balancer.Rank = null,
+    placement_log: bool = false,
+    allow_ptrace: bool = false,
 };
+
+/// `--placement-log`: one line per placed connection, with the peer port (so
+/// a client can tag it) and every executor's counts after the reservation.
+/// Written with std.debug.print, which takes stderr's lock: a cost every
+/// balanced arm pays equally, and none of the unbalanced ones.
+fn placementLogLine(_: *anyopaque, b: *const starh2.Balancer, ei: zio.ExecutorId, peer_port: u16) void {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("PLACE port={d} exec={d} conns=", .{ peer_port, ei }) catch return;
+    for (b.conns, 0..) |*c, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", c.load(.monotonic) }) catch return;
+    w.writeAll(" handlers=") catch return;
+    for (b.handlers, 0..) |*h, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", h.load(.monotonic) }) catch return;
+    std.debug.print("{s}\n", .{w.buffered()});
+}
 
 fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
     var out: Args = .{};
@@ -605,10 +745,6 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.trace_every = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--executors")) {
             out.executors = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
-        } else if (std.mem.eql(u8, a, "--task-migration")) {
-            out.task_migration = true;
-        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
-            out.task_migration = false;
         } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
             out.announce_running_wakes = true;
         } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
@@ -623,6 +759,86 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidSelfDriveCount;
             out.self_drive_oneshots = n;
+        } else if (std.mem.eql(u8, a, "--spawn-placement")) {
+            const v = args.next() orelse return error.MissingValue;
+            if (std.mem.eql(u8, v, "auto")) {
+                out.spawn_placement = .auto;
+            } else if (std.mem.eql(u8, v, "local")) {
+                // zio would refuse every spawn with InvalidPlacement, and each
+                // refusal is a REFUSED_STREAM, so the run would look like a
+                // slow server instead of a wrong build.
+                if (conn_mod.zio_scheduling == .work_stealing) {
+                    std.debug.print("--spawn-placement local needs -Dzio-scheduling=pinned or single_executor; this build is work_stealing\n", .{});
+                    return error.PlacementNeedsPinnedBuild;
+                }
+                out.spawn_placement = .local;
+            } else if (std.mem.eql(u8, v, "prefer_local")) {
+                // EXPERIMENT: needs the patched zio this branch pins. A start
+                // hint, valid under every scheduling: under work_stealing the
+                // task may still migrate.
+                out.spawn_placement = .prefer_local;
+            } else {
+                std.debug.print("--spawn-placement takes auto, local or prefer_local, got {s}\n", .{v});
+                return error.InvalidSpawnPlacement;
+            }
+        } else if (std.mem.eql(u8, a, "--conn-balance")) {
+            // Load-aware connection placement (src/edge/balancer.zig).
+            // Pinned or single_executor builds only.
+            if (conn_mod.zio_scheduling == .work_stealing) {
+                std.debug.print("--conn-balance needs -Dzio-scheduling=pinned or single_executor\n", .{});
+                return error.ConnBalanceNeedsPinnedBuild;
+            }
+            out.conn_balance = true;
+        } else if (std.mem.eql(u8, a, "--balance-rank")) {
+            // Measurement: which Balancer.Rank --conn-balance uses.
+            const v = args.next() orelse return error.MissingValue;
+            out.balance_rank = std.meta.stringToEnum(starh2.Balancer.Rank, v) orelse {
+                std.debug.print("--balance-rank takes connections_first, handlers_first or sum, got {s}\n", .{v});
+                return error.InvalidBalanceRank;
+            };
+        } else if (std.mem.eql(u8, a, "--placement-log")) {
+            // Measurement: one PLACE line per balanced connection on stderr.
+            out.placement_log = true;
+        } else if (std.mem.eql(u8, a, "--allow-ptrace")) {
+            // Diagnosis: let any process of this user attach a debugger
+            // (Linux yama ptrace_scope=1 otherwise allows only an ancestor),
+            // so a wedged server can be inspected live without being started
+            // under gdb, which changes its timing.
+            out.allow_ptrace = true;
+        } else if (std.mem.eql(u8, a, "--diag-stuck")) {
+            // Diagnosis: record each handler's and actor's blocking point
+            // for /stuck (connection.diag_stuck; off by default because it
+            // writes atomics on the hot path).
+            conn_mod.diag_stuck = true;
+            // With a zio that exports the debug hooks, /stuck also shows each
+            // stuck task's scheduler state (queued, parked, running).
+            if (comptime @hasDecl(zio, "debugCurrentTaskHandle")) {
+                conn_mod.diag_task_handle_fn = &zio.debugCurrentTaskHandle;
+            }
+        } else if (std.mem.eql(u8, a, "--probe-conn-placement")) {
+            // Placement probe: every connection on executor 0 (same), or
+            // alternating executors in accept order (split).
+            const v = args.next() orelse return error.MissingValue;
+            if (!conn_mod.placement_check) {
+                std.debug.print("--probe-conn-placement needs -Dobserve=true and a pinned build\n", .{});
+                return error.ProbeNeedsObserveBuild;
+            }
+            conn_mod.probe_conn_force = std.meta.stringToEnum(conn_mod.ProbeConnForce, v) orelse {
+                std.debug.print("--probe-conn-placement takes none, same or split, got {s}\n", .{v});
+                return error.InvalidProbePlacement;
+            };
+        } else if (std.mem.eql(u8, a, "--probe-handler-placement")) {
+            // Placement probe: force SSE handlers onto the actor's executor
+            // (same) or the other one (other). Needs an observe, pinned build.
+            const v = args.next() orelse return error.MissingValue;
+            if (!conn_mod.placement_check) {
+                std.debug.print("--probe-handler-placement needs -Dobserve=true and a pinned build\n", .{});
+                return error.ProbeNeedsObserveBuild;
+            }
+            conn_mod.probe_handler_force = std.meta.stringToEnum(conn_mod.ProbeForce, v) orelse {
+                std.debug.print("--probe-handler-placement takes none, same or other, got {s}\n", .{v});
+                return error.InvalidProbePlacement;
+            };
         } else {
             return error.UnknownArgument;
         }
@@ -632,7 +848,6 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
 
 const RuntimeArgs = struct {
     executors: ?u8 = null,
-    task_migration: bool = true,
     announce_running_wakes: bool = true,
     batch_wake_sleepers: bool = true,
 };
@@ -647,10 +862,6 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
             const n = try std.fmt.parseInt(u8, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidExecutorCount;
             out.executors = n;
-        } else if (std.mem.eql(u8, a, "--task-migration")) {
-            out.task_migration = true;
-        } else if (std.mem.eql(u8, a, "--no-task-migration")) {
-            out.task_migration = false;
         } else if (std.mem.eql(u8, a, "--announce-running-wakes")) {
             out.announce_running_wakes = true;
         } else if (std.mem.eql(u8, a, "--no-announce-running-wakes")) {
@@ -883,6 +1094,20 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         const sweeper = try std.Thread.spawn(.{}, diagSweeperMain, .{});
         sweeper.detach();
     }
+    conn_mod.placement_override = args.spawn_placement;
+    // One balancer for this runtime, sized by the runtime itself.
+    if (args.allow_ptrace) {
+        if (comptime @import("builtin").os.tag != .linux) return error.AllowPtraceIsLinuxOnly;
+        const linux = std.os.linux;
+        const rc = linux.prctl(@intFromEnum(linux.PR.SET_PTRACER), linux.PR.SET_PTRACER_ANY, 0, 0, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.PrctlSetPtracerFailed;
+    }
+    var balancer_storage: ?starh2.Balancer = if (args.conn_balance) try starh2.Balancer.init(gpa, rt) else null;
+    defer if (balancer_storage) |*b| b.deinit(gpa);
+    if (balancer_storage) |*b| {
+        if (args.balance_rank) |r| b.rank = r;
+        if (args.placement_log) b.trace = .{ .ctx = @constCast(&dummy), .placed = placementLogLine };
+    }
     trace.enabled = args.trace;
     trace.sample_every = args.trace_every;
     write_trace.enabled = args.trace;
@@ -903,6 +1128,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .{ .method = .GET, .path = "/trace", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = traceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence-reset", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceResetHandler } } },
+        .{ .method = .GET, .path = "/stuck", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = stuckHandler } } },
     };
 
     var cert_pem: []u8 = &.{};
@@ -921,6 +1147,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .endpoints = &.{ep},
         .routes = &routes,
         .tls = tls_cfg,
+        .balancer = if (balancer_storage) |*b| b else null,
     });
     defer server.deinit(server_gpa);
 
@@ -931,11 +1158,27 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     // the moment it reads this, so it must never be printed on a timer. Port 0
     // binds a free port, and this line is how the harness learns which.
     const port = server.localAddress(0).getPort();
-    const exec_n = args.executors orelse starh2.physical_cpus.executorCount();
+    // The runtime's real width: a single_executor build resolves any
+    // requested width to 1, and the harness sizes its shapes from this.
+    const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d}}}\n",
-        .{ if (args.tls) "tls" else "h2c", port, exec_n, @as(u8, @intFromBool(args.announce_running_wakes)), @as(u8, @intFromBool(args.batch_wake_sleepers)) },
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d}}}\n",
+        .{
+            if (args.tls) "tls" else "h2c",
+            port,
+            exec_n,
+            @as(u8, @intFromBool(args.announce_running_wakes)),
+            @as(u8, @intFromBool(args.batch_wake_sleepers)),
+            @tagName(conn_mod.zio_scheduling),
+            @tagName(conn_mod.connPlacement()),
+            @as(u8, @intFromBool(conn_mod.placement_check)),
+            @tagName(conn_mod.probe_handler_force),
+            @tagName(conn_mod.probe_conn_force),
+            @as(u8, @intFromBool(balancer_storage != null)),
+            if (balancer_storage) |*b| @tagName(b.rank) else "none",
+            @as(u8, @intFromBool(balancer_storage != null and balancer_storage.?.trace != null)),
+        },
     );
     defer gpa.free(ready);
     var out = zio.stdout().writer(&.{});
@@ -964,10 +1207,6 @@ pub fn main(init: std.process.Init) !void {
             .prewarm = 256,
         },
         .executors = .exact(if (runtime_args.executors) |n| n else starh2.physical_cpus.executorCount()),
-        // zio a2b134a can strand a migrated socket task while both directions
-        // have queued kernel data. Keep I/O tasks on their home executor; the
-        // opt-in flag exists only to preserve the upstream reproducer.
-        .enable_task_migration = runtime_args.task_migration,
     });
     defer rt.deinit();
     // The knob is a process-wide switch in the zio fork (announce-ab); a pin

@@ -1,0 +1,104 @@
+diff --git a/src/runtime.zig b/src/runtime.zig
+index 2edf3a1..392ef2d 100644
+--- a/src/runtime.zig
++++ b/src/runtime.zig
+@@ -354,7 +354,7 @@ pub fn getNextExecutor(rt: *Runtime) error{RuntimeShutdown}!*Executor {
+ 
+ /// Where `spawnInto` places a new task.
+ ///
+-/// Only `.auto` is valid with `.work_stealing` scheduling. The other
++/// Only `.auto` and `.prefer_local` are valid with `.work_stealing` scheduling. The other
+ /// placements promise the task stays on the chosen executor for its whole
+ /// life, which holds only when tasks never migrate, so there they fail with
+ /// `error.InvalidPlacement`.
+@@ -366,12 +366,27 @@ pub const Placement = union(enum) {
+     local,
+     /// The executor with the given index, from zero up to the executor count.
+     executor: ExecutorId,
++    /// Start on the executor of the calling thread, and make no promise
++    /// after that: with `.work_stealing` the task may migrate like any other.
++    /// Valid with every scheduling. From a thread that is not an executor of
++    /// this runtime it falls back to `.auto`, because a hint must never be
++    /// the reason a spawn fails.
++    prefer_local,
+ };
+ 
+ pub const PlacementError = error{ RuntimeShutdown, InvalidPlacement };
+ 
+ pub fn getPlacementExecutor(rt: *Runtime, placement: Placement) PlacementError!*Executor {
+     if (placement == .auto) return getNextExecutor(rt);
++    if (placement == .prefer_local) {
++        if (getCurrentExecutorOrNull()) |executor| {
++            if (executor.runtime == rt) {
++                if (rt.shutting_down.load(.acquire)) return error.RuntimeShutdown;
++                return executor;
++            }
++        }
++        return getNextExecutor(rt);
++    }
+     if (migrates) return error.InvalidPlacement;
+ 
+     if (rt.shutting_down.load(.acquire)) {
+@@ -379,7 +394,7 @@ pub fn getPlacementExecutor(rt: *Runtime, placement: Placement) PlacementError!*
+     }
+ 
+     switch (placement) {
+-        .auto => unreachable,
++        .auto, .prefer_local => unreachable,
+         .local => {
+             const executor = getCurrentExecutorOrNull() orelse return error.InvalidPlacement;
+             if (executor.runtime != rt) return error.InvalidPlacement;
+@@ -2518,6 +2533,53 @@ test "runtime: spawnInto local placement from a foreign thread" {
+     try std.testing.expectEqual(error.InvalidPlacement, result.?);
+ }
+ 
++test "runtime: spawnInto prefer_local is valid under every scheduling" {
++    if (builtin.single_threaded) return error.SkipZigTest;
++
++    const H = struct {
++        fn currentId() ExecutorId {
++            return getCurrentExecutor().id;
++        }
++
++        fn parent(rt: *Runtime) !void {
++            const id = currentId();
++            var handle = try rt.spawnInto(.prefer_local, currentId, .{});
++            const child_id = handle.join();
++            // Without migration the hint is a promise; with it, the child may
++            // have been stolen before it ran, so only success is checked.
++            if (!migrates) try std.testing.expectEqual(id, child_id);
++
++            var group: Group = .init;
++            defer group.cancel();
++            for (0..8) |_| try group.spawnInto(.prefer_local, currentId, .{});
++            try group.wait();
++            try std.testing.expect(!group.hasFailed());
++        }
++
++        fn foreign(rt: *Runtime, result: *?anyerror, out: *?JoinHandle(ExecutorId)) void {
++            out.* = rt.spawnInto(.prefer_local, currentId, .{}) catch |err| {
++                result.* = err;
++                return;
++            };
++        }
++    };
++
++    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
++    defer runtime.deinit();
++
++    var handle = try runtime.spawnInto(.auto, H.parent, .{runtime});
++    try handle.join();
++
++    // From a thread that is not an executor, the hint falls back to `.auto`
++    // instead of failing the spawn.
++    var result: ?anyerror = null;
++    var foreign_handle: ?JoinHandle(ExecutorId) = null;
++    const thread = try std.Thread.spawn(.{}, H.foreign, .{ runtime, &result, &foreign_handle });
++    thread.join();
++    try std.testing.expectEqual(null, result);
++    _ = foreign_handle.?.join();
++}
++
+ test "runtime: multi-threaded execution with max executors" {
+     if (!multi_executor) return error.SkipZigTest;
+     const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(Executor.max_executors) });

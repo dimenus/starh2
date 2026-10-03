@@ -15,7 +15,7 @@
 const std = @import("std");
 const zio = @import("zio");
 
-var never_set: zio.ResetEvent = .init;
+var never_set: zio.Event = .init;
 
 const Shared = struct {
     ch: *zio.Channel(u64),

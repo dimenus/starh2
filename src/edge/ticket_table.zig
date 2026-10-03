@@ -50,7 +50,7 @@ const ok_fail: u8 = 1;
 const ok_pass: u8 = 2;
 
 pub const TicketWait = struct {
-    event: zio.ResetEvent = .init,
+    event: zio.Event = .init,
     ok: std.atomic.Value(u8) = .init(ok_none),
     in_use: std.atomic.Value(bool) = .init(false),
     ticket: std.atomic.Value(u64) = .init(0),
@@ -95,7 +95,7 @@ pub const TicketTable = struct {
     next_ticket: std.atomic.Value(u64) = .init(1),
     write_failed: std.atomic.Value(bool) = .init(false),
     /// Connection teardown event. One-shot, never reset. Null in unit tests.
-    dead: ?*zio.ResetEvent = null,
+    dead: ?*zio.Event = null,
 
     pub fn init(io: std.Io, slots: []TicketWait) TicketTable {
         for (slots) |*s| s.* = .{};
@@ -501,7 +501,7 @@ test "wait maps SlotTerminal connection_closed over WriteFailed" {
 test "wait returns through dead without a ticket signal" {
     var storage: [1]TicketWait = undefined;
     var table = TicketTable.init(std.testing.io, &storage);
-    var dead: zio.ResetEvent = .init;
+    var dead: zio.Event = .init;
     table.dead = &dead;
     var term: response.SlotTerminal = .{};
     const a = try table.reserve();
@@ -513,7 +513,7 @@ test "wait returns through dead without a ticket signal" {
 test "a completed-ok ticket survives dead (t-537)" {
     var storage: [1]TicketWait = undefined;
     var table = TicketTable.init(std.testing.io, &storage);
-    var dead: zio.ResetEvent = .init;
+    var dead: zio.Event = .init;
     table.dead = &dead;
     var term: response.SlotTerminal = .{};
     const a = try table.reserve();

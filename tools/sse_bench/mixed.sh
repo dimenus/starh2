@@ -56,8 +56,15 @@ cd "$REPO/tools/sse_bench"
 [ -f go.mod ] || printf 'module ssebench\n\ngo 1.26\n' > go.mod
 go build -o "$OUT/sse-client" ./client.go || exit 1
 
+# zio scheduling is a build option, not a server flag, so an A/B builds two
+# binaries. STARH2_ZIO_SCHEDULING=pinned builds the migration-off arm.
+if [ -n "${STARH2_TASK_MIGRATION:-}" ]; then
+  echo "FAIL: STARH2_TASK_MIGRATION is gone. zio scheduling is the build option -Dzio-scheduling: set STARH2_ZIO_SCHEDULING=pinned for migration off (default work_stealing)." >&2
+  exit 2
+fi
+STARH2_ZIO_SCHEDULING=${STARH2_ZIO_SCHEDULING:-work_stealing}
 cd "$REPO"
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
+./zb build starh2-bench-server -Doptimize=ReleaseFast -Dzio-scheduling="$STARH2_ZIO_SCHEDULING" --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 
 cd "$REPO/tools/sse_bench"
@@ -72,19 +79,13 @@ TRACE_ARGS=
 if [ "${TRACE:-0}" != 0 ]; then
   TRACE_ARGS=--trace
 fi
-# The server default is migration ON since the t-853 gate. Rows before that
-# flip are migration-off rows; STARH2_TASK_MIGRATION=0 rebuilds that arm.
-MIGRATION_ARGS=
-if [ "${STARH2_TASK_MIGRATION:-1}" = 0 ]; then
-  MIGRATION_ARGS=--no-task-migration
-fi
 EXECUTOR_ARGS=
 if [ "$STARH2_EXECUTORS" != auto ]; then
   EXECUTOR_ARGS="--executors $STARH2_EXECUTORS"
 fi
 bench_lock
 "$STARH2" --mode tls --port 19450 --sse-interval-ms "$INTERVAL" \
-  $EXECUTOR_ARGS $MIGRATION_ARGS $TRACE_ARGS > "$OUT/starh2.log" 2>&1 &
+  $EXECUTOR_ARGS $TRACE_ARGS > "$OUT/starh2.log" 2>&1 &
 S_PID=$!
 STARH2_WIDTH=$(starh2_width "$OUT/starh2.log") || { kill $S_PID; bench_unlock; exit 1; }
 WIDTH=$(opponent_width "$STARH2_WIDTH")

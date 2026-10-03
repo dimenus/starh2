@@ -22,6 +22,23 @@
 //   - with -stall, one stream stops reading; the p99 of the OTHERS is the
 //     number that matters, because that is head-of-line blocking made visible
 //   - with -oneshot-url, completed oneshots, rps, and oneshot p50/p99/max
+//   - streams whose body ended before the window closed (ended_early) and
+//     read errors (scan_err). A stream that opened, delivered, and then died
+//     counts in neither `failed` nor a low `delivering`, so without these a
+//     truncated run reads as clean.
+//   - `sse fair`: events per measured stream (min, median, max, and the count
+//     the interval promises when -interval-ms is set) and the longest gap
+//     between two events of one stream. Pooled percentiles are dominated by
+//     the fast streams; these show the slowest one.
+//   - `sse conns`: the same per TCP connection, keyed by the client port the
+//     Go transport really dialed (httptrace GotConn), because Go can open a
+//     second socket per Transport when the server's stream limit is hit.
+//
+// Mixed shapes (placement work, t-2502): -light-conns adds Transports that
+// carry -light-streams streams each; -churn-workers loops short connections
+// (a fresh Transport, -churn-reqs requests, closed) for the whole run, so the
+// server's accept order interleaves them with the long-lived ones;
+// -stagger-ms spaces out the long-lived connections' opens.
 package main
 
 import (
@@ -31,7 +48,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"sort"
 	"strconv"
@@ -42,11 +61,18 @@ import (
 )
 
 type result struct {
-	stream    int
-	events    int
-	latencies []time.Duration
-	err       error
-	stalled   bool
+	stream     int
+	transport  int
+	light      bool
+	port       int
+	events     int
+	latencies  []time.Duration
+	err        error
+	stalled    bool
+	endedEarly bool
+	scanErr    error
+	maxGap     time.Duration
+	lastRecv   int64
 }
 
 func main() {
@@ -59,6 +85,14 @@ func main() {
 	stall := flag.Bool("stall", false, "one stream stops reading after opening")
 	conns := flag.Int("conns", 1, "TCP connections to spread the streams over")
 	label := flag.String("label", "arm", "name for the report")
+	lightConns := flag.Int("light-conns", 0, "extra connections carrying -light-streams streams each")
+	lightStreams := flag.Int("light-streams", 10, "streams per light connection")
+	churnWorkers := flag.Int("churn-workers", 0, "workers looping short connections for the whole run")
+	churnReqs := flag.Int("churn-reqs", 5, "requests per short connection")
+	churnURL := flag.String("churn-url", "", "URL the short connections GET (required with -churn-workers)")
+	churnPauseMs := flag.Int("churn-pause-ms", 0, "pause after each short connection; paces the churn so closed sockets in TIME_WAIT cannot exhaust the client's ephemeral ports (about 16k on macOS)")
+	staggerMs := flag.Int("stagger-ms", 0, "delay between opening successive long-lived connections")
+	intervalMs := flag.Int("interval-ms", 0, "server SSE interval, for the expected events per stream (0: not reported)")
 	flag.Parse()
 	if *seconds <= 0 || *warmup < 0 || *conns <= 0 || *oneshotWorkers <= 0 {
 		fmt.Fprintln(os.Stderr, "-seconds and -conns and -oneshot-workers must be positive; -warmup must be non-negative")
@@ -76,6 +110,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "oneshot-only requires -oneshot-url")
 		os.Exit(1)
 	}
+	if *lightConns < 0 || *lightStreams <= 0 || *churnWorkers < 0 || *churnReqs <= 0 || *staggerMs < 0 || *intervalMs < 0 || *churnPauseMs < 0 {
+		fmt.Fprintln(os.Stderr, "-light-conns, -churn-workers, -stagger-ms, -interval-ms must be non-negative; -light-streams, -churn-reqs positive")
+		os.Exit(1)
+	}
+	if *churnWorkers > 0 && *churnURL == "" {
+		fmt.Fprintln(os.Stderr, "-churn-workers needs -churn-url")
+		os.Exit(1)
+	}
+	if *lightConns > 0 && *url == "" {
+		fmt.Fprintln(os.Stderr, "-light-conns needs -url")
+		os.Exit(1)
+	}
 	if *stall && *streams < 2 {
 		fmt.Fprintln(os.Stderr, "-stall needs at least two SSE streams")
 		os.Exit(1)
@@ -84,7 +130,7 @@ func main() {
 	// One http.Client per connection. Go pools one h2 connection per host per
 	// Transport, so N Transports is exactly N connections, and -conns 1 keeps
 	// the default shape: every stream multiplexed over ONE socket.
-	clients := make([]*http.Client, *conns)
+	clients := make([]*http.Client, *conns+*lightConns)
 	for i := range clients {
 		tr := &http.Transport{
 			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}},
@@ -99,15 +145,73 @@ func main() {
 	safety := time.AfterFunc(time.Duration(*seconds+*warmup+30)*time.Second, cancel)
 	defer safety.Stop()
 
-	results := make([]result, *streams)
+	// Heavy streams are 0..streams-1, spread over the first -conns
+	// Transports; light streams follow, -light-streams per light Transport.
+	total := *streams + *lightConns**lightStreams
+	results := make([]result, total)
 	var wg sync.WaitGroup
 	var ready sync.WaitGroup
-	if *streams > 0 {
-		ready.Add(*streams)
+	if total > 0 {
+		ready.Add(total)
 	}
 	var measurementStart atomic.Int64
 	measurementStart.Store(1<<63 - 1)
-	for i := 0; i < *streams; i++ {
+	var churnConns, churnN, churnErr atomic.Int64
+	var churnLat []time.Duration
+	var churnMu sync.Mutex
+	// Short connections start first, so they are already interleaving with
+	// the long-lived ones in the server's accept order.
+	for w := 0; w < *churnWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				tr := &http.Transport{
+					TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}},
+					ForceAttemptHTTP2: true,
+					MaxConnsPerHost:   1,
+				}
+				c := &http.Client{Transport: tr}
+				churnConns.Add(1)
+				for k := 0; k < *churnReqs && ctx.Err() == nil; k++ {
+					req, err := http.NewRequestWithContext(ctx, "GET", *churnURL, nil)
+					if err != nil {
+						churnErr.Add(1)
+						break
+					}
+					t0 := time.Now()
+					resp, err := c.Do(req)
+					if err != nil {
+						if ctx.Err() == nil {
+							churnErr.Add(1)
+						}
+						break
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					if resp.StatusCode != 200 {
+						churnErr.Add(1)
+						continue
+					}
+					if t0.UnixNano() < measurementStart.Load() {
+						continue
+					}
+					churnN.Add(1)
+					churnMu.Lock()
+					churnLat = append(churnLat, time.Since(t0))
+					churnMu.Unlock()
+				}
+				tr.CloseIdleConnections()
+				if *churnPauseMs > 0 {
+					select {
+					case <-ctx.Done():
+					case <-time.After(time.Duration(*churnPauseMs) * time.Millisecond):
+					}
+				}
+			}
+		}()
+	}
+	for i := 0; i < total; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -118,15 +222,31 @@ func main() {
 				}
 			}()
 			r := result{stream: i}
+			if i < *streams {
+				r.transport = i % *conns
+			} else {
+				r.light = true
+				r.transport = *conns + (i-*streams) / *lightStreams
+			}
 			// The stalled consumer is stream 0 and only when asked for.
 			r.stalled = *stall && i == 0
-			req, err := http.NewRequestWithContext(ctx, "GET", *url, nil)
+			if *staggerMs > 0 && r.transport > 0 {
+				time.Sleep(time.Duration(r.transport**staggerMs) * time.Millisecond)
+			}
+			tctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+				GotConn: func(info httptrace.GotConnInfo) {
+					if a, ok := info.Conn.LocalAddr().(*net.TCPAddr); ok {
+						r.port = a.Port
+					}
+				},
+			})
+			req, err := http.NewRequestWithContext(tctx, "GET", *url, nil)
 			if err != nil {
 				r.err = err
 				results[i] = r
 				return
 			}
-			resp, err := clients[i%len(clients)].Do(req)
+			resp, err := clients[r.transport].Do(req)
 			if err != nil {
 				r.err = err
 				results[i] = r
@@ -149,6 +269,7 @@ func main() {
 			}
 			sc := bufio.NewScanner(resp.Body)
 			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			var last int64
 			for sc.Scan() {
 				line := sc.Text()
 				if !strings.HasPrefix(line, "data: ") {
@@ -164,6 +285,18 @@ func main() {
 				}
 				r.events++
 				r.latencies = append(r.latencies, time.Duration(now-sent))
+				if last != 0 && time.Duration(now-last) > r.maxGap {
+					r.maxGap = time.Duration(now - last)
+				}
+				last = now
+			}
+			r.lastRecv = last
+			// The body ends at our cancel when the window closes. Ending, or
+			// erroring, while the context is still live is the server
+			// dropping a stream that had already opened.
+			if ctx.Err() == nil {
+				r.endedEarly = true
+				r.scanErr = sc.Err()
 			}
 			results[i] = r
 		}(i)
@@ -224,11 +357,26 @@ func main() {
 	stop.Stop()
 
 	var all []time.Duration
-	opened, delivered, failed, totalEvents := 0, 0, 0, 0
+	opened, delivered, failed, totalEvents, endedEarly, scanErrs := 0, 0, 0, 0, 0, 0
+	shown := 0
 	for _, r := range results {
 		if r.err != nil {
 			failed++
+			if shown < 5 {
+				fmt.Fprintf(os.Stderr, "%s stream %d failed: %v\n", *label, r.stream, r.err)
+				shown++
+			}
 			continue
+		}
+		if r.endedEarly {
+			endedEarly++
+			if r.scanErr != nil {
+				scanErrs++
+			}
+			if shown < 5 {
+				fmt.Fprintf(os.Stderr, "%s stream %d ended early after %d events: %v\n", *label, r.stream, r.events, r.scanErr)
+				shown++
+			}
 		}
 		opened++
 		if r.stalled {
@@ -253,17 +401,27 @@ func main() {
 		return samples[i]
 	}
 
-	if *streams > 0 {
-		fmt.Printf("%-12s streams=%d conns=%d opened=%d delivering=%d failed=%d events=%d\n",
-			*label, *streams, *conns, opened, delivered, failed, totalEvents)
+	if total > 0 {
+		fmt.Printf("%-12s streams=%d conns=%d opened=%d delivering=%d failed=%d events=%d ended_early=%d scan_err=%d\n",
+			*label, total, *conns+*lightConns, opened, delivered, failed, totalEvents, endedEarly, scanErrs)
 		if len(all) == 0 {
 			fmt.Printf("%-12s NO EVENTS — SSE delivered nothing while the connection was live\n", *label)
 			os.Exit(1)
 		}
 		fmt.Printf("%-12s sse latency p50=%v p99=%v max=%v\n",
 			*label, pct(all, 0.50).Round(time.Microsecond), pct(all, 0.99).Round(time.Microsecond), all[len(all)-1].Round(time.Microsecond))
+		printFairness(*label, results, *seconds, *intervalMs, measurementStart.Load()+int64(*seconds)*int64(time.Second))
 	} else {
 		fmt.Printf("%-12s oneshot-only conns=%d workers=%d\n", *label, *conns, *oneshotWorkers)
+	}
+
+	if *churnWorkers > 0 {
+		sort.Slice(churnLat, func(i, j int) bool { return churnLat[i] < churnLat[j] })
+		fmt.Printf("%-12s churn conns=%d ok=%d err=%d p50=%v p99=%v max=%v\n",
+			*label, churnConns.Load(), churnN.Load(), churnErr.Load(),
+			pct(churnLat, 0.50).Round(time.Microsecond),
+			pct(churnLat, 0.99).Round(time.Microsecond),
+			pct(churnLat, 1.0).Round(time.Microsecond))
 	}
 
 	if *oneshotURL != "" {
@@ -280,4 +438,88 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// printFairness reports the slowest stream and each TCP connection, over the
+// streams that opened and were read (the stalled one is excluded).
+func printFairness(label string, results []result, seconds, intervalMs int, windowEnd int64) {
+	var evs []int
+	var gapMax time.Duration
+	// A stream that goes silent has no later event to close a gap, so the
+	// silence from its last event (or from the window start, if it never
+	// delivered) to the window end counts as a gap too. `stopped` counts the
+	// streams that were silent for the last second or more of the window.
+	stopped := 0
+	windowStart := windowEnd - int64(seconds)*int64(time.Second)
+	type connAgg struct {
+		light                  bool
+		streams, deliv, events int
+		lat                    []time.Duration
+	}
+	conns := map[int]*connAgg{}
+	var order []int
+	for _, r := range results {
+		if r.err != nil || r.stalled {
+			continue
+		}
+		evs = append(evs, r.events)
+		if r.maxGap > gapMax {
+			gapMax = r.maxGap
+		}
+		from := max(r.lastRecv, windowStart)
+		if tail := time.Duration(windowEnd - from); tail > gapMax {
+			gapMax = tail
+		}
+		if windowEnd-from >= int64(time.Second) {
+			stopped++
+		}
+		c := conns[r.port]
+		if c == nil {
+			c = &connAgg{light: r.light}
+			conns[r.port] = c
+			order = append(order, r.port)
+		}
+		c.streams++
+		if r.events > 0 {
+			c.deliv++
+		}
+		c.events += r.events
+		c.lat = append(c.lat, r.latencies...)
+	}
+	if len(evs) == 0 {
+		return
+	}
+	sort.Ints(evs)
+	expected := "na"
+	if intervalMs > 0 {
+		expected = strconv.Itoa(seconds * 1000 / intervalMs)
+	}
+	fmt.Printf("%-12s sse fair ev_min=%d ev_p50=%d ev_max=%d expected=%s gap_max=%v stopped=%d\n",
+		label, evs[0], evs[len(evs)/2], evs[len(evs)-1], expected, gapMax.Round(time.Microsecond), stopped)
+	sort.Ints(order)
+	var b strings.Builder
+	var heavyP50, heavyP99, lightP99 time.Duration
+	nHeavy, nLight := 0, 0
+	for _, port := range order {
+		c := conns[port]
+		sort.Slice(c.lat, func(i, j int) bool { return c.lat[i] < c.lat[j] })
+		p50, p99 := time.Duration(0), time.Duration(0)
+		if len(c.lat) > 0 {
+			p50 = c.lat[len(c.lat)/2]
+			p99 = c.lat[min(len(c.lat)-1, int(float64(len(c.lat))*0.99))]
+		}
+		kind := "h"
+		if c.light {
+			kind = "l"
+			nLight++
+			lightP99 = max(lightP99, p99)
+		} else {
+			nHeavy++
+			heavyP50 = max(heavyP50, p50)
+			heavyP99 = max(heavyP99, p99)
+		}
+		fmt.Fprintf(&b, " %d:%s:%d/%d:%d:%d:%d", port, kind, c.deliv, c.streams, c.events, p50.Microseconds(), p99.Microseconds())
+	}
+	fmt.Printf("%-12s sse conns n=%d heavy=%d light=%d heavy_worst_p50us=%d heavy_worst_p99us=%d light_worst_p99us=%d [port:kind:delivering/streams:events:p50us:p99us]%s\n",
+		label, len(order), nHeavy, nLight, heavyP50.Microseconds(), heavyP99.Microseconds(), lightP99.Microseconds(), b.String())
 }
