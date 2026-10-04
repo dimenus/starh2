@@ -11,7 +11,7 @@
 #   reporting that as a result. Packed drain turns at -m 10 sit well below 0.4.
 #   inbound_records/req = leftover counter from the old record loop (stays 0).
 #   encrypt/decrypt/send ns/req = Clock.awake around sendAccountedWire; encrypt
-#   and decrypt clocks stay 0 because SSL_write lives in TlsPump, not the actor.
+#   and decrypt clocks stay 0 because encryption lives in TlsPump, not the actor.
 #   decrypt_loop / accAppend / accCompact = unused after TLS-as-stream.
 #   allocs/request   = counting-allocator calls on the server GPA (--trace only)
 #   alloc_ns/request = GPA rawAlloc wall time including two Clock.awake reads.

@@ -1,17 +1,18 @@
-//! TLS via memory BIOs. HTTP/2 never sees ciphertext.
+//! TLS through tls.zig's non-blocking API. HTTP/2 never sees ciphertext.
 //!
-//! The SSL object has exactly one owner: the actor task, which drives `Pump`
-//! methods on its own stack. Its BIOs are a bounded `BIO_new_bio_pair`, not
-//! socket-coupled callbacks. SSL_read and SSL_write never run on a second
-//! task — BoringSSL's SSL object is not thread-safe, so a write-only pump
-//! beside an actor-owned recv would be a data race.
+//! The cipher state (`tls.nonblock.Connection`) has exactly one owner: the
+//! actor task, which drives `Pump` methods on its own stack. Encrypt and
+//! decrypt are plain function calls over byte buffers this file owns. There
+//! is no BIO, and `decryptInto` never lets tls.zig hold plaintext between
+//! calls, so every unread byte is in `Conn.in_buf`, where the park predicate
+//! (`pendingInbound`) sees it.
 //!
 //! The pump is a `zio.CompletionQueue` driver owned by the actor. The socket
 //! read is a raw `ev.NetRecv` completion the actor submits and re-submits
-//! after each arrival. Outbound frames stash on `queueWire` and SSL_write
+//! after each arrival. Outbound frames stash on `queueWire` and are encrypted
 //! on `driveTlsTurn` via `writeChunks` (not on the `drainEmit` stack: that
-//! overflowed the coroutine). Ciphertext stages into the handshake
-//! writer's buffer and arms `ev.NetSend`. Acks apply locally in `post`.
+//! overflowed the coroutine). Records are encrypted straight into the send
+//! staging buffer, which arms `ev.NetSend`. Acks apply locally in `post`.
 //! The actor's idle wait is one `select` that includes `.io = &cq` and
 //! loses `.reads` and `.acks`. There is no wake Event, no dirty flag, no
 //! reset-then-recheck list: the lost-wake class of the old protocol is
@@ -25,12 +26,15 @@
 //! `waitForActivity` still serves handler completions, deadlines, the
 //! doorbell and the slow-consumer kill. It parks on the CQ, never the socket.
 //!
+//! The server speaks TLS 1.3 only (tls.zig has no TLS 1.2 server), offers no
+//! session resumption, and negotiates x25519, P-256 or P-384.
+//!
 //! This file takes a DIRECT zio dependency (the CQ, the channel, the raw
 //! completion). That is deliberate and open: an interface over the CQ would
 //! be two implementations of one contract. The std.Io purity of src/edge
 //! ends here; the h2c pumps remain std.Io-pure.
 const std = @import("std");
-const boring = @import("boring");
+const tls = @import("tls");
 const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
@@ -46,7 +50,7 @@ pub const observe = @import("build_options").observe;
 /// the bench shape; overlapping pumps would share the totals.
 ///
 /// `select` / `select_write` / `select_peek` stay in the schema so a
-/// memory-BIO build that still Selects is visible: they must collapse to
+/// build that still Selects is visible: they must collapse to
 /// zero. Bump sites for those three are gone. `dirty_skip_wait` joins them
 /// with the CQ driver: the dirty-flag protocol is deleted, so a non-zero
 /// value would mean the old wake machinery came back.
@@ -153,19 +157,34 @@ pub const alpn_h2 = "h2";
 pub const alpn_http11 = "http/1.1";
 pub const stream_buffer_size: usize = limits_mod.TLS_STREAM_BUFFER_SIZE;
 pub const cipher_chunk_size: usize = limits_mod.TLS_CIPHER_CHUNK_SIZE;
+/// One maximum TLS 1.3 record on the wire. Both `Conn` buffers are this
+/// size: a full inbound buffer then always holds a complete record, and an
+/// empty outbound buffer always takes a full-size record.
+pub const record_buffer_size: usize = limits_mod.TLS_RECORD_BUFFER_SIZE;
+/// TLS caps a record's plaintext at 2^14 bytes.
+pub const max_record_plaintext: usize = 16 * 1024;
 pub const MaxHandshakeIterations: u32 = 4096;
 
 comptime {
     std.debug.assert(stream_buffer_size >= 16 * 1024);
-    std.debug.assert(stream_buffer_size == limits_mod.TLS_STREAM_BUFFER_SIZE);
+    std.debug.assert(record_buffer_size == tls.input_buffer_len);
+    std.debug.assert(record_buffer_size >= tls.output_buffer_len);
     std.debug.assert(conn_buffer_bytes == limits_mod.TLS_CONN_BUFFER_BYTES);
     std.debug.assert(cipher_chunk_size == stream_buffer_size);
+    // The pump decrypts into one wire chunk, which must take a whole
+    // record payload or decrypt cannot make progress (see `decryptInto`).
+    std.debug.assert(limits_mod.WIRE_CHUNK_SIZE >= record_buffer_size - 5);
 }
 
-var alpn_select_ctx: AlpnCtx = .{};
+/// `Conn.in_buf` + `Conn.out_buf`.
+pub const conn_buffer_bytes: usize = record_buffer_size * 2;
 
-/// tcp in + tcp out + BioPair (ssl write buf + transport write buf).
-pub const conn_buffer_bytes: usize = stream_buffer_size * 4;
+/// Server preference order: `h2`, then `http/1.1`. A client that sends no
+/// ALPN gets no selection and is served HTTP/1.1 (`isHttp11Alpn(null)`). A
+/// client that offers only other protocols fails the handshake
+/// (no_application_protocol).
+const server_alpn = [_][]const u8{ alpn_h2, alpn_http11 };
+const max_alpn_len = 32;
 
 pub fn isHttp2Alpn(selected: ?[]const u8) bool {
     const proto = selected orelse return false;
@@ -177,142 +196,74 @@ pub fn isHttp11Alpn(selected: ?[]const u8) bool {
     return std.mem.eql(u8, proto, alpn_http11);
 }
 
-const AlpnCtx = struct {};
-
-/// Prefer `h2`. Fall back to `http/1.1`. An empty client list (no ALPN) selects
-/// `http/1.1`. Unknown-only lists are fatal.
-pub fn selectAlpn(_: *AlpnCtx, _: *boring.ssl.SslRef, input: []const u8) boring.ssl.AlpnSelectResult {
-    if (input.len == 0) return .{ .selected = alpn_http11 };
-    var index: usize = 0;
-    var h1: ?[]const u8 = null;
-    while (index < input.len) {
-        const protocol_len = input[index];
-        const start = index + 1;
-        const next = start + protocol_len;
-        if (next > input.len) break;
-        const proto = input[start..next];
-        if (std.mem.eql(u8, proto, alpn_h2)) return .{ .selected = proto };
-        if (std.mem.eql(u8, proto, alpn_http11)) h1 = proto;
-        index = next;
-    }
-    if (h1) |proto| return .{ .selected = proto };
-    return .alertFatal;
-}
-
-/// Server-wide SSL_CTX plus certificate. Borrowed by every TLS connection.
+/// Server-wide certificate and key. Borrowed by every TLS connection.
 pub const Acceptor = struct {
-    tls_context: boring.ssl.Context,
+    auth: tls.config.CertKeyPair,
+    gpa: std.mem.Allocator,
 
-    pub fn initFromPem(certificate_chain_pem: []const u8, private_key_pem: []const u8) !Acceptor {
-        boring.init();
-        var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
-        errdefer builder.deinit();
-
-        try loadCertificateChain(&builder, certificate_chain_pem);
-        var key = boring.pkey.PKey.fromPem(private_key_pem) catch return error.InvalidCertificate;
-        defer key.deinit();
-        builder.usePrivateKey(&key) catch return error.InvalidCertificate;
-        builder.checkPrivateKey() catch return error.InvalidCertificate;
-        builder.setVerify(boring.ssl.VerifyMode.none);
-        builder.setAlpnSelectCallback(AlpnCtx, &alpn_select_ctx, selectAlpn) catch
+    /// The chain is sent in PEM order, so the leaf must come first. tls.zig
+    /// drops certificates that are not valid now, so an expired-only chain
+    /// is an error here rather than a handshake that sends no certificate.
+    pub fn initFromPem(gpa: std.mem.Allocator, io: std.Io, certificate_chain_pem: []const u8, private_key_pem: []const u8) !Acceptor {
+        var auth = tls.config.CertKeyPair.fromSlice(gpa, io, certificate_chain_pem, private_key_pem) catch
             return error.InvalidCertificate;
-
-        return .{ .tls_context = builder.build() };
+        errdefer auth.deinit(gpa);
+        if (auth.bundle.bytes.items.len == 0) return error.InvalidCertificate;
+        return .{ .auth = auth, .gpa = gpa };
     }
 
     pub fn deinit(self: *Acceptor) void {
-        self.tls_context.deinit();
+        self.auth.deinit(self.gpa);
     }
 };
 
-/// Bench-server `--self-drive-oneshots` client: verify none, ALPN `h2` only.
-/// A separate SSL_CTX from the acceptor, so TlsPump stays the sole owner of
-/// the server SSL object. Do not use this on a production connection.
+/// Loopback client settings for tests and the bench server's
+/// `--self-drive-oneshots`: no certificate verification, `alpn_protocols`
+/// offered in order. Do not use this against a real peer.
 pub const ClientConnector = struct {
-    tls_context: boring.ssl.Context,
-
-    pub fn initWithBuilder(builder: *boring.ssl.ContextBuilder) ClientConnector {
-        return .{ .tls_context = builder.build() };
-    }
-
-    pub fn deinit(self: *ClientConnector) void {
-        self.tls_context.deinit();
-    }
+    alpn_protocols: []const []const u8,
 };
 
-pub fn loopbackClientConnector() !ClientConnector {
-    boring.init();
-    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
-    errdefer builder.deinit();
-    builder.setVerify(boring.ssl.VerifyMode.none);
-    try builder.setClientAlpnProtocol(alpn_h2);
-    return .initWithBuilder(&builder);
+pub fn loopbackClientConnector() ClientConnector {
+    return .{ .alpn_protocols = &.{alpn_h2} };
 }
 
-/// Loopback HTTP/1.1 client. Production never uses this — TlsPump owns the
-/// server SSL object.
-pub fn loopbackH1ClientConnector() !ClientConnector {
-    boring.init();
-    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
-    errdefer builder.deinit();
-    builder.setVerify(boring.ssl.VerifyMode.none);
-    try builder.setClientAlpnProtocol(alpn_http11);
-    return .initWithBuilder(&builder);
+/// Loopback HTTP/1.1 client.
+pub fn loopbackH1ClientConnector() ClientConnector {
+    return .{ .alpn_protocols = &.{alpn_http11} };
 }
 
 /// Client offers `h2` then `http/1.1`. The server must select `h2`.
-pub fn loopbackBothAlpnClientConnector() !ClientConnector {
-    boring.init();
-    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
-    errdefer builder.deinit();
-    builder.setVerify(boring.ssl.VerifyMode.none);
-    var wire: [1 + 2 + 1 + 8]u8 = undefined;
-    wire[0] = 2;
-    @memcpy(wire[1..][0..2], alpn_h2);
-    wire[3] = 8;
-    @memcpy(wire[4..][0..8], alpn_http11);
-    try builder.setClientAlpnProtos(&wire);
-    return .initWithBuilder(&builder);
+pub fn loopbackBothAlpnClientConnector() ClientConnector {
+    return .{ .alpn_protocols = &.{ alpn_h2, alpn_http11 } };
 }
 
 /// Client sends no ALPN. The server must select `http/1.1`.
-pub fn loopbackNoAlpnClientConnector() !ClientConnector {
-    boring.init();
-    var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
-    errdefer builder.deinit();
-    builder.setVerify(boring.ssl.VerifyMode.none);
-    return .initWithBuilder(&builder);
+pub fn loopbackNoAlpnClientConnector() ClientConnector {
+    return .{ .alpn_protocols = &.{} };
 }
 
-fn loadCertificateChain(builder: *boring.ssl.ContextBuilder, pem: []const u8) !void {
-    var stack = boring.x509.X509.stackFromPem(pem) catch return error.InvalidCertificate;
-    defer stack.deinit();
-    const n = stack.len() catch return error.InvalidCertificate;
-    if (n == 0) return error.InvalidCertificate;
-
-    const leaf_ref = (stack.get(0) catch return error.InvalidCertificate) orelse
-        return error.InvalidCertificate;
-    var leaf: boring.x509.X509 = .{ .ptr = leaf_ref.ptr };
-    builder.useCertificate(&leaf) catch return error.InvalidCertificate;
-    leaf.ptr = null;
-
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        const extra_ref = (stack.get(i) catch return error.InvalidCertificate) orelse
-            return error.InvalidCertificate;
-        var extra: boring.x509.X509 = .{ .ptr = extra_ref.ptr };
-        builder.add1ChainCert(&extra) catch return error.InvalidCertificate;
-        extra.ptr = null;
-    }
+/// Byte length of the first TLS record in `bytes` when all of it is
+/// present, else null. The record header is 5 bytes: type, version, and a
+/// big-endian u16 payload length.
+fn completeRecordLen(bytes: []const u8) ?usize {
+    if (bytes.len < 5) return null;
+    const len = 5 + @as(usize, std.mem.readInt(u16, bytes[3..5], .big));
+    if (bytes.len < len) return null;
+    return len;
 }
 
-/// Per-connection TLS stream. Heap-allocated and never moved.
+/// Per-connection TLS state. Heap-allocated and never moved.
 ///
 /// Production: the server handshake reads the socket on the connection's
 /// own task (`feedFromSocket`); after it, `Pump` (the CQ driver) is the sole
-/// socket reader (via its `ev.NetRecv` completion), the sole SSL owner, and
-/// the sole socket writer. The client loopback path uses both directions on
-/// one task.
+/// socket reader (via its `ev.NetRecv` completion), the sole owner of
+/// `cipher`, and the sole socket writer. The client loopback path uses both
+/// directions on one task.
+///
+/// Inbound ciphertext accumulates in `in_buf[in_head..in_fill]` and is
+/// decrypted from there. Outbound records are encrypted into `out_buf`:
+/// handshake flights first, then the Pump's send staging.
 ///
 /// Bind reader/writer on the task that will park on them: a Reader built on
 /// one task is not another task's wait context.
@@ -320,16 +271,23 @@ pub const Conn = struct {
     tcp_stream: std.Io.net.Stream = undefined,
     tcp_reader: std.Io.net.Stream.Reader = undefined,
     tcp_writer: std.Io.net.Stream.Writer = undefined,
-    tcp_reader_buffer: [stream_buffer_size]u8 = undefined,
-    tcp_writer_buffer: [stream_buffer_size]u8 = undefined,
-    ssl: boring.ssl.Ssl = .{ .ptr = null },
-    pair: boring.ssl.BioPair = .{ .ssl_bio = null, .transport_bio = null },
-    /// Alias of the SSL-side BIO so unread INBOUND ciphertext is countable
-    /// (BIO_ctrl_pending). Load-bearing: the pump's park condition depends
-    /// on it, because SSL_pending counts processed-record plaintext only and
-    /// is blind to whole unread records in the pair. Not owned; never deinit.
-    ssl_in_bio: boring.ssl.BioPair = .{ .ssl_bio = null, .transport_bio = null },
-    state: enum { empty, tcp, tls } = .empty,
+    out_buf: [record_buffer_size]u8 = undefined,
+    in_buf: [record_buffer_size]u8 = undefined,
+    in_head: usize = 0,
+    in_fill: usize = 0,
+    /// Client loopback only: plaintext `readPlain` has not returned yet.
+    /// The client decrypts in place, so it sits inside `in_buf`, before
+    /// `in_head`. The server path never sets these.
+    plain_head: usize = 0,
+    plain_end: usize = 0,
+    cipher: tls.nonblock.Connection = undefined,
+    /// Set by `setupAccept`: the handshake signs with its key.
+    acceptor: ?*Acceptor = null,
+    alpn_buf: [max_alpn_len]u8 = undefined,
+    alpn_len: ?usize = null,
+    /// The peer sent close_notify.
+    peer_closed: bool = false,
+    state: enum { empty, tcp, accepting, open } = .empty,
 
     pub fn initTcp(self: *Conn, stream: std.Io.net.Stream) void {
         self.* = .{};
@@ -337,83 +295,74 @@ pub const Conn = struct {
         self.state = .tcp;
     }
 
-    /// Client loopback: this task is the ciphertext source. Production
-    /// never calls this — the CQ driver reads the raw socket.
+    /// Unbuffered on both sides. After the handshake the CQ driver reads the
+    /// raw socket, so a buffered reader could strand prefetched ciphertext
+    /// in a buffer nothing drains again; every read lands in `in_buf`.
     pub fn bindIo(self: *Conn, io: std.Io) void {
-        self.bindReader(io);
-        self.bindWriter(io);
+        self.tcp_reader = self.tcp_stream.reader(io, &.{});
+        self.tcp_writer = self.tcp_stream.writer(io, &.{});
     }
 
-    pub fn bindReader(self: *Conn, io: std.Io) void {
-        self.tcp_reader = self.tcp_stream.reader(io, &self.tcp_reader_buffer);
-    }
-
-    pub fn bindWriter(self: *Conn, io: std.Io) void {
-        self.tcp_writer = self.tcp_stream.writer(io, &self.tcp_writer_buffer);
-    }
-
-    fn attachSsl(self: *Conn, ssl: boring.ssl.Ssl) !void {
-        var owned = ssl;
-        errdefer owned.deinit();
-        var pair = try boring.ssl.BioPair.init(stream_buffer_size);
-        errdefer pair.deinit();
-        const ssl_bio = pair.ssl_bio orelse return error.TlsHandshakeFailed;
-        owned.setBio(ssl_bio);
-        self.ssl_in_bio = .{ .ssl_bio = null, .transport_bio = ssl_bio };
-        pair.ssl_bio = null;
-        self.ssl = owned;
-        self.pair = pair;
-        self.state = .tls;
-    }
-
-    pub fn setupAccept(self: *Conn, acceptor: *Acceptor) !void {
+    pub fn setupAccept(self: *Conn, acceptor: *Acceptor) void {
         std.debug.assert(self.state == .tcp);
-        var ssl = try acceptor.tls_context.createSsl();
-        ssl.setAcceptState();
-        try self.attachSsl(ssl);
+        self.acceptor = acceptor;
+        self.state = .accepting;
     }
 
-    pub fn setupConnect(self: *Conn, connector: *ClientConnector) !void {
-        std.debug.assert(self.state == .tcp);
-        var ssl = try connector.tls_context.createSsl();
-        try ssl.setConnectHostname("localhost");
-        ssl.setConnectState();
-        try self.attachSsl(ssl);
+    /// The protocol ALPN selected, or null when the client sent no ALPN.
+    pub fn selectedAlpn(self: *const Conn) ?[]const u8 {
+        const n = self.alpn_len orelse return null;
+        return self.alpn_buf[0..n];
+    }
+
+    fn setAlpn(self: *Conn, proto: ?[]const u8) error{TlsHandshakeFailed}!void {
+        const p = proto orelse {
+            self.alpn_len = null;
+            return;
+        };
+        if (p.len > self.alpn_buf.len) return error.TlsHandshakeFailed;
+        @memcpy(self.alpn_buf[0..p.len], p);
+        self.alpn_len = p.len;
     }
 
     /// Server handshake, on the connection's own task. It reads the socket
-    /// directly (`feedFromSocket`); the CQ driver does not exist yet. The
-    /// reader is UNBUFFERED on purpose: after the handshake the CQ driver
-    /// reads the raw socket, so a buffered Reader here could strand
-    /// prefetched ciphertext in a buffer nothing drains again. Ciphertext
-    /// beyond the handshake (a pipelined preface) lands in the BIO pair and
-    /// is SSL_read by the caller.
+    /// directly (`feedFromSocket`); the CQ driver does not exist yet.
+    /// Ciphertext beyond the handshake (a pipelined preface) stays in
+    /// `in_buf` and is decrypted by `drainLeftoverPlain` or the pump.
     ///
     /// Returns `error.Canceled` when a socket wait was canceled, so a caller
     /// under `zio.withTimeout` gets `error.Timeout` for its own deadline.
     /// Every other failure is `error.TlsHandshakeFailed`.
     pub fn handshake(self: *Conn, io: std.Io) error{ Canceled, TlsHandshakeFailed }!void {
-        std.debug.assert(self.state == .tls);
-        self.tcp_reader = self.tcp_stream.reader(io, &.{});
-        self.bindWriter(io);
+        std.debug.assert(self.state == .accepting);
+        self.bindIo(io);
+        // TLS 1.3 only: the cipher does not keep the RNG after the
+        // handshake, so it may live on this frame.
+        var rng: std.Random.IoSource = .{ .io = io };
+        var hs = tls.nonblock.Server.init(.{
+            .rng = rng.interface(),
+            .auth = &self.acceptor.?.auth,
+            .alpn_protocols = &server_alpn,
+            .now = std.Io.Clock.real.now(io),
+        });
         var iterations: u32 = 0;
-        while (!self.ssl.isHandshakeComplete()) {
+        while (!hs.done()) {
             iterations += 1;
             if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
-            self.drainToSocket() catch return self.handshakeIoError();
-            self.ssl.doHandshake() catch |err| switch (err) {
-                error.WantRead => {
-                    // doHandshake may have produced a flight (ServerHello).
-                    // Drain it before parking or the peer never replies.
-                    self.drainToSocket() catch return self.handshakeIoError();
-                    if (self.ssl.isHandshakeComplete()) break;
-                    self.feedFromSocket() catch return self.handshakeIoError();
-                },
-                error.WantWrite => {},
-                else => return error.TlsHandshakeFailed,
-            };
+            const res = hs.run(self.in_buf[self.in_head..self.in_fill], &self.out_buf) catch
+                return error.TlsHandshakeFailed;
+            self.in_head += res.recv_pos;
+            if (res.send.len > 0) {
+                self.tcp_writer.interface.writeAll(res.send) catch return self.handshakeIoError();
+            }
+            if (hs.done()) break;
+            if (res.recv_pos == 0 and res.send.len == 0) {
+                self.feedFromSocket() catch return self.handshakeIoError();
+            }
         }
-        self.drainToSocket() catch return self.handshakeIoError();
+        try self.setAlpn(hs.alpnProtocol());
+        self.cipher = .init(hs.cipher().?);
+        self.state = .open;
     }
 
     /// The std.Io stream reader and writer report every socket error as one
@@ -431,210 +380,208 @@ pub const Conn = struct {
     }
 
     /// Drain leftover plaintext after handshake (a pipelined request). Stops
-    /// on WantRead. Never grows `buf`.
+    /// when no complete record is buffered or `buf` cannot take the next
+    /// record; anything left stays in `in_buf` for the pump.
     pub fn drainLeftoverPlain(self: *Conn, buf: []u8) usize {
         var n: usize = 0;
         while (n < buf.len) {
-            const r = self.ssl.read(buf[n..]) catch break;
-            if (r == 0) break;
-            n += r;
+            const got = self.decryptInto(buf[n..]) catch break;
+            if (got == 0) break;
+            n += got;
         }
         return n;
     }
 
-    fn handshakeLoop(self: *Conn, io: std.Io) !void {
-        _ = io;
-        var iterations: u32 = 0;
-        while (!self.ssl.isHandshakeComplete()) {
-            iterations += 1;
-            if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
-            self.drainToSocket() catch return error.TlsHandshakeFailed;
-            self.ssl.doHandshake() catch |err| switch (err) {
-                error.WantRead => {
-                    self.drainToSocket() catch return error.TlsHandshakeFailed;
-                    if (self.ssl.isHandshakeComplete()) break;
-                    self.feedFromSocket() catch return error.TlsHandshakeFailed;
-                },
-                error.WantWrite => {},
-                else => return error.TlsHandshakeFailed,
-            };
-        }
-        self.drainToSocket() catch return error.TlsHandshakeFailed;
-    }
-
     /// Single-task client handshake: this task is the ciphertext source.
-    pub fn handshakeClient(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
-        self.bindIo(io);
-        try self.setupConnect(connector);
-        try self.handshakeLoop(io);
-        if (!isHttp2Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
+    pub fn handshakeClient(self: *Conn, connector: *const ClientConnector, io: std.Io) !void {
+        try self.handshakeClientAny(connector, io);
+        if (!isHttp2Alpn(self.selectedAlpn())) return error.TlsHandshakeFailed;
     }
 
-    /// Single-task HTTP/1.1 client handshake. The test client is the
-    /// ciphertext source; the server still owns TlsPump on its SSL object.
-    pub fn handshakeClientH1(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
-        self.bindIo(io);
-        try self.setupConnect(connector);
-        try self.handshakeLoop(io);
-        if (!isHttp11Alpn(self.ssl.selectedAlpn())) return error.TlsHandshakeFailed;
+    /// Single-task HTTP/1.1 client handshake.
+    pub fn handshakeClientH1(self: *Conn, connector: *const ClientConnector, io: std.Io) !void {
+        try self.handshakeClientAny(connector, io);
+        if (!isHttp11Alpn(self.selectedAlpn())) return error.TlsHandshakeFailed;
     }
 
     /// Handshake with no ALPN assertion. The caller checks `selectedAlpn`.
-    pub fn handshakeClientAny(self: *Conn, connector: *ClientConnector, io: std.Io) !void {
+    pub fn handshakeClientAny(self: *Conn, connector: *const ClientConnector, io: std.Io) !void {
+        std.debug.assert(self.state == .tcp);
         self.bindIo(io);
-        try self.setupConnect(connector);
-        try self.handshakeLoop(io);
+        var rng: std.Random.IoSource = .{ .io = io };
+        var hs = tls.nonblock.Client.init(.{
+            .rng = rng.interface(),
+            .now = std.Io.Clock.real.now(io),
+            .host = "localhost",
+            .root_ca = .empty,
+            .insecure_skip_verify = true,
+            // TLS 1.3 only, like the server; a TLS 1.2 cipher would keep a
+            // pointer to `rng` past this frame.
+            .cipher_suites = tls.config.cipher_suites.tls13,
+            .alpn_protocols = connector.alpn_protocols,
+        });
+        var iterations: u32 = 0;
+        while (!hs.done()) {
+            iterations += 1;
+            if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
+            const res = hs.run(self.in_buf[self.in_head..self.in_fill], &self.out_buf) catch
+                return error.TlsHandshakeFailed;
+            self.in_head += res.recv_pos;
+            if (res.send.len > 0) {
+                self.tcp_writer.interface.writeAll(res.send) catch return error.TlsHandshakeFailed;
+            }
+            if (hs.done()) break;
+            if (res.recv_pos == 0 and res.send.len == 0) {
+                self.feedFromSocket() catch return error.TlsHandshakeFailed;
+            }
+        }
+        try self.setAlpn(hs.inner.alpn_protocol);
+        self.cipher = .init(hs.cipher().?);
+        self.state = .open;
     }
 
     pub fn deinit(self: *Conn) void {
-        switch (self.state) {
-            .empty, .tcp => {},
-            .tls => {
-                self.ssl.deinit();
-                self.pair.deinit();
-            },
-        }
         self.state = .empty;
     }
 
-    /// Blocking plaintext read for the bench-server loopback client.
+    /// Blocking plaintext read for the loopback clients. Returns 0 at end of
+    /// stream (close_notify or socket EOF).
     pub fn readPlain(self: *Conn, output: []u8) !usize {
-        std.debug.assert(self.state == .tls);
+        std.debug.assert(self.state == .open);
         if (output.len == 0) return 0;
         var iterations: u32 = 0;
-        while (true) {
+        while (self.plain_head == self.plain_end) {
             iterations += 1;
             if (iterations > MaxHandshakeIterations) return error.TlsReadFailed;
-            const n = self.ssl.read(output) catch |err| switch (err) {
-                error.WantRead => {
-                    self.drainToSocket() catch return error.TlsReadFailed;
-                    self.feedFromSocket() catch |feed_err| switch (feed_err) {
-                        error.TlsReadFailed => return 0,
-                        else => return error.TlsReadFailed,
-                    };
-                    continue;
-                },
-                error.WantWrite => {
-                    self.drainToSocket() catch return error.TlsReadFailed;
-                    continue;
-                },
-                error.ZeroReturn => return 0,
-                else => return error.TlsReadFailed,
-            };
-            return n;
+            if (self.peer_closed) return 0;
+            // In place: tls.zig allows the cleartext buffer to be the
+            // ciphertext buffer. The plaintext lands at `in_head`, inside
+            // the bytes this call consumes.
+            const region = self.in_buf[self.in_head..self.in_fill];
+            const res = self.cipher.decrypt(region, region) catch return error.TlsReadFailed;
+            std.debug.assert(self.cipher.inner.cleartext_buf.len == 0);
+            if (res.closed) self.peer_closed = true;
+            if (res.ciphertext_pos > 0) {
+                self.plain_head = self.in_head;
+                self.plain_end = self.in_head + res.cleartext.len;
+                self.in_head += res.ciphertext_pos;
+                continue;
+            }
+            self.feedFromSocket() catch return 0;
         }
+        const n = @min(output.len, self.plain_end - self.plain_head);
+        @memcpy(output[0..n], self.in_buf[self.plain_head..][0..n]);
+        self.plain_head += n;
+        return n;
     }
 
     pub fn writePlain(self: *Conn, input: []const u8) !void {
-        std.debug.assert(self.state == .tls);
+        std.debug.assert(self.state == .open);
         var off: usize = 0;
-        var iterations: u32 = 0;
         while (off < input.len) {
-            iterations += 1;
-            if (iterations > MaxHandshakeIterations) return error.TlsWriteFailed;
-            const n = self.ssl.write(input[off..]) catch |err| switch (err) {
-                error.WantRead => {
-                    self.drainToSocket() catch return error.TlsWriteFailed;
-                    self.feedFromSocket() catch return error.TlsWriteFailed;
-                    continue;
-                },
-                error.WantWrite => {
-                    self.drainToSocket() catch return error.TlsWriteFailed;
-                    continue;
-                },
-                else => return error.TlsWriteFailed,
-            };
-            if (n == 0) return error.TlsWriteFailed;
-            off += n;
+            const chunk = @min(input.len - off, max_record_plaintext);
+            const res = self.cipher.encrypt(input[off..][0..chunk], &self.out_buf) catch
+                return error.TlsWriteFailed;
+            if (res.cleartext_pos == 0) return error.TlsWriteFailed;
+            self.tcp_writer.interface.writeAll(res.ciphertext) catch return error.TlsWriteFailed;
+            off += res.cleartext_pos;
         }
-        self.drainToSocket() catch return error.TlsWriteFailed;
     }
 
-    /// Inbound ciphertext written into the pair that SSL has not consumed
-    /// yet. Invisible to `pendingPlaintext` (SSL_pending counts
-    /// processed-record plaintext only). The t-866 wedge was the pump
-    /// parking while this was non-zero: the client's next pipelined
-    /// requests sat as unread records in the pair, nothing ever re-woke the
-    /// pump for them, and the connection stopped for good.
-    pub fn pendingInboundCiphertext(self: *Conn) usize {
-        return self.ssl_in_bio.pending() catch 0;
+    /// Inbound ciphertext not decrypted yet, complete records or not. Diag.
+    pub fn pendingInboundCiphertext(self: *const Conn) usize {
+        return self.in_fill - self.in_head;
     }
 
-    /// Diag: outbound ciphertext SSL wrote that has not been drained to the
-    /// socket.
-    pub fn pendingOutboundCiphertext(self: *Conn) usize {
-        return self.pair.pending() catch 0;
-    }
-
-    /// The pump's park predicate for the inbound direction: work exists if
-    /// SSL holds decrypted bytes OR the pair holds unread records. One
-    /// implementation for both pump gate sites, so the two cannot drift;
+    /// The pump's park predicate for the inbound direction: a complete
+    /// record is buffered, so a decrypt can make progress. A partial record
+    /// is not work: the pump must park until the socket brings the rest.
+    /// One implementation for every pump gate site, so they cannot drift;
     /// the in-process record test pins this exact function.
-    pub fn pendingInbound(self: *Conn) bool {
-        return self.pendingPlaintext() > 0 or self.pendingInboundCiphertext() > 0;
+    pub fn pendingInbound(self: *const Conn) bool {
+        return completeRecordLen(self.in_buf[self.in_head..self.in_fill]) != null;
     }
 
-    pub fn pendingPlaintext(self: *Conn) usize {
-        std.debug.assert(self.state == .tls);
-        const ref = self.ssl.ref() catch return 0;
-        return ref.pending();
-    }
-
-    pub fn drainToSocket(self: *Conn) !void {
-        var buf: [stream_buffer_size]u8 = undefined;
-        while (true) {
-            const n = self.pair.readEncrypted(&buf) catch |err| switch (err) {
-                error.WantRead => break,
-                else => return error.TlsWriteFailed,
-            };
-            if (n == 0) break;
-            self.tcp_writer.interface.writeAll(buf[0..n]) catch return error.TlsWriteFailed;
+    /// Decrypt complete buffered records into `out`, one record per call into
+    /// tls.zig. 0 means no complete record is buffered, `out` cannot take the
+    /// next record's payload, or the peer closed (`peer_closed`). Records
+    /// that carry no application data (a KeyUpdate) are consumed without
+    /// adding bytes.
+    ///
+    /// One record at a time, and only into room for its whole payload: when
+    /// the output is smaller than the payload, tls.zig decrypts in place in
+    /// the ciphertext buffer and keeps a reference to that plaintext for the
+    /// next call. `in_buf` is compacted and refilled, so that plaintext
+    /// would be overwritten before it was read.
+    fn decryptInto(self: *Conn, out: []u8) !usize {
+        var n: usize = 0;
+        while (!self.peer_closed) {
+            const rec_len = completeRecordLen(self.in_buf[self.in_head..self.in_fill]) orelse break;
+            if (out.len - n < rec_len - 5) break;
+            const res = try self.cipher.decrypt(self.in_buf[self.in_head..][0..rec_len], out[n..]);
+            std.debug.assert(res.ciphertext_pos == rec_len);
+            std.debug.assert(res.cleartext.ptr == out[n..].ptr);
+            std.debug.assert(self.cipher.inner.cleartext_buf.len == 0);
+            self.in_head += rec_len;
+            n += res.cleartext.len;
+            if (res.closed) self.peer_closed = true;
         }
-        self.tcp_writer.interface.flush() catch return error.TlsWriteFailed;
+        return n;
+    }
+
+    /// Copy up to `bytes.len` of received ciphertext into `in_buf`. Returns
+    /// how much fit; 0 when `in_buf` is full.
+    fn acceptCipher(self: *Conn, bytes: []const u8) usize {
+        if (self.in_buf.len - self.in_fill < bytes.len) self.compactIn();
+        const n = @min(bytes.len, self.in_buf.len - self.in_fill);
+        @memcpy(self.in_buf[self.in_fill..][0..n], bytes[0..n]);
+        self.in_fill += n;
+        return n;
+    }
+
+    /// Move the undecrypted tail to the front of `in_buf`.
+    fn compactIn(self: *Conn) void {
+        std.debug.assert(self.plain_head == self.plain_end);
+        const len = self.in_fill - self.in_head;
+        std.mem.copyForwards(u8, self.in_buf[0..len], self.in_buf[self.in_head..self.in_fill]);
+        self.in_head = 0;
+        self.in_fill = len;
+        self.plain_head = 0;
+        self.plain_end = 0;
     }
 
     fn feedFromSocket(self: *Conn) !void {
-        var dest_buf: [stream_buffer_size]u8 = undefined;
-        var dest: [1][]u8 = .{&dest_buf};
+        self.compactIn();
+        if (self.in_fill == self.in_buf.len) return error.TlsReadFailed;
+        var dest: [1][]u8 = .{self.in_buf[self.in_fill..]};
         const n = self.tcp_reader.interface.readVec(&dest) catch return error.TlsReadFailed;
         if (n == 0) return error.TlsReadFailed;
-        var off: usize = 0;
-        while (off < n) {
-            const w = self.pair.writeEncrypted(dest_buf[off..n]) catch |err| switch (err) {
-                error.WantWrite => {
-                    self.drainToSocket() catch return error.TlsWriteFailed;
-                    continue;
-                },
-                else => return error.TlsReadFailed,
-            };
-            if (w == 0) return error.TlsReadFailed;
-            off += w;
-        }
+        self.in_fill += n;
     }
 };
 
-/// One task owns SSL_read and SSL_write. Concurrent pumps on one SSL object
-/// are a data race; this is the share-nothing owner.
+
+/// One task owns encrypt and decrypt. The cipher state is not thread-safe;
+/// this is the share-nothing owner.
 ///
 /// The pump is a `zio.CompletionQueue` driver. Inbound ciphertext is a raw
 /// `ev.NetRecv` completion into ONE read buffer, re-submitted only when the
-/// buffer is fully fed into the BIO pair (the pair's bound plus this buffer
-/// is the inbound backpressure). Outbound frames arrive on a
+/// buffer is fully copied into `Conn.in_buf` (that buffer's bound plus this
+/// one is the inbound backpressure). Outbound frames arrive on a
 /// `zio.Channel(WireChunk)`. The idle wait is one select over both; nothing
 /// is reset, so no publish can be missed. Socket writes stay on the driver
 /// so the SSE event path does not gain a hop.
 ///
 /// The socket write is a raw `ev.NetSend` completion on the SAME queue, not
-/// a blocking writer: the driver stages ciphertext from the BIO pair into
-/// `send_buf` and submits it; the completion is one more CQ wake. The driver
-/// therefore never parks on the socket. When the staging buffer is full
+/// a blocking writer: the driver encrypts records straight into `send_buf`
+/// and submits it; the completion is one more CQ wake. The driver therefore
+/// never parks on the socket. When `send_buf` cannot take the next record
 /// behind an in-flight send, the unfinished write batch stays in
-/// `pending_writes` (with the SSL_write offset of the partial chunk) and the
+/// `pending_writes` (with the plaintext offset of the partial chunk) and the
 /// driver waits on the CQ only; the send completion compacts, re-arms, and
-/// the batch resumes. That is the backpressure path, exactly where the old
-/// `writeAll` used to block. A chunk is acked once its record is written
-/// (in the pair or the staging buffer): the same hand-off semantics as
-/// before, one 16 KB buffer earlier.
+/// the batch resumes. That is the backpressure path (t-2655), exactly where
+/// the old `writeAll` used to block. A chunk is acked once its records are
+/// in the staging buffer.
 ///
 /// Ownership: the recv completion lives in this struct and is submitted
 /// only by the driver itself, so it never needs the heap. No other task
@@ -683,14 +630,14 @@ pub const Pump = struct {
     /// DATA batch. WritePump parks the same item in `carried`; dropping it
     /// here leaked tickets and, for a flush with outbound_release, held bytes.
     carried: ?wire_pump.WireChunk = null,
-    /// Plaintext already SSL_read, waiting for the actor to ingest. Aliases
+    /// Plaintext already decrypted, waiting for the actor to ingest. Aliases
     /// `plain_buf`. Must not drop: the cipher has advanced.
     pending_read: ?wire_pump.WireChunk = null,
-    /// Unconsumed suffix of `recv_buf`, stashed when the BIO pair was full
-    /// and `pending_read` blocked SSL_read. The recv op is not re-armed
+    /// Unconsumed suffix of `recv_buf`, stashed when `Conn.in_buf` was full
+    /// and `pending_read` blocked decrypt. The recv op is not re-armed
     /// while this is set, so the bytes cannot be overwritten.
     pending_cipher: ?[]const u8 = null,
-    /// SSL_read destination. Aliases the first `WIRE_CHUNK_SIZE` of
+    /// Decrypt destination. Aliases the first `WIRE_CHUNK_SIZE` of
     /// `chunk_storage` (already in `resourceUpperBound`); no new buffer.
     /// `pending_read` always points here, never a pool lease or a GPA chunk.
     plain_buf: []u8 = &.{},
@@ -704,9 +651,8 @@ pub const Pump = struct {
     recv_iov: [1]zio.os.iovec = undefined,
     recv_armed: bool = false,
     /// Outbound ciphertext staging for the driver's raw `ev.NetSend`. Aliases
-    /// `conn.tcp_writer_buffer`: the blocking writer is handshake-only once
-    /// `run()` starts, so the buffer costs nothing new and the memory ceiling
-    /// is unchanged. `[send_head..send_fill)` is staged; the in-flight send
+    /// `conn.out_buf`: the handshake flights are done once `run()` starts, so
+    /// the buffer costs nothing new. `[send_head..send_fill)` is staged; the in-flight send
     /// covers a prefix of it. `send_op` is rebuilt per submit (the slice
     /// changes); it is only touched after the CQ handed it back.
     send_op: zio.ev.NetSend = undefined,
@@ -716,9 +662,8 @@ pub const Pump = struct {
     send_fill: usize = 0,
     send_armed: bool = false,
     /// A write batch that could not finish because the staging buffer is full
-    /// behind an in-flight send. `partial_off` is the plaintext offset SSL_write
-    /// already accepted for `pending_writes[0]` (SSL_write retries must pass the
-    /// same buffer, and they do: the chunk bytes do not move). Nothing new is
+    /// behind an in-flight send. `partial_off` is the plaintext offset already
+    /// encrypted for `pending_writes[0]` (the chunk bytes do not move). Nothing new is
     /// taken from `write_ch` while this is non-empty.
     pending_writes: [max_write_batch]wire_pump.WireChunk = undefined,
     pending_n: usize = 0,
@@ -813,42 +758,11 @@ pub const Pump = struct {
         self.post(.{ .fail_all = true });
     }
 
-    const Stage = enum { ok, full, exit };
-
-    /// Move ciphertext from the BIO pair into the staging buffer and (re)arm
-    /// the send completion. `.full`: the pair still holds records and the
-    /// buffer cannot take them until the in-flight send completes; the caller
-    /// parks on the CQ, never on the socket. `.exit`: CQ closed (teardown).
-    fn stageOutbound(self: *Pump) Stage {
-        while (self.conn.pendingOutboundCiphertext() > 0) {
-            if (self.send_fill == self.send_buf.len) {
-                if (self.send_head > 0 and !self.send_armed) {
-                    self.compactSend();
-                } else break;
-            }
-            const n = self.conn.pair.readEncrypted(self.send_buf[self.send_fill..]) catch |err| switch (err) {
-                error.WantRead => break,
-                else => {
-                    if (diag_wait) rawPrint("TLSERR ssl_write {s}\n", .{@errorName(err)});
-                    _ = tls_stage_failed.fetchAdd(1, .monotonic);
-                    self.failDrain();
-                    self.post(.{ .shutdown = true });
-                    return .exit;
-                },
-            };
-            if (n == 0) break;
-            self.send_fill += n;
-        }
-        if (!self.armSend()) return .exit;
-        if (self.conn.pendingOutboundCiphertext() > 0 and self.send_fill == self.send_buf.len) return .full;
-        return .ok;
-    }
-
-    /// Like `stageOutbound` for callers that only need to know whether the
-    /// connection is still alive; `.full` is tolerated (the records stay in
-    /// the pair and the next send completion stages them).
+    /// Records are encrypted straight into `send_buf`, so staging is only
+    /// arming the send for what is there. False only when the CQ is already
+    /// closed (teardown).
     fn stageOrExit(self: *Pump) bool {
-        return self.stageOutbound() != .exit;
+        return self.armSend();
     }
 
     fn compactSend(self: *Pump) void {
@@ -877,8 +791,9 @@ pub const Pump = struct {
         return true;
     }
 
-    /// The send completion fired: advance, compact, stage what the pair still
-    /// holds, re-arm. A short send is just a smaller advance.
+    /// The send completion fired: advance, compact, re-arm for what is still
+    /// staged. A short send is just a smaller advance. A batch parked on a
+    /// full `send_buf` resumes on the actor's next turn (`drivePending`).
     fn onSendComplete(self: *Pump) RecvOutcome {
         self.send_armed = false;
         const n = self.send_op.getResult() catch |err| switch (err) {
@@ -901,17 +816,14 @@ pub const Pump = struct {
         } else {
             self.compactSend();
         }
-        return switch (self.stageOutbound()) {
-            .exit => .exit,
-            .ok, .full => .ok,
-        };
+        return if (self.armSend()) .ok else .exit;
     }
 
     const Feed = enum { done, blocked, eof };
 
-    /// Write ciphertext into the pair. `consumed` is updated on every path.
-    /// `.blocked` means inbound cannot make progress (pending plaintext the
-    /// actor has not taken, or no read-pool index). Caller must stash the
+    /// Copy ciphertext into `Conn.in_buf`. `consumed` is updated on every
+    /// path. `.blocked` means inbound cannot make progress (pending plaintext
+    /// the actor has not taken, or no read-pool index). Caller must stash the
     /// rest and service `write_ch` — spinning here to MaxHandshakeIterations
     /// failDrains the connection while SETTINGS still sit on the write queue.
     fn feedCipher(self: *Pump, bytes: []const u8, consumed: *usize) Feed {
@@ -925,34 +837,29 @@ pub const Pump = struct {
                 self.post(.{ .shutdown = true });
                 return .eof;
             }
-            const n = self.conn.pair.writeEncrypted(bytes[consumed.*..]) catch |err| switch (err) {
-                error.WantWrite => {
-                    if (self.pending_read != null) return .blocked;
-                    switch (self.readOne()) {
-                        .eof => return .eof,
-                        .ok => {
-                            if (self.pending_read != null) return .blocked;
-                        },
-                        .stuck => return .blocked,
-                        .want => {},
-                    }
-                    if (!self.stageOrExit()) return .eof;
-                    continue;
-                },
-                else => {
-                    if (diag_wait) rawPrint("TLSERR recv {s}\n", .{@errorName(err)});
-                    self.failDrain();
-                    self.post(.{ .shutdown = true });
-                    return .eof;
-                },
-            };
-            if (n == 0) {
-                if (diag_wait) rawPrint("TLSERR recv_eof\n", .{});
+            const n = self.conn.acceptCipher(bytes[consumed.*..]);
+            if (n > 0) {
+                consumed.* += n;
+                continue;
+            }
+            // `in_buf` is full. It holds one maximum record, so a full buffer
+            // without a complete record is a record longer than TLS allows.
+            if (!self.conn.pendingInbound()) {
+                if (diag_wait) rawPrint("TLSERR oversized_record\n", .{});
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return .eof;
             }
-            consumed.* += n;
+            if (self.pending_read != null) return .blocked;
+            switch (self.readOne()) {
+                .eof => return .eof,
+                .ok => {
+                    if (self.pending_read != null) return .blocked;
+                },
+                .stuck => return .blocked,
+                .want => {},
+            }
+            if (!self.stageOrExit()) return .eof;
         }
         return .done;
     }
@@ -986,71 +893,49 @@ pub const Pump = struct {
 
     const WriteSome = enum { done, full, exit };
 
-    /// SSL_write `bytes` from `self.partial_off` on. `.full`: the staging
-    /// buffer is full behind an in-flight send and `partial_off` holds the
-    /// progress; the caller keeps the chunk pending and parks on the CQ.
-    fn sslWriteSome(self: *Pump, bytes: []const u8) WriteSome {
+    /// Encrypt `bytes` from `self.partial_off` on, one full-size record at a
+    /// time, straight into `send_buf`. `.full`: `send_buf` cannot take the
+    /// next record behind an in-flight send and `partial_off` holds the
+    /// progress; the caller keeps the chunk pending and parks on the CQ
+    /// (t-2655). A record is only encrypted when all of it fits, so record
+    /// sizes follow the write chunks (the packing in `emit_batch`), never
+    /// the space left in the buffer.
+    fn encryptSome(self: *Pump, bytes: []const u8) WriteSome {
         var spins: u32 = 0;
         while (self.partial_off < bytes.len) {
             spins += 1;
             if (spins > MaxHandshakeIterations) {
                 _ = tls_stage_failed.fetchAdd(1, .monotonic);
-                if (diag_wait) rawPrint("TLSERR sslwrite_spins\n", .{});
+                if (diag_wait) rawPrint("TLSERR encrypt_spins\n", .{});
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return .exit;
             }
-            const n = self.conn.ssl.write(bytes[self.partial_off..]) catch |err| switch (err) {
-                error.WantWrite => {
-                    switch (self.stageOutbound()) {
-                        .exit => return .exit,
-                        .full => return .full,
-                        .ok => continue,
-                    }
-                },
-                error.WantRead => {
-                    switch (self.readOne()) {
-                        .eof => return .exit,
-                        .ok => continue,
-                        .stuck => return .full,
-                        .want => {
-                            if (self.pending_cipher != null) {
-                                if (!self.consumeInbound()) return .exit;
-                                continue;
-                            }
-                            switch (self.pollRecv()) {
-                                .progress => continue,
-                                .exit => return .exit,
-                                .none => return .full,
-                            }
-                        },
-                    }
-                },
-                else => {
-                    if (diag_wait) rawPrint("TLSERR stage {s}\n", .{@errorName(err)});
-                    _ = tls_stage_failed.fetchAdd(1, .monotonic);
-                    self.failDrain();
-                    self.post(.{ .shutdown = true });
-                    return .exit;
-                },
+            const chunk = bytes[self.partial_off..][0..@min(bytes.len - self.partial_off, max_record_plaintext)];
+            const need = self.conn.cipher.encryptedLength(chunk.len);
+            if (self.send_buf.len - self.send_fill < need) {
+                if (!self.send_armed and self.send_head > 0) {
+                    self.compactSend();
+                    continue;
+                }
+                // Whatever is staged must be in flight, or nothing would
+                // ever free the buffer and the park would never end.
+                if (!self.armSend()) return .exit;
+                return .full;
+            }
+            const res = self.conn.cipher.encrypt(chunk, self.send_buf[self.send_fill..]) catch |err| {
+                if (diag_wait) rawPrint("TLSERR encrypt {s}\n", .{@errorName(err)});
+                _ = tls_stage_failed.fetchAdd(1, .monotonic);
+                self.failDrain();
+                self.post(.{ .shutdown = true });
+                return .exit;
             };
-            self.partial_off += n;
+            std.debug.assert(res.cleartext_pos == chunk.len);
+            self.send_fill += res.ciphertext.len;
+            self.partial_off += chunk.len;
         }
         self.partial_off = 0;
         return .done;
-    }
-
-    fn consumeInbound(self: *Pump) bool {
-        if (self.pending_cipher) |bytes| {
-            self.pending_cipher = null;
-            return self.ingestCipher(bytes);
-        }
-        switch (self.pollRecv()) {
-            .progress => return true,
-            .exit => return false,
-            .none => {},
-        }
-        return true;
     }
 
     /// Take a batch off `write_ch` (first already taken) into `pending_writes`
@@ -1119,28 +1004,25 @@ pub const Pump = struct {
         self.partial_off = 0;
     }
 
-    /// SSL_write the pending batch in order; ack each chunk as its record is
-    /// written; stop (keep the rest pending) when the staging buffer is full
+    /// Encrypt the pending batch in order; ack each chunk once its records
+    /// are staged; stop (keep the rest pending) when the staging buffer is full
     /// behind an in-flight send. Returns false on exit.
     pub fn drivePending(self: *Pump) bool {
         while (self.pending_n > 0) {
             const chunk = self.pending_writes[0];
             if (chunk.len == 0 and chunk.bytes.len == 0) {
-                // A flush barrier: everything before it must be staged.
+                // A flush barrier: everything before it is already staged;
+                // make sure it is on its way.
                 std.debug.assert(chunk.flush_barrier);
-                switch (self.stageOutbound()) {
-                    .exit => {
-                        self.failPending();
-                        return false;
-                    },
-                    .full => return true,
-                    .ok => {},
+                if (!self.armSend()) {
+                    self.failPending();
+                    return false;
                 }
                 self.popPending();
                 self.releaseChunk(chunk, true, false);
                 continue;
             }
-            switch (self.sslWriteSome(chunk.bytes[0..chunk.len])) {
+            switch (self.encryptSome(chunk.bytes[0..chunk.len])) {
                 .exit => {
                     self.failPending();
                     return false;
@@ -1153,9 +1035,8 @@ pub const Pump = struct {
                 },
             }
         }
-        // Batch end: move the records into the staging buffer and arm the
-        // send. `.full` here is fine: the rest stages on the next completion.
-        return self.stageOutbound() != .exit;
+        // Batch end: send what is staged.
+        return self.armSend();
     }
 
     pub const ReadOutcome = enum { ok, eof, want, stuck };
@@ -1168,24 +1049,19 @@ pub const Pump = struct {
             pump_trace.bump(&pump_trace.read_free_empty_yield);
             return .stuck;
         }
-        const n = self.conn.ssl.read(buf) catch |err| switch (err) {
-            error.WantRead => {
-                pump_trace.bump(&pump_trace.want_read);
-                return .want;
-            },
-            error.WantWrite => {
-                if (!self.stageOrExit()) return .eof;
-                return .want;
-            },
-            else => {
-                self.conn.tcp_stream.shutdown(self.io, .send) catch {};
-                if (diag_wait) rawPrint("TLSERR recv2 {s}\n", .{@errorName(err)});
-                self.failDrain();
-                self.postEof();
-                return .eof;
-            },
+        const n = self.conn.decryptInto(buf) catch |err| {
+            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            if (diag_wait) rawPrint("TLSERR recv2 {s}\n", .{@errorName(err)});
+            self.failDrain();
+            self.postEof();
+            return .eof;
         };
         if (n == 0) {
+            if (!self.conn.peer_closed) {
+                pump_trace.bump(&pump_trace.want_read);
+                return .want;
+            }
+            // close_notify: the same end of stream as a socket EOF.
             self.conn.tcp_stream.shutdown(self.io, .send) catch {};
             if (diag_wait) rawPrint("TLSERR recv2_eof\n", .{});
             self.failDrain();
@@ -1207,7 +1083,7 @@ pub const Pump = struct {
                     self.pending_cipher = bytes[consumed..];
                     return true;
                 }
-                // Fully in the pair; the read buffer is free again, but
+                // Fully in `in_buf`; the read buffer is free again, but
                 // inbound cannot advance right now — re-arm only.
                 return self.rearmRecv();
             },
@@ -1291,7 +1167,7 @@ pub const Pump = struct {
     /// not run in an init that returns by value (init-move hazard). False
     /// only when the CQ is already closed.
     pub fn start(self: *Pump) bool {
-        self.send_buf = self.conn.tcp_writer_buffer[0..];
+        self.send_buf = self.conn.out_buf[0..];
         self.send_head = 0;
         self.send_fill = 0;
         self.send_armed = false;
@@ -1324,47 +1200,16 @@ pub const Pump = struct {
 
 };
 
+
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 
-/// Move ciphertext `from` one pair `to` the other until the source is dry
-/// or the destination is full. Returns bytes moved.
-fn shuttle(from: *boring.ssl.BioPair, to: *boring.ssl.BioPair) usize {
-    var moved: usize = 0;
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = from.readEncrypted(&buf) catch break;
-        if (n == 0) break;
-        var off: usize = 0;
-        while (off < n) {
-            const w = to.writeEncrypted(buf[off..n]) catch return moved;
-            if (w == 0) return moved;
-            off += w;
-        }
-        moved += n;
-    }
-    return moved;
-}
-
-fn stepHandshake(ssl: *boring.ssl.Ssl) !void {
-    ssl.doHandshake() catch |err| switch (err) {
-        error.WantRead, error.WantWrite => {},
-        else => return err,
-    };
-}
-
-// The t-866 regression test: two application records fed in ONE chunk.
-// SSL_pending is blind to the second record after the first read - only
-// BIO_ctrl_pending sees it. The pump's park predicate (pendingInbound)
-// must report work, or the pump parks on top of a buried request and the
-// connection wedges for good. Removing the ciphertext term from
-// pendingInbound fails this test.
 // In-source loopback fixture pair for the record tests. Deliberately NOT
 // testdata/*.pem: those are machine-local by convention (gitignored), and a
 // unit test must build on a fresh checkout. Throwaway self-signed
 // CN=localhost material, public by nature.
-const fixture_cert_pem =
+pub const fixture_cert_pem =
     \\-----BEGIN CERTIFICATE-----
     \\MIIBfDCCASOgAwIBAgIUNrYfW/94JO0I8Ly5JLgu+e2Z+vcwCgYIKoZIzj0EAwIw
     \\FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgyMDEzNTIyNloXDTM2MDgxNzEz
@@ -1376,7 +1221,7 @@ const fixture_cert_pem =
     \\p0uJdNZ1LnWS2JPowPwCIEGkXAU3QDok+T9Sj0GOGEq6Nhnv3nchWxg24ZqUJ6CR
     \\-----END CERTIFICATE-----
 ;
-const fixture_key_pem =
+pub const fixture_key_pem =
     \\-----BEGIN PRIVATE KEY-----
     \\MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgjpKRKa9ZDVtHcAgb
     \\EwexTKPP66fnsfBsAyqcQoT4aKmhRANCAAQ/jAoyoGpnHnj4nuQnL10xyb4uzHpy
@@ -1384,63 +1229,106 @@ const fixture_key_pem =
     \\-----END PRIVATE KEY-----
 ;
 
-test "a second record in one chunk is invisible to SSL_pending but pendingInbound sees it" {
-    boring.init();
+/// Server and client cipher states after a handshake run entirely in
+/// memory, with the ALPN the server selected.
+const MemPair = struct {
+    server: tls.nonblock.Connection,
+    client: tls.nonblock.Connection,
+    alpn: ?[]const u8,
+};
 
-    var acceptor = try Acceptor.initFromPem(fixture_cert_pem, fixture_key_pem);
+/// Run a full handshake between tls.zig's non-blocking client and the
+/// server configuration `Conn.handshake` uses, shuttling bytes in memory.
+fn memHandshake(acceptor: *Acceptor, client_alpn: []const []const u8) !MemPair {
+    var prng = std.Random.DefaultPrng.init(0x5747_4832);
+    const now = std.Io.Clock.real.now(std.testing.io);
+    var srv = tls.nonblock.Server.init(.{
+        .rng = prng.random(),
+        .auth = &acceptor.auth,
+        .alpn_protocols = &server_alpn,
+        .now = now,
+    });
+    var cli = tls.nonblock.Client.init(.{
+        .rng = prng.random(),
+        .now = now,
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .cipher_suites = tls.config.cipher_suites.tls13,
+        .alpn_protocols = client_alpn,
+    });
+    var c2s: [2 * record_buffer_size]u8 = undefined;
+    var c2s_len: usize = 0;
+    var s2c: [2 * record_buffer_size]u8 = undefined;
+    var s2c_len: usize = 0;
+    var scratch: [record_buffer_size]u8 = undefined;
+    var iterations: u32 = 0;
+    while (!(cli.done() and srv.done())) {
+        iterations += 1;
+        if (iterations > 64) return error.HandshakeStalled;
+        const cr = try cli.run(s2c[0..s2c_len], &scratch);
+        std.mem.copyForwards(u8, s2c[0 .. s2c_len - cr.recv_pos], s2c[cr.recv_pos..s2c_len]);
+        s2c_len -= cr.recv_pos;
+        @memcpy(c2s[c2s_len..][0..cr.send.len], cr.send);
+        c2s_len += cr.send.len;
+        const sr = try srv.run(c2s[0..c2s_len], &scratch);
+        std.mem.copyForwards(u8, c2s[0 .. c2s_len - sr.recv_pos], c2s[sr.recv_pos..c2s_len]);
+        c2s_len -= sr.recv_pos;
+        @memcpy(s2c[s2c_len..][0..sr.send.len], sr.send);
+        s2c_len += sr.send.len;
+    }
+    return .{ .server = .init(srv.cipher().?), .client = .init(cli.cipher().?), .alpn = srv.alpnProtocol() };
+}
+
+// The t-866 regression test, on tls.zig: two application records arrive in
+// ONE chunk. After the first decrypt the second is still in `in_buf`, and the
+// pump's park predicate (pendingInbound) must report work, or the pump parks
+// on top of a buried request and the connection wedges for good. The other
+// half: a PARTIAL record is not work. If it counted, the pump would spin on
+// a record it cannot decrypt instead of parking until the socket brings the
+// rest. Removing either condition from pendingInbound fails this test.
+test "a second record in one chunk is work; a partial record is not" {
+    var acceptor = try Acceptor.initFromPem(std.testing.allocator, std.testing.io, fixture_cert_pem, fixture_key_pem);
     defer acceptor.deinit();
-    var connector = try loopbackClientConnector();
-    defer connector.deinit();
+    var pair = try memHandshake(&acceptor, &.{alpn_h2});
 
     var server: Conn = .{};
-    server.state = .tcp;
-    try server.setupAccept(&acceptor);
-    defer server.ssl.deinit();
-    defer server.pair.deinit();
+    server.state = .open;
+    server.cipher = pair.server;
 
-    var client: Conn = .{};
-    client.state = .tcp;
-    try client.setupConnect(&connector);
-    defer client.ssl.deinit();
-    defer client.pair.deinit();
-
-    // In-memory handshake: alternate handshake steps and ciphertext
-    // shuttling between the two pairs. No sockets anywhere.
-    var iterations: u32 = 0;
-    while (!(server.ssl.isHandshakeComplete() and client.ssl.isHandshakeComplete())) {
-        iterations += 1;
-        try std.testing.expect(iterations <= MaxHandshakeIterations);
-        try stepHandshake(&client.ssl);
-        _ = shuttle(&client.pair, &server.pair);
-        try stepHandshake(&server.ssl);
-        _ = shuttle(&server.pair, &client.pair);
-    }
-    try std.testing.expect(isHttp2Alpn(server.ssl.selectedAlpn()));
-
-    // The client writes TWO application records; their ciphertext arrives
-    // at the server as ONE chunk, like a burst read off the socket.
     const record_a = "first-record-payload";
     const record_b = "second-record-payload";
-    try std.testing.expectEqual(record_a.len, try client.ssl.write(record_a));
-    try std.testing.expectEqual(record_b.len, try client.ssl.write(record_b));
-    try std.testing.expect(shuttle(&client.pair, &server.pair) > 0);
+    var wire: [512]u8 = undefined;
+    const a = try pair.client.encrypt(record_a, &wire);
+    const a_len = a.ciphertext.len;
+    const b = try pair.client.encrypt(record_b, wire[a_len..]);
+    const b_len = b.ciphertext.len;
+    try std.testing.expectEqual(a_len + b_len, server.acceptCipher(wire[0 .. a_len + b_len]));
 
-    // One read consumes record A only.
-    var plain: [256]u8 = undefined;
-    const got_a = try server.ssl.read(&plain);
-    try std.testing.expectEqualStrings(record_a, plain[0..got_a]);
+    // An output with room for record A's payload only: B's does not fit
+    // after A's plaintext, so B stays buffered.
+    var plain_storage: [64]u8 = undefined;
+    const plain = plain_storage[0 .. a_len - 5];
+    try std.testing.expectEqual(record_a.len, try server.decryptInto(plain));
+    try std.testing.expectEqualStrings(record_a, plain[0..record_a.len]);
 
-    // The wedge's exact state: SSL_pending reports nothing at the record
-    // boundary while a whole unread record sits in the pair. The park
-    // predicate must still report inbound work.
-    try std.testing.expectEqual(@as(usize, 0), server.pendingPlaintext());
-    try std.testing.expect(server.pendingInboundCiphertext() > 0);
+    // The wedge's exact state: a whole unread record is buffered.
     try std.testing.expect(server.pendingInbound());
 
-    // The second read drains it; only then may the pump park.
-    const got_b = try server.ssl.read(&plain);
-    try std.testing.expectEqualStrings(record_b, plain[0..got_b]);
+    var plain_b: [64]u8 = undefined;
+    const got_b = try server.decryptInto(&plain_b);
+    try std.testing.expectEqualStrings(record_b, plain_b[0..got_b]);
     try std.testing.expect(!server.pendingInbound());
+
+    // Half a record: buffered bytes, but no work until the rest arrives.
+    const c = try pair.client.encrypt("third-record-payload", &wire);
+    const half = c.ciphertext.len / 2;
+    try std.testing.expectEqual(half, server.acceptCipher(wire[0..half]));
+    try std.testing.expect(server.pendingInboundCiphertext() > 0);
+    try std.testing.expect(!server.pendingInbound());
+    try std.testing.expectEqual(@as(usize, 0), try server.decryptInto(&plain_b));
+    try std.testing.expectEqual(c.ciphertext.len - half, server.acceptCipher(wire[half..c.ciphertext.len]));
+    try std.testing.expect(server.pendingInbound());
 }
 
 test "h2 ALPN matcher" {
@@ -1452,23 +1340,71 @@ test "h2 ALPN matcher" {
     try std.testing.expect(!isHttp11Alpn("h2"));
 }
 
-test "ALPN select prefers h2, falls back to http/1.1, empty selects h1" {
-    var ctx: AlpnCtx = .{};
-    var ssl: boring.ssl.SslRef = undefined;
-    const both = [_]u8{ 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
-    switch (selectAlpn(&ctx, &ssl, &both)) {
-        .selected => |p| try std.testing.expectEqualStrings(alpn_h2, p),
-        else => return error.ExpectedH2,
+test "ALPN select prefers h2, falls back to http/1.1, none selects nothing, unknown-only fails" {
+    var acceptor = try Acceptor.initFromPem(std.testing.allocator, std.testing.io, fixture_cert_pem, fixture_key_pem);
+    defer acceptor.deinit();
+
+    const both = try memHandshake(&acceptor, &.{ alpn_http11, alpn_h2 });
+    try std.testing.expectEqualStrings(alpn_h2, both.alpn.?);
+
+    const h1_only = try memHandshake(&acceptor, &.{alpn_http11});
+    try std.testing.expectEqualStrings(alpn_http11, h1_only.alpn.?);
+
+    // No ALPN extension: no selection, which the server serves as HTTP/1.1.
+    const none = try memHandshake(&acceptor, &.{});
+    try std.testing.expect(none.alpn == null);
+    try std.testing.expect(isHttp11Alpn(none.alpn));
+
+    try std.testing.expectError(error.TlsNoApplicationProtocol, memHandshake(&acceptor, &.{"spdy/3"}));
+}
+
+// tls.zig issue #36: the server cannot reassemble a ClientHello that the
+// client split across several records. This pins what that costs starh2:
+// the handshake FAILS AT ONCE with an error on the first flight. It does not
+// wait for bytes that will never come, so the connection closes right away
+// instead of holding a handshake slot until the timeout. The control half
+// proves the probe: the same ClientHello in one record is accepted. If
+// tls.zig fixes #36, the first expectation fails, and this test should then
+// require a completed handshake instead.
+test "a ClientHello split across records fails at once (tls.zig #36)" {
+    var acceptor = try Acceptor.initFromPem(std.testing.allocator, std.testing.io, fixture_cert_pem, fixture_key_pem);
+    defer acceptor.deinit();
+    var prng = std.Random.DefaultPrng.init(36);
+    const now = std.Io.Clock.real.now(std.testing.io);
+    var cli = tls.nonblock.Client.init(.{
+        .rng = prng.random(),
+        .now = now,
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .cipher_suites = tls.config.cipher_suites.tls13,
+        .alpn_protocols = &.{alpn_h2},
+    });
+    var scratch: [record_buffer_size]u8 = undefined;
+    const hello = (try cli.run(&.{}, &scratch)).send;
+    try std.testing.expect(hello.len > 5 + 512);
+
+    // The same handshake payload, re-framed as 512-byte records.
+    var frag: [2 * record_buffer_size]u8 = undefined;
+    var frag_len: usize = 0;
+    var off: usize = 5;
+    while (off < hello.len) {
+        const n = @min(512, hello.len - off);
+        @memcpy(frag[frag_len..][0..3], hello[0..3]);
+        std.mem.writeInt(u16, frag[frag_len + 3 ..][0..2], @intCast(n), .big);
+        @memcpy(frag[frag_len + 5 ..][0..n], hello[off..][0..n]);
+        frag_len += 5 + n;
+        off += n;
     }
-    const h1_only = [_]u8{ 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
-    switch (selectAlpn(&ctx, &ssl, &h1_only)) {
-        .selected => |p| try std.testing.expectEqualStrings(alpn_http11, p),
-        else => return error.ExpectedH1,
-    }
-    switch (selectAlpn(&ctx, &ssl, &.{})) {
-        .selected => |p| try std.testing.expectEqualStrings(alpn_http11, p),
-        else => return error.ExpectedH1Empty,
-    }
+
+    var out: [record_buffer_size]u8 = undefined;
+    var split_srv = tls.nonblock.Server.init(.{ .rng = prng.random(), .auth = &acceptor.auth, .alpn_protocols = &server_alpn, .now = now });
+    try std.testing.expectError(error.TlsDecodeError, split_srv.run(frag[0..frag_len], &out));
+
+    var whole_srv = tls.nonblock.Server.init(.{ .rng = prng.random(), .auth = &acceptor.auth, .alpn_protocols = &server_alpn, .now = now });
+    const accepted = try whole_srv.run(hello, &out);
+    try std.testing.expectEqual(hello.len, accepted.recv_pos);
+    try std.testing.expect(accepted.send.len > 0);
 }
 
 test "pump_trace moves on read_free-empty yield" {
@@ -1487,15 +1423,4 @@ test "pump_trace moves on read_free-empty yield" {
         try std.testing.expect(pump_trace.read_one.load(.acquire) >= r0 + 1);
         try std.testing.expect(pump_trace.read_free_empty_yield.load(.acquire) >= y0 + 1);
     }
-}
-
-test "memory BIO pair is bounded and opposite directions do not mix" {
-    var pair = try boring.ssl.BioPair.init(256);
-    defer pair.deinit();
-    const wrote = try pair.writeEncrypted("hello");
-    try std.testing.expectEqual(@as(usize, 5), wrote);
-    // writeEncrypted feeds the SSL half; readEncrypted is the SSL-outbound
-    // half and stays empty until SSL_write.
-    var buf: [8]u8 = undefined;
-    try std.testing.expectError(error.WantRead, pair.readEncrypted(&buf));
 }

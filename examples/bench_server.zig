@@ -1028,8 +1028,7 @@ fn driveOneshots(gpa: std.mem.Allocator, io: std.Io, tls: bool, peer: starh2.End
             conn.deinit();
             stream.close(io);
         }
-        var connector = try tls_edge.loopbackClientConnector();
-        defer connector.deinit();
+        const connector = tls_edge.loopbackClientConnector();
         try conn.handshakeClient(&connector, io);
         try driveH2(gpa, .{ .tls = &conn }, n);
     } else {

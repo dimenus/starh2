@@ -2,7 +2,7 @@
 //!
 //! Connection copies every batchable frame from one FairScheduler drain into
 //! one scratch buffer and hands it to queueWire as one input. On TLS that
-//! input is one SSL_write; on h2c it is one socket write. The rules here are
+//! input is one encrypt; on h2c it is one socket write. The rules here are
 //! the ones that used to live only inside `drainEmit`'s nested sink, which is
 //! why a second HEADERS silently started a new write: nothing could name the
 //! invariant without standing up a cipher.
@@ -13,7 +13,7 @@
 const std = @import("std");
 const wire_const = @import("../core/wire_const.zig");
 
-/// TLS 1.3 application plaintext cap. HTTP/2 packing stops here; SSL_write
+/// TLS 1.3 application plaintext cap. HTTP/2 packing stops here; one encrypt
 /// is one flush of this buffer on the actor, not a record loop.
 pub const max_plaintext = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
 

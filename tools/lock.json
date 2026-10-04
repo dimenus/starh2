@@ -11,12 +11,10 @@
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"
   },
-  "boring": {
-    "tag": "v0.1.1",
-    "url": "https://github.com/hendriknielaender/boring/archive/refs/tags/v0.1.1.tar.gz",
-    "hash": "boring-0.1.0-K6muvtBGCQAHvnOGuLmCcLZn-WgZkddupoEFKwSKpL7U",
-    "boringssl_revision": "7a6e828dc53ba9a56bd49915f2a0780d63af97d2",
-    "source": "-Dboringssl-source-path, else vendor/boringssl, else ../../oss/http2-zig-hendrik/boringssl",
-    "build_script": "tools/build-boringssl.sh overlays zig-pkg/boring-*/tools/build-boringssl.sh (zig glibc memchr -Werror on aarch64-linux-gnu)"
+  "tls.zig": {
+    "repo": "https://github.com/ianic/tls.zig",
+    "commit": "bd22bcb73f423389441a1de80bf031ef1b623cce",
+    "hash": "tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK",
+    "fork_patches": "none."
   }
 }

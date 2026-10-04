@@ -11,7 +11,7 @@
 //! | actor (`run`)  | 1     | `Session`, `FairScheduler`, slots, tickets    |
 //! |                |       | WritePump completions, byte releases          |
 //! |                |       | TLS: the zio.CompletionQueue driver. Sole     |
-//! |                |       | SSL_read/SSL_write owner, sole socket reader  |
+//! |                |       | encrypt/decrypt owner, sole socket reader     |
 //! |                |       | (raw NetRecv) and socket writer (NetSend).    |
 //! | `ReadPump`     | 1     | h2c: socket READ. TLS: not spawned            |
 //! | `WritePump`    | 1     | h2c: socket WRITE. TLS: not spawned           |
@@ -35,9 +35,9 @@
 //!   `drainEmit` -> `FairScheduler` sink -> `queueWire`. The
 //!   `test_queue_wire_bypass` counter is the mutation canary for that rule and
 //!   must stay at zero. On TLS, `queueWire` hands a plaintext chunk to the
-//!   actor-driven `Pump.writeChunks`; SSL_write is the actor's flush.
+//!   actor-driven `Pump.writeChunks`; encrypting it is the actor's flush.
 //! - One task drives the TLS cipher. That is the actor, not a second pump.
-//!   Sharing an SSL object with a second task is a data race.
+//!   Sharing the cipher state with a second task is a data race.
 //!
 //! # Lock discipline
 //!
@@ -45,8 +45,8 @@
 //! together, because a frame is built from session state and debited against
 //! session flow control. TLS cipher work now runs on the actor too, but it
 //! is not in this domain: HTTP/2 writes plaintext under the lock, and
-//! SSL_write into the memory BIO happens on the actor without taking a second
-//! mutex. The SSL object has one owner (the actor task).
+//! encryption happens on the actor without taking a second mutex. The
+//! cipher state has one owner (the actor task).
 //!
 //! There is exactly one place that releases the lock inside an operation:
 //! `waitForStreamSpace`. It must, because the capacity it waits for can only be
@@ -481,7 +481,7 @@ pub fn diagRekickSweep() u32 {
             },
         );
         diagRawPrint(
-            "STARH2_SWEEP2 conn={x} ackp={d} ackr={d} aapp={d} arec={d} tres={d} tcomp={d} tdrop_free={d} tdrop_mm={d} bio_in={d} bio_out={d} ssl_pend={d}\n",
+            "STARH2_SWEEP2 conn={x} ackp={d} ackr={d} aapp={d} arec={d} tres={d} tcomp={d} tdrop_free={d} tdrop_mm={d} tls_in_cipher={d}\n",
             .{
                 @intFromPtr(conn) & 0xffff,
                 wire_pump.diag_acks.posted_ticket.load(.acquire),
@@ -493,8 +493,6 @@ pub fn diagRekickSweep() u32 {
                 ticket_table.diag_dropped_not_in_use.load(.acquire),
                 ticket_table.diag_dropped_mismatch.load(.acquire),
                 if (conn.tls) |t| t.pendingInboundCiphertext() else 0,
-                if (conn.tls) |t| t.pendingOutboundCiphertext() else 0,
-                if (conn.tls) |t| t.pendingPlaintext() else 0,
             },
         );
         // The Event-era re-kick probe is gone with the Event: a published
@@ -645,7 +643,7 @@ pub const trace = struct {
     pub var send_ns: std.atomic.Value(u64) = .init(0);
     pub var send_n: std.atomic.Value(u64) = .init(0);
     pub var send_bytes: std.atomic.Value(u64) = .init(0);
-    /// Unused after TLS-as-stream (SSL_read lives in TlsPump). Kept so the
+    /// Unused after TLS-as-stream (decrypt lives in TlsPump). Kept so the
     /// phase-trace printer does not grow a second schema.
     pub var acc_append_ns: std.atomic.Value(u64) = .init(0);
     pub var acc_append_n: std.atomic.Value(u64) = .init(0);
@@ -1254,7 +1252,7 @@ const Connection = struct {
     doorbell: zio.Channel(u8) = undefined,
     tls: ?*tls_edge.Conn = null,
     /// Drain-turn packing buffer. HTTP/2 frames concat here before one
-    /// `queueWire`; on TLS that plaintext is what SSL_write flushes.
+    /// `queueWire`; on TLS that plaintext is what the pump encrypts.
     plaintext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
     handler_jobs: []HandlerJob,
@@ -2854,7 +2852,7 @@ const Connection = struct {
         if (pump.inbound_eof) return true;
         // t-866: never wait while pendingInbound(). Also don't park on a
         // stashed cipher suffix (recv is unarmed until it is fed), or while
-        // outbound is only stashed (carried / write_ch) and not yet SSL_written.
+        // outbound is only stashed (carried / write_ch) and not yet encrypted.
         if (pump.conn.pendingInbound() or pump.pending_read != null or pump.pending_cipher != null) {
             self.diagNoPark(pump, 1);
             return false;
@@ -3027,9 +3025,9 @@ const Connection = struct {
     /// 1. TLS, if any: the handshake already ran on this same task, in
     ///    `Server.serveTlsThenBranch`, which hands over `tls_ready` and the
     ///    leftover plaintext (a pipelined preface). Ingest that into
-    ///    Session, then arm the CQ driver: sole SSL_read/SSL_write owner and
-    ///    sole socket reader from here on; flush is SSL_write + BIO_read +
-    ///    NetSend.
+    ///    Session, then arm the CQ driver: sole encrypt/decrypt owner and
+    ///    sole socket reader from here on; flush is encrypt into the send
+    ///    staging buffer + NetSend.
     /// 2. h2c: spawn ReadPump and WritePump on the raw socket.
     /// 3. Flush the server preface that `Session.init` already queued.
     /// 4. For h2c, wait for the client preface under the preface deadline.
@@ -3216,7 +3214,7 @@ const Connection = struct {
         }
 
         // Leftover TLS plaintext (a pipelined preface) was ingested during
-        // handshake. Emit after the CQ is armed so queueWire can SSL_write.
+        // handshake. Emit after the CQ is armed so queueWire can encrypt.
         {
             self.lockSessionUncancelable(io);
             defer self.unlockSession(io);
@@ -4835,7 +4833,7 @@ const Connection = struct {
     /// once, then fail. A healthy connection still `putOne`s for backpressure.
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
         if (self.config.mode == .tls) {
-            // SSL_write + stage + arm on this task. Acks apply in `post` via
+            // Encrypt + stage + arm on this task. Acks apply in `post` via
             // `ack_apply` (no write_ack_ch hop). `pause` (DATA) and
             // `pause_control` (HEADERS/WINDOW_UPDATE) stop drain before this
             // stash fills, so trySend is the last-resort fail-close.
@@ -4843,8 +4841,8 @@ const Connection = struct {
                 _ = tls_edge.tls_stage_failed.fetchAdd(1, .monotonic);
                 return error.WriteFailed;
             };
-            // Stash only. SSL_write on this stack under session_mu overflowed
-            // the coroutine (BoringSSL's frame plus drainEmit). driveTlsTurn
+            // Stash only. Encrypting on this stack under session_mu overflowed
+            // the coroutine (the old BoringSSL frame plus drainEmit). driveTlsTurn
             // writes after the lock drops.
             if (pump.carried == null) {
                 pump.carried = chunk;
@@ -4990,7 +4988,7 @@ const Connection = struct {
     /// the `FairScheduler` sink; `test_queue_wire_bypass` proves it.
     ///
     /// HTTP/2 bytes are always plaintext here. h2c copies them into a WritePump
-    /// chunk; TLS SSL_writes the same chunk on this task (`pushWriteChunk` →
+    /// chunk; TLS encrypts the same chunk on this task (`pushWriteChunk` →
     /// `writeChunks`), stages ciphertext, and arms the send. Acks apply in
     /// `post` via `ack_apply` — no `write_ack_ch` hop. `session_mu` is held.
     ///

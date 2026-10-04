@@ -134,8 +134,8 @@ see `tools/README.md`.
   Session access with `session_mu`; handlers communicate through commands.
 - ReadPump and WritePump are the sole owners of their socket directions on h2c.
   On TLS there is no pump task: the actor drives the TLS `Pump` and is the
-  sole SSL_read/SSL_write owner and the sole socket reader and writer; never
-  share an SSL object with a second task. `session_mu` covers Session and
+  sole encrypt/decrypt owner and the sole socket reader and writer; never
+  share the cipher state with a second task. `session_mu` covers Session and
   FairScheduler, not the cipher.
 - Per-connection spawns (h2c pumps, task handlers, the HTTP/1.1 handler job)
   use `zio.spawnInto(connPlacement(), ...)`; only server-wide tasks (accept
@@ -152,31 +152,35 @@ see `tools/README.md`.
 
 ## TLS and allocation traps
 
-TLS is BoringSSL via `hendriknielaender/boring` v0.1.1 (`build.zig.zon`).
-HTTP/2 writes plaintext into a `std.Io.Writer`; flush is SSL_write. Pass
-`-Dboringssl-source-path`, or place a checkout at `vendor/boringssl`, or use
-the sibling `../../oss/http2-zig-hendrik/boringssl`. The expected BoringSSL
-revision is in `tools/lock.json`. `tools/build-boringssl.sh` overlays the
-fetched boring package so zig-cc glibc headers do not -Werror memchr on
-`aarch64-linux-gnu`. Do not wrap a record API beside this stream.
+TLS is pure Zig: `ianic/tls.zig` (`build.zig.zon`), driven through its
+non-blocking API (`tls.nonblock`). The server is TLS 1.3 only, with no
+session resumption. HTTP/2 writes plaintext; the pump encrypts each write
+chunk into the send staging buffer. Do not wrap a record API beside this.
 
 - The TLS `Pump` (`src/edge/tls.zig`) is not a task. It is a
   `zio.CompletionQueue` the actor drives: a raw `NetRecv` completion reads
   ciphertext, a raw `NetSend` completion writes it, and the actor's one
-  `zio.select` includes the queue. Concurrent ReadPump+WritePump on one SSL
-  object is a data race; h2c keeps the dual pumps. The SSL object's BIOs are
-  a bounded memory pair (`BIO_new_bio_pair`); do not restore socket-coupled
-  BIO callbacks. The handshake runs before the queue is armed and reads the
+  `zio.select` includes the queue. Concurrent ReadPump+WritePump on one
+  cipher state is a data race; h2c keeps the dual pumps. Received ciphertext
+  is copied into `Conn.in_buf` and decrypted from there.
+- Decrypt one complete record at a time, into room for its whole payload
+  (`Conn.decryptInto`). With a smaller output tls.zig decrypts in place in
+  the ciphertext buffer and keeps a reference to that plaintext for the next
+  call, and `in_buf` is compacted and refilled under it. A debug assert after
+  each decrypt checks tls.zig holds no plaintext.
+- The handshake runs before the queue is armed and reads the
   socket itself (`Conn.handshake`, unbuffered so no ciphertext is left in a
   reader buffer), on the connection's own task under `zio.withTimeout`
   (`Server.handshakeWithTimeout`). Do not move it to a subtask: the loop
   that first parks on a socket owns its reads for the fd's life.
 - Handshake leftover plaintext (a pipelined preface) is ingested on the actor
   before the queue is armed.
-- Packing stays in `emit_batch` (16 KiB concat). Do not put a record loop back
-  on the actor.
+- Packing stays in `emit_batch` (16 KiB concat). The pump encrypts one record
+  per write chunk, only when the whole record fits the staging buffer;
+  otherwise it parks on the CQ (t-2655). Do not split records to fill space.
 - Per-connection TLS Io buffers are bounded by `Limits.tls_stream_bytes`
-  (floor `TLS_CONN_BUFFER_BYTES` = tcp in/out + BioPair). The ciphertext
+  (floor `TLS_CONN_BUFFER_BYTES` = `in_buf` + `out_buf`, one maximum TLS
+  record each). The ciphertext
   chunk pool and work queue are separate declared terms
   (`tls_cipher_chunks_per_connection`).
 - Intent payloads, decoded headers, dispatch requests, scheduler leases, and

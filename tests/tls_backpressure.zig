@@ -10,7 +10,7 @@
 //! executor stopped for good. On nachos it showed as the zero-event collapse.
 //!
 //! Shape: ONE pinned executor, so the server and the test share it. A real
-//! TLS client on an OS thread has a small receive buffer, asks for a large
+//! TLS client (tls.zig's non-blocking API over a raw socket) on an OS thread has a small receive buffer, asks for a large
 //! streamed body, and does not read for 300 ms, so the server's socket fills
 //! and a send stays in flight while drainEmit keeps stashing chunks. Then the
 //! client reads to END_STREAM. With the spin, the stream never ends, and the
@@ -19,8 +19,7 @@ const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
-const boring = @import("boring");
-const sys = boring.boringssl;
+const tls = @import("tls");
 
 const event_bytes = 16 * 1024;
 const event_count = 32;
@@ -48,13 +47,55 @@ const ClientResult = struct {
     done: std.atomic.Value(bool) = .init(false),
 };
 
-fn sslWriteAll(ssl: *sys.SSL, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = sys.SSL_write(ssl, bytes[off..].ptr, @intCast(bytes.len - off));
-        if (n <= 0) return error.SslWrite;
-        off += @intCast(n);
+/// Blocking TLS h2 client on a raw libc socket. Received ciphertext
+/// accumulates in `in` and is decrypted from there; `out` holds one record.
+const Client = struct {
+    fd: c_int,
+    in: [2 * tls.input_buffer_len]u8 = undefined,
+    in_len: usize = 0,
+    out: [tls.output_buffer_len]u8 = undefined,
+
+    /// Read more ciphertext. `error.WouldBlock` when the receive timeout
+    /// fired with nothing to read.
+    fn fill(self: *Client) !void {
+        if (self.in_len == self.in.len) return error.ClientBufferFull;
+        const n = std.c.recv(self.fd, self.in[self.in_len..].ptr, self.in.len - self.in_len, 0);
+        if (n == 0) return error.Eof;
+        if (n < 0) {
+            return switch (std.c.errno(n)) {
+                .AGAIN, .INTR => error.WouldBlock,
+                else => error.Recv,
+            };
+        }
+        self.in_len += @intCast(n);
     }
+
+    fn consume(self: *Client, n: usize) void {
+        std.mem.copyForwards(u8, self.in[0 .. self.in_len - n], self.in[n..self.in_len]);
+        self.in_len -= n;
+    }
+
+    fn sendAll(self: *Client, bytes: []const u8) !void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = std.c.send(self.fd, bytes[off..].ptr, bytes.len - off, 0);
+            if (n <= 0) return error.Send;
+            off += @intCast(n);
+        }
+    }
+};
+
+/// Length of the first record in `bytes` when it is all there.
+fn recordLen(bytes: []const u8) ?usize {
+    if (bytes.len < 5) return null;
+    const len = 5 + @as(usize, std.mem.readInt(u16, bytes[3..5], .big));
+    return if (bytes.len < len) null else len;
+}
+
+fn realNow() std.Io.Timestamp {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return .fromNanoseconds(@as(i96, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 
 /// Blocking TLS h2 client. Plain OS thread and libc sockets on purpose: it
@@ -80,14 +121,29 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, out: *ClientResult) !void {
     };
     if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Connect;
 
-    const ctx = sys.SSL_CTX_new(sys.TLS_method()) orelse return error.SslCtx;
-    defer sys.SSL_CTX_free(ctx);
-    const alpn = "\x02h2";
-    if (sys.SSL_CTX_set_alpn_protos(ctx, alpn, alpn.len) != 0) return error.Alpn;
-    const ssl = sys.SSL_new(ctx) orelse return error.Ssl;
-    defer sys.SSL_free(ssl);
-    if (sys.SSL_set_fd(ssl, fd) != 1) return error.SslFd;
-    if (sys.SSL_connect(ssl) != 1) return error.Handshake;
+    const client = try gpa.create(Client);
+    defer gpa.destroy(client);
+    client.* = .{ .fd = fd };
+    var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(@as(i128, realNow().nanoseconds)))));
+    var hs = tls.nonblock.Client.init(.{
+        .rng = prng.random(),
+        .now = realNow(),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .cipher_suites = tls.config.cipher_suites.tls13,
+        .alpn_protocols = &.{"h2"},
+    });
+    while (!hs.done()) {
+        const r = try hs.run(client.in[0..client.in_len], &client.out);
+        client.consume(r.recv_pos);
+        if (r.send.len > 0) try client.sendAll(r.send);
+        if (hs.done()) break;
+        if (r.recv_pos == 0 and r.send.len == 0) try client.fill();
+    }
+    const alpn = hs.inner.alpn_protocol orelse return error.Alpn;
+    if (!std.mem.eql(u8, alpn, "h2")) return error.Alpn;
+    var conn: tls.nonblock.Connection = .init(hs.cipher().?);
 
     var wire = try h2c.buildClientPreface(gpa, .empty);
     defer wire.deinit(gpa);
@@ -99,48 +155,61 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, out: *ClientResult) !void {
     }
     try h2c.appendWindowUpdate(gpa, &wire, 0, 1 << 30);
     for (0..stream_count) |i| try h2c.appendHeaders(gpa, &wire, @intCast(1 + 2 * i), "/big", true);
-    try sslWriteAll(ssl, wire.items);
+    var off: usize = 0;
+    while (off < wire.items.len) {
+        const r = try conn.encrypt(wire.items[off..][0..@min(wire.items.len - off, 16 * 1024)], &client.out);
+        try client.sendAll(r.ciphertext);
+        off += r.cleartext_pos;
+    }
 
     // Stop reading while the server writes the body: its socket fills and a
     // send stays in flight.
     const pause: std.c.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
     _ = std.c.nanosleep(&pause, null);
 
-    // Read frames until stream 1 ends. A read timeout on the socket keeps a
-    // wedged server from blocking this thread past the deadline.
+    // Read frames until every stream ends. A read timeout on the socket keeps
+    // a wedged server from blocking this thread past the deadline.
     const tv: std.c.timeval = .{ .sec = 1, .usec = 0 };
     _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(std.c.timeval));
     const deadline = nowNs() + client_deadline_ns;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
-    var rd: [16384]u8 = undefined;
+    // Room for any record payload, and one record per decrypt: a smaller
+    // output makes tls.zig keep plaintext inside `client.in`, which
+    // `consume` then shifts.
+    var rd: [tls.input_buffer_len]u8 = undefined;
     while (out.ended_n < stream_count) {
         if (nowNs() >= deadline) {
             std.debug.panic("tls backpressure: stream did not end within {d} s ({d} of {d} body bytes); the actor is not parking", .{
                 client_deadline_ns / std.time.ns_per_s, out.data_bytes, stream_count * event_count * event_bytes,
             });
         }
-        const n = sys.SSL_read(ssl, &rd, rd.len);
-        if (n <= 0) {
-            const e = sys.SSL_get_error(ssl, n);
-            if (e == sys.SSL_ERROR_SYSCALL or e == sys.SSL_ERROR_WANT_READ) continue;
-            return error.SslRead;
+        const rec_len = recordLen(client.in[0..client.in_len]) orelse 0;
+        if (rec_len == 0) {
+            client.fill() catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            continue;
         }
-        try buf.appendSlice(gpa, rd[0..@intCast(n)]);
+        const res = try conn.decrypt(client.in[0..rec_len], &rd);
+        client.consume(rec_len);
+        if (res.closed) return error.PeerClosed;
+        try buf.appendSlice(gpa, res.cleartext);
         // Consume whole frames.
-        var off: usize = 0;
-        while (buf.items.len - off >= 9) {
-            const h = buf.items[off..];
+        var foff: usize = 0;
+        while (buf.items.len - foff >= 9) {
+            const h = buf.items[foff..];
             const len = (@as(usize, h[0]) << 16) | (@as(usize, h[1]) << 8) | h[2];
-            if (buf.items.len - off < 9 + len) break;
+            if (buf.items.len - foff < 9 + len) break;
             const ftype = h[3];
             const flags = h[4];
             const sid = std.mem.readInt(u32, h[5..9], .big) & 0x7fff_ffff;
             if (sid != 0 and ftype == 0) out.data_bytes += len;
             if (sid != 0 and (ftype == 0 or ftype == 1) and flags & 0x1 != 0) out.ended_n += 1;
-            off += 9 + len;
+            foff += 9 + len;
         }
-        buf.replaceRangeAssumeCapacity(0, off, &.{});
+        buf.replaceRangeAssumeCapacity(0, foff, &.{});
     }
 }
 

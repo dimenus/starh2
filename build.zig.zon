@@ -23,17 +23,18 @@
             .url = "https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz",
             .hash = "N-V-__8AAF_gIQDX2wVzXI-r96NyCgKuDj9W_Gab-TU7Qzoi",
         },
-        .boring = .{
-            .url = "https://github.com/hendriknielaender/boring/archive/refs/tags/v0.1.1.tar.gz",
-            .hash = "boring-0.1.0-K6muvtBGCQAHvnOGuLmCcLZn-WgZkddupoEFKwSKpL7U",
+        // ianic/tls.zig main bd22bcb (2026-10-03, after "update to zig 0.17").
+        // Pure Zig TLS: src/edge/tls.zig drives its non-blocking API. Its
+        // "trailing partial record" decrypt test is the guard for lalinsky's
+        // ef6780e fix, which upstream carries in a different form.
+        .tls = .{
+            .url = "git+https://github.com/ianic/tls.zig#bd22bcb73f423389441a1de80bf031ef1b623cce",
+            .hash = "tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK",
         },
     },
     // brotli pin: google/brotli v1.1.0 release archive (raw C sources; no build.zig)
     // tag v1.1.0 / https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz
     // consumed via addCSourceFiles on c/common + c/enc (c/dec only on test artifacts)
-    // boring pin: hendriknielaender/boring v0.1.1
-    // BoringSSL source: -Dboringssl-source-path, else vendor/boringssl, else
-    // ../../oss/http2-zig-hendrik/boringssl (revision recorded in tools/lock.json)
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -205,7 +205,6 @@ assert s2 != s, p
 open(p, 'w').write(s2)
 PY
 ( cd "$SWT" && ./zb build starh2-conformance-server -Doptimize=safe -Dzio-scheduling="$GATE_SCHEDULING" \
-    -Dboringssl-source-path="$HOME/Source/oss/http2-zig-hendrik/boringssl" \
     --prefix "$OUT/conf" ) > "$OUT/conf-build.log" 2>&1 || { echo "  FAIL: conformance build (candidate may lack APIs the starh2 tree requires, e.g. isDrained - see conf-build.log)"; fail=1; }
 if [ -x "$OUT/conf/bin/starh2-conformance-server" ]; then
   pass512=0
@@ -239,7 +238,6 @@ fi
 
 echo "== phase 8: collapse probe (15 rounds on $HOST)"
 ( cd "$SWT" && ./zb build starh2-bench-server -Doptimize=fast -Dtarget=x86_64-linux-musl -Dzio-scheduling="$GATE_SCHEDULING" \
-    -Dboringssl-source-path="$HOME/Source/oss/http2-zig-hendrik/boringssl" \
     --prefix "$OUT/bench" ) > "$OUT/bench-build.log" 2>&1 || { echo "  FAIL: bench build (see bench-build.log)"; fail=1; }
 ( cd "$REPO/tools/sse_bench" && GOOS=linux GOARCH=amd64 go build -o "$OUT/client" ./client.go ) || { echo "  FAIL: client build"; fail=1; }
 if [ -x "$OUT/bench/bin/starh2-bench-server" ] && [ -x "$OUT/client" ]; then

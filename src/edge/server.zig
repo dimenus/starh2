@@ -175,6 +175,8 @@ pub const Server = struct {
             if (tls_config.certificate_chain_pem.len > config.limits.certificate_chain_bytes) return error.CertificateTooLarge;
             if (tls_config.private_key_pem.len > config.limits.private_key_bytes) return error.PrivateKeyTooLarge;
             tls_acceptor = tls_edge.Acceptor.initFromPem(
+                gpa,
+                io,
                 tls_config.certificate_chain_pem,
                 tls_config.private_key_pem,
             ) catch return error.InvalidCertificate;
@@ -361,14 +363,7 @@ pub const Server = struct {
             return;
         };
         tls_conn.initTcp(stream);
-        tls_conn.setupAccept(acceptor) catch {
-            config.gpa.destroy(tls_conn);
-            if (config.handshake_held) {
-                if (config.accounting) |a| a.releaseHandshake();
-            }
-            stream.close(config.io);
-            return;
-        };
+        tls_conn.setupAccept(acceptor);
 
         handshakeWithTimeout(tls_conn, config) catch |err| {
             tls_conn.deinit();
@@ -388,7 +383,7 @@ pub const Server = struct {
         const leftover_n = tls_conn.drainLeftoverPlain(&leftover_buf);
         const leftover = leftover_buf[0..leftover_n];
 
-        if (tls_edge.isHttp2Alpn(tls_conn.ssl.selectedAlpn())) {
+        if (tls_edge.isHttp2Alpn(tls_conn.selectedAlpn())) {
             const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {
                 tls_conn.deinit();
                 config.gpa.destroy(tls_conn);

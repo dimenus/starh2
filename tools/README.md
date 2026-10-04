@@ -209,8 +209,7 @@ On a Linux host, always build with an explicit target, for example
 rejects them (`fatal linker error: unhandled relocation type R_X86_64_PC64`).
 An explicit target makes zig use its bundled CRT, so the link works. When a
 newer zig links the native target on a gcc-16 host, remove this section
-(t-885 tracks that check). BoringSSL itself builds with `zig cc` for every
-Linux target, native hosts included (`tools/build-boringssl.sh`).
+(t-885 tracks that check).
 
 ## Linux musl RUN (container)
 
