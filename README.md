@@ -26,7 +26,7 @@ would need the same conformance and security work as the paths that are used.
 
 ## Requirements
 
-- Zig 0.16.0 (pinned; the TLS dependency is not source-compatible with 0.17-dev)
+- Zig 0.17.0 (pinned in `build.zig.zon`; `./zb` runs that version through mise)
 - For TLS, a certificate and key in PEM form
 - curl built with HTTP/2, to run the TLS gate
 - Your zio dependency built with the same `.scheduling` as starh2's

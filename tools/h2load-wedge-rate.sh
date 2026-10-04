@@ -46,7 +46,7 @@ command -v h2load >/dev/null 2>&1 || {
 [ -f testdata/key.pem ] || { echo "h2load-wedge-rate: testdata/key.pem missing" >&2; exit 2; }
 
 mkdir -p "$OUT"
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 2
+./zb build starh2-bench-server -Doptimize=fast --prefix "$OUT/starh2" || exit 2
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 [ -x "$STARH2" ] || { echo "h2load-wedge-rate: build did not install $STARH2" >&2; exit 2; }
 

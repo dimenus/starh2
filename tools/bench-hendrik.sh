@@ -28,7 +28,7 @@ fi
 mkdir -p "$OUT"
 (
   cd "$HENDRIK_ROOT"
-  "$REPO/zb" build -Doptimize=ReleaseFast --prefix "$OUT/http2-zig"
+  "$REPO/zb" build -Doptimize=fast --prefix "$OUT/http2-zig"
 )
 
 opponent="$OUT/http2-zig/bin/benchmark"
@@ -41,7 +41,7 @@ fi
 # the whole bench, and the next locker reclaims when it exits.
 . "$REPO/tools/bench_lock.sh"
 bench_lock
-exec "$REPO/zb" build bench -Doptimize=ReleaseFast -- \
+exec "$REPO/zb" build bench -Doptimize=fast -- \
   --opponent "$opponent" \
   --opponent-name "http2.zig tls" \
   --opponent-revision "$revision" \

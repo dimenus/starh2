@@ -129,7 +129,7 @@ describe_bin() {
   _l=$2
   if [ ! -x "$_p" ]; then
     echo "FAIL $name: arm $_l binary is missing or not executable: $_p" >&2
-    echo "  build it with: ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix <dir>" >&2
+    echo "  build it with: ./zb build starh2-bench-server -Doptimize=fast --prefix <dir>" >&2
     exit 2
   fi
   bin_sha=$(sha_of "$_p")

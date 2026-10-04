@@ -36,7 +36,7 @@ OUT=${OUT:-/tmp/starh2-oneshot-trace}
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$REPO"
 . "$REPO/tools/bench_lock.sh"
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2"
+./zb build starh2-bench-server -Doptimize=fast --prefix "$OUT/starh2"
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 PORT=19447
 bench_lock

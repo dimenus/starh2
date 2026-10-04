@@ -83,7 +83,7 @@ HYPER="$OUT/hyper/sse-hyper"
 # after `zig build ci`, that is an example at a different optimize level, and
 # the run then reports a number for a binary nobody asked for. Observed: a
 # 4.7x improvement read back as no change at all.
-./zb build starh2-bench-server -Doptimize=ReleaseFast -Dzio-scheduling="${STARH2_ZIO_SCHEDULING:-work_stealing}" --prefix "$OUT/starh2" || exit 1
+./zb build starh2-bench-server -Doptimize=fast -Dzio-scheduling="${STARH2_ZIO_SCHEDULING:-work_stealing}" --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 
 bench_lock

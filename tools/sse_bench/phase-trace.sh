@@ -20,7 +20,7 @@ cd "$REPO"
 # after `zig build ci`, that is an example at a different optimize level, and
 # the run then reports a number for a binary nobody asked for. Observed: a
 # 4.7x improvement read back as no change at all.
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
+./zb build starh2-bench-server -Doptimize=fast --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 [ -x "$OUT/sse-client" ] || { echo "run tools/sse_bench/run.sh first to build the client" >&2; exit 1; }
 bench_lock

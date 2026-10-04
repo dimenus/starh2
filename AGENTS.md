@@ -9,7 +9,7 @@ Server-side HTTP/2 stack shaped around Datastar. Rationale lives in the git log
   synced repo; `qmdsync repos` shows valid scopes. Worth it before proposing a
   design that may already be decided, before filing a task, and when a constraint
   here has no stated reason.
-- Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib lookups. Do not guess 0.16 APIs.
+- Zig agents: read `~/.claude/skills/zig/SKILL.md` and use `zigstd` for stdlib lookups. Do not guess 0.17 APIs.
 - **Never guess a dependency's contract; read its source.** Every dependency
   is vendored at `zig-pkg/<name>/src` precisely so its implementation is one
   `Read` away. Before calling an API, read the function body and its callers
@@ -47,9 +47,9 @@ Re-derive the performance claims above rather than citing them; the numbers move
 with the machine:
 
 ```sh
-./zb build bench -Doptimize=ReleaseFast -- -n 100000 -c 50 -m 10 -t 4 --rounds 3
+./zb build bench -Doptimize=fast -- -n 100000 -c 50 -m 10 -t 4 --rounds 3
 tools/bench-hendrik.sh -n 100000 -c 50 -m 10 -t 4 --rounds 3 # builds + identifies the Zig opponent
-./zb build bench-pipeline -Doptimize=ReleaseFast -- -n 1000000 --rounds 5 # isolated CPU/allocation costs
+./zb build bench-pipeline -Doptimize=fast -- -n 1000000 --rounds 5 # isolated CPU/allocation costs
 tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5 # same isolation against the identified opponent
 tools/oneshot-phase-trace.sh    # packing + alloc oracle; exits 9 if records/response > 0.4
 tools/sse_bench/run.sh          # concurrent SSE against Go net/http, Kestrel, hyper

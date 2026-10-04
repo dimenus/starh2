@@ -8,7 +8,7 @@ Pins live in `tools/lock.json`. Held-out seeds stay outside this repo (`tools/he
 ./zb build ci
 ./zb build test
 ./zb build starh2-conformance-server example-hello example-datastar-sse
-./zb build starh2-conformance-server example-hello example-datastar-sse -Doptimize=ReleaseSafe
+./zb build starh2-conformance-server example-hello example-datastar-sse -Doptimize=safe
 ./zb build release   # x86_64-linux-musl + aarch64-linux-musl + aarch64-linux-gnu ReleaseSafe
 ```
 
@@ -152,7 +152,7 @@ one, packed-6 handoff, parked wake), and an empty task spawn/join using the
 same zio runtime shape as the bench server.
 
 ```sh
-./zb build bench-pipeline -Doptimize=ReleaseFast -- -n 1000000 --rounds 5
+./zb build bench-pipeline -Doptimize=fast -- -n 1000000 --rounds 5
 tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
 ```
 
@@ -224,7 +224,7 @@ with an `aarch64-linux-musl` binary, or a real amd64 Linux host for the
 x86_64-linux-musl deploy shape.
 
 ```sh
-./zb build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe --prefix zig-out-musl-arm starh2-conformance-server
+./zb build -Dtarget=aarch64-linux-musl -Doptimize=safe --prefix zig-out-musl-arm starh2-conformance-server
 docker run --rm --platform linux/arm64 --privileged \
   -v "$PWD/zig-out-musl-arm/bin/starh2-conformance-server:/srv/starh2-conformance-server:ro" \
   -v "$PWD/tools/multiplex-grader:/grader:ro" \

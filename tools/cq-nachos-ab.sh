@@ -31,7 +31,7 @@ build_arm() {
   ln -sfn "$REPO/vendor/boringssl" "$WT/vendor/boringssl" 2>/dev/null || true
   [ -e "$WT/vendor/boringssl/CMakeLists.txt" ] || \
     ln -sfn "$HOME/Source/oss/http2-zig-hendrik/boringssl" "$WT/vendor/boringssl"
-  (cd "$WT" && ./zb build starh2-bench-server -Doptimize=ReleaseFast \
+  (cd "$WT" && ./zb build starh2-bench-server -Doptimize=fast \
     -Dtarget=x86_64-linux-musl --prefix "$OUT")
   git -C "$REPO" worktree remove --force "$WT"
 }

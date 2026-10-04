@@ -58,7 +58,7 @@ command -v go >/dev/null 2>&1 || {
 }
 
 mkdir -p "$OUT"
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 2
+./zb build starh2-bench-server -Doptimize=fast --prefix "$OUT/starh2" || exit 2
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 [ -x "$STARH2" ] || {
   echo "wedge-probe: build did not install $STARH2" >&2

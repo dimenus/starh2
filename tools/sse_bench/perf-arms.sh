@@ -58,7 +58,7 @@ if [ -n "${STARH2_TASK_MIGRATION:-}" ]; then
 fi
 STARH2_ZIO_SCHEDULING=${STARH2_ZIO_SCHEDULING:-work_stealing}
 cd "$REPO"
-./zb build starh2-bench-server -Doptimize=ReleaseFast -Dzio-scheduling="$STARH2_ZIO_SCHEDULING" --prefix "$OUT/starh2" || exit 1
+./zb build starh2-bench-server -Doptimize=fast -Dzio-scheduling="$STARH2_ZIO_SCHEDULING" --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 build_hyper || exit 1
 HYPER="$OUT/hyper/sse-hyper"

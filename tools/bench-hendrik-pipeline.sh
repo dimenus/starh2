@@ -15,7 +15,7 @@ OUT="${TMPDIR:-/tmp}/starh2-hendrik-pipeline-${REVISION}"
 
 echo "bench-hendrik-pipeline: http2.zig revision $REVISION"
 "$ROOT/zb" build-exe \
-  -OReleaseFast \
+  -Ofast \
   -lc \
   --dep http2 \
   "-Mroot=$ROOT/tools/hendrik_pipeline_bench.zig" \
