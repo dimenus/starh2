@@ -215,7 +215,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         // faithful fix is to wake the actor the way a real peer would: any
         // inbound frame. PING is the cheapest.
         var ping_buf: [17]u8 = undefined;
-        const ping_n = try starh2.core.frame.Serializer.ping(&ping_buf, false, &[_]u8{0} ** 8);
+        const ping_n = try starh2.core.frame.Serializer.ping(&ping_buf, false, &@as([8]u8, @splat(0)));
         try writeAllStreamAt(stream, ping_buf[0..ping_n], @src());
         try waitAccountingZeroAt(&server, 2000, 187);
     }
@@ -728,7 +728,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     // Open more connections than global stream cap; each tries one SSE.
     var i: usize = 0;
-    var streams: [8]?zio.net.Stream = .{null} ** 8;
+    var streams: [8]?zio.net.Stream = @splat(null);
     defer {
         for (&streams) |*s| {
             if (s.*) |st| st.close();
@@ -1325,7 +1325,7 @@ test "lifecycle: >64KiB body under small window + RST (sparse stream id)" {
 // One resp.send whose body EXCEEDS outbound_bytes_per_stream. The handler must
 // chunk through the cap as the actor drains — never park forever waiting for
 // space that only its own drain can create. Static so the task stack stays small.
-const cap_crossing_body = [_]u8{'B'} ** (1024 * 1024);
+const cap_crossing_body: [1024 * 1024]u8 = @splat('B');
 
 fn capCrossingHello(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;

@@ -356,7 +356,7 @@ const test_budget: usize = 4 * 1024 * 1024;
 
 test "encoder round-trip identity" {
     const gpa = std.testing.allocator;
-    const plain = "hello brotli " ** 32;
+    const plain = repeat("hello brotli ", 32);
     const enc = try Encoder.create(gpa, test_budget, 5, 19);
     defer enc.destroy();
     const compressed = try enc.compressAll(plain, gpa);
@@ -443,7 +443,7 @@ test "budget OOM during compress returns Zig error not process exit" {
     defer enc.destroy();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    const block = "x" ** (64 * 1024);
+    const block = &@as([64 * 1024]u8, @splat('x'));
     try enc.compress(block, .process, &out, gpa);
     enc.budget.fail_remaining = 0;
     try std.testing.expectError(error.EncoderFailed, enc.compress(block, .finish, &out, gpa));
@@ -473,4 +473,15 @@ test "chunked compressAll body larger than context budget stays within budget" {
     defer gpa.free(decoded);
     try std.testing.expectEqual(@as(usize, plain.items.len), decoded.len);
     try std.testing.expectEqualSlices(u8, plain.items, decoded);
+}
+
+/// `s` repeated `n` times. Zig 0.17 removed the `**` operator; `@splat`
+/// covers only a single element.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const result = comptime blk: {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        break :blk out;
+    };
+    return &result;
 }

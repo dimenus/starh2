@@ -203,7 +203,7 @@ test "decoding does not allocate per escape" {
     try std.testing.expectEqualStrings("{\"a\":\"x y\"}", a);
 
     var large = std.testing.FailingAllocator.init(arena, .{});
-    const b = try decodeComponent(large.allocator(), "%41" ** 512);
+    const b = try decodeComponent(large.allocator(), repeat("%41", 512));
     try std.testing.expectEqual(@as(usize, 512), b.len);
 
     try std.testing.expectEqual(small.allocations, large.allocations);
@@ -228,4 +228,15 @@ test "param finds and decodes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectEqualStrings("hello world", try param(arena_state.allocator(), "x=1&msg=hello+world", "msg"));
+}
+
+/// `s` repeated `n` times. Zig 0.17 removed the `**` operator; `@splat`
+/// covers only a single element.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const result = comptime blk: {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        break :blk out;
+    };
+    return &result;
 }

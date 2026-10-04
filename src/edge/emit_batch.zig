@@ -323,7 +323,7 @@ test "ticketed DATA alone is a valid batch with no control occupancy" {
 test "frames fill the TLS plaintext cap without overflowing" {
     var storage: [max_plaintext]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    const payload = [_]u8{'x'} ** 64;
+    const payload: [64]u8 = @splat('x');
     while (batch.wouldFit(payload.len)) {
         batch.copyFrame(&payload, true, payload.len, true);
     }

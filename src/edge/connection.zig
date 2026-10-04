@@ -175,8 +175,8 @@ pub fn notePlacement(actor_thread: std.Thread.Id) void {
 pub const ProbeKind = enum(u8) { accept, conn_entry, actor_start, actor_turn, handler_start, handler_iter, reaper_job, tls_recv_submit, tls_send_submit };
 pub const probe_slots = 8;
 pub var probe_tids: [probe_slots]std.atomic.Value(i32) = std.mem.zeroes([probe_slots]std.atomic.Value(i32));
-pub var probe_counts: [@typeInfo(ProbeKind).@"enum".fields.len][probe_slots]std.atomic.Value(u64) =
-    std.mem.zeroes([@typeInfo(ProbeKind).@"enum".fields.len][probe_slots]std.atomic.Value(u64));
+pub var probe_counts: [@typeInfo(ProbeKind).@"enum".field_names.len][probe_slots]std.atomic.Value(u64) =
+    std.mem.zeroes([@typeInfo(ProbeKind).@"enum".field_names.len][probe_slots]std.atomic.Value(u64));
 /// More distinct threads than slots: those notes are dropped, and counted
 /// here, so a full table cannot pass as a complete one.
 pub var probe_overflow: std.atomic.Value(u64) = .init(0);
@@ -3067,6 +3067,21 @@ const Connection = struct {
     ///    slot has passed through `releaseSlot`.
     /// 5. Close the socket exactly once, guarded by `socket_closed`.
     fn run(self: *Connection) !void {
+        var torn_down = false;
+        // The error path runs after `runBody`'s own `defer`, the order an
+        // `errdefer` at the top of the body gave before Zig 0.17 removed
+        // error capture from `errdefer`.
+        self.runBody(&torn_down) catch |err| {
+            if (!torn_down) {
+                torn_down = true;
+                self.teardownExhaustive();
+                if (err == error.Canceled) zio.recancel();
+            }
+            return err;
+        };
+    }
+
+    fn runBody(self: *Connection, torn_down: *bool) !void {
         const gpa = self.config.gpa;
         const io = self.config.io;
         if (diag_task_handle_fn) |f| self.actor_task_h.store(f(), .release);
@@ -3080,12 +3095,6 @@ const Connection = struct {
         var write_handle: ?zio.JoinHandle(void) = null;
         var tls_started = false;
         var h2c_started = false;
-        var torn_down = false;
-        errdefer |err| if (!torn_down) {
-            torn_down = true;
-            self.teardownExhaustive();
-            if (err == error.Canceled) zio.recancel();
-        };
 
         defer {
             if (self.diag_registered) diagDeregister(self);
@@ -3389,7 +3398,7 @@ const Connection = struct {
         }
 
         self.teardownExhaustive();
-        torn_down = true;
+        torn_down.* = true;
         // endShield only drops shield_count. A cancel that arrived during
         // the shield is still pending; consume and return it.
         try zio.checkCancel();

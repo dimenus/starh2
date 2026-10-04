@@ -123,7 +123,7 @@ fn sseHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response)
 
 /// ~5 MiB one-shot body: the production shape that found t-482's ordering bug
 /// and t-538's TLS crash. Static so the handler allocates nothing.
-const big_body = [_]u8{'B'} ** (5 * 1024 * 1024);
+const big_body: [5 * 1024 * 1024]u8 = @splat('B');
 
 fn bigHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;

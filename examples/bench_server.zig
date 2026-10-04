@@ -296,8 +296,9 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         if (tid == 0) continue;
         try w.print("{s}{{\"tid\":{d}", .{ if (first_slot) "" else ",", tid });
         first_slot = false;
-        inline for (@typeInfo(conn_mod.ProbeKind).@"enum".fields) |f| {
-            try w.print(",\"{s}\":{d}", .{ f.name, conn_mod.probe_counts[f.value][i].load(.acquire) });
+        const probe_info = @typeInfo(conn_mod.ProbeKind).@"enum";
+        inline for (probe_info.field_names, probe_info.field_values) |name, value| {
+            try w.print(",\"{s}\":{d}", .{ name, conn_mod.probe_counts[value][i].load(.acquire) });
         }
         try w.writeAll("}");
     }
@@ -430,7 +431,7 @@ const StuckEntry = struct {
     task: std.atomic.Value(usize) = .init(0),
 };
 const stuck_table_len = 16384;
-var g_stuck: [stuck_table_len]StuckEntry = [_]StuckEntry{.{}} ** stuck_table_len;
+var g_stuck: [stuck_table_len]StuckEntry = @splat(.{});
 var g_stuck_next: std.atomic.Value(usize) = .init(0);
 var g_stuck_untracked: std.atomic.Value(u64) = .init(0);
 

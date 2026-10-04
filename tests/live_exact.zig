@@ -18,7 +18,7 @@ const HandlerEvt = struct {
 
 /// Bounded result channel — no global last-value races across rounds.
 const ResultCh = struct {
-    slots: [8]HandlerEvt = [_]HandlerEvt{.{}} ** 8,
+    slots: [8]HandlerEvt = @splat(.{}),
     w: std.atomic.Value(u32) = .init(0),
     r: std.atomic.Value(u32) = .init(0),
 

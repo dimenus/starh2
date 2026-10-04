@@ -199,7 +199,7 @@ const HuffDecodeNode = struct {
 
 const huff_decode_trie = build: {
     @setEvalBranchQuota(200_000);
-    var storage: [1024]HuffDecodeNode = [_]HuffDecodeNode{.{}} ** 1024;
+    var storage: [1024]HuffDecodeNode = @splat(.{});
     var count: u16 = 1;
     for (huff_pairs, 0..) |p, sym| {
         var idx: u16 = 0;

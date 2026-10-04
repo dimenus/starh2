@@ -269,7 +269,7 @@ fn compressiblePlain(n: usize, gpa: std.mem.Allocator) ![]u8 {
 
 fn sendTextHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
-    const plain = "hello compressed world " ** 20; // > 256 bytes
+    const plain = repeat("hello compressed world ", 20); // > 256 bytes
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, plain);
 }
 
@@ -301,7 +301,7 @@ fn sendWithContentEncoding(_: *anyopaque, req: *const starh2.Request, resp: *sta
 
 fn sendWithVaryAndLength(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
-    const plain = "vary-merge-body " ** 40;
+    const plain = repeat("vary-merge-body ", 40);
     var len_buf: [16]u8 = undefined;
     const len_s = try std.fmt.bufPrint(&len_buf, "{d}", .{plain.len});
     try resp.send(200, &.{
@@ -313,7 +313,7 @@ fn sendWithVaryAndLength(_: *anyopaque, req: *const starh2.Request, resp: *starh
 
 fn sendPngHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
-    const plain = "\x89PNG" ++ ("binary-not-compressible-pad" ** 20);
+    const plain = "\x89PNG" ++ (repeat("binary-not-compressible-pad", 20));
     try resp.send(200, &.{.{ .name = "content-type", .value = "image/png" }}, plain);
 }
 
@@ -451,7 +451,7 @@ test "I2 send path round-trips brotli" {
                     try std.testing.expect(cap.hasVaryAcceptEncoding());
                     const decoded = try brotli.Decoder.decompressAll(alloc, 2 * 1024 * 1024, cap.body.items);
                     defer alloc.free(decoded);
-                    const expect = "hello compressed world " ** 20;
+                    const expect = repeat("hello compressed world ", 20);
                     try std.testing.expectEqualStrings(expect, decoded);
                 }
             }.go);
@@ -543,7 +543,7 @@ test "five MiB one-shot br round-trip keeps server alive" {
                     try std.testing.expectEqualStrings("br", cap2.headerValue("content-encoding").?);
                     const d2 = try brotli.Decoder.decompressAll(alloc, 4 * 1024 * 1024, cap2.body.items);
                     defer alloc.free(d2);
-                    const expect = "hello compressed world " ** 20;
+                    const expect = repeat("hello compressed world ", 20);
                     try std.testing.expectEqualStrings(expect, d2);
                 }
             }.go);
@@ -794,7 +794,7 @@ test "I6 pool exhaustion serves identity and counts fallback" {
                     try readUntil(s2, &cap2, 5000, doneEnd);
                     try std.testing.expect(cap2.headerValue("content-encoding") == null);
                     try std.testing.expect(cap2.hasVaryAcceptEncoding());
-                    const expect = "hello compressed world " ** 20;
+                    const expect = repeat("hello compressed world ", 20);
                     try std.testing.expectEqualStrings(expect, cap2.body.items);
                     const pool = server.compression_pool orelse return error.NoPool;
                     try std.testing.expect(pool.identity_fallbacks.load(.acquire) >= 1);
@@ -999,7 +999,7 @@ test "no accept-encoding stays identity" {
                     try std.testing.expect(cap.headerValue("content-encoding") == null);
                     // Eligible by configuration still adds Vary.
                     try std.testing.expect(cap.hasVaryAcceptEncoding());
-                    const expect = "hello compressed world " ** 20;
+                    const expect = repeat("hello compressed world ", 20);
                     try std.testing.expectEqualStrings(expect, cap.body.items);
                 }
             }.go);
@@ -1060,4 +1060,15 @@ test "every Pinned by bullet names a test that exists" {
         std.debug.print("pinned bullets: {d} checked, {d} foreign, {d} missing\n", .{ checked, foreign, missing });
         return error.PinnedTestMissing;
     }
+}
+
+/// `s` repeated `n` times. Zig 0.17 removed the `**` operator; `@splat`
+/// covers only a single element.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const result = comptime blk: {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        break :blk out;
+    };
+    return &result;
 }

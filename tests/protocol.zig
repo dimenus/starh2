@@ -23,7 +23,7 @@ test "frame corpus reaches types" {
     parser.skipPreface();
 
     var buf: [32]u8 = undefined;
-    const opaque_data = [_]u8{0} ** 8;
+    const opaque_data: [8]u8 = @splat(0);
     const n = try frame.Serializer.ping(&buf, false, &opaque_data);
     const r = try parser.ingestOne(buf[0..n]);
     try std.testing.expect(r != null);

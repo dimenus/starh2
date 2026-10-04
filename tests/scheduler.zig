@@ -184,8 +184,8 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
     defer pool2.deinit(gpa);
     var s2 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool2);
     defer s2.deinit();
-    try s2.enqueueDataBytes(1, &[_]u8{1} ** 100, false, 0, 0);
-    try s2.enqueueDataBytes(3, &[_]u8{3} ** 100, true, 0, 0);
+    try s2.enqueueDataBytes(1, &@as([100]u8, @splat(1)), false, 0, 0);
+    try s2.enqueueDataBytes(3, &@as([100]u8, @splat(3)), true, 0, 0);
     var sink_state: SinkState = .{ .gpa = gpa };
     defer sink_state.emitted.deinit(gpa);
     const win = struct {
@@ -209,7 +209,7 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
     defer pool3.deinit(gpa);
     var s3 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 4, &pool3);
     defer s3.deinit();
-    try s3.enqueueDataBytes(1, &[_]u8{9} ** 100, true, 0, 0);
+    try s3.enqueueDataBytes(1, &@as([100]u8, @splat(9)), true, 0, 0);
     const p = try gpa.alloc(u8, 16);
     @memset(p, 8);
     try s3.enqueueControl(p, .ordinary, 0, 0);
@@ -307,7 +307,7 @@ test "zero stream window does not block other stream or control (session)" {
             else => {},
         };
     }
-    const chunk = [_]u8{'a'} ** 64;
+    const chunk: [64]u8 = @splat('a');
     try session.applyCommand(.{ .respond_data = .{ .stream_id = 1, .data = &chunk, .end_stream = false } });
     {
         const out = session.drainIntents();
@@ -325,7 +325,7 @@ test "zero stream window does not block other stream or control (session)" {
     try session.applyCommand(.{ .respond_data = .{ .stream_id = 3, .data = "ok", .end_stream = true } });
     {
         var pbuf: [17]u8 = undefined;
-        const opaque_data = [_]u8{0} ** 8;
+        const opaque_data: [8]u8 = @splat(0);
         const pn = try frame.Serializer.ping(&pbuf, false, &opaque_data);
         try session.ingest(pbuf[0..pn]);
     }
