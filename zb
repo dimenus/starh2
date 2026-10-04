@@ -1,6 +1,23 @@
 #!/bin/sh
-zvm="$HOME/.zvm/bin/zig"
-if [ -x "$zvm" ]; then
-  exec "$zvm" "$@"
+# Run the zig this tree targets: build.zig.zon's minimum_zig_version, through
+# mise, so worktrees on different Zig releases share one machine without
+# touching the global default. Without mise, fall back to ~/.zvm, then PATH,
+# and refuse a zig whose version differs from the pin: a wrong compiler
+# fails with std API errors that look like real porting work.
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+want=$(sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' "$root/build.zig.zon")
+if [ -z "$want" ]; then
+  echo "zb: no minimum_zig_version in $root/build.zig.zon" >&2
+  exit 1
 fi
-exec zig "$@"
+if command -v mise >/dev/null 2>&1; then
+  exec mise exec "zig@$want" -- zig "$@"
+fi
+zig="$HOME/.zvm/bin/zig"
+[ -x "$zig" ] || zig=zig
+have=$("$zig" version)
+if [ "$have" != "$want" ]; then
+  echo "zb: $zig is $have, build.zig.zon pins $want (install it with mise)" >&2
+  exit 1
+fi
+exec "$zig" "$@"
