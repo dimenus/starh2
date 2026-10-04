@@ -3,9 +3,9 @@ const builtin = @import("builtin");
 const macos_sdk = @import("tools/macos_sdk.zig");
 
 comptime {
-    const min = "0.16.0";
+    const min = "0.17.0";
     const ver = builtin.zig_version;
-    if (ver.major != 0 or ver.minor != 16) {
+    if (ver.major != 0 or ver.minor != 17) {
         @compileError("starh2 requires Zig " ++ min ++ ", found a different minor");
     }
 }
@@ -130,7 +130,24 @@ fn brotliDecLib(
     });
 }
 
+/// `src/http/brotli.zig` imports the brotli headers as `brotli_c`. Zig 0.17
+/// removed `@cImport`, so the headers go through a translate-c step here, for
+/// the module's own target and mode. Both headers are translated even where
+/// only the encoder links: an unreferenced decoder extern costs nothing.
 fn linkBrotliEnc(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *std.Build.Step.Compile) void {
+    const b = mod.owner;
+    const header = b.addWriteFiles().add("brotli_c.h",
+        \\#include <brotli/encode.h>
+        \\#include <brotli/decode.h>
+        \\
+    );
+    const tc = b.addTranslateC(.{
+        .root_source_file = header,
+        .target = mod.resolved_target.?,
+        .optimize = mod.optimize.?,
+    });
+    tc.addIncludePath(brotli.path("c/include"));
+    mod.addImport("brotli_c", tc.createModule());
     mod.addIncludePath(brotli.path("c/include"));
     mod.link_libc = true;
     mod.linkLibrary(lib);
@@ -154,8 +171,12 @@ fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, zio
 /// memchr const-generic; without the wrapper flag, aarch64-linux-gnu -Werror
 /// fails BoringSSL.
 fn overlayBoringBuildScript(b: *std.Build) void {
+    // Writes into zig-pkg at configure time, so the configuration must not be
+    // cached (Zig 0.17 caches configure output unless poisoned).
+    b.graph.poisonCache();
     const io = b.graph.io;
-    const root = b.build_root.handle;
+    var root = b.root.openDir(io, ".", .{}) catch return;
+    defer root.close(io);
     root.access(io, "tools/build-boringssl.sh", .{}) catch return;
     var pkg = root.openDir(io, "zig-pkg", .{ .iterate = true }) catch return;
     defer pkg.close(io);
@@ -170,6 +191,8 @@ fn overlayBoringBuildScript(b: *std.Build) void {
 }
 
 fn resolveBoringsslSource(b: *std.Build) []const u8 {
+    // Probes the filesystem at configure time; see overlayBoringBuildScript.
+    b.graph.poisonCache();
     if (b.option([]const u8, "boringssl-source-path", "Path to a BoringSSL source checkout")) |path| {
         return path;
     }
@@ -179,7 +202,7 @@ fn resolveBoringsslSource(b: *std.Build) []const u8 {
     };
     for (candidates) |candidate| {
         const cmake = b.pathJoin(&.{ candidate, "CMakeLists.txt" });
-        b.build_root.handle.access(b.graph.io, cmake, .{}) catch continue;
+        b.root.access(b.graph.io, cmake, .{}) catch continue;
         return candidate;
     }
     std.process.fatal(
@@ -231,7 +254,7 @@ pub fn build(b: *std.Build) void {
     // Gate builds are Debug; ReleaseFast benches compile the counters out unless
     // `-Dobserve=true`. Do not read `builtin.mode` inside connection.zig — an
     // imported module's mode is not the test artifact's mode.
-    const observe_hot = observe or (optimize == .Debug);
+    const observe_hot = observe or (optimize == .debug);
     const boringssl_source_path = resolveBoringsslSource(b);
 
     const zio_dep = b.dependency("zio", .{
@@ -795,14 +818,14 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "ReleaseSafe build of shipped binaries for every deploy target");
     inline for (release_queries) |rq| {
         const rt = b.resolveTargetQuery(rq.query);
-        const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .ReleaseSafe, .scheduling = zio_scheduling });
-        const datastar_rt = b.lazyDependency("datastar", .{ .target = rt, .optimize = .ReleaseSafe });
-        const boring_rt = boringModule(b, rt, .ReleaseSafe, boringssl_source_path);
-        const brotli_rt = b.dependency("brotli", .{ .target = rt, .optimize = .ReleaseSafe });
+        const zio_rt = b.dependency("zio", .{ .target = rt, .optimize = .safe, .scheduling = zio_scheduling });
+        const datastar_rt = b.lazyDependency("datastar", .{ .target = rt, .optimize = .safe });
+        const boring_rt = boringModule(b, rt, .safe, boringssl_source_path);
+        const brotli_rt = b.dependency("brotli", .{ .target = rt, .optimize = .safe });
         const starh2_rt = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = rt,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
             .imports = &.{
                 .{ .name = "boring", .module = boring_rt },
@@ -810,12 +833,12 @@ pub fn build(b: *std.Build) void {
             },
         });
         attachStarh2Options(b, starh2_rt, false, zio_scheduling);
-        const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .ReleaseSafe, b.fmt("brotli_enc_{s}", .{rq.name}));
+        const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .safe, b.fmt("brotli_enc_{s}", .{rq.name}));
         linkBrotliEnc(starh2_rt, brotli_rt, brotli_enc_rt);
         const datastar_mod_rt = b.createModule(.{
             .root_source_file = b.path("src/datastar.zig"),
             .target = rt,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{
                 .{ .name = "starh2", .module = starh2_rt },
             },
@@ -824,7 +847,7 @@ pub fn build(b: *std.Build) void {
             const exe_mod = b.createModule(.{
                 .root_source_file = b.path(ex.path),
                 .target = rt,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
                 .imports = &.{
                     .{ .name = "starh2", .module = starh2_rt },
                     .{ .name = "zio", .module = zio_rt.module("zio") },
@@ -848,7 +871,7 @@ pub fn build(b: *std.Build) void {
         // Zig 0.16 Debug --fuzz writes a coverage header with pcs_len=0 on
         // this runner; ReleaseSafe actually instruments. The 1K cap is the
         // bound; the optimize flag is the one that makes the gate runnable.
-        const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "fuzz-" ++ name, "--fuzz=1K", "-Doptimize=ReleaseSafe" });
+        const cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "fuzz-" ++ name, "--fuzz=1K", "-Doptimize=safe" });
         // Forwarded so a `ci` run under one scheduling does not fuzz a
         // binary built with another.
         cmd.addArg(b.fmt("-Dzio-scheduling={s}", .{@tagName(zio_scheduling)}));
@@ -960,7 +983,7 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.addArg("--server");
     bench_run.addFileArg(bench_server_exe.?.getEmittedBin());
-    if (b.args) |extra| bench_run.addArgs(extra);
+    bench_run.addPassthruArgs();
     bench_run.setCwd(b.path("."));
     bench_run.has_side_effects = true;
     bench_run.stdio = .inherit;
@@ -984,7 +1007,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(pipeline_bench_exe);
     const pipeline_bench_run = b.addRunArtifact(pipeline_bench_exe);
-    if (b.args) |extra| pipeline_bench_run.addArgs(extra);
+    pipeline_bench_run.addPassthruArgs();
     pipeline_bench_run.setCwd(b.path("."));
     pipeline_bench_run.has_side_effects = true;
     pipeline_bench_run.stdio = .inherit;
@@ -1101,8 +1124,7 @@ fn applyMacosSdkLibc(
     }
     const chosen = sel.chosen orelse return .{ .rejected_higher = sel.rejected_higher };
     std.debug.print("macos-sdk: using {s}\n", .{chosen.resolved_path});
-    const include_dir = b.pathJoin(&.{ chosen.resolved_path, "usr", "include" });
-    const bytes = macos_sdk.formatLibcFile(b.allocator, include_dir) catch @panic("OOM");
+    const bytes = macos_sdk.formatLibcFile(b.allocator, chosen.resolved_path) catch @panic("OOM");
     const wf = b.addWriteFiles();
     const lp = wf.add("macos-sdk.libc", bytes);
     const n = applyLibcToOwnedMacosCompiles(b, lp);
@@ -1120,6 +1142,9 @@ fn applyMacosSdkLibc(
 }
 
 fn selectMacosSdk(b: *std.Build, override: ?[]const u8, extra_root: ?[]const u8) MacosSdkSelection {
+    // Scans installed SDKs at configure time; a cached configuration could
+    // name an SDK that has since been removed or superseded.
+    b.graph.poisonCache();
     const io = b.graph.io;
     const gpa = b.allocator;
 

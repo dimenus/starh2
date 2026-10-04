@@ -33,8 +33,10 @@ zig="${ZIG:-zig}"
 tmp="$(mktemp -d)" || exit 2
 trap 'rm -rf "$tmp"' EXIT
 printf 'pub fn main() void {}\n' > "$tmp/empty.zig"
-printf 'include_dir=%s/usr/include\nsys_include_dir=%s/usr/include\ncrt_dir=\nmsvc_lib_dir=\nkernel32_lib_dir=\ngcc_dir=\n' \
-  "$sdk" "$sdk" > "$tmp/libc.txt"
+# Same seven keys as formatLibcFile in tools/macos_sdk.zig; Zig 0.17 rejects a
+# Darwin libc file whose crt_dir or darwin_sdk_dir is empty.
+printf 'include_dir=%s/usr/include\nsys_include_dir=%s/usr/include\ncrt_dir=%s/usr/lib\nmsvc_lib_dir=\nkernel32_lib_dir=\ncc_dir=\ndarwin_sdk_dir=%s\n' \
+  "$sdk" "$sdk" "$sdk" "$sdk" > "$tmp/libc.txt"
 "$zig" build-exe "$tmp/empty.zig" -lc++ -lc --libc "$tmp/libc.txt" \
   -femit-bin="$tmp/probe-bin" > "$tmp/out.txt" 2>&1
 rc=$?

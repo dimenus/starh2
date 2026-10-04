@@ -12,8 +12,11 @@ if [ "$#" -ne 8 ]; then
     exit 64
 fi
 
-source_dir=$1
-build_dir=$2
+# Zig 0.17 passes Run-step paths relative to the build root, and cmake
+# resolves the compiler path from another directory, so make both absolute.
+source_dir=$(CDPATH= cd -- "$1" && pwd -P)
+mkdir -p "$2"
+build_dir=$(CDPATH= cd -- "$2" && pwd -P)
 cmake_build_type=$3
 fips=$4
 zig=$5

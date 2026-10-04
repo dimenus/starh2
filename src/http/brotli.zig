@@ -6,10 +6,7 @@
 //! Init failure before headers commit is a counted identity fallback; budget
 //! exhaustion after commit is the caller's problem (abort the stream).
 const std = @import("std");
-const c = @cImport({
-    @cInclude("brotli/encode.h");
-    @cInclude("brotli/decode.h");
-});
+const c = @import("brotli_c");
 
 pub const EncodeError = error{
     OutOfMemory,
