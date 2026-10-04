@@ -85,7 +85,7 @@ if [ "$STARH2_EXECUTORS" != auto ]; then
 fi
 bench_lock
 "$STARH2" --mode tls --port 19450 --sse-interval-ms "$INTERVAL" \
-  $EXECUTOR_ARGS $TRACE_ARGS > "$OUT/starh2.log" 2>&1 &
+  $EXECUTOR_ARGS $TRACE_ARGS ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
 S_PID=$!
 STARH2_WIDTH=$(starh2_width "$OUT/starh2.log") || { kill $S_PID; bench_unlock; exit 1; }
 WIDTH=$(opponent_width "$STARH2_WIDTH")

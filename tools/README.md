@@ -104,7 +104,9 @@ line and the harness refuses to measure when a pinned arm differs
 (`tools/sse_bench/arm_width.sh`). zio task migration
 is a build option, not a runtime flag: starh2 builds zio with
 `-Dzio-scheduling=work_stealing` by default (migration on, 27ff454). For the
-off arm, build a second binary with `-Dzio-scheduling=pinned`.
+off arm, build a second binary with `-Dzio-scheduling=pinned`. `run.sh` and `mixed.sh` take
+`STARH2_ZIO_SCHEDULING=pinned` to build that arm, and pass `STARH2_EXTRA_ARGS`
+through to the starh2 server (e.g. `--spawn-placement local --conn-balance`).
 
 `tools/sse_bench/mixed.sh` keeps SSE streams live on one TLS connection and
 fires oneshots on the same socket (Go net/http, Kestrel, and hyper opponents;

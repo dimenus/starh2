@@ -83,15 +83,15 @@ HYPER="$OUT/hyper/sse-hyper"
 # after `zig build ci`, that is an example at a different optimize level, and
 # the run then reports a number for a binary nobody asked for. Observed: a
 # 4.7x improvement read back as no change at all.
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
+./zb build starh2-bench-server -Doptimize=ReleaseFast -Dzio-scheduling="${STARH2_ZIO_SCHEDULING:-work_stealing}" --prefix "$OUT/starh2" || exit 1
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 
 bench_lock
 if [ "$STARH2_EXECUTORS" = auto ]; then
-  "$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" > "$OUT/starh2.log" 2>&1 &
+  "$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
 else
   "$STARH2" --mode tls --port 19446 --sse-interval-ms "$INTERVAL" \
-    --executors "$STARH2_EXECUTORS" > "$OUT/starh2.log" 2>&1 &
+    --executors "$STARH2_EXECUTORS" ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
 fi
 S_PID=$!
 STARH2_WIDTH=$(starh2_width "$OUT/starh2.log") || { kill $S_PID; bench_unlock; exit 1; }
