@@ -1,12 +1,12 @@
 {
-  "zig": "0.16.0",
+  "zig": "0.17.0",
   "zio": {
-    "tag": "none. A commit on main after v0.18.0 (v0.18.0-18-g0299e57), not the tag.",
+    "tag": "none. lalinsky/zio PR 788 head (\"Zig 0.17 update\", unmerged on 2026-10-04): upstream main 8413cf4 ported to 0.17.0.",
     "repo": "https://github.com/lalinsky/zio",
-    "commit": "0299e5771b8c042ca42077af0748771fca27d38e",
-    "hash": "zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e",
+    "commit": "24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",
+    "hash": "zio-0.18.0-xHbVVNFVKwBpESpBmSGH8QcqCp1M6MrRbdRK8hXipsFr",
     "scheduling": "-Dzio-scheduling, default work_stealing, passed to every zio dependency in build.zig",
-    "fork_patches": "none. Upstream main carries every patch this repo needed: #709 (select conservation), #711 (post-backend-poll snapshot refresh), #713 (CompletionQueue producer claims)."
+    "fork_patches": "none."
   },
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"
