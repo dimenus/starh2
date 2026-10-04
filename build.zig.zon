@@ -2,14 +2,15 @@
     .name = .starh2,
     .version = "0.1.0",
     .fingerprint = 0x813a04b419058cf5,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // LOCAL EXPERIMENT pin: zio 0299e57 plus tools/zio-prefer-local/prefer-local.diff
-        // (a `.prefer_local` placement). tools/zio-prefer-local/pack.sh writes the
-        // tarball at this path and checks the hash. Not for master.
+        // lalinsky/zio PR 788 head ("Zig 0.17 update", unmerged on 2026-10-04):
+        // upstream main 8413cf4 ported to 0.17.0. No merged upstream rev both
+        // builds on 0.17.0 and has spawnInto; move to the merge commit once
+        // the PR lands.
         .zio = .{
-            .url = "/tmp/starh2-zio-prefer-local.tar.gz",
-            .hash = "zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc",
+            .url = "git+https://github.com/lalinsky/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",
+            .hash = "zio-0.18.0-xHbVVNFVKwBpESpBmSGH8QcqCp1M6MrRbdRK8hXipsFr",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.
