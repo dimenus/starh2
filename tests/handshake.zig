@@ -6,9 +6,13 @@
 //! everything it took: the connection slot, the handshake slot, and every
 //! handler slot. Nothing else in the suite drives a handshake past its
 //! deadline, so without this test a timeout that never fires stays green.
+//!
+//! The second gate pins tls.zig issue #36 (a ClientHello split across records
+//! is rejected): such a client must cost one quick close, not a held slot.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
+const tls = @import("tls");
 
 const conn_mod = starh2.edge.connection;
 const dummy: u8 = 0;
@@ -123,6 +127,110 @@ test "handshake: a stalled TLS client is closed at the timeout and releases ever
     var handle = try rt.spawn(runHandshakeTimeout, .{ rt, gpa });
     handle.join() catch |err| {
         std.debug.print("handshake timeout gate failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+const frag_timeout_ns: u64 = 2 * std.time.ns_per_s;
+
+/// A real ClientHello from tls.zig's client, one record.
+fn clientHello(scratch: []u8) ![]const u8 {
+    var prng = std.Random.DefaultPrng.init(36);
+    var cli = tls.nonblock.Client.init(.{
+        .rng = prng.random(),
+        .now = .fromNanoseconds(@as(i96, 1_790_000_000) * std.time.ns_per_s),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .cipher_suites = tls.config.cipher_suites.tls13,
+        .alpn_protocols = &.{"h2"},
+    });
+    return (try cli.run(&.{}, scratch)).send;
+}
+
+/// The handshake payload of `hello`, re-framed as records of at most
+/// `max_frag` bytes, as `openssl s_client -max_send_frag 512` sends it.
+fn fragment(hello_rec: []const u8, max_frag: usize, out: []u8) []const u8 {
+    var len: usize = 0;
+    var off: usize = 5;
+    while (off < hello_rec.len) {
+        const n = @min(max_frag, hello_rec.len - off);
+        @memcpy(out[len..][0..3], hello_rec[0..3]);
+        std.mem.writeInt(u16, out[len + 3 ..][0..2], @intCast(n), .big);
+        @memcpy(out[len + 5 ..][0..n], hello_rec[off..][0..n]);
+        len += 5 + n;
+        off += n;
+    }
+    return out[0..len];
+}
+
+fn runFragmentedHello(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const io = rt.io();
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.preface_timeout_ns = frag_timeout_ns;
+    var server = try starh2.Server.init(gpa, io, .{
+        .endpoints = &.{.{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .routes = &routes,
+        .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
+
+    var scratch: [20 * 1024]u8 = undefined;
+    const whole = try clientHello(&scratch);
+    try std.testing.expect(whole.len > 5 + 512);
+    var frag_buf: [20 * 1024]u8 = undefined;
+    const split = fragment(whole, 512, &frag_buf);
+
+    // Control: the same ClientHello in one record gets the server's flight.
+    // Without this, a server that rejected every ClientHello would pass.
+    {
+        var stream = try peer.connect(.{});
+        defer stream.close();
+        try writeAll(stream, whole);
+        var buf: [4096]u8 = undefined;
+        const n = try stream.read(&buf, .{ .duration = .fromSeconds(1) });
+        try std.testing.expect(n > 5);
+        try std.testing.expectEqual(@as(u8, 0x16), buf[0]); // handshake record
+    }
+    try waitReleased(&server);
+
+    // tls.zig cannot reassemble a split ClientHello (its issue #36). The cost
+    // must stay bounded: the handshake fails at once, the server closes the
+    // socket long before the handshake timeout, and every slot comes back.
+    var stream = try peer.connect(.{});
+    defer stream.close();
+    try writeAll(stream, split);
+    const elapsed = try waitServerClose(stream);
+    try waitReleased(&server);
+    std.debug.print("fragmented ClientHello: records={d} closed_after_ms={d}\n", .{
+        (split.len - whole.len) / 5 + 1,
+        elapsed / std.time.ns_per_ms,
+    });
+    try std.testing.expect(elapsed < frag_timeout_ns / 4);
+}
+
+test "handshake: a ClientHello split across records closes at once and releases every slot" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    var handle = try rt.spawn(runFragmentedHello, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("fragmented ClientHello gate failed: {s}\n", .{@errorName(err)});
         return err;
     };
 }
