@@ -8,9 +8,54 @@ Pins live in `tools/lock.json`. Held-out seeds stay outside this repo (`tools/he
 ./zb build ci
 ./zb build test
 ./zb build starh2-conformance-server example-hello example-datastar-sse
-./zb build starh2-conformance-server example-hello example-datastar-sse -Doptimize=ReleaseSafe
+./zb build starh2-conformance-server example-hello example-datastar-sse -Doptimize=safe
 ./zb build release   # x86_64-linux-musl + aarch64-linux-musl + aarch64-linux-gnu ReleaseSafe
 ```
+
+## Zig std: stock by default, zig-crypto opt-in
+
+Default builds (`./zb build ...`) use the std that ships with Zig 0.17.0 and
+nothing else; `./zb` refuses to run if `ZIG_LIB_DIR` is set in the
+environment. TLS handshakes then cost about 116 us (Mac) / 132 us (nachos) of
+server CPU, most of it P-256 ECDSA signing and X25519 in std.crypto.
+
+`tools/zig-crypto.sh` builds against the zig-crypto std instead (private
+`dimenus/zig-crypto`, branch `carmack/zig-crypto-sec-pass`), where the same
+handshake costs about 33 / 37 us. Get the checkout (the repo is private, so
+this needs read access to it) at the guard commit, whose `lib/` is the pinned
+`4f47b1d` tree:
+
+```sh
+git clone -b carmack/zig-crypto-sec-pass https://github.com/dimenus/zig-crypto.git ~/src/zig-crypto-sec-pass
+git -C ~/src/zig-crypto-sec-pass checkout 64409e6b7487c98aafe69835e2289a9bfe5c7de9
+```
+
+Then:
+
+```sh
+tools/zig-crypto.sh <zig-crypto-checkout> test
+tools/zig-crypto.sh <zig-crypto-checkout> bench -Doptimize=fast -- -n 100000 -c 50 -m 10 -t 4
+tools/zig-crypto.sh --check <zig-crypto-checkout>   # pin + constant-time guard only (CI)
+```
+
+It is a script rather than `-Dzig-crypto=<path>` because a build option is
+read inside `build.zig`, which is already compiled and running against a std;
+Zig 0.17 takes a std override only as `zig build --zig-lib=<dir>`, first.
+Before building, the script fails unless:
+
+- the checkout's `lib/` is exactly the pinned tree (`lib/` of
+  `4f47b1d81c20`, no local or untracked changes under `lib/`);
+- its constant-time guard (`tools/crypto_sec_pass/ctguard.sh`, from commit
+  `64409e6b7487` on) is unchanged and passes against that `lib/` with the
+  pinned zig. The guard compiles the secret-dependent selects and
+  conditional moves (`P256.basePointTableSelect`, the `pcSelect` scans over
+  `Fe.cMov`, 25519 `cMov`/`toBytes`, the X25519 ladder) for x86_64 baseline,
+  x86_64 znver5 and aarch64, and fails on any conditional branch beyond the
+  structural ones. A pass is cached in `.zig-cache/zig-crypto-guard/`.
+
+Then it runs `./zb build --zig-lib=<checkout>/lib <args>`. Artifacts land in
+the usual `zig-out/`, so rebuild with `./zb` before comparing against stock.
+To move the pin, edit `pin` / `guard_pin` in the script.
 
 ## One-shot benchmark against http2.zig
 
@@ -152,7 +197,7 @@ one, packed-6 handoff, parked wake), and an empty task spawn/join using the
 same zio runtime shape as the bench server.
 
 ```sh
-./zb build bench-pipeline -Doptimize=ReleaseFast -- -n 1000000 --rounds 5
+./zb build bench-pipeline -Doptimize=fast -- -n 1000000 --rounds 5
 tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
 ```
 
@@ -209,8 +254,7 @@ On a Linux host, always build with an explicit target, for example
 rejects them (`fatal linker error: unhandled relocation type R_X86_64_PC64`).
 An explicit target makes zig use its bundled CRT, so the link works. When a
 newer zig links the native target on a gcc-16 host, remove this section
-(t-885 tracks that check). BoringSSL itself builds with `zig cc` for every
-Linux target, native hosts included (`tools/build-boringssl.sh`).
+(t-885 tracks that check).
 
 ## Linux musl RUN (container)
 
@@ -224,7 +268,7 @@ with an `aarch64-linux-musl` binary, or a real amd64 Linux host for the
 x86_64-linux-musl deploy shape.
 
 ```sh
-./zb build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe --prefix zig-out-musl-arm starh2-conformance-server
+./zb build -Dtarget=aarch64-linux-musl -Doptimize=safe --prefix zig-out-musl-arm starh2-conformance-server
 docker run --rm --platform linux/arm64 --privileged \
   -v "$PWD/zig-out-musl-arm/bin/starh2-conformance-server:/srv/starh2-conformance-server:ro" \
   -v "$PWD/tools/multiplex-grader:/grader:ro" \
@@ -254,8 +298,11 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
 # measured handshake amortization, not the record layer.
 ./zig-out/bin/starh2-conformance-server --mode tls --bind 127.0.0.1:0 --cert testdata/cert.pem --key testdata/key.pem
 curl -vk --http2 -H 'x-grader-nonce: tls1' "https://127.0.0.1:$PORT/hello"
-# ALPN reject (expect TLS alert 120):
-openssl s_client -connect 127.0.0.1:$PORT -alpn http/1.1 -servername localhost </dev/null
+# Failed handshakes get a typed fatal alert, then a close:
+# ALPN with only unknown protocols -> alert 120 (no_application_protocol)
+openssl s_client -connect 127.0.0.1:$PORT -alpn spdy/3.1 -servername localhost </dev/null
+# TLS 1.2 only -> alert 70 (protocol_version)
+openssl s_client -connect 127.0.0.1:$PORT -tls1_2 -servername localhost </dev/null
 nghttp -nv --no-verify-peer "https://127.0.0.1:$PORT/hello" -H 'x-grader-nonce: ngtls'
 # The pinned v2.6.0 Darwin release was built with Go 1.12, where TLS 1.3
 # requires this compatibility switch. A modern independently rebuilt grader

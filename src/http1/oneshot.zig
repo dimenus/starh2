@@ -95,6 +95,10 @@ pub const ServerConfig = struct {
     handler: Handler,
     limits: Limits = .{},
     max_connections: usize = 64,
+    /// listen(2) accept-queue length; see `Limits.listen_backlog` in
+    /// core/limits.zig. std.Io's default is 128; the kernel caps this at
+    /// somaxconn.
+    listen_backlog: u31 = 4_096,
 };
 
 pub const Server = struct {
@@ -103,6 +107,7 @@ pub const Server = struct {
     address: std.Io.net.IpAddress,
     handler: Handler,
     limits: Limits,
+    listen_backlog: u31,
     max_connections: usize,
     listener: ?std.Io.net.Server = null,
     local_addr: std.Io.net.IpAddress = undefined,
@@ -116,6 +121,7 @@ pub const Server = struct {
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, config: ServerConfig) InitError!Server {
         if (config.max_connections == 0) return error.InvalidConfig;
+        if (config.listen_backlog == 0) return error.InvalidConfig;
         if (config.limits.header_bytes == 0 or config.limits.header_fields == 0) return error.InvalidConfig;
         return .{
             .gpa = gpa,
@@ -123,6 +129,7 @@ pub const Server = struct {
             .address = config.address,
             .handler = config.handler,
             .limits = config.limits,
+            .listen_backlog = config.listen_backlog,
             .max_connections = config.max_connections,
         };
     }
@@ -134,7 +141,10 @@ pub const Server = struct {
             self.bind_event.set(self.io);
         }
 
-        self.listener = self.address.listen(self.io, .{ .reuse_address = true }) catch return error.ListenFailed;
+        self.listener = self.address.listen(self.io, .{
+            .reuse_address = true,
+            .kernel_backlog = self.listen_backlog,
+        }) catch return error.ListenFailed;
         self.local_addr = self.listener.?.socket.address;
 
         var accept_group: std.Io.Group = .init;

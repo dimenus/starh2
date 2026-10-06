@@ -26,13 +26,18 @@ would need the same conformance and security work as the paths that are used.
 
 ## Requirements
 
-- Zig 0.16.0 (pinned; the TLS dependency is not source-compatible with 0.17-dev)
+- Zig 0.17.0 (pinned in `build.zig.zon`; `./zb` runs that version through mise)
 - For TLS, a certificate and key in PEM form
 - curl built with HTTP/2, to run the TLS gate
 - Your zio dependency built with the same `.scheduling` as starh2's
   `-Dzio-scheduling` (default `.work_stealing`). zio fixes scheduling at
   compile time, and two different values give two zio modules in one build,
   which fails to compile (`file exists in modules 'zio' and 'zio0'`).
+
+TLS crypto comes from Zig's std by default. An opt-in build against the
+faster zig-crypto std (`tools/zig-crypto.sh <checkout> <build args>`, pinned
+and checked by a constant-time codegen guard before it builds) is described
+in `tools/README.md`.
 
 ## Install
 

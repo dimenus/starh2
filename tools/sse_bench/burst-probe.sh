@@ -35,7 +35,7 @@ done
 command -v go >/dev/null 2>&1 || { echo "go is required for the client" >&2; exit 1; }
 mkdir -p "$OUT"
 cd "$REPO/tools/sse_bench" && go build -o "$OUT/sse-client" ./client.go || exit 1
-cd "$REPO" && ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2" || exit 1
+cd "$REPO" && ./zb build starh2-bench-server -Doptimize=fast --prefix "$OUT/starh2" || exit 1
 
 bench_lock
 "$OUT/starh2/bin/starh2-bench-server" --mode tls --port "$PORT" --sse-interval-ms 10 \

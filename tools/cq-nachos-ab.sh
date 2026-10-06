@@ -27,11 +27,7 @@ build_arm() {
   REF=$1; OUT=$2
   WT=$(mktemp -d /tmp/starh2-ab-XXXXXX)
   git -C "$REPO" worktree add -f "$WT" "$REF" > /dev/null
-  mkdir -p "$WT/vendor"
-  ln -sfn "$REPO/vendor/boringssl" "$WT/vendor/boringssl" 2>/dev/null || true
-  [ -e "$WT/vendor/boringssl/CMakeLists.txt" ] || \
-    ln -sfn "$HOME/Source/oss/http2-zig-hendrik/boringssl" "$WT/vendor/boringssl"
-  (cd "$WT" && ./zb build starh2-bench-server -Doptimize=ReleaseFast \
+  (cd "$WT" && ./zb build starh2-bench-server -Doptimize=fast \
     -Dtarget=x86_64-linux-musl --prefix "$OUT")
   git -C "$REPO" worktree remove --force "$WT"
 }

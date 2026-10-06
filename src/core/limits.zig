@@ -123,6 +123,24 @@ pub const Limits = struct {
     control_entries_per_connection: usize = 256,
     stream_tombstones: usize = 1_024,
     concurrent_tls_handshakes: usize = 128,
+    /// Kernel accept-queue length requested from listen(2) for every endpoint.
+    /// zio and std.Io both default to 128, which a connection burst overruns
+    /// before the accept loop runs: the kernel drops handshake packets for
+    /// a full queue, so the client waits out a TCP retransmit (1 s and up),
+    /// and a client with a connect deadline gives up. The kernel silently caps
+    /// the request at its own limit (Linux `net.core.somaxconn`, macOS
+    /// `kern.ipc.somaxconn`), so asking for more than it allows is not an
+    /// error; it only means the operator's sysctl is the ceiling.
+    ///
+    /// A longer queue only helps when the admission limits can take what it
+    /// holds: the accept loop closes a connection over `max_connections` or
+    /// `concurrent_tls_handshakes` instead of waiting for a slot. A TLS burst
+    /// bigger than `concurrent_tls_handshakes` needs that limit raised too.
+    ///
+    /// Not part of `resourceUpperBound`: the queue is kernel memory, and every
+    /// queued connection still passes `max_connections` and
+    /// `concurrent_tls_handshakes` when it is accepted.
+    listen_backlog: u31 = 4_096,
     certificate_chain_bytes: usize = 64 * 1024,
     private_key_bytes: usize = 16 * 1024,
     tls_handshake_scratch_bytes: usize = 256 * 1024,
@@ -223,6 +241,7 @@ pub const Limits = struct {
         if (self.control_bytes_per_connection <= TERMINAL_CONTROL_RESERVE_BYTES) return error.InvalidConfig;
         if (self.control_entries_per_connection <= TERMINAL_CONTROL_RESERVE_ENTRIES) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
+        if (self.listen_backlog == 0) return error.InvalidConfig;
         if (self.tls_stream_bytes < TLS_CONN_BUFFER_BYTES) return error.InvalidConfig;
         if (self.frame_slab_bytes < 9) return error.InvalidConfig;
         if (self.frame_slabs_per_connection == 0) return error.InvalidConfig;
@@ -496,6 +515,12 @@ test "h1_body term moves allocator_bytes with request_body_bytes" {
     const bigger = try more.resourceUpperBound();
     try std.testing.expect(bigger.terms.h1_body > base.terms.h1_body);
     try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+}
+
+test "rejects a zero listen backlog" {
+    var l = Limits.defaults;
+    l.listen_backlog = 0;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
 }
 
 test "rejects zero h1_head_bytes" {

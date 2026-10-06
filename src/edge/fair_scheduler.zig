@@ -145,7 +145,7 @@ pub const FairScheduler = struct {
     drr_cursor: u31 = 1,
     data_quanta: usize = 0,
     emitted_controls_since_data: usize = 0,
-    control_gaps: [128]usize = .{0} ** 128,
+    control_gaps: [128]usize = @splat(0),
     gap_i: usize = 0,
     sid_scratch: []u31,
     emits_total: usize = 0,
@@ -789,11 +789,11 @@ test "the per-stream cap is the pool's slab length" {
     var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
     defer sched.deinit();
 
-    try sched.enqueueDataBytes(1, &[_]u8{'a'} ** 40, false, 0, 0);
+    try sched.enqueueDataBytes(1, &@as([40]u8, @splat('a')), false, 0, 0);
     try std.testing.expectEqual(@as(usize, 40), sched.pendingByteLen(1));
     // Past the slab: OutOfMemory, which is the stream's own cap, distinct from
     // pool exhaustion.
-    try std.testing.expectError(error.OutOfMemory, sched.enqueueDataBytes(1, &[_]u8{'b'} ** 40, false, 0, 0));
+    try std.testing.expectError(error.OutOfMemory, sched.enqueueDataBytes(1, &@as([40]u8, @splat('b')), false, 0, 0));
     try std.testing.expectEqual(@as(usize, 40), sched.pendingByteLen(1));
 }
 

@@ -11,7 +11,7 @@
 #   reporting that as a result. Packed drain turns at -m 10 sit well below 0.4.
 #   inbound_records/req = leftover counter from the old record loop (stays 0).
 #   encrypt/decrypt/send ns/req = Clock.awake around sendAccountedWire; encrypt
-#   and decrypt clocks stay 0 because SSL_write lives in TlsPump, not the actor.
+#   and decrypt clocks stay 0 because encryption lives in TlsPump, not the actor.
 #   decrypt_loop / accAppend / accCompact = unused after TLS-as-stream.
 #   allocs/request   = counting-allocator calls on the server GPA (--trace only)
 #   alloc_ns/request = GPA rawAlloc wall time including two Clock.awake reads.
@@ -36,7 +36,7 @@ OUT=${OUT:-/tmp/starh2-oneshot-trace}
 REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$REPO"
 . "$REPO/tools/bench_lock.sh"
-./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$OUT/starh2"
+./zb build starh2-bench-server -Doptimize=fast --prefix "$OUT/starh2"
 STARH2="$OUT/starh2/bin/starh2-bench-server"
 PORT=19447
 bench_lock

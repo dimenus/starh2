@@ -162,7 +162,7 @@ pub fn inspectSdk(gpa: Allocator, io: Io, sdk_root: []const u8) error{OutOfMemor
     const resolved = Io.Dir.cwd().realPathFileAlloc(io, sdk_root, gpa) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{
-            .resolved_path = try gpa.dupeZ(u8, sdk_root),
+            .resolved_path = try gpa.dupeSentinel(u8, sdk_root, 0),
             .version = version_from_input,
             .verdict = if (isAbsentErr(err)) .absent else .inspect_failed,
         };
@@ -262,7 +262,7 @@ pub fn scan(gpa: Allocator, io: Io, roots: []const []const u8) error{OutOfMemory
     for (candidates, list.items) |*dst, src| {
         dst.version = src.version;
         dst.verdict = src.verdict;
-        dst.resolved_path = try gpa.dupeZ(u8, src.resolved_path);
+        dst.resolved_path = try gpa.dupeSentinel(u8, src.resolved_path, 0);
         copied += 1;
     }
 
@@ -369,17 +369,20 @@ pub fn formatChoiceBlocker(gpa: Allocator, blocker: ChoiceBlocker) ![]u8 {
     };
 }
 
-/// Six-key libc file. On macOS only `include_dir` and `sys_include_dir` hold a path.
-pub fn formatLibcFile(gpa: Allocator, include_dir: []const u8) ![]u8 {
+/// Seven-key libc file, the same paths Zig 0.17's native Darwin detection
+/// (`LibCInstallation.findNative`) derives from one SDK root. 0.17 rejects a
+/// Darwin libc file whose `crt_dir` or `darwin_sdk_dir` is empty.
+pub fn formatLibcFile(gpa: Allocator, sdk_dir: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa,
-        \\include_dir={s}
-        \\sys_include_dir={s}
-        \\crt_dir=
+        \\include_dir={s}/usr/include
+        \\sys_include_dir={s}/usr/include
+        \\crt_dir={s}/usr/lib
         \\msvc_lib_dir=
         \\kernel32_lib_dir=
-        \\gcc_dir=
+        \\cc_dir=
+        \\darwin_sdk_dir={s}
         \\
-    , .{ include_dir, include_dir });
+    , .{ sdk_dir, sdk_dir, sdk_dir, sdk_dir });
 }
 
 /// Fatal-message body: every search root, every candidate, each verdict.
@@ -550,9 +553,9 @@ test "scan enumerates every unique SDK and collapses symlink duplicates" {
 
 test "chooser picks the highest usable version from ascending input" {
     const gpa = std.testing.allocator;
-    const p15 = try gpa.dupeZ(u8, "/sdk/low");
-    const p26 = try gpa.dupeZ(u8, "/sdk/mid");
-    const p27 = try gpa.dupeZ(u8, "/sdk/high");
+    const p15 = try gpa.dupeSentinel(u8, "/sdk/low", 0);
+    const p26 = try gpa.dupeSentinel(u8, "/sdk/mid", 0);
+    const p27 = try gpa.dupeSentinel(u8, "/sdk/high", 0);
     defer gpa.free(p15);
     defer gpa.free(p26);
     defer gpa.free(p27);
@@ -576,9 +579,9 @@ test "chooser picks the highest usable version from ascending input" {
 }
 
 test "isRejectedHigher matches every rejected SDK above chosen" {
-    const p26 = try std.testing.allocator.dupeZ(u8, "/sdk/a");
-    const p270 = try std.testing.allocator.dupeZ(u8, "/sdk/b");
-    const p271 = try std.testing.allocator.dupeZ(u8, "/sdk/c");
+    const p26 = try std.testing.allocator.dupeSentinel(u8, "/sdk/a", 0);
+    const p270 = try std.testing.allocator.dupeSentinel(u8, "/sdk/b", 0);
+    const p271 = try std.testing.allocator.dupeSentinel(u8, "/sdk/c", 0);
     defer std.testing.allocator.free(p26);
     defer std.testing.allocator.free(p270);
     defer std.testing.allocator.free(p271);
@@ -724,8 +727,8 @@ test "higher SDK directory with no math.h does not block" {
 
 test "higher inspect_failed still blocks" {
     const gpa = std.testing.allocator;
-    const p26 = try gpa.dupeZ(u8, "/sdk/mid");
-    const p28 = try gpa.dupeZ(u8, "/sdk/high-io");
+    const p26 = try gpa.dupeSentinel(u8, "/sdk/mid", 0);
+    const p28 = try gpa.dupeSentinel(u8, "/sdk/high-io", 0);
     defer gpa.free(p26);
     defer gpa.free(p28);
     var cands = [_]Candidate{
@@ -762,7 +765,7 @@ test "duplicate aliases keep the highest version" {
 
 test "truncated root is a choice blocker" {
     const gpa = std.testing.allocator;
-    const p26 = try gpa.dupeZ(u8, "/sdk/mid");
+    const p26 = try gpa.dupeSentinel(u8, "/sdk/mid", 0);
     defer gpa.free(p26);
     var cands = [_]Candidate{
         .{ .resolved_path = p26, .version = .{ .major = 26, .minor = 5 }, .verdict = .usable },
@@ -838,17 +841,18 @@ test "unreadable math.h is not missing_math_h" {
     try std.testing.expectEqual(Verdict.unreadable, cand.verdict);
 }
 
-test "formatLibcFile writes the six keys and leaves crt_dir empty" {
+test "formatLibcFile writes the seven keys from one SDK root" {
     const gpa = std.testing.allocator;
-    const bytes = try formatLibcFile(gpa, "/sdk/usr/include");
+    const bytes = try formatLibcFile(gpa, "/sdk");
     defer gpa.free(bytes);
 
     try std.testing.expect(std.mem.indexOf(u8, bytes, "include_dir=/sdk/usr/include\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "sys_include_dir=/sdk/usr/include\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "crt_dir=\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "crt_dir=/sdk/usr/lib\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "msvc_lib_dir=\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "kernel32_lib_dir=\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "gcc_dir=\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "cc_dir=\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "darwin_sdk_dir=/sdk\n") != null);
 }
 
 test "formatScanReport names every root and every candidate verdict" {
@@ -865,7 +869,7 @@ test "formatScanReport names every root and every candidate verdict" {
     const result = try scan(gpa, io, &.{root_abs});
     defer result.deinit(gpa);
 
-    const forced_path = try gpa.dupeZ(u8, "/outside/search/roots.sdk");
+    const forced_path = try gpa.dupeSentinel(u8, "/outside/search/roots.sdk", 0);
     defer gpa.free(forced_path);
     const forced: Candidate = .{
         .resolved_path = forced_path,

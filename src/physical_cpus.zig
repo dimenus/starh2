@@ -91,7 +91,7 @@ const linux_count = if (builtin.os.tag == .linux) struct {
     }
 
     fn sysfsPath(buf: *[128]u8, cpu: usize, leaf: []const u8) [:0]const u8 {
-        return std.fmt.bufPrintZ(buf, "/sys/devices/system/cpu/cpu{d}/topology/{s}", .{ cpu, leaf }) catch {
+        return std.fmt.bufPrintSentinel(buf, "/sys/devices/system/cpu/cpu{d}/topology/{s}", .{ cpu, leaf }, 0) catch {
             buf[0] = 0;
             return buf[0..0 :0];
         };

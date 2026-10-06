@@ -1,6 +1,43 @@
 #!/bin/sh
-zvm="$HOME/.zvm/bin/zig"
-if [ -x "$zvm" ]; then
-  exec "$zvm" "$@"
+# Run the zig this tree targets: build.zig.zon's minimum_zig_version, through
+# mise, so worktrees on different Zig releases share one machine without
+# touching the global default. Without mise, fall back to ~/.zvm, then PATH,
+# and refuse a zig whose version differs from the pin: a wrong compiler
+# fails with std API errors that look like real porting work.
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+want=$(sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' "$root/build.zig.zon")
+if [ -z "$want" ]; then
+  echo "zb: no minimum_zig_version in $root/build.zig.zon" >&2
+  exit 1
 fi
-exec zig "$@"
+# A std other than the one that ships with zig $want is opt-in: only
+# tools/zig-crypto.sh sets ZB_ZIG_LIB, after checking the tree against its
+# pin. zb then exports ZIG_LIB_DIR for child zig processes and puts
+# --zig-lib=<dir> first for `zig build` (the only spelling Zig 0.17's build
+# frontend takes). Without ZB_ZIG_LIB, an inherited ZIG_LIB_DIR is refused,
+# so a default build always uses the stock std.
+if [ -n "${ZB_ZIG_LIB:-}" ]; then
+  if [ ! -f "$ZB_ZIG_LIB/std/std.zig" ]; then
+    echo "zb: no std at ZB_ZIG_LIB=$ZB_ZIG_LIB" >&2
+    exit 2
+  fi
+  export ZIG_LIB_DIR="$ZB_ZIG_LIB"
+  if [ "${1:-}" = "build" ]; then
+    shift
+    set -- build "--zig-lib=$ZB_ZIG_LIB" "$@"
+  fi
+elif [ -n "${ZIG_LIB_DIR:-}" ]; then
+  echo "zb: ZIG_LIB_DIR=$ZIG_LIB_DIR is set, but default builds use the std that ships with zig $want; unset it (see tools/README.md for the opt-in std)" >&2
+  exit 2
+fi
+if command -v mise >/dev/null 2>&1; then
+  exec mise exec "zig@$want" -- zig "$@"
+fi
+zig="$HOME/.zvm/bin/zig"
+[ -x "$zig" ] || zig=zig
+have=$("$zig" version)
+if [ "$have" != "$want" ]; then
+  echo "zb: $zig is $have, build.zig.zon pins $want (install it with mise)" >&2
+  exit 1
+fi
+exec "$zig" "$@"

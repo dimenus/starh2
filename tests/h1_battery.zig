@@ -1817,8 +1817,7 @@ fn runTlsSmallRecords(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var client: starh2.edge.tls_edge.Conn = .{};
     client.initTcp(stream);
     defer client.deinit();
-    var connector = try starh2.edge.tls_edge.loopbackH1ClientConnector();
-    defer connector.deinit();
+    const connector = starh2.edge.tls_edge.loopbackH1ClientConnector();
     try client.handshakeClientH1(&connector, rt.io());
 
     const req = "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
@@ -1942,8 +1941,7 @@ fn runTlsTaskPostReuses(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var client: starh2.edge.tls_edge.Conn = .{};
     client.initTcp(stream);
     defer client.deinit();
-    var connector = try starh2.edge.tls_edge.loopbackH1ClientConnector();
-    defer connector.deinit();
+    const connector = starh2.edge.tls_edge.loopbackH1ClientConnector();
     try client.handshakeClientH1(&connector, rt.io());
 
     observed.gpa = gpa;
@@ -1987,10 +1985,9 @@ fn runAlpnBoth(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var client: starh2.edge.tls_edge.Conn = .{};
     client.initTcp(stream);
     defer client.deinit();
-    var connector = try starh2.edge.tls_edge.loopbackBothAlpnClientConnector();
-    defer connector.deinit();
+    const connector = starh2.edge.tls_edge.loopbackBothAlpnClientConnector();
     try client.handshakeClientAny(&connector, rt.io());
-    const alpn = client.ssl.selectedAlpn() orelse return error.NoAlpn;
+    const alpn = client.selectedAlpn() orelse return error.NoAlpn;
     try std.testing.expectEqualStrings("h2", alpn);
 
     const wire = try h2c.buildClientHello(gpa, "/");
@@ -2030,8 +2027,7 @@ fn runAlpnH1Only(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var client: starh2.edge.tls_edge.Conn = .{};
     client.initTcp(stream);
     defer client.deinit();
-    var connector = try starh2.edge.tls_edge.loopbackH1ClientConnector();
-    defer connector.deinit();
+    const connector = starh2.edge.tls_edge.loopbackH1ClientConnector();
     try client.handshakeClientH1(&connector, rt.io());
     try tlsGet200(&client);
     ts.server.requestShutdown();
@@ -2057,10 +2053,9 @@ fn runAlpnNone(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var client: starh2.edge.tls_edge.Conn = .{};
     client.initTcp(stream);
     defer client.deinit();
-    var connector = try starh2.edge.tls_edge.loopbackNoAlpnClientConnector();
-    defer connector.deinit();
+    const connector = starh2.edge.tls_edge.loopbackNoAlpnClientConnector();
     try client.handshakeClientAny(&connector, rt.io());
-    try std.testing.expect(starh2.edge.tls_edge.isHttp11Alpn(client.ssl.selectedAlpn()));
+    try std.testing.expect(starh2.edge.tls_edge.isHttp11Alpn(client.selectedAlpn()));
     try tlsGet200(&client);
     ts.server.requestShutdown();
     try ts.future.await(rt.io());
@@ -2234,8 +2229,7 @@ fn runZeroAllocTls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var client: starh2.edge.tls_edge.Conn = .{};
     client.initTcp(stream);
     defer client.deinit();
-    var connector = try starh2.edge.tls_edge.loopbackH1ClientConnector();
-    defer connector.deinit();
+    const connector = starh2.edge.tls_edge.loopbackH1ClientConnector();
     try client.handshakeClientH1(&connector, rt.io());
     try tlsGet200(&client);
     const before = count.allocs.load(.acquire);

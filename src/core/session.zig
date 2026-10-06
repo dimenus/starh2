@@ -1829,7 +1829,7 @@ test "SETTINGS_INITIAL_WINDOW_SIZE negative send window holds queued DATA (real 
     }
 
     // Simulate connection scheduler pending: emit first quantum that fits, hold the rest.
-    const payload = [_]u8{'Q'} ** 200;
+    const payload: [200]u8 = @splat('Q');
     const first = payload[0..128];
     const rest = payload[128..];
     try session.applyCommand(.{ .respond_data = .{
@@ -1976,14 +1976,14 @@ test "intent capacity: flood fails closed without silent drop" {
     i = 0;
     while (i < session.intentCapacity() - session.terminal_reserve) : (i += 1) {
         var buf: [17]u8 = undefined;
-        const ping_data = [_]u8{0} ** 8;
+        const ping_data: [8]u8 = @splat(0);
         const pn = try frame.Serializer.ping(&buf, false, &ping_data);
         const p = try gpa.dupe(u8, buf[0..pn]);
         try session.pushIntent(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
     }
     {
         var buf: [17]u8 = undefined;
-        const ping_data = [_]u8{0} ** 8;
+        const ping_data: [8]u8 = @splat(0);
         const pn = try frame.Serializer.ping(&buf, false, &ping_data);
         const p = try gpa.dupe(u8, buf[0..pn]);
         try std.testing.expectError(error.PoolExhausted, session.pushIntent(.{ .outbound_frame = .{ .typ = .ping, .payload = p } }));

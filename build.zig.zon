@@ -2,14 +2,15 @@
     .name = .starh2,
     .version = "0.1.0",
     .fingerprint = 0x813a04b419058cf5,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // LOCAL EXPERIMENT pin: zio 0299e57 plus tools/zio-prefer-local/prefer-local.diff
-        // (a `.prefer_local` placement). tools/zio-prefer-local/pack.sh writes the
-        // tarball at this path and checks the hash. Not for master.
+        // lalinsky/zio PR 788 head ("Zig 0.17 update", unmerged on 2026-10-04):
+        // upstream main 8413cf4 ported to 0.17.0. No merged upstream rev both
+        // builds on 0.17.0 and has spawnInto; move to the merge commit once
+        // the PR lands.
         .zio = .{
-            .url = "/tmp/starh2-zio-prefer-local.tar.gz",
-            .hash = "zio-0.18.0-xHbVVLtSKgBTh3L_kMvlu9A5NJrowXV6QKjjpQ8m_aUc",
+            .url = "git+https://github.com/lalinsky/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",
+            .hash = "zio-0.18.0-xHbVVNFVKwBpESpBmSGH8QcqCp1M6MrRbdRK8hXipsFr",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.
@@ -22,17 +23,18 @@
             .url = "https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz",
             .hash = "N-V-__8AAF_gIQDX2wVzXI-r96NyCgKuDj9W_Gab-TU7Qzoi",
         },
-        .boring = .{
-            .url = "https://github.com/hendriknielaender/boring/archive/refs/tags/v0.1.1.tar.gz",
-            .hash = "boring-0.1.0-K6muvtBGCQAHvnOGuLmCcLZn-WgZkddupoEFKwSKpL7U",
+        // ianic/tls.zig main bd22bcb (2026-10-03, after "update to zig 0.17").
+        // Pure Zig TLS: src/edge/tls.zig drives its non-blocking API. Its
+        // "trailing partial record" decrypt test is the guard for lalinsky's
+        // ef6780e fix, which upstream carries in a different form.
+        .tls = .{
+            .url = "git+https://github.com/ianic/tls.zig#bd22bcb73f423389441a1de80bf031ef1b623cce",
+            .hash = "tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK",
         },
     },
     // brotli pin: google/brotli v1.1.0 release archive (raw C sources; no build.zig)
     // tag v1.1.0 / https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz
     // consumed via addCSourceFiles on c/common + c/enc (c/dec only on test artifacts)
-    // boring pin: hendriknielaender/boring v0.1.1
-    // BoringSSL source: -Dboringssl-source-path, else vendor/boringssl, else
-    // ../../oss/http2-zig-hendrik/boringssl (revision recorded in tools/lock.json)
     .paths = .{
         "build.zig",
         "build.zig.zon",

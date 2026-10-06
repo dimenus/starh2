@@ -426,10 +426,10 @@ pub fn main(init: std.process.Init) !void {
         \\var sink: ?*const anyopaque = null;
         \\
         \\pub fn main() void {{
-        \\    inline for (@typeInfo(files).@"struct".decls) |file_decl| {{
-        \\        const file = @field(files, file_decl.name);
-        \\        inline for (@typeInfo(file).@"struct".decls) |decl| {{
-        \\            const f = @field(file, decl.name);
+        \\    inline for (@typeInfo(files).@"struct".decl_names) |file_name| {{
+        \\        const file = @field(files, file_name);
+        \\        inline for (@typeInfo(file).@"struct".decl_names) |name| {{
+        \\            const f = @field(file, name);
         \\            if (@typeInfo(@TypeOf(f)) == .@"fn") sink = @ptrCast(&f);
         \\        }}
         \\    }}
@@ -462,7 +462,7 @@ pub fn main(init: std.process.Init) !void {
         \\    .name = .readme_consumer,
         \\    .version = "0.0.0",
         \\    .fingerprint = 0x9d5aafd09d46dee4,
-        \\    .minimum_zig_version = "0.16.0",
+        \\    .minimum_zig_version = "0.17.0",
         \\    .dependencies = .{{
         \\{s}    }},
         \\    .paths = .{{ "build.zig", "build.zig.zon", "src" }},

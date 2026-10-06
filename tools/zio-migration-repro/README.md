@@ -23,7 +23,7 @@ report.
 From this directory:
 
 ```sh
-../../zb build -Doptimize=ReleaseFast
+../../zb build -Doptimize=fast
 ./zig-out/bin/zio-migration-repro
 ./zig-out/bin/zio-migration-repro --no-migration
 ```

@@ -126,13 +126,13 @@ arm_sha() {
 build_bench() {
   root=$1
   prefix=$2
-  (CDPATH= cd -- "$root" && ./zb build starh2-bench-server -Doptimize=ReleaseFast --prefix "$prefix")
+  (CDPATH= cd -- "$root" && ./zb build starh2-bench-server -Doptimize=fast --prefix "$prefix")
 }
 
 build_pipeline() {
   root=$1
   prefix=$2
-  (CDPATH= cd -- "$root" && ./zb build -Doptimize=ReleaseFast --prefix "$prefix")
+  (CDPATH= cd -- "$root" && ./zb build -Doptimize=fast --prefix "$prefix")
 }
 
 skip_or_run() {
@@ -229,9 +229,9 @@ packed() {
   sum=$4
   name="packed-tls-h2c"
   log="$OUT/logs/${name}-${arm}.log"
-  cmd="cd $root && ./zb build bench -Doptimize=ReleaseFast -- -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS"
+  cmd="cd $root && ./zb build bench -Doptimize=fast -- -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS"
   if skip_or_run "$name" "$arm" "$sum" "$cmd" "$log"; then
-    run_logged "$log" sh -c "CDPATH= cd -- \"$root\" && ./zb build bench -Doptimize=ReleaseFast -- -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS" || true
+    run_logged "$log" sh -c "CDPATH= cd -- \"$root\" && ./zb build bench -Doptimize=fast -- -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS" || true
     st=$(bench_row_status "$log")
     emit_row "$name" "$arm" "$st" "see log" "$log" "$sum"
   fi
@@ -338,9 +338,9 @@ pipeline_hf() {
       fi
     fi
   else
-    cmd="cd $root && ./zb build bench-pipeline -Doptimize=ReleaseFast -- -n $PIPELINE_N --rounds 5"
+    cmd="cd $root && ./zb build bench-pipeline -Doptimize=fast -- -n $PIPELINE_N --rounds 5"
     if skip_or_run "$name" "$arm" "$sum" "$cmd" "$log"; then
-      if run_logged "$log" sh -c "CDPATH= cd -- \"$root\" && ./zb build bench-pipeline -Doptimize=ReleaseFast -- -n $PIPELINE_N --rounds 5"; then
+      if run_logged "$log" sh -c "CDPATH= cd -- \"$root\" && ./zb build bench-pipeline -Doptimize=fast -- -n $PIPELINE_N --rounds 5"; then
         emit_row "$name" "$arm" "ok" "zb build bench-pipeline" "$log" "$sum"
       else
         emit_row "$name" "$arm" "FAIL" "bench-pipeline exit non-zero" "$log" "$sum"
@@ -363,9 +363,9 @@ if [ "$OS" = Linux ] && command -v poop >/dev/null 2>&1; then
   name="pipeline-poop"
   log="$OUT/logs/${name}.log"
   if [ -n "$BASE_SHA" ] && [ -x "$NEW_PIPE" ]; then
-    cmd="poop --duration 15000 'cd $BASE_ROOT && ./zb build bench-pipeline -Doptimize=ReleaseFast -- -n $PIPELINE_N --rounds 5' '$NEW_PIPE -n $PIPELINE_N --rounds 5'"
+    cmd="poop --duration 15000 'cd $BASE_ROOT && ./zb build bench-pipeline -Doptimize=fast -- -n $PIPELINE_N --rounds 5' '$NEW_PIPE -n $PIPELINE_N --rounds 5'"
     if skip_or_run "$name" "$NEW_SHA+$BASE_SHA" "$NEW_SUM" "$cmd" "$log"; then
-      if run_logged "$log" poop --duration 15000 "CDPATH= cd -- \"$BASE_ROOT\" && ./zb build bench-pipeline -Doptimize=ReleaseFast -- -n $PIPELINE_N --rounds 5" "$NEW_PIPE -n $PIPELINE_N --rounds 5"; then
+      if run_logged "$log" poop --duration 15000 "CDPATH= cd -- \"$BASE_ROOT\" && ./zb build bench-pipeline -Doptimize=fast -- -n $PIPELINE_N --rounds 5" "$NEW_PIPE -n $PIPELINE_N --rounds 5"; then
         emit_row "$name" "$NEW_SHA+$BASE_SHA" "ok" "poop both arms" "$log" "$NEW_SUM"
       else
         emit_row "$name" "$NEW_SHA+$BASE_SHA" "FAIL" "poop exit non-zero" "$log" "$NEW_SUM"
@@ -572,9 +572,9 @@ if [ "$OS" = Linux ]; then
   name="observe-bimodal"
   log="$OUT/logs/${name}.log"
   obs_prefix="$OUT/bin/observe"
-  cmd="./zb build starh2-bench-server -Doptimize=ReleaseFast -Dobserve=true ; oneshot-only rounds with /trace"
+  cmd="./zb build starh2-bench-server -Doptimize=fast -Dobserve=true ; oneshot-only rounds with /trace"
   if skip_or_run "$name" "$NEW_SHA" "observe-pending" "$cmd" "$log"; then
-    if run_logged "$log" sh -c "CDPATH= cd -- \"$NEW_ROOT\" && ./zb build starh2-bench-server -Doptimize=ReleaseFast -Dobserve=true --prefix \"$obs_prefix\""; then
+    if run_logged "$log" sh -c "CDPATH= cd -- \"$NEW_ROOT\" && ./zb build starh2-bench-server -Doptimize=fast -Dobserve=true --prefix \"$obs_prefix\""; then
       obs_bin="$obs_prefix/bin/starh2-bench-server"
       obs_sum=$(sha256_file "$obs_bin")
       port=19480

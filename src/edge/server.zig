@@ -49,6 +49,10 @@ pub const TlsConfig = struct {
 /// a peer that broke the handshake. Counted in Debug and `-Dobserve=true`.
 pub var test_handshake_timeouts: std.atomic.Value(usize) = .init(0);
 
+/// Test-only: times an accept loop parked because the connection or TLS
+/// handshake limit was full. Counted in Debug and `-Dobserve=true`.
+pub var test_admission_waits: std.atomic.Value(usize) = .init(0);
+
 pub const InitError = error{
     OutOfMemory,
     InvalidConfig,
@@ -175,6 +179,8 @@ pub const Server = struct {
             if (tls_config.certificate_chain_pem.len > config.limits.certificate_chain_bytes) return error.CertificateTooLarge;
             if (tls_config.private_key_pem.len > config.limits.private_key_bytes) return error.PrivateKeyTooLarge;
             tls_acceptor = tls_edge.Acceptor.initFromPem(
+                gpa,
+                io,
                 tls_config.certificate_chain_pem,
                 tls_config.private_key_pem,
             ) catch return error.InvalidCertificate;
@@ -261,7 +267,7 @@ pub const Server = struct {
                 .h2c_prior_knowledge => |value| value,
                 .h1c => |value| value,
             };
-            self.listeners[i] = address.listen(self.io, .{ .reuse_address = true }) catch return error.ListenFailed;
+            self.listeners[i] = listenEndpoint(self.io, address, self.limits.listen_backlog) catch return error.ListenFailed;
             self.local_addrs[i] = self.listeners[i].socket.address;
             self.listeners_bound = i + 1;
         }
@@ -333,14 +339,59 @@ pub const Server = struct {
 
     fn tryAdmitConnection(self: *Server) bool {
         while (true) {
-            const current = self.active_connections.load(.acquire);
+            const current = self.active_connections.load(.seq_cst);
             if (current >= self.limits.max_connections) return false;
-            if (self.active_connections.cmpxchgWeak(current, current + 1, .acq_rel, .acquire) == null) return true;
+            if (self.active_connections.cmpxchgWeak(current, current + 1, .seq_cst, .seq_cst) == null) return true;
         }
     }
 
+    fn releaseConnection(self: *Server) void {
+        const prev = self.active_connections.fetchSub(1, .seq_cst);
+        std.debug.assert(prev > 0);
+        self.accounting.wakeAdmission();
+    }
+
+    /// Both limits an accept on this endpoint must pass have room. Checked
+    /// before `accept`, so a full server leaves new connections in the
+    /// kernel's listen queue.
+    fn admissionRoom(self: *Server, mode: connection.Mode) bool {
+        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) return false;
+        if (mode == .tls and self.accounting.active_handshakes.load(.seq_cst) >= self.accounting.max_handshakes) return false;
+        return true;
+    }
+
+    /// Take the connection slot and, for TLS, the handshake slot: both or
+    /// neither.
+    fn admitAccepted(self: *Server, mode: connection.Mode) bool {
+        if (!self.tryAdmitConnection()) return false;
+        if (mode == .tls and !self.accounting.tryAdmitHandshake()) {
+            self.releaseConnection();
+            return false;
+        }
+        return true;
+    }
+
+    /// Park the accept loop until `ready` holds. A release of either slot
+    /// kind wakes it (`GlobalAccounting.wakeAdmission`); the ordering argument
+    /// is on `GlobalAccounting.admission_waiters`. Server stop cancels the
+    /// accept group, which ends the wait with `error.Canceled`.
+    fn awaitAdmission(
+        self: *Server,
+        mode: connection.Mode,
+        comptime ready: fn (*Server, connection.Mode) bool,
+    ) std.Io.Cancelable!void {
+        if (ready(self, mode)) return;
+        const a = &self.accounting;
+        try a.admission_mu.lock();
+        defer a.admission_mu.unlock();
+        _ = a.admission_waiters.fetchAdd(1, .seq_cst);
+        defer _ = a.admission_waiters.fetchSub(1, .seq_cst);
+        if (comptime connection.test_observe) _ = test_admission_waits.fetchAdd(1, .monotonic);
+        while (!ready(self, mode)) try a.admission_cond.wait(&a.admission_mu);
+    }
+
     fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
-        defer _ = self.active_connections.fetchSub(1, .acq_rel);
+        defer self.releaseConnection();
         defer if (config.balancer) |b| b.releaseConn(config.exec_index.?);
         connection.probeNote(.conn_entry);
         if (config.mode == .h1c) return h1.serve(stream, config, null, &.{});
@@ -361,14 +412,7 @@ pub const Server = struct {
             return;
         };
         tls_conn.initTcp(stream);
-        tls_conn.setupAccept(acceptor) catch {
-            config.gpa.destroy(tls_conn);
-            if (config.handshake_held) {
-                if (config.accounting) |a| a.releaseHandshake();
-            }
-            stream.close(config.io);
-            return;
-        };
+        tls_conn.setupAccept(acceptor);
 
         handshakeWithTimeout(tls_conn, config) catch |err| {
             tls_conn.deinit();
@@ -388,7 +432,7 @@ pub const Server = struct {
         const leftover_n = tls_conn.drainLeftoverPlain(&leftover_buf);
         const leftover = leftover_buf[0..leftover_n];
 
-        if (tls_edge.isHttp2Alpn(tls_conn.ssl.selectedAlpn())) {
+        if (tls_edge.isHttp2Alpn(tls_conn.selectedAlpn())) {
             const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {
                 tls_conn.deinit();
                 config.gpa.destroy(tls_conn);
@@ -441,10 +485,27 @@ pub const Server = struct {
 
     /// Accept until shutdown. One loop per endpoint.
     ///
-    /// Admission happens HERE, before any connection state is built, because a
-    /// refusal must be cheap. The order is connection slot first, then TLS
-    /// handshake slot, and each failure path releases what it already took and
-    /// closes the socket.
+    /// Admission happens HERE, before any connection state is built. While
+    /// the connection limit, or for TLS the handshake limit, is full, the loop
+    /// does not call accept at all: it parks until a slot is released, and new
+    /// connections wait in the kernel's listen queue (`Limits.listen_backlog`)
+    /// instead of being accepted and closed. A burst larger than the limits
+    /// is then metered through them rather than refused, the way nginx and
+    /// Go's net/http behave.
+    ///
+    /// Room is checked before accept and the slots are taken after it. A
+    /// concurrent loop on another endpoint can take the room in between; this
+    /// loop then waits again holding the one accepted stream. Slots are never
+    /// held across an accept with nothing to show for it, so the counters stay
+    /// exact for the drain checks and for other endpoints.
+    ///
+    /// What bounds the wait: a handshake slot is held at most
+    /// `preface_timeout_ns` (the handshake timeout), so stalled TLS clients
+    /// delay admission by at most that long. A connection slot is held for
+    /// the connection's life; a server full of idle connections stops
+    /// accepting until one closes, where it used to accept and close at once.
+    /// The listen queue, and the client's own connect timeout, bound what
+    /// waits behind it.
     ///
     /// The TLS handshake slot is separate from the connection slot on purpose.
     /// A handshake costs asymmetric CPU — the client sends a few bytes, the
@@ -461,6 +522,7 @@ pub const Server = struct {
     ) std.Io.Cancelable!void {
         const listener = &self.listeners[endpoint_index];
         while (!self.shutdown_flag.load(.acquire)) {
+            try self.awaitAdmission(mode, admissionRoom);
             connection.probeNote(.accept);
             const stream = listener.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -476,20 +538,11 @@ pub const Server = struct {
             // was fine. Darwin's default is less punishing; the option is still
             // correct on every accepted socket.
             setTcpNoDelay(stream);
-            if (!self.tryAdmitConnection()) {
+            self.awaitAdmission(mode, admitAccepted) catch |err| {
                 stream.close(self.io);
-                continue;
-            }
-
-            var handshake_held = false;
-            if (mode == .tls) {
-                if (!self.accounting.tryAdmitHandshake()) {
-                    _ = self.active_connections.fetchSub(1, .acq_rel);
-                    stream.close(self.io);
-                    continue;
-                }
-                handshake_held = true;
-            }
+                return err;
+            };
+            const handshake_held = mode == .tls;
             var config: connection.ConnConfig = .{
                 .io = self.io,
                 .mode = mode,
@@ -536,7 +589,7 @@ pub const Server = struct {
             }
             connection_group.concurrent(self.io, connEntry, .{ self, stream, config }) catch {
                 if (handshake_held) self.accounting.releaseHandshake();
-                _ = self.active_connections.fetchSub(1, .acq_rel);
+                self.releaseConnection();
                 stream.close(self.io);
                 continue;
             };
@@ -611,6 +664,16 @@ pub const Server = struct {
         self.* = undefined;
     }
 };
+
+/// Bind and listen one endpoint with an explicit accept-queue length.
+///
+/// std.Io's `ListenOptions.kernel_backlog` defaults to 128, and zio's
+/// `netListenIp` passes it straight to listen(2), so a server that leaves it
+/// alone gets a 128-entry queue whatever the kernel allows. `backlog` comes
+/// from `Limits.listen_backlog`; the kernel caps it at somaxconn.
+fn listenEndpoint(io: std.Io, address: EndpointAddress, backlog: u31) std.Io.net.IpAddress.ListenError!std.Io.net.Server {
+    return address.listen(io, .{ .reuse_address = true, .kernel_backlog = backlog });
+}
 
 /// Turn off Nagle on an accepted TCP socket.
 ///
@@ -720,4 +783,57 @@ test "TCP_NODELAY after peer RST does not abort" {
     }
 
     setTcpNoDelay(accepted);
+}
+
+/// The accept-queue length the kernel actually granted a listening socket.
+/// Linux reports it as `tcpi_sacked` in TCP_INFO for a socket in LISTEN
+/// (`sk_max_ack_backlog`). Darwin has no getsockopt for it (only `netstat
+/// -L` shows it), so the test below runs on Linux only.
+fn linuxGrantedBacklog(listener: std.Io.net.Server) !u32 {
+    var info: [104]u8 align(4) = undefined;
+    var len: std.posix.socklen_t = info.len;
+    switch (std.posix.errno(std.posix.system.getsockopt(
+        listener.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.os.linux.TCP.INFO,
+        &info,
+        &len,
+    ))) {
+        .SUCCESS => {},
+        else => return error.GetSockOptFailed,
+    }
+    // struct tcp_info: 8 bytes of u8 fields, then u32 rto, ato, snd_mss,
+    // rcv_mss, unacked, sacked.
+    if (len < 32) return error.ShortTcpInfo;
+    return std.mem.readInt(u32, info[28..32], .little);
+}
+
+fn linuxSomaxconn(io: std.Io) !u32 {
+    var buf: [32]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, "/proc/sys/net/core/somaxconn", &buf);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10);
+}
+
+test "endpoints listen with Limits.listen_backlog, not the 128 default" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const cap = try linuxSomaxconn(io);
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+
+    // Control: the std.Io default the server used before. If this ever reads
+    // more than 128, the default moved and the knob below proves less.
+    var plain = try bind.listen(io, .{ .reuse_address = true });
+    defer plain.socket.close(io);
+    try std.testing.expectEqual(@min(cap, 128), try linuxGrantedBacklog(plain));
+
+    const want = limits_mod.Limits.defaults.listen_backlog;
+    try std.testing.expect(want > 128);
+    var server_listener = try listenEndpoint(io, bind, want);
+    defer server_listener.socket.close(io);
+    try std.testing.expectEqual(@min(cap, want), try linuxGrantedBacklog(server_listener));
+
+    // A small explicit value is honoured too, so the knob is not a floor.
+    var small = try listenEndpoint(io, bind, 7);
+    defer small.socket.close(io);
+    try std.testing.expectEqual(@as(u32, 7), try linuxGrantedBacklog(small));
 }

@@ -296,8 +296,9 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         if (tid == 0) continue;
         try w.print("{s}{{\"tid\":{d}", .{ if (first_slot) "" else ",", tid });
         first_slot = false;
-        inline for (@typeInfo(conn_mod.ProbeKind).@"enum".fields) |f| {
-            try w.print(",\"{s}\":{d}", .{ f.name, conn_mod.probe_counts[f.value][i].load(.acquire) });
+        const probe_info = @typeInfo(conn_mod.ProbeKind).@"enum";
+        inline for (probe_info.field_names, probe_info.field_values) |name, value| {
+            try w.print(",\"{s}\":{d}", .{ name, conn_mod.probe_counts[value][i].load(.acquire) });
         }
         try w.writeAll("}");
     }
@@ -430,7 +431,7 @@ const StuckEntry = struct {
     task: std.atomic.Value(usize) = .init(0),
 };
 const stuck_table_len = 16384;
-var g_stuck: [stuck_table_len]StuckEntry = [_]StuckEntry{.{}} ** stuck_table_len;
+var g_stuck: [stuck_table_len]StuckEntry = @splat(.{});
 var g_stuck_next: std.atomic.Value(usize) = .init(0);
 var g_stuck_untracked: std.atomic.Value(u64) = .init(0);
 
@@ -707,6 +708,11 @@ const Args = struct {
     balance_rank: ?starh2.Balancer.Rank = null,
     placement_log: bool = false,
     allow_ptrace: bool = false,
+    /// Null keeps `Limits.defaults` for each. Connection-churn shapes (many
+    /// new TLS connections at once) need all three above their defaults.
+    listen_backlog: ?u31 = null,
+    max_connections: ?usize = null,
+    tls_handshakes: ?usize = null,
 };
 
 /// `--placement-log`: one line per placed connection, with the peer port (so
@@ -772,13 +778,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
                     return error.PlacementNeedsPinnedBuild;
                 }
                 out.spawn_placement = .local;
-            } else if (std.mem.eql(u8, v, "prefer_local")) {
-                // EXPERIMENT: needs the patched zio this branch pins. A start
-                // hint, valid under every scheduling: under work_stealing the
-                // task may still migrate.
-                out.spawn_placement = .prefer_local;
             } else {
-                std.debug.print("--spawn-placement takes auto, local or prefer_local, got {s}\n", .{v});
+                std.debug.print("--spawn-placement takes auto or local, got {s}\n", .{v});
                 return error.InvalidSpawnPlacement;
             }
         } else if (std.mem.eql(u8, a, "--conn-balance")) {
@@ -805,6 +806,12 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             // so a wedged server can be inspected live without being started
             // under gdb, which changes its timing.
             out.allow_ptrace = true;
+        } else if (std.mem.eql(u8, a, "--listen-backlog")) {
+            out.listen_backlog = try std.fmt.parseInt(u31, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--max-connections")) {
+            out.max_connections = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--tls-handshakes")) {
+            out.tls_handshakes = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--diag-stuck")) {
             // Diagnosis: record each handler's and actor's blocking point
             // for /stuck (connection.diag_stuck; off by default because it
@@ -1032,8 +1039,7 @@ fn driveOneshots(gpa: std.mem.Allocator, io: std.Io, tls: bool, peer: starh2.End
             conn.deinit();
             stream.close(io);
         }
-        var connector = try tls_edge.loopbackClientConnector();
-        defer connector.deinit();
+        const connector = tls_edge.loopbackClientConnector();
         try conn.handshakeClient(&connector, io);
         try driveH2(gpa, .{ .tls = &conn }, n);
     } else {
@@ -1143,10 +1149,16 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         break :blk .{ .tls = addr };
     } else .{ .h2c_prior_knowledge = addr };
 
+    var limits: starh2.Limits = .defaults;
+    if (args.listen_backlog) |v| limits.listen_backlog = v;
+    if (args.max_connections) |v| limits.max_connections = v;
+    if (args.tls_handshakes) |v| limits.concurrent_tls_handshakes = v;
+
     var server = try starh2.Server.init(server_gpa, rt.io(), .{
         .endpoints = &.{ep},
         .routes = &routes,
         .tls = tls_cfg,
+        .limits = limits,
         .balancer = if (balancer_storage) |*b| b else null,
     });
     defer server.deinit(server_gpa);
@@ -1163,7 +1175,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d}}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d}}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1178,6 +1190,9 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             @as(u8, @intFromBool(balancer_storage != null)),
             if (balancer_storage) |*b| @tagName(b.rank) else "none",
             @as(u8, @intFromBool(balancer_storage != null and balancer_storage.?.trace != null)),
+            limits.listen_backlog,
+            limits.max_connections,
+            limits.concurrent_tls_handshakes,
         },
     );
     defer gpa.free(ready);
