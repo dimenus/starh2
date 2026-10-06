@@ -73,9 +73,123 @@ const Config = struct {
     rounds: usize = 3,
 };
 
+/// Every exit that is not the end of a clean run comes through here, so it
+/// is also where spawned servers die. `std.process.exit` runs no defers: an
+/// abort that only printed left the servers running, still bound to their
+/// ports (the opponent on a fixed one, 18444 in the tls.zig captures), and
+/// the next run then probed or benchmarked the leftover instead of its own
+/// arm.
 fn abort(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print("bench: " ++ fmt ++ "\n", args);
+    stopSpawned();
     std.process.exit(1);
+}
+
+/// Process groups of the servers this harness spawned and has not stopped
+/// yet; 0 is an empty slot. Each server runs in its own group (`pgid = 0`
+/// at spawn), so stopping the group also stops whatever a wrapper script
+/// started: `--opponent` is often a script around the real server, and
+/// signalling only the script's pid orphans that server on its port.
+var spawned: [3]std.atomic.Value(std.posix.pid_t) = @splat(.init(0));
+
+/// How long a server gets to exit on SIGTERM before it gets SIGKILL.
+const stop_grace_ns: u64 = 3 * std.time.ns_per_s;
+
+fn spawnServer(io: std.Io, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
+    var opts = options;
+    opts.pgid = 0;
+    const child = try std.process.spawn(io, opts);
+    const pid = child.id orelse return child;
+    for (&spawned) |*slot| {
+        if (slot.cmpxchgStrong(0, pid, .acq_rel, .acquire) == null) return child;
+    }
+    unreachable; // three servers at most: tls, h2c, opponent
+}
+
+fn untrack(pid: std.posix.pid_t) void {
+    for (&spawned) |*slot| _ = slot.cmpxchgStrong(pid, 0, .acq_rel, .acquire);
+}
+
+fn signalGroup(pid: std.posix.pid_t, sig: std.posix.SIG) void {
+    std.posix.kill(-pid, sig) catch std.posix.kill(pid, sig) catch {};
+}
+
+/// Reap `pid` if it has exited. True once it is gone.
+fn reaped(pid: std.posix.pid_t) bool {
+    var status: c_int = 0;
+    const rc = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+    return switch (std.posix.errno(rc)) {
+        .SUCCESS => rc != 0,
+        .INTR => false,
+        else => true, // ECHILD: not ours, or already reaped
+    };
+}
+
+/// SIGTERM every tracked server group, wait up to `stop_grace_ns` for the
+/// leaders to exit, then SIGKILL what is left. The abort path only: it reaps
+/// with waitpid directly, behind std.process.Child's back, so nothing may use
+/// those Child values afterwards.
+fn stopSpawned() void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return,
+        else => {},
+    }
+    var pids: [spawned.len]std.posix.pid_t = undefined;
+    for (&spawned, &pids) |*slot, *pid| {
+        pid.* = slot.swap(0, .acq_rel);
+        if (pid.* != 0) signalGroup(pid.*, .TERM);
+    }
+    var waited_ns: u64 = 0;
+    const step_ns: u64 = 20 * std.time.ns_per_ms;
+    while (waited_ns < stop_grace_ns) : (waited_ns += step_ns) {
+        var live = false;
+        for (&pids) |*pid| {
+            if (pid.* != 0 and reaped(pid.*)) pid.* = 0;
+            if (pid.* != 0) live = true;
+        }
+        if (!live) break;
+        const ts: std.posix.timespec = .{ .sec = 0, .nsec = @intCast(step_ns) };
+        _ = std.posix.system.nanosleep(&ts, null);
+    }
+    for (pids) |pid| {
+        if (pid == 0) continue;
+        std.debug.print("bench: pid {d} ignored SIGTERM for {d} s; killing its group\n", .{ pid, stop_grace_ns / std.time.ns_per_s });
+        signalGroup(pid, .KILL);
+        var status: c_int = 0;
+        _ = std.posix.system.waitpid(pid, &status, 0);
+    }
+}
+
+/// Ctrl-C reaches only this process: the servers are in their own groups,
+/// out of the terminal's foreground group. Pass the signal on to them, then
+/// die of it with the default action.
+fn onInterrupt(sig: std.posix.SIG) callconv(.c) void {
+    for (&spawned) |*slot| {
+        const pid = slot.load(.acquire);
+        if (pid != 0) signalGroup(pid, .TERM);
+    }
+    const dfl: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(sig, &dfl, null);
+    std.posix.raise(sig) catch {};
+}
+
+fn installInterruptHandlers() void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return,
+        else => {},
+    }
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = onInterrupt },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &action, null);
+    std.posix.sigaction(.TERM, &action, null);
+    std.posix.sigaction(.HUP, &action, null);
 }
 
 const Arm = struct {
@@ -334,6 +448,9 @@ fn awaitReadyPort(io: std.Io, child: *std.process.Child) !u16 {
     abort("server ready line exceeded {d} bytes", .{buf.len});
 }
 
+/// Clean-run shutdown: SIGTERM the server's group and wait for the leader,
+/// so its rusage is collected. Signalling the group, not the pid, also stops
+/// a server that a wrapper script started.
 fn stopAndCollect(child: *std.process.Child, io: std.Io) void {
     switch (builtin.os.tag) {
         .windows, .wasi => {
@@ -343,17 +460,60 @@ fn stopAndCollect(child: *std.process.Child, io: std.Io) void {
         else => {},
     }
     const pid = child.id orelse return;
-    std.posix.kill(pid, .TERM) catch {
-        child.kill(io);
-        return;
-    };
+    untrack(pid);
+    signalGroup(pid, .TERM);
     _ = child.wait(io) catch {
+        signalGroup(pid, .KILL);
         child.kill(io);
         return;
     };
 }
 
-pub fn main(init: std.process.Init) !void {
+/// The opponent's address, from `--opponent-url`. Only IP literals and
+/// `localhost`: the harness runs every arm on this machine.
+fn urlAddress(url: []const u8) ?std.Io.net.IpAddress {
+    const after_scheme = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
+    const authority = after_scheme[0 .. std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len];
+    const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse return null;
+    var host = authority[0..colon];
+    const port = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch return null;
+    if (std.mem.eql(u8, host, "localhost")) host = "127.0.0.1";
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
+    return std.Io.net.IpAddress.parse(host, port) catch null;
+}
+
+fn accepts(io: std.Io, addr: std.Io.net.IpAddress) bool {
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
+    return true;
+}
+
+/// How long the opponent gets to start accepting connections.
+const opponent_listen_timeout_ns: u64 = 15 * std.time.ns_per_s;
+
+/// The opponent prints no ready line, so the harness used to probe it the
+/// moment it was spawned and abort on h2load's empty output ("could not
+/// parse h2load request percentiles"). Wait until its port accepts a TCP
+/// connection instead, bounded, and fail by name if it never does.
+fn awaitOpponentListening(io: std.Io, addr: std.Io.net.IpAddress, url: []const u8) !void {
+    var waited_ns: u64 = 0;
+    const step_ns: u64 = 50 * std.time.ns_per_ms;
+    while (!accepts(io, addr)) : (waited_ns += step_ns) {
+        if (waited_ns >= opponent_listen_timeout_ns) {
+            abort("the opponent never accepted a connection at {s} within {d} s", .{ url, opponent_listen_timeout_ns / std.time.ns_per_s });
+        }
+        try io.sleep(.fromNanoseconds(step_ns), .awake);
+    }
+}
+
+pub fn main(init: std.process.Init) void {
+    installInterruptHandlers();
+    run(init) catch |err| abort("{s}", .{@errorName(err)});
+    // Anything still tracked (the starh2 arms under --opponent-only).
+    stopSpawned();
+}
+
+fn run(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
@@ -363,37 +523,43 @@ pub fn main(init: std.process.Init) !void {
 
     const cfg = try parseArgs(arena, init.minimal.args);
 
-    var tls_child = std.process.spawn(io, .{
+    // Before anything is spawned: a server left on the opponent's port by
+    // an earlier run would answer every probe in place of the real opponent.
+    const opponent_addr: ?std.Io.net.IpAddress = if (cfg.opponent.len == 0) null else urlAddress(cfg.opponent_url) orelse
+        abort("--opponent-url {s} needs an IP literal or localhost, and a port", .{cfg.opponent_url});
+    if (opponent_addr) |addr| {
+        if (accepts(io, addr)) abort("something already accepts connections at {s}, before the opponent was started; a server left by an earlier run?", .{cfg.opponent_url});
+    }
+
+    var tls_child = spawnServer(io, .{
         .argv = &.{ cfg.server, "--mode", "tls", "--port", "0" },
         .stdout = .pipe,
         .stderr = .ignore,
         .request_resource_usage_statistics = true,
     }) catch abort("cannot spawn {s}", .{cfg.server});
-    defer tls_child.kill(io);
     const tls_port = try awaitReadyPort(io, &tls_child);
     const tls_url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{d}/", .{tls_port});
 
-    var h2c_child = std.process.spawn(io, .{
+    var h2c_child = spawnServer(io, .{
         .argv = &.{ cfg.server, "--mode", "h2c", "--port", "0" },
         .stdout = .pipe,
         .stderr = .ignore,
         .request_resource_usage_statistics = true,
     }) catch abort("cannot spawn {s}", .{cfg.server});
-    defer h2c_child.kill(io);
     const h2c_port = try awaitReadyPort(io, &h2c_child);
     const h2c_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{h2c_port});
 
     var opponent_child: ?std.process.Child = null;
     if (cfg.opponent.len != 0) {
-        opponent_child = std.process.spawn(io, .{
+        opponent_child = spawnServer(io, .{
             .argv = &.{cfg.opponent},
             .cwd = if (cfg.opponent_cwd.len != 0) .{ .path = cfg.opponent_cwd } else .inherit,
             .stdout = .ignore,
             .stderr = .ignore,
             .request_resource_usage_statistics = true,
         }) catch abort("cannot spawn the opponent at {s}", .{cfg.opponent});
+        try awaitOpponentListening(io, opponent_addr.?, cfg.opponent_url);
     }
-    defer if (opponent_child) |*c| c.kill(io);
 
     var arms: std.ArrayList(Arm) = .empty;
     if (!cfg.opponent_only) {
