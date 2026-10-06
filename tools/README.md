@@ -12,6 +12,42 @@ Pins live in `tools/lock.json`. Held-out seeds stay outside this repo (`tools/he
 ./zb build release   # x86_64-linux-musl + aarch64-linux-musl + aarch64-linux-gnu ReleaseSafe
 ```
 
+## Zig std: stock by default, zig-crypto opt-in
+
+Default builds (`./zb build ...`) use the std that ships with Zig 0.17.0 and
+nothing else; `./zb` refuses to run if `ZIG_LIB_DIR` is set in the
+environment. TLS handshakes then cost about 116 us (Mac) / 132 us (nachos) of
+server CPU, most of it P-256 ECDSA signing and X25519 in std.crypto.
+
+`tools/zig-crypto.sh` builds against the zig-crypto std instead (private
+`dimenus/zig-crypto`, branch `carmack/zig-crypto-sec-pass`), where the same
+handshake costs about 33 / 37 us:
+
+```sh
+tools/zig-crypto.sh <zig-crypto-checkout> test
+tools/zig-crypto.sh <zig-crypto-checkout> bench -Doptimize=fast -- -n 100000 -c 50 -m 10 -t 4
+tools/zig-crypto.sh --check <zig-crypto-checkout>   # pin + constant-time guard only (CI)
+```
+
+It is a script rather than `-Dzig-crypto=<path>` because a build option is
+read inside `build.zig`, which is already compiled and running against a std;
+Zig 0.17 takes a std override only as `zig build --zig-lib=<dir>`, first.
+Before building, the script fails unless:
+
+- the checkout's `lib/` is exactly the pinned tree (`lib/` of
+  `4f47b1d81c20`, no local or untracked changes under `lib/`);
+- its constant-time guard (`tools/crypto_sec_pass/ctguard.sh`, from commit
+  `64409e6b7487` on) is unchanged and passes against that `lib/` with the
+  pinned zig. The guard compiles the secret-dependent selects and
+  conditional moves (`P256.basePointTableSelect`, the `pcSelect` scans over
+  `Fe.cMov`, 25519 `cMov`/`toBytes`, the X25519 ladder) for x86_64 baseline,
+  x86_64 znver5 and aarch64, and fails on any conditional branch beyond the
+  structural ones. A pass is cached in `.zig-cache/zig-crypto-guard/`.
+
+Then it runs `./zb build --zig-lib=<checkout>/lib <args>`. Artifacts land in
+the usual `zig-out/`, so rebuild with `./zb` before comparing against stock.
+To move the pin, edit `pin` / `guard_pin` in the script.
+
 ## One-shot benchmark against http2.zig
 
 `tools/bench-hendrik.sh` builds

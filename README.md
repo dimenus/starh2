@@ -34,6 +34,11 @@ would need the same conformance and security work as the paths that are used.
   compile time, and two different values give two zio modules in one build,
   which fails to compile (`file exists in modules 'zio' and 'zio0'`).
 
+TLS crypto comes from Zig's std by default. An opt-in build against the
+faster zig-crypto std (`tools/zig-crypto.sh <checkout> <build args>`, pinned
+and checked by a constant-time codegen guard before it builds) is described
+in `tools/README.md`.
+
 ## Install
 
 ```sh
