@@ -253,8 +253,11 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
 # measured handshake amortization, not the record layer.
 ./zig-out/bin/starh2-conformance-server --mode tls --bind 127.0.0.1:0 --cert testdata/cert.pem --key testdata/key.pem
 curl -vk --http2 -H 'x-grader-nonce: tls1' "https://127.0.0.1:$PORT/hello"
-# ALPN reject (expect TLS alert 120):
-openssl s_client -connect 127.0.0.1:$PORT -alpn http/1.1 -servername localhost </dev/null
+# Failed handshakes get a typed fatal alert, then a close:
+# ALPN with only unknown protocols -> alert 120 (no_application_protocol)
+openssl s_client -connect 127.0.0.1:$PORT -alpn spdy/3.1 -servername localhost </dev/null
+# TLS 1.2 only -> alert 70 (protocol_version)
+openssl s_client -connect 127.0.0.1:$PORT -tls1_2 -servername localhost </dev/null
 nghttp -nv --no-verify-peer "https://127.0.0.1:$PORT/hello" -H 'x-grader-nonce: ngtls'
 # The pinned v2.6.0 Darwin release was built with Go 1.12, where TLS 1.3
 # requires this compatibility switch. A modern independently rebuilt grader

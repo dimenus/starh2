@@ -125,6 +125,10 @@ pub const pump_trace = struct {
 pub var tls_write_overflow: std.atomic.Value(u64) = .init(0);
 pub var tls_stage_failed: std.atomic.Value(u64) = .init(0);
 
+/// Test-only: alerts the server sent for a failed handshake. Counted in
+/// Debug and `-Dobserve=true`.
+pub var test_handshake_alerts: std.atomic.Value(u64) = .init(0);
+
 pub fn writeFailJson(w: *std.Io.Writer) !void {
     try w.print(
         ",\"tls_write_overflow\":{d},\"tls_stage_failed\":{d}",
@@ -253,6 +257,215 @@ fn completeRecordLen(bytes: []const u8) ?usize {
     return len;
 }
 
+/// TLS alert descriptions the server sends when its handshake fails (RFC
+/// 8446 section 6). tls.zig defines the same enum, but only in its private
+/// `protocol.zig`; the package exports neither it nor `alertForLocalError`.
+pub const Alert = enum(u8) {
+    unexpected_message = 10,
+    bad_record_mac = 20,
+    record_overflow = 22,
+    handshake_failure = 40,
+    bad_certificate = 42,
+    unsupported_certificate = 43,
+    certificate_revoked = 44,
+    certificate_expired = 45,
+    certificate_unknown = 46,
+    illegal_parameter = 47,
+    unknown_ca = 48,
+    access_denied = 49,
+    decode_error = 50,
+    decrypt_error = 51,
+    protocol_version = 70,
+    insufficient_security = 71,
+    internal_error = 80,
+    inappropriate_fallback = 86,
+    missing_extension = 109,
+    unsupported_extension = 110,
+    unrecognized_name = 112,
+    bad_certificate_status_response = 113,
+    unknown_psk_identity = 115,
+    certificate_required = 116,
+    no_application_protocol = 120,
+};
+
+/// Alert level byte: every alert this server sends is fatal.
+const alert_level_fatal: u8 = 2;
+
+/// The fatal alert for an error `tls.nonblock.Server.run` returned, or null
+/// when the peer should get none.
+///
+/// tls.zig's blocking server writes these itself (`Handshake.writeAlert`,
+/// handshake_server.zig at bd22bcb); its non-blocking server only returns
+/// the error, so this wrapper sends the record. The table mirrors tls.zig's
+/// `Alert.forLocalError` (protocol.zig) so the two servers agree, with one
+/// deliberate difference: `TlsNoSupportedCiphers` is `handshake_failure`,
+/// which RFC 8446 section 4.1.1 requires when the parameters do not
+/// overlap, where tls.zig sends `illegal_parameter`. A ClientHello that does
+/// not offer TLS 1.3 at all gets protocol_version whatever this returns
+/// (`sendHandshakeAlert`, `clientHelloOffersTls13`).
+pub fn handshakeAlert(err: anyerror) ?Alert {
+    // The peer sent us an alert (tls.zig's `error.TlsAlert*`): it already
+    // knows, and a fatal alert ends the connection (RFC 8446 section 6.2).
+    if (std.mem.startsWith(u8, @errorName(err), "TlsAlert")) return null;
+    return switch (err) {
+        // Transport and resource failures: not the peer's protocol error, and
+        // usually nothing left to send on.
+        error.ReadFailed,
+        error.WriteFailed,
+        error.EndOfStream,
+        error.TlsConnectionTruncated,
+        error.TlsConnectionFailed,
+        error.Canceled,
+        error.OutOfMemory,
+        => null,
+
+        error.TlsUnexpectedMessage => .unexpected_message,
+        error.TlsBadRecordMac => .bad_record_mac,
+        error.TlsRecordOverflow => .record_overflow,
+        error.TlsHandshakeFailure,
+        error.TlsNoSupportedCiphers,
+        error.TlsServerHelloRetryRequest,
+        => .handshake_failure,
+        error.TlsBadCertificate => .bad_certificate,
+        error.TlsUnsupportedCertificate => .unsupported_certificate,
+        error.TlsCertificateRevoked => .certificate_revoked,
+        error.TlsCertificateExpired => .certificate_expired,
+        error.TlsCertificateUnknown => .certificate_unknown,
+        error.TlsIllegalParameter,
+        error.IdentityElement,
+        error.InvalidEncoding,
+        error.TlsBadSignatureScheme,
+        error.TlsUnknownSignatureScheme,
+        => .illegal_parameter,
+        error.TlsUnknownCa => .unknown_ca,
+        error.TlsAccessDenied => .access_denied,
+        error.TlsDecodeError => .decode_error,
+        error.TlsDecryptError, error.TlsDecryptFailure => .decrypt_error,
+        error.TlsProtocolVersion, error.TlsBadVersion => .protocol_version,
+        error.TlsUnsupportedFragmentedHandshakeMessage => .internal_error,
+        error.TlsInsufficientSecurity => .insufficient_security,
+        error.TlsInternalError => .internal_error,
+        error.TlsInappropriateFallback => .inappropriate_fallback,
+        error.TlsMissingExtension => .missing_extension,
+        error.TlsUnsupportedExtension => .unsupported_extension,
+        error.TlsUnrecognizedName => .unrecognized_name,
+        error.TlsBadCertificateStatusResponse => .bad_certificate_status_response,
+        error.TlsUnknownPskIdentity => .unknown_psk_identity,
+        error.TlsCertificateRequired => .certificate_required,
+        error.TlsNoApplicationProtocol => .no_application_protocol,
+        else => .internal_error,
+    };
+}
+
+/// Whether the ClientHello record at the start of `bytes` offers TLS 1.3,
+/// or null when it is not a complete, well-formed ClientHello record.
+///
+/// tls.zig judges a TLS 1.2-only ClientHello by whichever check it reaches
+/// first: no TLS 1.3 cipher suite (`TlsNoSupportedCiphers`), or no key_share
+/// (`TlsMissingExtension`). Only an explicit supported_versions without
+/// 0x0304 gives `TlsProtocolVersion`. A TLS 1.3-only server should answer
+/// every such client with protocol_version (RFC 8446 appendix D), so the
+/// version is read here, on the failure path only. This is a bounds-checked
+/// walk to the supported_versions extension, not a second handshake parser:
+/// tls.zig has already rejected the ClientHello.
+fn clientHelloOffersTls13(bytes: []const u8) ?bool {
+    const rec_len = completeRecordLen(bytes) orelse return null;
+    if (bytes[0] != 0x16) return null; // handshake record
+    const body = bytes[5..rec_len];
+    if (body.len < 4 or body[0] != 0x01) return null; // client_hello
+    const hs_len = std.mem.readInt(u24, body[1..4], .big);
+    if (hs_len > body.len - 4) return null; // split across records
+    var r: Walk = .{ .b = body[4..][0..hs_len] };
+    r.skip(2 + 32) orelse return null; // legacy_version, random
+    r.skip(r.int(u8) orelse return null) orelse return null; // session id
+    r.skip(r.int(u16) orelse return null) orelse return null; // cipher suites
+    r.skip(r.int(u8) orelse return null) orelse return null; // compression
+    if (r.i == r.b.len) return false; // no extensions: TLS 1.2 or older
+    const ext_end = r.i + (r.int(u16) orelse return null);
+    if (ext_end > r.b.len) return null;
+    while (r.i < ext_end) {
+        const ext_type = r.int(u16) orelse return null;
+        const ext_len = r.int(u16) orelse return null;
+        if (ext_type != 0x002b) {
+            r.skip(ext_len) orelse return null;
+            continue;
+        }
+        const list_len = r.int(u8) orelse return null;
+        if (list_len % 2 != 0 or list_len + 1 != ext_len) return null;
+        var k: usize = 0;
+        while (k < list_len) : (k += 2) {
+            if ((r.int(u16) orelse return null) == 0x0304) return true;
+        }
+        return false;
+    }
+    return false; // no supported_versions: TLS 1.2 or older
+}
+
+const Walk = struct {
+    b: []const u8,
+    i: usize = 0,
+
+    fn skip(w: *Walk, n: usize) ?void {
+        if (n > w.b.len - w.i) return null;
+        w.i += n;
+    }
+
+    fn int(w: *Walk, comptime T: type) ?T {
+        const n = @sizeOf(T);
+        if (n > w.b.len - w.i) return null;
+        defer w.i += n;
+        return std.mem.readInt(T, w.b[w.i..][0..n], .big);
+    }
+};
+
+/// Test fixture: a minimal hand-built ClientHello record, offering
+/// `suites`, the x25519 and P-256 groups, ecdsa_secp256r1_sha256, and a
+/// supported_versions extension only when `versions` is non-null. No
+/// key_share, so it never completes a handshake. With TLS 1.2 suites and no
+/// versions it is the shape `openssl s_client -tls1_2` sends.
+pub fn testClientHello(out: []u8, suites: []const u16, versions: ?[]const u16) []const u8 {
+    const P = struct {
+        fn int(o: []u8, at: *usize, comptime T: type, v: T) void {
+            std.mem.writeInt(T, o[at.*..][0..@sizeOf(T)], v, .big);
+            at.* += @sizeOf(T);
+        }
+    };
+    var n: usize = 9; // record and handshake headers are written last
+    P.int(out, &n, u16, 0x0303); // legacy_version
+    @memset(out[n..][0..32], 0x5a); // random
+    n += 32;
+    P.int(out, &n, u8, 0); // session id
+    P.int(out, &n, u16, @intCast(suites.len * 2));
+    for (suites) |cs| P.int(out, &n, u16, cs);
+    P.int(out, &n, u8, 1); // compression: null only
+    P.int(out, &n, u8, 0);
+    const ext_at = n;
+    n += 2;
+    P.int(out, &n, u16, 0x000a); // supported_groups
+    P.int(out, &n, u16, 6);
+    P.int(out, &n, u16, 4);
+    P.int(out, &n, u16, 0x001d);
+    P.int(out, &n, u16, 0x0017);
+    P.int(out, &n, u16, 0x000d); // signature_algorithms
+    P.int(out, &n, u16, 4);
+    P.int(out, &n, u16, 2);
+    P.int(out, &n, u16, 0x0403);
+    if (versions) |vs| {
+        P.int(out, &n, u16, 0x002b); // supported_versions
+        P.int(out, &n, u16, @intCast(1 + vs.len * 2));
+        P.int(out, &n, u8, @intCast(vs.len * 2));
+        for (vs) |v| P.int(out, &n, u16, v);
+    }
+    std.mem.writeInt(u16, out[ext_at..][0..2], @intCast(n - ext_at - 2), .big);
+    out[0] = 0x16; // handshake record, legacy version 0x0301
+    out[1] = 0x03;
+    out[2] = 0x01;
+    std.mem.writeInt(u16, out[3..5], @intCast(n - 5), .big);
+    out[5] = 0x01; // client_hello
+    std.mem.writeInt(u24, out[6..9], @intCast(n - 9), .big);
+    return out[0..n];
+}
+
 /// Per-connection TLS state. Heap-allocated and never moved.
 ///
 /// Production: the server handshake reads the socket on the connection's
@@ -346,14 +559,20 @@ pub const Conn = struct {
             .now = std.Io.Clock.real.now(io),
         });
         var iterations: u32 = 0;
+        // The server flight is out: the client now reads every server
+        // record, alerts included, under encryption (see sendHandshakeAlert).
+        var flight_sent = false;
         while (!hs.done()) {
             iterations += 1;
             if (iterations > MaxHandshakeIterations) return error.TlsHandshakeFailed;
-            const res = hs.run(self.in_buf[self.in_head..self.in_fill], &self.out_buf) catch
+            const res = hs.run(self.in_buf[self.in_head..self.in_fill], &self.out_buf) catch |err| {
+                try self.sendHandshakeAlert(&hs, err, flight_sent);
                 return error.TlsHandshakeFailed;
+            };
             self.in_head += res.recv_pos;
             if (res.send.len > 0) {
                 self.tcp_writer.interface.writeAll(res.send) catch return self.handshakeIoError();
+                flight_sent = true;
             }
             if (hs.done()) break;
             if (res.recv_pos == 0 and res.send.len == 0) {
@@ -363,6 +582,41 @@ pub const Conn = struct {
         try self.setAlpn(hs.alpnProtocol());
         self.cipher = .init(hs.cipher().?);
         self.state = .open;
+    }
+
+    /// Tell the client why its handshake failed, before the caller closes
+    /// the socket. Before the server flight the alert is a plaintext record
+    /// (legacy version 0x0303, as tls.zig frames its own). After it, the
+    /// client has the server Finished and reads under the server application
+    /// traffic keys. tls.zig's inner handshake switches its cipher to those
+    /// keys when the client's second flight fails (`clientFlight2`), and its
+    /// blocking server encrypts its own alert with that cipher; this does
+    /// the same through `hs.inner.cipher`, the one tls.zig internal this
+    /// relies on.
+    ///
+    /// Best effort: a write failure is ignored, because the connection is
+    /// closing anyway. Only cancellation propagates, so the handshake timeout
+    /// still reads as a timeout.
+    fn sendHandshakeAlert(self: *Conn, hs: *tls.nonblock.Server, err: anyerror, flight_sent: bool) error{Canceled}!void {
+        var alert = handshakeAlert(err) orelse return;
+        if (!flight_sent) {
+            // tls.zig has not consumed the ClientHello on failure, so it is
+            // still at `in_head`.
+            if (clientHelloOffersTls13(self.in_buf[self.in_head..self.in_fill]) == false) alert = .protocol_version;
+        }
+        const payload = [2]u8{ alert_level_fatal, @intFromEnum(alert) };
+        // Record header: alert (21), legacy version 0x0303, length 2.
+        const plain_record = [7]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, payload[0], payload[1] };
+        const record: []const u8 = if (flight_sent)
+            hs.inner.cipher.encrypt(&self.out_buf, .alert, &payload) catch return
+        else
+            &plain_record;
+        if (comptime observe) _ = test_handshake_alerts.fetchAdd(1, .monotonic);
+        self.tcp_writer.interface.writeAll(record) catch {
+            if (self.tcp_writer.err) |e| {
+                if (e == error.Canceled) return error.Canceled;
+            }
+        };
     }
 
     /// The std.Io stream reader and writer report every socket error as one
@@ -1423,4 +1677,67 @@ test "pump_trace moves on read_free-empty yield" {
         try std.testing.expect(pump_trace.read_one.load(.acquire) >= r0 + 1);
         try std.testing.expect(pump_trace.read_free_empty_yield.load(.acquire) >= y0 + 1);
     }
+}
+
+test "handshake alerts mirror tls.zig, except no common cipher is handshake_failure" {
+    try std.testing.expectEqual(Alert.no_application_protocol, handshakeAlert(error.TlsNoApplicationProtocol).?);
+    try std.testing.expectEqual(Alert.decode_error, handshakeAlert(error.TlsDecodeError).?);
+    try std.testing.expectEqual(Alert.protocol_version, handshakeAlert(error.TlsProtocolVersion).?);
+    try std.testing.expectEqual(Alert.protocol_version, handshakeAlert(error.TlsBadVersion).?);
+    try std.testing.expectEqual(Alert.unexpected_message, handshakeAlert(error.TlsUnexpectedMessage).?);
+    try std.testing.expectEqual(Alert.bad_certificate, handshakeAlert(error.TlsBadCertificate).?);
+    try std.testing.expectEqual(Alert.handshake_failure, handshakeAlert(error.TlsNoSupportedCiphers).?);
+    try std.testing.expectEqual(Alert.internal_error, handshakeAlert(error.SomethingNobodyMapped).?);
+    // The peer's own alert, and a dead transport, get nothing back.
+    try std.testing.expect(handshakeAlert(error.TlsAlertHandshakeFailure) == null);
+    try std.testing.expect(handshakeAlert(error.TlsAlertCloseNotify) == null);
+    try std.testing.expect(handshakeAlert(error.ReadFailed) == null);
+    try std.testing.expect(handshakeAlert(error.Canceled) == null);
+}
+
+test "clientHelloOffersTls13 reads supported_versions, and refuses what it cannot parse" {
+    var buf: [512]u8 = undefined;
+    // tls.zig's own client offers TLS 1.3.
+    var prng = std.Random.DefaultPrng.init(13);
+    var cli = tls.nonblock.Client.init(.{
+        .rng = prng.random(),
+        .now = std.Io.Clock.real.now(std.testing.io),
+        .host = "localhost",
+        .root_ca = .empty,
+        .insecure_skip_verify = true,
+        .cipher_suites = tls.config.cipher_suites.tls13,
+        .alpn_protocols = &.{alpn_h2},
+    });
+    var scratch: [record_buffer_size]u8 = undefined;
+    const real = (try cli.run(&.{}, &scratch)).send;
+    try std.testing.expectEqual(@as(?bool, true), clientHelloOffersTls13(real));
+
+    // `openssl s_client -tls1_2` shape: no supported_versions at all.
+    try std.testing.expectEqual(@as(?bool, false), clientHelloOffersTls13(testClientHello(&buf, &.{ 0xc02b, 0xc02f }, null)));
+    // supported_versions without 0x0304.
+    try std.testing.expectEqual(@as(?bool, false), clientHelloOffersTls13(testClientHello(&buf, &.{0x1301}, &.{ 0x0303, 0x0302 })));
+    try std.testing.expectEqual(@as(?bool, true), clientHelloOffersTls13(testClientHello(&buf, &.{0x1301}, &.{ 0x0303, 0x0304 })));
+
+    // Incomplete record, truncated handshake body, not a handshake record.
+    try std.testing.expect(clientHelloOffersTls13(real[0 .. real.len - 1]) == null);
+    try std.testing.expect(clientHelloOffersTls13(&.{ 0x16, 0x03, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00, 0x04, 0x03, 0x03, 0xde, 0xad }) == null);
+    try std.testing.expect(clientHelloOffersTls13(&.{ 0x17, 0x03, 0x03, 0x00, 0x02, 0x00, 0x00 }) == null);
+}
+
+test "a TLS 1.2-only ClientHello fails in tls.zig before it reaches a version check" {
+    // Why `clientHelloOffersTls13` exists: tls.zig rejects the openssl
+    // -tls1_2 shape for its cipher suites, not its version, so its own error
+    // would map to handshake_failure rather than protocol_version.
+    var acceptor = try Acceptor.initFromPem(std.testing.allocator, std.testing.io, fixture_cert_pem, fixture_key_pem);
+    defer acceptor.deinit();
+    var prng = std.Random.DefaultPrng.init(12);
+    var srv = tls.nonblock.Server.init(.{
+        .rng = prng.random(),
+        .auth = &acceptor.auth,
+        .alpn_protocols = &server_alpn,
+        .now = std.Io.Clock.real.now(std.testing.io),
+    });
+    var buf: [512]u8 = undefined;
+    var out: [record_buffer_size]u8 = undefined;
+    try std.testing.expectError(error.TlsNoSupportedCiphers, srv.run(testClientHello(&buf, &.{ 0xc02b, 0xc02f }, null), &out));
 }
