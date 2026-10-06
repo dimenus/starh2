@@ -49,6 +49,10 @@ pub const TlsConfig = struct {
 /// a peer that broke the handshake. Counted in Debug and `-Dobserve=true`.
 pub var test_handshake_timeouts: std.atomic.Value(usize) = .init(0);
 
+/// Test-only: times an accept loop parked because the connection or TLS
+/// handshake limit was full. Counted in Debug and `-Dobserve=true`.
+pub var test_admission_waits: std.atomic.Value(usize) = .init(0);
+
 pub const InitError = error{
     OutOfMemory,
     InvalidConfig,
@@ -335,14 +339,59 @@ pub const Server = struct {
 
     fn tryAdmitConnection(self: *Server) bool {
         while (true) {
-            const current = self.active_connections.load(.acquire);
+            const current = self.active_connections.load(.seq_cst);
             if (current >= self.limits.max_connections) return false;
-            if (self.active_connections.cmpxchgWeak(current, current + 1, .acq_rel, .acquire) == null) return true;
+            if (self.active_connections.cmpxchgWeak(current, current + 1, .seq_cst, .seq_cst) == null) return true;
         }
     }
 
+    fn releaseConnection(self: *Server) void {
+        const prev = self.active_connections.fetchSub(1, .seq_cst);
+        std.debug.assert(prev > 0);
+        self.accounting.wakeAdmission();
+    }
+
+    /// Both limits an accept on this endpoint must pass have room. Checked
+    /// before `accept`, so a full server leaves new connections in the
+    /// kernel's listen queue.
+    fn admissionRoom(self: *Server, mode: connection.Mode) bool {
+        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) return false;
+        if (mode == .tls and self.accounting.active_handshakes.load(.seq_cst) >= self.accounting.max_handshakes) return false;
+        return true;
+    }
+
+    /// Take the connection slot and, for TLS, the handshake slot: both or
+    /// neither.
+    fn admitAccepted(self: *Server, mode: connection.Mode) bool {
+        if (!self.tryAdmitConnection()) return false;
+        if (mode == .tls and !self.accounting.tryAdmitHandshake()) {
+            self.releaseConnection();
+            return false;
+        }
+        return true;
+    }
+
+    /// Park the accept loop until `ready` holds. A release of either slot
+    /// kind wakes it (`GlobalAccounting.wakeAdmission`); the ordering argument
+    /// is on `GlobalAccounting.admission_waiters`. Server stop cancels the
+    /// accept group, which ends the wait with `error.Canceled`.
+    fn awaitAdmission(
+        self: *Server,
+        mode: connection.Mode,
+        comptime ready: fn (*Server, connection.Mode) bool,
+    ) std.Io.Cancelable!void {
+        if (ready(self, mode)) return;
+        const a = &self.accounting;
+        try a.admission_mu.lock();
+        defer a.admission_mu.unlock();
+        _ = a.admission_waiters.fetchAdd(1, .seq_cst);
+        defer _ = a.admission_waiters.fetchSub(1, .seq_cst);
+        if (comptime connection.test_observe) _ = test_admission_waits.fetchAdd(1, .monotonic);
+        while (!ready(self, mode)) try a.admission_cond.wait(&a.admission_mu);
+    }
+
     fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
-        defer _ = self.active_connections.fetchSub(1, .acq_rel);
+        defer self.releaseConnection();
         defer if (config.balancer) |b| b.releaseConn(config.exec_index.?);
         connection.probeNote(.conn_entry);
         if (config.mode == .h1c) return h1.serve(stream, config, null, &.{});
@@ -436,10 +485,27 @@ pub const Server = struct {
 
     /// Accept until shutdown. One loop per endpoint.
     ///
-    /// Admission happens HERE, before any connection state is built, because a
-    /// refusal must be cheap. The order is connection slot first, then TLS
-    /// handshake slot, and each failure path releases what it already took and
-    /// closes the socket.
+    /// Admission happens HERE, before any connection state is built. While
+    /// the connection limit, or for TLS the handshake limit, is full, the loop
+    /// does not call accept at all: it parks until a slot is released, and new
+    /// connections wait in the kernel's listen queue (`Limits.listen_backlog`)
+    /// instead of being accepted and closed. A burst larger than the limits
+    /// is then metered through them rather than refused, the way nginx and
+    /// Go's net/http behave.
+    ///
+    /// Room is checked before accept and the slots are taken after it. A
+    /// concurrent loop on another endpoint can take the room in between; this
+    /// loop then waits again holding the one accepted stream. Slots are never
+    /// held across an accept with nothing to show for it, so the counters stay
+    /// exact for the drain checks and for other endpoints.
+    ///
+    /// What bounds the wait: a handshake slot is held at most
+    /// `preface_timeout_ns` (the handshake timeout), so stalled TLS clients
+    /// delay admission by at most that long. A connection slot is held for
+    /// the connection's life; a server full of idle connections stops
+    /// accepting until one closes, where it used to accept and close at once.
+    /// The listen queue, and the client's own connect timeout, bound what
+    /// waits behind it.
     ///
     /// The TLS handshake slot is separate from the connection slot on purpose.
     /// A handshake costs asymmetric CPU — the client sends a few bytes, the
@@ -456,6 +522,7 @@ pub const Server = struct {
     ) std.Io.Cancelable!void {
         const listener = &self.listeners[endpoint_index];
         while (!self.shutdown_flag.load(.acquire)) {
+            try self.awaitAdmission(mode, admissionRoom);
             connection.probeNote(.accept);
             const stream = listener.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -471,20 +538,11 @@ pub const Server = struct {
             // was fine. Darwin's default is less punishing; the option is still
             // correct on every accepted socket.
             setTcpNoDelay(stream);
-            if (!self.tryAdmitConnection()) {
+            self.awaitAdmission(mode, admitAccepted) catch |err| {
                 stream.close(self.io);
-                continue;
-            }
-
-            var handshake_held = false;
-            if (mode == .tls) {
-                if (!self.accounting.tryAdmitHandshake()) {
-                    _ = self.active_connections.fetchSub(1, .acq_rel);
-                    stream.close(self.io);
-                    continue;
-                }
-                handshake_held = true;
-            }
+                return err;
+            };
+            const handshake_held = mode == .tls;
             var config: connection.ConnConfig = .{
                 .io = self.io,
                 .mode = mode,
@@ -531,7 +589,7 @@ pub const Server = struct {
             }
             connection_group.concurrent(self.io, connEntry, .{ self, stream, config }) catch {
                 if (handshake_held) self.accounting.releaseHandshake();
-                _ = self.active_connections.fetchSub(1, .acq_rel);
+                self.releaseConnection();
                 stream.close(self.io);
                 continue;
             };

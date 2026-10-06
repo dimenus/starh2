@@ -787,6 +787,18 @@ pub const GlobalAccounting = struct {
     max_request_bytes: usize,
     active_handshakes: std.atomic.Value(usize) = .init(0),
     max_handshakes: usize,
+    /// Accept loops parked because the connection or handshake limit is full
+    /// (`Server.awaitAdmission`). A release that frees either kind of slot
+    /// calls `wakeAdmission`, which costs one load unless a loop is parked.
+    ///
+    /// The slot counters and this count are read and written `.seq_cst` on
+    /// the admission paths. A parked loop bumps this count and then rechecks
+    /// the slots; a release frees its slot and then reads this count. Total
+    /// order on those four operations means one side always sees the other,
+    /// so a release can never slip between the recheck and the wait.
+    admission_waiters: std.atomic.Value(usize) = .init(0),
+    admission_mu: zio.Mutex = .init,
+    admission_cond: zio.Condition = .init,
 
     pub fn tryAdmitStream(self: *GlobalAccounting) bool {
         while (true) {
@@ -846,15 +858,26 @@ pub const GlobalAccounting = struct {
 
     pub fn tryAdmitHandshake(self: *GlobalAccounting) bool {
         while (true) {
-            const cur = self.active_handshakes.load(.acquire);
+            const cur = self.active_handshakes.load(.seq_cst);
             if (cur >= self.max_handshakes) return false;
-            if (self.active_handshakes.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
+            if (self.active_handshakes.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) == null) return true;
         }
     }
 
     pub fn releaseHandshake(self: *GlobalAccounting) void {
-        const prev = self.active_handshakes.fetchSub(1, .acq_rel);
+        const prev = self.active_handshakes.fetchSub(1, .seq_cst);
         std.debug.assert(prev > 0);
+        self.wakeAdmission();
+    }
+
+    /// Wake every accept loop parked on a full admission limit; each rechecks
+    /// its own condition. Called after a connection or handshake slot is
+    /// released. Runs on connection tasks only (zio mutex).
+    pub fn wakeAdmission(self: *GlobalAccounting) void {
+        if (self.admission_waiters.load(.seq_cst) == 0) return;
+        self.admission_mu.lockUncancelable();
+        defer self.admission_mu.unlock();
+        self.admission_cond.broadcast();
     }
 };
 
