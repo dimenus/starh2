@@ -21,7 +21,16 @@ server CPU, most of it P-256 ECDSA signing and X25519 in std.crypto.
 
 `tools/zig-crypto.sh` builds against the zig-crypto std instead (private
 `dimenus/zig-crypto`, branch `carmack/zig-crypto-sec-pass`), where the same
-handshake costs about 33 / 37 us:
+handshake costs about 33 / 37 us. Get the checkout (the repo is private, so
+this needs read access to it) at the guard commit, whose `lib/` is the pinned
+`4f47b1d` tree:
+
+```sh
+git clone -b carmack/zig-crypto-sec-pass https://github.com/dimenus/zig-crypto.git ~/src/zig-crypto-sec-pass
+git -C ~/src/zig-crypto-sec-pass checkout 64409e6b7487c98aafe69835e2289a9bfe5c7de9
+```
+
+Then:
 
 ```sh
 tools/zig-crypto.sh <zig-crypto-checkout> test
