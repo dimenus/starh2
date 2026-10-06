@@ -708,6 +708,11 @@ const Args = struct {
     balance_rank: ?starh2.Balancer.Rank = null,
     placement_log: bool = false,
     allow_ptrace: bool = false,
+    /// Null keeps `Limits.defaults` for each. Connection-churn shapes (many
+    /// new TLS connections at once) need all three above their defaults.
+    listen_backlog: ?u31 = null,
+    max_connections: ?usize = null,
+    tls_handshakes: ?usize = null,
 };
 
 /// `--placement-log`: one line per placed connection, with the peer port (so
@@ -801,6 +806,12 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             // so a wedged server can be inspected live without being started
             // under gdb, which changes its timing.
             out.allow_ptrace = true;
+        } else if (std.mem.eql(u8, a, "--listen-backlog")) {
+            out.listen_backlog = try std.fmt.parseInt(u31, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--max-connections")) {
+            out.max_connections = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--tls-handshakes")) {
+            out.tls_handshakes = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--diag-stuck")) {
             // Diagnosis: record each handler's and actor's blocking point
             // for /stuck (connection.diag_stuck; off by default because it
@@ -1138,10 +1149,16 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         break :blk .{ .tls = addr };
     } else .{ .h2c_prior_knowledge = addr };
 
+    var limits: starh2.Limits = .defaults;
+    if (args.listen_backlog) |v| limits.listen_backlog = v;
+    if (args.max_connections) |v| limits.max_connections = v;
+    if (args.tls_handshakes) |v| limits.concurrent_tls_handshakes = v;
+
     var server = try starh2.Server.init(server_gpa, rt.io(), .{
         .endpoints = &.{ep},
         .routes = &routes,
         .tls = tls_cfg,
+        .limits = limits,
         .balancer = if (balancer_storage) |*b| b else null,
     });
     defer server.deinit(server_gpa);
@@ -1158,7 +1175,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d}}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d}}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1173,6 +1190,9 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             @as(u8, @intFromBool(balancer_storage != null)),
             if (balancer_storage) |*b| @tagName(b.rank) else "none",
             @as(u8, @intFromBool(balancer_storage != null and balancer_storage.?.trace != null)),
+            limits.listen_backlog,
+            limits.max_connections,
+            limits.concurrent_tls_handshakes,
         },
     );
     defer gpa.free(ready);

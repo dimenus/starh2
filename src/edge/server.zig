@@ -263,7 +263,7 @@ pub const Server = struct {
                 .h2c_prior_knowledge => |value| value,
                 .h1c => |value| value,
             };
-            self.listeners[i] = address.listen(self.io, .{ .reuse_address = true }) catch return error.ListenFailed;
+            self.listeners[i] = listenEndpoint(self.io, address, self.limits.listen_backlog) catch return error.ListenFailed;
             self.local_addrs[i] = self.listeners[i].socket.address;
             self.listeners_bound = i + 1;
         }
@@ -607,6 +607,16 @@ pub const Server = struct {
     }
 };
 
+/// Bind and listen one endpoint with an explicit accept-queue length.
+///
+/// std.Io's `ListenOptions.kernel_backlog` defaults to 128, and zio's
+/// `netListenIp` passes it straight to listen(2), so a server that leaves it
+/// alone gets a 128-entry queue whatever the kernel allows. `backlog` comes
+/// from `Limits.listen_backlog`; the kernel caps it at somaxconn.
+fn listenEndpoint(io: std.Io, address: EndpointAddress, backlog: u31) std.Io.net.IpAddress.ListenError!std.Io.net.Server {
+    return address.listen(io, .{ .reuse_address = true, .kernel_backlog = backlog });
+}
+
 /// Turn off Nagle on an accepted TCP socket.
 ///
 /// `posix.setsockopt` treats `.INVAL` as unreachable (Zig 0.16
@@ -715,4 +725,57 @@ test "TCP_NODELAY after peer RST does not abort" {
     }
 
     setTcpNoDelay(accepted);
+}
+
+/// The accept-queue length the kernel actually granted a listening socket.
+/// Linux reports it as `tcpi_sacked` in TCP_INFO for a socket in LISTEN
+/// (`sk_max_ack_backlog`). Darwin has no getsockopt for it (only `netstat
+/// -L` shows it), so the test below runs on Linux only.
+fn linuxGrantedBacklog(listener: std.Io.net.Server) !u32 {
+    var info: [104]u8 align(4) = undefined;
+    var len: std.posix.socklen_t = info.len;
+    switch (std.posix.errno(std.posix.system.getsockopt(
+        listener.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.os.linux.TCP.INFO,
+        &info,
+        &len,
+    ))) {
+        .SUCCESS => {},
+        else => return error.GetSockOptFailed,
+    }
+    // struct tcp_info: 8 bytes of u8 fields, then u32 rto, ato, snd_mss,
+    // rcv_mss, unacked, sacked.
+    if (len < 32) return error.ShortTcpInfo;
+    return std.mem.readInt(u32, info[28..32], .little);
+}
+
+fn linuxSomaxconn(io: std.Io) !u32 {
+    var buf: [32]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, "/proc/sys/net/core/somaxconn", &buf);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10);
+}
+
+test "endpoints listen with Limits.listen_backlog, not the 128 default" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const cap = try linuxSomaxconn(io);
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+
+    // Control: the std.Io default the server used before. If this ever reads
+    // more than 128, the default moved and the knob below proves less.
+    var plain = try bind.listen(io, .{ .reuse_address = true });
+    defer plain.socket.close(io);
+    try std.testing.expectEqual(@min(cap, 128), try linuxGrantedBacklog(plain));
+
+    const want = limits_mod.Limits.defaults.listen_backlog;
+    try std.testing.expect(want > 128);
+    var server_listener = try listenEndpoint(io, bind, want);
+    defer server_listener.socket.close(io);
+    try std.testing.expectEqual(@min(cap, want), try linuxGrantedBacklog(server_listener));
+
+    // A small explicit value is honoured too, so the knob is not a floor.
+    var small = try listenEndpoint(io, bind, 7);
+    defer small.socket.close(io);
+    try std.testing.expectEqual(@as(u32, 7), try linuxGrantedBacklog(small));
 }
