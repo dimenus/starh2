@@ -1,0 +1,1 @@
+Your working directory is the starh2 repository at commit 039c978. Read the brief at tools/fair-scheduler-brief.md and do exactly what it asks. It names the files to read. Do not edit any file. Write your full answer as your final message.
