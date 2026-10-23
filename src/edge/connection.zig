@@ -5888,10 +5888,14 @@ const Connection = struct {
         self.assertSessionHeld("refuseIfStreamDead");
         if (terminal.getCause()) |c| return response.causeToError(c);
         if (self.writer_failed.load(.acquire)) return error.WriteFailed;
+        // A live entry means the id was never tombstoned (releaseConcurrency
+        // tombstones and removes together), so the tombstone scan is only
+        // needed once the stream is gone.
+        if (self.session.streams.contains(stream_id)) return;
         if (self.session.tombstoneCode(stream_id)) |code| {
             if (code != .no_error) return error.PeerReset;
         }
-        if (self.session.streams.get(stream_id) == null) return error.WriteFailed;
+        return error.WriteFailed;
     }
 
     fn sendCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {

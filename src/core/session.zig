@@ -153,6 +153,13 @@ pub const Session = struct {
     decoder: hpack.Decoder,
     windows: flow.Windows = .{},
     streams: std.AutoHashMap(u31, stream_mod.Stream),
+    /// `streams.remove` calls since the last `streams.rehash`. std's HashMap
+    /// leaves a tombstone per remove and only clears them when it grows, and
+    /// it never grows here: every request puts one fresh stream id and later
+    /// removes it, so the size stays flat. The tombstones then fill every
+    /// free slot, and a lookup of a new id probes the whole table before it
+    /// misses. `ingest` rehashes once this reaches half the capacity.
+    stream_removes: usize = 0,
     tombstones: std.ArrayList(Tombstone),
     tombstone_next: usize = 0,
     /// Fixed-capacity intent ring — enqueue fails before ownership transfer when full.
@@ -573,6 +580,12 @@ pub const Session = struct {
 
     pub fn ingest(self: *Session, chunk: []const u8) !void {
         if (self.terminal != .none) return;
+        // Rehash moves entries, so it runs here, before any `*Stream` from
+        // `streams.getPtr` exists. O(capacity) once per capacity/2 removes.
+        if (self.stream_removes * 2 >= self.streams.capacity()) {
+            self.streams.rehash();
+            self.stream_removes = 0;
+        }
         var remaining = chunk;
         while (remaining.len > 0) {
             const maybe = self.parser.ingestOne(remaining) catch |err| {
@@ -684,6 +697,7 @@ pub const Session = struct {
         self.addTombstone(stream_id, tombstone_code) catch {};
         self.dropPendingRequest(stream_id);
         _ = self.streams.remove(stream_id);
+        self.stream_removes += 1;
     }
 
     fn emitRst(self: *Session, stream_id: u31, code: frame.ErrorCode) !void {
@@ -1710,6 +1724,37 @@ test "respond_headers after RST is StreamClosed" {
         .headers = &.{},
         .end_stream = true,
     } }));
+}
+
+test "stream churn keeps free slots in the stream map" {
+    // Every request puts a fresh id and removes it later, so without a rehash
+    // std's HashMap fills its free slots with tombstones, and each new-id
+    // lookup then probes the whole table before it misses.
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, .defaults);
+    defer session.deinit();
+    const live = 64;
+    var next: u31 = 1;
+    var oldest: u31 = 1;
+    var i: usize = 0;
+    while (i < 4096) : (i += 1) {
+        try session.streams.put(next, .{ .id = next, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+        session.active_streams += 1;
+        next += 2;
+        if (session.streams.count() > live) {
+            try session.applyCommand(.{ .reset_stream = .{ .stream_id = oldest, .code = .internal_error } });
+            oldest += 2;
+        }
+        const intents = session.drainIntents();
+        freeTestIntents(gpa, intents);
+        try session.ingest(&.{});
+        const map = &session.streams.unmanaged;
+        var free: usize = 0;
+        for (map.metadata.?[0..map.capacity()]) |m| {
+            if (m.isFree()) free += 1;
+        }
+        try std.testing.expect(free > 0);
+    }
 }
 
 test "session preface and settings ack" {
