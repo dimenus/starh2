@@ -198,6 +198,14 @@ if [ -n "$BASE_SHA" ]; then
   build_bench "$BASE_ROOT" "$OUT/bin/base"
   BASE_BIN="$OUT/bin/base/bin/starh2-bench-server"
   BASE_SUM=$(sha256_file "$BASE_BIN")
+  # A base tree that installs pipeline-bench gets a binary like the new arm.
+  # poop does not run its commands through a shell, so it can only compare
+  # two binaries; a "cd <base> && ./zb build ..." string fails as
+  # FileNotFound on the word "CDPATH=".
+  build_pipeline "$BASE_ROOT" "$OUT/bin/base"
+  if [ -x "$OUT/bin/base/bin/pipeline-bench" ]; then
+    BASE_PIPE="$OUT/bin/base/bin/pipeline-bench"
+  fi
 fi
 
 if [ -d "$NEW_ROOT/tools/sse_bench" ]; then
@@ -351,7 +359,7 @@ pipeline_hf() {
 
 pipeline_hf "$NEW_SHA" "$NEW_ROOT" "$NEW_PIPE" "$NEW_SUM"
 if [ -n "$BASE_SHA" ]; then
-  pipeline_hf "$BASE_SHA" "$BASE_ROOT" "" "$BASE_SUM"
+  pipeline_hf "$BASE_SHA" "$BASE_ROOT" "$BASE_PIPE" "$BASE_SUM"
 else
   log="$OUT/logs/pipeline-hyperfine-base-missing.log"
   write_log_header "$log" "absent" "PERF_STORY_BASE missing"
@@ -362,10 +370,10 @@ fi
 if [ "$OS" = Linux ] && command -v poop >/dev/null 2>&1; then
   name="pipeline-poop"
   log="$OUT/logs/${name}.log"
-  if [ -n "$BASE_SHA" ] && [ -x "$NEW_PIPE" ]; then
-    cmd="poop --duration 15000 'cd $BASE_ROOT && ./zb build bench-pipeline -Doptimize=fast -- -n $PIPELINE_N --rounds 5' '$NEW_PIPE -n $PIPELINE_N --rounds 5'"
+  if [ -n "$BASE_PIPE" ] && [ -x "$NEW_PIPE" ]; then
+    cmd="poop --duration 15000 '$BASE_PIPE -n $PIPELINE_N --rounds 5' '$NEW_PIPE -n $PIPELINE_N --rounds 5'"
     if skip_or_run "$name" "$NEW_SHA+$BASE_SHA" "$NEW_SUM" "$cmd" "$log"; then
-      if run_logged "$log" poop --duration 15000 "CDPATH= cd -- \"$BASE_ROOT\" && ./zb build bench-pipeline -Doptimize=fast -- -n $PIPELINE_N --rounds 5" "$NEW_PIPE -n $PIPELINE_N --rounds 5"; then
+      if run_logged "$log" poop --duration 15000 "$BASE_PIPE -n $PIPELINE_N --rounds 5" "$NEW_PIPE -n $PIPELINE_N --rounds 5"; then
         emit_row "$name" "$NEW_SHA+$BASE_SHA" "ok" "poop both arms" "$log" "$NEW_SUM"
       else
         emit_row "$name" "$NEW_SHA+$BASE_SHA" "FAIL" "poop exit non-zero" "$log" "$NEW_SUM"
