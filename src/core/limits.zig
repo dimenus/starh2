@@ -297,7 +297,8 @@ pub const Limits = struct {
         const complete_receipt_sids = try checkedMul(inline_sids, 4);
         const header_leases = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
-        const write_free = try checkedMul(n_chunks, @sizeOf(u32));
+        // The write pool is a SlabPool: one free bit per chunk, in u64 words.
+        const write_free = try checkedMul((n_chunks + 63) / 64, @sizeOf(u64));
         terms.stream_maps = bound.streamMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
         const pending_slots = bound.pendingWriteMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
         // Slabs are server-wide now, so they are NOT part of the per-connection

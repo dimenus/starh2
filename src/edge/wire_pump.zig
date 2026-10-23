@@ -23,6 +23,7 @@
 //! teardown may leave a waiting handler alone instead of canceling it. If a
 //! future change adds an exit path that skips `failDrain`, handlers will hang.
 const std = @import("std");
+const slab_pool = @import("slab_pool.zig");
 const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
@@ -234,7 +235,7 @@ pub const WritePump = struct {
     gpa: std.mem.Allocator,
     /// When set, `WireChunk.pool_index` is returned here instead of `gpa.free`.
     /// Tests that feed GPA-owned chunks leave this null.
-    free_indices: ?*std.Io.Queue(u32) = null,
+    free_indices: ?*slab_pool.SlabPool = null,
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
     test_fail_after: u64 = 0,
@@ -254,15 +255,10 @@ pub const WritePump = struct {
 
     fn releaseChunk(self: *WritePump, chunk: WireChunk, ok: bool, fail_all: bool) void {
         if (chunk.pool_index) |idx| {
-            const q = self.free_indices orelse unreachable;
-            // Never block: the actor is the only consumer of this queue and may
-            // already be parked on write_ch. An uncancelable put into a full
-            // free list deadlocks shutdown (pump cannot fail-drain, actor
-            // cannot take an index). A failed put is a duplicate return; leak
-            // the index and let later sends GPA-fallback.
-            if (!io_queue.tryPut(u32, q, self.io, idx)) {
-                std.debug.assert(false);
-            }
+            // A bitmap release never blocks, so returning a chunk cannot
+            // deadlock shutdown the way a put into a full queue could.
+            const pool = self.free_indices orelse unreachable;
+            pool.releaseIndex(self.io, idx);
         } else if (chunk.bytes.len != 0) {
             self.gpa.free(chunk.bytes);
         }

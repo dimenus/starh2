@@ -1353,9 +1353,10 @@ const Connection = struct {
     read_chunk_storage: []u8 = &.{},
     read_free_buf: []u32 = &.{},
     read_free_ch: std.Io.Queue(u32) = undefined,
-    write_chunk_storage: []u8 = &.{},
-    write_free_buf: []u32 = &.{},
-    write_free_ch: std.Io.Queue(u32) = undefined,
+    /// Write chunks, claimed lowest-free-bit. A FIFO free list rotated one
+    /// in-flight chunk through all of them and faulted every chunk's pages on
+    /// a connection that never had more than one write outstanding.
+    write_pool: slab_pool.SlabPool = undefined,
     /// TLS-only: the CQ driver's single ciphertext read buffer (replaces the
     /// cipher chunk pool), and the outbound frame channel the driver selects
     /// on. `tls_write_ch` shares the write_ch capacity; only one of the two
@@ -1554,10 +1555,8 @@ const Connection = struct {
         errdefer gpa.free(read_chunk_storage);
         const read_free_buf = try gpa.alloc(u32, n_chunks);
         errdefer gpa.free(read_free_buf);
-        const write_chunk_storage = try gpa.alloc(u8, @as(usize, n_chunks) * limits_mod.WIRE_CHUNK_SIZE);
-        errdefer gpa.free(write_chunk_storage);
-        const write_free_buf = try gpa.alloc(u32, n_chunks);
-        errdefer gpa.free(write_free_buf);
+        var write_pool = try slab_pool.SlabPool.init(gpa, config.io, limits_mod.WIRE_CHUNK_SIZE, n_chunks);
+        errdefer write_pool.deinit(gpa);
 
         var tls_read_buf: []u8 = &.{};
         var tls_write_buf: []wire_pump.WireChunk = &.{};
@@ -1628,8 +1627,7 @@ const Connection = struct {
             .sched = sched,
             .read_chunk_storage = read_chunk_storage,
             .read_free_buf = read_free_buf,
-            .write_chunk_storage = write_chunk_storage,
-            .write_free_buf = write_free_buf,
+            .write_pool = write_pool,
             .tls_read_buf = tls_read_buf,
             .tls_write_buf = tls_write_buf,
             .frame_pool = frame_pool,
@@ -1669,7 +1667,6 @@ const Connection = struct {
         self.completion_ch = .init(self.completion_ch_buf);
         self.write_ack_ch = .init(self.write_ack_buf);
         self.read_free_ch = .init(self.read_free_buf);
-        self.write_free_ch = .init(self.write_free_buf);
         if (self.tls_write_buf.len != 0) {
             self.tls_write_ch = .init(self.tls_write_buf);
         }
@@ -1702,9 +1699,6 @@ const Connection = struct {
         while (i < self.read_pool_n) : (i += 1) {
             self.read_free_ch.putOneUncancelable(self.config.io, i) catch {
                 // Fresh queue capacity exactly matches the number of pool indices.
-                unreachable;
-            };
-            self.write_free_ch.putOneUncancelable(self.config.io, i) catch {
                 unreachable;
             };
         }
@@ -1740,9 +1734,7 @@ const Connection = struct {
         // Drain channels before freeing their backing buffers.
         while (io_queue.tryGet(wire_pump.WireChunk, &self.write_ch, io)) |chunk| {
             if (chunk.pool_index) |idx| {
-                self.write_free_ch.putOneUncancelable(io, idx) catch {
-                    unreachable;
-                };
+                self.write_pool.releaseIndex(io, idx);
             } else if (chunk.bytes.len != 0) {
                 self.config.gpa.free(chunk.bytes);
             }
@@ -1766,9 +1758,7 @@ const Connection = struct {
             while (true) {
                 const chunk = self.tls_write_ch.tryReceive() catch break;
                 if (chunk.pool_index) |idx| {
-                    self.write_free_ch.putOneUncancelable(io, idx) catch {
-                        unreachable;
-                    };
+                    self.write_pool.releaseIndex(io, idx);
                 } else if (chunk.bytes.len != 0) {
                     self.config.gpa.free(chunk.bytes);
                 }
@@ -1853,8 +1843,7 @@ const Connection = struct {
         if (self.plaintext_scratch.len != 0) self.config.gpa.free(self.plaintext_scratch);
         if (self.read_chunk_storage.len != 0) self.config.gpa.free(self.read_chunk_storage);
         if (self.read_free_buf.len != 0) self.config.gpa.free(self.read_free_buf);
-        if (self.write_chunk_storage.len != 0) self.config.gpa.free(self.write_chunk_storage);
-        if (self.write_free_buf.len != 0) self.config.gpa.free(self.write_free_buf);
+        self.write_pool.deinit(self.config.gpa);
         if (self.tls_read_buf.len != 0) self.config.gpa.free(self.tls_read_buf);
         if (self.tls_write_buf.len != 0) self.config.gpa.free(self.tls_write_buf);
         if (self.sid_scratch.len != 0) self.config.gpa.free(self.sid_scratch);
@@ -2702,7 +2691,7 @@ const Connection = struct {
         const write_q = io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io);
         const read_q = io_queue.chanLen(wire_pump.WireChunk, &self.read_ch);
         const read_free_q = io_queue.queued(u32, &self.read_free_ch, self.config.io);
-        const write_free_q = io_queue.queued(u32, &self.write_free_ch, self.config.io);
+        const write_free_q = self.write_pool.capacity - self.write_pool.rentedCount();
         const tls_write_empty = if (self.tls_write_buf.len != 0) self.tls_write_ch.isEmpty() else true;
         var receipts_ready: usize = 0;
         while (receipts_ready < self.pending_complete_receipt_n) : (receipts_ready += 1) {
@@ -3183,7 +3172,7 @@ const Connection = struct {
                 .chunk_storage = self.read_chunk_storage,
                 .n_chunks = self.read_pool_n,
                 .read_free = &self.read_free_ch,
-                .write_free = &self.write_free_ch,
+                .write_free = &self.write_pool,
                 .live_task_handlers = &self.live_task_handlers,
                 .test_delay_ms = test_write_delay_ms,
                 .test_fail_after = test_write_fail_after,
@@ -3227,7 +3216,7 @@ const Connection = struct {
                 .from_actor = &self.write_ch,
                 .completions = &self.write_ack_ch,
                 .gpa = gpa,
-                .free_indices = &self.write_free_ch,
+                .free_indices = &self.write_pool,
                 .test_delay_ms = test_write_delay_ms,
                 .test_fail_after = test_write_fail_after,
             };
@@ -4926,14 +4915,13 @@ const Connection = struct {
     };
 
     /// Take a write-pool chunk when one is free; otherwise GPA of exact `n`.
-    /// Never blocks: the actor must not park on `write_free_ch` (it would miss
+    /// Never blocks: the actor must not park on the write pool (it would miss
     /// shutdown, reads, and writer failure while WritePump may already be idle).
     fn leaseWriteChunk(self: *Connection, n: usize) error{OutOfMemory}!WriteLease {
         if (n <= limits_mod.WIRE_CHUNK_SIZE) {
-            if (io_queue.tryGet(u32, &self.write_free_ch, self.config.io)) |idx| {
-                const off = @as(usize, idx) * limits_mod.WIRE_CHUNK_SIZE;
+            if (self.write_pool.tryRentIndex(self.config.io)) |idx| {
                 return .{
-                    .bytes = self.write_chunk_storage[off..][0..limits_mod.WIRE_CHUNK_SIZE],
+                    .bytes = self.write_pool.slabAt(idx),
                     .pool_index = idx,
                 };
             }
@@ -4944,9 +4932,7 @@ const Connection = struct {
 
     fn returnWriteChunk(self: *Connection, lease: WriteLease) void {
         if (lease.pool_index) |idx| {
-            if (!io_queue.tryPut(u32, &self.write_free_ch, self.config.io, idx)) {
-                std.debug.assert(false);
-            }
+            self.write_pool.releaseIndex(self.config.io, idx);
         } else if (lease.bytes.len != 0) {
             self.config.gpa.free(lease.bytes);
         }
@@ -6572,9 +6558,7 @@ pub const BenchHop = struct {
         const io = self.conn.config.io;
         while (io_queue.tryGet(wire_pump.WireChunk, &self.conn.write_ch, io)) |chunk| {
             if (chunk.pool_index) |idx| {
-                self.conn.write_free_ch.putOneUncancelable(io, idx) catch {
-                    unreachable;
-                };
+                self.conn.write_pool.releaseIndex(io, idx);
             } else if (chunk.bytes.len != 0) {
                 self.conn.config.gpa.free(chunk.bytes);
             }

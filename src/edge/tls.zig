@@ -34,6 +34,7 @@
 //! be two implementations of one contract. The std.Io purity of src/edge
 //! ends here; the h2c pumps remain std.Io-pure.
 const std = @import("std");
+const slab_pool = @import("slab_pool.zig");
 const tls = @import("tls");
 const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
@@ -874,7 +875,7 @@ pub const Pump = struct {
     chunk_storage: []u8,
     n_chunks: u32,
     read_free: *std.Io.Queue(u32),
-    write_free: ?*std.Io.Queue(u32) = null,
+    write_free: ?*slab_pool.SlabPool = null,
     live_task_handlers: *std.atomic.Value(usize),
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
@@ -947,10 +948,8 @@ pub const Pump = struct {
 
     fn releaseChunk(self: *Pump, chunk: wire_pump.WireChunk, ok: bool, fail_all: bool) void {
         if (chunk.pool_index) |idx| {
-            const q = self.write_free orelse unreachable;
-            if (!io_queue.tryPut(u32, q, self.io, idx)) {
-                std.debug.assert(false);
-            }
+            const pool = self.write_free orelse unreachable;
+            pool.releaseIndex(self.io, idx);
         } else if (chunk.bytes.len != 0) {
             self.gpa.free(chunk.bytes);
         }

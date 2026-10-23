@@ -10,6 +10,7 @@
 //! framing (Content-Length, chunked, or close-delimited). Keep-alive loops
 //! until a close reason.
 const std = @import("std");
+const slab_pool = @import("slab_pool.zig");
 const zio = @import("zio");
 const request = @import("../http/request.zig");
 const response = @import("../http/response.zig");
@@ -141,8 +142,9 @@ const H1Conn = struct {
     tls_write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
     tls_acks: zio.Channel(wire_pump.WriteCompletion) = undefined,
     tls_read_free: std.Io.Queue(u32) = undefined,
-    tls_write_free_buf: []u32 = &.{},
-    tls_write_free: std.Io.Queue(u32) = undefined,
+    /// One write chunk: slab 0 is `tls_out`, and holding it is the token that
+    /// says the TLS pump has not yet finished the previous write.
+    tls_write_pool: slab_pool.SlabPool = undefined,
     tls_req_buf: [1]u32 = undefined,
     tls_req_ch: zio.Channel(u32) = undefined,
     tls_ok_buf: [1]bool = undefined,
@@ -194,8 +196,7 @@ const H1Conn = struct {
         if (self.tls_write_ch_buf.len != 0) self.gpa.free(self.tls_write_ch_buf);
         if (self.tls_ack_buf.len != 0) self.gpa.free(self.tls_ack_buf);
         if (self.tls_read_free_buf.len != 0) self.gpa.free(self.tls_read_free_buf);
-        if (self.tls_write_free_buf.len != 0) self.gpa.free(self.tls_write_free_buf);
-        if (self.tls_out.len != 0) self.gpa.free(self.tls_out);
+        if (self.tls_out.len != 0) self.tls_write_pool.deinit(self.gpa);
         self.* = undefined;
     }
 };
@@ -294,17 +295,15 @@ fn startTlsPump(self: *H1Conn) !void {
     self.tls_write_ch_buf = try gpa.alloc(wire_pump.WireChunk, 4);
     self.tls_ack_buf = try gpa.alloc(wire_pump.WriteCompletion, 4);
     self.tls_read_free_buf = try gpa.alloc(u32, 1);
-    self.tls_write_free_buf = try gpa.alloc(u32, 1);
-    self.tls_out = try gpa.alloc(u8, limits_mod.WIRE_CHUNK_SIZE);
+    self.tls_write_pool = try slab_pool.SlabPool.init(gpa, self.io, limits_mod.WIRE_CHUNK_SIZE, 1);
+    self.tls_out = self.tls_write_pool.slabAt(0);
 
     self.tls_to_actor = .init(self.tls_to_actor_buf);
     self.tls_write_ch = .init(self.tls_write_ch_buf);
     self.tls_acks = .init(self.tls_ack_buf);
     self.tls_read_free = .init(self.tls_read_free_buf);
-    self.tls_write_free = .init(self.tls_write_free_buf);
     self.tls_req_ch = .init(&self.tls_req_buf);
     self.tls_ok_ch = .init(&self.tls_ok_buf);
-    self.tls_write_free.putOneUncancelable(self.io, 0) catch unreachable;
 
     const pump = try gpa.create(tls_edge.Pump);
     errdefer gpa.destroy(pump);
@@ -321,7 +320,7 @@ fn startTlsPump(self: *H1Conn) !void {
         .chunk_storage = self.tls_chunk_storage,
         .n_chunks = 1,
         .read_free = &self.tls_read_free,
-        .write_free = &self.tls_write_free,
+        .write_free = &self.tls_write_pool,
         .live_task_handlers = &self.tls_live_handlers,
     };
     if (!pump.start()) {
@@ -989,7 +988,7 @@ fn driveHandlerTlsWrite(self: *H1Conn, n: u32) void {
         ackTlsWrite(self, false);
         return;
     };
-    const idx = io_queue.tryGet(u32, &self.tls_write_free, self.io) orelse {
+    const idx = self.tls_write_pool.tryRentIndex(self.io) orelse {
         ackTlsWrite(self, false);
         return;
     };
@@ -1503,7 +1502,7 @@ fn writeRawTlsOwner(self: *H1Conn, bytes: []const u8) response.ResponseError!voi
     while (off < bytes.len) {
         const n = @min(bytes.len - off, self.tls_out.len);
         @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
-        const idx = io_queue.tryGet(u32, &self.tls_write_free, self.io) orelse return error.WriteFailed;
+        const idx = self.tls_write_pool.tryRentIndex(self.io) orelse return error.WriteFailed;
         const chunk = wire_pump.WireChunk{
             .bytes = self.tls_out[0..n],
             .len = n,

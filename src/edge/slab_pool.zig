@@ -91,6 +91,14 @@ pub const SlabPool = struct {
     /// and retry, never drop the write. A stream that already holds a slab is
     /// unaffected, which is what keeps exhaustion from stalling the drainer.
     pub fn tryRent(self: *SlabPool, io: std.Io) ?[]u8 {
+        const idx = self.tryRentIndex(io) orelse return null;
+        return self.slabAt(idx);
+    }
+
+    /// `tryRent` for callers that carry the slab as an index (wire chunks: the
+    /// index travels in `WireChunk.pool_index` and comes back through a pump).
+    /// Same lowest-free-bit claim, same backpressure meaning of null.
+    pub fn tryRentIndex(self: *SlabPool, io: std.Io) ?u32 {
         _ = io;
         for (self.free_words, 0..) |*word, wi| {
             var bits = word.load(.acquire);
@@ -105,11 +113,16 @@ pub const SlabPool = struct {
                 const idx = wi * 64 + bit;
                 std.debug.assert(idx < self.capacity);
                 _ = self.rented.fetchAdd(1, .acq_rel);
-                const off = idx * self.slab_bytes;
-                return self.storage[off..][0..self.slab_bytes];
+                return @intCast(idx);
             }
         }
         return null;
+    }
+
+    pub fn slabAt(self: *SlabPool, idx: u32) []u8 {
+        std.debug.assert(idx < self.capacity);
+        const off = @as(usize, idx) * self.slab_bytes;
+        return self.storage[off..][0..self.slab_bytes];
     }
 
     /// True when `ptr` is inside this pool's storage (including a used-prefix
@@ -140,16 +153,19 @@ pub const SlabPool = struct {
     /// foreign pointer and a misaligned one, which is what a double return or a
     /// subslice would look like.
     pub fn release(self: *SlabPool, io: std.Io, slab: []u8) void {
-        _ = io;
         const base = @intFromPtr(self.storage.ptr);
         const here = @intFromPtr(slab.ptr);
         std.debug.assert(here >= base);
         const off = here - base;
         std.debug.assert(off % self.slab_bytes == 0);
-        const idx = off / self.slab_bytes;
-        std.debug.assert(idx < self.capacity);
         std.debug.assert(slab.len == self.slab_bytes);
+        self.releaseIndex(io, @intCast(off / self.slab_bytes));
+    }
 
+    /// `release` by index. A double return trips the bitmap assert below.
+    pub fn releaseIndex(self: *SlabPool, io: std.Io, idx: u32) void {
+        _ = io;
+        std.debug.assert(idx < self.capacity);
         const wi = idx / 64;
         const bit: u6 = @intCast(idx % 64);
         const mask = @as(u64, 1) << bit;
@@ -303,4 +319,26 @@ test "a full pool drains and refills without losing a slab" {
         for (taken) |slab| pool.release(testing.io, slab);
         try testing.expectEqual(@as(usize, 0), pool.rentedCount());
     }
+}
+
+test "index rent reuses the lowest free index, so one writer at a time touches one slab" {
+    var pool = try SlabPool.init(testing.allocator, testing.io, 64, 4);
+    defer pool.deinit(testing.allocator);
+    // One write in flight at a time, many times: always slab 0. A FIFO free
+    // list would walk 0, 1, 2, 3 and fault every slab's pages.
+    var round: usize = 0;
+    while (round < 8) : (round += 1) {
+        const idx = pool.tryRentIndex(testing.io).?;
+        try testing.expectEqual(@as(u32, 0), idx);
+        pool.releaseIndex(testing.io, idx);
+    }
+    const a = pool.tryRentIndex(testing.io).?;
+    const b = pool.tryRentIndex(testing.io).?;
+    try testing.expectEqual(@as(u32, 0), a);
+    try testing.expectEqual(@as(u32, 1), b);
+    try testing.expect(pool.slabAt(a).ptr != pool.slabAt(b).ptr);
+    pool.releaseIndex(testing.io, a);
+    try testing.expectEqual(@as(u32, 0), pool.tryRentIndex(testing.io).?);
+    pool.releaseIndex(testing.io, 0);
+    pool.releaseIndex(testing.io, b);
 }
