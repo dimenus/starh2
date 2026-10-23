@@ -5046,9 +5046,12 @@ const Connection = struct {
                 reaper_reserved = true;
             }
         }
-        errdefer if (reaper_reserved) {
+        // `defer`, not `errdefer`: the no-slot refusal below returns without
+        // an error, and an errdefer leaked one server-wide token per refused
+        // task stream until every task stream was refused (t-3494). The slot
+        // takes ownership where `slot.reaper_reserved` is set.
+        defer if (reaper_reserved) {
             if (self.config.accounting) |acct| acct.releaseReaper();
-            reaper_reserved = false;
         };
 
         const slot = self.allocSlot(d.stream_id) orelse {
@@ -5166,8 +5169,9 @@ const Connection = struct {
         }
 
         slot.reaper_reserved = reaper_reserved;
-        // From here every exit must `finishHandlerJob` (task `defer`, complete
-        // batch after receipts, or spawn-fail below). Do not run a task
+        reaper_reserved = false;
+        // From here every exit must `finishHandlerJob` (task `defer`, the end
+        // of the complete batch's drain turn, or spawn-fail below). Do not run a task
         // handler synchronously on this path: that is the ingest-park.
         job.owned_request = d;
         dispatch_owned = false;

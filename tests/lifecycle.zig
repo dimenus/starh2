@@ -34,6 +34,14 @@ fn hangSse(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) an
     }
 }
 
+/// Answers, then keeps running: a handler may do work after its response,
+/// and its stream is closed for the peer the moment END_STREAM arrives.
+fn helloThenLinger(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = req;
+    try resp.send(200, &.{}, "ok");
+    zio.sleep(.fromMilliseconds(300)) catch {};
+}
+
 fn delayedHello(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
     const t0 = zio.Timestamp.now(.monotonic).toNanoseconds();
@@ -578,6 +586,81 @@ test "a stream inside the advertised limit waits for a receipt-held slot instead
     var handle = try rt.spawn(runSlotHeldByReceipt, .{ rt, gpa });
     handle.join() catch |err| {
         std.debug.print("slot held by receipt: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+/// Stream 1's task handler has answered but not returned, so its slot is busy
+/// while the peer may already open stream 3 inside the advertised limit of
+/// one. Today that stream is refused for want of a slot (t-3494, open). The
+/// refusal path reserved a server-wide reaper token and returned without
+/// releasing it, so every refused task stream leaked one until the server
+/// refused every task stream. This test pins the refusal and the zero
+/// accounting after it; when t-3494 makes stream 3 wait instead, the first
+/// expectation fails and this test must be rewritten to that behaviour.
+fn runTaskSlotHeldAfterResponse(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/linger", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = helloThenLinger } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 1;
+    limits.max_streams_per_server = 8;
+    limits.cancellation_reaper_jobs = 8;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    var stream_open = true;
+    defer if (stream_open) stream.close();
+
+    var first = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer first.deinit(gpa);
+    try h2c.appendHeaders(gpa, &first, 1, "/linger", true);
+    try writeAllStreamAt(stream, first.items, @src());
+    try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 1, 2_000));
+
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(gpa);
+    try h2c.appendHeaders(gpa, &second, 3, "/linger", true);
+    try writeAllStreamAt(stream, second.items, @src());
+    try std.testing.expectEqual(StreamOutcome.reset, try awaitStreamOutcome(stream, 3, 2_000));
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+    stream.close();
+    stream_open = false;
+}
+
+test "a task stream refused for want of a slot returns its reaper token" {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in task-slot test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runTaskSlotHeldAfterResponse, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("task slot held after response: {s}\n", .{@errorName(err)});
         return err;
     };
 }
