@@ -57,67 +57,6 @@ Then it runs `./zb build --zig-lib=<checkout>/lib <args>`. Artifacts land in
 the usual `zig-out/`, so rebuild with `./zb` before comparing against stock.
 To move the pin, edit `pin` / `guard_pin` in the script.
 
-## One-shot benchmark against http2.zig
-
-`tools/bench-hendrik.sh` builds
-[`hendriknielaender/http2.zig`](https://github.com/hendriknielaender/http2.zig)
-at the checkout's current revision, then runs the common h2load harness. It
-records that revision, verifies every arm serves the same 13-byte body, alternates
-arm order, and rejects client-limited or collapsed runs. Every round reports
-request-completion p50/p99 as well as throughput. The summary reports server CPU
-per request, total server CPU, peak RSS, and RSS retained immediately before
-shutdown.
-
-```sh
-# Default checkout: ../../oss/http2-zig-hendrik relative to this repo.
-tools/bench-hendrik.sh -n 100000 -c 50 -m 10 -t 4 --rounds 3
-
-# Any other checkout:
-HENDRIK_ROOT=/path/to/http2.zig tools/bench-hendrik.sh \
-  -n 100000 -c 50 -m 10 -t 4 --rounds 3
-
-# Attribute the opponent in isolation, without producing Starh2 rows:
-tools/bench-hendrik.sh -n 100000 -c 50 -m 10 -t 4 --rounds 3 --opponent-only
-```
-
-CPU/request covers the reachability probe, reported rounds, and the final
-double-client-thread run used to reject client-limited results. The latency
-percentiles come from h2load and measure complete one-shot responses; they are
-not comparable to the server-timestamp-to-client SSE latency reported by
-`tools/sse_bench/run.sh`.
-
-The checkout needs its `boringssl` submodule initialized. The script builds into
-an explicit `/tmp` prefix, so a newer Debug or unrelated binary cannot silently
-replace the measured ReleaseFast server.
-
-### What the opponent measures
-
-Verified at `http2.zig` revision
-`a2859f8c76a05c917e2a33162939721c45ca5d4f`:
-
-- On Darwin, one `std.Io.Kqueue` task owns each accepted connection. That task
-  reads and dispatches frames synchronously; handlers are not separate tasks.
-- Request-ready stream indices enter a bounded per-connection queue. The
-  connection calls a handler returning a complete `Response`, writes HEADERS
-  and flow-controlled DATA into one buffered writer, then flushes when idle or
-  full.
-- Connection slots own fixed storage for 100 streams and use an open-addressed
-  stream-id lookup. The benchmark supplies this storage, avoiding per-connection
-  stream-storage allocation.
-- TLS is outside the HTTP/2 core: the benchmark uses `http2-boring` with
-  BoringSSL and requires ALPN `h2`.
-- The response API is one-shot (`setBody`, no flush). It cannot hold a
-  Datastar `/updates` stream or post patches onto one from another task, so
-  it is an opponent only for the one-shot benchmark; SSE and mixed continue
-  to use Go `net/http`. A zero-window oneshot stream does not park sibling
-  GETs on that connection (measured at this revision: tiny
-  `SETTINGS_INITIAL_WINDOW_SIZE`, WU withheld on stream 1, 99 sibling `GET /`
-  completed under their 100-stream cap). Protocol: `tools/oneshot-gap.md`.
-
-This is not an identical stack comparison: both arms here use BoringSSL
-(`http2-boring` vs starh2 `TlsPump`). The starh2 h2c arm remains in the same
-run so the result shows whether a gap survives after removing TLS cost.
-
 ## Concurrent SSE benchmark against Go, Kestrel, and hyper
 
 ```sh
@@ -198,16 +137,7 @@ same zio runtime shape as the bench server.
 
 ```sh
 ./zb build bench-pipeline -Doptimize=fast -- -n 1000000 --rounds 5
-tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
 ```
-
-The second command compiles `tools/hendrik_pipeline_bench.zig` directly against
-the checkout selected by `HENDRIK_ROOT` (the same default as
-`bench-hendrik.sh`). It prints the opponent revision and leaves that checkout
-unmodified. Its `inline request core` starts from a parsed HEADERS frame and
-includes stream lookup/lifecycle, HPACK decode and validation, direct handler
-dispatch, response HPACK/framing, and fixed-buffer output. Starh2's comparable
-hop is `Connection complete oneshot`.
 
 Each row reports median ns/op, the full round range, successful allocator calls
 per operation, and requested bytes per operation. Setup, dynamic-table seeding,
@@ -237,8 +167,7 @@ tools/oneshot-phase-trace.sh
 Packed drain turns at `-m 10` are about 0.17 TLS records per response. The
 script exits 9 if that ratio exceeds 0.4 (one record per response again).
 h2c concatenates the same drain-turn into one write chunk. Concat itself is
-a few nanoseconds. HPACK, Huffman, and frame parse are not the live ~5× vs
-http2.zig; the TLS residue is Connection lifecycle (actor + pumps +
+a few nanoseconds; the TLS residue is Connection lifecycle (actor + pumps +
 receipts). Protocol: `tools/oneshot-gap.md`.
 
 The 30s TLS stall (DATA left in FairScheduler after a RST tombstone) is a

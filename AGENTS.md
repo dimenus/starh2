@@ -48,9 +48,7 @@ with the machine:
 
 ```sh
 ./zb build bench -Doptimize=fast -- -n 100000 -c 50 -m 10 -t 4 --rounds 3
-tools/bench-hendrik.sh -n 100000 -c 50 -m 10 -t 4 --rounds 3 # builds + identifies the Zig opponent
 ./zb build bench-pipeline -Doptimize=fast -- -n 1000000 --rounds 5 # isolated CPU/allocation costs
-tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5 # same isolation against the identified opponent
 tools/oneshot-phase-trace.sh    # packing + alloc oracle; exits 9 if records/response > 0.4
 tools/sse_bench/run.sh          # concurrent SSE against Go net/http, Kestrel, hyper
 tools/sse_bench/mixed.sh        # SSE + oneshot on one TLS connection; STALL=0 skips the blocked reader

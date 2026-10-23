@@ -7,9 +7,9 @@
 //! another project's purpose-built benchmark binary would compare harnesses,
 //! not stacks.
 //!
-//! The body is `Hello, World!` because that is byte-for-byte what
-//! hendriknielaender/http2.zig serves from `/` in its own benchmark server. A
-//! throughput number is not comparable unless the bytes are.
+//! The body is a fixed 13 bytes (`Hello, World!`). `tools/bench.zig` refuses
+//! to compare arms whose body lengths differ, so an opponent must serve the
+//! same bytes.
 //!
 //! `--mode h2c` runs the identical handler, router and framing path with the
 //! TLS record layer removed. That arm exists to answer one question with a

@@ -793,7 +793,7 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
             "ticket parked wake includes a concurrent complete; compare to empty task spawn.\n" ++
             "AES-GCM is std.crypto; packing is emit_batch concat, not a TLS record loop.\n" ++
             "Connection complete oneshot is Session + scheduler + inline encode + local ack;\n" ++
-            "still no socket. Compare it to http2.zig's inline request core, not to Session alone.\n",
+            "still no socket; compare it to a full inline request core, not to Session alone.\n",
         .{},
     );
 }

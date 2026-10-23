@@ -91,7 +91,6 @@ includes `tls-smoke`. Packing itself is the phase-trace exit 9.
 
 ```sh
 ./zb build bench-pipeline -Doptimize=ReleaseFast -- -n 1000000 --rounds 5
-tools/bench-hendrik-pipeline.sh -n 1000000 --rounds 5
 ```
 
 `TLS pack 6 HEADERS+DATA` is a few nanoseconds and zero allocs. Do not
@@ -123,7 +122,6 @@ Official one-shot:
 
 ```sh
 ./zb build bench -Doptimize=ReleaseFast -- -n 100000 -c 50 -m 10 -t 4 --rounds 3
-tools/bench-hendrik.sh -n 100000 -c 50 -m 10 -t 4 --rounds 3
 ```
 
 Keep `tools/sse_bench/phase-trace.sh` as the paired axis. Drain-turn

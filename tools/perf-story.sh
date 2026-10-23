@@ -17,7 +17,6 @@ REPO=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 OUT=${PERF_STORY_OUT:-/tmp/perf-story}
 NEW_ROOT=${PERF_STORY_NEW:-$REPO}
 BASE_ROOT=${PERF_STORY_BASE:-}
-HENDRIK_ROOT=${HENDRIK_ROOT:-}
 N=${PERF_STORY_N:-100000}
 PIPELINE_N=${PERF_STORY_PIPELINE_N:-1000000}
 SELF_DRIVE_N=${PERF_STORY_SELF_DRIVE_N:-100000}
@@ -28,14 +27,6 @@ ROUNDS=${PERF_STORY_ROUNDS:-3}
 
 OS=$(uname -s)
 HOST_UNAME=$(uname -n)
-
-if [ -z "$HENDRIK_ROOT" ]; then
-  if [ -f "$NEW_ROOT/../../oss/http2-zig-hendrik/build.zig" ]; then
-    HENDRIK_ROOT=$(CDPATH= cd -- "$NEW_ROOT/../../oss/http2-zig-hendrik" && pwd -P)
-  elif [ -f "$HOME/src/oss/http2-zig-hendrik/build.zig" ]; then
-    HENDRIK_ROOT=$(CDPATH= cd -- "$HOME/src/oss/http2-zig-hendrik" && pwd -P)
-  fi
-fi
 
 mkdir -p "$OUT/logs" "$OUT/bin"
 ROWS="$OUT/rows.tsv"
@@ -255,24 +246,6 @@ else
   emit_row "packed-tls-h2c" "55835a4" "GAP" "no base tree" "$log" "absent"
 fi
 
-if [ -n "$HENDRIK_ROOT" ] && [ -f "$HENDRIK_ROOT/build.zig" ]; then
-  name="packed-hendrik"
-  log="$OUT/logs/${name}.log"
-  cmd="HENDRIK_ROOT=$HENDRIK_ROOT $NEW_ROOT/tools/bench-hendrik.sh -n $N -c $H2LOAD_C -m $H2LOAD_M -t $H2LOAD_T --rounds $ROUNDS"
-  if skip_or_run "$name" "http2.zig" "pending" "$cmd" "$log"; then
-    run_logged "$log" env HENDRIK_ROOT="$HENDRIK_ROOT" OUT="$OUT/hendrik" "$NEW_ROOT/tools/bench-hendrik.sh" -n "$N" -c "$H2LOAD_C" -m "$H2LOAD_M" -t "$H2LOAD_T" --rounds "$ROUNDS" || true
-      hbin=$OUT/hendrik/http2-zig/bin/benchmark
-      hsum=absent
-      if [ -x "$hbin" ]; then hsum=$(sha256_file "$hbin"); fi
-    st=$(bench_row_status "$log")
-    emit_row "$name" "http2.zig" "$st" "see log" "$log" "$hsum"
-  fi
-else
-  log="$OUT/logs/packed-hendrik-missing.log"
-  write_log_header "$log" "absent" "HENDRIK_ROOT missing"
-  echo "GAP: http2.zig checkout not found" >> "$log"
-  emit_row "packed-hendrik" "http2.zig" "GAP" "no http2.zig checkout" "$log" "absent"
-fi
 
 mixed_row() {
   arm=$1
