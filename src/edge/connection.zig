@@ -3973,7 +3973,10 @@ const Connection = struct {
             const queued = self.write_ch.type_erased.len / @sizeOf(wire_pump.WireChunk);
             diagRawPrint("t1002 conn={x} shutdownHandlers_enter unflushed_chunks={d} parked={d}\n", .{ @intFromPtr(self), queued, close_probe_parked.load(.acquire) });
         }
-        self.stream.shutdown(self.config.io, .both) catch {};
+        // On a `runBody` error, its defer has already closed the socket before
+        // `run` reaches here. A shutdown then targets a closed fd number that
+        // an accept may already have handed to another connection.
+        if (!self.socket_closed.load(.acquire)) self.stream.shutdown(self.config.io, .both) catch {};
         if (diag_park) diagRawPrint("WFSET shutdown_handlers conn={x}\n", .{ @intFromPtr(self) & 0xffff });
         self.writer_failed.store(true, .release);
         std.debug.assert(self.writer_failed.load(.acquire));
