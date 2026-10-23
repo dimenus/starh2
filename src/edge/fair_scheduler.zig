@@ -25,14 +25,18 @@
 //! yields after `CONTROL_BEFORE_DATA` frames whenever DATA is eligible. That
 //! turns starvation into a bounded delay.
 //!
-//! Within tier 3, `drr_cursor` is what makes the round robin fair. It resumes
-//! at the stream after the one last served, so a low-numbered stream cannot win
-//! every pass. A fixed quantum caps how long any one stream holds the wire.
+//! Within tier 3 the contract is round robin, not an order of stream ids: no
+//! stream with DATA ready gets a second quantum before every other ready stream
+//! had one. The ready list delivers it (pop head, one quantum, push tail), so
+//! picking the next stream costs O(1) however many are open. A fixed quantum
+//! caps how long any one stream holds the wire. Streams blocked on their own
+//! window wait on a separate list and cost nothing until `rearm`.
 //!
 //! # No allocation on the write path
 //!
 //! Pending DATA lives in per-stream slabs carved from ONE boot allocation, and
-//! a slot is a fixed array entry rather than a map. A handler write is a
+//! a slot is a fixed array entry. The id index and the lists over the slots
+//! are fixed arrays sized at `init` too. A handler write is a
 //! `memcpy` into an existing slab; when the slab is full the handler parks in
 //! `Connection.waitForStreamSpace`. That is the mechanism behind the promise
 //! that a connection stays inside `Limits.resourceUpperBound` under any load.
@@ -83,6 +87,19 @@ pub const DataPending = struct {
     flush_ticket: u64 = 0,
     flush_slot: u32 = 0,
     flush_remain: usize = 0,
+    /// Which tier-3 list the slot is on. `idle` is a live slot on neither:
+    /// nothing to send yet, or popped and being served.
+    place: Place = .free,
+    /// Set after the first quantum. An unserved slot enters the ready list in
+    /// the front segment, so a new response is not queued behind a full pass
+    /// of other streams' DATA.
+    served: bool = false,
+    next: u32 = none,
+    prev: u32 = none,
+    /// Position in `FairScheduler.live`, so a free is a swap-remove.
+    live_pos: u32 = none,
+
+    pub const Place = enum { free, idle, ready, blocked };
 
     pub fn bytes(self: *const DataPending) []const u8 {
         return self.slab[0..self.len];
@@ -96,8 +113,22 @@ pub const DataPending = struct {
         self.flush_slot = 0;
         self.flush_remain = 0;
         self.last_progress_ns = 0;
+        self.place = .free;
+        self.served = false;
+        self.next = none;
+        self.prev = none;
+        self.live_pos = none;
     }
 };
+
+const none: u32 = std.math.maxInt(u32);
+
+/// Slots in the stream-id index: a power of two at least twice the slot
+/// count, so the load stays at or below one half and a miss stops at an
+/// empty entry within a short probe. Exported for `bound_shapes`.
+pub fn indexCapacity(max_streams: usize) usize {
+    return std.math.ceilPowerOfTwoAssert(usize, @max(2, max_streams * 2));
+}
 
 pub const EmitSink = *const fn (
     ctx: *anyopaque,
@@ -142,12 +173,37 @@ pub const FairScheduler = struct {
     payload_free_ctx: ?*anyopaque = null,
     payload_free: ?*const fn (*anyopaque, []u8) void = null,
     active_pending: usize = 0,
-    drr_cursor: u31 = 1,
+    /// Open-addressed `stream_id -> slot index`, linear probing, deleted by
+    /// backward shift so no tombstones accumulate under stream churn. Key 0 is
+    /// empty (stream id 0 is never a stream).
+    idx_keys: []u31,
+    idx_vals: []u32,
+    idx_shift: u5,
+    /// Every occupied slot, dense, for the walks that must see blocked
+    /// streams too (`forEachPending`, `nextSlowDeadlineNs`).
+    live: []u32,
+    free_stack: []u32,
+    free_len: usize,
+    /// Streams with DATA to send that were not seen blocked on their own
+    /// window. Pop the head, serve one quantum, push the tail. `fresh_tail`
+    /// ends the front segment of never-served slots (none when empty).
+    ready_head: u32 = none,
+    ready_tail: u32 = none,
+    fresh_tail: u32 = none,
+    ready_len: usize = 0,
+    /// Streams seen with `stream_win <= 0` while the connection had credit:
+    /// their own window, or an RST tombstone. Never visited on the emit path;
+    /// only `rearm` moves them back.
+    blocked_head: u32 = none,
+    blocked_tail: u32 = none,
+    blocked_len: usize = 0,
+    /// A `forEachPending` callback must not free a slot: `live` is a dense
+    /// array and a swap-remove would skip a neighbour.
+    iterating: bool = false,
     data_quanta: usize = 0,
     emitted_controls_since_data: usize = 0,
     control_gaps: [128]usize = @splat(0),
     gap_i: usize = 0,
-    sid_scratch: []u31,
     emits_total: usize = 0,
     emit_kinds: [512]EmitKind = undefined,
     emit_kinds_n: usize = 0,
@@ -189,11 +245,22 @@ pub const FairScheduler = struct {
         errdefer gpa.free(oq);
         const fq = try gpa.alloc(FramedDataEntry, @max(ordinary_cap, 1));
         errdefer gpa.free(fq);
-        const scratch = try gpa.alloc(u31, max_streams);
-        errdefer gpa.free(scratch);
+        std.debug.assert(max_streams < none);
         const slots = try gpa.alloc(DataPending, max_streams);
         errdefer gpa.free(slots);
         @memset(slots, .{});
+        const idx_cap = indexCapacity(max_streams);
+        const keys = try gpa.alloc(u31, idx_cap);
+        errdefer gpa.free(keys);
+        @memset(keys, 0);
+        const vals = try gpa.alloc(u32, idx_cap);
+        errdefer gpa.free(vals);
+        const live = try gpa.alloc(u32, max_streams);
+        errdefer gpa.free(live);
+        const free_stack = try gpa.alloc(u32, max_streams);
+        errdefer gpa.free(free_stack);
+        // Pop order hands out slot 0 first, which only matters for diagnostics.
+        for (free_stack, 0..) |*f, i| f.* = @intCast(max_streams - 1 - i);
         return .{
             .gpa = gpa,
             .io = io,
@@ -203,7 +270,12 @@ pub const FairScheduler = struct {
             .framed_data_q = fq,
             .pending_slots = slots,
             .pool = pool,
-            .sid_scratch = scratch,
+            .idx_keys = keys,
+            .idx_vals = vals,
+            .idx_shift = @intCast(32 - std.math.log2_int(usize, idx_cap)),
+            .live = live,
+            .free_stack = free_stack,
+            .free_len = max_streams,
         };
     }
 
@@ -228,7 +300,10 @@ pub const FairScheduler = struct {
         // would starve every other connection instead of just this one.
         for (self.pending_slots) |*slot| self.returnSlab(slot);
         self.gpa.free(self.pending_slots);
-        self.gpa.free(self.sid_scratch);
+        self.gpa.free(self.idx_keys);
+        self.gpa.free(self.idx_vals);
+        self.gpa.free(self.live);
+        self.gpa.free(self.free_stack);
     }
 
     fn pushRing(comptime T: type, q: []T, head: *usize, tail: *usize, len: *usize, e: T) error{QueueFull}!void {
@@ -257,24 +332,160 @@ pub const FairScheduler = struct {
         return popRing(FramedDataEntry, self.framed_data_q, &self.framed_head, &self.framed_len);
     }
 
-    pub fn findPending(self: *FairScheduler, stream_id: u31) ?*DataPending {
-        for (self.pending_slots) |*s| {
-            if (s.stream_id == stream_id) return s;
+    fn idxHome(self: *const FairScheduler, stream_id: u31) usize {
+        return (@as(u32, stream_id) *% 0x9E3779B1) >> self.idx_shift;
+    }
+
+    fn idxFind(self: *const FairScheduler, stream_id: u31) ?u32 {
+        std.debug.assert(stream_id != 0);
+        const mask = self.idx_keys.len - 1;
+        var i = self.idxHome(stream_id);
+        // Terminates: the table is at most half full, so an empty key exists.
+        while (true) : (i = (i + 1) & mask) {
+            const k = self.idx_keys[i];
+            if (k == 0) return null;
+            if (k == stream_id) return self.idx_vals[i];
         }
-        return null;
+    }
+
+    fn idxInsert(self: *FairScheduler, stream_id: u31, slot: u32) void {
+        const mask = self.idx_keys.len - 1;
+        var i = self.idxHome(stream_id);
+        while (self.idx_keys[i] != 0) : (i = (i + 1) & mask) {
+            std.debug.assert(self.idx_keys[i] != stream_id);
+        }
+        self.idx_keys[i] = stream_id;
+        self.idx_vals[i] = slot;
+    }
+
+    /// Backward-shift delete. Each later key in the cluster moves into the
+    /// hole unless its home lies cyclically in (hole, its position], in which
+    /// case moving it would put it before its own home and a lookup would
+    /// stop at the hole. A plain clear (or a tombstone) is what this replaces.
+    fn idxRemove(self: *FairScheduler, stream_id: u31) void {
+        const mask = self.idx_keys.len - 1;
+        var hole = self.idxHome(stream_id);
+        while (self.idx_keys[hole] != stream_id) : (hole = (hole + 1) & mask) {
+            std.debug.assert(self.idx_keys[hole] != 0);
+        }
+        var j = hole;
+        while (true) {
+            j = (j + 1) & mask;
+            const k = self.idx_keys[j];
+            if (k == 0) break;
+            const home = self.idxHome(k);
+            const stays = if (hole <= j) (hole < home and home <= j) else (hole < home or home <= j);
+            if (stays) continue;
+            self.idx_keys[hole] = k;
+            self.idx_vals[hole] = self.idx_vals[j];
+            hole = j;
+        }
+        self.idx_keys[hole] = 0;
+    }
+
+    fn slotIndex(self: *const FairScheduler, pw: *const DataPending) u32 {
+        return @intCast((@intFromPtr(pw) - @intFromPtr(self.pending_slots.ptr)) / @sizeOf(DataPending));
+    }
+
+    fn listPushTail(self: *FairScheduler, head: *u32, tail: *u32, i: u32) void {
+        const s = &self.pending_slots[i];
+        s.next = none;
+        s.prev = tail.*;
+        if (tail.* != none) self.pending_slots[tail.*].next = i else head.* = i;
+        tail.* = i;
+    }
+
+    fn listPushHead(self: *FairScheduler, head: *u32, tail: *u32, i: u32) void {
+        const s = &self.pending_slots[i];
+        s.prev = none;
+        s.next = head.*;
+        if (head.* != none) self.pending_slots[head.*].prev = i else tail.* = i;
+        head.* = i;
+    }
+
+    fn listUnlink(self: *FairScheduler, head: *u32, tail: *u32, i: u32) void {
+        const s = &self.pending_slots[i];
+        if (s.prev != none) self.pending_slots[s.prev].next = s.next else head.* = s.next;
+        if (s.next != none) self.pending_slots[s.next].prev = s.prev else tail.* = s.prev;
+        s.next = none;
+        s.prev = none;
+    }
+
+    /// Ready list, front segment for never-served slots. The segment is a
+    /// prefix ending at `fresh_tail`; newcomers append to it in arrival order.
+    fn readyInsert(self: *FairScheduler, i: u32) void {
+        const s = &self.pending_slots[i];
+        std.debug.assert(s.place == .idle);
+        if (!s.served) {
+            if (self.fresh_tail == none) {
+                self.listPushHead(&self.ready_head, &self.ready_tail, i);
+            } else {
+                const after = self.fresh_tail;
+                const nxt = self.pending_slots[after].next;
+                s.prev = after;
+                s.next = nxt;
+                self.pending_slots[after].next = i;
+                if (nxt != none) self.pending_slots[nxt].prev = i else self.ready_tail = i;
+            }
+            self.fresh_tail = i;
+        } else {
+            self.listPushTail(&self.ready_head, &self.ready_tail, i);
+        }
+        s.place = .ready;
+        self.ready_len += 1;
+    }
+
+    fn readyUnlink(self: *FairScheduler, i: u32) void {
+        // The front segment is a prefix, so the previous slot is still in it.
+        if (self.fresh_tail == i) self.fresh_tail = self.pending_slots[i].prev;
+        self.listUnlink(&self.ready_head, &self.ready_tail, i);
+        self.pending_slots[i].place = .idle;
+        self.ready_len -= 1;
+    }
+
+    fn blockedPush(self: *FairScheduler, i: u32) void {
+        std.debug.assert(self.pending_slots[i].place == .idle);
+        self.listPushTail(&self.blocked_head, &self.blocked_tail, i);
+        self.pending_slots[i].place = .blocked;
+        self.blocked_len += 1;
+    }
+
+    fn blockedUnlink(self: *FairScheduler, i: u32) void {
+        self.listUnlink(&self.blocked_head, &self.blocked_tail, i);
+        self.pending_slots[i].place = .idle;
+        self.blocked_len -= 1;
+    }
+
+    /// Put a live slot that has a DATA frame to send on the ready list, unless
+    /// it is already on a list. A blocked slot stays blocked: more bytes do not
+    /// change its window.
+    fn arm(self: *FairScheduler, pw: *DataPending) void {
+        if (pw.place != .idle) return;
+        if (pw.len == 0 and !pw.end_stream) return;
+        self.readyInsert(self.slotIndex(pw));
+    }
+
+    pub fn findPending(self: *FairScheduler, stream_id: u31) ?*DataPending {
+        if (stream_id == 0) return null;
+        const i = self.idxFind(stream_id) orelse return null;
+        return &self.pending_slots[i];
     }
 
     fn allocPending(self: *FairScheduler, stream_id: u31) error{StreamCap}!*DataPending {
         if (self.findPending(stream_id)) |s| return s;
-        for (self.pending_slots) |*s| {
-            if (s.stream_id == 0) {
-                s.clear();
-                s.stream_id = stream_id;
-                self.active_pending += 1;
-                return s;
-            }
-        }
-        return error.StreamCap;
+        if (self.free_len == 0) return error.StreamCap;
+        self.free_len -= 1;
+        const i = self.free_stack[self.free_len];
+        const s = &self.pending_slots[i];
+        std.debug.assert(s.stream_id == 0 and s.place == .free);
+        s.clear();
+        s.stream_id = stream_id;
+        s.place = .idle;
+        s.live_pos = @intCast(self.active_pending);
+        self.live[self.active_pending] = i;
+        self.active_pending += 1;
+        self.idxInsert(stream_id, i);
+        return s;
     }
 
     pub fn pendingByteLen(self: *FairScheduler, stream_id: u31) usize {
@@ -289,8 +500,9 @@ pub const FairScheduler = struct {
     pub fn nextSlowDeadlineNs(self: *const FairScheduler, timeout_ns: u64) ?u64 {
         if (timeout_ns == 0) return null;
         var next: ?u64 = null;
-        for (self.pending_slots) |slot| {
-            if (slot.stream_id == 0 or slot.len == 0 or slot.last_progress_ns == 0) continue;
+        for (self.live[0..self.active_pending]) |i| {
+            const slot = self.pending_slots[i];
+            if (slot.len == 0 or slot.last_progress_ns == 0) continue;
             const deadline = slot.last_progress_ns +% timeout_ns;
             if (next == null or deadline < next.?) next = deadline;
         }
@@ -311,11 +523,27 @@ pub const FairScheduler = struct {
         self.pool.release(self.io, slab);
     }
 
+    /// The one exit from every list and the index. A second unlink path is
+    /// how a slot ends up in the ready list after its stream is gone.
     fn freePending(self: *FairScheduler, pw: *DataPending) void {
+        std.debug.assert(!self.iterating);
         self.returnSlab(pw);
         if (pw.stream_id != 0) {
+            const i = self.slotIndex(pw);
+            switch (pw.place) {
+                .ready => self.readyUnlink(i),
+                .blocked => self.blockedUnlink(i),
+                .idle => {},
+                .free => unreachable,
+            }
+            self.idxRemove(pw.stream_id);
             std.debug.assert(self.active_pending > 0);
             self.active_pending -= 1;
+            const last = self.live[self.active_pending];
+            self.live[pw.live_pos] = last;
+            self.pending_slots[last].live_pos = pw.live_pos;
+            self.free_stack[self.free_len] = i;
+            self.free_len += 1;
         }
         pw.clear();
     }
@@ -417,6 +645,9 @@ pub const FairScheduler = struct {
                 return error.TicketWithoutFrame;
             }
         }
+        // Nothing to frame and nothing to carry: do not occupy a slot that the
+        // admission cap in `Connection.enqueuePending` would count.
+        if (bytes.len == 0 and !end and flush_ticket == 0) return;
         const pw = try self.allocPending(stream_id);
         if (bytes.len != 0 and pw.slab.len == 0) {
             // First bytes for this stream: take a slab now. Exhaustion is
@@ -445,6 +676,7 @@ pub const FairScheduler = struct {
             pw.flush_slot = flush_slot;
             pw.flush_remain = pw.len;
         }
+        self.arm(pw);
     }
 
     fn recordGap(self: *FairScheduler) void {
@@ -480,19 +712,36 @@ pub const FairScheduler = struct {
         return .{ t, s };
     }
 
-    fn dataEligible(
-        self: *FairScheduler,
-        win_ctx: *anyopaque,
-        stream_win: WindowQuery,
-        conn_win: ConnWindowQuery,
-    ) bool {
+    /// A ready slot may turn out blocked when it is popped (its window has not
+    /// been probed since it was armed). Then `emitOneData` moves it to blocked
+    /// and returns false, and the ordinary loop in `drain` pops a control
+    /// instead: one wasted probe, never a spin.
+    fn dataEligible(self: *FairScheduler, win_ctx: *anyopaque, conn_win: ConnWindowQuery) bool {
         if (conn_win(win_ctx) <= 0) return false;
-        if (self.framed_len > 0) return true;
-        for (self.pending_slots) |*s| {
-            if (s.stream_id == 0) continue;
-            if (stream_win(win_ctx, s.stream_id) > 0 and (s.len > 0 or s.end_stream)) return true;
+        return self.framed_len > 0 or self.ready_len > 0;
+    }
+
+    /// Move streams whose send credit grew back to the ready tail. `ids` are
+    /// stream WINDOW_UPDATEs; `all` is a positive SETTINGS_INITIAL_WINDOW_SIZE
+    /// change or an overflowed journal (`Session.noteSendCredit`). It does not
+    /// probe windows: the next pop does, and a still-blocked stream goes back.
+    /// A connection WINDOW_UPDATE needs no call, because connection credit
+    /// never puts a stream on the blocked list (see `emitOneData`).
+    pub fn rearm(self: *FairScheduler, ids: []const u31, all: bool) void {
+        if (all) {
+            while (self.blocked_head != none) {
+                const i = self.blocked_head;
+                self.blockedUnlink(i);
+                self.readyInsert(i);
+            }
+            return;
         }
-        return false;
+        for (ids) |sid| {
+            const i = self.idxFind(sid) orelse continue;
+            if (self.pending_slots[i].place != .blocked) continue;
+            self.blockedUnlink(i);
+            self.readyInsert(i);
+        }
     }
 
     pub fn shouldForceDataNow(self: *const FairScheduler) bool {
@@ -529,7 +778,7 @@ pub const FairScheduler = struct {
         }
         while (self.ordinary_len > 0) {
             if (self.isControlPaused()) break;
-            if (!self.isPaused() and self.shouldForceDataNow() and self.dataEligible(win_ctx, stream_win, conn_win)) {
+            if (!self.isPaused() and self.shouldForceDataNow() and self.dataEligible(win_ctx, conn_win)) {
                 if (try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) {
                     continue;
                 }
@@ -564,18 +813,31 @@ pub const FairScheduler = struct {
     /// Emit at most one DATA frame. Returns false when nothing is eligible.
     ///
     /// Order of decisions:
-    /// 1. The connection window gates everything. No credit, no DATA.
+    /// 1. The connection window gates everything. No credit, no DATA, and the
+    ///    ready list is left exactly as it is.
     /// 2. Already-framed DATA goes first. Those bytes are past `Session`, so
     ///    holding them would reorder frames that the protocol layer has already
     ///    committed to.
-    /// 3. Otherwise round-robin the pending slots from `drr_cursor`, and skip
-    ///    any stream whose own window is empty.
+    /// 3. Otherwise pop the ready head. A head whose own window is empty moves
+    ///    to the blocked list and the next head is tried.
     ///
-    /// Inside the chosen stream the sequence is: build the frame (which DEBITS
-    /// flow control), then shrink the slab, then emit. The `pw.stream_id == sid`
-    /// re-check between build and shrink is not paranoia — building can run
-    /// nested cancellation that frees this very pending entry, and shrinking a
-    /// slot that now belongs to another stream would discard its bytes.
+    /// Tier-3 fairness is round robin: a served stream with bytes left goes to
+    /// the TAIL, so no stream gets a second quantum while another ready stream
+    /// waits for its first. Never-served streams enter a front segment instead
+    /// (see `readyInsert`), which is what today's newcomers got from the id
+    /// cursor: a new response is not queued behind a full pass of bulk DATA.
+    ///
+    /// Blocked means the STREAM's window, never the connection's. `stream_win`
+    /// is `min(stream, connection)` credit (`flow.availableSend`), so it is
+    /// read only before the build and only after step 1 saw connection credit;
+    /// a build that spends the last connection credit puts the remainder on
+    /// the ready tail without re-reading it. Reading it after the debit would
+    /// park a stream that still has its own credit on the blocked list, where
+    /// a connection WINDOW_UPDATE never reaches it.
+    ///
+    /// The builder must not call back into this scheduler: the slot is popped,
+    /// built, then shrunk, and the assert after the build is what a re-entrant
+    /// builder would trip.
     fn emitOneData(
         self: *FairScheduler,
         sink_ctx: *anyopaque,
@@ -601,66 +863,55 @@ pub const FairScheduler = struct {
             }
         }
 
-        if (self.active_pending == 0) return false;
-        var n_ids: usize = 0;
-        for (self.pending_slots) |*s| {
-            if (s.stream_id == 0) continue;
-            if (n_ids >= self.sid_scratch.len) break;
-            self.sid_scratch[n_ids] = s.stream_id;
-            n_ids += 1;
-        }
-        std.mem.sort(u31, self.sid_scratch[0..n_ids], {}, comptime std.sort.asc(u31));
-        var start: usize = 0;
-        for (self.sid_scratch[0..n_ids], 0..) |id, i| {
-            if (id >= self.drr_cursor) {
-                start = i;
-                break;
-            }
-        }
-        var i: usize = 0;
-        while (i < n_ids) : (i += 1) {
-            const sid = self.sid_scratch[(start + i) % n_ids];
+        while (self.ready_head != none) {
+            const i = self.ready_head;
+            const in_front = self.fresh_tail != none;
+            self.readyUnlink(i);
+            const pw = &self.pending_slots[i];
+            const sid = pw.stream_id;
+            // `arm` only lists a slot with a frame to send, and every path that
+            // empties one frees it.
+            std.debug.assert(pw.len > 0 or pw.end_stream);
             const avail = stream_win(win_ctx, sid);
-            if (avail <= 0) continue;
-            const pw = self.findPending(sid) orelse continue;
-            if (pw.len == 0 and !pw.end_stream) {
-                self.freePending(pw);
+            if (avail <= 0) {
+                self.blockedPush(i);
                 continue;
             }
             const quantum = if (pw.len == 0) 0 else @min(pw.len, DATA_QUANTUM, @as(usize, @intCast(avail)));
-            if (pw.len > 0 and quantum == 0) continue;
             const end = pw.end_stream and quantum == pw.len;
-            const slice = pw.slab[0..quantum];
-            // Build frame first (Session debit). On sink failure Connection fail-closes;
-            // pending may also be cleared by nested cancel during build — shrink only if still ours.
-            // Comment historically said “commit shrink only after sink succeeds”; Session debit
-            // must precede sink, so we shrink after successful build and fail-close on sink error.
-            const payload = build_data_frame(build_ctx, sid, slice, end) catch |err| {
-                if (err == error.FlowBlocked) continue;
-                return err;
-            };
-            var attach: struct { u64, u32 } = .{ 0, 0 };
-            if (pw.stream_id == sid) {
-                attach = attachTicket(pw, quantum);
-                const take = @min(quantum, pw.len);
-                const rest = pw.len - take;
-                // The class invariant `pw.len <= pw.slab.len` is what makes this
-                // compaction in-bounds. `enqueueDataBytes` is the only writer
-                // that can break it, so state it at the reader too.
-                std.debug.assert(pw.len <= pw.slab.len);
-                if (rest > 0) @memmove(pw.slab[0..rest], pw.slab[take..][0..rest]);
-                pw.len = rest;
-                pw.last_progress_ns = nowNs(self.io);
-                // Drained empty: hand the slab back at once rather than at
-                // stream close. A long-lived SSE stream is idle between events,
-                // and holding a slab across that idle time is the cost this
-                // pool exists to remove.
-                if (rest == 0 and !pw.end_stream) self.returnSlab(pw);
-                if (end or (pw.len == 0 and pw.end_stream)) {
-                    self.freePending(pw);
+            const payload = build_data_frame(build_ctx, sid, pw.slab[0..quantum], end) catch |err| {
+                if (err != error.FlowBlocked) return err;
+                if (conn_win(win_ctx) <= 0) {
+                    // The connection ran dry, not this stream: keep its place.
+                    self.listPushHead(&self.ready_head, &self.ready_tail, i);
+                    pw.place = .ready;
+                    self.ready_len += 1;
+                    if (in_front and self.fresh_tail == none) self.fresh_tail = i;
+                    return false;
                 }
+                self.blockedPush(i);
+                continue;
+            };
+            std.debug.assert(pw.stream_id == sid);
+            const attach = attachTicket(pw, quantum);
+            const rest = pw.len - quantum;
+            // The class invariant `pw.len <= pw.slab.len` is what makes this
+            // compaction in-bounds. `enqueueDataBytes` is the only writer
+            // that can break it, so state it at the reader too.
+            std.debug.assert(pw.len <= pw.slab.len);
+            if (rest > 0) @memmove(pw.slab[0..rest], pw.slab[quantum..][0..rest]);
+            pw.len = rest;
+            pw.last_progress_ns = nowNs(self.io);
+            if (end or rest == 0) {
+                // Drained: free the slot (and its slab) at once. A long-lived
+                // SSE stream is idle between events, and holding a slab or an
+                // admission slot across that idle time is the cost this
+                // design exists to remove. Its next event is a newcomer again.
+                self.freePending(pw);
+            } else {
+                pw.served = true;
+                self.readyInsert(i);
             }
-            self.drr_cursor = sid +% 2;
             self.recordGap();
             self.emits_total += 1;
             self.sink_origin_emits += 1;
@@ -714,22 +965,16 @@ pub const FairScheduler = struct {
         return max_gap;
     }
 
-    /// Iterate active pending for slow-consumer sweeps (Connection).
+    /// Iterate every live slot, blocked ones included (Connection's sweeps).
+    /// The callback may read and write the slot but must not remove it:
+    /// collect ids and call `removePending` after this returns.
     pub fn forEachPending(self: *FairScheduler, ctx: *anyopaque, cb: *const fn (*anyopaque, u31, *DataPending) void) void {
-        for (self.pending_slots) |*s| {
-            if (s.stream_id == 0) continue;
+        self.iterating = true;
+        defer self.iterating = false;
+        for (self.live[0..self.active_pending]) |i| {
+            const s = &self.pending_slots[i];
             cb(ctx, s.stream_id, s);
         }
-    }
-
-    pub fn takePending(self: *FairScheduler, stream_id: u31) ?DataPending {
-        const pw = self.findPending(stream_id) orelse return null;
-        var copy = pw.*;
-        // Detach slab ownership for caller cleanup of logical state only — slab stays in pool.
-        copy.slab = pw.slab; // same backing; caller must not free
-        self.freePending(pw);
-        // Return a snapshot with len/tickets; bytes still in shared slab until overwritten.
-        return copy;
     }
 
     pub fn removePending(self: *FairScheduler, stream_id: u31) bool {
@@ -871,4 +1116,194 @@ test "deinit returns every slab it still holds" {
         try std.testing.expectEqual(@as(usize, 2), pool.rentedCount());
     }
     try std.testing.expectEqual(@as(usize, 0), pool.rentedCount());
+}
+
+/// A wire for tier-3 tests: per-stream and connection windows that the builder
+/// debits the way `Session.makeDataFrame` does, and the order streams went out.
+const TestWire = struct {
+    gpa: std.mem.Allocator,
+    conn: i32 = 1 << 30,
+    win: [64]i32 = @splat(1 << 30),
+    order: std.ArrayList(u31) = .empty,
+    stream_queries: usize = 0,
+
+    fn streamWin(ctx: *anyopaque, sid: u31) i32 {
+        const t: *TestWire = @ptrCast(@alignCast(ctx));
+        t.stream_queries += 1;
+        const w = t.win[sid];
+        if (w <= 0 or t.conn <= 0) return 0;
+        return @min(w, t.conn);
+    }
+    fn connWin(ctx: *anyopaque) i32 {
+        const t: *TestWire = @ptrCast(@alignCast(ctx));
+        return t.conn;
+    }
+    fn build(ctx: *anyopaque, sid: u31, bytes: []const u8, end: bool) anyerror![]u8 {
+        _ = end;
+        const t: *TestWire = @ptrCast(@alignCast(ctx));
+        if (bytes.len > 0 and (t.win[sid] <= 0 or t.conn <= 0)) return error.FlowBlocked;
+        t.win[sid] -= @intCast(bytes.len);
+        t.conn -= @intCast(bytes.len);
+        try t.order.append(t.gpa, sid);
+        return t.gpa.dupe(u8, bytes);
+    }
+    fn sink(ctx: *anyopaque, payload: []u8, flush: bool, ticket: u64, ticket_slot: u32, control_n: usize, control_entry: bool) anyerror!void {
+        _ = .{ flush, ticket, ticket_slot, control_n, control_entry };
+        const t: *TestWire = @ptrCast(@alignCast(ctx));
+        t.gpa.free(payload);
+    }
+    fn emit(t: *TestWire, sched: *FairScheduler) !bool {
+        return sched.emitOneDataPublic(t, sink, t, streamWin, connWin, build, t);
+    }
+    fn deinit(t: *TestWire) void {
+        t.order.deinit(t.gpa);
+    }
+};
+
+test "tier 3 serves ready streams round robin, newcomers in arrival order, not by id" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    defer sched.deinit();
+    var w: TestWire = .{ .gpa = gpa };
+    defer w.deinit();
+
+    const body: [3 * DATA_QUANTUM]u8 = @splat('x');
+    // Arrival order is deliberately not id order.
+    try sched.enqueueDataBytes(11, &body, true, 0, 0);
+    try sched.enqueueDataBytes(1, &body, true, 0, 0);
+    try sched.enqueueDataBytes(9, &body, true, 0, 0);
+    while (try w.emit(&sched)) {}
+
+    try std.testing.expectEqualSlices(u31, &.{ 11, 1, 9, 11, 1, 9, 11, 1, 9 }, w.order.items);
+    try std.testing.expectEqual(@as(usize, 0), sched.pendingCount());
+}
+
+test "a newcomer goes out before a running stream's next quantum, and newcomers keep arrival order" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    defer sched.deinit();
+    var w: TestWire = .{ .gpa = gpa };
+    defer w.deinit();
+
+    const bulk: [3 * DATA_QUANTUM]u8 = @splat('b');
+    try sched.enqueueDataBytes(1, &bulk, true, 0, 0);
+    try std.testing.expect(try w.emit(&sched));
+    // Stream 1 is now served and back on the ready list. Two short responses
+    // arrive; each must go out before stream 1's second quantum, 3 before 5.
+    try sched.enqueueDataBytes(3, "page", true, 0, 0);
+    try sched.enqueueDataBytes(5, "page", true, 0, 0);
+    while (try w.emit(&sched)) {}
+
+    try std.testing.expectEqualSlices(u31, &.{ 1, 3, 5, 1, 1 }, w.order.items);
+}
+
+test "a quantum that spends the last connection credit does not strand its stream" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    defer sched.deinit();
+    var w: TestWire = .{ .gpa = gpa, .conn = DATA_QUANTUM };
+    defer w.deinit();
+
+    const body: [2 * DATA_QUANTUM]u8 = @splat('c');
+    try sched.enqueueDataBytes(1, &body, true, 0, 0);
+    try std.testing.expect(try w.emit(&sched));
+    try std.testing.expect(!(try w.emit(&sched)));
+    // Out of connection credit, not stream credit: still ready, not blocked.
+    try std.testing.expectEqual(@as(usize, 0), sched.blocked_len);
+    try std.testing.expectEqual(DataPending.Place.ready, sched.findPending(1).?.place);
+
+    // A connection WINDOW_UPDATE has no rearm; the stream must go out anyway.
+    w.conn += 1 << 20;
+    try std.testing.expect(try w.emit(&sched));
+    try std.testing.expectEqualSlices(u31, &.{ 1, 1 }, w.order.items);
+}
+
+test "a stream blocked on its own window waits for rearm, and only rearm" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    defer sched.deinit();
+    var w: TestWire = .{ .gpa = gpa };
+    defer w.deinit();
+
+    w.win[1] = 0;
+    w.win[3] = 0;
+    try sched.enqueueDataBytes(1, "one", true, 0, 0);
+    try sched.enqueueDataBytes(3, "three", true, 0, 0);
+    try std.testing.expect(!(try w.emit(&sched)));
+    try std.testing.expectEqual(@as(usize, 2), sched.blocked_len);
+
+    w.win[1] = 1 << 20;
+    w.win[3] = 1 << 20;
+    // Credit alone does not move them: the emit path never looks at blocked.
+    try std.testing.expect(!(try w.emit(&sched)));
+    sched.rearm(&.{1}, false);
+    try std.testing.expect(try w.emit(&sched));
+    try std.testing.expect(!(try w.emit(&sched)));
+    sched.rearm(&.{}, true);
+    try std.testing.expect(try w.emit(&sched));
+    try std.testing.expectEqualSlices(u31, &.{ 1, 3 }, w.order.items);
+    try std.testing.expectEqual(@as(usize, 0), sched.pendingCount());
+}
+
+test "blocked streams cost no window query on the emit path" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 16);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 16, &pool);
+    defer sched.deinit();
+    var w: TestWire = .{ .gpa = gpa };
+    defer w.deinit();
+
+    var sid: u31 = 1;
+    while (sid < 20) : (sid += 2) {
+        w.win[sid] = 0;
+        try sched.enqueueDataBytes(sid, "z", true, 0, 0);
+    }
+    const body: [3 * DATA_QUANTUM]u8 = @splat('r');
+    try sched.enqueueDataBytes(41, &body, true, 0, 0);
+    // The first emit pops the ten blocked heads once each, then serves 41.
+    try std.testing.expect(try w.emit(&sched));
+    try std.testing.expectEqual(@as(usize, 10), sched.blocked_len);
+    w.stream_queries = 0;
+    try std.testing.expect(try w.emit(&sched));
+    try std.testing.expect(try w.emit(&sched));
+    try std.testing.expectEqual(@as(usize, 2), w.stream_queries);
+}
+
+test "index delete keeps a colliding key reachable" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+    defer sched.deinit();
+
+    // Three odd ids with the same home slot, so they share one probe cluster.
+    var ids: [3]u31 = undefined;
+    var n: usize = 0;
+    const home = sched.idxHome(1);
+    var cand: u31 = 1;
+    while (n < ids.len) : (cand += 2) {
+        if (sched.idxHome(cand) == home) {
+            ids[n] = cand;
+            n += 1;
+        }
+    }
+    for (ids) |id| try sched.enqueueDataBytes(id, "k", false, 0, 0);
+    // Removing the first leaves a hole where the cluster starts. Without the
+    // backward shift a lookup for the others stops at that hole.
+    try std.testing.expect(sched.removePending(ids[0]));
+    try std.testing.expectEqual(ids[1], sched.findPending(ids[1]).?.stream_id);
+    try std.testing.expectEqual(ids[2], sched.findPending(ids[2]).?.stream_id);
+    try std.testing.expect(sched.findPending(ids[0]) == null);
+    try std.testing.expect(sched.removePending(ids[2]));
+    try std.testing.expect(sched.removePending(ids[1]));
+    try std.testing.expectEqual(@as(usize, 0), sched.pendingCount());
 }

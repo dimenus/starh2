@@ -318,6 +318,7 @@ pub const Limits = struct {
         const space_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
         const deadline_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
         const deadline_state = deadline_events;
+        // `Session.credit_ids`, the send-credit journal for `FairScheduler.rearm`.
         const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         // head_buf, name_scratch, and the head prefix of carry_buf (init in edge/h1.zig).
         terms.h1_head = try checkedMul(self.max_connections, try checkedMul(self.h1_head_bytes, 3));

@@ -104,13 +104,17 @@ pub fn streamMapBytes(max_streams: usize) error{Overflow}!usize {
     return hashMapBytes(u31, stream_mod.Stream, max_streams);
 }
 
-/// Pending outbound DATA uses a fixed slot array and not a HashMap. The
-/// scheduler must add a pending entry on a handler write, and a HashMap can
-/// resize on insert. A resize after boot would allocate on the write path,
-/// which breaks the promise that `resourceUpperBound` is an upper bound.
+/// Pending outbound DATA uses a fixed slot array and a fixed open-addressed
+/// index, not a HashMap. The scheduler must add a pending entry on a handler
+/// write, and a HashMap can resize on insert. A resize after boot would
+/// allocate on the write path, which breaks the promise that
+/// `resourceUpperBound` is an upper bound. Slabs are counted separately.
 pub fn pendingWriteMapBytes(max_streams: usize) error{Overflow}!usize {
-    // Fixed DataPending slots (no HashMap) — slabs counted separately in Limits.
-    return std.math.mul(usize, max_streams, @sizeOf(fair_scheduler.DataPending));
+    const slots = try std.math.mul(usize, max_streams, @sizeOf(fair_scheduler.DataPending));
+    const index = try std.math.mul(usize, fair_scheduler.indexCapacity(max_streams), @sizeOf(u31) + @sizeOf(u32));
+    // `live` and `free_stack`, one slot index each.
+    const lists = try std.math.mul(usize, max_streams, 2 * @sizeOf(u32));
+    return std.math.add(usize, slots, try std.math.add(usize, index, lists));
 }
 
 pub fn pendingSlabBytes(max_streams: usize, bytes_per_stream: usize) error{Overflow}!usize {

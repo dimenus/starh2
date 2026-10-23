@@ -160,6 +160,15 @@ pub const Session = struct {
     /// free slot, and a lookup of a new id probes the whole table before it
     /// misses. `ingest` rehashes once this reaches half the capacity.
     stream_removes: usize = 0,
+    /// Streams whose send window grew since `Connection` last consumed this
+    /// journal, for `FairScheduler.rearm`. Fixed at `init`
+    /// (`max_streams_per_connection`); on overflow, or on a positive
+    /// SETTINGS_INITIAL_WINDOW_SIZE change, `credit_all` covers every stream.
+    /// A connection WINDOW_UPDATE is not recorded: connection credit never
+    /// blocks a single stream in the scheduler.
+    credit_ids: []u31 = &.{},
+    credit_len: usize = 0,
+    credit_all: bool = false,
     tombstones: std.ArrayList(Tombstone),
     tombstone_next: usize = 0,
     /// Fixed-capacity intent ring — enqueue fails before ownership transfer when full.
@@ -337,6 +346,7 @@ pub const Session = struct {
         intent_storage_owned = false;
         errdefer s.deinit();
         try s.streams.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
+        s.credit_ids = try gpa.alloc(u31, @max(limits.max_streams_per_connection, 1));
         try s.tombstones.ensureTotalCapacity(gpa, limits.stream_tombstones);
         try s.pending_bodies.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_headers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
@@ -367,6 +377,7 @@ pub const Session = struct {
         self.decoder.deinit();
         self.clearIntents();
         if (self.intent_storage.len != 0) self.gpa.free(self.intent_storage);
+        if (self.credit_ids.len != 0) self.gpa.free(self.credit_ids);
         self.tombstones.deinit(self.gpa);
         self.header_block.deinit(self.gpa);
         var bit = self.pending_bodies.iterator();
@@ -945,6 +956,9 @@ pub const Session = struct {
                         };
                     }
                     self.peer_initial_window = new_iw;
+                    // A decrease cannot unblock anything; the scheduler finds
+                    // streams it made negative when it next pops them.
+                    if (delta > 0) self.credit_all = true;
                 },
                 .max_frame_size => {
                     if (value < 16384 or value > 16_777_215) {
@@ -1001,10 +1015,12 @@ pub const Session = struct {
                 try self.failConnection(code);
             };
         } else if (self.streams.getPtr(hdr.stream_id)) |s| {
-            s.window.applySendUpdate(incr) catch |err| {
+            if (s.window.applySendUpdate(incr)) |_| {
+                self.noteSendCredit(hdr.stream_id);
+            } else |err| {
                 const code: frame.ErrorCode = if (err == error.ProtocolError) .protocol_error else .flow_control_error;
                 try self.emitRst(hdr.stream_id, code);
-            };
+            }
         } else if (hdr.stream_id <= self.highest_peer_stream) {
             // CLOSED, not idle. RFC 9113 section 6.9 is explicit: a peer may
             // send WINDOW_UPDATE for a stream it has not yet learned is over,
@@ -1636,6 +1652,25 @@ pub const Session = struct {
             if (code != .no_error) return 0;
         }
         return self.windows.conn_send;
+    }
+
+    fn noteSendCredit(self: *Session, stream_id: u31) void {
+        if (self.credit_all) return;
+        if (self.credit_len == self.credit_ids.len) {
+            self.credit_all = true;
+            return;
+        }
+        self.credit_ids[self.credit_len] = stream_id;
+        self.credit_len += 1;
+    }
+
+    /// For the consumer: the streams credited since the last call, and
+    /// whether to treat every stream as credited. Clears the journal.
+    pub fn takeSendCredit(self: *Session) struct { []const u31, bool } {
+        const out = .{ self.credit_ids[0..self.credit_len], self.credit_all };
+        self.credit_len = 0;
+        self.credit_all = false;
+        return out;
     }
 
     pub fn tombstoneCode(self: *const Session, id: u31) ?frame.ErrorCode {

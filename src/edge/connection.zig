@@ -4423,6 +4423,7 @@ const Connection = struct {
             .c = self,
             .emit = .{ .buf = self.plaintext_scratch },
         };
+        self.rearmCredited();
         self.sched.drain(
             &sink_ctx,
             SinkCtx.sink,
@@ -4629,6 +4630,7 @@ const Connection = struct {
             .receipt_slot = receipt_slot,
         };
         defer attached.* = sink_ctx.receipt_attached;
+        self.rearmCredited();
         self.sched.drain(
             &sink_ctx,
             ReceiptSink.sink,
@@ -5896,6 +5898,17 @@ const Connection = struct {
             if (code != .no_error) return error.PeerReset;
         }
         return error.WriteFailed;
+    }
+
+    /// Hand the streams whose send window grew to the scheduler before it
+    /// drains. Runs before BOTH drain entry points; a drain without it leaves a
+    /// credited stream on the blocked list until the slow-consumer sweep
+    /// resets it. The journal is cleared only here, so a turn that skips the
+    /// drain keeps it for the next one.
+    fn rearmCredited(self: *Connection) void {
+        self.assertSessionHeld("rearmCredited");
+        const credit = self.session.takeSendCredit();
+        self.sched.rearm(credit[0], credit[1]);
     }
 
     fn sendCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {
