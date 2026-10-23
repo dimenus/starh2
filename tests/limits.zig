@@ -366,8 +366,8 @@ test "raised request_body_bytes: publish concurrent body memory cost" {
     try std.testing.expect(body_only.allocator_bytes > base.allocator_bytes);
 
     const S = lim.max_streams_per_connection;
-    const need_conn = B * S; // 2 MiB * 64 = 128 MiB
-    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), need_conn);
+    const need_conn = B * S; // 2 MiB * 256 = 512 MiB
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), need_conn);
 
     lim.request_bytes_per_connection = need_conn;
     lim.request_bytes_per_server = @max(lim.request_bytes_per_server, need_conn);
