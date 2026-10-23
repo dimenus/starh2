@@ -1,0 +1,1 @@
+Round 2 of the same review. The repository is now at commit 3dfd805. Read captures/rss-panel/round2-brief.md and do exactly what it asks, starting with step 0 before you open any file. Do not edit any file. Write your full answer as your final message.
