@@ -202,5 +202,53 @@ hyper_peak=$(awk 'BEGIN { m=0 } $1 > m { m=$1 } END { print m }' "$OUT/hyper-rss
 echo "== RSS sampled during benchmark rounds"
 echo "  peak:     starh2=${starh2_peak}KB  go=${go_peak}KB  kestrel=${kestrel_peak}KB  hyper=${hyper_peak}KB"
 echo "  retained: starh2=${starh2_retained}KB  go=${go_retained}KB  kestrel=${kestrel_retained}KB  hyper=${hyper_retained}KB"
+
+# The many-streams-on-one-connection latency above mixes two effects, and the
+# split rows separate them. Measured on nachos 2026-10-23 (p50): a background
+# client on a SEPARATE connection cut one stream from 28-34 to 10-14 us for
+# starh2 and from 28-37 to 22-24 us for Go, so part of every arm's number is the
+# machine being warm. What is left is the cost of multiplexing on one
+# connection: starh2 10-14 -> 8-11 at 200 streams, Go 22-24 -> 55-72. Read the
+# headline row against both split rows, never alone.
+#   1-quiet        one stream, nothing else running
+#   1-beside-load  one stream on its own connection while STREAMS-1 streams
+#                  run on another; the row is marked BG-INCOMPLETE when that
+#                  background client did not deliver on every stream, because
+#                  then the box was not loaded the way the label says.
+SPLIT_ROUNDS=${SPLIT_ROUNDS:-2}
+if [ "$SPLIT_ROUNDS" -gt 0 ] && [ "$STREAMS" -gt 1 ]; then
+  echo "== latency split: 1 stream quiet vs beside $((STREAMS - 1)) streams on another connection, $SPLIT_ROUNDS rounds"
+  split_quiet() {
+    "$OUT/sse-client" -url "https://127.0.0.1:$2/sse" -streams 1 -seconds "$SECONDS_RUN" -warmup "$WARMUP" \
+      -label "$1 1-quiet" | grep "sse latency" | sed 's/^/  /'
+  }
+  split_loaded() {
+    "$OUT/sse-client" -url "https://127.0.0.1:$2/sse" -streams $((STREAMS - 1)) \
+      -seconds $((SECONDS_RUN + WARMUP + 3)) -warmup 0 -label bg > "$OUT/split-bg.txt" 2>&1 &
+    bg_pid=$!
+    sleep 2
+    row=$("$OUT/sse-client" -url "https://127.0.0.1:$2/sse" -streams 1 -seconds "$SECONDS_RUN" -warmup "$WARMUP" \
+      -label "$1 1-beside-load" | grep "sse latency")
+    wait $bg_pid
+    want=$((STREAMS - 1))
+    if grep -q "opened=$want delivering=$want failed=0 " "$OUT/split-bg.txt"; then
+      echo "  $row"
+    else
+      echo "  $row BG-INCOMPLETE: $(grep -o 'opened=[0-9]* delivering=[0-9]* failed=[0-9]*' "$OUT/split-bg.txt")"
+    fi
+  }
+  j=1
+  while [ "$j" -le "$SPLIT_ROUNDS" ]; do
+    for arm in starh2:19446 go-net/http:19447 kestrel:19449 hyper:19453; do
+      name=${arm%%:*}; port=${arm##*:}
+      if [ $((j % 2)) = 1 ]; then
+        split_quiet "$name" "$port"; split_loaded "$name" "$port"
+      else
+        split_loaded "$name" "$port"; split_quiet "$name" "$port"
+      fi
+    done
+    j=$((j + 1))
+  done
+fi
 cleanup
 trap - EXIT INT TERM
