@@ -4,13 +4,12 @@
     .fingerprint = 0x813a04b419058cf5,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // lalinsky/zio PR 788 head ("Zig 0.17 update", unmerged on 2026-10-04):
-        // upstream main 8413cf4 ported to 0.17.0. No merged upstream rev both
-        // builds on 0.17.0 and has spawnInto; move to the merge commit once
-        // the PR lands.
+        // lalinsky/zio main be65431 (2026-10-23), the upstream Zig 0.17 port
+        // (#792) plus everything after it. PR 788, the earlier pin, was
+        // closed unmerged.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#24d6bfbb0c0dd71b1925dad06e5ba17edb79efbe",
-            .hash = "zio-0.18.0-xHbVVNFVKwBpESpBmSGH8QcqCp1M6MrRbdRK8hXipsFr",
+            .url = "git+https://github.com/lalinsky/zio#be65431ba2f9aa91232cac89a3e76b4480d15689",
+            .hash = "zio-0.19.0-xHbVVOZILQDHwvSkKoyueGl29__yoF4DRzNDIEzjgprv",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.
