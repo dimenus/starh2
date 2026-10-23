@@ -337,7 +337,9 @@ fn runLoop(self: *H1Conn) !void {
         keep = try serveOne(self);
         if (self.occupies) break;
         if (!keep) break;
-        _ = self.arena.reset(.retain_capacity);
+        // `Request.arena` is request memory: free it, or a keep-alive
+        // connection holds its largest request's arena for its whole life.
+        _ = self.arena.reset(.free_all);
         self.acc.reset();
         self.committed = false;
         self.finished = false;

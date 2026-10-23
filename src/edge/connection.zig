@@ -256,6 +256,9 @@ var no_shutdown_event: zio.Event = .init;
 var no_ack_hold_event: zio.Event = .init;
 var hold_dummy_completion_buf: [1]u31 = undefined;
 var hold_dummy_completion_ch: zio.Channel(u31) = .init(&hold_dummy_completion_buf);
+/// Test-only: when true, `borrowHeaderListAlloc` finds no free lease, so the
+/// next HEADERS takes Session's refuse-without-memory path.
+pub var test_no_request_lease: std.atomic.Value(bool) = .init(false);
 /// Test-only: delay write pump by N ms.
 pub var test_write_delay_ms: u64 = 0;
 /// Test-only: fail write pump after N successful writes (0 = never).
@@ -1062,9 +1065,23 @@ const SendTrace = struct {
     hpack: u64,
 };
 
+/// A decoded-but-not-dispatched request's memory, keyed by stream. The arena
+/// is the request's: HPACK decodes its header block into it, dispatch moves it
+/// into the handler job, where it backs `Request.arena`, and `finishHandlerJob`
+/// frees it. Request memory therefore lives exactly as long as the request,
+/// not as long as a slot or the connection, and a request needs no slot to
+/// own its headers. Entries stay put while Session decodes into one, because
+/// `arena.allocator()` points at the entry.
+const RequestLease = struct {
+    stream_id: u31 = 0,
+    arena: std.heap.ArenaAllocator = undefined,
+};
+
 /// Per-slot handler state, reserved at connection boot so dispatch never heap-allocates a job.
 const HandlerJob = struct {
     conn: *Connection,
+    /// The request's own memory, moved in from `request_leases` at dispatch
+    /// and freed by `finishHandlerJob`.
     arena: std.heap.ArenaAllocator,
     stream_id: u31,
     owned_request: session_mod.DispatchRequest,
@@ -1145,6 +1162,12 @@ pub const ReaperJob = struct {
 comptime {
     if (@sizeOf(HandlerSlot) != limits_mod.HANDLER_SLOT_SIZE) {
         @compileError("HANDLER_SLOT_SIZE must match @sizeOf(HandlerSlot)");
+    }
+    if (@sizeOf(RequestLease) != limits_mod.REQUEST_LEASE_SIZE) {
+        @compileError(std.fmt.comptimePrint(
+            "REQUEST_LEASE_SIZE must match @sizeOf(RequestLease) (got {d})",
+            .{@sizeOf(RequestLease)},
+        ));
     }
     if (@sizeOf(HandlerJob) != limits_mod.HANDLER_JOB_SIZE) {
         @compileError(std.fmt.comptimePrint(
@@ -1297,18 +1320,13 @@ const Connection = struct {
     /// `queueWire`; on TLS that plaintext is what the pump encrypts.
     plaintext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
+    /// Untouched until a slot is first dispatched: dispatch assigns the whole
+    /// job, so nothing is set up at connect.
     handler_jobs: []HandlerJob,
-    /// Jobs `[0, jobs_ready)` are set up; the rest are untouched memory.
-    /// Writing every job at connect touched `max_streams_per_connection` x
-    /// `HANDLER_JOB_SIZE` (166 KiB at 256) per connection whether or not the
-    /// slots were ever used. `readyJob` sets one up on first hand-out.
-    jobs_ready: usize = 0,
-    /// Parallel to `handlers`. Non-zero means this job's arena holds decoded
-    /// request-list bytes for that stream, so `allocSlot` must not give the
-    /// slot to a different stream.
-    header_lease_sid: []u31,
-    discard_arena: std.heap.ArenaAllocator,
-    discard_lease_sid: u31 = 0,
+    /// Requests decoded but not yet dispatched. One more than the stream
+    /// limit, because Session decodes a block before it checks the limit
+    /// (the HPACK table must advance either way).
+    request_leases: []RequestLease,
     shutting_down: bool = false,
     /// Set by a handler after it refills scheduler slab space; cleared by the
     /// actor at the top of each iteration. Emission happens only in the
@@ -1502,7 +1520,7 @@ const Connection = struct {
                 }
             }.f,
             .headerListAlloc = struct {
-                fn f(ctx: *anyopaque, stream_id: u31) std.mem.Allocator {
+                fn f(ctx: *anyopaque, stream_id: u31) ?std.mem.Allocator {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     return c.borrowHeaderListAlloc(stream_id);
                 }
@@ -1560,9 +1578,9 @@ const Connection = struct {
         errdefer gpa.free(handlers);
         const handler_jobs = try gpa.alloc(HandlerJob, config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_jobs);
-        const header_lease_sid = try gpa.alloc(u31, config.limits.max_streams_per_connection);
-        errdefer gpa.free(header_lease_sid);
-        @memset(header_lease_sid, 0);
+        const request_leases = try gpa.alloc(RequestLease, config.limits.max_streams_per_connection + 1);
+        errdefer gpa.free(request_leases);
+        @memset(request_leases, .{});
         const handler_joins = try gpa.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_joins);
         const completion_ch_buf = try gpa.alloc(u31, config.limits.max_streams_per_connection);
@@ -1634,8 +1652,7 @@ const Connection = struct {
             .write_ch_buf = write_ch_buf,
             .handlers = handlers,
             .handler_jobs = handler_jobs,
-            .header_lease_sid = header_lease_sid,
-            .discard_arena = std.heap.ArenaAllocator.init(gpa),
+            .request_leases = request_leases,
             .handler_joins = handler_joins,
             .completion_ch_buf = completion_ch_buf,
             .write_ack_buf = write_ack_buf,
@@ -1829,10 +1846,13 @@ const Connection = struct {
         self.config.gpa.free(self.read_ch_buf);
         self.config.gpa.free(self.write_ch_buf);
         self.config.gpa.free(self.handlers);
-        for (self.handler_jobs[0..self.jobs_ready]) |*job| job.arena.deinit();
         self.config.gpa.free(self.handler_jobs);
-        self.config.gpa.free(self.header_lease_sid);
-        self.discard_arena.deinit();
+        // Session is gone, so a lease left here is a request it never handed
+        // to dispatch nor dropped (a teardown with HEADERS still pending).
+        for (self.request_leases) |*l| {
+            if (l.stream_id != 0) l.arena.deinit();
+        }
+        self.config.gpa.free(self.request_leases);
         self.config.gpa.free(self.handler_joins);
         self.config.gpa.free(self.completion_ch_buf);
         if (self.write_ack_buf.len != 0) self.config.gpa.free(self.write_ack_buf);
@@ -3460,14 +3480,7 @@ const Connection = struct {
     /// `error.BodyClosed`.
     fn allocSlot(self: *Connection, stream_id: u31) ?*HandlerSlot {
         for (self.handlers, 0..) |*slot, i| {
-            if (!slot.in_use and self.header_lease_sid[i] == stream_id) {
-                return self.claimSlot(slot, i, stream_id);
-            }
-        }
-        for (self.handlers, 0..) |*slot, i| {
-            if (!slot.in_use and self.header_lease_sid[i] == 0) {
-                return self.claimSlot(slot, i, stream_id);
-            }
+            if (!slot.in_use) return self.claimSlot(slot, i, stream_id);
         }
         return null;
     }
@@ -3476,7 +3489,6 @@ const Connection = struct {
         std.debug.assert(!slot.in_use);
         std.debug.assert(i < self.handlers.len);
         std.debug.assert(stream_id != 0);
-        self.readyJob(i);
         slot.in_use = true;
         self.slots_claimed += 1;
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
@@ -3496,25 +3508,6 @@ const Connection = struct {
         return slot;
     }
 
-    /// Set up job `i` on its first hand-out. Slots and header leases are both
-    /// handed out lowest free index first, and every index below a handed-out
-    /// one was itself handed out, so `i` is at most `jobs_ready`. A larger
-    /// `i` means a new scan order broke that, and the job would be garbage.
-    fn readyJob(self: *Connection, i: usize) void {
-        if (i < self.jobs_ready) return;
-        if (i > self.jobs_ready) std.debug.panic("job {d} handed out before job {d} was set up", .{ i, self.jobs_ready });
-        self.handler_jobs[i] = .{
-            .conn = undefined,
-            .arena = std.heap.ArenaAllocator.init(self.config.gpa),
-            .stream_id = 0,
-            .owned_request = undefined,
-            .req = undefined,
-            .resp = undefined,
-            .matched = .not_found,
-        };
-        self.jobs_ready += 1;
-    }
-
     /// Production admission. Dispatch is the only caller besides the
     /// double-finalize trap, which must use this rather than forging counters.
     fn admitHandler(self: *Connection, slot: *HandlerSlot) void {
@@ -3526,47 +3519,38 @@ const Connection = struct {
         std.debug.assert(slot.admitted);
     }
 
-    /// Lease a request-list allocator for `stream_id` before HPACK decode.
-    /// Prefers a free handler-job arena so dispatch can keep the strings
-    /// without a second copy. Falls back to a connection-local discard arena
-    /// when every job is busy; that path is ephemeral and must be discarded
-    /// or copied before the next acquire.
-    fn borrowHeaderListAlloc(self: *Connection, stream_id: u31) std.mem.Allocator {
-        for (self.header_lease_sid, 0..) |sid, i| {
-            if (sid == stream_id) return self.handler_jobs[i].arena.allocator();
+    /// The allocator `stream_id`'s header block decodes into: its existing
+    /// lease (trailers), or a new request arena. Null only when the lease
+    /// table is full, which the stream limit should make unreachable; Session
+    /// then refuses the stream rather than decode it into shared memory.
+    /// Actor-only.
+    fn borrowHeaderListAlloc(self: *Connection, stream_id: u31) ?std.mem.Allocator {
+        var free: ?*RequestLease = null;
+        for (self.request_leases) |*l| {
+            if (l.stream_id == stream_id) return l.arena.allocator();
+            if (free == null and l.stream_id == 0) free = l;
         }
-        if (self.discard_lease_sid == stream_id) return self.discard_arena.allocator();
-        for (self.handlers, 0..) |slot, i| {
-            if (!slot.in_use and self.header_lease_sid[i] == 0) {
-                self.readyJob(i);
-                self.header_lease_sid[i] = stream_id;
-                _ = self.handler_jobs[i].arena.reset(.retain_capacity);
-                return self.handler_jobs[i].arena.allocator();
-            }
-        }
-        if (self.discard_lease_sid != 0 and self.discard_lease_sid != stream_id) {
-            _ = self.discard_arena.reset(.retain_capacity);
-        }
-        self.discard_lease_sid = stream_id;
-        _ = self.discard_arena.reset(.retain_capacity);
-        return self.discard_arena.allocator();
+        if (test_no_request_lease.load(.acquire)) return null;
+        const lease = free orelse return null;
+        lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.gpa) };
+        return lease.arena.allocator();
     }
 
+    /// Free `stream_id`'s request memory: a decode Session dropped, or a
+    /// dispatch that refused the stream. No-op once dispatch took the arena.
+    /// Actor-only.
     fn releaseHeaderList(self: *Connection, stream_id: u31) void {
-        if (self.discard_lease_sid == stream_id) {
-            _ = self.discard_arena.reset(.retain_capacity);
-            self.discard_lease_sid = 0;
-            return;
+        const arena = self.takeRequestArena(stream_id) orelse return;
+        arena.deinit();
+    }
+
+    fn takeRequestArena(self: *Connection, stream_id: u31) ?std.heap.ArenaAllocator {
+        for (self.request_leases) |*l| {
+            if (l.stream_id != stream_id) continue;
+            l.stream_id = 0;
+            return l.arena;
         }
-        for (self.header_lease_sid, 0..) |*sid, i| {
-            if (sid.* == stream_id) {
-                sid.* = 0;
-                if (!self.handlers[i].in_use) {
-                    _ = self.handler_jobs[i].arena.reset(.retain_capacity);
-                }
-                return;
-            }
-        }
+        return null;
     }
 
     fn slotIndex(self: *Connection, stream_id: u31) ?usize {
@@ -5002,9 +4986,9 @@ const Connection = struct {
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
 
-    /// Drop the dispatch-intent payload. Header-list bytes live in the job
-    /// arena when this stream still holds the decode lease; `releaseHeaderList`
-    /// is a no-op in that case. A non-empty body is always GPA-owned.
+    /// Drop a dispatch-intent payload that never became a job: free the
+    /// request's arena (headers) if dispatch has not taken it, and the body,
+    /// which is always GPA-owned.
     fn releaseDispatchRequest(self: *Connection, d: session_mod.DispatchRequest) void {
         self.releaseHeaderList(d.stream_id);
         if (d.body.len != 0) self.config.gpa.free(d.body);
@@ -5013,11 +4997,10 @@ const Connection = struct {
     /// Build a handler job. Actor-only, under `session_mu`.
     ///
     /// Ownership of the decoded request moves from the Session intent to the
-    /// handler job. Request header strings already live in the job arena when
-    /// decode leased this slot; only the lightweight Header arrays and handler
-    /// scratch are additional arena allocations. The handler therefore shares
-    /// nothing with Session without copying every decoded string and body a
-    /// second time.
+    /// handler job. The header strings were decoded into the request's own
+    /// arena, which moves into the job here; only the lightweight Header
+    /// arrays and handler scratch are new allocations in it. The handler
+    /// therefore shares nothing with Session, and nothing is copied.
     ///
     /// Admission order is reserve-then-claim, and it is deliberate:
     /// 1. Classify the route. Complete oneshots never spawn, so they skip the
@@ -5041,9 +5024,8 @@ const Connection = struct {
         defer if (dispatch_owned) self.releaseDispatchRequest(d);
 
         // Classify before reserving: complete oneshots have no join handle.
-        // Reuse this match when the job keeps the header-lease path (same
-        // bytes). Rematch after a dupe so `path_remainder` cannot alias the
-        // dispatch intent that releaseDispatchRequest may free.
+        // `path_remainder` slices `d.path`, which lives in the request arena
+        // the job takes over, so the match stays valid for the handler.
         const classified = self.config.router.match(request.Method.parse(d.method), d.path);
         const complete_inline = switch (classified) {
             .found => |f| f.handler == .complete,
@@ -5078,15 +5060,11 @@ const Connection = struct {
         errdefer std.debug.assert(self.releaseSlot(d.stream_id));
         const slot_i = self.slotIndex(d.stream_id) orelse unreachable;
         const job = &self.handler_jobs[slot_i];
-        const keep_arena = self.header_lease_sid[slot_i] == d.stream_id;
-        const arena = blk: {
-            if (keep_arena) {
-                self.header_lease_sid[slot_i] = 0;
-            } else {
-                _ = job.arena.reset(.retain_capacity);
-            }
-            break :blk job.arena;
-        };
+        // Session decodes every dispatched request into a lease (it refuses
+        // the stream when there is none), so a miss here is a broken
+        // invariant, and its strings would be memory nobody owns.
+        const arena = self.takeRequestArena(d.stream_id) orelse
+            std.debug.panic("dispatch of stream {d} without a request arena", .{d.stream_id});
         job.* = .{
             .conn = self,
             .arena = arena,
@@ -5096,46 +5074,29 @@ const Connection = struct {
             .resp = undefined,
             .matched = .not_found,
         };
+        errdefer job.arena.deinit();
         const a = job.arena.allocator();
 
+        // The strings are already in this arena; only the handler-facing
+        // arrays are built here.
         const headers: []request.Header = if (d.headers.len == 0)
             &.{}
         else
             try a.alloc(request.Header, d.headers.len);
-        if (d.headers.len != 0) {
-            for (d.headers, 0..) |h, i| {
-                headers[i] = if (keep_arena)
-                    .{ .name = h.name, .value = h.value }
-                else
-                    .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
-            }
-        }
+        for (d.headers, 0..) |h, i| headers[i] = .{ .name = h.name, .value = h.value };
 
         const trailers: []request.Header = if (d.trailers.len == 0)
             &.{}
         else
             try a.alloc(request.Header, d.trailers.len);
-        if (d.trailers.len != 0) {
-            for (d.trailers, 0..) |h, i| {
-                trailers[i] = if (keep_arena)
-                    .{ .name = h.name, .value = h.value }
-                else
-                    .{ .name = try a.dupe(u8, h.name), .value = try a.dupe(u8, h.value) };
-            }
-        }
-
-        const scheme = if (keep_arena) d.scheme else try a.dupe(u8, d.scheme);
-        const authority = if (keep_arena) d.authority else try a.dupe(u8, d.authority);
-        const path = if (keep_arena) d.path else try a.dupe(u8, d.path);
-        const query = if (keep_arena) d.query else try a.dupe(u8, d.query);
-        if (!keep_arena) self.releaseHeaderList(d.stream_id);
+        for (d.trailers, 0..) |h, i| trailers[i] = .{ .name = h.name, .value = h.value };
 
         job.req = .{
             .method = .parse(d.method),
-            .scheme = scheme,
-            .authority = authority,
-            .path = path,
-            .query = query,
+            .scheme = d.scheme,
+            .authority = d.authority,
+            .path = d.path,
+            .query = d.query,
             .headers = headers,
             .body = d.body,
             .trailers = trailers,
@@ -5177,7 +5138,7 @@ const Connection = struct {
             .method = job.req.method,
             .accept_encoding = accept_encoding,
         };
-        job.matched = if (keep_arena) classified else self.config.router.match(job.req.method, job.req.path);
+        job.matched = classified;
         switch (job.matched) {
             .found => |f| job.req.path_remainder = f.path_remainder,
             else => {},
@@ -5308,8 +5269,10 @@ const Connection = struct {
             if (self.config.balancer) |b| b.noteHandlerEnd(self.config.exec_index.?);
         }
         if (comptime test_observe) _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
-        _ = job.arena.reset(.retain_capacity);
-        self.releaseDispatchRequest(job.owned_request);
+        // Runs on whichever task finished the job, so it must not touch the
+        // actor's lease table: the arena (headers included) is the job's own.
+        job.arena.deinit();
+        if (job.owned_request.body.len != 0) self.config.gpa.free(job.owned_request.body);
     }
 
     fn runHandlerJob(job: *HandlerJob) void {
@@ -6654,6 +6617,8 @@ pub fn testTrapDoubleFinalize(io: std.Io) void {
     const i = trap.hop.conn.slotIndex(1) orelse std.debug.panic("trap slotIndex failed", .{});
     const job = &trap.hop.conn.handler_jobs[i];
     job.conn = &trap.hop.conn;
+    job.arena = .init(gpa);
+    job.task_counted = false;
     job.stream_id = 1;
     job.slot = slot;
     const body = gpa.dupe(u8, "trap-body") catch std.debug.panic("trap body dupe failed", .{});
@@ -6715,6 +6680,8 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *HandlerJob {
     const i = conn.slotIndex(sid) orelse std.debug.panic("trap slotIndex failed", .{});
     const job = &conn.handler_jobs[i];
     job.conn = conn;
+    job.arena = .init(conn.config.gpa);
+    job.task_counted = false;
     job.stream_id = sid;
     job.slot = slot;
     job.owned_request = .{

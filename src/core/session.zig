@@ -232,8 +232,11 @@ pub const Session = struct {
         releaseRequest: ?*const fn (*anyopaque, usize) void = null,
         /// Route body cap for this method and path. Null hook uses `Limits.request_body_bytes`.
         requestBodyCap: ?*const fn (*anyopaque, method: []const u8, path: []const u8) usize = null,
-        /// Allocator for one stream's decoded request-list (not the dynamic table).
-        headerListAlloc: ?*const fn (*anyopaque, u31) std.mem.Allocator = null,
+        /// Allocator for one stream's decoded request-list (not the dynamic
+        /// table): the request's own memory. Null means the edge has none to
+        /// give; Session still decodes the block (the table must advance) and
+        /// then refuses the stream.
+        headerListAlloc: ?*const fn (*anyopaque, u31) ?std.mem.Allocator = null,
         /// Reset that allocator after a decode that will not be dispatched.
         discardHeaderList: ?*const fn (*anyopaque, u31) void = null,
         /// Rent a boot-reserved outbound frame slab. `n` is the on-wire size.
@@ -253,7 +256,7 @@ pub const Session = struct {
         return global;
     }
 
-    fn headerListAllocator(self: *Session, stream_id: u31) std.mem.Allocator {
+    fn headerListAllocator(self: *Session, stream_id: u31) ?std.mem.Allocator {
         if (self.stream_hooks) |h| {
             if (h.headerListAlloc) |f| return f(h.ctx, stream_id);
         }
@@ -1329,7 +1332,8 @@ pub const Session = struct {
     /// header-list hook. Success hands the slice to an intent or to
     /// `pending_headers` / `pending_trailers`.
     fn finishHeaderBlock(self: *Session, stream_id: u31, block: []const u8) !void {
-        const req_alloc = self.headerListAllocator(stream_id);
+        const leased = self.headerListAllocator(stream_id);
+        const req_alloc = leased orelse self.gpa;
         const decoded = self.decoder.decodeInto(
             req_alloc,
             block,
@@ -1347,6 +1351,12 @@ pub const Session = struct {
             }
             return;
         };
+        if (leased == null) {
+            // Decoded only to keep the HPACK table in step with the peer.
+            self.decoder.freeResultInto(self.gpa, decoded);
+            try self.emitRst(stream_id, .refused_stream);
+            return;
+        }
 
         var s_ptr = self.streams.getPtr(stream_id);
         if (s_ptr == null) {

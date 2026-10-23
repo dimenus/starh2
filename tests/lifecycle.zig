@@ -42,6 +42,20 @@ fn helloThenLinger(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Resp
     zio.sleep(.fromMilliseconds(300)) catch {};
 }
 
+const big_request_bytes = 1024 * 1024;
+
+fn bigArenaTask(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    const scratch = try req.arena.alloc(u8, big_request_bytes);
+    @memset(scratch, 0x5a);
+    try resp.send(200, &.{}, "ok");
+}
+
+fn bigArenaComplete(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    const scratch = try req.arena.alloc(u8, big_request_bytes);
+    @memset(scratch, 0x5a);
+    try resp.send(200, &.{}, "ok");
+}
+
 fn delayedHello(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
     const t0 = zio.Timestamp.now(.monotonic).toNanoseconds();
@@ -751,6 +765,173 @@ test "a complete batch waits for a control entry instead of resetting the stream
     var handle = try rt.spawn(runCompleteWaitsForControlEntry, .{ rt, gpa });
     handle.join() catch |err| {
         std.debug.print("control entry wait: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+/// A stream that gets no request memory is refused, and the connection goes
+/// on: Session still decoded its block, so the HPACK table stays in step.
+fn runRefusedWithoutRequestMemory(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/complete", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = completeHello } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 8;
+    limits.max_streams_per_server = 16;
+    limits.cancellation_reaper_jobs = 16;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const c = starh2.edge.connection;
+    c.test_no_request_lease.store(true, .release);
+    defer c.test_no_request_lease.store(false, .release);
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    defer stream.close();
+
+    var first = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer first.deinit(gpa);
+    try h2c.appendHeaders(gpa, &first, 1, "/complete", true);
+    try writeAllStreamAt(stream, first.items, @src());
+    try std.testing.expectEqual(StreamOutcome.reset, try awaitStreamOutcome(stream, 1, 2_000));
+
+    c.test_no_request_lease.store(false, .release);
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(gpa);
+    try h2c.appendHeaders(gpa, &second, 3, "/complete", true);
+    try writeAllStreamAt(stream, second.items, @src());
+    try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 3, 2_000));
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+}
+
+test "a stream with no request memory is refused and the connection goes on" {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in no-request-memory test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runRefusedWithoutRequestMemory, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("no request memory: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+const CountingDbg = std.heap.DebugAllocator(.{
+    .never_unmap = true,
+    .retain_metadata = true,
+    .safety = true,
+    .enable_memory_limit = true,
+});
+
+fn liveBytes(dbg: *CountingDbg) usize {
+    return @atomicLoad(usize, &dbg.total_requested_bytes, .monotonic);
+}
+
+/// Request memory lives as long as the request. A handler's `req.arena` used
+/// to be its slot's arena, reset with `.retain_capacity`, so every slot kept
+/// its largest request's memory until the connection closed.
+fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator, dbg: *CountingDbg) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
+        .{ .method = .GET, .path = "/big-task", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigArenaTask } } },
+        .{ .method = .GET, .path = "/big-complete", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = bigArenaComplete } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 8;
+    limits.max_streams_per_server = 16;
+    limits.cancellation_reaper_jobs = 16;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    defer stream.close();
+
+    var wire = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer wire.deinit(gpa);
+    try h2c.appendHeaders(gpa, &wire, 1, "/hello", true);
+    try writeAllStreamAt(stream, wire.items, @src());
+    try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 1, 2_000));
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+    // The connection is up and idle: everything it holds for its own life is
+    // counted here.
+    const baseline = liveBytes(dbg);
+
+    const paths = [_][]const u8{ "/big-task", "/big-complete" };
+    for (paths, 0..) |path, k| {
+        const sid: u31 = @intCast(3 + 2 * k);
+        var req: std.ArrayList(u8) = .empty;
+        defer req.deinit(gpa);
+        try h2c.appendHeaders(gpa, &req, sid, path, true);
+        try writeAllStreamAt(stream, req.items, @src());
+        try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, sid, 2_000));
+        try waitAccountingZeroAt(&server, 2_000, @src().line);
+        const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
+        while (liveBytes(dbg) > baseline + big_request_bytes / 4) {
+            if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
+                std.debug.print("{s}: live bytes {d} after the request, {d} before it, with the connection still open\n", .{ path, liveBytes(dbg), baseline });
+                return error.RequestMemoryOutlivedRequest;
+            }
+            zio.sleep(.fromMilliseconds(5)) catch {};
+        }
+    }
+}
+
+test "request memory is freed when its handler finishes, not when the connection closes" {
+    var dbg = CountingDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in request-memory test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runRequestMemoryFreedAtFinish, .{ rt, gpa, &dbg });
+    handle.join() catch |err| {
+        std.debug.print("request memory: {s}\n", .{@errorName(err)});
         return err;
     };
 }

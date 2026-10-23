@@ -73,6 +73,8 @@ pub const Terms = struct {
 /// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
 pub const HANDLER_SLOT_SIZE: usize = 32;
 pub const HANDLER_JOB_SIZE: usize = 648;
+/// Must match `edge.connection.RequestLease` — comptime-asserted in connection.zig.
+pub const REQUEST_LEASE_SIZE: usize = 40;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
 pub const REAPER_JOB_SIZE: usize = 40;
 
@@ -294,7 +296,7 @@ pub const Limits = struct {
         const plain_scratch: usize = TLS_PLAINTEXT_SCRATCH_SIZE;
         const sid_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const inline_sids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        const header_leases = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
+        const header_leases = try checkedMul(self.max_streams_per_connection + 1, REQUEST_LEASE_SIZE);
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
         // The write pool is a SlabPool: one free bit per chunk, in u64 words.
         const write_free = try checkedMul((n_chunks + 63) / 64, @sizeOf(u64));
