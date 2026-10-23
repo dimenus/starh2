@@ -36,8 +36,11 @@ fn hangSse(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) an
 
 /// Answers, then keeps running: a handler may do work after its response,
 /// and its stream is closed for the peer the moment END_STREAM arrives.
+var linger_runs: std.atomic.Value(usize) = .init(0);
+
 fn helloThenLinger(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = req;
+    _ = linger_runs.fetchAdd(1, .acq_rel);
     try resp.send(200, &.{}, "ok");
     zio.sleep(.fromMilliseconds(300)) catch {};
 }
@@ -606,12 +609,9 @@ test "a stream inside the advertised limit waits for a receipt-held slot instead
 
 /// Stream 1's task handler has answered but not returned, so its slot is busy
 /// while the peer may already open stream 3 inside the advertised limit of
-/// one. Today that stream is refused for want of a slot (t-3494, open). The
-/// refusal path reserved a server-wide reaper token and returned without
-/// releasing it, so every refused task stream leaked one until the server
-/// refused every task stream. This test pins the refusal and the zero
-/// accounting after it; when t-3494 makes stream 3 wait instead, the first
-/// expectation fails and this test must be rewritten to that behaviour.
+/// one. Stream 3 must wait for the slot, never be refused (t-3494). The
+/// no-slot path once also leaked a server-wide reaper token per stream, so
+/// the accounting must come back to zero after it.
 fn runTaskSlotHeldAfterResponse(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
@@ -654,13 +654,18 @@ fn runTaskSlotHeldAfterResponse(rt: *zio.Runtime, gpa: std.mem.Allocator) !void 
     defer second.deinit(gpa);
     try h2c.appendHeaders(gpa, &second, 3, "/linger", true);
     try writeAllStreamAt(stream, second.items, @src());
-    try std.testing.expectEqual(StreamOutcome.reset, try awaitStreamOutcome(stream, 3, 2_000));
+    // helloThenLinger keeps stream 1's slot for 300 ms after it answered.
+    const while_busy = try awaitStreamOutcome(stream, 3, 100);
+    if (while_busy == .reset) return error.RefusedInsideAdvertisedLimit;
+    // Answered while the only slot was still busy: nothing waited.
+    if (while_busy == .ended) return error.SlotNotHeldByLingeringHandler;
+    try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 3, 2_000));
     try waitAccountingZeroAt(&server, 2_000, @src().line);
     stream.close();
     stream_open = false;
 }
 
-test "a task stream refused for want of a slot returns its reaper token" {
+test "a stream inside the advertised limit waits for a task handler that answered but has not returned" {
     var dbg = LifecycleDbg.init;
     defer {
         const status = dbg.deinit();
@@ -677,6 +682,137 @@ test "a task stream refused for want of a slot returns its reaper token" {
         std.debug.print("task slot held after response: {s}\n", .{@errorName(err)});
         return err;
     };
+}
+
+const ParkedEnd = enum { peer_reset, server_shutdown, peer_close };
+
+/// How a parked request ends when it never gets its slot the ordinary way.
+/// Stream 1's handler holds the only slot for 300 ms after answering; stream
+/// 3 parks behind it.
+fn runParkedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, how: ParkedEnd) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/linger", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = helloThenLinger } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 1;
+    limits.max_streams_per_server = 8;
+    limits.cancellation_reaper_jobs = 8;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+    linger_runs.store(0, .release);
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    var stream_open = true;
+    defer if (stream_open) stream.close();
+
+    var first = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer first.deinit(gpa);
+    try h2c.appendHeaders(gpa, &first, 1, "/linger", true);
+    try writeAllStreamAt(stream, first.items, @src());
+    try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 1, 2_000));
+
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(gpa);
+    try h2c.appendHeaders(gpa, &second, 3, "/linger", true);
+    try writeAllStreamAt(stream, second.items, @src());
+    try std.testing.expectEqual(StreamOutcome.timed_out, try awaitStreamOutcome(stream, 3, 50));
+
+    switch (how) {
+        .peer_reset => {
+            var rst: std.ArrayList(u8) = .empty;
+            defer rst.deinit(gpa);
+            try h2c.appendRst(gpa, &rst, 3);
+            try writeAllStreamAt(stream, rst.items, @src());
+            // Past stream 1's linger: the slot is free again, and stream 3
+            // must not have run on it.
+            zio.sleep(.fromMilliseconds(400)) catch {};
+            try std.testing.expectEqual(@as(usize, 1), linger_runs.load(.acquire));
+            var third: std.ArrayList(u8) = .empty;
+            defer third.deinit(gpa);
+            try h2c.appendHeaders(gpa, &third, 5, "/linger", true);
+            try writeAllStreamAt(stream, third.items, @src());
+            try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 5, 2_000));
+            try waitAccountingZeroAt(&server, 2_000, @src().line);
+            try std.testing.expectEqual(@as(usize, 2), linger_runs.load(.acquire));
+        },
+        .server_shutdown => {
+            // Hold completions so stream 1's slot stays busy after its handler
+            // returns: no handler is live, nothing is left to write, and a
+            // request still waits. Graceful finish must not drop it.
+            const c = starh2.edge.connection;
+            c.test_hold_completion_drain.store(true, .release);
+            defer c.test_hold_completion_drain.store(false, .release);
+            server.requestShutdown();
+            // Past the 1 s phase-1 deadline (this client never acks the
+            // grace PING), so the finish check runs in phase 2.
+            try std.testing.expectEqual(StreamOutcome.timed_out, try awaitStreamOutcome(stream, 3, 1_500));
+            try std.testing.expectEqual(@as(usize, 1), linger_runs.load(.acquire));
+            c.test_hold_completion_drain.store(false, .release);
+            // A held completion does not wake the actor; a PING does.
+            const ping = [_]u8{ 0, 0, 8, 0x6, 0, 0, 0, 0, 0 } ++ [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+            try writeAllStreamAt(stream, &ping, @src());
+            // Graceful: a stream the server accepted before GOAWAY is served.
+            try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 3, 2_000));
+            serve_handle.join() catch {};
+            serving = false;
+            try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+        },
+        .peer_close => {
+            stream.close();
+            stream_open = false;
+            try waitAccountingZeroAt(&server, 2_000, @src().line);
+        },
+    }
+}
+
+fn runParkedEndArm(how: ParkedEnd) !void {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in parked-end test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runParkedEnd, .{ rt, gpa, how });
+    handle.join() catch |err| {
+        std.debug.print("parked end {s}: {s}\n", .{ @tagName(how), @errorName(err) });
+        return err;
+    };
+}
+
+test "a parked stream the peer resets is dropped without running its handler" {
+    try runParkedEndArm(.peer_reset);
+}
+
+test "a parked stream is still served when the server shuts down gracefully" {
+    try runParkedEndArm(.server_shutdown);
+}
+
+test "a parked stream is released when the peer closes the connection" {
+    try runParkedEndArm(.peer_close);
 }
 
 /// Every complete response holds one ordinary control entry (its HEADERS)

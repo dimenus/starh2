@@ -296,7 +296,11 @@ pub const Limits = struct {
         const plain_scratch: usize = TLS_PLAINTEXT_SCRATCH_SIZE;
         const sid_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const inline_sids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        const header_leases = try checkedMul(self.max_streams_per_connection + 1, REQUEST_LEASE_SIZE);
+        // Request leases (decoded, not dispatched) plus the parked-request ring.
+        const header_leases = try checkedAdd(
+            try checkedMul(self.max_streams_per_connection + 1, REQUEST_LEASE_SIZE),
+            try checkedMul(self.max_streams_per_connection, bound.DISPATCH_REQUEST_SIZE),
+        );
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
         // The write pool is a SlabPool: one free bit per chunk, in u64 words.
         const write_free = try checkedMul((n_chunks + 63) / 64, @sizeOf(u64));

@@ -86,6 +86,7 @@ pub const TICKET_WAIT_SIZE: usize = @sizeOf(ticket_table.TicketWait);
 pub const STREAM_SIZE: usize = @sizeOf(stream_mod.Stream);
 pub const U31_SIZE: usize = @sizeOf(u31);
 pub const INTENT_SIZE: usize = @sizeOf(session_mod.Intent);
+pub const DISPATCH_REQUEST_SIZE: usize = @sizeOf(session_mod.DispatchRequest);
 pub const DATA_PENDING_SIZE: usize = @sizeOf(fair_scheduler.DataPending);
 pub const CONTROL_ENTRY_SIZE: usize = @sizeOf(fair_scheduler.ControlEntry);
 pub const FramedDataEntryShape = fair_scheduler.FramedDataEntry;

@@ -1327,6 +1327,16 @@ const Connection = struct {
     /// limit, because Session decodes a block before it checks the limit
     /// (the HPACK table must advance either way).
     request_leases: []RequestLease,
+    /// Requests waiting for a handler slot, oldest first (a ring). The peer
+    /// may open a stream as soon as it reads the previous one's END_STREAM,
+    /// while that stream's handler is still running, so a slot can be busy
+    /// for a stream inside the advertised limit. Such a request waits here
+    /// instead of being refused. A parked request is an open stream, so the
+    /// stream limit bounds this queue; the slots are never written before
+    /// use.
+    parked: []session_mod.DispatchRequest,
+    parked_head: usize = 0,
+    parked_len: usize = 0,
     shutting_down: bool = false,
     /// Set by a handler after it refills scheduler slab space; cleared by the
     /// actor at the top of each iteration. Emission happens only in the
@@ -1581,6 +1591,8 @@ const Connection = struct {
         const request_leases = try gpa.alloc(RequestLease, config.limits.max_streams_per_connection + 1);
         errdefer gpa.free(request_leases);
         @memset(request_leases, .{});
+        const parked = try gpa.alloc(session_mod.DispatchRequest, config.limits.max_streams_per_connection);
+        errdefer gpa.free(parked);
         const handler_joins = try gpa.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
         errdefer gpa.free(handler_joins);
         const completion_ch_buf = try gpa.alloc(u31, config.limits.max_streams_per_connection);
@@ -1653,6 +1665,7 @@ const Connection = struct {
             .handlers = handlers,
             .handler_jobs = handler_jobs,
             .request_leases = request_leases,
+            .parked = parked,
             .handler_joins = handler_joins,
             .completion_ch_buf = completion_ch_buf,
             .write_ack_buf = write_ack_buf,
@@ -1847,6 +1860,10 @@ const Connection = struct {
         self.config.gpa.free(self.write_ch_buf);
         self.config.gpa.free(self.handlers);
         self.config.gpa.free(self.handler_jobs);
+        // The sweep released every parked request; a request still here would
+        // be a teardown path that skipped it.
+        std.debug.assert(self.parked_len == 0);
+        self.config.gpa.free(self.parked);
         // Session is gone, so a lease left here is a request it never handed
         // to dispatch nor dropped (a teardown with HEADERS still pending).
         for (self.request_leases) |*l| {
@@ -3271,6 +3288,9 @@ const Connection = struct {
                 // the RST'd streams keep their pending DATA, drain skips them
                 // forever, and the actor parks until slow-consumer. That is
                 // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
+                // Slots freed since the last turn go to parked requests before
+                // any new one, so a waiting request is not overtaken.
+                try self.dispatchParked();
                 diagActor(self, .lk_materialize);
                 self.materializeIntents() catch {
                     // Terminal enqueue failure sets writer_failed inside
@@ -3306,11 +3326,13 @@ const Connection = struct {
                     self.freezeAndSweepLocked();
                     break;
                 }
-                // Graceful finish needs all three conditions together: phase 2
-                // reached, nothing left to write, and no handler still running.
-                // Any one alone would cut off work that is still in flight.
+                // Graceful finish needs all four conditions together: phase 2
+                // reached, nothing left to write, no handler still running,
+                // and no request waiting for a slot. Any one alone would cut
+                // off work that is still in flight.
                 if (self.shutting_down and self.session.grace_phase == .phase2 and
-                    self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0)
+                    self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0 and
+                    self.parked_len == 0)
                 {
                     try self.finishGraceful();
                     self.freezeAndSweepLocked();
@@ -3697,6 +3719,7 @@ const Connection = struct {
         }
         std.debug.assert(self.inline_n == 0);
         std.debug.assert(self.teardown_inline_n <= self.inline_sids.len);
+        self.releaseParked();
         self.sweepHandlerWaitersLocked();
     }
 
@@ -5019,7 +5042,69 @@ const Connection = struct {
     /// the actor would park ingest for as long as that handler blocks (SSE).
     /// Complete handlers are the intentional no-spawn path: they are queued
     /// here and run in `runPendingInline` with the lock released.
+    ///
+    /// No free slot is not a refusal: the request parks (`parked`) and
+    /// `dispatchParked` resumes it when a slot frees. A request never
+    /// overtakes one that is already waiting.
     fn dispatch(self: *Connection, d: session_mod.DispatchRequest) anyerror!void {
+        if (self.parked_len == 0 and try self.tryDispatch(d)) return;
+        self.park(d);
+    }
+
+    fn park(self: *Connection, d: session_mod.DispatchRequest) void {
+        if (self.parked_len == self.parked.len) {
+            // More parked than open streams can exist: an accounting fault,
+            // answered like the old no-slot path rather than dropped.
+            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
+            self.releaseDispatchRequest(d);
+            return;
+        }
+        self.parked[(self.parked_head + self.parked_len) % self.parked.len] = d;
+        self.parked_len += 1;
+    }
+
+    /// Dispatch parked requests, oldest first, while slots are free. A stream
+    /// the peer reset while it waited is no longer in Session; its request is
+    /// dropped instead of run. Actor-only, under `session_mu`.
+    fn dispatchParked(self: *Connection) anyerror!void {
+        self.assertSessionHeld("dispatchParked");
+        while (self.parked_len != 0) {
+            const d = self.parked[self.parked_head];
+            if (self.session.streams.get(d.stream_id) == null) {
+                self.popParked();
+                self.releaseDispatchRequest(d);
+                continue;
+            }
+            // Pop first: on an error tryDispatch has already released `d`.
+            self.popParked();
+            if (!try self.tryDispatch(d)) {
+                self.parked_head = (self.parked_head + self.parked.len - 1) % self.parked.len;
+                self.parked[self.parked_head] = d;
+                self.parked_len += 1;
+                return;
+            }
+        }
+    }
+
+    fn popParked(self: *Connection) void {
+        std.debug.assert(self.parked_len != 0);
+        self.parked_head = (self.parked_head + 1) % self.parked.len;
+        self.parked_len -= 1;
+    }
+
+    /// Release every parked request without running it. Teardown only.
+    fn releaseParked(self: *Connection) void {
+        while (self.parked_len != 0) {
+            const d = self.parked[self.parked_head];
+            self.popParked();
+            self.releaseDispatchRequest(d);
+        }
+    }
+
+    /// The body of `dispatch`. Returns false, with `d` still the caller's,
+    /// when no handler slot is free; every other outcome (a handler started,
+    /// or the stream refused) consumes `d`.
+    fn tryDispatch(self: *Connection, d: session_mod.DispatchRequest) anyerror!bool {
         var dispatch_owned = true;
         defer if (dispatch_owned) self.releaseDispatchRequest(d);
 
@@ -5038,24 +5123,23 @@ const Connection = struct {
                 if (!acct.tryReserveReaper()) {
                     self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
                     try self.processIntents();
-                    return;
+                    return true;
                 }
                 reaper_reserved = true;
             }
         }
-        // `defer`, not `errdefer`: the no-slot refusal below returns without
-        // an error, and an errdefer leaked one server-wide token per refused
-        // task stream until every task stream was refused (t-3494). The slot
-        // takes ownership where `slot.reaper_reserved` is set.
+        // `defer`, not `errdefer`: the no-slot return below carries no error,
+        // and an errdefer leaked one server-wide token per such task stream
+        // until every task stream was refused. A parked request reserves a
+        // fresh token when it resumes. The slot takes ownership where
+        // `slot.reaper_reserved` is set.
         defer if (reaper_reserved) {
             if (self.config.accounting) |acct| acct.releaseReaper();
         };
 
         const slot = self.allocSlot(d.stream_id) orelse {
-            // A terminal connection needs no additional refusal frame.
-            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
-            try self.processIntents();
-            return;
+            dispatch_owned = false;
+            return false;
         };
         errdefer std.debug.assert(self.releaseSlot(d.stream_id));
         const slot_i = self.slotIndex(d.stream_id) orelse unreachable;
@@ -5182,7 +5266,7 @@ const Connection = struct {
             // the actor is parked. Flag-before-ring: inline_n is the state,
             // the ring is the persistent wake.
             self.ring();
-            return;
+            return true;
         }
         // Count before spawn so a handler that finishes before this function
         // stores the join handle still decrements in finishHandlerJob.
@@ -5210,11 +5294,12 @@ const Connection = struct {
             // the intent batch is live. The RST is picked up on the next drain.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
             finishHandlerJob(job);
-            return;
+            return true;
         };
         if (self.slotIndex(d.stream_id)) |i| {
             self.handler_joins[i] = h;
         }
+        return true;
     }
 
     /// The handler task entry point.
