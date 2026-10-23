@@ -88,14 +88,14 @@ pub const FrameHeader = struct {
 
     pub fn encode(self: FrameHeader, out: *[FRAME_HEADER_LEN]u8) void {
         std.mem.writeInt(u24, out[0..3], self.length, .big);
-        out[3] = @intFromEnum(self.type);
+        out[3] = @backingInt(self.type);
         out[4] = self.flags.toByte();
         std.mem.writeInt(u32, out[5..9], @as(u32, self.stream_id), .big);
     }
 
     pub fn decode(bytes: *const [FRAME_HEADER_LEN]u8) FrameHeader {
         const length = std.mem.readInt(u24, bytes[0..3], .big);
-        const typ: FrameType = @enumFromInt(bytes[3]);
+        const typ: FrameType = @fromBackingInt(@intCast(bytes[3]));
         const flags = FrameFlags.fromByte(bytes[4]);
         const stream_id: u31 = @truncate(std.mem.readInt(u32, bytes[5..9], .big) & 0x7fff_ffff);
         return .{
@@ -433,7 +433,7 @@ pub const Serializer = struct {
         hdr.encode(buf[0..FRAME_HEADER_LEN]);
         var i: usize = FRAME_HEADER_LEN;
         for (settings) |s| {
-            std.mem.writeInt(u16, buf[i..][0..2], @intFromEnum(s.id), .big);
+            std.mem.writeInt(u16, buf[i..][0..2], @backingInt(s.id), .big);
             std.mem.writeInt(u32, buf[i + 2 ..][0..4], s.value, .big);
             i += 6;
         }
@@ -477,7 +477,7 @@ pub const Serializer = struct {
         };
         hdr.encode(buf[0..FRAME_HEADER_LEN]);
         std.mem.writeInt(u32, buf[FRAME_HEADER_LEN..][0..4], @as(u32, last_stream_id), .big);
-        std.mem.writeInt(u32, buf[FRAME_HEADER_LEN + 4 ..][0..4], @intFromEnum(error_code), .big);
+        std.mem.writeInt(u32, buf[FRAME_HEADER_LEN + 4 ..][0..4], @backingInt(error_code), .big);
         @memcpy(buf[FRAME_HEADER_LEN + 8 ..][0..debug.len], debug);
         return FRAME_HEADER_LEN + payload_len;
     }
@@ -491,7 +491,7 @@ pub const Serializer = struct {
             .stream_id = stream_id,
         };
         hdr.encode(buf[0..FRAME_HEADER_LEN]);
-        std.mem.writeInt(u32, buf[FRAME_HEADER_LEN..][0..4], @intFromEnum(error_code), .big);
+        std.mem.writeInt(u32, buf[FRAME_HEADER_LEN..][0..4], @backingInt(error_code), .big);
         return FRAME_HEADER_LEN + 4;
     }
 };
@@ -515,16 +515,20 @@ pub const Setting = struct {
 /// `enable_push = 0` is load-bearing: this stack never implements PUSH_PROMISE,
 /// so it refuses the capability at the handshake instead of at frame receipt.
 /// The other values match the profile that the rest of the stack is sized for.
-/// `max_concurrent_streams` mirrors `Limits.max_streams_per_connection`, and
+/// `max_concurrent_streams` is the session's configured
+/// `Limits.max_streams_per_connection`: it is a parameter, not a copy, because
+/// a copy drifts and the server then advertises streams it refuses.
 /// `max_frame_size` mirrors the parser's boot-reserved scratch buffer.
-pub const serverPrefaceSettings = [_]Setting{
-    .{ .id = .header_table_size, .value = 4096 },
-    .{ .id = .enable_push, .value = 0 },
-    .{ .id = .max_concurrent_streams, .value = 256 },
-    .{ .id = .initial_window_size, .value = 65_535 },
-    .{ .id = .max_frame_size, .value = 16_384 },
-    .{ .id = .max_header_list_size, .value = 32_768 },
-};
+pub fn serverPrefaceSettings(max_concurrent_streams: u32) [6]Setting {
+    return .{
+        .{ .id = .header_table_size, .value = 4096 },
+        .{ .id = .enable_push, .value = 0 },
+        .{ .id = .max_concurrent_streams, .value = max_concurrent_streams },
+        .{ .id = .initial_window_size, .value = 65_535 },
+        .{ .id = .max_frame_size, .value = 16_384 },
+        .{ .id = .max_header_list_size, .value = 32_768 },
+    };
+}
 
 test "encodedOnWireLen reads the header, not the slab tail" {
     var slab: [64]u8 = undefined;
@@ -565,7 +569,7 @@ test "preface rejection" {
 
 test "settings serialize" {
     var buf: [128]u8 = undefined;
-    const n = try Serializer.settingsFrame(&buf, false, &serverPrefaceSettings);
+    const n = try Serializer.settingsFrame(&buf, false, &serverPrefaceSettings(256));
     try std.testing.expect(n > FRAME_HEADER_LEN);
     const hdr = FrameHeader.decode(buf[0..FRAME_HEADER_LEN]);
     try std.testing.expectEqual(FrameType.settings, hdr.type);

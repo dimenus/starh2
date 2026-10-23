@@ -102,7 +102,7 @@ pub const Limits = struct {
     max_routes: usize = 256,
     max_route_path_bytes: usize = 64 * 1024,
     max_connections: usize = 1_024,
-    max_streams_per_connection: usize = 256,
+    max_streams_per_connection: usize = 64,
     max_streams_per_server: usize = 4_096,
     inbound_wire_chunks_per_connection: usize = 8,
     /// Boot-reserved outbound HEADERS/DATA frame slabs per connection. A frame

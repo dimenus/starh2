@@ -565,7 +565,8 @@ pub const Session = struct {
 
     fn emitServerPreface(self: *Session) !void {
         var buf: [256]u8 = undefined;
-        const n = try frame.Serializer.settingsFrame(&buf, false, &frame.serverPrefaceSettings);
+        const settings = frame.serverPrefaceSettings(@intCast(self.limits.max_streams_per_connection));
+        const n = try frame.Serializer.settingsFrame(&buf, false, &settings);
         const payload = try self.gpa.dupe(u8, buf[0..n]);
         // Store as raw bytes frame — edge writes verbatim. Use typ=settings with full frame in payload.
         // Simpler: outbound is complete wire bytes in a synthetic frame.
@@ -1806,6 +1807,30 @@ test "session preface and settings ack" {
         // intent_drain scratch — do not free slice
     }
     try std.testing.expect(intents.len >= 2);
+}
+
+test "the preface advertises the configured stream limit" {
+    var limits = limits_mod.Limits.defaults;
+    limits.max_streams_per_connection = 37;
+    var session = try Session.init(std.testing.allocator, limits);
+    defer session.deinit();
+    const intents = session.drainIntents();
+    defer freeTestIntents(std.testing.allocator, intents);
+    var advertised: ?u32 = null;
+    for (intents) |it| switch (it) {
+        .outbound_frame => |f| if (f.typ == .settings) {
+            // Full wire frame: 9-byte header, then 6-byte (id, value) entries.
+            var off: usize = frame.FRAME_HEADER_LEN;
+            while (off + 6 <= f.payload.len) : (off += 6) {
+                const id = std.mem.readInt(u16, f.payload[off..][0..2], .big);
+                if (id == @intFromEnum(frame.SettingId.max_concurrent_streams)) {
+                    advertised = std.mem.readInt(u32, f.payload[off + 2 ..][0..4], .big);
+                }
+            }
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(?u32, 37), advertised);
 }
 
 test "bad preface" {
