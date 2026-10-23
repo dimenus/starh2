@@ -340,13 +340,8 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try h2c.appendHeaders(gpa, &first, 1, "/complete", true);
     try writeAllStreamAt(stream, first.items, @src());
 
-    var deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
-    while (c.test_observed_live_handlers.load(.acquire) < 1) {
-        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
-            return error.FirstCompleteNotDispatched;
-        }
-        zio.sleep(.fromMilliseconds(1)) catch {};
-    }
+    // A held receipt ack proves A dispatched, ran and was written.
+    const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
     while (!c.test_complete_receipt_ack_held.load(.acquire)) {
         if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
             return error.CompleteReceiptAckNotHeld;
@@ -359,17 +354,19 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try h2c.appendHeaders(gpa, &second, 3, "/complete", true);
     try writeAllStreamAt(stream, second.items, @src());
 
-    deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 250 * std.time.ns_per_ms;
-    while (c.test_observed_live_handlers.load(.acquire) < 2) {
-        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
-            std.debug.print("complete receipt pipeline did not dispatch B while A ack was held: live={d} slots={d}\n", .{
-                c.test_observed_live_handlers.load(.acquire),
-                c.test_observed_slots_in_use.load(.acquire),
-            });
-            return error.SecondCompleteBlockedByFirstAck;
-        }
-        zio.sleep(.fromMilliseconds(1)) catch {};
+    // A's job finished at the end of its drain turn, so a handler count no
+    // longer shows B overlapping A. B's END_STREAM on the wire while A's
+    // receipt ack is still held does: the actor ingested, ran and emitted B
+    // without waiting for A's write.
+    const b_outcome = try awaitStreamOutcome(stream, 3, 250);
+    if (b_outcome != .ended) {
+        std.debug.print("complete receipt pipeline did not answer B while A ack was held: {s} held={}\n", .{
+            @tagName(b_outcome),
+            c.test_complete_receipt_ack_held.load(.acquire),
+        });
+        return error.SecondCompleteBlockedByFirstAck;
     }
+    if (!c.test_complete_receipt_ack_held.load(.acquire)) return error.CompleteReceiptAckNotHeld;
 
     c.test_hold_complete_receipt_ack.store(false, .release);
     c.test_release_complete_receipt_ack.set();
@@ -436,6 +433,241 @@ test "complete receipt pipeline ingests B while A write ack is held" {
     var handle = try rt.spawn(runCompleteReceiptPipeline, .{ rt, gpa });
     handle.join() catch |err| {
         std.debug.print("complete receipt pipeline failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+const StreamOutcome = enum { ended, reset, timed_out };
+
+/// Read frames until every stream in `sids` ends (HEADERS or DATA with
+/// END_STREAM) or is reset, or the deadline passes. A stream still open at the
+/// deadline reads `.timed_out`. Frames for other streams are skipped, so wait
+/// for every stream you care about in one call.
+fn awaitStreamOutcomes(stream: zio.net.Stream, sids: []const u31, out: []StreamOutcome, timeout_ms: u64) !void {
+    std.debug.assert(sids.len == out.len);
+    @memset(out, .timed_out);
+    var open = sids.len;
+    const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% timeout_ms * std.time.ns_per_ms;
+    var hdr: [9]u8 = undefined;
+    var payload: [64 * 1024]u8 = undefined;
+    while (open > 0) {
+        const now = zio.Timestamp.now(.monotonic).toNanoseconds();
+        if (now >= deadline) return;
+        const n = stream.read(hdr[0..1], .{ .duration = .fromMilliseconds(20) }) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionClosed;
+        try readExact(stream, hdr[1..]);
+        const len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | hdr[2];
+        const typ = hdr[3];
+        const flags = hdr[4];
+        const frame_sid: u31 = @intCast(std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff);
+        std.debug.assert(len <= payload.len);
+        try readExact(stream, payload[0..len]);
+        for (sids, out) |sid, *o| {
+            if (sid != frame_sid or o.* != .timed_out) continue;
+            if (typ == 0x3) { // RST_STREAM
+                o.* = .reset;
+                open -= 1;
+            } else if ((typ == 0x0 or typ == 0x1) and flags & 0x1 != 0) {
+                o.* = .ended;
+                open -= 1;
+            }
+        }
+    }
+}
+
+fn awaitStreamOutcome(stream: zio.net.Stream, sid: u31, timeout_ms: u64) !StreamOutcome {
+    var out: [1]StreamOutcome = undefined;
+    try awaitStreamOutcomes(stream, &.{sid}, &out, timeout_ms);
+    return out[0];
+}
+
+/// A stream is closed for the peer once both sides sent END_STREAM, so a new
+/// stream after that is inside the advertised limit even while the server
+/// still holds the old stream's handler slot for its write receipt. The new
+/// stream must wait for the slot, never be refused (t-3491).
+fn runSlotHeldByReceipt(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/complete", .handler = .{ .complete = .{
+            .ptr = @constCast(&dummy),
+            .runFn = completeHello,
+        } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 1;
+    limits.max_streams_per_server = 8;
+    limits.cancellation_reaper_jobs = 8;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const c = starh2.edge.connection;
+    c.test_release_complete_receipt_ack.reset();
+    c.test_complete_receipt_ack_held.store(false, .release);
+    c.test_hold_complete_receipt_ack.store(true, .release);
+    defer {
+        c.test_hold_complete_receipt_ack.store(false, .release);
+        c.test_release_complete_receipt_ack.set();
+        c.test_complete_receipt_ack_held.store(false, .release);
+    }
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    var stream_open = true;
+    defer if (stream_open) stream.close();
+
+    var first = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer first.deinit(gpa);
+    try h2c.appendHeaders(gpa, &first, 1, "/complete", true);
+    try writeAllStreamAt(stream, first.items, @src());
+    // Stream 1's response reaches us while its write ack is held, so its slot
+    // stays occupied although the stream is closed.
+    try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 1, 2_000));
+    const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
+    while (!c.test_complete_receipt_ack_held.load(.acquire)) {
+        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) return error.CompleteReceiptAckNotHeld;
+        zio.sleep(.fromMilliseconds(1)) catch {};
+    }
+
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(gpa);
+    try h2c.appendHeaders(gpa, &second, 3, "/complete", true);
+    try writeAllStreamAt(stream, second.items, @src());
+    const while_held = try awaitStreamOutcome(stream, 3, 300);
+    if (while_held == .reset) return error.RefusedInsideAdvertisedLimit;
+
+    c.test_hold_complete_receipt_ack.store(false, .release);
+    c.test_release_complete_receipt_ack.set();
+    if (while_held != .ended) {
+        try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 3, 2_000));
+    }
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+    stream.close();
+    stream_open = false;
+}
+
+test "a stream inside the advertised limit waits for a receipt-held slot instead of being refused" {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in slot-held-by-receipt test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runSlotHeldByReceipt, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("slot held by receipt: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+/// Every complete response holds one ordinary control entry (its HEADERS)
+/// until WritePump acks the write. With slots no longer held to that ack, the
+/// streams in flight can outnumber the entries, and a complete batch must wait
+/// for an entry instead of failing the stream with RST_STREAM (t-3491).
+fn runCompleteWaitsForControlEntry(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/complete", .handler = .{ .complete = .{
+            .ptr = @constCast(&dummy),
+            .runFn = completeHello,
+        } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 8;
+    limits.max_streams_per_server = 16;
+    limits.cancellation_reaper_jobs = 16;
+    limits.cancellation_reaper_tasks = 2;
+    // Four ordinary entries for eight streams. With two, the connection
+    // closed before stream 1 was answered; not traced yet (t-3492).
+    limits.control_entries_per_connection = starh2.core.limits.TERMINAL_CONTROL_RESERVE_ENTRIES + 4;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const c = starh2.edge.connection;
+    // Every write acks late, so each queued HEADERS keeps its entry while
+    // the rest of the batch runs.
+    c.test_write_delay_ms = 100;
+    defer c.test_write_delay_ms = 0;
+    const cut_before = c.test_observed_inline_ctrl_full.load(.acquire);
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    var stream_open = true;
+    defer if (stream_open) stream.close();
+
+    var wire = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer wire.deinit(gpa);
+    const sids = [_]u31{ 1, 3, 5, 7, 9, 11, 13, 15 };
+    for (sids) |sid| try h2c.appendHeaders(gpa, &wire, sid, "/complete", true);
+    try writeAllStreamAt(stream, wire.items, @src());
+
+    var outcomes: [sids.len]StreamOutcome = undefined;
+    try awaitStreamOutcomes(stream, &sids, &outcomes, 5_000);
+    for (sids, outcomes) |sid, o| {
+        if (o != .ended) {
+            std.debug.print("control entry wait: stream {d} {s}\n", .{ sid, @tagName(o) });
+            return error.StreamNotAnswered;
+        }
+    }
+    // The batch really stopped on a full pool: otherwise this test passes
+    // without exercising the wait.
+    if (c.test_observed_inline_ctrl_full.load(.acquire) == cut_before) return error.ControlEntriesNotExhausted;
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+    stream.close();
+    stream_open = false;
+}
+
+test "a complete batch waits for a control entry instead of resetting the stream" {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in control-entry wait test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runCompleteWaitsForControlEntry, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("control entry wait: {s}\n", .{@errorName(err)});
         return err;
     };
 }

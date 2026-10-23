@@ -281,6 +281,8 @@ pub var test_observed_sched_emits: std.atomic.Value(usize) = .init(0);
 pub var test_observed_writer_fail_handled: std.atomic.Value(bool) = .init(false);
 /// Test-only: complete handlers run on the actor (no spawn).
 pub var test_observed_inline_jobs: std.atomic.Value(usize) = .init(0);
+/// Times `runPendingInline` stopped a batch because no ordinary control entry was free.
+pub var test_observed_inline_ctrl_full: std.atomic.Value(usize) = .init(0);
 /// Test-only: queueWire calls not from FairScheduler sink (must stay 0).
 pub var test_queue_wire_bypass: std.atomic.Value(usize) = .init(0);
 /// Test-only: true while FairScheduler sink is executing queueWire.
@@ -672,6 +674,8 @@ pub const trace = struct {
     pub var inline_full_n: std.atomic.Value(u64) = .init(0);
     pub var inline_full_sids: std.atomic.Value(u64) = .init(0);
     pub var inline_full_max: std.atomic.Value(u64) = .init(0);
+    /// `runPendingInline` cut a batch short: no ordinary control entry left.
+    pub var inline_ctrl_full_n: std.atomic.Value(u64) = .init(0);
     /// Complete-batch stamp → actor consumed the receipt (credit reuse).
     pub var credit_reuse_ns: std.atomic.Value(u64) = .init(0);
     pub var credit_reuse_n: std.atomic.Value(u64) = .init(0);
@@ -1043,14 +1047,19 @@ const HandlerCtx = struct {
     /// true for the whole connection and would skip a concurrent task handler's wait.
     defer_receipt: bool = false,
     /// `1` means encode succeeded. The drain-turn receipt is reserved after
-    /// the inline batch, not per response (`deferred_slot` is unused then).
+    /// the inline batch, not per response.
     deferred_ticket: u64 = 0,
-    deferred_slot: u32 = 0,
-    send_traced: bool = false,
-    t_send_before: u64 = 0,
-    t_send_acquired: u64 = 0,
-    t_send_unlocked: u64 = 0,
-    t_send_hpack: u64 = 0,
+    /// Set when this send owns the connection's one `trace_ticket` sample.
+    send_trace: ?SendTrace = null,
+};
+
+/// Timestamps of one sampled `sendCb`, stamped into the trace counters once
+/// its write ack lands (`stampSendWait`).
+const SendTrace = struct {
+    before: u64,
+    acquired: u64,
+    unlocked: u64,
+    hpack: u64,
 };
 
 /// Per-slot handler state, reserved at connection boot so dispatch never heap-allocates a job.
@@ -1097,12 +1106,22 @@ pub const inbound_chunk_batch: usize = 4;
 /// queue depth becomes the latency.
 const flush_occupancy_cap: usize = 8 * 1024;
 
+/// A complete-handler drain turn whose write is queued but not yet acked.
+///
+/// It holds no handler slot. The batch's jobs finish at the end of the drain
+/// turn that encoded them, because by then nothing references their arenas:
+/// HEADERS were HPACK-encoded by Session and the body was copied into the
+/// scheduler slab. Holding the slots until this ack refused streams inside
+/// the advertised limit: the peer reads END_STREAM, opens its next stream
+/// legally (RFC 9113 5.1.2), and found every slot still busy (t-3491).
+///
+/// What the receipt still does: it bounds how many drain turns run ahead of
+/// WritePump (`complete_receipt_capacity`), reclaims the ticket slot, and
+/// carries the one sampled send of the batch to `stampSendWait`.
 const PendingCompleteReceipt = struct {
-    /// Boot-reserved actor-owned storage; only `stream_ids[0..stream_count]` is live.
-    stream_ids: []u31 = &.{},
-    stream_count: usize = 0,
     ticket: u64 = 0,
     ticket_slot: u32 = ticket_table.no_completion_slot,
+    send_trace: ?SendTrace = null,
 };
 
 comptime {
@@ -1411,9 +1430,8 @@ const Connection = struct {
     /// `released` counts in-use → free transitions only, never a stale SID.
     teardown_wait_expected: usize = 0,
     teardown_wait_released: usize = 0,
-    /// Actor-owned batches whose drain-turn receipt is attached but not yet
+    /// Actor-owned drain turns whose receipt is attached but not yet
     /// consumed. Separate from `inline_sids`, which is the ready queue.
-    complete_receipt_sid_storage: []u31 = &.{},
     pending_complete_receipts: [complete_receipt_capacity]PendingCompleteReceipt = .{ .{}, .{}, .{}, .{} },
     pending_complete_receipt_n: usize = 0,
     /// Complete-batch write acks stashed while `test_hold_complete_receipt_ack`
@@ -1577,11 +1595,6 @@ const Connection = struct {
         errdefer gpa.free(sid_scratch);
         const inline_sids = try gpa.alloc(u31, config.limits.max_streams_per_connection);
         errdefer gpa.free(inline_sids);
-        const complete_receipt_sid_storage = try gpa.alloc(
-            u31,
-            config.limits.max_streams_per_connection * complete_receipt_capacity,
-        );
-        errdefer gpa.free(complete_receipt_sid_storage);
         const space_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(space_events);
         @memset(space_events, .init);
@@ -1634,16 +1647,6 @@ const Connection = struct {
             .read_pool_n = n_chunks,
             .sid_scratch = sid_scratch,
             .inline_sids = inline_sids,
-            .complete_receipt_sid_storage = complete_receipt_sid_storage,
-            .pending_complete_receipts = blk: {
-                const per = config.limits.max_streams_per_connection;
-                break :blk .{
-                    .{ .stream_ids = complete_receipt_sid_storage[0..per] },
-                    .{ .stream_ids = complete_receipt_sid_storage[per .. per * 2] },
-                    .{ .stream_ids = complete_receipt_sid_storage[per * 2 .. per * 3] },
-                    .{ .stream_ids = complete_receipt_sid_storage[per * 3 .. per * 4] },
-                };
-            },
             .space_events = space_events,
             .deadline_events = deadline_events,
             .intent_batch = intent_batch,
@@ -1848,7 +1851,6 @@ const Connection = struct {
         if (self.tls_write_buf.len != 0) self.config.gpa.free(self.tls_write_buf);
         if (self.sid_scratch.len != 0) self.config.gpa.free(self.sid_scratch);
         if (self.inline_sids.len != 0) self.config.gpa.free(self.inline_sids);
-        if (self.complete_receipt_sid_storage.len != 0) self.config.gpa.free(self.complete_receipt_sid_storage);
         if (self.space_events.len != 0) self.config.gpa.free(self.space_events);
         if (self.deadline_events.len != 0) self.config.gpa.free(self.deadline_events);
         if (self.intent_batch.len != 0) self.config.gpa.free(self.intent_batch);
@@ -2297,14 +2299,6 @@ const Connection = struct {
         };
     }
 
-    /// After a failed ticket wait, apply the same terminal mapping as
-    /// `refuseIfStreamDead`. Peer RST sets a Session tombstone in `handleFrame`
-    /// before the `stream_reset` intent reaches `cancelHandler`, and
-    /// `wakeHandlerWaiters` can post `ok = false` in that gap — including the
-    /// no-slot path that drops pending without a `SlotTerminal` cause.
-    ///
-    /// The lock is uncancelable: a cancelable acquire can turn the RST into
-    /// `Canceled` (I8 code 5) in the same gap this mapping exists to close.
     /// ACTOR-side ticket wait (t-899). The actor is the sole consumer of
     /// `write_ack_ch`, so it must never park on a bare ticket event: the
     /// completion that would set the event can only be applied BY the actor.
@@ -2312,9 +2306,12 @@ const Connection = struct {
     /// actor in `waitTicket`, four acks queued (the ticket's failed ack, a
     /// fail_all, and the pump's shutdown) with nothing left to apply them.
     /// This loop feeds the wait: drain acks, and park only on a select that
-    /// includes the ack channel. The final `waitTicket` then returns without
-    /// parking and keeps the terminal/cause mapping in one place.
-    fn waitTicketDraining(self: *Connection, stream_id: u31, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
+    /// includes the ack channel. The final `tickets.wait` then returns without
+    /// parking and reclaims the ticket slot. Returns whether the write landed.
+    ///
+    /// Only the complete-batch receipt waits here, and its handlers have
+    /// already finished, so there is no terminal cause to map.
+    fn waitTicketDraining(self: *Connection, slot_i: u32) bool {
         while (!self.tickets.isSignaled(slot_i)) {
             self.drainWriteAcks();
             if (self.tickets.isSignaled(slot_i)) break;
@@ -2342,7 +2339,7 @@ const Connection = struct {
             const winner = zio.select(.{
                 .acks = self.write_ack_ch.asyncReceive(),
                 .bell = self.doorbell.asyncReceive(),
-            }) catch break; // Canceled: waitTicket below maps it without parking.
+            }) catch break;
             switch (winner) {
                 .acks => |r| {
                     const ack = r catch break;
@@ -2353,9 +2350,18 @@ const Connection = struct {
                 },
             }
         }
-        return self.waitTicket(stream_id, slot_i, terminal);
+        self.tickets.wait(slot_i, null) catch return false;
+        return true;
     }
 
+    /// After a failed ticket wait, apply the same terminal mapping as
+    /// `refuseIfStreamDead`. Peer RST sets a Session tombstone in `handleFrame`
+    /// before the `stream_reset` intent reaches `cancelHandler`, and
+    /// `wakeHandlerWaiters` can post `ok = false` in that gap — including the
+    /// no-slot path that drops pending without a `SlotTerminal` cause.
+    ///
+    /// The lock is uncancelable: a cancelable acquire can turn the RST into
+    /// `Canceled` (I8 code 5) in the same gap this mapping exists to close.
     fn waitTicket(self: *Connection, stream_id: u31, slot_i: u32, terminal: *response.SlotTerminal) response.ResponseError!void {
         self.tickets.wait(slot_i, terminal) catch |err| {
             if (terminal.getCause()) |c| return response.causeToError(c);
@@ -2552,8 +2558,8 @@ const Connection = struct {
 
     /// Reclaim complete-handler drain-turn receipts whose tickets this actor
     /// has already completed. Walk from the front while `isSignaled`; stop at
-    /// the first unsignaled receipt so a later ack cannot steer which jobs
-    /// get stamped. Writer-failure and shutdown (`finalize_all`) still wait
+    /// the first unsignaled receipt so a later ack cannot steer which sample
+    /// gets stamped. Writer-failure and shutdown (`finalize_all`) still wait
     /// via `waitTicketDraining` so in-flight acks can land. The ordinary path
     /// never starts that wait for an unsignaled front receipt — the loop top
     /// applies acks first, then this drain sees the event.
@@ -2562,8 +2568,7 @@ const Connection = struct {
 
         while (self.pending_complete_receipt_n > 0) {
             const receipt = self.pending_complete_receipts[0];
-            std.debug.assert(receipt.stream_count > 0);
-            std.debug.assert(receipt.stream_count <= receipt.stream_ids.len);
+            std.debug.assert(receipt.ticket != 0);
             if (!wait_unsignaled and !self.tickets.isSignaled(receipt.ticket_slot)) break;
             if (std.debug.runtime_safety) {
                 const meta = self.tickets.completion(receipt.ticket_slot) orelse
@@ -2571,61 +2576,25 @@ const Connection = struct {
                 std.debug.assert(meta.ticket == receipt.ticket);
             }
 
-            var wait_job: ?*HandlerJob = null;
-            for (receipt.stream_ids[0..receipt.stream_count]) |sid| {
-                const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                if (job.hctx.deferred_ticket != 0 and wait_job == null) wait_job = job;
+            const receipt_ok = self.waitTicketDraining(receipt.ticket_slot);
+            if (receipt.send_trace) |t| {
+                if (receipt_ok) self.stampSendWait(t) else self.trace_ticket.store(0, .release);
             }
-
-            var receipt_ok = true;
-            if (wait_job) |job| {
-                self.waitTicketDraining(job.stream_id, receipt.ticket_slot, job.hctx.terminal) catch {
-                    receipt_ok = false;
-                };
-            } else {
-                // Every attached receipt was reserved for at least one encoded
-                // complete response. Preserve ticket ownership if corruption
-                // violates that invariant, then fail the connection loudly.
-                self.tickets.releaseReserved(receipt.ticket_slot);
-                if (diag_park) diagRawPrint("WFSET receipts_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
-                self.writer_failed.store(true, .release);
-                receipt_ok = false;
-            }
-
-            if (receipt_ok) {
-                for (receipt.stream_ids[0..receipt.stream_count]) |sid| {
-                    const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                    self.stampSendWait(&job.hctx);
-                }
-            } else {
-                for (receipt.stream_ids[0..receipt.stream_count]) |sid| {
-                    const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                    if (job.hctx.send_traced) self.trace_ticket.store(0, .release);
-                }
-            }
-
-            for (receipt.stream_ids[0..receipt.stream_count]) |sid| {
-                const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                if (job.hctx.deferred_ticket != 0) {
-                    job.slot.awaiting_receipt.store(false, .release);
-                }
-                finishHandlerJob(job);
-            }
-            _ = self.drainCompletions();
-
-            const reusable = receipt.stream_ids;
-            var i: usize = 1;
-            while (i < self.pending_complete_receipt_n) : (i += 1) {
-                self.pending_complete_receipts[i - 1] = self.pending_complete_receipts[i];
-            }
-            const old_n = self.pending_complete_receipt_n;
-            self.pending_complete_receipt_n -= 1;
-            self.pending_complete_receipts[self.pending_complete_receipt_n] = .{
-                .stream_ids = reusable,
-            };
-            self.noteCreditReuse();
-            self.noteReceiptDepthChange(old_n, self.pending_complete_receipt_n);
+            self.popCompleteReceipt();
         }
+    }
+
+    fn popCompleteReceipt(self: *Connection) void {
+        std.debug.assert(self.pending_complete_receipt_n > 0);
+        var i: usize = 1;
+        while (i < self.pending_complete_receipt_n) : (i += 1) {
+            self.pending_complete_receipts[i - 1] = self.pending_complete_receipts[i];
+        }
+        const old_n = self.pending_complete_receipt_n;
+        self.pending_complete_receipt_n -= 1;
+        self.pending_complete_receipts[self.pending_complete_receipt_n] = .{};
+        self.noteCreditReuse();
+        self.noteReceiptDepthChange(old_n, self.pending_complete_receipt_n);
     }
 
     /// Protocol deadlines only (idle, slow-consumer, grace, test canary).
@@ -3765,20 +3734,7 @@ const Connection = struct {
         return n;
     }
 
-    fn sidHasPendingReceipt(self: *const Connection, sid: u31) bool {
-        std.debug.assert(sid != 0);
-        std.debug.assert(self.pending_complete_receipt_n <= complete_receipt_capacity);
-        var r: usize = 0;
-        while (r < self.pending_complete_receipt_n) : (r += 1) {
-            const rec = self.pending_complete_receipts[r];
-            for (rec.stream_ids[0..rec.stream_count]) |rsid| {
-                if (rsid == sid) return true;
-            }
-        }
-        return false;
-    }
-
-    /// Run frozen complete jobs that have no pending receipt. Causes are
+    /// Run frozen complete jobs that never reached a drain turn. Causes are
     /// already set, so the body returns without emit. Does not take `session_mu`.
     fn finishTerminalInline(self: *Connection, n: usize) void {
         std.debug.assert(n <= self.inline_sids.len);
@@ -3787,7 +3743,6 @@ const Connection = struct {
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const sid = self.inline_sids[i];
-            if (self.sidHasPendingReceipt(sid)) continue;
             const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
             std.debug.assert(job.slot.in_use);
             runHandlerJobBody(job);
@@ -3796,45 +3751,19 @@ const Connection = struct {
         _ = self.drainCompletions();
     }
 
-    /// Finish complete jobs that still hold a drain-turn receipt. Does not
-    /// wait on a ticket: `waitTicket` can take `session_mu`, and an unsignaled
-    /// wait is the actor waiting for itself. `failAll` has already run.
+    /// Release the ticket slots of drain-turn receipts still in flight. Does
+    /// not wait on a ticket: `waitTicket` can take `session_mu`, and an
+    /// unsignaled wait is the actor waiting for itself. `failAll` has already
+    /// run. The batches' handler slots were freed when their drain turn ended.
     fn finishPendingReceiptsNoWait(self: *Connection) void {
         std.debug.assert(shutdown_sweep.get() != null);
         std.debug.assert(self.pending_complete_receipt_n <= complete_receipt_capacity);
-        var steps: usize = 0;
         while (self.pending_complete_receipt_n > 0) {
-            steps += 1;
-            std.debug.assert(steps <= complete_receipt_capacity);
             const receipt = self.pending_complete_receipts[0];
-            std.debug.assert(receipt.stream_count > 0);
-            std.debug.assert(receipt.stream_count <= receipt.stream_ids.len);
-            if (receipt.ticket_slot != ticket_table.no_completion_slot) {
-                self.tickets.releaseReserved(receipt.ticket_slot);
-            }
-            for (receipt.stream_ids[0..receipt.stream_count]) |sid| {
-                const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                if (job.hctx.deferred_ticket != 0) {
-                    job.slot.awaiting_receipt.store(false, .release);
-                }
-                finishHandlerJob(job);
-            }
-            _ = self.drainCompletions();
-
-            const reusable = receipt.stream_ids;
-            var i: usize = 1;
-            while (i < self.pending_complete_receipt_n) : (i += 1) {
-                self.pending_complete_receipts[i - 1] = self.pending_complete_receipts[i];
-            }
-            const old_n = self.pending_complete_receipt_n;
-            self.pending_complete_receipt_n -= 1;
-            self.pending_complete_receipts[self.pending_complete_receipt_n] = .{
-                .stream_ids = reusable,
-            };
-            self.noteCreditReuse();
-            self.noteReceiptDepthChange(old_n, self.pending_complete_receipt_n);
+            std.debug.assert(receipt.ticket_slot != ticket_table.no_completion_slot);
+            self.tickets.releaseReserved(receipt.ticket_slot);
+            self.popCompleteReceipt();
         }
-        std.debug.assert(self.pending_complete_receipt_n == 0);
     }
 
     fn assertTeardownPosters(self: *const Connection) void {
@@ -5445,18 +5374,17 @@ const Connection = struct {
         try self.materializeIntents();
     }
 
-    fn stampSendWait(self: *Connection, hctx: *HandlerCtx) void {
-        if (!hctx.send_traced) return;
+    fn stampSendWait(self: *Connection, send: SendTrace) void {
         defer self.trace_ticket.store(0, .release);
         const t_done = nowNs(self.config.io);
         const t_ack = self.trace_ack_ns.load(.acquire);
-        const t_unlocked = hctx.t_send_unlocked;
+        const t_unlocked = send.unlocked;
         if (t_ack >= t_unlocked and t_done >= t_ack) {
             const t_emit = self.trace_emit_ns.load(.acquire);
             const t_queued = self.trace_queued_ns.load(.acquire);
             const t_written = self.trace_written_ns.load(.acquire);
-            const block = t_acquiredGap(hctx.t_send_acquired, hctx.t_send_before);
-            const hold = t_acquiredGap(t_unlocked, hctx.t_send_acquired);
+            const block = t_acquiredGap(send.acquired, send.before);
+            const hold = t_acquiredGap(t_unlocked, send.acquired);
             const ack = t_ack - t_unlocked;
             const res = t_done - t_ack;
             _ = trace.samples.fetchAdd(1, .monotonic);
@@ -5464,7 +5392,7 @@ const Connection = struct {
             _ = trace.hold_ns.fetchAdd(hold, .monotonic);
             _ = trace.ack_ns.fetchAdd(ack, .monotonic);
             _ = trace.resume_ns.fetchAdd(res, .monotonic);
-            _ = trace.hpack_ns.fetchAdd(hctx.t_send_hpack, .monotonic);
+            _ = trace.hpack_ns.fetchAdd(send.hpack, .monotonic);
             if (t_emit >= t_unlocked and t_queued >= t_emit and t_ack >= t_queued) {
                 _ = trace.ack_split_samples.fetchAdd(1, .monotonic);
                 _ = trace.actor_ns.fetchAdd(t_emit - t_unlocked, .monotonic);
@@ -5480,7 +5408,7 @@ const Connection = struct {
             trace.bumpMax(&trace.hold_max, hold);
             trace.bumpMax(&trace.ack_max, ack);
             trace.bumpMax(&trace.resume_max, res);
-            trace.bumpMax(&trace.hpack_max, hctx.t_send_hpack);
+            trace.bumpMax(&trace.hpack_max, send.hpack);
         }
     }
 
@@ -5490,8 +5418,10 @@ const Connection = struct {
 
     /// Complete handlers skip spawn. They are queued under `session_mu` and
     /// run here with the lock released. Encode one drain-turn, attach one
-    /// receipt, return to the actor loop. The actor consumes that receipt only
-    /// after `drainWriteAcks` reports it ready — it does not `waitTicket` here.
+    /// receipt, finish every job of the batch, return to the actor loop. The
+    /// actor consumes that receipt only after `drainWriteAcks` reports it
+    /// ready — it does not `waitTicket` here. The jobs do not wait for it:
+    /// see `PendingCompleteReceipt` for why their slots free now (t-3491).
     /// SSE and any handler that can wait are still spawned (`connPlacement`).
     fn runPendingInline(self: *Connection) void {
         // Do not assert `!session_held`: that flag means SOMEBODY holds the
@@ -5510,27 +5440,42 @@ const Connection = struct {
         self.running_inline = true;
         defer self.running_inline = false;
 
-        const batch_n: usize = blk: {
+        const queued_n: usize = blk: {
             self.lockSessionUncancelable(self.config.io);
             defer self.unlockSession(self.config.io);
             break :blk self.inline_n;
         };
-        if (batch_n == 0) return;
+        if (queued_n == 0) return;
 
+        // Each complete response queues one HEADERS frame in the ordinary
+        // control pool, and that entry stays held until WritePump acks the
+        // write. Stop the batch when no entry is left, or the next HEADERS
+        // fails its stream with WriteFailed. The rest stay queued — their
+        // streams are still open for the peer — and run once acks free
+        // entries. Slots used to bound this by accident: they were held until
+        // the same ack (t-3491).
         var i: usize = 0;
-        while (i < batch_n) : (i += 1) {
+        while (i < queued_n) : (i += 1) {
             const sid = self.inline_sids[i];
             const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+            if (!self.sched.ctrl.hasOrdinaryEntry()) {
+                if (trace.enabled) _ = trace.inline_ctrl_full_n.fetchAdd(1, .monotonic);
+                if (comptime test_observe) _ = test_observed_inline_ctrl_full.fetchAdd(1, .monotonic);
+                break;
+            }
             if (comptime test_observe) _ = test_observed_inline_jobs.fetchAdd(1, .monotonic);
             job.hctx.defer_receipt = true;
             runHandlerJobBody(job);
         }
+        const batch_n = i;
+        if (batch_n == 0) return;
 
         var receipt_ticket: u64 = 0;
         var receipt_slot: u32 = ticket_table.no_completion_slot;
         var receipt_attached = false;
         var wait_job: ?*HandlerJob = null;
         var reservation_failed = false;
+        var receipt_trace: ?SendTrace = null;
         {
             self.lockSessionUncancelable(self.config.io);
             defer self.unlockSession(self.config.io);
@@ -5552,14 +5497,14 @@ const Connection = struct {
                     while (i < batch_n) : (i += 1) {
                         const sid = self.inline_sids[i];
                         const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                        if (!job.hctx.send_traced) continue;
+                        const t = job.hctx.send_trace orelse continue;
                         if (self.trace_ticket.cmpxchgStrong(0, pair[0], .acq_rel, .monotonic) == null) {
                             self.trace_ack_ns.store(0, .release);
                             self.trace_emit_ns.store(0, .release);
                             self.trace_queued_ns.store(0, .release);
                             self.trace_written_ns.store(0, .release);
+                            receipt_trace = t;
                         } else {
-                            job.hctx.send_traced = false;
                             _ = trace.skipped.fetchAdd(1, .monotonic);
                         }
                     }
@@ -5580,29 +5525,11 @@ const Connection = struct {
         }
 
         if (receipt_ticket != 0 and receipt_attached) {
-            const pending = &self.pending_complete_receipts[self.pending_complete_receipt_n];
-            std.debug.assert(batch_n <= pending.stream_ids.len);
-            @memcpy(pending.stream_ids[0..batch_n], self.inline_sids[0..batch_n]);
-            pending.stream_count = batch_n;
-            pending.ticket = receipt_ticket;
-            pending.ticket_slot = receipt_slot;
-
-            i = 0;
-            while (i < batch_n) : (i += 1) {
-                const sid = self.inline_sids[i];
-                const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                if (job.hctx.deferred_ticket != 0) {
-                    // t-537 stays active for the whole queued-write gap.
-                    // drainWriteAcks reports readiness; only consume clears it
-                    // after the already-complete receipt.
-                    // This store does not call `waitTicket`. The handler already
-                    // returned from `sendCb` with `defer_receipt`. Teardown
-                    // `finishPendingReceiptsNoWait` consumes this slot before
-                    // `enqueueTeardownReapers`, so an r158-deferred hang arm
-                    // cannot fire through `shutdownHandlers`. Named gap.
-                    job.slot.awaiting_receipt.store(true, .release);
-                }
-            }
+            self.pending_complete_receipts[self.pending_complete_receipt_n] = .{
+                .ticket = receipt_ticket,
+                .ticket_slot = receipt_slot,
+                .send_trace = receipt_trace,
+            };
             const old_n = self.pending_complete_receipt_n;
             self.pending_complete_receipt_n += 1;
             if (trace.enabled) {
@@ -5614,17 +5541,16 @@ const Connection = struct {
             }
         } else if (receipt_ticket != 0) {
             self.tickets.releaseReserved(receipt_slot);
+            if (receipt_trace != null) self.trace_ticket.store(0, .release);
         }
 
-        if (!receipt_attached) {
-            i = 0;
-            while (i < batch_n) : (i += 1) {
-                const sid = self.inline_sids[i];
-                const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
-                finishHandlerJob(job);
-            }
-            _ = self.drainCompletions();
+        i = 0;
+        while (i < batch_n) : (i += 1) {
+            const sid = self.inline_sids[i];
+            const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+            finishHandlerJob(job);
         }
+        _ = self.drainCompletions();
 
         {
             self.lockSessionUncancelable(self.config.io);
@@ -6047,11 +5973,12 @@ const Connection = struct {
             // Encode now; the actor consumes the drain-turn receipt after applying the write ack.
             defer_wait = true;
             hctx.deferred_ticket = 1;
-            hctx.send_traced = traced;
-            hctx.t_send_before = t_before;
-            hctx.t_send_acquired = t_acquired;
-            hctx.t_send_unlocked = t_unlocked;
-            hctx.t_send_hpack = t_hpack;
+            if (traced) hctx.send_trace = .{
+                .before = t_before,
+                .acquired = t_acquired,
+                .unlocked = t_unlocked,
+                .hpack = t_hpack,
+            };
             return;
         }
         // From here until the wait returns, teardown must NOT cancel this
@@ -6061,12 +5988,12 @@ const Connection = struct {
         defer hctx.slot.awaiting_receipt.store(false, .release);
         try self.waitTicket(stream_id, slot_i, hctx.terminal);
         if (traced) {
-            hctx.send_traced = true;
-            hctx.t_send_before = t_before;
-            hctx.t_send_acquired = t_acquired;
-            hctx.t_send_unlocked = t_unlocked;
-            hctx.t_send_hpack = t_hpack;
-            self.stampSendWait(hctx);
+            self.stampSendWait(.{
+                .before = t_before,
+                .acquired = t_acquired,
+                .unlocked = t_unlocked,
+                .hpack = t_hpack,
+            });
         }
     }
 

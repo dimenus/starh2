@@ -62,6 +62,12 @@ pub const ControlPool = struct {
         }
     }
 
+    /// True when one more ordinary entry fits. Bytes are not checked: the
+    /// caller does not know its frame's size yet.
+    pub fn hasOrdinaryEntry(self: *const ControlPool) bool {
+        return self.entries_held.load(.acquire) < self.ordinaryCaps().entries;
+    }
+
     /// Terminal / required ACK / SETTINGS ACK — may consume the reserved slice.
     pub fn tryReserveTerminal(self: *ControlPool, n: usize) bool {
         while (true) {

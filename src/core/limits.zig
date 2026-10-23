@@ -294,7 +294,6 @@ pub const Limits = struct {
         const plain_scratch: usize = TLS_PLAINTEXT_SCRATCH_SIZE;
         const sid_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const inline_sids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        const complete_receipt_sids = try checkedMul(inline_sids, 4);
         const header_leases = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
         const read_free = try checkedMul(n_chunks, @sizeOf(u32));
         // The write pool is a SlabPool: one free bit per chunk, in u64 words.
@@ -327,7 +326,7 @@ pub const Limits = struct {
         terms.h1_body = try checkedMul(self.max_connections, try checkedMul(self.request_body_bytes, 2));
         terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_stream_bytes, try checkedAdd(header_maps, intents)))));
 
-        const sid_and_inline = try checkedAdd(sid_scratch, try checkedAdd(inline_sids, complete_receipt_sids));
+        const sid_and_inline = try checkedAdd(sid_scratch, inline_sids);
         const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
         // wire_descs already counts read+write channel descriptors; TLS
         // reuses the write capacity for its channel, so no extra desc term.
