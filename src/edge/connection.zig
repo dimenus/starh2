@@ -1298,6 +1298,11 @@ const Connection = struct {
     plaintext_scratch: []u8 = &.{},
     handlers: []HandlerSlot,
     handler_jobs: []HandlerJob,
+    /// Jobs `[0, jobs_ready)` are set up; the rest are untouched memory.
+    /// Writing every job at connect touched `max_streams_per_connection` x
+    /// `HANDLER_JOB_SIZE` (166 KiB at 256) per connection whether or not the
+    /// slots were ever used. `readyJob` sets one up on first hand-out.
+    jobs_ready: usize = 0,
     /// Parallel to `handlers`. Non-zero means this job's arena holds decoded
     /// request-list bytes for that stream, so `allocSlot` must not give the
     /// slot to a different stream.
@@ -1653,17 +1658,6 @@ const Connection = struct {
         };
         @memset(self.handlers, .{});
         @memset(self.handler_joins, null);
-        for (self.handler_jobs) |*job| {
-            job.* = .{
-                .conn = undefined,
-                .arena = std.heap.ArenaAllocator.init(gpa),
-                .stream_id = 0,
-                .owned_request = undefined,
-                .req = undefined,
-                .resp = undefined,
-                .matched = .not_found,
-            };
-        }
         self.tickets = ticket_table.TicketTable.init(config.io, self.ticket_slots);
         self.read_ch = .init(self.read_ch_buf);
         self.write_ch = .init(self.write_ch_buf);
@@ -1835,7 +1829,7 @@ const Connection = struct {
         self.config.gpa.free(self.read_ch_buf);
         self.config.gpa.free(self.write_ch_buf);
         self.config.gpa.free(self.handlers);
-        for (self.handler_jobs) |*job| job.arena.deinit();
+        for (self.handler_jobs[0..self.jobs_ready]) |*job| job.arena.deinit();
         self.config.gpa.free(self.handler_jobs);
         self.config.gpa.free(self.header_lease_sid);
         self.discard_arena.deinit();
@@ -3482,6 +3476,7 @@ const Connection = struct {
         std.debug.assert(!slot.in_use);
         std.debug.assert(i < self.handlers.len);
         std.debug.assert(stream_id != 0);
+        self.readyJob(i);
         slot.in_use = true;
         self.slots_claimed += 1;
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchAdd(1, .acq_rel);
@@ -3499,6 +3494,25 @@ const Connection = struct {
         std.debug.assert(!slot.admitted);
         std.debug.assert(slot.finalize_count.load(.acquire) == 0);
         return slot;
+    }
+
+    /// Set up job `i` on its first hand-out. Slots and header leases are both
+    /// handed out lowest free index first, and every index below a handed-out
+    /// one was itself handed out, so `i` is at most `jobs_ready`. A larger
+    /// `i` means a new scan order broke that, and the job would be garbage.
+    fn readyJob(self: *Connection, i: usize) void {
+        if (i < self.jobs_ready) return;
+        if (i > self.jobs_ready) std.debug.panic("job {d} handed out before job {d} was set up", .{ i, self.jobs_ready });
+        self.handler_jobs[i] = .{
+            .conn = undefined,
+            .arena = std.heap.ArenaAllocator.init(self.config.gpa),
+            .stream_id = 0,
+            .owned_request = undefined,
+            .req = undefined,
+            .resp = undefined,
+            .matched = .not_found,
+        };
+        self.jobs_ready += 1;
     }
 
     /// Production admission. Dispatch is the only caller besides the
@@ -3524,6 +3538,7 @@ const Connection = struct {
         if (self.discard_lease_sid == stream_id) return self.discard_arena.allocator();
         for (self.handlers, 0..) |slot, i| {
             if (!slot.in_use and self.header_lease_sid[i] == 0) {
+                self.readyJob(i);
                 self.header_lease_sid[i] = stream_id;
                 _ = self.handler_jobs[i].arena.reset(.retain_capacity);
                 return self.handler_jobs[i].arena.allocator();
