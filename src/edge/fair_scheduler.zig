@@ -43,6 +43,7 @@
 const std = @import("std");
 const control_pool = @import("control_pool.zig");
 const slab_pool = @import("slab_pool.zig");
+const Touched = @import("touched.zig").Touched;
 const frame = @import("../core/frame.zig");
 
 /// One round-robin turn. It matches the HTTP/2 default max frame size, so a
@@ -162,8 +163,9 @@ pub const FairScheduler = struct {
     framed_head: usize = 0,
     framed_tail: usize = 0,
     framed_len: usize = 0,
-    /// Fixed slots — one per max concurrent stream; slab storage contiguous.
-    pending_slots: []DataPending,
+    /// One per max concurrent stream, written on first use. A connection
+    /// touches only as many as it ever had streams with DATA pending at once.
+    pending_slots: Touched(DataPending),
     /// Borrowed, server-owned. Slabs are rented when a stream first queues
     /// DATA and returned the moment it has none, so an idle stream — and an
     /// idle connection — holds none at all.
@@ -182,8 +184,10 @@ pub const FairScheduler = struct {
     /// Every occupied slot, dense, for the walks that must see blocked
     /// streams too (`forEachPending`, `nextSlowDeadlineNs`).
     live: []u32,
+    /// Touched slots that are free again. A slot comes from here first, and
+    /// is touched fresh only when this is empty.
     free_stack: []u32,
-    free_len: usize,
+    free_len: usize = 0,
     /// Streams with DATA to send that were not seen blocked on their own
     /// window. Pop the head, serve one quantum, push the tail. `fresh_tail`
     /// ends the front segment of never-served slots (none when empty).
@@ -248,7 +252,6 @@ pub const FairScheduler = struct {
         std.debug.assert(max_streams < none);
         const slots = try gpa.alloc(DataPending, max_streams);
         errdefer gpa.free(slots);
-        @memset(slots, .{});
         const idx_cap = indexCapacity(max_streams);
         const keys = try gpa.alloc(u31, idx_cap);
         errdefer gpa.free(keys);
@@ -259,8 +262,6 @@ pub const FairScheduler = struct {
         errdefer gpa.free(live);
         const free_stack = try gpa.alloc(u32, max_streams);
         errdefer gpa.free(free_stack);
-        // Pop order hands out slot 0 first, which only matters for diagnostics.
-        for (free_stack, 0..) |*f, i| f.* = @intCast(max_streams - 1 - i);
         return .{
             .gpa = gpa,
             .io = io,
@@ -268,14 +269,13 @@ pub const FairScheduler = struct {
             .terminal_q = tq,
             .ordinary_q = oq,
             .framed_data_q = fq,
-            .pending_slots = slots,
+            .pending_slots = .init(slots),
             .pool = pool,
             .idx_keys = keys,
             .idx_vals = vals,
             .idx_shift = @intCast(32 - std.math.log2_int(usize, idx_cap)),
             .live = live,
             .free_stack = free_stack,
-            .free_len = max_streams,
         };
     }
 
@@ -298,8 +298,8 @@ pub const FairScheduler = struct {
         // A slot still holding a slab here means some teardown path missed it.
         // Return them rather than leaking into the shared pool, where the loss
         // would starve every other connection instead of just this one.
-        for (self.pending_slots) |*slot| self.returnSlab(slot);
-        self.gpa.free(self.pending_slots);
+        for (self.pending_slots.slice()) |*slot| self.returnSlab(slot);
+        self.gpa.free(self.pending_slots.storage);
         self.gpa.free(self.idx_keys);
         self.gpa.free(self.idx_vals);
         self.gpa.free(self.live);
@@ -384,29 +384,29 @@ pub const FairScheduler = struct {
     }
 
     fn slotIndex(self: *const FairScheduler, pw: *const DataPending) u32 {
-        return @intCast((@intFromPtr(pw) - @intFromPtr(self.pending_slots.ptr)) / @sizeOf(DataPending));
+        return @intCast((@intFromPtr(pw) - @intFromPtr(self.pending_slots.storage.ptr)) / @sizeOf(DataPending));
     }
 
     fn listPushTail(self: *FairScheduler, head: *u32, tail: *u32, i: u32) void {
-        const s = &self.pending_slots[i];
+        const s = &self.pending_slots.slice()[i];
         s.next = none;
         s.prev = tail.*;
-        if (tail.* != none) self.pending_slots[tail.*].next = i else head.* = i;
+        if (tail.* != none) self.pending_slots.slice()[tail.*].next = i else head.* = i;
         tail.* = i;
     }
 
     fn listPushHead(self: *FairScheduler, head: *u32, tail: *u32, i: u32) void {
-        const s = &self.pending_slots[i];
+        const s = &self.pending_slots.slice()[i];
         s.prev = none;
         s.next = head.*;
-        if (head.* != none) self.pending_slots[head.*].prev = i else tail.* = i;
+        if (head.* != none) self.pending_slots.slice()[head.*].prev = i else tail.* = i;
         head.* = i;
     }
 
     fn listUnlink(self: *FairScheduler, head: *u32, tail: *u32, i: u32) void {
-        const s = &self.pending_slots[i];
-        if (s.prev != none) self.pending_slots[s.prev].next = s.next else head.* = s.next;
-        if (s.next != none) self.pending_slots[s.next].prev = s.prev else tail.* = s.prev;
+        const s = &self.pending_slots.slice()[i];
+        if (s.prev != none) self.pending_slots.slice()[s.prev].next = s.next else head.* = s.next;
+        if (s.next != none) self.pending_slots.slice()[s.next].prev = s.prev else tail.* = s.prev;
         s.next = none;
         s.prev = none;
     }
@@ -414,18 +414,18 @@ pub const FairScheduler = struct {
     /// Ready list, front segment for never-served slots. The segment is a
     /// prefix ending at `fresh_tail`; newcomers append to it in arrival order.
     fn readyInsert(self: *FairScheduler, i: u32) void {
-        const s = &self.pending_slots[i];
+        const s = &self.pending_slots.slice()[i];
         std.debug.assert(s.place == .idle);
         if (!s.served) {
             if (self.fresh_tail == none) {
                 self.listPushHead(&self.ready_head, &self.ready_tail, i);
             } else {
                 const after = self.fresh_tail;
-                const nxt = self.pending_slots[after].next;
+                const nxt = self.pending_slots.slice()[after].next;
                 s.prev = after;
                 s.next = nxt;
-                self.pending_slots[after].next = i;
-                if (nxt != none) self.pending_slots[nxt].prev = i else self.ready_tail = i;
+                self.pending_slots.slice()[after].next = i;
+                if (nxt != none) self.pending_slots.slice()[nxt].prev = i else self.ready_tail = i;
             }
             self.fresh_tail = i;
         } else {
@@ -437,22 +437,22 @@ pub const FairScheduler = struct {
 
     fn readyUnlink(self: *FairScheduler, i: u32) void {
         // The front segment is a prefix, so the previous slot is still in it.
-        if (self.fresh_tail == i) self.fresh_tail = self.pending_slots[i].prev;
+        if (self.fresh_tail == i) self.fresh_tail = self.pending_slots.slice()[i].prev;
         self.listUnlink(&self.ready_head, &self.ready_tail, i);
-        self.pending_slots[i].place = .idle;
+        self.pending_slots.slice()[i].place = .idle;
         self.ready_len -= 1;
     }
 
     fn blockedPush(self: *FairScheduler, i: u32) void {
-        std.debug.assert(self.pending_slots[i].place == .idle);
+        std.debug.assert(self.pending_slots.slice()[i].place == .idle);
         self.listPushTail(&self.blocked_head, &self.blocked_tail, i);
-        self.pending_slots[i].place = .blocked;
+        self.pending_slots.slice()[i].place = .blocked;
         self.blocked_len += 1;
     }
 
     fn blockedUnlink(self: *FairScheduler, i: u32) void {
         self.listUnlink(&self.blocked_head, &self.blocked_tail, i);
-        self.pending_slots[i].place = .idle;
+        self.pending_slots.slice()[i].place = .idle;
         self.blocked_len -= 1;
     }
 
@@ -468,15 +468,20 @@ pub const FairScheduler = struct {
     pub fn findPending(self: *FairScheduler, stream_id: u31) ?*DataPending {
         if (stream_id == 0) return null;
         const i = self.idxFind(stream_id) orelse return null;
-        return &self.pending_slots[i];
+        return &self.pending_slots.slice()[i];
     }
 
     fn allocPending(self: *FairScheduler, stream_id: u31) error{StreamCap}!*DataPending {
         if (self.findPending(stream_id)) |s| return s;
-        if (self.free_len == 0) return error.StreamCap;
-        self.free_len -= 1;
-        const i = self.free_stack[self.free_len];
-        const s = &self.pending_slots[i];
+        const i: u32 = if (self.free_len != 0) blk: {
+            self.free_len -= 1;
+            break :blk self.free_stack[self.free_len];
+        } else blk: {
+            const fresh: u32 = @intCast(self.pending_slots.touched);
+            _ = self.pending_slots.touchNext(.{}) orelse return error.StreamCap;
+            break :blk fresh;
+        };
+        const s = &self.pending_slots.slice()[i];
         std.debug.assert(s.stream_id == 0 and s.place == .free);
         s.clear();
         s.stream_id = stream_id;
@@ -501,7 +506,7 @@ pub const FairScheduler = struct {
         if (timeout_ns == 0) return null;
         var next: ?u64 = null;
         for (self.live[0..self.active_pending]) |i| {
-            const slot = self.pending_slots[i];
+            const slot = self.pending_slots.slice()[i];
             if (slot.len == 0 or slot.last_progress_ns == 0) continue;
             const deadline = slot.last_progress_ns +% timeout_ns;
             if (next == null or deadline < next.?) next = deadline;
@@ -541,7 +546,7 @@ pub const FairScheduler = struct {
             self.active_pending -= 1;
             const last = self.live[self.active_pending];
             self.live[pw.live_pos] = last;
-            self.pending_slots[last].live_pos = pw.live_pos;
+            self.pending_slots.slice()[last].live_pos = pw.live_pos;
             self.free_stack[self.free_len] = i;
             self.free_len += 1;
         }
@@ -738,7 +743,7 @@ pub const FairScheduler = struct {
         }
         for (ids) |sid| {
             const i = self.idxFind(sid) orelse continue;
-            if (self.pending_slots[i].place != .blocked) continue;
+            if (self.pending_slots.slice()[i].place != .blocked) continue;
             self.blockedUnlink(i);
             self.readyInsert(i);
         }
@@ -867,7 +872,7 @@ pub const FairScheduler = struct {
             const i = self.ready_head;
             const in_front = self.fresh_tail != none;
             self.readyUnlink(i);
-            const pw = &self.pending_slots[i];
+            const pw = &self.pending_slots.slice()[i];
             const sid = pw.stream_id;
             // `arm` only lists a slot with a frame to send, and every path that
             // empties one frees it.
@@ -972,7 +977,7 @@ pub const FairScheduler = struct {
         self.iterating = true;
         defer self.iterating = false;
         for (self.live[0..self.active_pending]) |i| {
-            const s = &self.pending_slots[i];
+            const s = &self.pending_slots.slice()[i];
             cb(ctx, s.stream_id, s);
         }
     }

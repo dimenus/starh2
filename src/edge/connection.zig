@@ -123,6 +123,7 @@ const fair_scheduler = @import("fair_scheduler.zig");
 const io_queue = @import("io_queue.zig");
 pub const Balancer = @import("balancer.zig").Balancer;
 const slab_pool = @import("slab_pool.zig");
+const Touched = @import("touched.zig").Touched;
 const flow = @import("../core/flow.zig");
 
 pub const zio_scheduling = @import("build_options").zio_scheduling;
@@ -1319,14 +1320,20 @@ const Connection = struct {
     /// Drain-turn packing buffer. HTTP/2 frames concat here before one
     /// `queueWire`; on TLS that plaintext is what the pump encrypts.
     plaintext_scratch: []u8 = &.{},
-    handlers: []HandlerSlot,
+    /// Written on first use: `allocSlot` touches the next slot only when
+    /// every touched slot is busy. `handler_joins`, `space_events` and
+    /// `deadline_events` are indexed like `handlers` and are valid for the
+    /// touched slots only. The touched count is written by the actor under
+    /// `session_mu`, and read by the actor or by any task under `session_mu`.
+    handlers: Touched(HandlerSlot),
     /// Untouched until a slot is first dispatched: dispatch assigns the whole
     /// job, so nothing is set up at connect.
     handler_jobs: []HandlerJob,
     /// Requests decoded but not yet dispatched. One more than the stream
     /// limit, because Session decodes a block before it checks the limit
-    /// (the HPACK table must advance either way).
-    request_leases: []RequestLease,
+    /// (the HPACK table must advance either way). Written on first use, like
+    /// `handlers`. Actor-only.
+    request_leases: Touched(RequestLease),
     /// Requests waiting for a handler slot, oldest first (a ring). The peer
     /// may open a stream as soon as it reads the previous one's END_STREAM,
     /// while that stream's handler is still running, so a slot can be busy
@@ -1590,7 +1597,6 @@ const Connection = struct {
         errdefer gpa.free(handler_jobs);
         const request_leases = try gpa.alloc(RequestLease, config.limits.max_streams_per_connection + 1);
         errdefer gpa.free(request_leases);
-        @memset(request_leases, .{});
         const parked = try gpa.alloc(session_mod.DispatchRequest, config.limits.max_streams_per_connection);
         errdefer gpa.free(parked);
         const handler_joins = try gpa.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
@@ -1632,10 +1638,8 @@ const Connection = struct {
         errdefer gpa.free(inline_sids);
         const space_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(space_events);
-        @memset(space_events, .init);
         const deadline_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
         errdefer gpa.free(deadline_events);
-        @memset(deadline_events, .init);
         const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
         errdefer gpa.free(intent_batch);
 
@@ -1662,9 +1666,9 @@ const Connection = struct {
             .session = session,
             .read_ch_buf = read_ch_buf,
             .write_ch_buf = write_ch_buf,
-            .handlers = handlers,
+            .handlers = .init(handlers),
             .handler_jobs = handler_jobs,
-            .request_leases = request_leases,
+            .request_leases = .init(request_leases),
             .parked = parked,
             .handler_joins = handler_joins,
             .completion_ch_buf = completion_ch_buf,
@@ -1686,8 +1690,6 @@ const Connection = struct {
             .deadline_events = deadline_events,
             .intent_batch = intent_batch,
         };
-        @memset(self.handlers, .{});
-        @memset(self.handler_joins, null);
         self.tickets = ticket_table.TicketTable.init(config.io, self.ticket_slots);
         self.read_ch = .init(self.read_ch_buf);
         self.write_ch = .init(self.write_ch_buf);
@@ -1818,7 +1820,7 @@ const Connection = struct {
                 }
             }
         }
-        for (self.handlers) |s| {
+        for (self.handlers.slice()) |s| {
             if (s.in_use) {
                 std.debug.panic("deinit with slot sid={d} still in_use", .{s.stream_id});
             }
@@ -1842,7 +1844,7 @@ const Connection = struct {
         var leak_slot_bytes: usize = 0;
         var leak_slot_n: usize = 0;
         var leak_slot_max: usize = 0;
-        for (self.sched.pending_slots) |ps| {
+        for (self.sched.pending_slots.slice()) |ps| {
             if (ps.stream_id == 0) continue;
             leak_slot_bytes +|= ps.len;
             if (ps.len > leak_slot_max) leak_slot_max = ps.len;
@@ -1858,7 +1860,7 @@ const Connection = struct {
 
         self.config.gpa.free(self.read_ch_buf);
         self.config.gpa.free(self.write_ch_buf);
-        self.config.gpa.free(self.handlers);
+        self.config.gpa.free(self.handlers.storage);
         self.config.gpa.free(self.handler_jobs);
         // The sweep released every parked request; a request still here would
         // be a teardown path that skipped it.
@@ -1866,10 +1868,10 @@ const Connection = struct {
         self.config.gpa.free(self.parked);
         // Session is gone, so a lease left here is a request it never handed
         // to dispatch nor dropped (a teardown with HEADERS still pending).
-        for (self.request_leases) |*l| {
+        for (self.request_leases.slice()) |*l| {
             if (l.stream_id != 0) l.arena.deinit();
         }
-        self.config.gpa.free(self.request_leases);
+        self.config.gpa.free(self.request_leases.storage);
         self.config.gpa.free(self.handler_joins);
         self.config.gpa.free(self.completion_ch_buf);
         if (self.write_ack_buf.len != 0) self.config.gpa.free(self.write_ack_buf);
@@ -2189,7 +2191,7 @@ const Connection = struct {
     }
 
     fn wakeAllSpace(self: *Connection) void {
-        for (self.space_events) |*event| event.set();
+        for (self.space_events[0..self.handlers.touched]) |*event| event.set();
     }
 
     fn wakeHandlerDeadline(self: *Connection, stream_id: u31) void {
@@ -2198,7 +2200,7 @@ const Connection = struct {
     }
 
     fn wakeAllDeadlines(self: *Connection) void {
-        for (self.deadline_events) |*event| event.set();
+        for (self.deadline_events[0..self.handlers.touched]) |*event| event.set();
     }
 
     /// Write-ack-signaled writer failure: terminate connection, reset every stream,
@@ -2230,7 +2232,7 @@ const Connection = struct {
         self.writer_fail_handled = true;
         if (comptime test_observe) test_observed_writer_fail_handled.store(true, .release);
 
-        for (self.handlers) |*slot| {
+        for (self.handlers.slice()) |*slot| {
             if (!slot.in_use) continue;
             // Active pump-write failure → WriteFailed (internal), not ConnectionClosed.
             // Subsequent ops still see writer_failed / closed connection.
@@ -2450,7 +2452,7 @@ const Connection = struct {
         while (i < n_stale) : (i += 1) {
             const sid = self.sid_scratch[i];
             if (self.slotIndex(sid)) |si| {
-                self.handlers[si].terminal.setCause(.slow_consumer);
+                self.handlers.slice()[si].terminal.setCause(.slow_consumer);
             }
             // Local terminal/accounting cleanup remains required if the stream already closed.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .cancel } }) catch {};
@@ -2670,7 +2672,7 @@ const Connection = struct {
         var rst0: u32 = 0;
         var min_win: i32 = std.math.maxInt(i32);
         var pending_bytes: usize = 0;
-        for (self.sched.pending_slots) |s| {
+        for (self.sched.pending_slots.slice()) |s| {
             if (s.stream_id == 0) continue;
             pending_bytes += s.len;
             if (self.slotIndex(s.stream_id) != null) pend_slots += 1;
@@ -3501,15 +3503,19 @@ const Connection = struct {
     /// the generation it was created with, and any mismatch becomes
     /// `error.BodyClosed`.
     fn allocSlot(self: *Connection, stream_id: u31) ?*HandlerSlot {
-        for (self.handlers, 0..) |*slot, i| {
+        for (self.handlers.slice(), 0..) |*slot, i| {
             if (!slot.in_use) return self.claimSlot(slot, i, stream_id);
         }
-        return null;
+        const i = self.handlers.touched;
+        const slot = self.handlers.touchNext(.{}) orelse return null;
+        self.space_events[i] = .init;
+        self.deadline_events[i] = .init;
+        return self.claimSlot(slot, i, stream_id);
     }
 
     fn claimSlot(self: *Connection, slot: *HandlerSlot, i: usize, stream_id: u31) *HandlerSlot {
         std.debug.assert(!slot.in_use);
-        std.debug.assert(i < self.handlers.len);
+        std.debug.assert(i < self.handlers.touched);
         std.debug.assert(stream_id != 0);
         slot.in_use = true;
         self.slots_claimed += 1;
@@ -3548,12 +3554,12 @@ const Connection = struct {
     /// Actor-only.
     fn borrowHeaderListAlloc(self: *Connection, stream_id: u31) ?std.mem.Allocator {
         var free: ?*RequestLease = null;
-        for (self.request_leases) |*l| {
+        for (self.request_leases.slice()) |*l| {
             if (l.stream_id == stream_id) return l.arena.allocator();
             if (free == null and l.stream_id == 0) free = l;
         }
         if (test_no_request_lease.load(.acquire)) return null;
-        const lease = free orelse return null;
+        const lease = free orelse self.request_leases.touchNext(.{}) orelse return null;
         lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.gpa) };
         return lease.arena.allocator();
     }
@@ -3567,7 +3573,7 @@ const Connection = struct {
     }
 
     fn takeRequestArena(self: *Connection, stream_id: u31) ?std.heap.ArenaAllocator {
-        for (self.request_leases) |*l| {
+        for (self.request_leases.slice()) |*l| {
             if (l.stream_id != stream_id) continue;
             l.stream_id = 0;
             return l.arena;
@@ -3576,7 +3582,7 @@ const Connection = struct {
     }
 
     fn slotIndex(self: *Connection, stream_id: u31) ?usize {
-        for (self.handlers, 0..) |slot, i| {
+        for (self.handlers.slice(), 0..) |slot, i| {
             if (slot.in_use and slot.stream_id == stream_id) return i;
         }
         return null;
@@ -3596,7 +3602,7 @@ const Connection = struct {
     /// SID returns false and must not count as teardown progress.
     fn releaseSlot(self: *Connection, stream_id: u31) bool {
         const i = self.slotIndex(stream_id) orelse return false;
-        const slot = &self.handlers[i];
+        const slot = &self.handlers.slice()[i];
         std.debug.assert(slot.in_use);
         const n = slot.finalize_count.load(.acquire);
         if (slot.admitted) {
@@ -3643,7 +3649,7 @@ const Connection = struct {
             self.wakeHandlerWaiters(stream_id);
             return;
         };
-        const slot = &self.handlers[i];
+        const slot = &self.handlers.slice()[i];
         slot.terminal.setCause(cause);
         self.wakeHandlerWaiters(stream_id);
     }
@@ -3679,8 +3685,8 @@ const Connection = struct {
     /// take the mutex: a handler can park inside it on `write_ch.putOne`.
     fn sweepHandlerWaitersLocked(self: *Connection) void {
         self.assertSessionHeld("sweepHandlerWaitersLocked");
-        std.debug.assert(self.handlers.len != 0);
-        for (self.handlers) |*slot| {
+        std.debug.assert(self.handlers.capacity() != 0);
+        for (self.handlers.slice()) |*slot| {
             if (!slot.in_use) continue;
             std.debug.assert(slot.stream_id != 0);
             slot.terminal.setCause(.server_shutdown);
@@ -3747,12 +3753,12 @@ const Connection = struct {
     }
 
     fn countInUseSlots(self: *const Connection) usize {
-        std.debug.assert(self.handlers.len != 0);
+        std.debug.assert(self.handlers.capacity() != 0);
         var n: usize = 0;
-        for (self.handlers) |s| {
+        for (self.handlers.slice()) |s| {
             if (s.in_use) n += 1;
         }
-        std.debug.assert(n <= self.handlers.len);
+        std.debug.assert(n <= self.handlers.touched);
         return n;
     }
 
@@ -3789,8 +3795,8 @@ const Connection = struct {
     }
 
     fn assertTeardownPosters(self: *const Connection) void {
-        std.debug.assert(self.handlers.len != 0);
-        for (self.handlers, 0..) |*slot, i| {
+        std.debug.assert(self.handlers.capacity() != 0);
+        for (self.handlers.slice(), 0..) |*slot, i| {
             if (!slot.in_use) continue;
             const owner = slot.completion_owner.load(.acquire);
             if (owner != live and owner != reaper_owned and owner != reaper_running and owner != reported) {
@@ -3828,7 +3834,7 @@ const Connection = struct {
     }
 
     fn panicTeardownWatchdog(self: *const Connection) noreturn {
-        std.debug.assert(self.teardown_wait_expected <= self.handlers.len);
+        std.debug.assert(self.teardown_wait_expected <= self.handlers.touched);
         std.debug.assert(self.teardown_wait_released < self.teardown_wait_expected);
         var in_use: usize = 0;
         var reaper_n: usize = 0;
@@ -3836,7 +3842,7 @@ const Connection = struct {
         var reaper_queued: usize = 0;
         var reaper_run: usize = 0;
         var awaiting_n: usize = 0;
-        for (self.handlers) |s| {
+        for (self.handlers.slice()) |s| {
             if (!s.in_use) continue;
             in_use += 1;
             if (s.reaper_reserved) reaper_n += 1;
@@ -3847,7 +3853,7 @@ const Connection = struct {
             if (owner == reaper_running) reaper_run += 1;
         }
         std.debug.assert(in_use != 0);
-        for (self.handlers, 0..) |s, i| {
+        for (self.handlers.slice(), 0..) |s, i| {
             if (!s.in_use) continue;
             const space_wait = i < self.space_events.len and eventHasWaiters(&self.space_events[i]);
             const deadline_wait = i < self.deadline_events.len and eventHasWaiters(&self.deadline_events[i]);
@@ -3931,8 +3937,8 @@ const Connection = struct {
 
     fn publishTeardownWakes(self: *Connection) void {
         std.debug.assert(shutdown_sweep.get() != null);
-        std.debug.assert(self.handlers.len != 0);
-        for (self.handlers) |*slot| {
+        std.debug.assert(self.handlers.capacity() != 0);
+        for (self.handlers.slice()) |*slot| {
             if (!slot.in_use) continue;
             slot.terminal.setCause(.server_shutdown);
         }
@@ -3946,7 +3952,7 @@ const Connection = struct {
         std.debug.assert(shutdown_sweep.get() != null);
         self.teardown_wait_expected = self.countInUseSlots();
         self.teardown_wait_released = 0;
-        std.debug.assert(self.teardown_wait_expected <= self.handlers.len);
+        std.debug.assert(self.teardown_wait_expected <= self.handlers.touched);
         const no_progress_ns: u64 = 5 * std.time.ns_per_s;
         var last_progress_ns = nowNs(self.config.io);
         var waits: usize = 0;
@@ -3970,7 +3976,7 @@ const Connection = struct {
                 diagRawPrint("t1002 conn={x} shutdown_wait in_use={d} parked={d}\n", .{ @intFromPtr(self), after_drain, close_probe_parked.load(.acquire) });
             }
             waits += 1;
-            std.debug.assert(waits <= self.handlers.len);
+            std.debug.assert(waits <= self.handlers.touched);
             const sid = self.takeTeardownCompletion(last_progress_ns, no_progress_ns);
             if (!self.releaseSlot(sid)) {
                 std.debug.panic("teardown completion sid={d} released no slot", .{sid});
@@ -4745,7 +4751,7 @@ const Connection = struct {
                 .stream_reset => |r| self.applyStreamResetIntent(r),
                 .connection_error => {
                     if (close_probe) diagRawPrint("t1002 conn={x} intent_connection_error parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
-                    for (self.handlers) |*slot| {
+                    for (self.handlers.slice()) |*slot| {
                         if (!slot.in_use) continue;
                         slot.terminal.setCause(.connection_closed);
                     }
@@ -4753,7 +4759,7 @@ const Connection = struct {
                     self.writer_failed.store(true, .release);
                 },
                 .connection_closed => {
-                    for (self.handlers) |*slot| {
+                    for (self.handlers.slice()) |*slot| {
                         if (!slot.in_use) continue;
                         slot.terminal.setCause(.connection_closed);
                     }
@@ -4822,7 +4828,7 @@ const Connection = struct {
                 // drain turn is trying to move and the gap that built it.
                 if (diag_park) {
                     var backlog: usize = 0;
-                    for (self.sched.pending_slots) |s| backlog += s.len;
+                    for (self.sched.pending_slots.slice()) |s| backlog += s.len;
                     diagRawPrint("OVERFLOW backlog_bytes={d} sched_pending={d} prev_drain_gap_us={d} chunk_len={d}\n", .{ backlog, self.sched.pendingCount(), diag_prev_drain_gap_ns / 1000, chunk.len });
                 }
                 return error.WriteFailed;
@@ -6856,7 +6862,7 @@ fn trapR158ParkedHolder(job: *HandlerJob) void {
 fn trapAssertSweepClean(conn: *Connection) void {
     var live_n: usize = 0;
     var running_n: usize = 0;
-    for (conn.handlers) |s| {
+    for (conn.handlers.slice()) |s| {
         if (!s.in_use) continue;
         const owner = s.completion_owner.load(.acquire);
         if (owner == live) live_n += 1;
@@ -6975,7 +6981,7 @@ pub fn testTrapDeinitLive(io: std.Io) void {
 }
 
 fn trapStaleSidPoster(conn: *Connection) void {
-    std.debug.assert(conn.handlers.len != 0);
+    std.debug.assert(conn.handlers.capacity() != 0);
     zio.sleep(.fromMilliseconds(300)) catch std.debug.panic("stale sid poster sleep canceled", .{});
     conn.completion_ch.trySend(1) catch |err| switch (err) {
         error.WouldBlock => std.debug.panic("stale sid trySend WouldBlock", .{}),
