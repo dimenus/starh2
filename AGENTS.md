@@ -55,6 +55,7 @@ tools/sse_bench/mixed.sh        # SSE + oneshot on one TLS connection; STALL=0 s
 tools/sse_bench/burst-probe.sh  # 200 SSE streams opened at once on one TLS connection, 10 rounds; fails on any silent fail-close
 tools/sse_bench/phase-trace.sh  # where one flushed event spends its time
 tools/perf-story.sh             # the whole two-OS characterization matrix in one run
+tools/rss-stability.sh          # RSS across load/idle/churn cycles beside long-lived SSE; exits 3 if a phase did no work
 ```
 
 ## Review recall — is an agent reviewer worth a pre-push gate?

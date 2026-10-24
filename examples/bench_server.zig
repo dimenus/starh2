@@ -357,6 +357,43 @@ fn helloHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteR
     try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, BODY);
 }
 
+/// Request memory whose size varies, for `tools/rss-stability.sh`. Renders
+/// `kb=N` KiB of HTML into the request arena, the way a page renders a large
+/// fragment. It appends row by row rather than allocating once, because a
+/// renderer does not know its size up front, and the arena's growth is part
+/// of what the tool measures.
+fn renderFragment(req: *const starh2.Request, max_kb: usize) ![]const u8 {
+    var kb: usize = 16;
+    var it = std.mem.splitScalar(u8, req.query, '&');
+    while (it.next()) |kv| {
+        if (std.mem.startsWith(u8, kv, "kb=")) kb = try std.fmt.parseInt(usize, kv[3..], 10);
+    }
+    if (kb == 0 or kb > max_kb) return error.FragmentSizeOutOfRange;
+    const row = "<div class=\"row\"><span>fragment row</span></div>\n";
+    var out: std.ArrayList(u8) = .empty;
+    while (out.items.len < kb * 1024) try out.appendSlice(req.arena, row);
+    return out.items;
+}
+
+/// A complete handler's body must fit its stream's outbound slab
+/// (`Limits.outbound_bytes_per_stream`, 64 KiB by default), so the inline
+/// arm stops at 60 KiB.
+fn fragmentHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/html" }}, try renderFragment(req, 60));
+}
+
+/// The same render on a spawned task, which may run on another executor than
+/// the connection's actor, so its memory can be freed on another thread.
+fn fragmentTaskHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/html" }}, try renderFragment(req, 1024));
+}
+
+/// Answers with the request body's length: exercises the request-body path.
+fn echoLenHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var buf: [24]u8 = undefined;
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, try std.fmt.bufPrint(&buf, "{d}\n", .{req.body.len}));
+}
+
 /// The SSE arm: one event every `--sse-interval-ms`, each carrying the
 /// monotonic nanosecond count at the moment the server wrote it.
 ///
@@ -797,6 +834,9 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
                 std.debug.print("--balance-rank takes connections_first, handlers_first or sum, got {s}\n", .{v});
                 return error.InvalidBalanceRank;
             };
+        } else if (std.mem.eql(u8, a, "--gpa")) {
+            // Parsed by parseRuntimeArgs: the allocator exists before this runs.
+            _ = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, a, "--placement-log")) {
             // Measurement: one PLACE line per balanced connection on stderr.
             out.placement_log = true;
@@ -853,7 +893,14 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
     return out;
 }
 
+/// `init` is `std.process.Init.gpa`: glibc malloc here, because brotli links
+/// libc. `smp` is `std.heap.smp_allocator`. Both arms run the same binary.
+const GpaChoice = enum { init, smp };
+/// Printed in the ready line, so a harness can check which arm it started.
+var g_gpa_choice: GpaChoice = .init;
+
 const RuntimeArgs = struct {
+    gpa: GpaChoice = .init,
     executors: ?u8 = null,
     announce_running_wakes: bool = true,
     batch_wake_sleepers: bool = true,
@@ -877,6 +924,12 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
             out.batch_wake_sleepers = true;
         } else if (std.mem.eql(u8, a, "--no-batch-wake-sleepers")) {
             out.batch_wake_sleepers = false;
+        } else if (std.mem.eql(u8, a, "--gpa")) {
+            const v = args.next() orelse return error.MissingValue;
+            out.gpa = std.meta.stringToEnum(GpaChoice, v) orelse {
+                std.debug.print("--gpa takes init or smp, got {s}\n", .{v});
+                return error.InvalidGpa;
+            };
         }
     }
     return out;
@@ -1135,6 +1188,9 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .{ .method = .GET, .path = "/sse-cadence", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence-reset", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceResetHandler } } },
         .{ .method = .GET, .path = "/stuck", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = stuckHandler } } },
+        .{ .method = .GET, .path = "/fragment", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = fragmentHandler } } },
+        .{ .method = .GET, .path = "/fragment-task", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = fragmentTaskHandler } } },
+        .{ .method = .POST, .path = "/echo-len", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = echoLenHandler } } },
     };
 
     var cert_pem: []u8 = &.{};
@@ -1175,7 +1231,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d}}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\"}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1193,6 +1249,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             limits.listen_backlog,
             limits.max_connections,
             limits.concurrent_tls_handshakes,
+            @tagName(g_gpa_choice),
         },
     );
     defer gpa.free(ready);
@@ -1211,8 +1268,12 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const runtime_args = try parseRuntimeArgs(gpa, init.minimal.args);
+    const runtime_args = try parseRuntimeArgs(init.gpa, init.minimal.args);
+    const gpa = switch (runtime_args.gpa) {
+        .init => init.gpa,
+        .smp => std.heap.smp_allocator,
+    };
+    g_gpa_choice = runtime_args.gpa;
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,

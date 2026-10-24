@@ -52,6 +52,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,6 +94,11 @@ func main() {
 	churnPauseMs := flag.Int("churn-pause-ms", 0, "pause after each short connection; paces the churn so closed sockets in TIME_WAIT cannot exhaust the client's ephemeral ports (about 16k on macOS)")
 	staggerMs := flag.Int("stagger-ms", 0, "delay between opening successive long-lived connections")
 	intervalMs := flag.Int("interval-ms", 0, "server SSE interval, for the expected events per stream (0: not reported)")
+	// For a harness whose run length is not known when it starts the client
+	// (tools/rss-stability.sh): -seconds is then only an upper bound. The
+	// report still prints, but every rate and expected count in it assumes
+	// the full -seconds, so read only the counts.
+	interruptEnds := flag.Bool("interrupt-ends-window", false, "SIGINT closes the measurement window early and still prints the report")
 	flag.Parse()
 	if *seconds <= 0 || *warmup < 0 || *conns <= 0 || *oneshotWorkers <= 0 {
 		fmt.Fprintln(os.Stderr, "-seconds and -conns and -oneshot-workers must be positive; -warmup must be non-negative")
@@ -353,6 +359,14 @@ func main() {
 	start := time.Now().Add(time.Duration(*warmup) * time.Second)
 	measurementStart.Store(start.UnixNano())
 	stop := time.AfterFunc(time.Until(start)+time.Duration(*seconds)*time.Second, cancel)
+	if *interruptEnds {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt)
+		go func() {
+			<-sig
+			cancel()
+		}()
+	}
 	wg.Wait()
 	stop.Stop()
 
