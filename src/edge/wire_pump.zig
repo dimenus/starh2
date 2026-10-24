@@ -88,7 +88,16 @@ pub const WireChunk = struct {
     pool_index: ?u32 = null,
     /// Echoed into WriteCompletion: this chunk's ticket is a complete-batch receipt.
     complete_batch_receipt: bool = false,
+    /// Safe builds only: the position of this chunk in the order it was
+    /// pushed into the TLS stash (`Pump.push`). The pump checks it as it
+    /// writes, because the writer reads from two places (`Pump.carried`,
+    /// then `write_ch`), so a chunk that reaches the wire ahead of an older
+    /// one panics instead of reordering frames.
+    stash_seq: StashSeq = stash_seq_none,
 };
+
+pub const StashSeq = if (std.debug.runtime_safety) u64 else void;
+pub const stash_seq_none: StashSeq = if (std.debug.runtime_safety) 0 else {};
 
 /// Reads the socket into pooled chunks and hands them to the actor.
 ///

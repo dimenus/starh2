@@ -22,6 +22,10 @@
 //! HEADERS batch and queues a full DATA frame on its own. The drain then
 //! pushes the batch receipt after its last pop. A stash with no room for that
 //! push fail-closed the connection, and the client saw the TLS stream end.
+//!
+//! Every shape checks each DATA byte against the byte its stream offset must
+//! hold, so bytes that arrive in the wrong order within a stream fail the
+//! test, not only bytes that go missing.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -36,17 +40,30 @@ const stream_count = 64;
 const complete_body_bytes = 20 * 1024;
 const complete_stream_count = 8;
 const client_deadline_ns = 10 * std.time.ns_per_s;
+const max_client_streams = 64;
 const dummy: u8 = 0;
 
 fn nowNs() u64 {
     return zio.Timestamp.now(.monotonic).toNanoseconds();
 }
 
+/// Byte `off` of a /big body. Each event has its own byte, so a client that
+/// gets a stream's DATA out of order sees the wrong byte at that offset.
+fn sseByte(off: usize) u8 {
+    return 'A' + @as(u8, @intCast((off / event_bytes) % 26));
+}
+
+fn completeByte(_: usize) u8 {
+    return 'c';
+}
+
 fn bigSse(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     var body = try resp.startSse(&.{});
     var payload: [event_bytes]u8 = undefined;
-    @memset(&payload, 'x');
-    for (0..event_count) |_| try body.writeAll(&payload);
+    for (0..event_count) |i| {
+        @memset(&payload, sseByte(i * event_bytes));
+        try body.writeAll(&payload);
+    }
     try body.finish();
 }
 
@@ -61,6 +78,8 @@ const Shape = struct {
     path: []const u8,
     streams: usize,
     body_bytes_per_stream: usize,
+    /// The byte every response body must hold at each offset.
+    body_byte: *const fn (off: usize) u8,
     /// How long the client waits before it reads anything.
     read_pause_ns: u64,
     /// How long the client waits between its preface and its requests. The
@@ -71,6 +90,8 @@ const Shape = struct {
 
 const ClientResult = struct {
     data_bytes: usize = 0,
+    /// DATA bytes that differ from `Shape.body_byte` at their stream offset.
+    wrong_bytes: usize = 0,
     ended_n: usize = 0,
     err: ?anyerror = null,
     /// Set last by the client thread; the fields above are read after it.
@@ -220,6 +241,9 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, shape: Shape, out: *ClientResult
     // output makes tls.zig keep plaintext inside `client.in`, which
     // `consume` then shifts.
     var rd: [tls.input_buffer_len]u8 = undefined;
+    // Body offset per stream, indexed by (stream id - 1) / 2.
+    var body_off: [max_client_streams]usize = @splat(0);
+    std.debug.assert(shape.streams <= max_client_streams);
     while (out.ended_n < shape.streams) {
         if (nowNs() >= deadline) {
             std.debug.panic("tls backpressure: {s}: stream did not end within {d} s ({d} of {d} body bytes)", .{
@@ -247,7 +271,14 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, shape: Shape, out: *ClientResult
             const ftype = h[3];
             const flags = h[4];
             const sid = std.mem.readInt(u32, h[5..9], .big) & 0x7fff_ffff;
-            if (sid != 0 and ftype == 0) out.data_bytes += len;
+            if (sid != 0 and ftype == 0) {
+                out.data_bytes += len;
+                const off = &body_off[(sid - 1) / 2];
+                for (h[9..][0..len]) |b| {
+                    if (b != shape.body_byte(off.*)) out.wrong_bytes += 1;
+                    off.* += 1;
+                }
+            }
             if (sid != 0 and (ftype == 0 or ftype == 1) and flags & 0x1 != 0) out.ended_n += 1;
             foff += 9 + len;
         }
@@ -285,11 +316,12 @@ fn runShape(rt: *zio.Runtime, gpa: std.mem.Allocator, routes: []const starh2.Rou
     }
     t.join();
     const overflows = starh2.edge.tls_edge.tls_write_overflow.load(.acquire) - overflow_before;
-    std.debug.print("tls backpressure: {s}: ended={d}/{d} body_bytes={d} stash_overflows={d} err={?}\n", .{ shape.path, result.ended_n, shape.streams, result.data_bytes, overflows, result.err });
+    std.debug.print("tls backpressure: {s}: ended={d}/{d} body_bytes={d} wrong_bytes={d} stash_overflows={d} err={?}\n", .{ shape.path, result.ended_n, shape.streams, result.data_bytes, result.wrong_bytes, overflows, result.err });
     if (result.err) |err| return err;
     try std.testing.expectEqual(@as(u64, 0), overflows);
     try std.testing.expectEqual(shape.streams, result.ended_n);
     try std.testing.expectEqual(shape.streams * shape.body_bytes_per_stream, result.data_bytes);
+    try std.testing.expectEqual(@as(usize, 0), result.wrong_bytes);
 }
 
 fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
@@ -301,6 +333,7 @@ fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .path = "/big",
         .streams = stream_count,
         .body_bytes_per_stream = event_count * event_bytes,
+        .body_byte = sseByte,
         .read_pause_ns = 300 * std.time.ns_per_ms,
         .request_delay_ns = 0,
     });
@@ -320,6 +353,7 @@ fn runCompleteStash(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
             .path = "/complete",
             .streams = complete_stream_count,
             .body_bytes_per_stream = complete_body_bytes,
+            .body_byte = completeByte,
             .read_pause_ns = 0,
             .request_delay_ns = request_delay_ns,
         });

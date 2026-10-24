@@ -20,7 +20,7 @@
 //!
 //! A peer that stops reading must not stop the actor: `pending_n > 0`
 //! pauses FairScheduler DATA drain only, so WINDOW_UPDATE still emits into
-//! the stash. A full stash (`carried` plus `write_ch`) pauses controls too:
+//! the stash. A full stash (`write_ch`) pauses controls too:
 //! that is the 200-HEADERS burst bound, and it is not the same as pausing
 //! every tier on `pending_n` (that blew stall p99 to 11 ms). The actor's
 //! `waitForActivity` still serves handler completions, deadlines, the
@@ -884,6 +884,12 @@ pub const Pump = struct {
     /// Empty flush/sentinel pulled off the write queue while gathering a
     /// DATA batch. WritePump parks the same item in `carried`; dropping it
     /// here leaked tickets and, for a flush with outbound_release, held bytes.
+    ///
+    /// Consumer only. Whatever is here came off the head of `write_ch`, so
+    /// it is older than everything still in the channel, and the writer
+    /// takes it first. Producers push only into `write_ch`: they drain on
+    /// handler tasks (under `session_mu`) as well as on the actor, while the
+    /// actor reads this field with no lock.
     carried: ?wire_pump.WireChunk = null,
     /// Plaintext already decrypted, waiting for the actor to ingest. Aliases
     /// `plain_buf`. Must not drop: the cipher has advanced.
@@ -923,6 +929,10 @@ pub const Pump = struct {
     pending_writes: [max_write_batch]wire_pump.WireChunk = undefined,
     pending_n: usize = 0,
     partial_off: usize = 0,
+    /// Safe builds only: the last `stash_seq` handed out by `stampPush` and
+    /// the last one written. See `WireChunk.stash_seq`.
+    stash_pushed: wire_pump.StashSeq = wire_pump.stash_seq_none,
+    stash_written: wire_pump.StashSeq = wire_pump.stash_seq_none,
 
     pub const max_write_batch = 16;
 
@@ -1138,23 +1148,32 @@ pub const Pump = struct {
     /// `wire_const.TLS_STASH_TAIL_SLOTS` extra slots to hold them.
     pub const tail_pushes_per_drain: usize = limits_mod.TLS_STASH_TAIL_SLOTS;
 
-    /// True when the stash has room for `n` more chunks. `carried` holds one
-    /// chunk; `write_ch` holds the rest.
+    /// `write_ch` slots beyond the wire chunk count. The owner allocates
+    /// this many extra, and the smallest legal stash (one chunk) must still
+    /// have room for one pop and the tail, or the drain would never pop.
+    pub const extra_stash_slots: usize = limits_mod.TLS_STASH_EXTRA_SLOTS;
+    comptime {
+        std.debug.assert(1 + extra_stash_slots >= pushes_per_pop + tail_pushes_per_drain);
+    }
+
+    /// Push one chunk for the writer. Safe from any task holding the
+    /// owner's push lock (`session_mu`): it touches only `write_ch` and the
+    /// push counter. Fails when the stash is full.
+    pub fn push(self: *Pump, chunk_in: wire_pump.WireChunk) error{StashFull}!void {
+        var chunk = chunk_in;
+        self.stampPush(&chunk);
+        self.write_ch.trySend(chunk) catch return error.StashFull;
+    }
+
+    /// True when the stash has room for `n` more chunks.
     pub fn hasRoomFor(self: *Pump, n: usize) bool {
-        const cap = 1 + self.write_ch.impl.capacity;
-        const used = @as(usize, if (self.carried != null) 1 else 0) + io_queue.chanLen(wire_pump.WireChunk, self.write_ch);
-        return cap - used >= n;
+        return self.write_ch.impl.capacity - io_queue.chanLen(wire_pump.WireChunk, self.write_ch) >= n;
     }
 
     /// True when the scheduler must stop popping: one more pop and the
     /// drain's tail push could need more room than the stash has.
     pub fn stashFull(self: *Pump) bool {
         return !self.hasRoomFor(pushes_per_pop + tail_pushes_per_drain);
-    }
-
-    fn stealWrite(self: *Pump) void {
-        if (self.carried != null) return;
-        self.carried = self.tryTakeWrite();
     }
 
     const WriteSome = enum { done, full, exit };
@@ -1259,8 +1278,23 @@ pub const Pump = struct {
         self.partial_off = 0;
     }
 
+    /// Give `chunk` the next push position. `push` calls this; HTTP/1.1,
+    /// which hands chunks straight to `writeChunks`, calls it itself.
+    pub fn stampPush(self: *Pump, chunk: *wire_pump.WireChunk) void {
+        if (comptime !std.debug.runtime_safety) return;
+        self.stash_pushed += 1;
+        chunk.stash_seq = self.stash_pushed;
+    }
+
     fn popPending(self: *Pump) void {
         std.debug.assert(self.pending_n > 0);
+        if (comptime std.debug.runtime_safety) {
+            const seq = self.pending_writes[0].stash_seq;
+            if (seq != self.stash_written + 1) {
+                std.debug.panic("TLS stash wrote chunk {d} after chunk {d}: a push landed ahead of older chunks", .{ seq, self.stash_written });
+            }
+            self.stash_written = seq;
+        }
         std.mem.copyForwards(
             wire_pump.WireChunk,
             self.pending_writes[0 .. self.pending_n - 1],

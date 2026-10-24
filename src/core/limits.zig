@@ -287,10 +287,10 @@ pub const Limits = struct {
         terms.tls_cipher_payload = wire_const.TLS_CIPHER_CHUNK_SIZE;
         terms.frame_slabs = try checkedMul(self.frame_slabs_per_connection, self.frame_slab_bytes);
         // Read channel (n + 1 for the EOF sentinel), write channel (n), and
-        // the TLS write stash (n + its tail slots), as `Connection.init`
+        // the TLS write stash (n + its extra slots), as `Connection.init`
         // allocates them. The stash is counted for every connection because
         // the bound does not know which endpoints are TLS.
-        const wire_desc_n = try checkedAdd(try checkedMul(n_chunks, 3), 1 + wire_const.TLS_STASH_TAIL_SLOTS);
+        const wire_desc_n = try checkedAdd(try checkedMul(n_chunks, 3), 1 + wire_const.TLS_STASH_EXTRA_SLOTS);
         terms.wire_descs = try checkedMul(wire_desc_n, bound.WIRE_CHUNK_DESC_SIZE);
         terms.handlers = try checkedMul(self.max_streams_per_connection, HANDLER_SLOT_SIZE);
         terms.handler_jobs = try checkedMul(self.max_streams_per_connection, HANDLER_JOB_SIZE);

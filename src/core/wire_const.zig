@@ -21,6 +21,12 @@ pub const TLS_CONN_BUFFER_BYTES: usize = TLS_RECORD_BUFFER_SIZE * 2;
 /// same room they had before the tail push was counted.
 pub const TLS_STASH_TAIL_SLOTS: usize = 1;
 
+/// TLS write stash (`tls.Pump.write_ch`) slots beyond
+/// `inbound_wire_chunks_per_connection`: the tail slots, plus one so that a
+/// one-chunk stash can still pop. A pop needs `tls.Pump.pushes_per_pop` +
+/// `TLS_STASH_TAIL_SLOTS` free slots, which is 3 when there is one chunk.
+pub const TLS_STASH_EXTRA_SLOTS: usize = 1 + TLS_STASH_TAIL_SLOTS;
+
 /// One max HTTP/2 frame (16 KiB payload + 9-byte header), at least one TLS
 /// record payload, plus a little writer-buffer headroom. The TLS pump
 /// decrypts into one wire chunk, and tls.zig only decrypts into the

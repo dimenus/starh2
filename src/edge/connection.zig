@@ -1621,7 +1621,7 @@ const Connection = struct {
         if (config.mode == .tls) {
             tls_read_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
             errdefer gpa.free(tls_read_buf);
-            tls_write_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + tls_edge.Pump.tail_pushes_per_drain);
+            tls_write_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + tls_edge.Pump.extra_stash_slots);
             errdefer gpa.free(tls_write_buf);
         }
         var frame_pool = try slab_pool.SlabPool.init(
@@ -4807,9 +4807,8 @@ const Connection = struct {
         if (!std.debug.runtime_safety) return;
         const pump = self.tls_driver orelse return;
         if (pump.hasRoomFor(tls_edge.Pump.tail_pushes_per_drain)) return;
-        std.debug.panic("TLS stash has no room for the {s} tail push: carried={} write_ch={d}/{d}", .{
+        std.debug.panic("TLS stash has no room for the {s} tail push: write_ch={d}/{d}", .{
             site,
-            pump.carried != null,
             io_queue.chanLen(wire_pump.WireChunk, pump.write_ch),
             pump.write_ch.impl.capacity,
         });
@@ -4840,11 +4839,7 @@ const Connection = struct {
             // Stash only. Encrypting on this stack under session_mu overflowed
             // the coroutine (the old BoringSSL frame plus drainEmit). driveTlsTurn
             // writes after the lock drops.
-            if (pump.carried == null) {
-                pump.carried = chunk;
-                return;
-            }
-            pump.write_ch.trySend(chunk) catch {
+            pump.push(chunk) catch {
                 _ = tls_edge.tls_write_overflow.fetchAdd(1, .monotonic);
                 // t-1022 probe: the fail-close moment, with the backlog this
                 // drain turn is trying to move and the gap that built it.

@@ -994,11 +994,12 @@ fn driveHandlerTlsWrite(self: *H1Conn, n: u32) void {
         ackTlsWrite(self, false);
         return;
     };
-    const chunk = wire_pump.WireChunk{
+    var chunk = wire_pump.WireChunk{
         .bytes = self.tls_out[0..n],
         .len = n,
         .pool_index = idx,
     };
+    pump.stampPush(&chunk);
     if (!pump.writeChunks(chunk)) {
         ackTlsWrite(self, false);
         return;
@@ -1505,11 +1506,12 @@ fn writeRawTlsOwner(self: *H1Conn, bytes: []const u8) response.ResponseError!voi
         const n = @min(bytes.len - off, self.tls_out.len);
         @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
         const idx = self.tls_write_pool.tryRentIndex(self.io) orelse return error.WriteFailed;
-        const chunk = wire_pump.WireChunk{
+        var chunk = wire_pump.WireChunk{
             .bytes = self.tls_out[0..n],
             .len = n,
             .pool_index = idx,
         };
+        pump.stampPush(&chunk);
         if (!pump.writeChunks(chunk)) return error.WriteFailed;
         try driveTlsUntilIdle(self);
         off += n;
