@@ -1130,13 +1130,26 @@ pub const Pump = struct {
     /// room lets that second push overflow and fail-close the connection.
     pub const pushes_per_pop: usize = 2;
 
-    /// True when the stash cannot take `pushes_per_pop` more chunks, so the
-    /// scheduler must stop popping. `carried` holds one chunk; `write_ch`
-    /// holds the rest.
-    pub fn stashFull(self: *Pump) bool {
+    /// The most chunks one drain pushes after `sched.drain` returns, with no
+    /// pause check in between: the batch it was still packing, or, for a
+    /// complete batch whose last pop left the batch empty, the bare receipt
+    /// (a zero-length flush ticket). The stash keeps this many slots free on
+    /// top of `pushes_per_pop`, and the owner allocates
+    /// `wire_const.TLS_STASH_TAIL_SLOTS` extra slots to hold them.
+    pub const tail_pushes_per_drain: usize = limits_mod.TLS_STASH_TAIL_SLOTS;
+
+    /// True when the stash has room for `n` more chunks. `carried` holds one
+    /// chunk; `write_ch` holds the rest.
+    pub fn hasRoomFor(self: *Pump, n: usize) bool {
         const cap = 1 + self.write_ch.impl.capacity;
         const used = @as(usize, if (self.carried != null) 1 else 0) + io_queue.chanLen(wire_pump.WireChunk, self.write_ch);
-        return cap - used < pushes_per_pop;
+        return cap - used >= n;
+    }
+
+    /// True when the scheduler must stop popping: one more pop and the
+    /// drain's tail push could need more room than the stash has.
+    pub fn stashFull(self: *Pump) bool {
+        return !self.hasRoomFor(pushes_per_pop + tail_pushes_per_drain);
     }
 
     fn stealWrite(self: *Pump) void {

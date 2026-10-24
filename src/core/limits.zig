@@ -286,7 +286,12 @@ pub const Limits = struct {
         terms.write_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
         terms.tls_cipher_payload = wire_const.TLS_CIPHER_CHUNK_SIZE;
         terms.frame_slabs = try checkedMul(self.frame_slabs_per_connection, self.frame_slab_bytes);
-        terms.wire_descs = try checkedMul(try checkedMul(n_chunks, 2), bound.WIRE_CHUNK_DESC_SIZE); // read+write ch
+        // Read channel (n + 1 for the EOF sentinel), write channel (n), and
+        // the TLS write stash (n + its tail slots), as `Connection.init`
+        // allocates them. The stash is counted for every connection because
+        // the bound does not know which endpoints are TLS.
+        const wire_desc_n = try checkedAdd(try checkedMul(n_chunks, 3), 1 + wire_const.TLS_STASH_TAIL_SLOTS);
+        terms.wire_descs = try checkedMul(wire_desc_n, bound.WIRE_CHUNK_DESC_SIZE);
         terms.handlers = try checkedMul(self.max_streams_per_connection, HANDLER_SLOT_SIZE);
         terms.handler_jobs = try checkedMul(self.max_streams_per_connection, HANDLER_JOB_SIZE);
         terms.joins = try checkedMul(self.max_streams_per_connection, bound.JOIN_HANDLE_SIZE);
@@ -334,8 +339,6 @@ pub const Limits = struct {
 
         const sid_and_inline = try checkedAdd(sid_scratch, inline_sids);
         const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
-        // wire_descs already counts read+write channel descriptors; TLS
-        // reuses the write capacity for its channel, so no extra desc term.
         const h1_per_conn = try checkedAdd(try checkedMul(self.h1_head_bytes, 3), try checkedMul(self.request_body_bytes, 2));
         const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, try checkedAdd(terms.tls_cipher_payload, h1_per_conn)))));
 

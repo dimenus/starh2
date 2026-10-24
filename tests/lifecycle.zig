@@ -684,6 +684,100 @@ test "a stream inside the advertised limit waits for a task handler that answere
     };
 }
 
+/// Larger than the 64 KiB stream slab, so the handler must wait for the
+/// actor to drain before it can queue the rest.
+const big_task_body_bytes = 512 * 1024;
+
+fn bigTaskBody(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    const body = try req.arena.alloc(u8, big_task_body_bytes);
+    @memset(body, 't');
+    try resp.send(200, &.{}, body);
+}
+
+/// Set by `slowComplete`: stream 1's task handler was parked in the stream
+/// space wait while this complete handler held the actor.
+var slow_complete_saw_space_wait: std.atomic.Value(bool) = .init(false);
+
+/// A complete handler runs on the actor, so its sleep keeps the actor inside
+/// the inline batch, as a slow batch would.
+fn slowComplete(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    zio.sleep(.fromMilliseconds(300)) catch {};
+    slow_complete_saw_space_wait.store(starh2.edge.connection.test_waiting_for_space.load(.acquire) == 1, .release);
+    try resp.send(200, &.{}, "ok");
+}
+
+/// A task handler whose stream slab is full waits for the actor to drain it.
+/// While the actor runs a complete batch on the same connection, that wait
+/// used to return WriteFailed, because the check asked whether the
+/// connection was running an inline batch instead of whether this handler
+/// was the inline one. The task stream was reset with INTERNAL_ERROR
+/// (t-3509).
+fn runTaskWaitDuringCompleteBatch(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigTaskBody } } },
+        .{ .method = .GET, .path = "/slow", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = slowComplete } } },
+    };
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = starh2.Limits.defaults,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    starh2.edge.connection.test_waiting_for_space.store(0, .release);
+    slow_complete_saw_space_wait.store(false, .release);
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    var stream_open = true;
+    defer if (stream_open) stream.close();
+
+    var wire = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer wire.deinit(gpa);
+    try h2c.appendWindowUpdate(gpa, &wire, 0, 1 << 30);
+    try h2c.appendHeaders(gpa, &wire, 1, "/big", true);
+    try h2c.appendHeaders(gpa, &wire, 3, "/slow", true);
+    try writeAllStreamAt(stream, wire.items, @src());
+
+    var outcomes: [2]StreamOutcome = undefined;
+    try awaitStreamOutcomes(stream, &.{ 1, 3 }, &outcomes, 5_000);
+    if (outcomes[0] == .reset) return error.TaskStreamResetDuringCompleteBatch;
+    try std.testing.expectEqual(StreamOutcome.ended, outcomes[0]);
+    try std.testing.expectEqual(StreamOutcome.ended, outcomes[1]);
+    // The run proves its own shape: without the overlap it tests nothing.
+    if (!slow_complete_saw_space_wait.load(.acquire)) return error.TaskNeverWaitedDuringCompleteBatch;
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+    stream.close();
+    stream_open = false;
+}
+
+test "a task handler waits for stream space while the actor runs a complete batch" {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in task-wait-during-complete-batch test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runTaskWaitDuringCompleteBatch, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("task wait during complete batch: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
 const ParkedEnd = enum { peer_reset, server_shutdown, peer_close };
 
 /// How a parked request ends when it never gets its slot the ordinary way.

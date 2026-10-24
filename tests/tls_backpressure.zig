@@ -15,6 +15,13 @@
 //! and a send stays in flight while drainEmit keeps stashing chunks. Then the
 //! client reads to END_STREAM. With the spin, the stream never ends, and the
 //! client panics at its deadline: a loud failure, never a hang.
+//!
+//! Gate for t-3509: a complete (inline) response must not overflow the TLS
+//! write stash. Shape: the smallest legal stash (one wire chunk) and complete
+//! responses larger than one DATA frame, so one scheduler pop flushes the
+//! HEADERS batch and queues a full DATA frame on its own. The drain then
+//! pushes the batch receipt after its last pop. A stash with no room for that
+//! push fail-closed the connection, and the client saw the TLS stream end.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -24,6 +31,10 @@ const tls = @import("tls");
 const event_bytes = 16 * 1024;
 const event_count = 32;
 const stream_count = 64;
+/// Larger than one 16 KiB DATA frame, and inside the 64 KiB stream slab that a
+/// complete body must fit.
+const complete_body_bytes = 20 * 1024;
+const complete_stream_count = 8;
 const client_deadline_ns = 10 * std.time.ns_per_s;
 const dummy: u8 = 0;
 
@@ -38,6 +49,25 @@ fn bigSse(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyer
     for (0..event_count) |_| try body.writeAll(&payload);
     try body.finish();
 }
+
+fn bigComplete(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    var body: [complete_body_bytes]u8 = undefined;
+    @memset(&body, 'c');
+    try resp.send(200, &.{}, &body);
+}
+
+/// What one client run asks for and how it reads.
+const Shape = struct {
+    path: []const u8,
+    streams: usize,
+    body_bytes_per_stream: usize,
+    /// How long the client waits before it reads anything.
+    read_pause_ns: u64,
+    /// How long the client waits between its preface and its requests. The
+    /// server's SETTINGS and SETTINGS ACK are written in that time, so the
+    /// requests meet an empty stash.
+    request_delay_ns: u64,
+};
 
 const ClientResult = struct {
     data_bytes: usize = 0,
@@ -100,14 +130,23 @@ fn realNow() std.Io.Timestamp {
 
 /// Blocking TLS h2 client. Plain OS thread and libc sockets on purpose: it
 /// must keep running while the server's executor is wedged.
-fn clientMain(port: u16, gpa: std.mem.Allocator, out: *ClientResult) void {
-    clientRun(port, gpa, out) catch |err| {
+fn clientMain(port: u16, gpa: std.mem.Allocator, shape: Shape, out: *ClientResult) void {
+    clientRun(port, gpa, shape, out) catch |err| {
         out.err = err;
     };
     out.done.store(true, .release);
 }
 
-fn clientRun(port: u16, gpa: std.mem.Allocator, out: *ClientResult) !void {
+fn sendWire(conn: *tls.nonblock.Connection, client: *Client, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const r = try conn.encrypt(bytes[off..][0..@min(bytes.len - off, 16 * 1024)], &client.out);
+        try client.sendAll(r.ciphertext);
+        off += r.cleartext_pos;
+    }
+}
+
+fn clientRun(port: u16, gpa: std.mem.Allocator, shape: Shape, out: *ClientResult) !void {
     const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
     if (fd < 0) return error.Socket;
     defer _ = std.c.close(fd);
@@ -154,18 +193,21 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, out: *ClientResult) !void {
         try wire.appendSlice(gpa, sbuf[0..sn]);
     }
     try h2c.appendWindowUpdate(gpa, &wire, 0, 1 << 30);
-    for (0..stream_count) |i| try h2c.appendHeaders(gpa, &wire, @intCast(1 + 2 * i), "/big", true);
-    var off: usize = 0;
-    while (off < wire.items.len) {
-        const r = try conn.encrypt(wire.items[off..][0..@min(wire.items.len - off, 16 * 1024)], &client.out);
-        try client.sendAll(r.ciphertext);
-        off += r.cleartext_pos;
+    if (shape.request_delay_ns != 0) {
+        try sendWire(&conn, client, wire.items);
+        wire.clearRetainingCapacity();
+        const delay: std.c.timespec = .{ .sec = 0, .nsec = @intCast(shape.request_delay_ns) };
+        _ = std.c.nanosleep(&delay, null);
     }
+    for (0..shape.streams) |i| try h2c.appendHeaders(gpa, &wire, @intCast(1 + 2 * i), shape.path, true);
+    try sendWire(&conn, client, wire.items);
 
     // Stop reading while the server writes the body: its socket fills and a
     // send stays in flight.
-    const pause: std.c.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&pause, null);
+    if (shape.read_pause_ns != 0) {
+        const pause: std.c.timespec = .{ .sec = 0, .nsec = @intCast(shape.read_pause_ns) };
+        _ = std.c.nanosleep(&pause, null);
+    }
 
     // Read frames until every stream ends. A read timeout on the socket keeps
     // a wedged server from blocking this thread past the deadline.
@@ -178,10 +220,10 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, out: *ClientResult) !void {
     // output makes tls.zig keep plaintext inside `client.in`, which
     // `consume` then shifts.
     var rd: [tls.input_buffer_len]u8 = undefined;
-    while (out.ended_n < stream_count) {
+    while (out.ended_n < shape.streams) {
         if (nowNs() >= deadline) {
-            std.debug.panic("tls backpressure: stream did not end within {d} s ({d} of {d} body bytes); the actor is not parking", .{
-                client_deadline_ns / std.time.ns_per_s, out.data_bytes, stream_count * event_count * event_bytes,
+            std.debug.panic("tls backpressure: {s}: stream did not end within {d} s ({d} of {d} body bytes)", .{
+                shape.path, client_deadline_ns / std.time.ns_per_s, out.data_bytes, shape.streams * shape.body_bytes_per_stream,
             });
         }
         const rec_len = recordLen(client.in[0..client.in_len]) orelse 0;
@@ -213,20 +255,17 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, out: *ClientResult) !void {
     }
 }
 
-fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+fn runShape(rt: *zio.Runtime, gpa: std.mem.Allocator, routes: []const starh2.Route, limits: starh2.Limits, shape: Shape) !void {
     const io = rt.io();
     const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
     defer gpa.free(cert_pem);
     const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
     defer gpa.free(key_pem);
-    const routes = [_]starh2.Route{
-        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigSse } } },
-    };
     var server = try starh2.Server.init(gpa, io, .{
         .endpoints = &.{.{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
-        .routes = &routes,
+        .routes = routes,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
-        .limits = starh2.Limits.defaults,
+        .limits = limits,
     });
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
@@ -236,28 +275,76 @@ fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
+    const overflow_before = starh2.edge.tls_edge.tls_write_overflow.load(.acquire);
     var result: ClientResult = .{};
-    const t = try std.Thread.spawn(.{}, clientMain, .{ server.localAddress(0).getPort(), gpa, &result });
+    const t = try std.Thread.spawn(.{}, clientMain, .{ server.localAddress(0).getPort(), gpa, shape, &result });
     // Wait inside zio so this executor keeps serving the connection.
     while (true) {
         zio.sleep(.fromMilliseconds(20)) catch {};
         if (result.done.load(.acquire)) break;
     }
     t.join();
-    std.debug.print("tls backpressure: ended={d}/{d} body_bytes={d} err={?}\n", .{ result.ended_n, stream_count, result.data_bytes, result.err });
+    const overflows = starh2.edge.tls_edge.tls_write_overflow.load(.acquire) - overflow_before;
+    std.debug.print("tls backpressure: {s}: ended={d}/{d} body_bytes={d} stash_overflows={d} err={?}\n", .{ shape.path, result.ended_n, shape.streams, result.data_bytes, overflows, result.err });
     if (result.err) |err| return err;
-    try std.testing.expectEqual(@as(usize, stream_count), result.ended_n);
-    // Every byte arrived (writeAll sends the bytes as given, no SSE framing).
-    try std.testing.expectEqual(@as(usize, stream_count * event_count * event_bytes), result.data_bytes);
+    try std.testing.expectEqual(@as(u64, 0), overflows);
+    try std.testing.expectEqual(shape.streams, result.ended_n);
+    try std.testing.expectEqual(shape.streams * shape.body_bytes_per_stream, result.data_bytes);
+}
+
+fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = bigSse } } },
+    };
+    // Every byte arrives (writeAll sends the bytes as given, no SSE framing).
+    try runShape(rt, gpa, &routes, starh2.Limits.defaults, .{
+        .path = "/big",
+        .streams = stream_count,
+        .body_bytes_per_stream = event_count * event_bytes,
+        .read_pause_ns = 300 * std.time.ns_per_ms,
+        .request_delay_ns = 0,
+    });
+}
+
+fn runCompleteStash(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/complete", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = bigComplete } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.inbound_wire_chunks_per_connection = 1;
+    // Two stash states at the batch drain. With the delay, the stash is empty
+    // and the drain pops until it is full. Without it, the SETTINGS ACK is
+    // still stashed, so the drain starts one slot short.
+    for ([_]u64{ 100 * std.time.ns_per_ms, 0 }) |request_delay_ns| {
+        try runShape(rt, gpa, &routes, limits, .{
+            .path = "/complete",
+            .streams = complete_stream_count,
+            .body_bytes_per_stream = complete_body_bytes,
+            .read_pause_ns = 0,
+            .request_delay_ns = request_delay_ns,
+        });
+    }
+}
+
+fn oneExecutor(gpa: std.mem.Allocator) !*zio.Runtime {
+    return zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(1),
+    });
 }
 
 test "tls: an actor with staging full behind an in-flight send parks until the send completes" {
     const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
-        .executors = .exact(1),
-    });
+    const rt = try oneExecutor(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runBackpressure, .{ rt, gpa });
+    try h.join();
+}
+
+test "tls: complete responses larger than one DATA frame do not overflow a one-chunk stash" {
+    const gpa = std.testing.allocator;
+    const rt = try oneExecutor(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runCompleteStash, .{ rt, gpa });
     try h.join();
 }

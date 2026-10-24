@@ -1045,11 +1045,13 @@ const HandlerCtx = struct {
     trace_on: bool = false,
     t_dispatch: u64 = 0,
     t_handler: u64 = 0,
-    /// Ticket `sendCb` reserved for a complete handler. Waited after the
-    /// batch drain so multiplexed complete responses share one TLS record.
-    /// Also the flag `sendCb` uses: do not key off `running_inline`, which is
-    /// true for the whole connection and would skip a concurrent task handler's wait.
-    defer_receipt: bool = false,
+    /// True for a complete handler that `runPendingInline` runs on the actor,
+    /// for that job's whole life. Such a handler must not park on anything
+    /// only the actor wakes (stream space, a ticket), so `sendCb` leaves its
+    /// receipt to the batch drain, where multiplexed complete responses share
+    /// one TLS record. This is per handler on purpose: a task handler on the
+    /// same connection can be writing while the actor runs a complete batch.
+    runs_inline: bool = false,
     /// `1` means encode succeeded. The drain-turn receipt is reserved after
     /// the inline batch, not per response.
     deferred_ticket: u64 = 0,
@@ -1490,9 +1492,6 @@ const Connection = struct {
     receipt_ready_stamp: [complete_receipt_capacity]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0), .init(0) },
     receipt_ready_stamp_w: std.atomic.Value(usize) = .init(0),
     receipt_ready_stamp_r: usize = 0,
-    /// True while the actor is encoding or waiting a complete-handler batch.
-    /// `waitForStreamSpace` must not park: that wait is woken by the actor.
-    running_inline: bool = false,
     /// Next outbound wire frame (HEADERS/control/DATA) receives this ticket once.
     next_wire_ticket: u64 = 0,
     next_wire_slot: u32 = 0,
@@ -1622,7 +1621,7 @@ const Connection = struct {
         if (config.mode == .tls) {
             tls_read_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
             errdefer gpa.free(tls_read_buf);
-            tls_write_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
+            tls_write_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + tls_edge.Pump.tail_pushes_per_drain);
             errdefer gpa.free(tls_write_buf);
         }
         var frame_pool = try slab_pool.SlabPool.init(
@@ -4097,17 +4096,20 @@ const Connection = struct {
     ///    when the handler is being canceled.
     /// 5. Re-check the terminal state before trusting the wait result, because
     ///    a cancel and a capacity wake can arrive together.
-    fn waitForStreamSpace(self: *Connection, stream_id: u31, terminal: *response.SlotTerminal, cap: usize) response.ResponseError!void {
+    fn waitForStreamSpace(self: *Connection, hctx: *HandlerCtx, stream_id: u31, cap: usize) response.ResponseError!void {
         std.debug.assert(cap > 0);
+        const terminal = hctx.terminal;
         while (true) {
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             const len = self.sched.pendingByteLen(stream_id);
             if (len < cap) return;
-            // Complete handlers run on the actor. This wait is woken by the
+            // A complete handler runs on the actor. This wait is woken by the
             // actor's drain, so parking here would never return. A body that
-            // does not fit in the stream slab belongs on a task handler.
-            if (self.running_inline) return error.WriteFailed;
+            // does not fit in the stream slab belongs on a task handler. Ask
+            // the caller, not the connection: a task handler on the same
+            // connection may wait here while the actor runs a complete batch.
+            if (hctx.runs_inline) return error.WriteFailed;
             // Prove sparse/dense capacity wait for live gates. Debug (and
             // -Dobserve=true) only: same gate as the other hot test hooks.
             if (comptime test_observe) test_waiting_for_space.store(@as(u32, stream_id), .release);
@@ -4160,7 +4162,7 @@ const Connection = struct {
         end: bool,
         flush_ticket: u64,
         flush_slot: u32,
-        terminal: *response.SlotTerminal,
+        hctx: *HandlerCtx,
     ) response.ResponseError!void {
         const cap = self.config.limits.outbound_bytes_per_stream;
         if (self.sched.pendingCount() >= self.config.limits.max_streams_per_connection) {
@@ -4171,7 +4173,7 @@ const Connection = struct {
         }
         var off: usize = 0;
         while (off < bytes.len) {
-            try self.waitForStreamSpace(stream_id, terminal, cap);
+            try self.waitForStreamSpace(hctx, stream_id, cap);
             const room = cap - self.sched.pendingByteLen(stream_id);
             if (room == 0) continue;
             const take = @min(bytes.len - off, room);
@@ -4389,6 +4391,7 @@ const Connection = struct {
             self.handleWriterFailed();
             return err;
         };
+        if (!sink_ctx.emit.empty()) self.assertTailRoom("drain batch");
         sink_ctx.flushBatch() catch |err| {
             if (diag_park) diagRawPrint("WFSET data_sink_catch2 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
             self.writer_failed.store(true, .release);
@@ -4607,6 +4610,7 @@ const Connection = struct {
                     };
                 }
                 sink_ctx.emit.noteTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot);
+                self.assertTailRoom("receipt batch");
                 sink_ctx.flushBatch(true) catch |err| {
                     if (diag_park) diagRawPrint("WFSET emit_fail3 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.writer_failed.store(true, .release);
@@ -4615,6 +4619,7 @@ const Connection = struct {
                 };
                 sink_ctx.receipt_attached = true;
             } else if (sink_ctx.queued_any) {
+                self.assertTailRoom("bare receipt");
                 self.sendFlushTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot, true) catch |err| {
                     if (diag_park) diagRawPrint("WFSET emit_fail4 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                     self.writer_failed.store(true, .release);
@@ -4625,6 +4630,7 @@ const Connection = struct {
                 sink_ctx.receipt_attached = true;
             }
         } else {
+            if (!sink_ctx.emit.empty()) self.assertTailRoom("receipt drain batch");
             sink_ctx.flushBatch(false) catch |err| {
                 if (diag_park) diagRawPrint("WFSET emit_fail5 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
                 self.writer_failed.store(true, .release);
@@ -4790,6 +4796,22 @@ const Connection = struct {
             .ticket_slot = slot,
             .ticket_count = 1,
             .complete_batch_receipt = complete_batch_receipt,
+        });
+    }
+
+    /// A drain's tail push always finds a free stash slot: the pause stopped
+    /// every pop while `Pump.tail_pushes_per_drain` slots were still free. A
+    /// trap here means one pop pushed more than `Pump.pushes_per_pop`, and in
+    /// a build without the check that push would fail the connection closed.
+    fn assertTailRoom(self: *Connection, comptime site: []const u8) void {
+        if (!std.debug.runtime_safety) return;
+        const pump = self.tls_driver orelse return;
+        if (pump.hasRoomFor(tls_edge.Pump.tail_pushes_per_drain)) return;
+        std.debug.panic("TLS stash has no room for the {s} tail push: carried={} write_ch={d}/{d}", .{
+            site,
+            pump.carried != null,
+            io_queue.chanLen(wire_pump.WireChunk, pump.write_ch),
+            pump.write_ch.impl.capacity,
         });
     }
 
@@ -5510,8 +5532,6 @@ const Connection = struct {
             }
             return;
         }
-        self.running_inline = true;
-        defer self.running_inline = false;
 
         const queued_n: usize = blk: {
             self.lockSessionUncancelable(self.config.io);
@@ -5537,7 +5557,7 @@ const Connection = struct {
                 break;
             }
             if (comptime test_observe) _ = test_observed_inline_jobs.fetchAdd(1, .monotonic);
-            job.hctx.defer_receipt = true;
+            job.hctx.runs_inline = true;
             runHandlerJobBody(job);
         }
         const batch_n = i;
@@ -5930,7 +5950,7 @@ const Connection = struct {
         var ticket: u64 = 0;
         var slot_i: u32 = 0;
         var armed = false;
-        if (!hctx.defer_receipt) {
+        if (!hctx.runs_inline) {
             const ticket_pair = self.reserveTicket() catch |err| return err;
             ticket = ticket_pair[0];
             slot_i = ticket_pair[1];
@@ -5946,18 +5966,18 @@ const Connection = struct {
         var traced = lifecycle or (trace.enabled and
             (trace.writes.fetchAdd(1, .monotonic) % trace.sample_every == 0));
         if (lifecycle) _ = trace.writes.fetchAdd(1, .monotonic);
-        if (traced and !hctx.defer_receipt) {
+        if (traced and !hctx.runs_inline) {
             traced = self.trace_ticket.cmpxchgStrong(0, ticket, .acq_rel, .monotonic) == null;
             if (!traced) _ = trace.skipped.fetchAdd(1, .monotonic);
         }
         var defer_wait = false;
-        defer if (traced and !defer_wait and !hctx.defer_receipt) self.trace_ticket.store(0, .release);
+        defer if (traced and !defer_wait and !hctx.runs_inline) self.trace_ticket.store(0, .release);
         var t_before: u64 = 0;
         var t_acquired: u64 = 0;
         var t_hpack: u64 = 0;
         var t_unlocked: u64 = 0;
         if (traced or lifecycle) {
-            if (traced and !hctx.defer_receipt) {
+            if (traced and !hctx.runs_inline) {
                 self.trace_ack_ns.store(0, .release);
                 self.trace_emit_ns.store(0, .release);
                 self.trace_queued_ns.store(0, .release);
@@ -5997,13 +6017,13 @@ const Connection = struct {
                 const pending_len = self.sched.pendingByteLen(stream_id);
                 const fits_without_wait = pending_len < self.config.limits.outbound_bytes_per_stream and
                     body_out.len <= self.config.limits.outbound_bytes_per_stream - pending_len;
-                if (hctx.defer_receipt or fits_without_wait) {
+                if (hctx.runs_inline or fits_without_wait) {
                     // Stage DATA first, then place HEADERS in the ordinary
                     // control queue. Drain is left to the actor (task) or to
                     // `runPendingInline` after the whole complete batch encodes.
                     // Complete handlers carry no per-response ticket: the
                     // drain-turn receipt is reserved after this encode loop.
-                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx) catch |err| return err;
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;
@@ -6016,7 +6036,7 @@ const Connection = struct {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;
                     };
-                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx.terminal) catch |err| return err;
+                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx) catch |err| return err;
                     self.processIntents() catch {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;
@@ -6027,7 +6047,7 @@ const Connection = struct {
                     self.next_wire_ticket = ticket;
                     self.next_wire_slot = slot_i;
                 }
-                if (hctx.defer_receipt) {
+                if (hctx.runs_inline) {
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;
@@ -6042,7 +6062,7 @@ const Connection = struct {
         }
         if (traced) t_unlocked = nowNs(self.config.io);
         armed = false;
-        if (hctx.defer_receipt) {
+        if (hctx.runs_inline) {
             // Encode now; the actor consumes the drain-turn receipt after applying the write ack.
             defer_wait = true;
             hctx.deferred_ticket = 1;
@@ -6238,6 +6258,10 @@ const Connection = struct {
     fn writeCb(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool, flush: bool, wait: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
+        // `CompleteResponse` has only `send`. A streaming write from an inline
+        // handler would wait on a ticket that only the actor (busy running it)
+        // can complete.
+        std.debug.assert(!hctx.runs_inline);
         if (hctx.terminal.getCause()) |c| return response.causeToError(c);
         if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
         if (!flush and !end and bytes.len == 0) return;
@@ -6332,7 +6356,7 @@ const Connection = struct {
             // It also restores the ownership rule this module states at the
             // top: only the actor emits.
             if (wait and !end) {
-                try self.waitForStreamSpace(stream_id, hctx.terminal, flush_occupancy_cap);
+                try self.waitForStreamSpace(hctx, stream_id, flush_occupancy_cap);
             }
             if (wire_bytes.len == 0 and need_ticket and !end) {
                 // A zero-length, non-final DataPending is ineligible forever:
@@ -6351,13 +6375,7 @@ const Connection = struct {
                     self.sendFlushTicket(ticket, slot_i, false) catch return error.WriteFailed;
                 }
             } else if (wire_bytes.len != 0 or end) {
-                self.enqueuePending(stream_id, wire_bytes, end, if (need_ticket) ticket else 0, if (need_ticket) slot_i else 0, hctx.terminal) catch |err| return err;
-            }
-            if (self.running_inline and need_ticket) {
-                self.processIntents() catch {
-                    self.failClosedOnIntentError();
-                    return error.WriteFailed;
-                };
+                self.enqueuePending(stream_id, wire_bytes, end, if (need_ticket) ticket else 0, if (need_ticket) slot_i else 0, hctx) catch |err| return err;
             }
         }
         if (traced) t_unlocked = nowNs(self.config.io);
@@ -6435,7 +6453,7 @@ const Connection = struct {
                     try self.lockSession();
                     defer self.unlockSession(self.config.io);
                     try self.refuseIfStreamDead(stream_id, hctx.terminal);
-                    self.enqueuePending(stream_id, out.items, false, ticket, slot_i, hctx.terminal) catch |err| return err;
+                    self.enqueuePending(stream_id, out.items, false, ticket, slot_i, hctx) catch |err| return err;
                     self.processIntents() catch {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;

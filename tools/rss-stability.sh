@@ -15,10 +15,10 @@
 #       load   a fixed count of mixed requests (RSS_COMPLETE_N, RSS_TASK_N,
 #              RSS_POST_N): complete and task
 #              fragments from 1 KiB to 1 MiB rendered into the request arena,
-#              plus 64 KiB POST bodies. Complete and task routes run on
-#              separate connections: mixed on one connection, complete
-#              handlers fail beside 1 MiB task responses (t-3509). Put them
-#              back together when that is fixed.
+#              plus 64 KiB POST bodies. Complete and task routes run in
+#              separate h2load processes, because one h2load spreads its
+#              -n evenly over its URIs and the two routes need different
+#              counts.
 #       idle   RSS_IDLE_S seconds of the SSE streams only
 #       churn  RSS_CHURN_S seconds of waves of fresh TLS connections, one
 #              request each
