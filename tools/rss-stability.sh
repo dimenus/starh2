@@ -37,6 +37,11 @@
 # `init` is glibc malloc on Linux). RSS_SERVER_ENV is prepended to the server
 # command, e.g. RSS_SERVER_ENV="GLIBC_TUNABLES=glibc.malloc.trim_threshold=268435456".
 #
+# RSS_COUNT_GPA=1 runs the server with --count-gpa and reads /mem at each
+# phase end: the bytes the server has allocated and not freed. RSS that rises
+# while live bytes stay flat is the allocator keeping freed memory; live bytes
+# that rise too are memory the server itself still holds.
+#
 # Exit codes: 0 ran and every phase did work; 2 setup failed; 3 a phase did
 # no work or reported failures (the numbers are then not a result). A clean
 # zero from a run that never loaded the server is the failure this guards.
@@ -73,8 +78,11 @@ SERVER_ENV=${RSS_SERVER_ENV:-}
 SERVER_CPUS=${RSS_SERVER_CPUS:-}
 CLIENT_CPUS=${RSS_CLIENT_CPUS:-}
 EXECUTORS=${RSS_EXECUTORS:-}
+COUNT_GPA=${RSS_COUNT_GPA:-0}
 
-for tool in h2load go; do
+tools=(h2load go)
+[ "$COUNT_GPA" = 1 ] && tools+=(curl)
+for tool in "${tools[@]}"; do
   command -v "$tool" >/dev/null || { echo "rss-stability: $tool not found" >&2; exit 2; }
 done
 [ -x "$BIN" ] || { echo "rss-stability: no server at $BIN (./zb build starh2-bench-server -Doptimize=ReleaseFast)" >&2; exit 2; }
@@ -130,6 +138,7 @@ srv_cmd=(${SERVER_PIN[@]+"${SERVER_PIN[@]}"})
 srv_cmd+=(env $SERVER_ENV "$BIN" --port 0 --mode tls --cert "$CERT" --key "$KEY" --gpa "$GPA"
   --sse-interval-ms "$SSE_INTERVAL_MS" --max-connections $((SSE + LOAD_C + POST_C + CHURN_C + 64)))
 [ -n "$EXECUTORS" ] && srv_cmd+=(--executors "$EXECUTORS")
+[ "$COUNT_GPA" = 1 ] && srv_cmd+=(--count-gpa)
 "${srv_cmd[@]}" > "$OUT/server.out" 2> "$OUT/server.err" &
 SRV=$!
 for _ in $(seq 100); do grep -q '"ready":true' "$OUT/server.out" 2>/dev/null && break; sleep 0.1; done
@@ -138,6 +147,18 @@ grep -q '"ready":true' "$OUT/server.out" || { echo "rss-stability: server never 
 grep -q "\"gpa\":\"$GPA\"" "$OUT/server.out" || { echo "rss-stability: server is not on gpa=$GPA: $(cat "$OUT/server.out")" >&2; exit 2; }
 PORT=$(grep -o '"port":[0-9]*' "$OUT/server.out" | cut -d: -f2)
 BASE=https://127.0.0.1:$PORT
+if [ "$COUNT_GPA" = 1 ]; then
+  grep -q '"count_gpa":1' "$OUT/server.out" || { echo "rss-stability: server is not counting its allocator: $(cat "$OUT/server.out")" >&2; exit 2; }
+fi
+
+# Live bytes from /mem in KB, or "-" when not counting. A failed read is
+# "?", and fails the run below: a missing number must not read as flat.
+live_kb() {
+  [ "$COUNT_GPA" = 1 ] || { echo -; return; }
+  local b
+  b=$(curl -sk --http2 --max-time 5 "$BASE/mem" | grep -o '"live_bytes":[0-9]*' | cut -d: -f2)
+  if [ -z "$b" ]; then echo "?"; else echo $((b / 1024)); fi
+}
 
 PHASE_FILE=$OUT/phase
 echo "0 start" > "$PHASE_FILE"
@@ -175,7 +196,7 @@ check_h2load() { # check_h2load <log> <phase label>
 COMPLETE_URIS=("$BASE/fragment?kb=1" "$BASE/fragment?kb=4" "$BASE/fragment?kb=16" "$BASE/fragment?kb=60")
 TASK_URIS=("$BASE/fragment-task?kb=4" "$BASE/fragment-task?kb=64" "$BASE/fragment-task?kb=256" "$BASE/fragment-task?kb=1024")
 
-printf 'cycle\tload_end_kb\tidle_end_kb\tchurn_end_kb\n' > "$OUT/rows.tsv"
+printf 'cycle\tload_end_kb\tidle_end_kb\tchurn_end_kb\tload_live_kb\tidle_live_kb\tchurn_live_kb\n' > "$OUT/rows.tsv"
 for c in $(seq "$CYCLES"); do
   echo "$c load" > "$PHASE_FILE"
   # -n, not -D: at a -D deadline h2load counts the requests still in
@@ -190,6 +211,7 @@ for c in $(seq "$CYCLES"); do
   p=$!
   wait "$g1" "$g2" "$p" || true
   load_end=$(rss_kb)
+  load_live=$(live_kb)
   check_h2load "$OUT/load-complete-$c.log" "cycle $c load-complete"
   check_h2load "$OUT/load-task-$c.log" "cycle $c load-task"
   check_h2load "$OUT/post-$c.log" "cycle $c load-post"
@@ -197,6 +219,7 @@ for c in $(seq "$CYCLES"); do
   echo "$c idle" > "$PHASE_FILE"
   sleep "$IDLE_S"
   idle_end=$(rss_kb)
+  idle_live=$(live_kb)
 
   echo "$c churn" > "$PHASE_FILE"
   end=$(( $(date +%s) + CHURN_S ))
@@ -207,8 +230,12 @@ for c in $(seq "$CYCLES"); do
     check_h2load "$OUT/churn-$c-$w.log" "cycle $c churn wave $w"
   done
   churn_end=$(rss_kb)
-  printf '%s\t%s\t%s\t%s\n' "$c" "$load_end" "$idle_end" "$churn_end" >> "$OUT/rows.tsv"
-  echo "cycle $c: load_end=${load_end} KB idle_end=${idle_end} KB churn_end=${churn_end} KB (churn waves=$w)"
+  churn_live=$(live_kb)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$load_end" "$idle_end" "$churn_end" "$load_live" "$idle_live" "$churn_live" >> "$OUT/rows.tsv"
+  for v in "$load_live" "$idle_live" "$churn_live"; do
+    if [ "$v" = "?" ]; then echo "INVALID cycle $c: /mem gave no live_bytes" >&2; bad=1; fi
+  done
+  echo "cycle $c: load_end=${load_end} KB idle_end=${idle_end} KB churn_end=${churn_end} KB live load/idle/churn=${load_live}/${idle_live}/${churn_live} KB (churn waves=$w)"
 done
 
 echo "end idle" > "$PHASE_FILE"
@@ -245,12 +272,17 @@ slope=$(awk -F'\t' 'NR > 2 {n++; x = $1; y = $3; sx += x; sy += y; sxx += x * x;
   END {d = n * sxx - sx * sx; if (n < 2 || d == 0) print "n/a"; else printf "%.0f", (n * sxy - sx * sy) / d}' "$OUT/rows.tsv")
 idle_first=$(awk -F'\t' 'NR == 3 {print $3}' "$OUT/rows.tsv")
 idle_last=$(awk -F'\t' 'END {print $3}' "$OUT/rows.tsv")
+live_slope=n/a
+if [ "$COUNT_GPA" = 1 ]; then
+  live_slope=$(awk -F'\t' 'NR > 2 {n++; x = $1; y = $6; sx += x; sy += y; sxx += x * x; sxy += x * y}
+    END {d = n * sxx - sx * sx; if (n < 2 || d == 0) print "n/a"; else printf "%.0f", (n * sxy - sx * sy) / d}' "$OUT/rows.tsv")
+fi
 
 {
   echo "rss-stability gpa=$GPA server_env=[${SERVER_ENV}] cycles=$CYCLES load_n=$COMPLETE_N/$TASK_N/$POST_N idle=${IDLE_S}s churn=${CHURN_S}s sse=$SSE"
   echo "host=$(uname -n) bin_sha256=$( (sha256sum "$BIN" 2>/dev/null || shasum -a 256 "$BIN") | awk '{print $1}')"
   echo "boot_kb=$RSS_BOOT with_sse_kb=$RSS_SSE peak_kb=$peak samples=$nsamples"
-  echo "idle_end cycle2=${idle_first:-n/a} last=${idle_last:-n/a} slope_kb_per_cycle=$slope"
+  echo "idle_end cycle2=${idle_first:-n/a} last=${idle_last:-n/a} slope_kb_per_cycle=$slope live_slope_kb_per_cycle=$live_slope"
 } | tee "$OUT/summary.txt"
 
 if [ "$bad" -ne 0 ]; then

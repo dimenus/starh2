@@ -837,6 +837,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
         } else if (std.mem.eql(u8, a, "--gpa")) {
             // Parsed by parseRuntimeArgs: the allocator exists before this runs.
             _ = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, a, "--count-gpa")) {
+            // Parsed by parseRuntimeArgs, as --gpa.
         } else if (std.mem.eql(u8, a, "--placement-log")) {
             // Measurement: one PLACE line per balanced connection on stderr.
             out.placement_log = true;
@@ -899,8 +901,109 @@ const GpaChoice = enum { init, smp };
 /// Printed in the ready line, so a harness can check which arm it started.
 var g_gpa_choice: GpaChoice = .init;
 
+/// `--count-gpa`: wraps the chosen allocator and counts the bytes it has
+/// handed out and not had back, so tools/rss-stability.sh can tell memory
+/// the server still holds from memory the allocator keeps after a free.
+/// Off by default: it adds two atomic adds to every allocation. Memory that
+/// does not come from this allocator (zio's coroutine stacks, TLS library
+/// state that uses its own) is not counted.
+const CountingGpa = struct {
+    child: std.mem.Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    calls: std.atomic.Value(u64) = .init(0),
+    /// Per size class (power of two, by the length asked for): allocations
+    /// and bytes since start, and bytes live now. A resize or remap that
+    /// moves a block to another class is counted as a free and an alloc.
+    class_calls: [classes]std.atomic.Value(u64) = @splat(.init(0)),
+    class_bytes: [classes]std.atomic.Value(u64) = @splat(.init(0)),
+    class_live: [classes]std.atomic.Value(usize) = @splat(.init(0)),
+
+    const classes = 40;
+
+    fn class(len: usize) usize {
+        return @min(classes - 1, std.math.log2_int_ceil(usize, @max(len, 1)));
+    }
+
+    fn noteAlloc(self: *CountingGpa, len: usize) void {
+        const c = class(len);
+        _ = self.class_calls[c].fetchAdd(1, .monotonic);
+        _ = self.class_bytes[c].fetchAdd(len, .monotonic);
+        _ = self.class_live[c].fetchAdd(len, .monotonic);
+    }
+
+    fn noteFree(self: *CountingGpa, len: usize) void {
+        _ = self.class_live[class(len)].fetchSub(len, .monotonic);
+    }
+
+    fn allocator(self: *CountingGpa) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingGpa = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        _ = self.live.fetchAdd(len, .monotonic);
+        _ = self.calls.fetchAdd(1, .monotonic);
+        self.noteAlloc(len);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingGpa = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.moveLive(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingGpa = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.moveLive(memory.len, new_len);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingGpa = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+        _ = self.live.fetchSub(memory.len, .monotonic);
+        self.noteFree(memory.len);
+    }
+
+    fn moveLive(self: *CountingGpa, old_len: usize, new_len: usize) void {
+        self.noteFree(old_len);
+        self.noteAlloc(new_len);
+        if (new_len > old_len) {
+            _ = self.live.fetchAdd(new_len - old_len, .monotonic);
+        } else {
+            _ = self.live.fetchSub(old_len - new_len, .monotonic);
+        }
+    }
+};
+var g_counting: ?*CountingGpa = null;
+
+/// `/mem`: the `--count-gpa` counters as one JSON line, or 404 without it.
+/// `classes` lists each size class that has seen an allocation as
+/// [log2 upper bound, calls, bytes, live bytes].
+fn memHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    const c = g_counting orelse return resp.send(404, &.{}, "run with --count-gpa\n");
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.print("{{\"live_bytes\":{d},\"alloc_calls\":{d},\"classes\":[", .{ c.live.load(.monotonic), c.calls.load(.monotonic) });
+    var first = true;
+    for (0..CountingGpa.classes) |i| {
+        const calls = c.class_calls[i].load(.monotonic);
+        if (calls == 0) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("[{d},{d},{d},{d}]", .{ i, calls, c.class_bytes[i].load(.monotonic), c.class_live[i].load(.monotonic) });
+    }
+    try w.writeAll("]}\n");
+    try resp.send(200, &.{}, w.buffered());
+}
+
 const RuntimeArgs = struct {
     gpa: GpaChoice = .init,
+    count_gpa: bool = false,
     executors: ?u8 = null,
     announce_running_wakes: bool = true,
     batch_wake_sleepers: bool = true,
@@ -930,6 +1033,8 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
                 std.debug.print("--gpa takes init or smp, got {s}\n", .{v});
                 return error.InvalidGpa;
             };
+        } else if (std.mem.eql(u8, a, "--count-gpa")) {
+            out.count_gpa = true;
         }
     }
     return out;
@@ -1188,6 +1293,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .{ .method = .GET, .path = "/sse-cadence", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence-reset", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceResetHandler } } },
         .{ .method = .GET, .path = "/stuck", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = stuckHandler } } },
+        .{ .method = .GET, .path = "/mem", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = memHandler } } },
         .{ .method = .GET, .path = "/fragment", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = fragmentHandler } } },
         .{ .method = .GET, .path = "/fragment-task", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = fragmentTaskHandler } } },
         .{ .method = .POST, .path = "/echo-len", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = echoLenHandler } } },
@@ -1231,7 +1337,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\"}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\",\"count_gpa\":{d}}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1250,6 +1356,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             limits.max_connections,
             limits.concurrent_tls_handshakes,
             @tagName(g_gpa_choice),
+            @as(u8, @intFromBool(g_counting != null)),
         },
     );
     defer gpa.free(ready);
@@ -1269,11 +1376,14 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
 
 pub fn main(init: std.process.Init) !void {
     const runtime_args = try parseRuntimeArgs(init.gpa, init.minimal.args);
-    const gpa = switch (runtime_args.gpa) {
+    const chosen = switch (runtime_args.gpa) {
         .init => init.gpa,
         .smp => std.heap.smp_allocator,
     };
     g_gpa_choice = runtime_args.gpa;
+    var counting: CountingGpa = .{ .child = chosen };
+    if (runtime_args.count_gpa) g_counting = &counting;
+    const gpa = if (runtime_args.count_gpa) counting.allocator() else chosen;
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{
             .maximum_size = 1024 * 1024,
