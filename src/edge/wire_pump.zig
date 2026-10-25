@@ -193,6 +193,10 @@ pub const ReadPump = struct {
 
 /// Test-only: when true, the next WritePump write fails and the flag clears.
 pub var test_fail_next_write: std.atomic.Value(bool) = .init(false);
+/// Test-only: while true, a WritePump holds the chunks it has taken instead of
+/// writing them, as a socket write that never completes would. Unlike
+/// `test_write_delay_ms`, it can be set after a connection is running.
+pub var test_hold_writes: std.atomic.Value(bool) = .init(false);
 /// Test-only: monotonic ns of last successful WritePump completion that carried a ticket.
 pub var test_last_ticket_ok_ns: std.atomic.Value(u64) = .init(0);
 /// Test-only: ticket id of that completion (0 = none).
@@ -372,6 +376,14 @@ pub const WritePump = struct {
                     chunks[count] = next;
                     count += 1;
                 }
+            }
+            while (test_hold_writes.load(.acquire)) {
+                self.io.sleep(.fromMilliseconds(1), .awake) catch {
+                    for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
+                    self.failDrain();
+                    self.post(.{ .shutdown = true });
+                    return;
+                };
             }
             if (self.test_delay_ms > 0) {
                 self.io.sleep(.fromMilliseconds(@intCast(self.test_delay_ms)), .awake) catch {

@@ -8,9 +8,8 @@
 //!
 //! - more streams than `max_streams_per_connection`: Session queues
 //!   RST_STREAM REFUSED_STREAM while it ingests the flight;
-//! - a DATA frame on stream 0: Session queues GOAWAY PROTOCOL_ERROR. Whether
-//!   the GOAWAY reaches the client is t-3520; this test asserts only that
-//!   whatever arrives starts with the server SETTINGS.
+//! - a DATA frame on stream 0: Session queues GOAWAY PROTOCOL_ERROR. The
+//!   client must receive SETTINGS, then that GOAWAY, then the close (t-3520).
 //!
 //! Both frames are in the scheduler's terminal class and used to be emitted
 //! before the server SETTINGS. Each shape opens many connections, because
@@ -52,6 +51,8 @@ const Seen = struct {
     sid: u32,
     /// Error code of RST_STREAM (payload 0..4) or GOAWAY (payload 4..8).
     code: u32,
+    /// Last stream id of a GOAWAY (payload 0..4); 0 for any other frame.
+    last_stream_id: u32,
 };
 
 const ClientResult = struct {
@@ -215,6 +216,7 @@ fn oneConnection(port: u16, gpa: std.mem.Allocator, shape: Shape) !void {
                     7 => if (len >= 8) std.mem.readInt(u32, payload[4..8], .big) else 0,
                     else => 0,
                 },
+                .last_stream_id = if (h[3] == 7 and len >= 8) std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff else 0,
             };
             seen_n += 1;
             foff += 9 + len;
@@ -229,11 +231,9 @@ fn oneConnection(port: u16, gpa: std.mem.Allocator, shape: Shape) !void {
                 }
                 ended = rsts >= refused_streams;
             },
-            .connection_error => {
-                for (seen[0..seen_n]) |s| {
-                    if (s.ftype == 7) ended = true;
-                }
-            },
+            // The close is part of the shape: keep reading until the server
+            // closes, so a frame after the GOAWAY, or no close at all, shows.
+            .connection_error => {},
         }
     }
 
@@ -248,13 +248,8 @@ fn dump(shape: Shape, seen: []const Seen) void {
 
 fn check(shape: Shape, seen: []const Seen) !void {
     errdefer dump(shape, seen);
-    // Whatever the server writes starts with its SETTINGS, without ACK. The
-    // connection-error shape may receive nothing at all today (see below), so
-    // an empty list is allowed there only.
-    if (seen.len == 0) {
-        if (shape == .connection_error) return;
-        return error.NoFrames;
-    }
+    // Whatever the server writes starts with its SETTINGS, without ACK.
+    if (seen.len == 0) return error.NoFrames;
     if (seen[0].ftype != 4 or seen[0].flags & 0x1 != 0 or seen[0].sid != 0) return error.FirstFrameNotServerSettings;
     switch (shape) {
         .refused_stream => {
@@ -268,10 +263,26 @@ fn check(shape: Shape, seen: []const Seen) !void {
             }
             if (n != refused_streams) return error.MissingRefusal;
         },
-        // GOAWAY delivery after a first-flight connection error is t-3520:
-        // today teardown drops the stashed GOAWAY. This assertion tightens
-        // there to "SETTINGS, then GOAWAY PROTOCOL_ERROR".
-        .connection_error => {},
+        // SETTINGS, then one GOAWAY PROTOCOL_ERROR naming last stream 0
+        // (nothing was processed). The GOAWAY is a terminal-class frame and
+        // leaves the scheduler ahead of ordinary control, so the ACK of the
+        // client's first SETTINGS, queued before the error, may follow it.
+        // Nothing else may.
+        .connection_error => {
+            var goaways: usize = 0;
+            var at: usize = 0;
+            for (seen, 0..) |s, i| {
+                if (s.ftype != 7) continue;
+                goaways += 1;
+                at = i;
+            }
+            if (goaways != 1) return error.WrongGoawayCount;
+            if (seen[at].code != 1) return error.WrongGoawayCode;
+            if (seen[at].last_stream_id != 0) return error.WrongLastStreamId;
+            for (seen[at + 1 ..]) |s| {
+                if (s.ftype != 4 or s.flags & 0x1 == 0) return error.FrameAfterGoaway;
+            }
+        },
     }
 }
 

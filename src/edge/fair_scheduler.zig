@@ -502,6 +502,13 @@ pub const FairScheduler = struct {
         return self.active_pending;
     }
 
+    /// True when no control frame, framed DATA or pending DATA waits to be
+    /// emitted.
+    pub fn idle(self: *const FairScheduler) bool {
+        return self.terminal_len == 0 and self.ordinary_len == 0 and
+            self.framed_len == 0 and self.active_pending == 0;
+    }
+
     pub fn nextSlowDeadlineNs(self: *const FairScheduler, timeout_ns: u64) ?u64 {
         if (timeout_ns == 0) return null;
         var next: ?u64 = null;

@@ -1138,7 +1138,7 @@ pub const Pump = struct {
     /// packed batch and then queues an unbatchable frame (unticketed DATA)
     /// on its own: two pushes for one pop. A pause that fires only at zero
     /// room lets that second push overflow and fail-close the connection.
-    pub const pushes_per_pop: usize = 2;
+    pub const pushes_per_pop: usize = limits_mod.POP_PUSHES;
 
     /// The most chunks one drain pushes after `sched.drain` returns, with no
     /// pause check in between: the batch it was still packing, or, for a
@@ -1174,6 +1174,15 @@ pub const Pump = struct {
     /// drain's tail push could need more room than the stash has.
     pub fn stashFull(self: *Pump) bool {
         return !self.hasRoomFor(pushes_per_pop + tail_pushes_per_drain);
+    }
+
+    /// True when every chunk pushed so far has been encrypted AND the socket
+    /// has accepted all of the ciphertext. A chunk is acked once its records
+    /// are staged, which is earlier than that: the staged bytes can still be
+    /// waiting behind an in-flight send. Actor only.
+    pub fn writesDrained(self: *Pump) bool {
+        return self.pending_n == 0 and self.carried == null and self.write_ch.isEmpty() and
+            !self.send_armed and self.send_head == self.send_fill;
     }
 
     const WriteSome = enum { done, full, exit };
@@ -1629,6 +1638,44 @@ test "a second record in one chunk is work; a partial record is not" {
     try std.testing.expectEqual(@as(usize, 0), try server.decryptInto(&plain_b));
     try std.testing.expectEqual(c.ciphertext.len - half, server.acceptCipher(wire[half..c.ciphertext.len]));
     try std.testing.expect(server.pendingInbound());
+}
+
+test "writesDrained is false while anything pushed is not yet on the socket (t-3520)" {
+    var buf: [2]wire_pump.WireChunk = undefined;
+    var ch = zio.Channel(wire_pump.WireChunk).init(&buf);
+    var pump: Pump = undefined;
+    pump.write_ch = &ch;
+    pump.pending_n = 0;
+    pump.carried = null;
+    pump.send_armed = false;
+    pump.send_head = 0;
+    pump.send_fill = 0;
+    try std.testing.expect(pump.writesDrained());
+
+    // Encrypted and acked, but the socket has not taken the ciphertext: the
+    // chunk's ack already fired, so only these fields say it is still unsent.
+    pump.send_fill = 40;
+    try std.testing.expect(!pump.writesDrained());
+    pump.send_head = 40;
+    try std.testing.expect(pump.writesDrained());
+    pump.send_armed = true;
+    try std.testing.expect(!pump.writesDrained());
+    pump.send_armed = false;
+
+    // A batch parked behind a full staging buffer.
+    pump.pending_n = 1;
+    try std.testing.expect(!pump.writesDrained());
+    pump.pending_n = 0;
+
+    pump.carried = .{ .bytes = &.{}, .len = 0, .flush_barrier = true };
+    try std.testing.expect(!pump.writesDrained());
+    pump.carried = null;
+
+    // A chunk still in the stash.
+    try ch.trySend(.{ .bytes = &.{}, .len = 0, .flush_barrier = true });
+    try std.testing.expect(!pump.writesDrained());
+    _ = try ch.tryReceive();
+    try std.testing.expect(pump.writesDrained());
 }
 
 test "h2 ALPN matcher" {

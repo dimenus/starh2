@@ -143,9 +143,12 @@ pub const Server = struct {
         if (config.limits.cancellation_reaper_tasks == 0) return error.InvalidConfig;
 
         var need_tls = false;
+        var need_h2c = false;
         for (config.endpoints) |ep| {
             if (ep == .tls) need_tls = true;
+            if (ep == .h2c_prior_knowledge) need_h2c = true;
         }
+        if (need_h2c) try config.limits.checkH2cWriteQueue();
         if (need_tls and config.tls == null) return error.InvalidConfig;
 
         var route_bytes: usize = 0;

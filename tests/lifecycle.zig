@@ -1523,7 +1523,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
         .max_streams_per_server = 2,
         .cancellation_reaper_jobs = 2,
         .cancellation_reaper_tasks = 1,
-        .inbound_wire_chunks_per_connection = 2,
+        .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
         .outbound_bytes_per_connection = 16 * 1024,
         .outbound_bytes_per_server = 16 * 1024,

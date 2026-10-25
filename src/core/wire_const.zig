@@ -15,6 +15,12 @@ pub const TLS_RECORD_BUFFER_SIZE: usize = 5 + 16 * 1024 + 256;
 /// `Conn.in_buf` + `Conn.out_buf`, one maximum record each.
 pub const TLS_CONN_BUFFER_BYTES: usize = TLS_RECORD_BUFFER_SIZE * 2;
 
+/// The most chunks one scheduler pop can push before the scheduler asks its
+/// pause hooks again (see `tls.Pump.pushes_per_pop`). The drain sink flushes a
+/// non-empty packed batch and then queues an unbatchable frame on its own: two
+/// pushes for one pop.
+pub const POP_PUSHES: usize = 2;
+
 /// TLS write stash slots beyond `inbound_wire_chunks_per_connection`. They
 /// hold the one push a drain makes after its last scheduler pop (see
 /// `tls.Pump.tail_pushes_per_drain`), so the pause rule leaves the pops the

@@ -471,8 +471,9 @@ pub const Session = struct {
     /// and must never recurse through `pushIntentOrFailClosed`.
     ///
     /// Every step degrades rather than gives up: if even the reserved GOAWAY
-    /// cannot be queued, `terminal` is still set, so the actor loop breaks and
-    /// the edge tears the connection down. The rule is that a broken connection
+    /// cannot be queued, `terminal` is still set, so the actor starts its
+    /// closing phase, which has nothing to wait for, and the edge tears the
+    /// connection down. The rule is that a broken connection
     /// closes; it never continues in an unknown protocol state.
     pub fn failClosedInternal(self: *Session) !void {
         if (self.terminal != .none) return;

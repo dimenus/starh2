@@ -82,6 +82,12 @@ pub const WIRE_CHUNK_SIZE = wire_const.WIRE_CHUNK_SIZE;
 pub const TLS_PLAINTEXT_SCRATCH_SIZE = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
 pub const TLS_CONN_BUFFER_BYTES = wire_const.TLS_CONN_BUFFER_BYTES;
 pub const TLS_CIPHER_CHUNK_SIZE = wire_const.TLS_CIPHER_CHUNK_SIZE;
+/// Smallest h2c write queue: the room one scheduler pop is reserved, a pop's
+/// pushes plus the drain's tail push. The h2c queue is
+/// `inbound_wire_chunks_per_connection` slots with no extra; TLS adds
+/// `TLS_STASH_EXTRA_SLOTS` to its stash, so a 1-chunk TLS setting is legal and
+/// this bound does not apply to it.
+pub const H2C_MIN_WRITE_QUEUE_CHUNKS: usize = wire_const.POP_PUSHES + wire_const.TLS_STASH_TAIL_SLOTS;
 pub const TERMINAL_CONTROL_RESERVE_BYTES: usize = 4 * 1024;
 pub const TERMINAL_CONTROL_RESERVE_ENTRIES: usize = 16;
 
@@ -202,6 +208,19 @@ pub const Limits = struct {
     request_body_idle_timeout_ns: u64 = 15 * std.time.ns_per_s,
     slow_consumer_timeout_ns: u64 = 30 * std.time.ns_per_s,
     graceful_drain_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// How long a connection that has decided to close (a connection error, or
+    /// the end of a graceful drain) waits for its last queued frames, the
+    /// GOAWAY above all, to reach the socket (RFC 9113 section 5.4.1). A frame
+    /// counts as written when the socket accepted it, not when the peer read it,
+    /// so a peer that reads at all finishes this in well under a millisecond on
+    /// a LAN. The deadline only matters when the socket buffer is full because
+    /// the peer stopped reading: it then bounds how long that peer can hold the
+    /// connection after it has already been told to go away. 500 ms is long
+    /// enough for a few round trips to a slow reader and short enough that
+    /// provoking a connection error from a peer that never reads is not a way
+    /// to hold a connection slot. Holds no memory: the frames were already
+    /// counted when they were queued. Must be non-zero.
+    close_flush_timeout_ns: u64 = 500 * std.time.ns_per_ms,
 
     pub const defaults: Limits = .{};
 
@@ -215,6 +234,17 @@ pub const Limits = struct {
         const r = @addWithOverflow(a, b);
         if (r[1] != 0) return error.InvalidConfig;
         return r[0];
+    }
+
+    /// Boot check for a server or connection that runs h2c. An ending h2c
+    /// connection holds a drain back before every pop that lacks the room one
+    /// pop is reserved (`H2C_MIN_WRITE_QUEUE_CHUNKS`). A queue smaller than that
+    /// never has the room, so the bound would not hold: one pop could push more
+    /// than is free and park the actor in `putOne` under `session_mu`, where
+    /// the closing deadline cannot fire. Not part of `resourceUpperBound`
+    /// because that is mode-blind and TLS legally uses a smaller value.
+    pub fn checkH2cWriteQueue(self: Limits) error{InvalidConfig}!void {
+        if (self.inbound_wire_chunks_per_connection < H2C_MIN_WRITE_QUEUE_CHUNKS) return error.InvalidConfig;
     }
 
     pub fn resourceUpperBound(self: Limits) error{InvalidConfig}!ResourceUpperBound {
@@ -242,6 +272,8 @@ pub const Limits = struct {
         // instead of fail-closed.
         if (self.control_bytes_per_connection <= TERMINAL_CONTROL_RESERVE_BYTES) return error.InvalidConfig;
         if (self.control_entries_per_connection <= TERMINAL_CONTROL_RESERVE_ENTRIES) return error.InvalidConfig;
+        // Zero would close before the GOAWAY is written, the defect this limit exists to remove.
+        if (self.close_flush_timeout_ns == 0) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.listen_backlog == 0) return error.InvalidConfig;
         if (self.tls_stream_bytes < TLS_CONN_BUFFER_BYTES) return error.InvalidConfig;

@@ -87,7 +87,7 @@ test "counting allocator: Server.init under published ceiling" {
         .max_streams_per_server = 8,
         .cancellation_reaper_jobs = 8,
         .cancellation_reaper_tasks = 2,
-        .inbound_wire_chunks_per_connection = 2,
+        .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
         .outbound_bytes_per_connection = 16 * 1024,
         .outbound_bytes_per_server = 64 * 1024,
@@ -145,7 +145,7 @@ test "fail-index iteration: Server.init fails closed" {
         .max_streams_per_server = 4,
         .cancellation_reaper_jobs = 4,
         .cancellation_reaper_tasks = 1,
-        .inbound_wire_chunks_per_connection = 1,
+        .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 1024,
         .outbound_bytes_per_connection = 4 * 1024,
         .outbound_bytes_per_server = 8 * 1024,
@@ -211,7 +211,7 @@ test "counting allocator peak under live hello stays under ceiling" {
         .max_streams_per_server = 8,
         .cancellation_reaper_jobs = 8,
         .cancellation_reaper_tasks = 2,
-        .inbound_wire_chunks_per_connection = 2,
+        .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
         .outbound_bytes_per_connection = 16 * 1024,
         .outbound_bytes_per_server = 64 * 1024,
@@ -375,4 +375,33 @@ test "raised request_body_bytes: publish concurrent body memory cost" {
     try std.testing.expect(full.allocator_bytes > body_only.allocator_bytes);
     const delta = full.allocator_bytes - body_only.allocator_bytes;
     try std.testing.expect(delta >= need_conn);
+}
+
+test "h2c: a write queue smaller than one pop's reservation is rejected at boot (t-3520)" {
+    // One pop pushes up to `pushes_per_pop` (2) chunks and the drain's tail one
+    // more: 3. The h2c write queue is `inbound_wire_chunks_per_connection` slots
+    // with no extra, so a smaller queue lets one pop push more than is free and
+    // park the actor in `putOne` under `session_mu`.
+    const min_slots = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS;
+    try std.testing.expectEqual(@as(usize, 3), min_slots);
+    const gpa = std.testing.allocator;
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    var lim = starh2.Limits.defaults;
+
+    lim.inbound_wire_chunks_per_connection = min_slots - 1;
+    try std.testing.expectError(error.InvalidConfig, starh2.Server.init(gpa, std.testing.io, .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &.{},
+        .tls = null,
+        .limits = lim,
+    }));
+
+    lim.inbound_wire_chunks_per_connection = min_slots;
+    var server = try starh2.Server.init(gpa, std.testing.io, .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &.{},
+        .tls = null,
+        .limits = lim,
+    });
+    server.deinit(gpa);
 }

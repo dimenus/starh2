@@ -297,6 +297,19 @@ pub var test_preface_checks: std.atomic.Value(usize) = .init(0);
 /// preface tests assert every tested connection took that path, because a
 /// server read that returned only the Finished record would skip it.
 pub var test_tls_leftover_connections: std.atomic.Value(usize) = .init(0);
+/// Counts the times `error.Canceled` reached `Connection.run`, so a test can
+/// tell a cancel that left as `Canceled` from one a `catch` turned into
+/// something else. The connection task's result is not visible to a test.
+pub var test_run_canceled: std.atomic.Value(usize) = .init(0);
+/// Counts the times `runPendingInline` saw `error.Canceled` from its drain. With
+/// `test_run_canceled` it lets a test tell WHICH path carried a cancel: a cancel
+/// parked elsewhere (the main-loop drain, a select) reaches `run` without
+/// moving this one.
+pub var test_inline_drain_canceled: std.atomic.Value(usize) = .init(0);
+/// Counts the pops an ending h2c connection held back because the write queue
+/// had no room (see `h2cEndingPause`). A test that expects the hold-back
+/// proves it ran; removing the hooks leaves the other tests green.
+pub var test_closing_emit_deferred: std.atomic.Value(usize) = .init(0);
 /// Test-only: true while FairScheduler sink is executing queueWire.
 threadlocal var test_in_sched_sink: bool = false;
 /// Test-only: force queueWire/send fail after N successful accounted sends (0=never).
@@ -1374,6 +1387,10 @@ const Connection = struct {
     /// lost wakeup.
     sched_refilled: std.atomic.Value(bool) = .init(false),
     grace_deadline: ?std.Io.Timestamp = null,
+    /// Set when the connection has decided to close and is delivering the
+    /// frames it already queued: the time after which it stops waiting for the
+    /// peer. Null while the connection is open. See `runBody` ("Closing phase").
+    closing_deadline_ns: ?u64 = null,
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
     session_mu: std.Io.Mutex = .init,
@@ -1537,6 +1554,9 @@ const Connection = struct {
     };
 
     fn init(stream: std.Io.net.Stream, config: ConnConfig) !Connection {
+        // `Server.init` checks this at boot; a connection built any other way
+        // gets the same answer, not a queue its drain can overrun.
+        if (config.mode == .h2c) try config.limits.checkH2cWriteQueue();
         const gpa = config.gpa;
         var session = try session_mod.Session.init(gpa, config.limits);
         errdefer {
@@ -2370,7 +2390,11 @@ const Connection = struct {
     ///
     /// Only the complete-batch receipt waits here, and its handlers have
     /// already finished, so there is no terminal cause to map.
-    fn waitTicketDraining(self: *Connection, slot_i: u32) bool {
+    ///
+    /// Both waits here are cancellation points. zio delivers a cancel once, so
+    /// `error.Canceled` leaves as itself and is not folded into "the write
+    /// did not land" (`false`).
+    fn waitTicketDraining(self: *Connection, slot_i: u32) error{Canceled}!bool {
         while (!self.tickets.isSignaled(slot_i)) {
             self.drainWriteAcks();
             if (self.tickets.isSignaled(slot_i)) break;
@@ -2379,10 +2403,10 @@ const Connection = struct {
                 // the send is in flight: drive the CQ, never park on a
                 // channel with no TLS producer.
                 const pump = self.tls_driver orelse break;
-                const winner = zio.select(.{
+                const winner = try zio.select(.{
                     .io = &pump.cq,
                     .bell = self.doorbell.asyncReceive(),
-                }) catch break;
+                });
                 switch (winner) {
                     .io => |r| {
                         const c = r catch break;
@@ -2395,10 +2419,10 @@ const Connection = struct {
                 }
                 continue;
             }
-            const winner = zio.select(.{
+            const winner = try zio.select(.{
                 .acks = self.write_ack_ch.asyncReceive(),
                 .bell = self.doorbell.asyncReceive(),
-            }) catch break;
+            });
             switch (winner) {
                 .acks => |r| {
                     const ack = r catch break;
@@ -2409,7 +2433,10 @@ const Connection = struct {
                 },
             }
         }
-        self.tickets.wait(slot_i, null) catch return false;
+        self.tickets.wait(slot_i, null) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            return false;
+        };
         return true;
     }
 
@@ -2535,10 +2562,10 @@ const Connection = struct {
     /// consume ready receipts so the closing `runPendingInline` has a slot,
     /// then stop the batch on terminal or writer failure. Do not `runPendingInline`
     /// here — extras share one drain-turn after the batch.
-    fn inboundBatchShouldStop(self: *Connection) InboundBatchStop {
+    fn inboundBatchShouldStop(self: *Connection) error{Canceled}!InboundBatchStop {
         self.drainWriteAcks();
         _ = self.drainCompletions();
-        self.drainPendingCompleteReceipts(false);
+        try self.drainPendingCompleteReceipts(false);
         if (self.writer_failed.load(.acquire)) return .failed;
         self.lockSessionUncancelable(self.config.io);
         defer self.unlockSession(self.config.io);
@@ -2567,6 +2594,9 @@ const Connection = struct {
                 _ = trace.intent_n.fetchAdd(1, .monotonic);
             }
         }
+        // Start closing here, under the hold ingest already has, so the
+        // inline queue is frozen before anything can run those handlers.
+        self.beginClosingIfTerminal();
         return self.session.terminal != .none;
     }
 
@@ -2622,7 +2652,7 @@ const Connection = struct {
     /// via `waitTicketDraining` so in-flight acks can land. The ordinary path
     /// never starts that wait for an unsignaled front receipt — the loop top
     /// applies acks first, then this drain sees the event.
-    fn drainPendingCompleteReceipts(self: *Connection, finalize_all: bool) void {
+    fn drainPendingCompleteReceipts(self: *Connection, finalize_all: bool) error{Canceled}!void {
         const wait_unsignaled = finalize_all or self.complete_receipts_fail_all.swap(false, .acq_rel);
 
         while (self.pending_complete_receipt_n > 0) {
@@ -2635,7 +2665,7 @@ const Connection = struct {
                 std.debug.assert(meta.ticket == receipt.ticket);
             }
 
-            const receipt_ok = self.waitTicketDraining(receipt.ticket_slot);
+            const receipt_ok = try self.waitTicketDraining(receipt.ticket_slot);
             if (receipt.send_trace) |t| {
                 if (receipt_ok) self.stampSendWait(t) else self.trace_ticket.store(0, .release);
             }
@@ -2660,6 +2690,10 @@ const Connection = struct {
     /// Handler deadlines are handler-owned zio timed waits and never appear
     /// in the actor's park timer.
     fn nextDeadlineNs(self: *Connection) ?u64 {
+        // While closing, the other deadlines are not enforced (the loop does
+        // not run them), and an overdue one would make `waitForActivity`
+        // return at once on every turn.
+        if (self.closing_deadline_ns) |deadline| return deadline;
         var next = self.session.nextIdleDeadlineNs();
         if (self.sched.nextSlowDeadlineNs(self.config.limits.slow_consumer_timeout_ns)) |deadline| {
             if (next == null or deadline < next.?) next = deadline;
@@ -2836,10 +2870,15 @@ const Connection = struct {
         const pump = self.tls_driver.?;
         if (pump.inbound_eof) return true;
 
+        // Closing phase: a completion taken here can be the last send, which
+        // is what ends the phase. Only the lock block decides that, so a turn
+        // that took one goes round again instead of parking on the timer.
+        var polled_progress = false;
         if (pump.pending_cipher == null) {
             switch (pump.pollRecv()) {
                 .exit => return true,
-                .progress, .none => {},
+                .progress => polled_progress = true,
+                .none => {},
             }
         }
 
@@ -2862,6 +2901,10 @@ const Connection = struct {
 
         var held_n: usize = 0;
         var leave = false;
+        // Closing phase: the peer's frames are read and dropped, not ingested.
+        // Reading on keeps the pump from stalling on a full inbound buffer and
+        // keeps `waitForActivity` from refusing to park on unread plaintext.
+        const closing = self.closing_deadline_ns != null;
         while (held_n < inbound_chunk_batch) {
             if (pump.pending_read == null and pump.conn.pendingInbound()) {
                 switch (pump.readOne()) {
@@ -2874,8 +2917,11 @@ const Connection = struct {
             pump.pending_read = null;
             if (chunk.len == 0) return true;
             held_n += 1;
+            if (closing) continue;
             leave = try self.ingestWireChunk(chunk) or leave;
-            if (leave) return true;
+            // Session went terminal. If that began the closing phase, the next
+            // turn writes the GOAWAY; otherwise the writer failed: leave.
+            if (leave) return self.closing_deadline_ns == null;
             if (self.writer_failed.load(.acquire)) break;
         }
         if (held_n > 0) {
@@ -2883,9 +2929,11 @@ const Connection = struct {
                 if (!pump.drivePending()) return true;
             }
             if (self.live_task_handlers.load(.acquire) > 0) {
-                self.config.io.sleep(.zero, .awake) catch {};
+                // A yield is a cancellation point. zio delivers a cancel once,
+                // so it must leave as `error.Canceled`, not be dropped here.
+                try self.config.io.sleep(.zero, .awake);
             }
-            self.runPendingInline();
+            try self.runPendingInline();
             return false;
         }
 
@@ -2912,6 +2960,7 @@ const Connection = struct {
             return false;
         }
         self.diag_no_park_run = 0;
+        if (polled_progress and self.closing_deadline_ns != null) return false;
 
         const maybe_chunk = try self.waitForActivity();
         if (maybe_chunk) |chunk| {
@@ -2948,7 +2997,7 @@ const Connection = struct {
         // every turn, so the actor never parks and holds its executor for the
         // whole drain (t-2652). The drain still wakes on its own deadlines
         // (`grace_deadline` is in nextDeadlineNs) and on peer activity.
-        const shutdown_ev = if (self.shutting_down)
+        const shutdown_ev = if (self.shutting_down or self.closing_deadline_ns != null)
             &no_shutdown_event
         else
             self.config.shutdown_event orelse &no_shutdown_event;
@@ -3074,8 +3123,10 @@ const Connection = struct {
     ///    must leave the scheduler before any client byte is ingested
     ///    (RFC 9113 section 3.4).
     /// 4. TLS only: ingest the leftover plaintext, then flush again. It still
-    ///    reaches Session before any byte the pump received.
-    /// 5. For h2c, wait for the client preface under the preface deadline.
+    ///    reaches Session before any byte the pump received. A connection
+    ///    error here starts the closing phase; it does not return.
+    /// 5. For h2c, wait for the client preface under the preface deadline. A
+    ///    bad preface starts the closing phase the same way.
     ///
     /// ## Steady-state iteration
     /// Each pass does the same five things, and the order is the contract:
@@ -3096,6 +3147,33 @@ const Connection = struct {
     ///    source holds persistent evidence, so a publish that races the park
     ///    is observed by the select's fast path — no reset, no recheck list.
     ///
+    /// ## Closing phase
+    /// RFC 9113 section 5.4.1: on a connection error send GOAWAY first, then
+    /// close. The connection starts a closing phase, inside the same loop, when
+    /// Session becomes terminal with a GOAWAY queued (a connection error, in the
+    /// first flight or later) or when a graceful drain ends and its RST_STREAMs
+    /// are queued. `beginClosing` sets `closing_deadline_ns` and runs the sweep,
+    /// so handlers are told to stop and no inline job runs. Then, each turn:
+    /// - The deadline checks, graceful steps, slow-consumer kills and parked
+    ///   dispatch are skipped. The materialize and emit steps still run, so a
+    ///   frame still in the scheduler reaches the writer.
+    /// - Inbound bytes are read and dropped, not ingested. Reading on keeps the
+    ///   TLS pump from stalling on a full inbound buffer; dropping means a peer
+    ///   that keeps talking cannot restart the work the sweep just stopped.
+    /// - Writes are driven the normal way: `driveTlsTurn` on TLS, the WritePump
+    ///   on h2c. On h2c, once the connection is ending, `drainEmit` installs
+    ///   scheduler pause hooks (`h2cEndingPause`) that stop each pop that lacks
+    ///   room in the write queue: a push would park the actor in `putOne`, and
+    ///   the deadline could not fire. The frames wait in the scheduler, and a
+    ///   write completion wakes the actor to try again.
+    /// - `closeFlushed` ends the phase when `outboundFlushed` (every chunk acked,
+    ///   and on TLS the socket has accepted all ciphertext), or the deadline
+    ///   `Limits.close_flush_timeout_ns` passed, or the writer failed. It is
+    ///   the only place that decides this.
+    /// A cancel during the phase is not caught: it leaves through `run` like
+    /// any other, and `run` re-raises it. After the phase, the teardown below
+    /// runs unchanged and releases whatever the phase did not write.
+    ///
     /// ## Teardown sequence (the `defer` block, then the tail)
     /// 1. Tell the live pump(s) to stop. h2c: push a sentinel so a writer
     ///    parked on an empty queue wakes. TLS: close the unused overflow
@@ -3115,6 +3193,9 @@ const Connection = struct {
         // `errdefer` at the top of the body gave before Zig 0.17 removed
         // error capture from `errdefer`.
         self.runBody(&torn_down) catch |err| {
+            if (comptime test_observe) {
+                if (err == error.Canceled) _ = test_run_canceled.fetchAdd(1, .acq_rel);
+            }
             if (!torn_down) {
                 torn_down = true;
                 self.teardownExhaustive();
@@ -3262,7 +3343,6 @@ const Connection = struct {
         // the loop first takes a completion off the pump's queue, so it still
         // reaches Session before any byte the pump received. Emit after the CQ is armed so queueWire can
         // encrypt.
-        var first_flight_terminal = false;
         {
             self.lockSessionUncancelable(io);
             defer self.unlockSession(io);
@@ -3273,15 +3353,12 @@ const Connection = struct {
                 try self.session.ingest(self.config.tls_leftover);
                 try self.flushSessionIntents();
             }
-            // Read under the lock: ingest can spawn task handlers, and they
-            // mutate `terminal` under `session_mu`.
-            first_flight_terminal = self.session.terminal != .none;
+            // A connection error in the first flight starts the closing phase
+            // here, under the lock: its GOAWAY is stashed behind the SETTINGS
+            // and the loop below writes both.
+            self.beginClosingIfTerminal();
         }
-        // A connection error in the first flight leaves here. Its GOAWAY is
-        // stashed behind the SETTINGS; whether teardown writes it is the
-        // general GOAWAY-delivery question (t-3520), not decided here.
-        if (first_flight_terminal) return error.ConnectionClosed;
-        self.runPendingInline();
+        try self.runPendingInline();
 
         if (close_probe) diagRawPrint("t1002 conn={x} sess={x} start peer={d} parked={d}\n", .{ @intFromPtr(self), @intFromPtr(&self.session), closeProbePeerPort(self.stream.socket.handle), close_probe_parked.load(.acquire) });
         if (self.config.mode == .h2c) {
@@ -3289,7 +3366,7 @@ const Connection = struct {
                 @as(i96, nowNs(io) +% self.config.limits.preface_timeout_ns),
             );
             try self.waitH2cPreface();
-            self.runPendingInline();
+            try self.runPendingInline();
         }
 
         var inbound_eof = false;
@@ -3303,10 +3380,10 @@ const Connection = struct {
             self.drainWriteAcks();
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
             _ = self.drainCompletions();
-            self.drainPendingCompleteReceipts(false);
+            try self.drainPendingCompleteReceipts(false);
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
             diagActor(self, .inline_handlers);
-            if (!leaving and !self.writer_failed.load(.acquire)) self.runPendingInline();
+            if (!leaving and !self.writer_failed.load(.acquire)) try self.runPendingInline();
 
             {
                 diagActor(self, .loop_lock);
@@ -3315,31 +3392,36 @@ const Connection = struct {
                 defer self.unlockSession(io);
                 defer diagActor(self, .running);
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
-                if (leaving) {
+                // `.transport` is the writer-failed terminal: nothing to deliver.
+                if (leaving or self.session.terminal == .transport) {
                     self.freezeAndSweepLocked();
                     break;
                 }
-                if (self.session.terminal != .none) {
-                    self.freezeAndSweepLocked();
-                    break;
+                self.beginClosingIfTerminal();
+                // While closing, none of the checks below run: no deadline is
+                // enforced, no graceful step is taken and no parked request is
+                // dispatched. Only the emit that follows does, so a frame still
+                // in the scheduler reaches the writer.
+                if (self.closing_deadline_ns == null) {
+                    const now = nowNs(io);
+                    self.session.edge_now_ns = now;
+                    try self.session.checkIdleDeadlines(now);
+                    if (try self.maybeBeginGraceful()) {
+                        // The drain is over; its RST_STREAMs are queued.
+                        self.beginClosing();
+                    } else {
+                        try self.checkSlowConsumers();
+                        // Deadlines and slow-consumer kills push Session intents
+                        // (RST_STREAM, stream_reset). drainEmit only walks the
+                        // scheduler, so those intents have to be materialized first or
+                        // the RST'd streams keep their pending DATA, drain skips them
+                        // forever, and the actor parks until slow-consumer. That is
+                        // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
+                        // Slots freed since the last turn go to parked requests before
+                        // any new one, so a waiting request is not overtaken.
+                        try self.dispatchParked();
+                    }
                 }
-                const now = nowNs(io);
-                self.session.edge_now_ns = now;
-                try self.session.checkIdleDeadlines(now);
-                if (try self.maybeBeginGraceful()) {
-                    self.freezeAndSweepLocked();
-                    break;
-                }
-                try self.checkSlowConsumers();
-                // Deadlines and slow-consumer kills push Session intents
-                // (RST_STREAM, stream_reset). drainEmit only walks the
-                // scheduler, so those intents have to be materialized first or
-                // the RST'd streams keep their pending DATA, drain skips them
-                // forever, and the actor parks until slow-consumer. That is
-                // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
-                // Slots freed since the last turn go to parked requests before
-                // any new one, so a waiting request is not overtaken.
-                try self.dispatchParked();
                 diagActor(self, .lk_materialize);
                 self.materializeIntents() catch {
                     // Terminal enqueue failure sets writer_failed inside
@@ -3347,7 +3429,9 @@ const Connection = struct {
                     self.failClosedOnIntentError();
                 };
                 diagActor(self, .lk_drain_emit);
-                self.drainEmit() catch {
+                self.drainEmit() catch |err| {
+                    // A cancel is not a write failure: leave as `error.Canceled`.
+                    if (err == error.Canceled) return err;
                     // Fail-closed: Session may already be debited — terminate connection.
                     // A frame that failed after its flow-control debit cannot
                     // be retried and cannot be un-debited, so the connection's
@@ -3371,31 +3455,43 @@ const Connection = struct {
                 // lock and this fires, instead of the race returning silently.
                 diagActor(self, .lk_tail);
                 self.assertSessionHeld("graceful finish check");
-                if (self.session.terminal != .none) {
-                    self.freezeAndSweepLocked();
-                    break;
+                if (self.closing_deadline_ns == null) {
+                    if (self.session.terminal == .goaway) {
+                        // Made terminal this turn (a deadline above), and
+                        // `drainEmit` has just queued its GOAWAY.
+                        self.beginClosing();
+                    } else if (self.session.terminal != .none) {
+                        self.freezeAndSweepLocked();
+                        break;
+                    } else if (self.shutting_down and self.session.grace_phase == .phase2 and
+                        // Graceful finish needs all four conditions together: phase 2
+                        // reached, nothing left to write, no handler still running,
+                        // and no request waiting for a slot. Any one alone would cut
+                        // off work that is still in flight.
+                        self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0 and
+                        self.parked_len == 0)
+                    {
+                        try self.finishGraceful();
+                        self.beginClosing();
+                    } else if (inbound_eof) {
+                        self.freezeAndSweepLocked();
+                        break;
+                    }
                 }
-                // Graceful finish needs all four conditions together: phase 2
-                // reached, nothing left to write, no handler still running,
-                // and no request waiting for a slot. Any one alone would cut
-                // off work that is still in flight.
-                if (self.shutting_down and self.session.grace_phase == .phase2 and
-                    self.sched.pendingCount() == 0 and self.live_handlers.load(.acquire) == 0 and
-                    self.parked_len == 0)
-                {
-                    try self.finishGraceful();
-                    self.freezeAndSweepLocked();
-                    break;
-                }
-                if (inbound_eof) {
-                    self.freezeAndSweepLocked();
-                    break;
+                // Checked in the turn that began the phase too. If nothing was
+                // queued, no write completion will ever wake the actor, and it
+                // would wait out the whole deadline.
+                if (self.closing_deadline_ns) |deadline| {
+                    if (self.closeFlushed(deadline)) {
+                        self.freezeAndSweepLocked();
+                        break;
+                    }
                 }
             }
             // The donate-yield that followed fire-due is gone with the heap:
             // a handler deadline parks on its own timed wait, so zio makes
             // the waiter runnable without the actor's help.
-            self.runPendingInline();
+            try self.runPendingInline();
 
             if (self.config.mode == .tls) {
                 if (try self.driveTlsTurn()) {
@@ -3415,6 +3511,12 @@ const Connection = struct {
                 if (maybe_chunk == null) continue;
             }
             const chunk = maybe_chunk.?;
+            // Closing phase: read and drop (an EOF too: the write side may
+            // still be open, and the GOAWAY is for a peer that half-closed).
+            if (self.closing_deadline_ns != null) {
+                self.recycleReadChunk(chunk);
+                continue;
+            }
             if (chunk.len == 0 and chunk.bytes.len == 0) {
                 self.beginLeave(&leaving);
                 continue;
@@ -3440,7 +3542,7 @@ const Connection = struct {
                         inbound_eof = true;
                         break;
                     }
-                    switch (self.inboundBatchShouldStop()) {
+                    switch (try self.inboundBatchShouldStop()) {
                         .go => {},
                         .terminal => leave = true,
                         .failed => {},
@@ -3454,11 +3556,14 @@ const Connection = struct {
                 }
             }
             if (trace.enabled) noteInboundBatch(held_n);
-            if (leave or self.writer_failed.load(.acquire)) {
+            // Session went terminal. If that began the closing phase, the lock
+            // block above drives it; otherwise the writer failed: leave.
+            if (self.writer_failed.load(.acquire) or (leave and self.closing_deadline_ns == null)) {
                 self.beginLeave(&leaving);
                 continue;
             }
-            self.runPendingInline();
+            if (leave) continue;
+            try self.runPendingInline();
         }
 
         self.teardownExhaustive();
@@ -3533,7 +3638,12 @@ const Connection = struct {
                 defer self.unlockSession(self.config.io);
                 try self.session.ingest(chunk.bytes[0..chunk.len]);
                 try self.processIntents();
-                if (self.session.terminal != .none) return error.ConnectionClosed;
+                // A bad preface is a connection error. Return to the main
+                // loop, which delivers its GOAWAY.
+                if (self.session.terminal != .none) {
+                    self.beginClosingIfTerminal();
+                    return;
+                }
             }
         }
         self.preface_deadline = null;
@@ -3766,6 +3876,9 @@ const Connection = struct {
     fn freezeAndSweepLocked(self: *Connection) void {
         self.assertSessionHeld("freezeAndSweepLocked");
         std.debug.assert(self.inline_n <= self.inline_sids.len);
+        // A second freeze (closing phase, then teardown) must find nothing new
+        // to freeze, or it would overwrite the first batch and leak its jobs.
+        std.debug.assert(self.inline_n == 0 or self.teardown_inline_n == 0);
         if (self.inline_n != 0) {
             self.teardown_inline_n = self.inline_n;
             self.inline_n = 0;
@@ -3797,6 +3910,76 @@ const Connection = struct {
         self.closeWriterQueues();
         leaving.* = true;
         std.debug.assert(leaving.*);
+    }
+
+    /// Start the closing phase (see `runBody`). The caller holds `session_mu`,
+    /// and the last frames the connection will send are already queued: a
+    /// terminal GOAWAY, or the RST_STREAMs that end a graceful drain.
+    ///
+    /// The sweep runs now, not at the end, so that no handler writes more
+    /// while the phase waits and no inline job runs against a closing
+    /// connection. `teardownExhaustive` runs it again; it is idempotent.
+    fn beginClosing(self: *Connection) void {
+        self.assertSessionHeld("beginClosing");
+        std.debug.assert(self.closing_deadline_ns == null);
+        self.closing_deadline_ns = nowNs(self.config.io) +% self.config.limits.close_flush_timeout_ns;
+        self.freezeAndSweepLocked();
+    }
+
+    /// `.goaway` is the only terminal state with a frame to deliver:
+    /// `.transport` means the writer already failed.
+    fn beginClosingIfTerminal(self: *Connection) void {
+        self.assertSessionHeld("beginClosingIfTerminal");
+        if (self.closing_deadline_ns != null) return;
+        if (self.session.terminal != .goaway) return;
+        self.beginClosing();
+    }
+
+    /// The ONE place that decides the closing phase is over: everything queued
+    /// has been written, or the deadline passed, or the writer failed.
+    fn closeFlushed(self: *Connection, deadline_ns: u64) bool {
+        self.assertSessionHeld("closeFlushed");
+        if (self.writer_failed.load(.acquire)) return true;
+        if (nowNs(self.config.io) >= deadline_ns) return true;
+        return self.outboundFlushed();
+    }
+
+    /// True when nothing is left between Session and the socket: no intent,
+    /// no scheduler entry, no chunk the writer has not acked, and on TLS no
+    /// ciphertext the socket has not accepted. h2c acks a chunk after its
+    /// flush, so for h2c "acked" already means "written".
+    fn outboundFlushed(self: *Connection) bool {
+        if (self.session.intentLen() != 0) return false;
+        if (!self.sched.idle()) return false;
+        if (self.wire_outbound_held.load(.acquire) != 0) return false;
+        if (self.config.mode == .tls) return self.tls_driver.?.writesDrained();
+        return true;
+    }
+
+    /// The scheduler's pause hook for an ending h2c connection: stop before a
+    /// pop when the write queue lacks the room one pop is reserved. The
+    /// scheduler asks before EVERY pop, so a drain with many entries cannot
+    /// push past the room it checked, which a single check before `drain`
+    /// could not promise.
+    fn h2cEndingPause(ctx: *anyopaque) bool {
+        const self: *Connection = @ptrCast(@alignCast(ctx));
+        if (self.h2cEndingHasRoom()) return false;
+        if (comptime test_observe) _ = test_closing_emit_deferred.fetchAdd(1, .monotonic);
+        return true;
+    }
+
+    /// True when the h2c write queue can take what one pop pushes
+    /// (`Pump.pushes_per_pop` plus `Pump.tail_pushes_per_drain`, the bound TLS
+    /// also uses). TLS gets its room by adding stash slots; h2c does not, so
+    /// `Limits.checkH2cWriteQueue` rejects a smaller queue at boot and the
+    /// reservation always fits in it.
+    fn h2cEndingHasRoom(self: *Connection) bool {
+        std.debug.assert(self.config.mode == .h2c);
+        const capacity = self.write_ch_buf.len;
+        const needed = tls_edge.Pump.pushes_per_pop + tls_edge.Pump.tail_pushes_per_drain;
+        std.debug.assert(needed == limits_mod.H2C_MIN_WRITE_QUEUE_CHUNKS);
+        std.debug.assert(capacity >= needed);
+        return capacity - io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) >= needed;
     }
 
     fn countInUseSlots(self: *const Connection) usize {
@@ -4274,6 +4457,23 @@ const Connection = struct {
     /// window state the peer does not share.
     fn drainEmit(self: *Connection) !void {
         self.assertSessionHeld("drainEmit");
+        // A connection that is ending must not park in `pushWriteChunk`: it
+        // would wait in `putOne` for room, holding `session_mu`, and a writer
+        // that is not moving never makes room, so the closing deadline could
+        // not fire. TLS bounds its drain with pause hooks that re-check room
+        // before every pop. h2c gets the same hooks, but only from the moment
+        // it is ending, so its normal drain is unchanged. The frames the hooks
+        // hold back stay in the scheduler, and the closing phase drains again
+        // when a write completes. Terminal Session counts as ending here
+        // because the drain inside `ingestWireChunk` runs before the closing
+        // phase has begun.
+        if (self.config.mode == .h2c and self.sched.pause_control == null and
+            (self.closing_deadline_ns != null or self.session.terminal == .goaway))
+        {
+            self.sched.pause = h2cEndingPause;
+            self.sched.pause_control = h2cEndingPause;
+            self.sched.pause_ctx = self;
+        }
         if (diag_park) {
             const now = nowNs(self.config.io);
             if (diag_last_drain_ns != 0) diag_prev_drain_gap_ns = now -% diag_last_drain_ns;
@@ -4809,8 +5009,9 @@ const Connection = struct {
                         if (!slot.in_use) continue;
                         slot.terminal.setCause(.connection_closed);
                     }
-                    if (diag_park) diagRawPrint("WFSET intent_conn_err conn={x}\n", .{ @intFromPtr(self) & 0xffff });
-                    self.writer_failed.store(true, .release);
+                    // The writer is NOT failed: the GOAWAY queued just before this
+                    // intent is still to be written (closing phase). Handlers
+                    // are told the connection is closed by the cause above.
                 },
                 .connection_closed => {
                     for (self.handlers.slice()) |*slot| {
@@ -4874,7 +5075,7 @@ const Connection = struct {
     /// Hand a chunk to WritePump. Never parks the actor once the connection is
     /// going away: tryPut, shut the socket to unstick a blocked write, retry
     /// once, then fail. A healthy connection still `putOne`s for backpressure.
-    fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{WriteFailed}!void {
+    fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{ WriteFailed, Canceled }!void {
         if (self.config.mode == .tls) {
             // Encrypt + stage + arm on this task. Acks apply in `post` via
             // `ack_apply` (no write_ack_ch hop). `pause` (DATA) and
@@ -4904,14 +5105,23 @@ const Connection = struct {
             if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
                 return;
             }
-            self.stream.shutdown(self.config.io, .both) catch {};
+            // `shutdown` and `putOne` are cancellation points. zio delivers a
+            // cancel once, so `error.Canceled` leaves as itself; any other
+            // error keeps its meaning (a failed shutdown is best effort, a
+            // closed queue is a failed write).
+            self.stream.shutdown(self.config.io, .both) catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+            };
             if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
                 return;
             }
             return error.WriteFailed;
         }
         self.actor_site.store(4, .release);
-        self.write_ch.putOne(self.config.io, chunk) catch return error.WriteFailed;
+        self.write_ch.putOne(self.config.io, chunk) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => return error.WriteFailed,
+        };
         self.actor_site.store(1, .release);
     }
 
@@ -5052,11 +5262,12 @@ const Connection = struct {
             .control_release = control_n,
             .control_entries = control_entries,
             .pool_index = lease.pool_index,
-        }) catch {
+        }) catch |err| {
             self.applyOutboundRelease(src.len, .wire);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             self.returnWriteChunk(lease);
-            return error.WriteFailed;
+            // `err` is `WriteFailed` or `Canceled`; a cancel must not become a failed write.
+            return err;
         };
     }
 
@@ -5637,7 +5848,13 @@ const Connection = struct {
     /// ready — it does not `waitTicket` here. The jobs do not wait for it:
     /// see `PendingCompleteReceipt` for why their slots free now (t-3491).
     /// SSE and any handler that can wait are still spawned (`connPlacement`).
-    fn runPendingInline(self: *Connection) void {
+    ///
+    /// The drain can park in `putOne` on a full h2c queue, a cancellation
+    /// point. `error.Canceled` leaves as itself, after the batch below is
+    /// finished exactly as on any other drain failure: each job once, the
+    /// receipt slot released, the inline queue shifted. Every other drain error
+    /// still goes to `failClosedOnIntentError`.
+    fn runPendingInline(self: *Connection) error{Canceled}!void {
         // Do not assert `!session_held`: that flag means SOMEBODY holds the
         // mutex, often a task handler's sendCb, not this actor. Taking the
         // lock to discover an empty queue would convoy behind that handler
@@ -5687,6 +5904,8 @@ const Connection = struct {
         var receipt_attached = false;
         var wait_job: ?*HandlerJob = null;
         var reservation_failed = false;
+        // Set when the drain was canceled; returned once the batch is finished.
+        var canceled = false;
         var receipt_trace: ?SendTrace = null;
         {
             self.lockSessionUncancelable(self.config.io);
@@ -5732,7 +5951,14 @@ const Connection = struct {
             }
 
             if (!reservation_failed) {
-                self.processIntentsWithReceipt(receipt_ticket, receipt_slot, &receipt_attached) catch self.failClosedOnIntentError();
+                self.processIntentsWithReceipt(receipt_ticket, receipt_slot, &receipt_attached) catch |err| {
+                    if (err == error.Canceled) {
+                        if (comptime test_observe) _ = test_inline_drain_canceled.fetchAdd(1, .acq_rel);
+                        canceled = true;
+                    } else {
+                        self.failClosedOnIntentError();
+                    }
+                };
             }
         }
 
@@ -5774,6 +6000,7 @@ const Connection = struct {
             }
             self.inline_n = rest;
         }
+        if (canceled) return error.Canceled;
     }
 
     fn withSession(self: *Connection, comptime f: anytype, arg: anytype) void {
@@ -6678,10 +6905,10 @@ pub const BenchHop = struct {
             try self.conn.processIntents();
         }
         self.drainLocalWrites();
-        self.conn.runPendingInline();
+        try self.conn.runPendingInline();
         self.drainLocalWrites();
         if (!self.conn.frontCompleteReceiptReady()) return error.HopNoReceipt;
-        self.conn.drainPendingCompleteReceipts(false);
+        try self.conn.drainPendingCompleteReceipts(false);
         if (self.conn.writer_failed.load(.acquire)) return error.HopWriterFailed;
         if (self.conn.pending_complete_receipt_n != 0) return error.HopReceiptStuck;
         if (self.conn.inline_n != 0) return error.HopInlineStuck;
@@ -6810,6 +7037,82 @@ fn hopBigBody(_: *anyopaque, _: *const request.Request, resp: *response.Complete
     try resp.send(200, &.{}, &body);
 }
 
+const PushProbe = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+};
+
+fn pushProbeTask(conn: *Connection, out: *PushProbe) void {
+    conn.pushWriteChunk(.{ .bytes = &.{}, .len = 0, .flush_barrier = true }) catch |err| {
+        out.err = err;
+    };
+    out.done.store(true, .release);
+}
+
+/// The same push, through the accounting wrapper every production frame uses.
+fn sendProbeTask(conn: *Connection, out: *PushProbe) void {
+    var settings: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    const n = frame.Serializer.settingsFrame(&settings, true, &.{}) catch unreachable;
+    conn.sendAccountedWire(settings[0..n], false, 0, 0, 0, 0, 0, false, null) catch |err| {
+        out.err = err;
+    };
+    out.done.store(true, .release);
+}
+
+fn pushCancelBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const io = rt.io();
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    const barrier: wire_pump.WireChunk = .{ .bytes = &.{}, .len = 0, .flush_barrier = true };
+    // Fill the write queue, so the next push parks in `putOne`.
+    while (io_queue.tryPut(wire_pump.WireChunk, &conn.write_ch, io, barrier)) {}
+    defer while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, io)) |_| {};
+
+    var probe: PushProbe = .{};
+    var h = try rt.spawn(pushProbeTask, .{ conn, &probe });
+    zio.sleep(.fromMilliseconds(100)) catch {};
+    // Still parked: nothing made room.
+    try std.testing.expect(!probe.done.load(.acquire));
+    h.cancel();
+    try std.testing.expect(probe.done.load(.acquire));
+    try std.testing.expectEqual(error.Canceled, probe.err orelse return error.PushReturnedOk);
+
+    // Through `sendAccountedWire`: the cancel survives its cleanup path, and
+    // the cleanup still releases the wire reservation it took.
+    var send_probe: PushProbe = .{};
+    var h2 = try rt.spawn(sendProbeTask, .{ conn, &send_probe });
+    zio.sleep(.fromMilliseconds(100)) catch {};
+    try std.testing.expect(!send_probe.done.load(.acquire));
+    h2.cancel();
+    try std.testing.expect(send_probe.done.load(.acquire));
+    try std.testing.expectEqual(error.Canceled, send_probe.err orelse return error.SendReturnedOk);
+    try std.testing.expectEqual(@as(usize, 0), conn.wire_outbound_held.load(.acquire));
+}
+
+test "pushWriteChunk returns error.Canceled when its task is canceled while parked in putOne (t-3520)" {
+    // zio delivers a cancel once. A push that turned it into `WriteFailed` lost
+    // it, and `run` then never re-raised it with `zio.recancel`.
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(2),
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(pushCancelBody, .{ rt, gpa });
+    try h.join();
+}
+
+test "an h2c connection refuses a write queue smaller than one pop's reservation (t-3520)" {
+    // `Server.init` rejects it at boot; a connection built any other way gets
+    // the same answer from `Connection.init`.
+    var trap: TrapHop = undefined;
+    var limits = limits_mod.Limits.defaults;
+    limits.inbound_wire_chunks_per_connection = limits_mod.H2C_MIN_WRITE_QUEUE_CHUNKS - 1;
+    try std.testing.expectError(error.InvalidConfig, openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, limits));
+}
+
 test "a full DATA frame is built in a write-pool chunk and reaches the pump without a copy" {
     // Before, a 16,393-byte DATA frame did not fit a 512-byte frame slab, so
     // every one was a GPA alloc, a copy into a write chunk, and a free. That
@@ -6848,7 +7151,7 @@ test "a full DATA frame is built in a write-pool chunk and reaches the pump with
         try hop.conn.processIntents();
     }
     hop.drainLocalWrites();
-    hop.conn.runPendingInline();
+    try hop.conn.runPendingInline();
 
     var full_frames: usize = 0;
     var body_off: usize = 0;
@@ -6878,7 +7181,7 @@ test "a full DATA frame is built in a write-pool chunk and reaches the pump with
     try std.testing.expectEqual(fallbacks_before, gpa_fallbacks.frame.load(.monotonic));
     // HEADERS and the short last DATA frame may be copied; a full frame not.
     try std.testing.expect(hop.conn.wire_copied_bytes - copied_before < 16 * 1024);
-    hop.conn.drainPendingCompleteReceipts(false);
+    try hop.conn.drainPendingCompleteReceipts(false);
     try std.testing.expect(!hop.conn.writer_failed.load(.acquire));
 }
 
@@ -6935,6 +7238,10 @@ fn openTrapHop(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn openTrapHopRoutes(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: []const router_mod.Route) !void {
+    return openTrapHopLimits(out, gpa, io, routes, limits_mod.Limits.defaults);
+}
+
+fn openTrapHopLimits(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: []const router_mod.Route, limits: limits_mod.Limits) !void {
     out.gpa = gpa;
     out.io = io;
     out.slabs = try slab_pool.SlabPool.init(gpa, io, limits_mod.Limits.defaults.outbound_bytes_per_stream, 8);
@@ -6956,7 +7263,7 @@ fn openTrapHopRoutes(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: 
     out.hop.open(accepted, .{
         .io = io,
         .mode = .h2c,
-        .limits = limits_mod.Limits.defaults,
+        .limits = limits,
         .router = .{ .routes = routes },
         .gpa = gpa,
         .slab_pool = &out.slabs,
