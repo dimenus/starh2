@@ -2223,6 +2223,7 @@ fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const frame = starh2.core.frame;
 
     // Several rounds: the reorder was a race against the first drain.
+    const checks_before = starh2.edge.connection.test_preface_checks.load(.acquire);
     var round: usize = 0;
     while (round < 8) : (round += 1) {
         const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -2238,6 +2239,9 @@ fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try std.testing.expectEqual(frame.FrameType.settings, hdr.type);
         try std.testing.expect(!hdr.flags.ack());
     }
+    // The first-frame check in `queueWire` ran for every h2c connection.
+    const checks = starh2.edge.connection.test_preface_checks.load(.acquire) - checks_before;
+    try std.testing.expect(checks >= 8);
 }
 
 test "lifecycle: the first wire frame is the server's own SETTINGS, never an ack (t-538)" {

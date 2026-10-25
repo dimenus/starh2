@@ -172,8 +172,10 @@ chunk into the send staging buffer. Do not wrap a record API beside this.
   reader buffer), on the connection's own task under `zio.withTimeout`
   (`Server.handshakeWithTimeout`). Do not move it to a subtask: the loop
   that first parks on a socket owns its reads for the fd's life.
-- Handshake leftover plaintext (a pipelined preface) is ingested on the actor
-  before the queue is armed.
+- The server preface leaves the scheduler before any client byte is ingested.
+  Handshake leftover plaintext (a pipelined preface) is ingested on the actor
+  after the queue is armed and the first flush, and before the pump is first
+  driven.
 - Packing stays in `emit_batch` (16 KiB concat). The pump encrypts one record
   per write chunk, only when the whole record fits the staging buffer;
   otherwise it parks on the CQ (t-2655). Do not split records to fill space.

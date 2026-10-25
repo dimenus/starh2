@@ -289,6 +289,14 @@ pub var test_observed_inline_jobs: std.atomic.Value(usize) = .init(0);
 pub var test_observed_inline_ctrl_full: std.atomic.Value(usize) = .init(0);
 /// Test-only: queueWire calls not from FairScheduler sink (must stay 0).
 pub var test_queue_wire_bypass: std.atomic.Value(usize) = .init(0);
+/// Counts the first-frame checks `queueWire` ran: one per connection that
+/// wrote. A test that expects N connections to be checked proves the check
+/// is wired in; deleting the call leaves every other test green.
+pub var test_preface_checks: std.atomic.Value(usize) = .init(0);
+/// Counts connections that started with a non-empty `tls_leftover`. The TLS
+/// preface tests assert every tested connection took that path, because a
+/// server read that returned only the Finished record would skip it.
+pub var test_tls_leftover_connections: std.atomic.Value(usize) = .init(0);
 /// Test-only: true while FairScheduler sink is executing queueWire.
 threadlocal var test_in_sched_sink: bool = false;
 /// Test-only: force queueWire/send fail after N successful accounted sends (0=never).
@@ -1410,6 +1418,9 @@ const Connection = struct {
     wire_outbound_held: std.atomic.Value(usize) = .init(0),
     request_held: std.atomic.Value(usize) = .init(0),
     handshake_held: bool = false,
+    /// True once `queueWire` has seen the connection's first wire bytes.
+    /// Written under `session_mu`, like every `queueWire` call.
+    wire_started: bool = false,
     socket_closed: std.atomic.Value(bool) = .init(false),
     /// Set when a write completion reports failure; actor owns handler terminal transition.
     writer_failed: std.atomic.Value(bool) = .init(false),
@@ -3053,13 +3064,18 @@ const Connection = struct {
     /// ## Startup sequence
     /// 1. TLS, if any: the handshake already ran on this same task, in
     ///    `Server.serveTlsThenBranch`, which hands over `tls_ready` and the
-    ///    leftover plaintext (a pipelined preface). Ingest that into
-    ///    Session, then arm the CQ driver: sole encrypt/decrypt owner and
-    ///    sole socket reader from here on; flush is encrypt into the send
-    ///    staging buffer + NetSend.
+    ///    leftover plaintext (a pipelined preface). Arm the CQ driver: sole
+    ///    encrypt/decrypt owner and sole socket reader from here on; flush is
+    ///    encrypt into the send staging buffer + NetSend. Arming submits the
+    ///    first recv, and the kernel may fill it at once, but no received byte
+    ///    reaches Session until the loop below takes it off the queue.
     /// 2. h2c: spawn ReadPump and WritePump on the raw socket.
-    /// 3. Flush the server preface that `Session.init` already queued.
-    /// 4. For h2c, wait for the client preface under the preface deadline.
+    /// 3. Flush the server preface that `Session.init` already queued. It
+    ///    must leave the scheduler before any client byte is ingested
+    ///    (RFC 9113 section 3.4).
+    /// 4. TLS only: ingest the leftover plaintext, then flush again. It still
+    ///    reaches Session before any byte the pump received.
+    /// 5. For h2c, wait for the client preface under the preface deadline.
     ///
     /// ## Steady-state iteration
     /// Each pass does the same five things, and the order is the contract:
@@ -3157,12 +3173,6 @@ const Connection = struct {
             // HTTP/2 or HTTP/1.1 from ALPN before a Connection exists.
             self.tls = self.config.tls_ready orelse
                 @panic("tls mode needs tls_ready: the handshake runs in Server.serveTlsThenBranch");
-            if (self.config.tls_leftover.len != 0) {
-                self.lockSessionUncancelable(io);
-                defer self.unlockSession(io);
-                try self.session.ingest(self.config.tls_leftover);
-                if (self.session.terminal != .none) return error.ConnectionClosed;
-            }
             if (self.handshake_held) {
                 if (self.config.accounting) |a| a.releaseHandshake();
                 self.handshake_held = false;
@@ -3242,13 +3252,35 @@ const Connection = struct {
             h2c_started = true;
         }
 
-        // Leftover TLS plaintext (a pipelined preface) was ingested during
-        // handshake. Emit after the CQ is armed so queueWire can encrypt.
+        // The server preface (SETTINGS, queued by `Session.init`) leaves the
+        // scheduler BEFORE anything the client sent is ingested (RFC 9113
+        // section 3.4: it must be the first frame). Ingest can queue
+        // RST_STREAM or GOAWAY, which the scheduler drains ahead of ordinary
+        // controls, so it must not run while SETTINGS is still queued. On TLS
+        // the handshake leftover (a pipelined client preface and requests) is
+        // the first client bytes; it is ingested after this flush and before
+        // the loop first takes a completion off the pump's queue, so it still
+        // reaches Session before any byte the pump received. Emit after the CQ is armed so queueWire can
+        // encrypt.
+        var first_flight_terminal = false;
         {
             self.lockSessionUncancelable(io);
             defer self.unlockSession(io);
             try self.flushSessionIntents();
+            if (self.config.tls_leftover.len != 0) {
+                std.debug.assert(self.config.mode == .tls);
+                if (comptime test_observe) _ = test_tls_leftover_connections.fetchAdd(1, .acq_rel);
+                try self.session.ingest(self.config.tls_leftover);
+                try self.flushSessionIntents();
+            }
+            // Read under the lock: ingest can spawn task handlers, and they
+            // mutate `terminal` under `session_mu`.
+            first_flight_terminal = self.session.terminal != .none;
         }
+        // A connection error in the first flight leaves here. Its GOAWAY is
+        // stashed behind the SETTINGS; whether teardown writes it is the
+        // general GOAWAY-delivery question (t-3520), not decided here.
+        if (first_flight_terminal) return error.ConnectionClosed;
         self.runPendingInline();
 
         if (close_probe) diagRawPrint("t1002 conn={x} sess={x} start peer={d} parked={d}\n", .{ @intFromPtr(self), @intFromPtr(&self.session), closeProbePeerPort(self.stream.socket.handle), close_probe_parked.load(.acquire) });
@@ -5054,6 +5086,34 @@ const Connection = struct {
         return false;
     }
 
+    /// RFC 9113 section 3.4: the server connection preface is a SETTINGS
+    /// frame, and it must be the first frame the server sends. `plain` is the
+    /// first handoff of the connection, so its first frame is the one that
+    /// goes first on the wire (h2c and TLS alike). A SETTINGS ACK is not the
+    /// preface: the t-538 defect put one first.
+    const PrefaceCheck = enum { ok, short, not_settings, ack, on_stream };
+
+    fn checkPrefaceFirst(plain: []const u8) PrefaceCheck {
+        if (plain.len < frame.FRAME_HEADER_LEN) return .short;
+        const hdr = frame.FrameHeader.decode(plain[0..frame.FRAME_HEADER_LEN]);
+        if (hdr.type != .settings) return .not_settings;
+        if (hdr.flags.ack()) return .ack;
+        if (hdr.stream_id != 0) return .on_stream;
+        return .ok;
+    }
+
+    /// Panics in safe builds; one predictable branch in ReleaseFast (the
+    /// `wire_started` test at the call site).
+    fn assertPrefaceFirst(plain: []const u8) void {
+        if (comptime test_observe) _ = test_preface_checks.fetchAdd(1, .acq_rel);
+        if (comptime !std.debug.runtime_safety) return;
+        const check = checkPrefaceFirst(plain);
+        if (check != .ok) {
+            const type_byte: u8 = if (plain.len > 3) plain[3] else 0xff;
+            std.debug.panic("first wire handoff of a connection is not the server SETTINGS: {s} (frame type byte {d}, {d} bytes)", .{ @tagName(check), type_byte, plain.len });
+        }
+    }
+
     fn queueWire(
         self: *Connection,
         bytes: []u8,
@@ -5075,6 +5135,10 @@ const Connection = struct {
         var bytes_held = owns_bytes;
         defer if (bytes_held) self.releaseWireBytes(bytes);
         const plain = if (owns_bytes) frame.encodedOnWire(bytes) else bytes;
+        if (!self.wire_started) {
+            self.wire_started = true;
+            assertPrefaceFirst(plain);
+        }
         if (trace.enabled) trace.noteHandoff(ticket_count, plain.len);
         const trace_batch = trace.enabled and self.batchContainsTraceTicket(ticket_slot, ticket_count);
         if (trace_batch) self.trace_emit_ns.store(nowNs(self.config.io), .release);
@@ -6662,6 +6726,26 @@ pub const BenchHop = struct {
         }
     }
 };
+
+test "the first-frame check accepts only a SETTINGS frame without ACK on stream 0 (t-3511)" {
+    var hdr: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    const encode = struct {
+        fn f(out: *[frame.FRAME_HEADER_LEN]u8, t: frame.FrameType, ack: bool, sid: u31) void {
+            (frame.FrameHeader{ .length = 0, .type = t, .flags = .{ .end_stream = ack }, .stream_id = sid }).encode(out);
+        }
+    }.f;
+    encode(&hdr, .settings, false, 0);
+    try std.testing.expectEqual(Connection.PrefaceCheck.ok, Connection.checkPrefaceFirst(&hdr));
+    encode(&hdr, .settings, true, 0);
+    try std.testing.expectEqual(Connection.PrefaceCheck.ack, Connection.checkPrefaceFirst(&hdr));
+    encode(&hdr, .rst_stream, false, 1);
+    try std.testing.expectEqual(Connection.PrefaceCheck.not_settings, Connection.checkPrefaceFirst(&hdr));
+    encode(&hdr, .goaway, false, 0);
+    try std.testing.expectEqual(Connection.PrefaceCheck.not_settings, Connection.checkPrefaceFirst(&hdr));
+    encode(&hdr, .settings, false, 1);
+    try std.testing.expectEqual(Connection.PrefaceCheck.on_stream, Connection.checkPrefaceFirst(&hdr));
+    try std.testing.expectEqual(Connection.PrefaceCheck.short, Connection.checkPrefaceFirst(hdr[0..8]));
+}
 
 test "t-894 leftover write acks: skip Forced is visible, Forced then deinit is quiet" {
     // Mutation-c (t-882) skipped only drainWriteAcksForced and deinit's

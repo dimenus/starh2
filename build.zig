@@ -653,6 +653,25 @@ pub fn build(b: *std.Build) void {
     const handshake_step = b.step("test-handshake", "Run the TLS handshake timeout gate");
     handshake_step.dependOn(&run_handshake_tests.step);
 
+    const tls_preface_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/tls_preface.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_tls_preface_tests = b.addRunArtifact(tls_preface_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_tls_preface_tests.setCwd(b.path("."));
+    const tls_preface_step = b.step("test-tls-preface", "Run the TLS server-preface-first gates");
+    tls_preface_step.dependOn(&run_tls_preface_tests.step);
+
     const admission_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/admission.zig"),
@@ -701,6 +720,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_deadline_tests.step);
     test_step.dependOn(&run_placement_tests.step);
     test_step.dependOn(&run_handshake_tests.step);
+    test_step.dependOn(&run_tls_preface_tests.step);
     test_step.dependOn(&run_admission_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
