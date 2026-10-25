@@ -997,7 +997,10 @@ fn memHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteRes
         first = false;
         try w.print("[{d},{d},{d},{d}]", .{ i, calls, c.class_bytes[i].load(.monotonic), c.class_live[i].load(.monotonic) });
     }
-    try w.writeAll("]}\n");
+    try w.print("],\"fallbacks\":{{\"frame\":{d},\"write_chunk\":{d}}}}}\n", .{
+        conn_mod.gpa_fallbacks.frame.load(.monotonic),
+        conn_mod.gpa_fallbacks.write_chunk.load(.monotonic),
+    });
     try resp.send(200, &.{}, w.buffered());
 }
 

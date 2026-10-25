@@ -573,6 +573,18 @@ fn tlsNetHandle(h: std.Io.net.Socket.Handle) zio.ev.Backend.NetHandle {
 /// One event in `trace_sample_every` is measured for the latency intervals, so
 /// that instrument cannot become the load. Batch counters are per-handoff, not
 /// per-request, and stay off on the official bench path.
+/// Outbound buffers that missed their pool and came from the GPA, server-wide.
+/// Always counted: each one is already a GPA call, so one more atomic add is
+/// noise. A benchmark reads these to tell which pool its allocator churn
+/// comes from.
+pub const gpa_fallbacks = struct {
+    /// `rentFrame` returned null: the frame was larger than a frame slab, or
+    /// the frame pool was empty.
+    pub var frame: std.atomic.Value(u64) = .init(0);
+    /// `leaseWriteChunk` found the write pool empty, or the chunk too large.
+    pub var write_chunk: std.atomic.Value(u64) = .init(0);
+};
+
 pub const trace = struct {
     /// Set once at boot by a benchmark binary. A plain bool: it is written
     /// before any connection exists and only read afterwards.
@@ -1451,6 +1463,10 @@ const Connection = struct {
     /// it spawns read it without a race. Only `notePlacement` reads it.
     actor_thread: std.Thread.Id = 0,
     frame_pool: slab_pool.SlabPool = undefined,
+    /// Bytes `sendAccountedWire` copied into a write chunk. A frame that
+    /// already sits in one is handed over instead, so a test reads this to
+    /// prove the handover happened. Written under `session_mu`.
+    wire_copied_bytes: usize = 0,
     read_pool_n: u32 = 0,
     /// Preallocated scratch for stream-id sweeps (no hot-path ArrayList).
     sid_scratch: []u31 = &.{},
@@ -4867,20 +4883,51 @@ const Connection = struct {
         self.actor_site.store(1, .release);
     }
 
+    /// A frame that fits a frame slab takes one. A larger frame (a full DATA
+    /// frame is 16,393 bytes) takes a write-pool chunk, because that chunk is
+    /// what an unbatched frame becomes: `queueWire` hands it to the pump as
+    /// is, with no copy. Small frames stay in `frame_pool`: most of them are
+    /// copied into the drain-turn batch, and a 16 KiB chunk for each would
+    /// empty the write pool (`inbound_wire_chunks_per_connection` chunks).
+    /// A HEADERS block larger than a frame slab also takes a write chunk.
+    /// When the write pool is empty the frame comes from the GPA.
     fn rentFrame(self: *Connection, n: usize) ?[]u8 {
-        if (n > self.frame_pool.slab_bytes) return null;
-        return self.frame_pool.tryRent(self.config.io);
+        if (n <= self.frame_pool.slab_bytes) {
+            if (self.frame_pool.tryRent(self.config.io)) |slab| return slab;
+        } else if (n <= limits_mod.WIRE_CHUNK_SIZE) {
+            if (self.write_pool.tryRentIndex(self.config.io)) |idx| return self.write_pool.slabAt(idx);
+        }
+        _ = gpa_fallbacks.frame.fetchAdd(1, .monotonic);
+        return null;
     }
 
-    /// Return a frame buffer: a full slab if `buf` is in `frame_pool`, else GPA.
-    /// `buf` may be a used prefix; the pointer must be the slab base.
+    /// Return a frame buffer to where it came from: `frame_pool`,
+    /// `write_pool`, or the GPA. `buf` may be a used prefix; the pointer must
+    /// be the slab base.
     fn releaseWireBytes(self: *Connection, buf: []u8) void {
         if (buf.len == 0) return;
         if (self.frame_pool.containsPtr(buf.ptr)) {
             self.frame_pool.release(self.config.io, self.frame_pool.slabFromPtr(buf.ptr));
             return;
         }
+        if (self.write_pool.containsPtr(buf.ptr)) {
+            self.write_pool.releaseIndex(self.config.io, self.write_pool.indexFromPtr(buf.ptr));
+            return;
+        }
         self.config.gpa.free(buf);
+    }
+
+    /// The write chunk an owned frame buffer already is, or null for a frame
+    /// slab, which is too small to be a write chunk and is copied instead.
+    /// A GPA frame is its own exact allocation, so it can travel as a
+    /// pool-less chunk: every place that frees a chunk frees `bytes` whole.
+    fn frameAsWriteLease(self: *Connection, buf: []u8) ?WriteLease {
+        if (self.frame_pool.containsPtr(buf.ptr)) return null;
+        if (self.write_pool.containsPtr(buf.ptr)) {
+            const idx = self.write_pool.indexFromPtr(buf.ptr);
+            return .{ .bytes = self.write_pool.slabAt(idx), .pool_index = idx };
+        }
+        return .{ .bytes = buf, .pool_index = null };
     }
 
     const WriteLease = struct {
@@ -4900,6 +4947,7 @@ const Connection = struct {
                 };
             }
         }
+        _ = gpa_fallbacks.write_chunk.fetchAdd(1, .monotonic);
         const buf = self.config.gpa.alloc(u8, n) catch return error.OutOfMemory;
         return .{ .bytes = buf, .pool_index = null };
     }
@@ -4912,8 +4960,10 @@ const Connection = struct {
         }
     }
 
-    /// Copy `src` into a write-pool chunk and hand that to the WritePump, with
-    /// accounting attached. Does not take ownership of `src`.
+    /// Hand `src` to the WritePump with accounting attached. With `owned` null,
+    /// copy `src` into a fresh write chunk and leave `src` with the caller.
+    /// With `owned` set, `src` is the start of `owned.bytes` and that chunk
+    /// goes to the pump as is; this function then owns it on every path.
     ///
     /// The chunk carries the release amounts rather than a callback, so the
     /// pump needs no access to `Connection`. The actor applies them when the
@@ -4933,6 +4983,7 @@ const Connection = struct {
         control_n: usize,
         control_entries: u32,
         complete_batch_receipt: bool,
+        owned: ?WriteLease,
     ) anyerror!void {
         const send_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
         defer if (trace.enabled) {
@@ -4940,17 +4991,22 @@ const Connection = struct {
             _ = trace.send_n.fetchAdd(1, .monotonic);
             _ = trace.send_bytes.fetchAdd(src.len, .monotonic);
         };
+        if (owned) |o| std.debug.assert(o.bytes.ptr == src.ptr and src.len <= o.bytes.len);
         if (!self.tryReserveOutboundBytes(src.len, .wire)) {
+            if (owned) |o| self.returnWriteChunk(o);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return error.OutOfMemory;
         }
-        const lease = self.leaseWriteChunk(src.len) catch |err| {
+        const lease = if (owned) |o| o else self.leaseWriteChunk(src.len) catch |err| {
             self.applyOutboundRelease(src.len, .wire);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return err;
         };
         std.debug.assert(src.len <= lease.bytes.len);
-        @memcpy(lease.bytes[0..src.len], src);
+        if (owned == null) {
+            @memcpy(lease.bytes[0..src.len], src);
+            self.wire_copied_bytes += src.len;
+        }
         if (trace.enabled) _ = trace.records.fetchAdd(1, .monotonic);
         self.pushWriteChunk(.{
             .bytes = lease.bytes,
@@ -5015,7 +5071,9 @@ const Connection = struct {
                 _ = test_queue_wire_bypass.fetchAdd(1, .acq_rel);
             }
         }
-        defer if (owns_bytes) self.releaseWireBytes(bytes);
+        // `bytes_held` goes false once `sendAccountedWire` owns the buffer.
+        var bytes_held = owns_bytes;
+        defer if (bytes_held) self.releaseWireBytes(bytes);
         const plain = if (owns_bytes) frame.encodedOnWire(bytes) else bytes;
         if (trace.enabled) trace.noteHandoff(ticket_count, plain.len);
         const trace_batch = trace.enabled and self.batchContainsTraceTicket(ticket_slot, ticket_count);
@@ -5028,7 +5086,9 @@ const Connection = struct {
                 return error.WriteFailed;
             }
         }
-        try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries, complete_batch_receipt);
+        const owned = if (owns_bytes) self.frameAsWriteLease(bytes) else null;
+        if (owned != null) bytes_held = false;
+        try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries, complete_batch_receipt, owned);
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
 
@@ -6568,31 +6628,36 @@ pub const BenchHop = struct {
     /// and complete tickets so the actor path can `waitTicket` on an
     /// already-signaled slot. Readiness is the ticket event, not a count.
     fn drainLocalWrites(self: *BenchHop) void {
+        while (io_queue.tryGet(wire_pump.WireChunk, &self.conn.write_ch, self.conn.config.io)) |chunk| {
+            self.completeLocalWrite(chunk);
+        }
+    }
+
+    /// One chunk of `drainLocalWrites`, for a test that reads the chunk first.
+    fn completeLocalWrite(self: *BenchHop, chunk: wire_pump.WireChunk) void {
         const io = self.conn.config.io;
-        while (io_queue.tryGet(wire_pump.WireChunk, &self.conn.write_ch, io)) |chunk| {
-            if (chunk.pool_index) |idx| {
-                self.conn.write_pool.releaseIndex(io, idx);
-            } else if (chunk.bytes.len != 0) {
-                self.conn.config.gpa.free(chunk.bytes);
-            }
-            self.conn.applyOutboundRelease(chunk.outbound_release, .wire);
-            if (chunk.control_entries != 0) {
-                self.conn.applyControlRelease(chunk.control_release, chunk.control_entries);
-            }
-            if (chunk.ticket != 0) {
-                const ack = wire_pump.WriteCompletion{
-                    .ticket = chunk.ticket,
-                    .ticket_slot = chunk.ticket_slot,
-                    .ticket_count = chunk.ticket_count,
-                    .ok = true,
-                    .complete_batch_receipt = chunk.complete_batch_receipt,
-                };
-                if (!self.conn.completeAckTickets(ack)) {
-                    if (diag_park) diagRawPrint("WFSET local_writes_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
-                    self.conn.writer_failed.store(true, .release);
-                    self.conn.tickets.failAll();
-                    self.conn.complete_receipts_fail_all.store(true, .release);
-                }
+        if (chunk.pool_index) |idx| {
+            self.conn.write_pool.releaseIndex(io, idx);
+        } else if (chunk.bytes.len != 0) {
+            self.conn.config.gpa.free(chunk.bytes);
+        }
+        self.conn.applyOutboundRelease(chunk.outbound_release, .wire);
+        if (chunk.control_entries != 0) {
+            self.conn.applyControlRelease(chunk.control_release, chunk.control_entries);
+        }
+        if (chunk.ticket != 0) {
+            const ack = wire_pump.WriteCompletion{
+                .ticket = chunk.ticket,
+                .ticket_slot = chunk.ticket_slot,
+                .ticket_count = chunk.ticket_count,
+                .ok = true,
+                .complete_batch_receipt = chunk.complete_batch_receipt,
+            };
+            if (!self.conn.completeAckTickets(ack)) {
+                if (diag_park) diagRawPrint("WFSET local_writes_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                self.conn.writer_failed.store(true, .release);
+                self.conn.tickets.failAll();
+                self.conn.complete_receipts_fail_all.store(true, .release);
             }
         }
     }
@@ -6651,6 +6716,115 @@ test "t-894 leftover write acks: skip Forced is visible, Forced then deinit is q
     hop.conn.assertWriteAcksDrained();
 }
 
+fn bigBodyByte(i: usize) u8 {
+    return @intCast('a' + (i / 1000) % 26);
+}
+
+fn hopBigBody(_: *anyopaque, _: *const request.Request, resp: *response.CompleteResponse) anyerror!void {
+    var body: [48 * 1024]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = bigBodyByte(i);
+    try resp.send(200, &.{}, &body);
+}
+
+test "a full DATA frame is built in a write-pool chunk and reaches the pump without a copy" {
+    // Before, a 16,393-byte DATA frame did not fit a 512-byte frame slab, so
+    // every one was a GPA alloc, a copy into a write chunk, and a free. That
+    // churn was most of the server's 16-32 KiB allocations under load. Here
+    // the pool is idle, so every full frame must arrive as a write-pool chunk
+    // whose bytes are the frame itself.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopBigBody } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    try hop.preparePreface();
+
+    const fallbacks_before = gpa_fallbacks.frame.load(.monotonic);
+    const copied_before = hop.conn.wire_copied_bytes;
+    const block = [_]u8{ 0x82, 0x87, 0x84 }; // :method GET, :scheme https, :path /
+    var headers: [frame.FRAME_HEADER_LEN + block.len]u8 = undefined;
+    (frame.FrameHeader{
+        .length = block.len,
+        .type = .headers,
+        .flags = .{ .end_stream = true, .end_headers = true },
+        .stream_id = 1,
+    }).encode(headers[0..frame.FRAME_HEADER_LEN]);
+    @memcpy(headers[frame.FRAME_HEADER_LEN..], &block);
+    {
+        hop.conn.lockSessionUncancelable(io);
+        defer hop.conn.unlockSession(io);
+        hop.conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        try hop.conn.session.ingest(&headers);
+        try hop.conn.processIntents();
+    }
+    hop.drainLocalWrites();
+    hop.conn.runPendingInline();
+
+    var full_frames: usize = 0;
+    var body_off: usize = 0;
+    while (io_queue.tryGet(wire_pump.WireChunk, &hop.conn.write_ch, io)) |chunk| {
+        defer hop.completeLocalWrite(chunk);
+        var off: usize = 0;
+        while (off < chunk.len) {
+            const fh = frame.FrameHeader.decode(chunk.bytes[off..][0..frame.FRAME_HEADER_LEN]);
+            const payload = chunk.bytes[off + frame.FRAME_HEADER_LEN ..][0..fh.length];
+            if (fh.type == .data) {
+                for (payload, body_off..) |b, i| try std.testing.expectEqual(bigBodyByte(i), b);
+                body_off += payload.len;
+                if (payload.len == 16 * 1024) {
+                    full_frames += 1;
+                    // The chunk is the frame: a write-pool slab, starting at it.
+                    try std.testing.expectEqual(@as(usize, 0), off);
+                    try std.testing.expectEqual(chunk.len, frame.FRAME_HEADER_LEN + payload.len);
+                    const idx = chunk.pool_index orelse return error.FullFrameNotInWritePool;
+                    try std.testing.expectEqual(hop.conn.write_pool.slabAt(idx).ptr, chunk.bytes.ptr);
+                }
+            }
+            off += frame.FRAME_HEADER_LEN + fh.length;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 48 * 1024), body_off);
+    try std.testing.expectEqual(@as(usize, 3), full_frames);
+    try std.testing.expectEqual(fallbacks_before, gpa_fallbacks.frame.load(.monotonic));
+    // HEADERS and the short last DATA frame may be copied; a full frame not.
+    try std.testing.expect(hop.conn.wire_copied_bytes - copied_before < 16 * 1024);
+    hop.conn.drainPendingCompleteReceipts(false);
+    try std.testing.expect(!hop.conn.writer_failed.load(.acquire));
+}
+
+test "a write-pool frame refused by the outbound budget goes back to the write pool" {
+    // `queueWire` hands an owned write-pool frame to `sendAccountedWire`,
+    // which then owns it on every path. Its first exit is the budget check,
+    // before any lease exists, so the chunk must be returned there by hand.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+
+    const rented_before = conn.write_pool.rentedCount();
+    const full = conn.rentFrame(frame.FRAME_HEADER_LEN + 16 * 1024) orelse return error.NoWriteChunk;
+    try std.testing.expect(conn.write_pool.containsPtr(full.ptr));
+    (frame.FrameHeader{ .length = 16 * 1024, .type = .data, .flags = .{}, .stream_id = 1 }).encode(full[0..frame.FRAME_HEADER_LEN]);
+
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    const held = conn.outbound_held.load(.acquire);
+    try std.testing.expect(conn.tryReserveOutboundBytes(lim - held, .wire));
+    defer conn.applyOutboundRelease(lim - held, .wire);
+    test_in_sched_sink = true;
+    defer test_in_sched_sink = false;
+    try std.testing.expectError(error.OutOfMemory, conn.queueWire(full, false, 0, 0, 0, 0, 0, true, false));
+    try std.testing.expectEqual(rented_before, conn.write_pool.rentedCount());
+}
+
 test "recordFinalize first call stores 1" {
     var slot: HandlerSlot = .{};
     slot.in_use = true;
@@ -6673,6 +6847,10 @@ const TrapHop = struct {
 };
 
 fn openTrapHop(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io) !void {
+    return openTrapHopRoutes(out, gpa, io, &.{});
+}
+
+fn openTrapHopRoutes(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: []const router_mod.Route) !void {
     out.gpa = gpa;
     out.io = io;
     out.slabs = try slab_pool.SlabPool.init(gpa, io, limits_mod.Limits.defaults.outbound_bytes_per_stream, 8);
@@ -6695,7 +6873,7 @@ fn openTrapHop(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io) !void {
         .io = io,
         .mode = .h2c,
         .limits = limits_mod.Limits.defaults,
-        .router = .{ .routes = &.{} },
+        .router = .{ .routes = routes },
         .gpa = gpa,
         .slab_pool = &out.slabs,
     }) catch |err| {

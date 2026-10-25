@@ -239,9 +239,10 @@ pub const Session = struct {
         headerListAlloc: ?*const fn (*anyopaque, u31) ?std.mem.Allocator = null,
         /// Reset that allocator after a decode that will not be dispatched.
         discardHeaderList: ?*const fn (*anyopaque, u31) void = null,
-        /// Rent a boot-reserved outbound frame slab. `n` is the on-wire size.
-        /// Returns a full slab (`len == slab_bytes >= n`) or null (too large or
-        /// exhausted — caller GPA-falls-back). Never a used prefix.
+        /// Rent a boot-reserved outbound frame buffer. `n` is the on-wire size.
+        /// Returns a full slab of whichever pool the edge picks for `n`
+        /// (`len >= n`), or null (too large or exhausted — caller
+        /// GPA-falls-back). Never a used prefix.
         rentFrame: ?*const fn (*anyopaque, usize) ?[]u8 = null,
         /// Return a buffer from `rentFrame` or a GPA fallback. Pointer-range
         /// decides which; a prefix of a slab is reconstructed to the full lease.

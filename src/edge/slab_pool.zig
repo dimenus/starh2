@@ -146,6 +146,18 @@ pub const SlabPool = struct {
         return self.storage[off..][0..self.slab_bytes];
     }
 
+    /// Index of the slab a pointer starts. Same rules as `slabFromPtr`: the
+    /// pointer must be a slab base inside this pool.
+    pub fn indexFromPtr(self: *const SlabPool, ptr: [*]const u8) u32 {
+        const here = @intFromPtr(ptr);
+        const base = @intFromPtr(self.storage.ptr);
+        std.debug.assert(here >= base);
+        const off = here - base;
+        std.debug.assert(off % self.slab_bytes == 0);
+        std.debug.assert(off < self.storage.len);
+        return @intCast(off / self.slab_bytes);
+    }
+
     /// Give a slab back. It must have come from this pool.
     ///
     /// The index is derived from the pointer rather than tracked by the caller,
