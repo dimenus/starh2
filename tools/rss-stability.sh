@@ -30,6 +30,7 @@
 #              the load has stopped. A positive slope across cycles is growth.
 #   load_end   RSS at the end of each load phase.
 #   peak       the highest sample of the run.
+#   phase_growth  mean RSS change inside load, idle and churn, per cycle.
 # One run gives one curve. Run-to-run spread needs several runs of the same
 # arm (n>=3), which is the caller's loop, not this script's.
 #
@@ -38,9 +39,10 @@
 # command, e.g. RSS_SERVER_ENV="GLIBC_TUNABLES=glibc.malloc.trim_threshold=268435456".
 #
 # RSS_COUNT_GPA=1 runs the server with --count-gpa and reads /mem at each
-# phase end: the bytes the server has allocated and not freed. RSS that rises
-# while live bytes stay flat is the allocator keeping freed memory; live bytes
-# that rise too are memory the server itself still holds.
+# phase end (saved as mem-<phase>-<cycle>.json): the bytes the server has
+# allocated and not freed. RSS that rises while live bytes stay flat is the
+# allocator keeping freed memory; live bytes that rise too are memory the
+# server itself still holds.
 #
 # Exit codes: 0 ran and every phase did work; 2 setup failed; 3 a phase did
 # no work or reported failures (the numbers are then not a result). A clean
@@ -153,10 +155,11 @@ fi
 
 # Live bytes from /mem in KB, or "-" when not counting. A failed read is
 # "?", and fails the run below: a missing number must not read as flat.
-live_kb() {
+live_kb() { # live_kb <label>: also keeps the whole /mem reply as mem-<label>.json
   [ "$COUNT_GPA" = 1 ] || { echo -; return; }
   local b
-  b=$(curl -sk --http2 --max-time 5 "$BASE/mem" | grep -o '"live_bytes":[0-9]*' | cut -d: -f2)
+  curl -sk --http2 --max-time 5 "$BASE/mem" > "$OUT/mem-$1.json"
+  b=$(grep -o '"live_bytes":[0-9]*' "$OUT/mem-$1.json" | cut -d: -f2)
   if [ -z "$b" ]; then echo "?"; else echo $((b / 1024)); fi
 }
 
@@ -211,7 +214,7 @@ for c in $(seq "$CYCLES"); do
   p=$!
   wait "$g1" "$g2" "$p" || true
   load_end=$(rss_kb)
-  load_live=$(live_kb)
+  load_live=$(live_kb load-$c)
   check_h2load "$OUT/load-complete-$c.log" "cycle $c load-complete"
   check_h2load "$OUT/load-task-$c.log" "cycle $c load-task"
   check_h2load "$OUT/post-$c.log" "cycle $c load-post"
@@ -219,7 +222,7 @@ for c in $(seq "$CYCLES"); do
   echo "$c idle" > "$PHASE_FILE"
   sleep "$IDLE_S"
   idle_end=$(rss_kb)
-  idle_live=$(live_kb)
+  idle_live=$(live_kb idle-$c)
 
   echo "$c churn" > "$PHASE_FILE"
   end=$(( $(date +%s) + CHURN_S ))
@@ -230,7 +233,7 @@ for c in $(seq "$CYCLES"); do
     check_h2load "$OUT/churn-$c-$w.log" "cycle $c churn wave $w"
   done
   churn_end=$(rss_kb)
-  churn_live=$(live_kb)
+  churn_live=$(live_kb churn-$c)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$load_end" "$idle_end" "$churn_end" "$load_live" "$idle_live" "$churn_live" >> "$OUT/rows.tsv"
   for v in "$load_live" "$idle_live" "$churn_live"; do
     if [ "$v" = "?" ]; then echo "INVALID cycle $c: /mem gave no live_bytes" >&2; bad=1; fi
@@ -270,6 +273,10 @@ nsamples=$(wc -l < "$OUT/samples.tsv" | tr -d ' ')
 # Least-squares slope of idle_end over cycles 2..N, in KB per cycle.
 slope=$(awk -F'\t' 'NR > 2 {n++; x = $1; y = $3; sx += x; sy += y; sxx += x * x; sxy += x * y}
   END {d = n * sxx - sx * sx; if (n < 2 || d == 0) print "n/a"; else printf "%.0f", (n * sxy - sx * sy) / d}' "$OUT/rows.tsv")
+# Mean RSS change inside each phase over cycles 2..N, in KB: load is from the
+# previous churn end to this load end. It says which phase the growth is in.
+phase_growth=$(awk -F'\t' 'NR == 2 {pc = $4} NR > 2 {n++; l += $2 - pc; i += $3 - $2; c += $4 - $3; pc = $4}
+  END {if (n < 1) print "n/a"; else printf "load=%.0f idle=%.0f churn=%.0f", l / n, i / n, c / n}' "$OUT/rows.tsv")
 idle_first=$(awk -F'\t' 'NR == 3 {print $3}' "$OUT/rows.tsv")
 idle_last=$(awk -F'\t' 'END {print $3}' "$OUT/rows.tsv")
 live_slope=n/a
@@ -283,6 +290,7 @@ fi
   echo "host=$(uname -n) bin_sha256=$( (sha256sum "$BIN" 2>/dev/null || shasum -a 256 "$BIN") | awk '{print $1}')"
   echo "boot_kb=$RSS_BOOT with_sse_kb=$RSS_SSE peak_kb=$peak samples=$nsamples"
   echo "idle_end cycle2=${idle_first:-n/a} last=${idle_last:-n/a} slope_kb_per_cycle=$slope live_slope_kb_per_cycle=$live_slope"
+  echo "phase_growth_kb_per_cycle $phase_growth"
 } | tee "$OUT/summary.txt"
 
 if [ "$bad" -ne 0 ]; then

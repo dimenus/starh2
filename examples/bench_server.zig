@@ -918,7 +918,29 @@ const CountingGpa = struct {
     class_bytes: [classes]std.atomic.Value(u64) = @splat(.init(0)),
     class_live: [classes]std.atomic.Value(usize) = @splat(.init(0)),
 
+    /// Per OS thread, bytes allocated and freed in blocks under 64 KiB, the
+    /// sizes smp_allocator serves from per-thread free lists. smp puts a
+    /// freed block on the FREEING thread's list, so a thread that allocates
+    /// more than it frees maps new slabs while another thread's list grows.
+    /// A large alloc/free gap per thread shows that flow; it does not by
+    /// itself show that RSS grows from it.
+    /// Indexed [thread][size class].
+    thread_alloc: [max_threads][classes]std.atomic.Value(u64) = @splat(@splat(.init(0))),
+    thread_free: [max_threads][classes]std.atomic.Value(u64) = @splat(@splat(.init(0))),
+    next_thread: std.atomic.Value(u32) = .init(0),
+
     const classes = 40;
+    const max_threads = 64;
+    const small_limit = 64 * 1024;
+    threadlocal var thread_slot: u32 = std.math.maxInt(u32);
+
+    /// The last slot is shared by every thread past the first 63.
+    fn slot(self: *CountingGpa) u32 {
+        if (thread_slot == std.math.maxInt(u32)) {
+            thread_slot = @min(self.next_thread.fetchAdd(1, .monotonic), max_threads - 1);
+        }
+        return thread_slot;
+    }
 
     fn class(len: usize) usize {
         return @min(classes - 1, std.math.log2_int_ceil(usize, @max(len, 1)));
@@ -926,12 +948,14 @@ const CountingGpa = struct {
 
     fn noteAlloc(self: *CountingGpa, len: usize) void {
         const c = class(len);
+        if (len < small_limit) _ = self.thread_alloc[self.slot()][c].fetchAdd(len, .monotonic);
         _ = self.class_calls[c].fetchAdd(1, .monotonic);
         _ = self.class_bytes[c].fetchAdd(len, .monotonic);
         _ = self.class_live[c].fetchAdd(len, .monotonic);
     }
 
     fn noteFree(self: *CountingGpa, len: usize) void {
+        if (len < small_limit) _ = self.thread_free[self.slot()][class(len)].fetchAdd(len, .monotonic);
         _ = self.class_live[class(len)].fetchSub(len, .monotonic);
     }
 
@@ -983,11 +1007,14 @@ var g_counting: ?*CountingGpa = null;
 
 /// `/mem`: the `--count-gpa` counters as one JSON line, or 404 without it.
 /// `classes` lists each size class that has seen an allocation as
-/// [log2 upper bound, calls, bytes, live bytes].
-fn memHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+/// [log2 upper bound, calls, bytes, live bytes]. `threads` lists, per OS
+/// thread in first-use order, [bytes allocated, bytes freed] in blocks
+/// under 64 KiB. `thread_gap` lists, per size class, [log2 upper bound,
+/// summed per-thread excess of allocated over freed bytes].
+fn memHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     const c = g_counting orelse return resp.send(404, &.{}, "run with --count-gpa\n");
-    var buf: [4096]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
+    const buf = try req.arena.alloc(u8, 32 * 1024);
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{{\"live_bytes\":{d},\"alloc_calls\":{d},\"classes\":[", .{ c.live.load(.monotonic), c.calls.load(.monotonic) });
     var first = true;
     for (0..CountingGpa.classes) |i| {
@@ -996,6 +1023,35 @@ fn memHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteRes
         if (!first) try w.writeAll(",");
         first = false;
         try w.print("[{d},{d},{d},{d}]", .{ i, calls, c.class_bytes[i].load(.monotonic), c.class_live[i].load(.monotonic) });
+    }
+    try w.writeAll("],\"threads\":[");
+    const n_threads = @min(c.next_thread.load(.monotonic), CountingGpa.max_threads);
+    for (0..n_threads) |t| {
+        var a: u64 = 0;
+        var f: u64 = 0;
+        for (0..CountingGpa.classes) |i| {
+            a += c.thread_alloc[t][i].load(.monotonic);
+            f += c.thread_free[t][i].load(.monotonic);
+        }
+        if (t != 0) try w.writeAll(",");
+        try w.print("[{d},{d}]", .{ a, f });
+    }
+    // Per class, summed over threads: bytes a thread allocated beyond what
+    // it freed. Minus that class's live bytes, it is a floor on the bytes
+    // freed on another thread than the one that allocated them.
+    try w.writeAll("],\"thread_gap\":[");
+    first = true;
+    for (0..CountingGpa.classes) |i| {
+        var gap: u64 = 0;
+        for (0..n_threads) |t| {
+            const a = c.thread_alloc[t][i].load(.monotonic);
+            const f = c.thread_free[t][i].load(.monotonic);
+            if (a > f) gap += a - f;
+        }
+        if (gap == 0) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("[{d},{d}]", .{ i, gap });
     }
     try w.print("],\"fallbacks\":{{\"frame\":{d},\"write_chunk\":{d}}}}}\n", .{
         conn_mod.gpa_fallbacks.frame.load(.monotonic),
