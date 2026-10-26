@@ -237,8 +237,13 @@ fn status304(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResp
     try resp.send(304, &.{}, "nope");
 }
 
+/// An informational status is not a final response: `send` refuses it and
+/// leaves the response open, so the handler can still send a final one.
 fn status103(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
-    try resp.send(103, &.{.{ .name = "link", .value = "</style.css>" }}, "nope");
+    if (resp.send(103, &.{.{ .name = "link", .value = "</style.css>" }}, "nope")) |_| {
+        return error.InformationalStatusAccepted;
+    } else |err| if (err != error.InvalidStatus) return err;
+    try resp.send(204, &.{}, "nope");
 }
 
 fn crlfH(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
@@ -853,7 +858,7 @@ fn runNobodyPipeline(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAd
         .{ .req = "HEAD /head-stream HTTP/1.1\r\nHost: h\r\n\r\n", .status = 200, .no_chunk = true },
         .{ .req = "GET /204 HTTP/1.1\r\nHost: h\r\n\r\n", .status = 204, .no_chunk = true },
         .{ .req = "GET /304 HTTP/1.1\r\nHost: h\r\n\r\n", .status = 304, .no_chunk = true },
-        .{ .req = "GET /info HTTP/1.1\r\nHost: h\r\n\r\n", .status = 103, .no_chunk = true },
+        .{ .req = "GET /info HTTP/1.1\r\nHost: h\r\n\r\n", .status = 204, .no_chunk = true },
     };
     for (pairs) |p| {
         const stream = try addr.connect(io, .{ .mode = .stream });
@@ -868,22 +873,11 @@ fn runNobodyPipeline(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAd
         try both.appendSlice(gpa, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
         try writeReq(&writer.interface, both.items);
         const is_head = std.mem.startsWith(u8, p.req, "HEAD ");
-        if (p.status == 103) {
-            const head_bytes = try readUntilHead(&reader.interface, gpa);
-            defer gpa.free(head_bytes);
-            var first = try parseHeadBytes(gpa, head_bytes);
-            defer first.deinit();
-            try std.testing.expectEqual(@as(?u16, 103), first.status);
-            try std.testing.expect(!first.saw_cl);
-            try std.testing.expect(!first.saw_te_chunked);
-            try std.testing.expectEqual(@as(usize, 0), first.body.items.len);
-        } else {
-            var first = try readResponse(&reader.interface, gpa, is_head);
-            defer first.deinit();
-            try std.testing.expectEqual(@as(?u16, p.status), first.status);
-            try std.testing.expectEqual(@as(usize, 0), first.body.items.len);
-            if (p.no_chunk) try std.testing.expect(!first.saw_te_chunked);
-        }
+        var first = try readResponse(&reader.interface, gpa, is_head);
+        defer first.deinit();
+        try std.testing.expectEqual(@as(?u16, p.status), first.status);
+        try std.testing.expectEqual(@as(usize, 0), first.body.items.len);
+        if (p.no_chunk) try std.testing.expect(!first.saw_te_chunked);
         var second = try readResponse(&reader.interface, gpa, false);
         defer second.deinit();
         try std.testing.expectEqual(@as(?u16, 200), second.status);

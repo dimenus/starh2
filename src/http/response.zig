@@ -142,6 +142,15 @@ pub const Body = struct {
     }
 };
 
+/// `send` and `start` take a FINAL status only, 200 to 599. The HEADERS they
+/// produce open the response, and the scheduler lets DATA follow them, so an
+/// informational status (1xx) would carry a body and leave no way to send the
+/// final status. 1xx needs its own API; HTTP/2 also forbids 101 (RFC 9113
+/// section 8.6).
+fn isFinalStatus(status: u16) bool {
+    return status >= 200 and status <= 599;
+}
+
 pub const Response = struct {
     stream_id: u31,
     /// Snapshot at Body creation; live generation/cause live in `terminal`.
@@ -170,7 +179,7 @@ pub const Response = struct {
     pub fn send(self: *Response, status: u16, headers: []const request.Header, body: []const u8) ResponseError!void {
         if (self.slotTerminal()) |c| return causeToError(c);
         if (self.committed) return error.ResponseCommitted;
-        if (status < 100 or status > 599) return error.InvalidStatus;
+        if (!isFinalStatus(status)) return error.InvalidStatus;
         self.committed = true;
         try self.sendFn(self.ctx, self.stream_id, status, headers, body);
         self.finished = true;
@@ -179,7 +188,7 @@ pub const Response = struct {
     pub fn start(self: *Response, status: u16, headers: []const request.Header) ResponseError!Body {
         if (self.slotTerminal()) |c| return causeToError(c);
         if (self.committed) return error.ResponseCommitted;
-        if (status < 100 or status > 599) return error.InvalidStatus;
+        if (!isFinalStatus(status)) return error.InvalidStatus;
         self.committed = true;
         self.body_open = true;
         try self.startFn(self.ctx, self.stream_id, status, headers, false);
@@ -410,4 +419,53 @@ test "mapFailedTicketWait prefers SlotTerminal, then RST tombstone (t-718)" {
 
     term.setCause(.slow_consumer);
     try std.testing.expectEqual(error.SlowConsumer, mapFailedTicketWait(&term, .cancel, error.WriteFailed));
+}
+
+test "a status below 200 is refused before it reaches the wire" {
+    const Calls = struct {
+        var send_n: usize = 0;
+        var start_n: usize = 0;
+        var last_status: u16 = 0;
+        fn send(_: *anyopaque, _: u31, status: u16, _: []const request.Header, _: []const u8) ResponseError!void {
+            send_n += 1;
+            last_status = status;
+        }
+        fn start(_: *anyopaque, _: u31, status: u16, _: []const request.Header, _: bool) ResponseError!void {
+            start_n += 1;
+            last_status = status;
+        }
+    };
+    var slot: SlotTerminal = .{};
+    var resp: Response = .{
+        .stream_id = 1,
+        .generation = 0,
+        .terminal = &slot,
+        .ctx = undefined,
+        .io = std.testing.io,
+        .sendFn = Calls.send,
+        .startFn = Calls.start,
+        .writeFn = undefined,
+        .flushFn = undefined,
+        .abortFn = undefined,
+        .waitUntilFn = undefined,
+    };
+    // The scheduler treats every HEADERS as the response's start, so an
+    // informational status would let DATA follow it and no final status
+    // could. 1xx needs its own API.
+    for ([_]u16{ 0, 99, 100, 101, 103, 199, 600 }) |status| {
+        try std.testing.expectError(error.InvalidStatus, resp.send(status, &.{}, "body"));
+        try std.testing.expectError(error.InvalidStatus, resp.start(status, &.{}));
+        try std.testing.expect(!resp.committed);
+    }
+    try std.testing.expectEqual(@as(usize, 0), Calls.send_n + Calls.start_n);
+    _ = try resp.start(200, &.{});
+    try std.testing.expectEqual(@as(usize, 1), Calls.start_n);
+    // `startSse` takes no status: it always starts with 200.
+    var slot2: SlotTerminal = .{};
+    var sse = resp;
+    sse.terminal = &slot2;
+    sse.committed = false;
+    sse.body_open = false;
+    _ = try sse.startSse(&.{});
+    try std.testing.expectEqual(@as(u16, 200), Calls.last_status);
 }

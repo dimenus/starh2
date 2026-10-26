@@ -241,6 +241,10 @@ fn probeHandlerPlacement() zio.Placement {
 pub var test_force_spawn_fail: bool = false;
 /// Test-only: when true, actor skips draining completion_ch (sticky until cleared).
 pub var test_hold_completion_drain: std.atomic.Value(bool) = .init(false);
+/// Test-only: while true, `drainEmit` emits nothing, so frames a handler
+/// queued stay in the scheduler (a reset can then arrive before them).
+/// Compiled out unless `test_observe`.
+pub var test_hold_emit: std.atomic.Value(bool) = .init(false);
 /// Test-only: stash a complete-batch write ack on the actor instead of
 /// applying it. Separate from `test_hold_completion_drain`, which parks
 /// `completion_ch`. Must not park the actor on the release event — that
@@ -1857,6 +1861,13 @@ pub const Connection = struct {
             fn f(ctx: *anyopaque, payload: []u8) void {
                 const c: *Connection = @ptrCast(@alignCast(ctx));
                 c.releaseWireBytes(payload);
+            }
+        }.f;
+        self.sched.ticket_fail_ctx = self;
+        self.sched.ticket_fail = struct {
+            fn f(ctx: *anyopaque, ticket: u64, slot: u32) void {
+                const c: *Connection = @ptrCast(@alignCast(ctx));
+                c.tickets.wake(slot, ticket, false);
             }
         }.f;
         // Seed read/write-chunk free lists after channels are live.
@@ -4646,6 +4657,9 @@ pub const Connection = struct {
     /// window state the peer does not share.
     fn drainEmit(self: *Connection) !void {
         self.assertSessionHeld("drainEmit");
+        if (comptime test_observe) {
+            if (test_hold_emit.load(.acquire)) return;
+        }
         // A connection that is ending must not park in `pushWriteChunk`: it
         // would wait in `putOne` for room, holding `session_mu`, and a writer
         // that is not moving never makes room, so the closing deadline could
@@ -5086,6 +5100,10 @@ pub const Connection = struct {
     }
 
     fn applyStreamResetIntent(self: *Connection, r: anytype) void {
+        // Every reset, local or from the peer, comes through here, so this is
+        // where the scheduler's per-stream HEADERS state ends for it, and its
+        // HEADERS still queued are dropped unsent.
+        self.sched.forgetStream(r.stream_id);
         const cause: response.TerminalCause = if (r.from_peer)
             .{ .peer_reset = r.code }
         else if (self.shutting_down)

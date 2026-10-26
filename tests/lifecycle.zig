@@ -999,6 +999,233 @@ test "a complete batch waits for a control entry instead of resetting the stream
     };
 }
 
+/// Read frames until a HEADERS frame has arrived for every stream in `sids`.
+fn awaitResponseHeaders(stream: zio.net.Stream, sids: []const u31, timeout_ms: u64) !void {
+    var seen: [16]bool = @splat(false);
+    std.debug.assert(sids.len <= seen.len);
+    var left = sids.len;
+    const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% timeout_ms * std.time.ns_per_ms;
+    var hdr: [9]u8 = undefined;
+    var payload: [64 * 1024]u8 = undefined;
+    while (left > 0) {
+        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) return error.NoResponseHeaders;
+        const n = stream.read(hdr[0..1], .{ .duration = .fromMilliseconds(20) }) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionClosed;
+        try readExact(stream, hdr[1..]);
+        const len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | hdr[2];
+        const frame_sid: u31 = @intCast(std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff);
+        std.debug.assert(len <= payload.len);
+        try readExact(stream, payload[0..len]);
+        if (hdr[3] == 0x7) return error.GoAway;
+        if (hdr[3] != 0x1) continue;
+        for (sids, 0..) |sid, i| {
+            if (sid == frame_sid and !seen[i]) {
+                seen[i] = true;
+                left -= 1;
+            }
+        }
+    }
+}
+
+/// The scheduler remembers each stream whose response HEADERS went out
+/// until that stream ends, and a reset is an end. One connection opens a
+/// full set of streams, gets their HEADERS, resets them all, and does it
+/// again. If a reset did not end that state, the set would be full on the
+/// second round and the connection would fail (t-3514).
+fn runResetsEndHeadersState(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangSse } } },
+        .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 4;
+    limits.max_streams_per_server = 16;
+    limits.cancellation_reaper_jobs = 16;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    defer stream.close();
+
+    var wire = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer wire.deinit(gpa);
+    var next: u31 = 1;
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        var sids: [4]u31 = undefined;
+        for (&sids) |*sid| {
+            sid.* = next;
+            next += 2;
+            try h2c.appendHeaders(gpa, &wire, sid.*, "/sse", true);
+        }
+        try writeAllStreamAt(stream, wire.items, @src());
+        wire.clearRetainingCapacity();
+        awaitResponseHeaders(stream, &sids, 5_000) catch |err| {
+            std.debug.print("resets end HEADERS state: round {d}: {s}\n", .{ round, @errorName(err) });
+            return err;
+        };
+        for (sids) |sid| try h2c.appendRst(gpa, &wire, sid);
+        try writeAllStreamAt(stream, wire.items, @src());
+        wire.clearRetainingCapacity();
+        try waitAccountingZeroAt(&server, 2_000, @src().line);
+    }
+    try h2c.appendHeaders(gpa, &wire, next, "/hello", true);
+    try writeAllStreamAt(stream, wire.items, @src());
+    if (try awaitStreamOutcome(stream, next, 5_000) != .ended) return error.StreamNotAnswered;
+}
+
+test "a reset ends the scheduler's HEADERS state for that stream (t-3514)" {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in resets-end-HEADERS-state test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runResetsEndHeadersState, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("resets end HEADERS state: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
+var sse_entered: std.atomic.Value(usize) = .init(0);
+
+fn countedSse(ctx: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = sse_entered.fetchAdd(1, .acq_rel);
+    return hangSse(ctx, req, resp);
+}
+
+/// An SSE start queues HEADERS with the ticket its handler waits on, and the
+/// actor drains it later. A peer reset that arrives first must drop that
+/// HEADERS unsent and fail its ticket, so the handler wakes and the stream's
+/// scheduler state ends; the connection then goes on serving (t-3514).
+fn runResetDropsQueuedHeaders(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = countedSse } } },
+        .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 4;
+    limits.max_streams_per_connection = 4;
+    limits.max_streams_per_server = 16;
+    limits.cancellation_reaper_jobs = 16;
+    limits.cancellation_reaper_tasks = 2;
+
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    const c = starh2.edge.connection;
+    const fs = starh2.edge.fair_scheduler;
+    const dropped_before = fs.test_dropped_ticketed_headers.load(.acquire);
+    const entered_before = sse_entered.load(.acquire);
+    c.test_hold_emit.store(true, .release);
+    defer c.test_hold_emit.store(false, .release);
+
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    var stream = try peer.connect(.{});
+    defer stream.close();
+    var wire = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer wire.deinit(gpa);
+    try h2c.appendHeaders(gpa, &wire, 1, "/sse", true);
+    try writeAllStreamAt(stream, wire.items, @src());
+    wire.clearRetainingCapacity();
+
+    // The handler runs, queues its HEADERS and parks on their ticket. Its
+    // entry is visible; the queueing right after it is not, so allow it a
+    // moment. If the reset still wins, nothing is dropped and the check
+    // below fails instead of passing without exercising the drop.
+    const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
+    while (sse_entered.load(.acquire) == entered_before) {
+        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) return error.HandlerNeverRan;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    zio.sleep(.fromMilliseconds(50)) catch {};
+    try h2c.appendRst(gpa, &wire, 1);
+    try writeAllStreamAt(stream, wire.items, @src());
+    wire.clearRetainingCapacity();
+    try waitAccountingZeroAt(&server, 2_000, @src().line);
+    if (fs.test_dropped_ticketed_headers.load(.acquire) != dropped_before + 1) return error.QueuedHeadersNotDropped;
+
+    c.test_hold_emit.store(false, .release);
+    try h2c.appendHeaders(gpa, &wire, 3, "/hello", true);
+    try writeAllStreamAt(stream, wire.items, @src());
+    // Stream 1's HEADERS never reaches the wire; stream 3 is answered.
+    var hdr: [9]u8 = undefined;
+    var payload: [64 * 1024]u8 = undefined;
+    const end = zio.Timestamp.now(.monotonic).toNanoseconds() +% 5 * std.time.ns_per_s;
+    while (true) {
+        if (zio.Timestamp.now(.monotonic).toNanoseconds() >= end) return error.StreamNotAnswered;
+        const n = stream.read(hdr[0..1], .{ .duration = .fromMilliseconds(20) }) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionClosed;
+        try readExact(stream, hdr[1..]);
+        const len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | hdr[2];
+        const sid: u31 = @intCast(std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff);
+        try readExact(stream, payload[0..len]);
+        if (sid == 1 and hdr[3] == 0x1) return error.ResetStreamGotHeaders;
+        if (sid == 3 and (hdr[3] == 0x0 or hdr[3] == 0x1) and hdr[4] & 0x1 != 0) break;
+    }
+}
+
+test "a reset drops a stream's queued HEADERS and fails their ticket (t-3514)" {
+    var dbg = LifecycleDbg.init;
+    defer {
+        const status = dbg.deinit();
+        if (status != .ok) @panic("DebugAllocator reported leak/UAF in reset-drops-queued-HEADERS test");
+    }
+    const gpa = dbg.allocator();
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 64, .prewarm = 16 },
+        .executors = .exact(4),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(runResetDropsQueuedHeaders, .{ rt, gpa });
+    handle.join() catch |err| {
+        std.debug.print("reset drops queued HEADERS: {s}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
 /// A stream that gets no request memory is refused, and the connection goes
 /// on: Session still decoded its block, so the HPACK table stays in step.
 fn runRefusedWithoutRequestMemory(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {

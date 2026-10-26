@@ -67,6 +67,7 @@ pub const edge = struct {
     pub const slab_pool = @import("edge/slab_pool.zig");
     pub const conn_slot = @import("edge/conn_slot.zig");
     pub const touched = @import("edge/touched.zig");
+    pub const wire_ring = @import("edge/wire_ring.zig");
 };
 
 pub const http = struct {
@@ -134,6 +135,7 @@ test {
     _ = edge.fair_scheduler;
     _ = edge.slab_pool;
     _ = edge.touched;
+    _ = edge.wire_ring;
     _ = core.bound_shapes;
     _ = core.boot_plan;
     _ = edge.conn_slot;

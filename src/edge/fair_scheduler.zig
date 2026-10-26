@@ -1,5 +1,7 @@
 //! Production fair write scheduler — owned by Connection actor.
 //! Terminal/required ACK → ordinary controls+HEADERS → 16KiB DRR DATA.
+//! A stream's DATA is never eligible before its response HEADERS has been
+//! handed to the sink (see "HEADERS before DATA" below).
 //! Pending DATA uses boot-reserved per-stream slabs (no post-boot GPA growth).
 //! Nonterminal controls counted only when emitted.
 //!
@@ -32,6 +34,36 @@
 //! caps how long any one stream holds the wire. Streams blocked on their own
 //! window wait on a separate list and cost nothing until `rearm`.
 //!
+//! # HEADERS before DATA
+//!
+//! A response starts with HEADERS (RFC 9113 section 8.1). DATA on a stream
+//! whose HEADERS the peer has not seen is a connection error at the peer, so
+//! one misordered frame kills every stream on the connection (t-3514).
+//!
+//! Tier order alone does not give this. The anti-starvation yield emits DATA
+//! while controls are still queued, and a drain on a handler task can see the
+//! control pause and the DATA pause disagree, because the actor empties the
+//! TLS stash without `session_mu`. A complete handler also stages DATA before
+//! its HEADERS reaches the ordinary queue. So the rule is per stream, by
+//! construction: `DataPending.headers_out` is false until that stream's
+//! HEADERS goes to the sink, and `arm` puts only a slot with it set on the
+//! ready list. A slot waiting for its HEADERS stays idle: it is visited by
+//! nothing, keeps its newcomer place, and `drain` returns when nothing else is
+//! eligible, as for a window-blocked stream.
+//!
+//! A slot is freed every time it drains (an SSE stream between events), so
+//! the fact outlives slots in `started`: the streams whose HEADERS went out
+//! and whose local side has not ended. An entry ends when END_STREAM goes to
+//! the sink (on DATA, or on a HEADERS such as trailers) or when the connection
+//! reports the stream reset (`forgetStream`). A new slot reads it.
+//!
+//! A reset also drops the stream's HEADERS that are still queued. Sent later,
+//! it would be a frame on a closed stream (RFC 9113 section 5.1); after a
+//! local reset the RST_STREAM, a terminal control, would even have gone out
+//! first. And it would put the stream back into `started` with nothing left
+//! to end it. The encoder keeps no dynamic table (`hpack.Encoder`), so a
+//! dropped block cannot desynchronize the peer's decoder.
+//!
 //! # No allocation on the write path
 //!
 //! Pending DATA lives in per-stream slabs carved from ONE boot allocation, and
@@ -46,6 +78,12 @@ const slab_pool = @import("slab_pool.zig");
 const Touched = @import("touched.zig").Touched;
 const frame = @import("../core/frame.zig");
 const boot_plan = @import("../core/boot_plan.zig");
+const wire_ring = @import("wire_ring.zig");
+const observe = @import("build_options").observe;
+
+/// Test-only (`observe` builds): HEADERS dropped by `forgetStream` that
+/// carried a ticket, so an integration test can prove that path ran.
+pub var test_dropped_ticketed_headers: std.atomic.Value(usize) = .init(0);
 
 /// One round-robin turn. It matches the HTTP/2 default max frame size, so a
 /// quantum is exactly one DATA frame and the scheduler never has to split a
@@ -100,6 +138,9 @@ pub const DataPending = struct {
     prev: u32 = none,
     /// Position in `FairScheduler.live`, so a free is a swap-remove.
     live_pos: u32 = none,
+    /// This stream's HEADERS has been handed to the sink. Until then the
+    /// slot is never armed (see "HEADERS before DATA").
+    headers_out: bool = false,
 
     pub const Place = enum { free, idle, ready, blocked };
 
@@ -120,6 +161,7 @@ pub const DataPending = struct {
         self.next = none;
         self.prev = none;
         self.live_pos = none;
+        self.headers_out = false;
     }
 };
 
@@ -128,6 +170,68 @@ const none: u32 = std.math.maxInt(u32);
 /// Slots in the stream-id index: a power of two at least twice the slot
 /// count, so the load stays at or below one half and a miss stops at an
 /// empty entry within a short probe. Exported for `bound_shapes`.
+/// The stream of a HEADERS frame payload; null for any other frame, and for
+/// stream 0, which no HEADERS may use.
+fn headersStream(payload: []const u8) ?u31 {
+    if (payload.len < frame.FRAME_HEADER_LEN or payload[3] != @backingInt(frame.FrameType.headers)) return null;
+    const sid: u31 = @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
+    if (sid == 0) return null;
+    return sid;
+}
+
+/// Open-addressed `u31` keys, linear probing, key 0 empty. The table is at
+/// most half full (`indexCapacity`), so a probe always meets an empty key.
+fn probeHome(shift: u5, stream_id: u31) usize {
+    return (@as(u32, stream_id) *% 0x9E3779B1) >> shift;
+}
+
+fn probeFind(keys: []const u31, shift: u5, stream_id: u31) ?usize {
+    std.debug.assert(stream_id != 0);
+    const mask = keys.len - 1;
+    var i = probeHome(shift, stream_id);
+    while (true) : (i = (i + 1) & mask) {
+        const k = keys[i];
+        if (k == 0) return null;
+        if (k == stream_id) return i;
+    }
+}
+
+fn probeInsert(keys: []u31, shift: u5, stream_id: u31) usize {
+    const mask = keys.len - 1;
+    var i = probeHome(shift, stream_id);
+    while (keys[i] != 0) : (i = (i + 1) & mask) {
+        std.debug.assert(keys[i] != stream_id);
+    }
+    keys[i] = stream_id;
+    return i;
+}
+
+/// Backward-shift delete. Each later key in the cluster moves into the
+/// hole unless its home lies cyclically in (hole, its position], in which
+/// case moving it would put it before its own home and a lookup would
+/// stop at the hole. A plain clear (or a tombstone) is what this replaces.
+/// `vals`, when given, moves with its key.
+fn probeRemove(keys: []u31, vals: ?[]u32, shift: u5, stream_id: u31) void {
+    const mask = keys.len - 1;
+    var hole = probeHome(shift, stream_id);
+    while (keys[hole] != stream_id) : (hole = (hole + 1) & mask) {
+        std.debug.assert(keys[hole] != 0);
+    }
+    var j = hole;
+    while (true) {
+        j = (j + 1) & mask;
+        const k = keys[j];
+        if (k == 0) break;
+        const home = probeHome(shift, k);
+        const stays = if (hole <= j) (hole < home and home <= j) else (hole < home or home <= j);
+        if (stays) continue;
+        keys[hole] = k;
+        if (vals) |v| v[hole] = v[j];
+        hole = j;
+    }
+    keys[hole] = 0;
+}
+
 pub fn indexCapacity(max_streams: usize) usize {
     return std.math.ceilPowerOfTwoAssert(usize, @max(2, max_streams * 2));
 }
@@ -175,6 +279,10 @@ pub const FairScheduler = struct {
     /// means every payload is a GPA allocation of the on-wire size.
     payload_free_ctx: ?*anyopaque = null,
     payload_free: ?*const fn (*anyopaque, []u8) void = null,
+    /// Fails the ticket of a control that `forgetStream` drops unsent, so its
+    /// waiter wakes. Required once a dropped control can carry a ticket.
+    ticket_fail_ctx: ?*anyopaque = null,
+    ticket_fail: ?*const fn (*anyopaque, u64, u32) void = null,
     active_pending: usize = 0,
     /// Open-addressed `stream_id -> slot index`, linear probing, deleted by
     /// backward shift so no tombstones accumulate under stream churn. Key 0 is
@@ -182,6 +290,13 @@ pub const FairScheduler = struct {
     idx_keys: []u31,
     idx_vals: []u32,
     idx_shift: u5,
+    /// Streams whose HEADERS went to the sink and whose local side has not
+    /// ended (see "HEADERS before DATA"). Same capacity and probing as the
+    /// index, keys only. At most `max_streams` entries: the server advertises
+    /// that as SETTINGS_MAX_CONCURRENT_STREAMS and every entry is an open
+    /// stream, so a full set is a broken invariant, reported as StreamCap.
+    started_keys: []u31,
+    started_len: usize = 0,
     /// Every occupied slot, dense, for the walks that must see blocked
     /// streams too (`forEachPending`, `nextSlowDeadlineNs`).
     live: []u32,
@@ -224,6 +339,34 @@ pub const FairScheduler = struct {
     /// emit WINDOW_UPDATE. Only stash-full should set this.
     pause_control: ?*const fn (*anyopaque) bool = null,
 
+    /// `-Dwire-ring=true` only (t-3514): which `drain` site asked for DATA,
+    /// and whether the ordinary loop last stopped on `isControlPaused`.
+    diag_path: enum { forced, tail } = .tail,
+    diag_ctrl_break: bool = false,
+
+    /// `-Dwire-ring=true` only: a HEADERS frame for `sid` still waits in the
+    /// ordinary queue. DATA emitted now reaches the peer before the stream's
+    /// HEADERS, which a client treats as a connection error.
+    fn diagHeadersQueued(self: *const FairScheduler, sid: u31) bool {
+        var k: usize = 0;
+        while (k < self.ordinary_len) : (k += 1) {
+            const p = self.ordinary_q[(self.ordinary_head + k) % self.ordinary_q.len].payload;
+            if (p.len < frame.FRAME_HEADER_LEN or p[3] != @backingInt(frame.FrameType.headers)) continue;
+            if (std.mem.readInt(u32, p[5..9], .big) & 0x7fff_ffff == sid) return true;
+        }
+        return false;
+    }
+
+    fn diagDataBeforeHeaders(self: *FairScheduler, sid: u31, site: []const u8) void {
+        if (!self.diagHeadersQueued(sid)) return;
+        var buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "SCHED data_before_headers sid={d} site={s} path={s} ctrl_break={} paused_now={} ctrl_paused_now={} ordinary_len={d} since_data={d}\n", .{
+            sid,             site,                   @tagName(self.diag_path), self.diag_ctrl_break,
+            self.isPaused(), self.isControlPaused(), self.ordinary_len,        self.emitted_controls_since_data,
+        }) catch return;
+        _ = std.c.write(2, line.ptr, line.len);
+    }
+
     fn isPaused(self: *FairScheduler) bool {
         const f = self.pause orelse return false;
         return f(self.pause_ctx);
@@ -250,6 +393,8 @@ pub const FairScheduler = struct {
         const idx_cap = indexCapacity(max_streams);
         try plan.array(u31, idx_cap);
         try plan.array(u32, idx_cap);
+        // `started_keys`, keys only, same capacity as the index.
+        try plan.array(u31, idx_cap);
         try plan.array(u32, max_streams);
         try plan.array(u32, max_streams);
     }
@@ -279,6 +424,9 @@ pub const FairScheduler = struct {
         @memset(keys, 0);
         const vals = try gpa.alloc(u32, idx_cap);
         errdefer gpa.free(vals);
+        const started = try gpa.alloc(u31, idx_cap);
+        errdefer gpa.free(started);
+        @memset(started, 0);
         const live = try gpa.alloc(u32, max_streams);
         errdefer gpa.free(live);
         const free_stack = try gpa.alloc(u32, max_streams);
@@ -295,6 +443,7 @@ pub const FairScheduler = struct {
             .idx_keys = keys,
             .idx_vals = vals,
             .idx_shift = @intCast(32 - std.math.log2_int(usize, idx_cap)),
+            .started_keys = started,
             .live = live,
             .free_stack = free_stack,
         };
@@ -331,6 +480,7 @@ pub const FairScheduler = struct {
         self.gpa.free(self.pending_slots.storage);
         self.gpa.free(self.idx_keys);
         self.gpa.free(self.idx_vals);
+        self.gpa.free(self.started_keys);
         self.gpa.free(self.live);
         self.gpa.free(self.free_stack);
     }
@@ -362,54 +512,101 @@ pub const FairScheduler = struct {
     }
 
     fn idxHome(self: *const FairScheduler, stream_id: u31) usize {
-        return (@as(u32, stream_id) *% 0x9E3779B1) >> self.idx_shift;
+        return probeHome(self.idx_shift, stream_id);
     }
 
     fn idxFind(self: *const FairScheduler, stream_id: u31) ?u32 {
-        std.debug.assert(stream_id != 0);
-        const mask = self.idx_keys.len - 1;
-        var i = self.idxHome(stream_id);
-        // Terminates: the table is at most half full, so an empty key exists.
-        while (true) : (i = (i + 1) & mask) {
-            const k = self.idx_keys[i];
-            if (k == 0) return null;
-            if (k == stream_id) return self.idx_vals[i];
-        }
+        const at = probeFind(self.idx_keys, self.idx_shift, stream_id) orelse return null;
+        return self.idx_vals[at];
     }
 
     fn idxInsert(self: *FairScheduler, stream_id: u31, slot: u32) void {
-        const mask = self.idx_keys.len - 1;
-        var i = self.idxHome(stream_id);
-        while (self.idx_keys[i] != 0) : (i = (i + 1) & mask) {
-            std.debug.assert(self.idx_keys[i] != stream_id);
-        }
-        self.idx_keys[i] = stream_id;
-        self.idx_vals[i] = slot;
+        self.idx_vals[probeInsert(self.idx_keys, self.idx_shift, stream_id)] = slot;
     }
 
-    /// Backward-shift delete. Each later key in the cluster moves into the
-    /// hole unless its home lies cyclically in (hole, its position], in which
-    /// case moving it would put it before its own home and a lookup would
-    /// stop at the hole. A plain clear (or a tombstone) is what this replaces.
     fn idxRemove(self: *FairScheduler, stream_id: u31) void {
-        const mask = self.idx_keys.len - 1;
-        var hole = self.idxHome(stream_id);
-        while (self.idx_keys[hole] != stream_id) : (hole = (hole + 1) & mask) {
-            std.debug.assert(self.idx_keys[hole] != 0);
+        probeRemove(self.idx_keys, self.idx_vals, self.idx_shift, stream_id);
+    }
+
+    fn startedContains(self: *const FairScheduler, stream_id: u31) bool {
+        return probeFind(self.started_keys, self.idx_shift, stream_id) != null;
+    }
+
+    fn startedInsert(self: *FairScheduler, stream_id: u31) error{StreamCap}!void {
+        if (self.startedContains(stream_id)) return;
+        if (self.started_len == self.pending_slots.storage.len) return error.StreamCap;
+        _ = probeInsert(self.started_keys, self.idx_shift, stream_id);
+        self.started_len += 1;
+    }
+
+    fn startedRemove(self: *FairScheduler, stream_id: u31) void {
+        if (!self.startedContains(stream_id)) return;
+        probeRemove(self.started_keys, null, self.idx_shift, stream_id);
+        self.started_len -= 1;
+    }
+
+    /// True once `stream_id`'s HEADERS has been handed to the sink.
+    fn headersOut(self: *FairScheduler, stream_id: u31) bool {
+        if (self.findPending(stream_id)) |pw| return pw.headers_out;
+        return self.startedContains(stream_id);
+    }
+
+    /// A HEADERS frame is about to go to the sink: its stream's DATA becomes
+    /// eligible. END_STREAM on it (a response with no body, or trailers) ends
+    /// the local side, so the stream leaves `started`. A slot that already
+    /// waits is armed; DATA after an END_STREAM HEADERS would be a caller
+    /// bug, and arming it makes that bug a loud peer error, not a silent stall.
+    ///
+    /// `drain` is the production caller, for every ordinary control it hands
+    /// to the sink. Public so a test that drives `emitOneDataPublic` directly
+    /// can open streams the same way.
+    pub fn noteHeadersOut(self: *FairScheduler, payload: []const u8) error{StreamCap}!void {
+        const sid = headersStream(payload) orelse return;
+        if (payload[4] & 0x1 != 0) self.startedRemove(sid) else try self.startedInsert(sid);
+        if (self.findPending(sid)) |pw| {
+            pw.headers_out = true;
+            self.arm(pw);
         }
-        var j = hole;
-        while (true) {
-            j = (j + 1) & mask;
-            const k = self.idx_keys[j];
-            if (k == 0) break;
-            const home = self.idxHome(k);
-            const stays = if (hole <= j) (hole < home and home <= j) else (hole < home or home <= j);
-            if (stays) continue;
-            self.idx_keys[hole] = k;
-            self.idx_vals[hole] = self.idx_vals[j];
-            hole = j;
+    }
+
+    /// The connection saw this stream reset, by either side: it will send
+    /// no more frames, so its HEADERS state ends and its still-queued HEADERS
+    /// are dropped with their control-pool occupancy and tickets (see "HEADERS
+    /// before DATA"). Its DATA slot, if any, is the caller's to remove
+    /// (`removePending`), because the caller owns that byte accounting.
+    pub fn forgetStream(self: *FairScheduler, stream_id: u31) void {
+        if (stream_id == 0) return;
+        self.startedRemove(stream_id);
+        self.dropQueuedHeaders(stream_id);
+    }
+
+    /// Only HEADERS: they are what opens a response, and the only control a
+    /// handler queues for its stream. RST_STREAM is terminal-class and must
+    /// still go. Order of everything kept is unchanged.
+    fn dropQueuedHeaders(self: *FairScheduler, stream_id: u31) void {
+        const n = self.ordinary_len;
+        if (n == 0) return;
+        const cap = self.ordinary_q.len;
+        var kept: usize = 0;
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const e = self.ordinary_q[(self.ordinary_head + k) % cap];
+            if (headersStream(e.payload) == stream_id) {
+                self.ctrl.release(e.control_n, 1);
+                if (e.ticket != 0) {
+                    if (comptime observe) _ = test_dropped_ticketed_headers.fetchAdd(1, .acq_rel);
+                    const fail = self.ticket_fail orelse
+                        std.debug.panic("dropped HEADERS for stream {d} carries ticket {d} and no ticket_fail is set", .{ stream_id, e.ticket });
+                    fail(self.ticket_fail_ctx.?, e.ticket, e.ticket_slot);
+                }
+                self.freePayload(e.payload);
+                continue;
+            }
+            self.ordinary_q[(self.ordinary_head + kept) % cap] = e;
+            kept += 1;
         }
-        self.idx_keys[hole] = 0;
+        self.ordinary_len = kept;
+        self.ordinary_tail = (self.ordinary_head + kept) % cap;
     }
 
     fn slotIndex(self: *const FairScheduler, pw: *const DataPending) u32 {
@@ -445,6 +642,7 @@ pub const FairScheduler = struct {
     fn readyInsert(self: *FairScheduler, i: u32) void {
         const s = &self.pending_slots.slice()[i];
         std.debug.assert(s.place == .idle);
+        std.debug.assert(s.headers_out);
         if (!s.served) {
             if (self.fresh_tail == none) {
                 self.listPushHead(&self.ready_head, &self.ready_tail, i);
@@ -491,6 +689,7 @@ pub const FairScheduler = struct {
     fn arm(self: *FairScheduler, pw: *DataPending) void {
         if (pw.place != .idle) return;
         if (pw.len == 0 and !pw.end_stream) return;
+        if (!pw.headers_out) return;
         self.readyInsert(self.slotIndex(pw));
     }
 
@@ -515,6 +714,7 @@ pub const FairScheduler = struct {
         s.clear();
         s.stream_id = stream_id;
         s.place = .idle;
+        s.headers_out = self.startedContains(stream_id);
         s.live_pos = @intCast(self.active_pending);
         self.live[self.active_pending] = i;
         self.active_pending += 1;
@@ -817,9 +1017,14 @@ pub const FairScheduler = struct {
             self.recordEmitKind(.terminal_control);
             try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
         }
+        if (comptime wire_ring.enabled) self.diag_ctrl_break = false;
         while (self.ordinary_len > 0) {
-            if (self.isControlPaused()) break;
+            if (self.isControlPaused()) {
+                if (comptime wire_ring.enabled) self.diag_ctrl_break = true;
+                break;
+            }
             if (!self.isPaused() and self.shouldForceDataNow() and self.dataEligible(win_ctx, conn_win)) {
+                if (comptime wire_ring.enabled) self.diag_path = .forced;
                 if (try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) {
                     continue;
                 }
@@ -830,8 +1035,13 @@ pub const FairScheduler = struct {
             self.recordEmitKind(.ordinary_control);
             self.emitted_controls_since_data += 1;
             self.ctrl.noteControl();
+            self.noteHeadersOut(e.payload) catch |err| {
+                self.freePayload(e.payload);
+                return err;
+            };
             try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
         }
+        if (comptime wire_ring.enabled) self.diag_path = .tail;
         while (true) {
             if (self.isPaused()) return;
             if (!try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) break;
@@ -893,8 +1103,10 @@ pub const FairScheduler = struct {
 
         if (self.framed_len > 0) {
             const head = self.framed_data_q[self.framed_head];
-            if (stream_win(win_ctx, head.stream_id) > 0 or self.active_pending == 0) {
+            if (self.headersOut(head.stream_id) and (stream_win(win_ctx, head.stream_id) > 0 or self.active_pending == 0)) {
+                if (comptime wire_ring.enabled) self.diagDataBeforeHeaders(head.stream_id, "framed");
                 const e = self.popFramed() orelse return false;
+                if (e.end_stream) self.startedRemove(e.stream_id);
                 self.emits_total += 1;
                 self.sink_origin_emits += 1;
                 self.recordEmitKind(.data);
@@ -910,9 +1122,10 @@ pub const FairScheduler = struct {
             self.readyUnlink(i);
             const pw = &self.pending_slots.slice()[i];
             const sid = pw.stream_id;
-            // `arm` only lists a slot with a frame to send, and every path that
-            // empties one frees it.
+            // `arm` only lists a slot with a frame to send and its HEADERS
+            // out, and every path that empties one frees it.
             std.debug.assert(pw.len > 0 or pw.end_stream);
+            std.debug.assert(pw.headers_out);
             const avail = stream_win(win_ctx, sid);
             if (avail <= 0) {
                 self.blockedPush(i);
@@ -920,6 +1133,7 @@ pub const FairScheduler = struct {
             }
             const quantum = if (pw.len == 0) 0 else @min(pw.len, DATA_QUANTUM, @as(usize, @intCast(avail)));
             const end = pw.end_stream and quantum == pw.len;
+            if (comptime wire_ring.enabled) self.diagDataBeforeHeaders(sid, "slot");
             const payload = build_data_frame(build_ctx, sid, pw.slab[0..quantum], end) catch |err| {
                 if (err != error.FlowBlocked) return err;
                 if (conn_win(win_ctx) <= 0) {
@@ -943,6 +1157,7 @@ pub const FairScheduler = struct {
             if (rest > 0) @memmove(pw.slab[0..rest], pw.slab[quantum..][0..rest]);
             pw.len = rest;
             pw.last_progress_ns = nowNs(self.io);
+            if (end) self.startedRemove(sid);
             if (end or rest == 0) {
                 // Drained: free the slot (and its slab) at once. A long-lived
                 // SSE stream is idle between events, and holding a slab or an
@@ -1201,6 +1416,16 @@ const TestWire = struct {
     }
 };
 
+/// Hand HEADERS for `sids` out the way `drain` does, so a tier-3 test that
+/// drives `emitOneData` directly has streams whose DATA may go.
+fn testHeadersOut(sched: *FairScheduler, sids: []const u31) !void {
+    for (sids) |sid| {
+        var h = [_]u8{ 0, 0, 0, @backingInt(frame.FrameType.headers), 0x4, 0, 0, 0, 0 };
+        std.mem.writeInt(u32, h[5..9], sid, .big);
+        try sched.noteHeadersOut(&h);
+    }
+}
+
 test "tier 3 serves ready streams round robin, newcomers in arrival order, not by id" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
@@ -1211,6 +1436,7 @@ test "tier 3 serves ready streams round robin, newcomers in arrival order, not b
     defer w.deinit();
 
     const body: [3 * DATA_QUANTUM]u8 = @splat('x');
+    try testHeadersOut(&sched, &.{ 11, 1, 9 });
     // Arrival order is deliberately not id order.
     try sched.enqueueDataBytes(11, &body, true, 0, 0);
     try sched.enqueueDataBytes(1, &body, true, 0, 0);
@@ -1231,6 +1457,7 @@ test "a newcomer goes out before a running stream's next quantum, and newcomers 
     defer w.deinit();
 
     const bulk: [3 * DATA_QUANTUM]u8 = @splat('b');
+    try testHeadersOut(&sched, &.{ 1, 3, 5 });
     try sched.enqueueDataBytes(1, &bulk, true, 0, 0);
     try std.testing.expect(try w.emit(&sched));
     // Stream 1 is now served and back on the ready list. Two short responses
@@ -1252,6 +1479,7 @@ test "a quantum that spends the last connection credit does not strand its strea
     defer w.deinit();
 
     const body: [2 * DATA_QUANTUM]u8 = @splat('c');
+    try testHeadersOut(&sched, &.{1});
     try sched.enqueueDataBytes(1, &body, true, 0, 0);
     try std.testing.expect(try w.emit(&sched));
     try std.testing.expect(!(try w.emit(&sched)));
@@ -1276,6 +1504,7 @@ test "a stream blocked on its own window waits for rearm, and only rearm" {
 
     w.win[1] = 0;
     w.win[3] = 0;
+    try testHeadersOut(&sched, &.{ 1, 3 });
     try sched.enqueueDataBytes(1, "one", true, 0, 0);
     try sched.enqueueDataBytes(3, "three", true, 0, 0);
     try std.testing.expect(!(try w.emit(&sched)));
@@ -1303,6 +1532,7 @@ test "blocked streams cost no window query on the emit path" {
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
 
+    try testHeadersOut(&sched, &.{ 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 41 });
     var sid: u31 = 1;
     while (sid < 20) : (sid += 2) {
         w.win[sid] = 0;
@@ -1347,4 +1577,307 @@ test "index delete keeps a colliding key reachable" {
     try std.testing.expect(sched.removePending(ids[2]));
     try std.testing.expect(sched.removePending(ids[1]));
     try std.testing.expectEqual(@as(usize, 0), sched.pendingCount());
+}
+
+/// Records what `drain` emits, in order: a control by the stream id in its
+/// frame header, DATA by the stream the builder framed.
+const OrderWire = struct {
+    gpa: std.mem.Allocator,
+    events: std.ArrayList(struct { headers: bool, sid: u31 }) = .empty,
+    ctrl_pause_calls: usize = 0,
+
+    fn streamWin(_: *anyopaque, _: u31) i32 {
+        return 1 << 30;
+    }
+    fn connWin(_: *anyopaque) i32 {
+        return 1 << 30;
+    }
+    fn build(ctx: *anyopaque, sid: u31, bytes: []const u8, _: bool) anyerror![]u8 {
+        const t: *OrderWire = @ptrCast(@alignCast(ctx));
+        try t.events.append(t.gpa, .{ .headers = false, .sid = sid });
+        return t.gpa.dupe(u8, bytes);
+    }
+    fn sink(ctx: *anyopaque, payload: []u8, _: bool, _: u64, _: u32, _: usize, control_entry: bool) anyerror!void {
+        const t: *OrderWire = @ptrCast(@alignCast(ctx));
+        defer t.gpa.free(payload);
+        if (!control_entry) return;
+        const sid: u31 = @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
+        try t.events.append(t.gpa, .{ .headers = true, .sid = sid });
+    }
+    /// The stash is full when the control loop asks, and has room by the
+    /// time the DATA loop asks: the actor emptied it in between, without
+    /// `session_mu`, while a handler task held the lock and drained.
+    fn ctrlPausedOnce(ctx: *anyopaque) bool {
+        const t: *OrderWire = @ptrCast(@alignCast(ctx));
+        t.ctrl_pause_calls += 1;
+        return t.ctrl_pause_calls == 1;
+    }
+    fn neverPaused(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+test "DATA never leaves before its stream's HEADERS when the stash frees between the pause checks (t-3514)" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: OrderWire = .{ .gpa = gpa };
+    defer w.events.deinit(gpa);
+    sched.pause = OrderWire.neverPaused;
+    sched.pause_control = OrderWire.ctrlPausedOnce;
+    sched.pause_ctx = &w;
+
+    // A task handler's response: HEADERS (ordinary control) and its body.
+    const hdr = [_]u8{ 0, 0, 1, @backingInt(frame.FrameType.headers), 0x4, 0, 0, 0, 7, 0x88 };
+    try sched.enqueueControl(try gpa.dupe(u8, &hdr), .ordinary, 0, 0);
+    try sched.enqueueDataBytes(7, "body", true, 0, 0);
+
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+
+    try std.testing.expectEqual(@as(usize, 2), w.events.items.len);
+    try std.testing.expect(w.events.items[0].headers);
+    try std.testing.expectEqual(@as(u31, 7), w.events.items[0].sid);
+    try std.testing.expect(!w.events.items[1].headers);
+    try std.testing.expectEqual(@as(u31, 7), w.events.items[1].sid);
+}
+
+fn orderHeaders(gpa: std.mem.Allocator, sid: u31, end_stream: bool) ![]u8 {
+    var h = [_]u8{ 0, 0, 1, @backingInt(frame.FrameType.headers), 0x4, 0, 0, 0, 0, 0x88 };
+    if (end_stream) h[4] |= 0x1;
+    std.mem.writeInt(u32, h[5..9], sid, .big);
+    return gpa.dupe(u8, &h);
+}
+
+/// Every DATA in `events` follows a HEADERS for its stream.
+fn expectHeadersBeforeData(events: anytype) !void {
+    var seen: [64]bool = @splat(false);
+    for (events) |e| {
+        if (e.headers) seen[e.sid] = true else try std.testing.expect(seen[e.sid]);
+    }
+}
+
+test "the anti-starvation yield does not send DATA before its stream's HEADERS" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: OrderWire = .{ .gpa = gpa };
+    defer w.events.deinit(gpa);
+
+    // HEADERS 9 first, then 64 other controls, then HEADERS and a body for
+    // stream 7. The yield fires after the 64th control, while HEADERS 7
+    // still waits. Stream 9's body is queued after 7's, so 7 would be the
+    // ready head if it were eligible. With 7 held back the yield serves 9,
+    // which shows the yield did fire.
+    try sched.enqueueControl(try orderHeaders(gpa, 9, false), .ordinary, 0, 0);
+    var k: usize = 0;
+    while (k < control_pool.CONTROL_BEFORE_DATA) : (k += 1) {
+        try sched.enqueueControl(try orderHeaders(gpa, 61, true), .ordinary, 0, 0);
+    }
+    try sched.enqueueControl(try orderHeaders(gpa, 7, false), .ordinary, 0, 0);
+    try sched.enqueueDataBytes(7, "body", true, 0, 0);
+    const bulk: [4 * DATA_QUANTUM]u8 = @splat('b');
+    try sched.enqueueDataBytes(9, &bulk, true, 0, 0);
+
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+
+    try expectHeadersBeforeData(w.events.items);
+    var data9_before_h7 = false;
+    for (w.events.items) |e| {
+        if (e.headers and e.sid == 7) break;
+        if (!e.headers and e.sid == 9) data9_before_h7 = true;
+    }
+    try std.testing.expect(data9_before_h7);
+    try std.testing.expectEqual(@as(usize, 0), sched.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), sched.started_len);
+}
+
+test "a stream waiting for its HEADERS is not visited, and is served once they leave" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: TestWire = .{ .gpa = gpa };
+    defer w.deinit();
+
+    // Only streams whose HEADERS has not gone out. A complete handler stages
+    // DATA before its HEADERS reaches the queue, so this is a real state.
+    try sched.enqueueDataBytes(7, "body", true, 0, 0);
+    try sched.enqueueDataBytes(9, "body", true, 0, 0);
+    try std.testing.expect(!(try w.emit(&sched)));
+    try std.testing.expect(!(try w.emit(&sched)));
+    // Not spinning: no window was asked, nothing moved to the blocked list.
+    try std.testing.expectEqual(@as(usize, 0), w.stream_queries);
+    try std.testing.expectEqual(@as(usize, 0), sched.blocked_len);
+    try std.testing.expectEqual(@as(usize, 0), sched.ready_len);
+    try std.testing.expectEqual(@as(usize, 2), sched.pendingCount());
+
+    // HEADERS 9 leaves first, then 7: they go out in that order.
+    try testHeadersOut(&sched, &.{ 9, 7 });
+    while (try w.emit(&sched)) {}
+    try std.testing.expectEqualSlices(u31, &.{ 9, 7 }, w.order.items);
+    try std.testing.expectEqual(@as(usize, 0), sched.started_len);
+}
+
+test "HEADERS state outlives a slot freed between writes, and ends at END_STREAM" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: OrderWire = .{ .gpa = gpa };
+    defer w.events.deinit(gpa);
+
+    // An SSE-shaped stream: HEADERS, one event, idle, another event.
+    try sched.enqueueControl(try orderHeaders(gpa, 7, false), .ordinary, 0, 0);
+    try sched.enqueueDataBytes(7, "event one", false, 0, 0);
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 0), sched.pendingCount());
+    try std.testing.expectEqual(@as(usize, 1), sched.started_len);
+
+    try sched.enqueueDataBytes(7, "event two", true, 0, 0);
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 3), w.events.items.len);
+    try std.testing.expect(!w.events.items[2].headers);
+    try expectHeadersBeforeData(w.events.items);
+    try std.testing.expectEqual(@as(usize, 0), sched.started_len);
+}
+
+test "a reset ends the HEADERS state; trailers do not gate and end it too" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: OrderWire = .{ .gpa = gpa };
+    defer w.events.deinit(gpa);
+
+    try testHeadersOut(&sched, &.{ 5, 7 });
+    try std.testing.expectEqual(@as(usize, 2), sched.started_len);
+    sched.forgetStream(5);
+    try std.testing.expectEqual(@as(usize, 1), sched.started_len);
+
+    // Trailers: DATA without END_STREAM, then an END_STREAM HEADERS.
+    try sched.enqueueDataBytes(7, "body", false, 0, 0);
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try sched.enqueueControl(try orderHeaders(gpa, 7, true), .ordinary, 0, 0);
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 2), w.events.items.len);
+    try std.testing.expect(!w.events.items[0].headers);
+    try std.testing.expect(w.events.items[1].headers);
+    try std.testing.expectEqual(@as(usize, 0), sched.started_len);
+}
+
+test "framed DATA waits for its stream's HEADERS too" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: OrderWire = .{ .gpa = gpa };
+    defer w.events.deinit(gpa);
+    sched.pause = OrderWire.neverPaused;
+    sched.pause_control = OrderWire.ctrlPausedOnce;
+    sched.pause_ctx = &w;
+
+    // Framed DATA is already a frame; the sink sees it as non-control.
+    var d = [_]u8{ 0, 0, 1, @backingInt(frame.FrameType.data), 0x1, 0, 0, 0, 7, 'x' };
+    try sched.enqueueControl(try orderHeaders(gpa, 7, false), .ordinary, 0, 0);
+    try sched.enqueueFramedData(try gpa.dupe(u8, &d), 7, true, 0, 0);
+
+    try sched.drain(&w, FramedWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 0), w.events.items.len);
+    try sched.drain(&w, FramedWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 2), w.events.items.len);
+    try expectHeadersBeforeData(w.events.items);
+    try std.testing.expectEqual(@as(usize, 0), sched.started_len);
+}
+
+/// `OrderWire` for framed DATA: a non-control payload is a whole frame, so
+/// its stream id is in the header rather than known to the builder.
+const FramedWire = struct {
+    fn sink(ctx: *anyopaque, payload: []u8, _: bool, _: u64, _: u32, _: usize, control_entry: bool) anyerror!void {
+        const t: *OrderWire = @ptrCast(@alignCast(ctx));
+        defer t.gpa.free(payload);
+        const sid: u31 = @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
+        try t.events.append(t.gpa, .{ .headers = control_entry, .sid = sid });
+    }
+};
+
+test "a reset before its queued HEADERS reaches the sink leaves no started entry, past capacity" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    const max_streams = 8;
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, max_streams, &pool);
+    defer sched.deinit();
+    var w: OrderWire = .{ .gpa = gpa };
+    defer w.events.deinit(gpa);
+
+    // Each round is a task handler that queued its HEADERS without a drain,
+    // then the peer's RST: the connection forgets the stream before the next
+    // drain reaches that HEADERS. Twice the set's capacity.
+    var sid: u31 = 1;
+    var round: usize = 0;
+    while (round < 2 * max_streams) : (round += 1) {
+        try sched.enqueueControl(try orderHeaders(gpa, sid, false), .ordinary, 0, 0);
+        sched.forgetStream(sid);
+        try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+        sid += 2;
+    }
+    try std.testing.expectEqual(@as(usize, 0), sched.started_len);
+    // Nothing for a reset stream reached the wire.
+    try std.testing.expectEqual(@as(usize, 0), w.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sched.ordinary_len);
+    try std.testing.expectEqual(@as(usize, 0), sched.ctrl.entries_held.load(.acquire));
+}
+
+test "a reset drops only that stream's queued HEADERS, with its ticket and control entry" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: OrderWire = .{ .gpa = gpa };
+    defer w.events.deinit(gpa);
+    const Failed = struct {
+        ticket: u64 = 0,
+        slot: u32 = 0,
+        calls: usize = 0,
+        fn f(ctx: *anyopaque, ticket: u64, slot: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.ticket = ticket;
+            self.slot = slot;
+        }
+    };
+    var failed: Failed = .{};
+    sched.ticket_fail_ctx = &failed;
+    sched.ticket_fail = Failed.f;
+
+    try sched.enqueueControl(try orderHeaders(gpa, 1, false), .ordinary, 0, 0);
+    // An SSE start: its HEADERS carries the ticket the handler waits on.
+    try sched.enqueueControl(try orderHeaders(gpa, 3, false), .ordinary, 41, 7);
+    try sched.enqueueControl(try orderHeaders(gpa, 5, false), .ordinary, 0, 0);
+    try std.testing.expectEqual(@as(usize, 3), sched.ctrl.entries_held.load(.acquire));
+
+    sched.forgetStream(3);
+    try std.testing.expectEqual(@as(usize, 1), failed.calls);
+    try std.testing.expectEqual(@as(u64, 41), failed.ticket);
+    try std.testing.expectEqual(@as(u32, 7), failed.slot);
+    try std.testing.expectEqual(@as(usize, 2), sched.ordinary_len);
+    try std.testing.expectEqual(@as(usize, 2), sched.ctrl.entries_held.load(.acquire));
+
+    try sched.drain(&w, OrderWire.sink, &w, OrderWire.streamWin, OrderWire.connWin, OrderWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 2), w.events.items.len);
+    try std.testing.expectEqual(@as(u31, 1), w.events.items[0].sid);
+    try std.testing.expectEqual(@as(u31, 5), w.events.items[1].sid);
+    sched.forgetStream(1);
+    sched.forgetStream(5);
+    try std.testing.expectEqual(@as(usize, 0), sched.started_len);
 }

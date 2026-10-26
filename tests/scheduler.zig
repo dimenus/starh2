@@ -33,6 +33,16 @@ fn selfPtr(p: anytype) *anyopaque {
     return @ptrCast(p);
 }
 
+/// Hand HEADERS for `sids` out the way `drain` does: a stream's DATA is not
+/// eligible before its HEADERS (FairScheduler "HEADERS before DATA").
+fn headersOut(sched: *starh2.edge.fair_scheduler.FairScheduler, sids: []const u31) !void {
+    for (sids) |sid| {
+        var h = [_]u8{ 0, 0, 0, @backingInt(starh2.core.frame.FrameType.headers), 0x4, 0, 0, 0, 0 };
+        std.mem.writeInt(u32, h[5..9], sid, .big);
+        try sched.noteHeadersOut(&h);
+    }
+}
+
 test "prefill max ordinary queue: emit gap <= 64 when DATA eligible" {
     const gpa = std.testing.allocator;
     const fs = starh2.edge.fair_scheduler;
@@ -46,6 +56,7 @@ test "prefill max ordinary queue: emit gap <= 64 when DATA eligible" {
     // Eligible DATA before controls (prefilled into boot slab).
     var big: [16 * 1024]u8 = undefined;
     @memset(&big, 'd');
+    try headersOut(&sched, &.{1});
     var i: usize = 0;
     while (i < 64) : (i += 1) {
         try sched.enqueueDataBytes(1, &big, false, 0, 0);
@@ -100,6 +111,7 @@ test "fair scheduler: 10k controls interleaved drain gaps <= 64" {
 
     var big: [16 * 1024]u8 = undefined;
     @memset(&big, 'y');
+    try headersOut(&sched, &.{1});
     var i: usize = 0;
     while (i < 512) : (i += 1) {
         try sched.enqueueDataBytes(1, &big, false, 0, 0);
@@ -184,6 +196,7 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
     defer pool2.deinit(gpa);
     var s2 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool2);
     defer s2.deinit();
+    try headersOut(&s2, &.{ 1, 3 });
     try s2.enqueueDataBytes(1, &@as([100]u8, @splat(1)), false, 0, 0);
     try s2.enqueueDataBytes(3, &@as([100]u8, @splat(3)), true, 0, 0);
     var sink_state: SinkState = .{ .gpa = gpa };
@@ -209,6 +222,7 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
     defer pool3.deinit(gpa);
     var s3 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 4, &pool3);
     defer s3.deinit();
+    try headersOut(&s3, &.{1});
     try s3.enqueueDataBytes(1, &@as([100]u8, @splat(9)), true, 0, 0);
     const p = try gpa.alloc(u8, 16);
     @memset(p, 8);
@@ -384,6 +398,7 @@ test "drain emits pending DATA after Session dropped the stream" {
     var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
     defer sched.deinit();
     const body = "Hello, World!";
+    try headersOut(&sched, &.{1});
     try sched.enqueueDataBytes(1, body, true, 0, 0);
 
     const DrainCtx = struct {
@@ -472,6 +487,8 @@ test "drain does not emit pending DATA after a RST tombstone" {
     defer pool.deinit(gpa);
     var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
     defer sched.deinit();
+    // HEADERS out, so only the tombstone can be what holds the DATA back.
+    try headersOut(&sched, &.{1});
     try sched.enqueueDataBytes(1, "Hello, World!", true, 0, 0);
 
     const DrainCtx = struct {

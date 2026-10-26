@@ -159,9 +159,10 @@ fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *st
     mod.linkLibrary(lib);
 }
 
-fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, zio_scheduling: ZioScheduling) void {
+fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, wire_ring: bool, zio_scheduling: ZioScheduling) void {
     const opts = b.addOptions();
     opts.addOption(bool, "observe", observe);
+    opts.addOption(bool, "wire_ring", wire_ring);
     opts.addOption(ZioScheduling, "zio_scheduling", zio_scheduling);
     mod.addOptions("build_options", opts);
 }
@@ -173,6 +174,11 @@ pub fn build(b: *std.Build) void {
         bool,
         "observe",
         "Keep test-only hot counters in non-Debug artifacts (A/B the counter tax)",
+    ) orelse false;
+    const wire_ring = b.option(
+        bool,
+        "wire-ring",
+        "Per-connection TLS frame ring, printed when a peer drops a connection (t-3514)",
     ) orelse false;
     // Default work_stealing: measured faster and without the bimodal oneshot
     // bands of pinned placement on nachos (27ff454, t-853).
@@ -226,7 +232,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, starh2_mod, observe_hot, zio_scheduling);
+    attachStarh2Options(b, starh2_mod, observe_hot, wire_ring, zio_scheduling);
     // Encoder only on the production module (static lib — see brotliEncLib).
     // Decoder is linked only into test artifacts that round-trip.
     const brotli_enc = brotliEncLib(b, brotli_dep, target, optimize, "brotli_enc");
@@ -270,7 +276,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, lib_test_mod, true, zio_scheduling);
+    attachStarh2Options(b, lib_test_mod, true, false, zio_scheduling);
     linkBrotliEnc(lib_test_mod, brotli_dep, brotli_enc);
     linkBrotliDec(lib_test_mod, brotli_dep, brotli_dec);
     const lib_tests = b.addTest(.{
@@ -851,7 +857,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zio", .module = zio_rt.module("zio") },
             },
         });
-        attachStarh2Options(b, starh2_rt, false, zio_scheduling);
+        attachStarh2Options(b, starh2_rt, false, false, zio_scheduling);
         const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .safe, b.fmt("brotli_enc_{s}", .{rq.name}));
         linkBrotliEnc(starh2_rt, brotli_rt, brotli_enc_rt);
         const datastar_mod_rt = b.createModule(.{

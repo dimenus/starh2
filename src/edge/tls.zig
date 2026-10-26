@@ -40,6 +40,7 @@ const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
 const io_queue = @import("io_queue.zig");
 const wire_pump = @import("wire_pump.zig");
+const wire_ring = @import("wire_ring.zig");
 
 /// Same gate as `connection.test_observe`: Debug (the suite) and
 /// `-Dobserve=true` ReleaseFast. Plain ReleaseFast compiles the increments
@@ -502,6 +503,24 @@ pub const Conn = struct {
     /// The peer sent close_notify.
     peer_closed: bool = false,
     state: enum { empty, tcp, accepting, open } = .empty,
+    /// `-Dwire-ring=true` only: the last frames each side sent, printed when
+    /// the peer drops the connection. HTTP/2 connections only.
+    ring: if (wire_ring.enabled) wire_ring.Ring else void = if (wire_ring.enabled) .{} else {},
+
+    fn ringOn(self: *Conn) bool {
+        if (comptime !wire_ring.enabled) return false;
+        if (!isHttp2Alpn(self.selectedAlpn())) return false;
+        if (self.ring.t0_ns == 0) self.ring.start();
+        return true;
+    }
+
+    /// The peer ended the stream first: print the ring (see wire_ring.zig).
+    fn ringPeerClosed(self: *Conn, ev: ?wire_ring.Event, reason: []const u8) void {
+        if (comptime !wire_ring.enabled) return;
+        if (!self.ringOn()) return;
+        if (ev) |e| self.ring.event(e);
+        self.ring.peerClosed(@intFromPtr(self), reason);
+    }
 
     pub fn initTcp(self: *Conn, stream: std.Io.net.Stream) void {
         self.* = .{};
@@ -773,7 +792,14 @@ pub const Conn = struct {
         while (!self.peer_closed) {
             const rec_len = completeRecordLen(self.in_buf[self.in_head..self.in_fill]) orelse break;
             if (out.len - n < rec_len - 5) break;
-            const res = try self.cipher.decrypt(self.in_buf[self.in_head..][0..rec_len], out[n..]);
+            const res = self.cipher.decrypt(self.in_buf[self.in_head..][0..rec_len], out[n..]) catch |err| {
+                self.ringPeerClosed(.decrypt_error, @errorName(err));
+                return err;
+            };
+            if (wire_ring.enabled and self.ringOn()) {
+                self.ring.inbound(res.cleartext);
+                if (res.closed) self.ring.event(.close_notify_in);
+            }
             std.debug.assert(res.ciphertext_pos == rec_len);
             std.debug.assert(res.cleartext.ptr == out[n..].ptr);
             std.debug.assert(self.cipher.inner.cleartext_buf.len == 0);
@@ -1225,6 +1251,7 @@ pub const Pump = struct {
                 return .exit;
             };
             std.debug.assert(res.cleartext_pos == chunk.len);
+            if (wire_ring.enabled and self.conn.ringOn()) self.conn.ring.outbound(chunk);
             self.send_fill += res.ciphertext.len;
             self.partial_off += chunk.len;
         }
@@ -1373,6 +1400,7 @@ pub const Pump = struct {
             // close_notify: the same end of stream as a socket EOF.
             self.conn.tcp_stream.shutdown(self.io, .send) catch {};
             if (diag_wait) rawPrint("TLSERR recv2_eof\n", .{});
+            self.conn.ringPeerClosed(null, "close_notify");
             self.failDrain();
             self.postEof();
             return .eof;
@@ -1453,6 +1481,7 @@ pub const Pump = struct {
             else => {
                 self.conn.tcp_stream.shutdown(self.io, .send) catch {};
                 if (diag_wait) rawPrint("TLSERR cqrecv {s}\n", .{@errorName(err)});
+                self.conn.ringPeerClosed(.socket_error, @errorName(err));
                 self.failDrain();
                 self.postEof();
                 self.post(.{ .shutdown = true });
@@ -1462,6 +1491,7 @@ pub const Pump = struct {
         if (n == 0) {
             self.conn.tcp_stream.shutdown(self.io, .send) catch {};
             if (diag_wait) rawPrint("TLSERR cqrecv_eof\n", .{});
+            self.conn.ringPeerClosed(.socket_eof, "socket_eof");
             self.failDrain();
             self.postEof();
             self.post(.{ .shutdown = true });
