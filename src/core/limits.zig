@@ -28,6 +28,7 @@ const connection = @import("../edge/connection.zig");
 const conn_slot = @import("../edge/conn_slot.zig");
 const request_pool = @import("../edge/request_pool.zig");
 const hpack = @import("hpack.zig");
+const frame = @import("frame.zig");
 
 /// How an accepted socket is served. `h1c` is plain HTTP/1.1 and takes no
 /// connection slot.
@@ -89,6 +90,15 @@ pub const TLS_CIPHER_CHUNK_SIZE = wire_const.TLS_CIPHER_CHUNK_SIZE;
 /// `TLS_STASH_EXTRA_SLOTS` to its stash, so a 1-chunk TLS setting is legal and
 /// this bound does not apply to it.
 pub const H2C_MIN_WRITE_QUEUE_CHUNKS: usize = wire_const.POP_PUSHES + wire_const.TLS_STASH_TAIL_SLOTS;
+/// Smallest write pool. A scheduler pop needs `POP_PUSHES` free chunks
+/// (`Connection.outboundMemoryPaused`), and a frame queued by a handler or by
+/// ingest may take a chunk only while more than that many are free, so a pool
+/// of exactly `POP_PUSHES` would never lend one and a smaller pool would never
+/// pop. Every mode: the pool is `inbound_wire_chunks_per_connection` chunks.
+pub const MIN_WRITE_POOL_CHUNKS: usize = wire_const.POP_PUSHES + 1;
+/// The most frames one response header block may be cut into. `cmdHeaders`
+/// builds them all or none, so it keeps their buffers in a fixed array.
+pub const MAX_HEADER_FRAGMENTS: usize = 8;
 pub const TERMINAL_CONTROL_RESERVE_BYTES: usize = 4 * 1024;
 pub const TERMINAL_CONTROL_RESERVE_ENTRIES: usize = 16;
 
@@ -114,8 +124,10 @@ pub const Limits = struct {
     max_streams_per_connection: usize = 256,
     max_streams_per_server: usize = 4_096,
     inbound_wire_chunks_per_connection: usize = 8,
-    /// Boot-reserved outbound HEADERS/DATA frame slabs per connection. A frame
-    /// larger than `frame_slab_bytes` falls back to the GPA.
+    /// Boot-reserved outbound frame slabs per connection. A frame larger than
+    /// `frame_slab_bytes` takes a write chunk instead (so does a small one when
+    /// every slab is rented), and when no chunk can be spared the frame is
+    /// refused.
     frame_slab_bytes: usize = 512,
     frame_slabs_per_connection: usize = 256,
     outbound_bytes_per_stream: usize = 64 * 1024,
@@ -180,6 +192,16 @@ pub const Limits = struct {
     decoded_header_bytes: usize = 32 * 1024,
     compressed_header_bytes: usize = 64 * 1024,
     header_fields: usize = 100,
+    /// The most header fields a response may carry, `:status` included, and the
+    /// most bytes of its encoded header block. `Session.cmdHeaders` checks both
+    /// before it encodes anything; a response over either is refused before a
+    /// byte is queued, and the handler's request is answered 500. The block is
+    /// cut into frames of 16 KiB, each in a write chunk, so the bytes bound is
+    /// at most `MAX_HEADER_FRAGMENTS` of them. Whether a block that size can
+    /// be sent at a given moment is up to the write pool (a frame it cannot lend
+    /// a chunk for refuses the response the same way).
+    response_header_fields: usize = 100,
+    response_header_bytes: usize = 32 * 1024,
     continuation_frames: usize = 16,
     regular_field_value_bytes: usize = 8 * 1024,
     path_wire_bytes: usize = 24 * 1024,
@@ -267,6 +289,32 @@ pub const Limits = struct {
         if (self.inbound_wire_chunks_per_connection < H2C_MIN_WRITE_QUEUE_CHUNKS) return error.InvalidConfig;
     }
 
+    /// Slabs of the frame pool that only terminal frames (GOAWAY, RST_STREAM)
+    /// may take: a quarter of the pool, at most the 16 entries `ControlPool`
+    /// reserves. `Connection.init` reads it from here.
+    pub fn frameSlabReserve(self: Limits) usize {
+        return @min(TERMINAL_CONTROL_RESERVE_ENTRIES, self.frame_slabs_per_connection / 4);
+    }
+
+    /// Boot check for the frame pool. A connection queues its two preface
+    /// frames (SETTINGS, WINDOW_UPDATE) at birth and must always be able to
+    /// make a GOAWAY or RST_STREAM, so the pool has to hold them:
+    /// - a slab holds the biggest control frame (the preface SETTINGS, 45
+    ///   bytes; sized by encoded frames, not by their 9-byte header), because a
+    ///   control frame that does not fit a slab needs a write chunk, and the
+    ///   chunks are not reserved for them;
+    /// - the terminal reserve is above zero, which a pool under 4 slabs does
+    ///   not give, and the two preface frames fit above it (they are ordinary
+    ///   frames).
+    /// Anything smaller passed `resourceUpperBound` before and then could not
+    /// boot a connection.
+    pub fn checkFramePool(self: Limits) error{InvalidConfig}!void {
+        if (self.frame_slab_bytes < frame.max_control_frame_bytes) return error.InvalidConfig;
+        const reserve = self.frameSlabReserve();
+        if (reserve == 0) return error.InvalidConfig;
+        if (self.frame_slabs_per_connection < reserve + 2) return error.InvalidConfig;
+    }
+
     /// The size of a connection slot's boot buffer for `mode`: exactly the
     /// bytes `Connection.init` takes from it (and, for TLS, the `Conn` taken
     /// before it), including alignment padding. One byte less and the boot
@@ -285,6 +333,14 @@ pub const Limits = struct {
     /// room cannot fail to decode.
     pub fn hpackDecodeBytes(self: Limits) error{InvalidConfig}!usize {
         return hpack.Decoder.requestBytesBound(self.header_fields, self.decoded_header_bytes) catch error.InvalidConfig;
+    }
+
+    /// The slot's HPACK scratch: room for the largest decode as the whole
+    /// request memory of a request the pool refused (`hpackDecodeBytes`), and
+    /// beside it the decoder's transient room for one field that enters the
+    /// table past the request's budget (at most `MAX_DYNAMIC_TABLE` bytes).
+    pub fn hpackScratchBytes(self: Limits) error{InvalidConfig}!usize {
+        return checkedAdd(try self.hpackDecodeBytes(), hpack.MAX_DYNAMIC_TABLE);
     }
 
     /// The size of a request's first block: the smallest class that holds the
@@ -326,7 +382,9 @@ pub const Limits = struct {
         // job that the cancel path has no way to retry, which strands the
         // handler slot and its capacity token.
         if (self.cancellation_reaper_jobs < self.max_streams_per_server) return error.InvalidConfig;
-        if (self.inbound_wire_chunks_per_connection == 0) return error.InvalidConfig;
+        if (self.inbound_wire_chunks_per_connection < MIN_WRITE_POOL_CHUNKS) return error.InvalidConfig;
+        if (self.response_header_fields == 0 or self.response_header_bytes == 0) return error.InvalidConfig;
+        if (self.response_header_bytes > MAX_HEADER_FRAGMENTS * frame.DEFAULT_MAX_FRAME_SIZE) return error.InvalidConfig;
         if (self.outbound_bytes_per_stream == 0 or self.outbound_bytes_per_connection == 0) return error.InvalidConfig;
         // The three ceilings must nest: stream <= connection <= server. An
         // inverted pair makes the inner limit unreachable, so a handler would
@@ -354,8 +412,7 @@ pub const Limits = struct {
         if (self.close_flush_timeout_ns == 0) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.listen_backlog == 0) return error.InvalidConfig;
-        if (self.frame_slab_bytes < 9) return error.InvalidConfig;
-        if (self.frame_slabs_per_connection == 0) return error.InvalidConfig;
+        try self.checkFramePool();
         // A server with no slabs can never write DATA.
         if (self.outbound_slabs_per_server == 0) return error.InvalidConfig;
         // Every admitted stream can hold at most one slab, and global stream

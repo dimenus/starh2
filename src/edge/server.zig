@@ -486,21 +486,18 @@ pub const Server = struct {
         const leftover = leftover_buf[0..leftover_n];
 
         if (tls_edge.isHttp2Alpn(tls_conn.selectedAlpn())) {
-            const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {
-                tls_conn.deinit();
-                stream.close(config.io);
-                return;
-            };
+            // `leftover_buf` is on this frame, and `serveAccepted` runs the
+            // whole connection inside it, so the bytes outlive their only
+            // reader. That reader is the actor's first ingest
+            // (`Connection.runBody`), and `Session.ingest` keeps nothing it
+            // was given: a complete frame is read in place and a partial one
+            // is copied into the parser's own buffer (`Parser.ingestOne`).
+            // So no copy is made here.
             var cfg = config;
             cfg.handshake_held = false;
             cfg.tls_ready = tls_conn;
-            cfg.tls_leftover = owned;
-            connection.serveAccepted(stream, cfg, slot) catch |err| {
-                if (owned.len != 0) config.gpa.free(owned);
-                return err;
-            };
-            if (owned.len != 0) config.gpa.free(owned);
-            return;
+            cfg.tls_leftover = leftover;
+            return connection.serveAccepted(stream, cfg, slot);
         }
 
         const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {

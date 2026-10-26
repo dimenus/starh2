@@ -17,7 +17,9 @@
 //! client panics at its deadline: a loud failure, never a hang.
 //!
 //! Gate for t-3509: a complete (inline) response must not overflow the TLS
-//! write stash. Shape: the smallest legal stash (one wire chunk) and complete
+//! write stash. Shape: the smallest legal stash (`MIN_WRITE_POOL_CHUNKS` wire
+//! chunks, 3: it was 1 before the drain also waited for write-pool room, and
+//! the stash is 2 slots longer than the pool) and complete
 //! responses larger than one DATA frame, so one scheduler pop flushes the
 //! HEADERS batch and queues a full DATA frame on its own. The drain then
 //! pushes the batch receipt after its last pop. A stash with no room for that
@@ -344,7 +346,7 @@ fn runCompleteStash(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .{ .method = .GET, .path = "/complete", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = bigComplete } } },
     };
     var limits = starh2.Limits.defaults;
-    limits.inbound_wire_chunks_per_connection = 1;
+    limits.inbound_wire_chunks_per_connection = starh2.core.limits.MIN_WRITE_POOL_CHUNKS;
     // Two stash states at the batch drain. With the delay, the stash is empty
     // and the drain pops until it is full. Without it, the SETTINGS ACK is
     // still stashed, so the drain starts one slot short.
@@ -375,7 +377,7 @@ test "tls: an actor with staging full behind an in-flight send parks until the s
     try h.join();
 }
 
-test "tls: complete responses larger than one DATA frame do not overflow a one-chunk stash" {
+test "tls: complete responses larger than one DATA frame do not overflow the smallest stash" {
     const gpa = std.testing.allocator;
     const rt = try oneExecutor(gpa);
     defer rt.deinit();

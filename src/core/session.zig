@@ -151,17 +151,36 @@ pub const CloseProbeEvent = struct {
 };
 pub var close_probe_fn: ?*const fn (ev: CloseProbeEvent) void = null;
 
+/// Control frames made by `Session.controlFrame`, in every Session of the
+/// process. The work counter that goes with "no general-allocator call": a zero
+/// count of calls means nothing in a run that made no control frame. The bench
+/// server prints it on `/mem`.
+pub var control_frames_built: std.atomic.Value(u64) = .init(0);
+
+/// Streams reset because their request body went idle, in every Session of the
+/// process: the work counter for the idle-sweep list. The bench server prints it.
+pub var body_idle_expiries: std.atomic.Value(u64) = .init(0);
+
+/// What a frame is for, when the edge decides which buffer it gets. A GOAWAY
+/// or RST_STREAM is `terminal`: the frame that ends a flood, or a connection,
+/// must not be refused for the memory the flood already took, so the edge keeps
+/// slabs for these that every other frame leaves alone (the frame pool twin of
+/// `ControlPool`'s terminal reserve).
+pub const FrameClass = enum { ordinary, terminal };
+
 /// Where a header block is decoded.
 pub const HeaderListMem = union(enum) {
-    /// The request's own memory. It lives as long as the request.
-    request: std.mem.Allocator,
+    /// The request's own memory, which lives as long as the request, and the
+    /// scratch the decoder may use for the length of one decode (the slot's
+    /// `hpack_scratch`; see `Decoder.decodeInto`).
+    request: struct { alloc: std.mem.Allocator, scratch: std.mem.Allocator },
     /// The edge could not give the request any memory (the pool refused its
     /// first block, or it has no lease for it). The block is decoded here
     /// only so the HPACK table stays in step with the peer's, the decoded
     /// fields are read to validate the request and then forgotten, and the
     /// stream is answered with `status`. The edge resets this allocator at
     /// its next call, so the fields must not outlive the call that decoded
-    /// them.
+    /// them. The decoder's transient room comes from it too.
     scratch: struct { alloc: std.mem.Allocator, status: u16 },
 };
 
@@ -195,6 +214,10 @@ pub const Session = struct {
     /// A connection WINDOW_UPDATE is not recorded: connection credit never
     /// blocks a single stream in the scheduler.
     credit_ids: []u31 = &.{},
+    /// Scratch for `checkIdleDeadlines`: the streams whose body went idle, one
+    /// sweep at a time. `body_idle_ns` never holds more entries than there are
+    /// streams (`putBounded`), so `max_streams_per_connection` ids always fit.
+    stale_ids: []u31 = &.{},
     credit_len: usize = 0,
     credit_all: bool = false,
     tombstones: std.ArrayList(Tombstone),
@@ -276,11 +299,11 @@ pub const Session = struct {
         discardHeaderList: ?*const fn (*anyopaque, u31) void = null,
         /// Rent a boot-reserved outbound frame buffer. `n` is the on-wire size.
         /// Returns a full slab of whichever pool the edge picks for `n`
-        /// (`len >= n`), or null (too large or exhausted — caller
-        /// GPA-falls-back). Never a used prefix.
-        rentFrame: ?*const fn (*anyopaque, usize) ?[]u8 = null,
-        /// Return a buffer from `rentFrame` or a GPA fallback. Pointer-range
-        /// decides which; a prefix of a slab is reconstructed to the full lease.
+        /// (`len >= n`), or null when no pool has one: the frame is then
+        /// refused with `OutOfMemory`. Never a used prefix.
+        rentFrame: ?*const fn (*anyopaque, usize, FrameClass) ?[]u8 = null,
+        /// Return a buffer from `rentFrame`. Pointer-range decides which
+        /// pool; a prefix of a slab is reconstructed to the full lease.
         releaseFrame: ?*const fn (*anyopaque, []u8) void = null,
     };
 
@@ -327,7 +350,7 @@ pub const Session = struct {
         if (self.stream_hooks) |h| {
             if (h.headerListMem) |f| return f(h.ctx, stream_id);
         }
-        return .{ .request = self.gpa };
+        return .{ .request = .{ .alloc = self.gpa, .scratch = self.gpa } };
     }
 
     /// True for an isolated Session: request memory (header lists and bodies)
@@ -359,13 +382,27 @@ pub const Session = struct {
         }
     }
 
-    fn allocFrame(self: *Session, n: usize) error{OutOfMemory}![]u8 {
+    /// A buffer for one frame of `n` bytes on the wire. Where the edge has
+    /// installed `rentFrame`, the frame comes from the connection's own pools
+    /// and a refusal is `OutOfMemory`: there is no fallback to `gpa`, because
+    /// a path with a bound must fail at the bound. A Session with no hook is an
+    /// isolated one in a test, and its frames are `gpa` allocations.
+    fn allocFrame(self: *Session, n: usize, class: FrameClass) error{OutOfMemory}![]u8 {
         if (self.stream_hooks) |h| {
-            if (h.rentFrame) |f| {
-                if (f(h.ctx, n)) |slab| return slab;
-            }
+            if (h.rentFrame) |f| return f(h.ctx, n, class) orelse error.OutOfMemory;
         }
         return self.gpa.alloc(u8, n);
+    }
+
+    /// A serialized control frame in a frame buffer, ready to become an
+    /// intent. Every control frame goes through here: SETTINGS (the preface and
+    /// the ack), PING, WINDOW_UPDATE, RST_STREAM and GOAWAY. The caller owns the
+    /// result (`freeFrame`, or an intent that is released).
+    fn controlFrame(self: *Session, bytes: []const u8, class: FrameClass) error{OutOfMemory}![]u8 {
+        const out = try self.allocFrame(bytes.len, class);
+        @memcpy(out[0..bytes.len], bytes);
+        _ = control_frames_built.fetchAdd(1, .monotonic);
+        return out;
     }
 
     fn freeFrame(self: *Session, buf: []u8) void {
@@ -384,7 +421,7 @@ pub const Session = struct {
     fn dropDecoded(self: *Session, stream_id: u31, decoded: hpack.Decoder.DecodeResult, scratch: bool) void {
         if (scratch) return;
         if (self.headerListIsGpa()) {
-            self.decoder.freeResult(decoded);
+            self.decoder.freeResultInto(self.gpa, decoded);
             return;
         }
         self.discardHeaderList(stream_id);
@@ -432,8 +469,10 @@ pub const Session = struct {
         const max_streams = limits.max_streams_per_connection;
         try plan.array(Intent, intentCapacityFor(limits));
         try plan.array(u8, frame.DEFAULT_MAX_FRAME_SIZE); // parser scratch
+        try hpack.Decoder.planBoot(plan); // the dynamic table: bytes, then descriptors
         try plan.hashMap(u31, stream_mod.Stream, max_streams);
         try plan.array(u31, @max(max_streams, 1)); // credit_ids
+        try plan.array(u31, @max(max_streams, 1)); // stale_ids
         try plan.array(Tombstone, limits.stream_tombstones);
         try plan.hashMap(u31, std.ArrayList(u8), max_streams);
         try plan.hashMap(u31, []hpack.HeaderField, max_streams);
@@ -447,15 +486,36 @@ pub const Session = struct {
     /// queued here. On the live edge `boot` is a slot's buffer and `gpa` the
     /// server allocator.
     pub fn init(boot: std.mem.Allocator, gpa: std.mem.Allocator, limits: limits_mod.Limits) !Session {
+        var s = try initBare(boot, gpa, limits);
+        errdefer s.deinit();
+        try s.emitServerPreface();
+        return s;
+    }
+
+    /// `init` without the server preface. The edge uses this one: the preface
+    /// frames come from the connection's frame pool, so they can only be made
+    /// once `stream_hooks` is installed, and it calls `emitServerPreface` then.
+    /// RFC 9113 requires the server's SETTINGS to be the first frame it sends,
+    /// and the only way to guarantee that is to make it the first intent that
+    /// can possibly exist, so nothing may be queued between `initBare` and
+    /// `emitServerPreface` (see `edge.fair_scheduler.classifyControl` for the
+    /// ordering defect that appeared when a later ack could overtake it, t-538).
+    pub fn initBare(boot: std.mem.Allocator, gpa: std.mem.Allocator, limits: limits_mod.Limits) !Session {
         const intent_storage = try boot.alloc(Intent, intentCapacityFor(limits));
         var intent_storage_owned = true;
         errdefer if (intent_storage_owned) boot.free(intent_storage);
+        var parser = try frame.Parser.initReserved(boot, frame.DEFAULT_MAX_FRAME_SIZE);
+        var parser_owned = true;
+        errdefer if (parser_owned) parser.deinit();
+        var decoder = try hpack.Decoder.init(boot);
+        var decoder_owned = true;
+        errdefer if (decoder_owned) decoder.deinit();
         var s: Session = .{
             .gpa = gpa,
             .boot = boot,
             .limits = limits,
-            .parser = try frame.Parser.initReserved(boot, frame.DEFAULT_MAX_FRAME_SIZE),
-            .decoder = hpack.Decoder.init(gpa),
+            .parser = parser,
+            .decoder = decoder,
             .streams = std.AutoHashMap(u31, stream_mod.Stream).init(boot),
             .tombstones = .empty,
             .intent_storage = intent_storage,
@@ -467,22 +527,18 @@ pub const Session = struct {
             .body_idle_ns = std.AutoHashMap(u31, u64).init(boot),
         };
         intent_storage_owned = false;
+        parser_owned = false;
+        decoder_owned = false;
         errdefer s.deinit();
         try s.streams.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         s.credit_ids = try boot.alloc(u31, @max(limits.max_streams_per_connection, 1));
+        s.stale_ids = try boot.alloc(u31, @max(limits.max_streams_per_connection, 1));
         try s.tombstones.ensureTotalCapacityPrecise(boot, limits.stream_tombstones);
         try s.pending_bodies.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_headers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_trailers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.body_idle_ns.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.header_block.ensureTotalCapacityPrecise(boot, headerBlockCapacityFor(limits));
-        // The preface is queued at construction, before the peer has said
-        // anything. RFC 9113 requires the server's SETTINGS to be the first
-        // frame it sends, and the only way to guarantee that is to make it the
-        // first intent that can possibly exist. See
-        // `edge.fair_scheduler.classifyControl` for the ordering defect that
-        // appeared when a later ack could overtake this frame (t-538).
-        try s.emitServerPreface();
         return s;
     }
 
@@ -500,7 +556,6 @@ pub const Session = struct {
                 if (self.stream_hooks) |h| h.onRelease(h.ctx);
             }
         }
-        self.decoder.deinit();
         self.clearIntents();
         var bit = self.pending_bodies.iterator();
         while (bit.next()) |e| {
@@ -534,11 +589,12 @@ pub const Session = struct {
     }
 
     /// Free the fixed tables one at a time, for a session that was not booted
-    /// into a slot. `releaseRuntime` has run, and must not run again: it frees
-    /// the HPACK decoder.
+    /// into a slot. `releaseRuntime` has run. The HPACK table is one of them.
     pub fn freeBoot(self: *Session) void {
+        self.decoder.deinit();
         self.parser.deinit();
         if (self.intent_storage.len != 0) self.boot.free(self.intent_storage);
+        if (self.stale_ids.len != 0) self.boot.free(self.stale_ids);
         if (self.credit_ids.len != 0) self.boot.free(self.credit_ids);
         self.tombstones.deinit(self.boot);
         self.header_block.deinit(self.boot);
@@ -618,9 +674,9 @@ pub const Session = struct {
         const last = self.last_processed_stream;
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, .internal_error, &.{});
-        const p = self.gpa.dupe(u8, buf[0..n]) catch return error.OutOfMemory;
+        const p = self.controlFrame(buf[0..n], .terminal) catch return error.OutOfMemory;
         self.pushIntent(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } }) catch {
-            self.gpa.free(p);
+            self.freeFrame(p);
             self.terminal = .{ .goaway = .{ .code = .internal_error, .last_stream_id = last } };
             return;
         };
@@ -676,7 +732,7 @@ pub const Session = struct {
             if (self.tombstoneCode(stream_id)) |code| {
                 if (code != .no_error) return error.FlowBlocked;
             }
-            const out = try self.allocFrame(frame.FRAME_HEADER_LEN + data.len);
+            const out = try self.allocFrame(frame.FRAME_HEADER_LEN + data.len, .ordinary);
             _ = encodeDataFrameInto(out, stream_id, data, end_stream);
             if (data.len > 0) self.windows.conn_send -= @intCast(data.len);
             return out;
@@ -692,7 +748,7 @@ pub const Session = struct {
         else
             @min(data.len, @as(usize, @intCast(avail)), 16 * 1024);
         if (data.len > 0 and take < data.len) return error.FlowBlocked;
-        const out = try self.allocFrame(frame.FRAME_HEADER_LEN + take);
+        const out = try self.allocFrame(frame.FRAME_HEADER_LEN + take, .ordinary);
         _ = encodeDataFrameInto(out, stream_id, data[0..take], end_stream);
         if (take > 0) {
             s.window.send -= @intCast(take);
@@ -705,11 +761,14 @@ pub const Session = struct {
         return out;
     }
 
-    fn emitServerPreface(self: *Session) !void {
+    /// Queue the server preface: SETTINGS, then the connection WINDOW_UPDATE.
+    /// Once per session, before anything else is queued (see `initBare`).
+    pub fn emitServerPreface(self: *Session) !void {
+        std.debug.assert(!self.sent_preface and self.intent_len == 0);
         var buf: [256]u8 = undefined;
         const settings = frame.serverPrefaceSettings(@intCast(self.limits.max_streams_per_connection));
         const n = try frame.Serializer.settingsFrame(&buf, false, &settings);
-        const payload = try self.gpa.dupe(u8, buf[0..n]);
+        const payload = try self.controlFrame(buf[0..n], .ordinary);
         // Store as raw bytes frame — edge writes verbatim. Use typ=settings with full frame in payload.
         // Simpler: outbound is complete wire bytes in a synthetic frame.
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{
@@ -722,7 +781,7 @@ pub const Session = struct {
         const incr: u31 = @intCast(flow.CONNECTION_RECV_TARGET - flow.INITIAL_WINDOW);
         var wbuf: [13]u8 = undefined;
         const wn = try frame.Serializer.windowUpdate(&wbuf, 0, incr);
-        const wp = try self.gpa.dupe(u8, wbuf[0..wn]);
+        const wp = try self.controlFrame(wbuf[0..wn], .ordinary);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{
             .typ = .window_update,
             .payload = wp,
@@ -768,7 +827,7 @@ pub const Session = struct {
             .ping => |opaque_data| {
                 var buf: [17]u8 = undefined;
                 const n = try frame.Serializer.ping(&buf, false, &opaque_data);
-                const p = try self.gpa.dupe(u8, buf[0..n]);
+                const p = try self.controlFrame(buf[0..n], .ordinary);
                 try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
             },
             .goaway => |g| try self.failConnectionWith(g.code, g.last_stream_id),
@@ -780,7 +839,7 @@ pub const Session = struct {
     fn emitGoawayNoTerminal(self: *Session, last: u31, code: frame.ErrorCode) !void {
         var buf: [32]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, code, &.{});
-        const p = try self.gpa.dupe(u8, buf[0..n]);
+        const p = try self.controlFrame(buf[0..n], .terminal);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } });
     }
 
@@ -790,7 +849,7 @@ pub const Session = struct {
         try self.emitGoawayNoTerminal(std.math.maxInt(u31), .no_error);
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.ping(&buf, false, &self.grace_ping);
-        const p = try self.gpa.dupe(u8, buf[0..n]);
+        const p = try self.controlFrame(buf[0..n], .ordinary);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
         self.grace_phase = .phase1;
         self.grace_ping_acked = false;
@@ -816,7 +875,7 @@ pub const Session = struct {
         if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .fail_connection, .code = code, .stream_id = last });
         var buf: [32]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, code, &.{});
-        const p = try self.gpa.dupe(u8, buf[0..n]);
+        const p = try self.controlFrame(buf[0..n], .terminal);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } });
         try self.pushIntentOrFailClosed(.{ .connection_error = .{ .code = code, .last_stream_id = last } });
         self.terminal = .{ .goaway = .{ .code = code, .last_stream_id = last } };
@@ -861,7 +920,7 @@ pub const Session = struct {
     fn emitRst(self: *Session, stream_id: u31, code: frame.ErrorCode) !void {
         var buf: [13]u8 = undefined;
         const n = try frame.Serializer.rstStream(&buf, stream_id, code);
-        const p = try self.gpa.dupe(u8, buf[0..n]);
+        const p = try self.controlFrame(buf[0..n], .terminal);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .rst_stream, .payload = p, .stream_id = stream_id } });
         try self.pushIntentOrFailClosed(.{ .stream_reset = .{ .stream_id = stream_id, .code = code, .from_peer = false } });
         if (self.streams.getPtr(stream_id)) |s| {
@@ -1024,18 +1083,20 @@ pub const Session = struct {
             }
         }
         // Collect first, act second. `emitRst` removes map entries, and a
-        // mutation during iteration invalidates the iterator.
-        var stale: std.ArrayList(u31) = .empty;
-        defer stale.deinit(self.gpa);
+        // mutation during iteration invalidates the iterator. The ids go in
+        // `stale_ids`, which holds one per stream the connection may have.
+        var n_stale: usize = 0;
         var it = self.body_idle_ns.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* == 0) continue;
             if (now_ns -% e.value_ptr.* >= self.limits.request_body_idle_timeout_ns) {
-                try stale.append(self.gpa, e.key_ptr.*);
+                self.stale_ids[n_stale] = e.key_ptr.*;
+                n_stale += 1;
             }
         }
-        for (stale.items) |sid| {
+        for (self.stale_ids[0..n_stale]) |sid| {
             _ = self.body_idle_ns.remove(sid);
+            _ = body_idle_expiries.fetchAdd(1, .monotonic);
             try self.emitRst(sid, .cancel);
         }
     }
@@ -1128,7 +1189,7 @@ pub const Session = struct {
         // ACK
         var buf: [9]u8 = undefined;
         const n = try frame.Serializer.settingsFrame(&buf, true, &.{});
-        const p = try self.gpa.dupe(u8, buf[0..n]);
+        const p = try self.controlFrame(buf[0..n], .ordinary);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } });
     }
 
@@ -1147,7 +1208,7 @@ pub const Session = struct {
         @memcpy(&opaque_data, payload[0..8]);
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.ping(&buf, true, &opaque_data);
-        const p = try self.gpa.dupe(u8, buf[0..n]);
+        const p = try self.controlFrame(buf[0..n], .ordinary);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } });
     }
 
@@ -1232,10 +1293,12 @@ pub const Session = struct {
                 if (self.windows.needsConnWindowUpdate()) {
                     const inc = self.windows.connWindowUpdateIncrement();
                     if (inc > 0) {
-                        self.windows.creditConnRecv(inc);
                         var buf: [13]u8 = undefined;
                         const n = try frame.Serializer.windowUpdate(&buf, 0, inc);
-                        const p = try self.gpa.dupe(u8, buf[0..n]);
+                        // The frame first, the credit after: a refusal then
+                        // leaves the window as the peer knows it.
+                        const p = try self.controlFrame(buf[0..n], .ordinary);
+                        self.windows.creditConnRecv(inc);
                         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p } });
                     }
                 }
@@ -1310,20 +1373,20 @@ pub const Session = struct {
         if (s.window.needsWindowUpdate()) {
             const inc = s.window.windowUpdateIncrement();
             if (inc > 0) {
-                s.window.creditRecv(inc);
                 var buf: [13]u8 = undefined;
                 const n = try frame.Serializer.windowUpdate(&buf, hdr.stream_id, inc);
-                const p = try self.gpa.dupe(u8, buf[0..n]);
+                const p = try self.controlFrame(buf[0..n], .ordinary);
+                s.window.creditRecv(inc);
                 try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p, .stream_id = hdr.stream_id } });
             }
         }
         if (self.windows.needsConnWindowUpdate()) {
             const inc = self.windows.connWindowUpdateIncrement();
             if (inc > 0) {
-                self.windows.creditConnRecv(inc);
                 var buf: [13]u8 = undefined;
                 const n = try frame.Serializer.windowUpdate(&buf, 0, inc);
-                const p = try self.gpa.dupe(u8, buf[0..n]);
+                const p = try self.controlFrame(buf[0..n], .ordinary);
+                self.windows.creditConnRecv(inc);
                 try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p } });
             }
         }
@@ -1474,7 +1537,11 @@ pub const Session = struct {
     fn finishHeaderBlock(self: *Session, stream_id: u31, block: []const u8) !void {
         const mem = self.headerListMem(stream_id);
         const req_alloc = switch (mem) {
-            .request => |a| a,
+            .request => |r| r.alloc,
+            .scratch => |sc| sc.alloc,
+        };
+        const transient = switch (mem) {
+            .request => |r| r.scratch,
             .scratch => |sc| sc.alloc,
         };
         // Set when the edge had no memory for this request. The block is
@@ -1486,6 +1553,7 @@ pub const Session = struct {
         };
         const decoded = self.decoder.decodeInto(
             req_alloc,
+            transient,
             block,
             self.limits.header_fields,
             self.limits.decoded_header_bytes,
@@ -1771,6 +1839,24 @@ pub const Session = struct {
         } });
     }
 
+    /// Queue a response's HEADERS. A block that does not fit one frame of the
+    /// default maximum size (16 KiB, which is also the most this server ever
+    /// sends in one frame) is cut into a HEADERS frame and CONTINUATION
+    /// frames, each its own intent and its own buffer. RFC 9113 section 6.10
+    /// forbids any other frame between them: the scheduler keeps them
+    /// together (`FairScheduler.block_open`). END_STREAM goes on the HEADERS
+    /// frame and END_HEADERS on the last one.
+    ///
+    /// The response is bounded before anything is encoded or allocated:
+    /// `Limits.response_header_fields` fields (`:status` counts) and
+    /// `response_header_bytes` of encoded block, and a response at the bound is
+    /// accepted. Over it, `HeadersTooLarge`.
+    ///
+    /// All or none: every frame's buffer and every intent slot is taken before
+    /// the first intent is queued, so a refusal (`HeadersTooLarge` or
+    /// `OutOfMemory`) leaves nothing queued and the caller may still answer
+    /// the stream with something else. A half-queued block would be one the
+    /// peer waits on forever.
     fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool) !void {
         // A RST tombstone already released the map entry. Emitting HEADERS
         // after that is how a handler that took `session_mu` late queued a
@@ -1779,34 +1865,56 @@ pub const Session = struct {
         var status_buf: [3]u8 = undefined;
         const status_str = try std.fmt.bufPrint(&status_buf, "{d}", .{status});
         const status_field = [_]hpack.HeaderField{.{ .name = ":status", .value = status_str }};
-        const status_len = hpack.Encoder.encodedLen(&status_field) catch return error.OutOfMemory;
-        const headers_len = hpack.Encoder.encodedLen(headers) catch return error.OutOfMemory;
-        const block_len = std.math.add(usize, status_len, headers_len) catch return error.OutOfMemory;
-        if (block_len > std.math.maxInt(u24)) return error.OutOfMemory;
-        const total = std.math.add(usize, frame.FRAME_HEADER_LEN, block_len) catch return error.OutOfMemory;
+        const parts = [_][]const hpack.HeaderField{ &status_field, headers };
+        if (headers.len >= self.limits.response_header_fields) return error.HeadersTooLarge;
+        const status_len = hpack.Encoder.encodedLen(&status_field) catch return error.HeadersTooLarge;
+        const headers_len = hpack.Encoder.encodedLen(headers) catch return error.HeadersTooLarge;
+        const block_len = std.math.add(usize, status_len, headers_len) catch return error.HeadersTooLarge;
+        if (block_len > self.limits.response_header_bytes) return error.HeadersTooLarge;
 
-        const out = try self.allocFrame(total);
-        var out_owned = true;
-        errdefer if (out_owned) self.freeFrame(out);
+        const max_payload: usize = frame.DEFAULT_MAX_FRAME_SIZE;
+        const n_frames = @max(1, (block_len + max_payload - 1) / max_payload);
+        // `Limits.check` keeps the bound within `MAX_HEADER_FRAGMENTS` frames.
+        std.debug.assert(n_frames <= limits_mod.MAX_HEADER_FRAGMENTS);
+        const intent_room = self.intent_storage.len -| self.terminal_reserve -| self.intent_len;
+        if (intent_room < n_frames) return error.OutOfMemory;
 
-        const fh = frame.FrameHeader{
-            .length = @intCast(block_len),
-            .type = .headers,
-            .flags = .{ .end_headers = true, .end_stream = end_stream },
-            .stream_id = stream_id,
-        };
-        fh.encode(out[0..frame.FRAME_HEADER_LEN]);
-        const n1 = hpack.Encoder.encodeInto(out[frame.FRAME_HEADER_LEN..], &status_field) catch return error.OutOfMemory;
-        const n2 = hpack.Encoder.encodeInto(out[frame.FRAME_HEADER_LEN + n1 ..], headers) catch return error.OutOfMemory;
-        std.debug.assert(n1 + n2 == block_len);
+        var bufs: [limits_mod.MAX_HEADER_FRAGMENTS][]u8 = undefined;
+        var built: usize = 0;
+        errdefer for (bufs[0..built]) |buf| self.freeFrame(buf);
+        var offset: usize = 0;
+        while (built < n_frames) {
+            const take = @min(max_payload, block_len - offset);
+            const first = built == 0;
+            const last = built + 1 == n_frames;
+            const out = try self.allocFrame(frame.FRAME_HEADER_LEN + take, .ordinary);
+            bufs[built] = out;
+            built += 1;
+            const fh = frame.FrameHeader{
+                .length = @intCast(take),
+                .type = if (first) .headers else .continuation,
+                .flags = .{ .end_headers = last, .end_stream = first and end_stream },
+                .stream_id = stream_id,
+            };
+            fh.encode(out[0..frame.FRAME_HEADER_LEN]);
+            const wrote = hpack.Encoder.encodeRange(out[frame.FRAME_HEADER_LEN..][0..take], &parts, offset);
+            std.debug.assert(wrote == take);
+            offset += take;
+        }
+        std.debug.assert(offset == block_len);
 
-        out_owned = false;
-        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{
-            .typ = .headers,
-            .payload = out,
-            .stream_id = stream_id,
-            .flags = fh.flags,
-        } });
+        // From here the frames belong to the intents. The room was checked
+        // above, so a push cannot fail.
+        for (bufs[0..n_frames], 0..) |out, k| {
+            const flags = frame.FrameHeader.decode(out[0..frame.FRAME_HEADER_LEN]).flags;
+            self.pushIntent(.{ .outbound_frame = .{
+                .typ = if (k == 0) .headers else .continuation,
+                .payload = out,
+                .stream_id = stream_id,
+                .flags = flags,
+            } }) catch unreachable;
+        }
+        built = 0;
         if (self.streams.getPtr(stream_id)) |s| {
             if (end_stream) {
                 s.localEndStream();
@@ -1915,6 +2023,113 @@ test "makeDataFrame still frames DATA after the stream map entry is gone" {
 
     try session.addTombstone(5, .cancel);
     try std.testing.expectEqual(@as(i32, 0), session.streamSendAvailable(5));
+}
+
+/// An isolated Session with stream 1 open for a response, its preface frames
+/// already given back.
+fn headerBoundSession(gpa: std.mem.Allocator, boot: std.mem.Allocator, limits: limits_mod.Limits) !Session {
+    var session = try Session.init(boot, gpa, limits);
+    errdefer session.deinit();
+    freeTestIntents(gpa, session.drainIntents());
+    try session.streams.put(1, .{
+        .id = 1,
+        .state = .half_closed_remote,
+        .window = .{ .send = flow.INITIAL_WINDOW },
+    });
+    session.active_streams = 1;
+    return session;
+}
+
+test "response header bound: a block of exactly response_header_bytes is queued, one byte more is refused with nothing queued" {
+    const gpa = std.testing.allocator;
+    // One header: a new name and a value of `n` bytes. The block is `:status`
+    // (one byte, static index) and the literal: 1 + name (1 + 5) + value (1 or
+    // 2 length bytes + n).
+    var value: [200]u8 = @splat('v');
+    const fits = [_]hpack.HeaderField{.{ .name = "x-hdr", .value = value[0..120] }};
+    const over = [_]hpack.HeaderField{.{ .name = "x-hdr", .value = value[0..121] }};
+    const exact = (try hpack.Encoder.encodedLen(&.{.{ .name = ":status", .value = "200" }})) + try hpack.Encoder.encodedLen(&fits);
+    try std.testing.expectEqual(exact + 1, (try hpack.Encoder.encodedLen(&.{.{ .name = ":status", .value = "200" }})) + try hpack.Encoder.encodedLen(&over));
+
+    var limits = limits_mod.Limits.defaults;
+    limits.response_header_bytes = exact;
+    var session = try headerBoundSession(gpa, gpa, limits);
+    defer session.deinit();
+
+    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{
+        .stream_id = 1,
+        .status = 200,
+        .headers = &over,
+        .end_stream = true,
+    } }));
+    try std.testing.expectEqual(@as(usize, 0), session.intentLen());
+    // The stream is still open: the caller may answer it another way.
+    try std.testing.expect(session.streams.get(1) != null);
+
+    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &fits, .end_stream = true } });
+    try std.testing.expectEqual(@as(usize, 1), session.intentLen());
+    freeTestIntents(gpa, session.drainIntents());
+}
+
+test "response header bound: response_header_fields counts :status, and a response at the bound is queued" {
+    const gpa = std.testing.allocator;
+    var limits = limits_mod.Limits.defaults;
+    limits.response_header_fields = 3;
+    var session = try headerBoundSession(gpa, gpa, limits);
+    defer session.deinit();
+    const two = [_]hpack.HeaderField{ .{ .name = "x-a", .value = "1" }, .{ .name = "x-b", .value = "2" } };
+    const three = [_]hpack.HeaderField{ .{ .name = "x-a", .value = "1" }, .{ .name = "x-b", .value = "2" }, .{ .name = "x-c", .value = "3" } };
+    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &three, .end_stream = false } }));
+    try std.testing.expectEqual(@as(usize, 0), session.intentLen());
+    // :status and two more is three fields: at the bound.
+    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &two, .end_stream = false } });
+    try std.testing.expectEqual(@as(usize, 1), session.intentLen());
+    freeTestIntents(gpa, session.drainIntents());
+}
+
+test "a header block above one frame is cut into HEADERS and CONTINUATION frames of at most 16 KiB, or queued not at all" {
+    const gpa = std.testing.allocator;
+    var limits = limits_mod.Limits.defaults;
+    limits.response_header_bytes = 3 * frame.DEFAULT_MAX_FRAME_SIZE;
+    var big: [frame.DEFAULT_MAX_FRAME_SIZE + 1000]u8 = @splat('h');
+    const wide = [_]hpack.HeaderField{
+        .{ .name = "x-one", .value = &big },
+        .{ .name = "x-two", .value = big[0 .. big.len - 100] },
+    };
+    const block_len = (try hpack.Encoder.encodedLen(&.{.{ .name = ":status", .value = "200" }})) + try hpack.Encoder.encodedLen(&wide);
+    try std.testing.expect(block_len > 2 * frame.DEFAULT_MAX_FRAME_SIZE);
+    try std.testing.expect(block_len <= limits.response_header_bytes);
+
+    {
+        var session = try headerBoundSession(gpa, gpa, limits);
+        defer session.deinit();
+        try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &wide, .end_stream = true } });
+        const intents = session.drainIntents();
+        defer freeTestIntents(gpa, intents);
+        try std.testing.expectEqual(@as(usize, 3), intents.len);
+        var total: usize = 0;
+        for (intents, 0..) |it, k| {
+            const f = it.outbound_frame;
+            const hdr = frame.FrameHeader.decode(f.payload[0..frame.FRAME_HEADER_LEN]);
+            try std.testing.expect(hdr.length <= frame.DEFAULT_MAX_FRAME_SIZE);
+            try std.testing.expectEqual(if (k == 0) frame.FrameType.headers else frame.FrameType.continuation, hdr.type);
+            try std.testing.expectEqual(k == 2, hdr.flags.end_headers);
+            // END_STREAM rides the HEADERS frame only.
+            try std.testing.expectEqual(k == 0, hdr.flags.end_stream);
+            total += hdr.length;
+        }
+        try std.testing.expectEqual(block_len, total);
+    }
+
+    // The third frame cannot be had: the first two are given back and the
+    // stream has no half-queued block.
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var session = try headerBoundSession(failing.allocator(), gpa, limits);
+    defer session.deinit();
+    failing.fail_index = failing.alloc_index + 2;
+    try std.testing.expectError(error.OutOfMemory, session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &wide, .end_stream = true } }));
+    try std.testing.expectEqual(@as(usize, 0), session.intentLen());
+    try std.testing.expect(session.streams.get(1) != null);
 }
 
 test "respond_headers after RST is StreamClosed" {

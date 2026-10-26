@@ -140,7 +140,7 @@ const DecodeCtx = struct {
     block: []const u8,
 
     fn init(gpa: std.mem.Allocator, block: []const u8, seed_dynamic: bool) !DecodeCtx {
-        var decoder = hpack.Decoder.init(gpa);
+        var decoder = try hpack.Decoder.init(gpa);
         errdefer decoder.deinit();
         if (seed_dynamic) {
             const seeded = try decoder.decode(&dynamic_insert_block, 100, 32 * 1024, 256, 8 * 1024);
@@ -205,7 +205,7 @@ const InboundCtx = struct {
     fn init(gpa: std.mem.Allocator) !InboundCtx {
         var parse_ctx = try ParseCtx.init(gpa);
         errdefer parse_ctx.deinit();
-        var decoder = hpack.Decoder.init(gpa);
+        var decoder = try hpack.Decoder.init(gpa);
         errdefer decoder.deinit();
         const seeded = try decoder.decode(&dynamic_insert_block, 100, 32 * 1024, 256, 8 * 1024);
         decoder.freeResult(seeded);

@@ -35,6 +35,13 @@ pub const ResponseError = error{
     OutOfMemory,
     InvalidStatus,
     InvalidHeader,
+    /// The edge refused the response before queueing anything: its header
+    /// list is over `Limits.response_header_fields` or
+    /// `response_header_bytes`, or no memory could be had for it. `send`,
+    /// `start` and `startSse` take their commit back, so the handler (or the
+    /// edge, after the handler returns) may still answer the stream with a
+    /// status of its own.
+    ResponseRefused,
     ResponseCommitted,
     BodyClosed,
     ConnectionClosed,
@@ -176,12 +183,21 @@ pub const Response = struct {
         return self.terminal.getCause();
     }
 
+    fn rollbackStart(self: *Response) void {
+        self.committed = false;
+        self.sse = false;
+        self.body_open = false;
+    }
+
     pub fn send(self: *Response, status: u16, headers: []const request.Header, body: []const u8) ResponseError!void {
         if (self.slotTerminal()) |c| return causeToError(c);
         if (self.committed) return error.ResponseCommitted;
         if (!isFinalStatus(status)) return error.InvalidStatus;
         self.committed = true;
-        try self.sendFn(self.ctx, self.stream_id, status, headers, body);
+        self.sendFn(self.ctx, self.stream_id, status, headers, body) catch |err| {
+            if (err == error.ResponseRefused) self.committed = false;
+            return err;
+        };
         self.finished = true;
     }
 
@@ -191,7 +207,10 @@ pub const Response = struct {
         if (!isFinalStatus(status)) return error.InvalidStatus;
         self.committed = true;
         self.body_open = true;
-        try self.startFn(self.ctx, self.stream_id, status, headers, false);
+        self.startFn(self.ctx, self.stream_id, status, headers, false) catch |err| {
+            if (err == error.ResponseRefused) self.rollbackStart();
+            return err;
+        };
         return .{ .response = self, .stream_id = self.stream_id, .generation = self.terminal.currentGeneration() };
     }
 
@@ -209,7 +228,10 @@ pub const Response = struct {
         self.committed = true;
         self.sse = true;
         self.body_open = true;
-        try self.startFn(self.ctx, self.stream_id, 200, headers, true);
+        self.startFn(self.ctx, self.stream_id, 200, headers, true) catch |err| {
+            if (err == error.ResponseRefused) self.rollbackStart();
+            return err;
+        };
         return .{ .response = self, .stream_id = self.stream_id, .generation = self.terminal.currentGeneration() };
     }
 

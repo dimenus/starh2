@@ -603,10 +603,12 @@ const Stall = enum {
     drain_overflow,
     /// No connection error. The writer is held and the h2c write queue filled
     /// with PING ACKs, then a request for a complete (inline) handler arrives:
-    /// its response drain parks the actor in `putOne` from `runPendingInline`.
-    /// The test then cancels the server. (t-3520, round 3)
+    /// its response drain is held back by the write pool (it used to park the
+    /// actor in `putOne`; the pool check stops it before a push can wait), and
+    /// `runPendingInline` returns. The test then cancels the server, which the
+    /// actor sees in its select. (t-3520, round 3)
     inline_drain_parked,
-    /// As above, but the actor parks in the main loop's `drainEmit`: an endless
+    /// As above, but the held drain is the main loop's `drainEmit`: an endless
     /// SSE stream fills the queue behind the held writer.
     main_drain_parked,
 };
@@ -924,8 +926,9 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     }
 
     if (stall == .inline_drain_parked or stall == .main_drain_parked) {
-        // The actor is parked in `putOne` behind a held writer. Cancel the
-        // server: `error.Canceled` must reach `Connection.run`, which counts it.
+        // The drain is held back behind a held writer, and the actor waits in
+        // its select. Cancel the server: `error.Canceled` must reach
+        // `Connection.run`, which counts it.
         try std.testing.expectEqual(@as(usize, 1), server.active_connections.load(.acquire));
         const canceled_before = conn_mod.test_run_canceled.load(.acquire);
         const inline_before = conn_mod.test_inline_drain_canceled.load(.acquire);
@@ -939,9 +942,10 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
         try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
         try std.testing.expect(cancel_ms <= 2000);
         try std.testing.expectEqual(@as(usize, 1), reached_run);
-        // The two tests prove different paths: only the inline one parks the
-        // actor in `runPendingInline`'s drain.
-        try std.testing.expectEqual(@as(usize, if (stall == .inline_drain_parked) 1 else 0), inline_saw);
+        // No drain parks the actor any more (the write-pool check stops a pop
+        // that could push past the queue), so no cancel is delivered inside
+        // `runPendingInline`'s drain.
+        try std.testing.expectEqual(@as(usize, 0), inline_saw);
         return;
     }
 
@@ -1034,10 +1038,10 @@ test "goaway: tls a cancel reaches the actor through the inbound-batch yield whi
     try runStalledCase(.tls, .peer_floods_input, .cancel, "tls cancel with inbound flood");
 }
 
-test "goaway: h2c a cancel while an inline drain is parked in putOne reaches run as error.Canceled (t-3520)" {
+test "goaway: h2c a cancel while an inline drain is held back by the write pool reaches run as error.Canceled (t-3520)" {
     try runStalledCase(.h2c, .inline_drain_parked, .cancel, "h2c cancel in inline drain");
 }
 
-test "goaway: h2c a cancel while the main loop drain is parked in putOne reaches run as error.Canceled (t-3520)" {
+test "goaway: h2c a cancel while the main loop drain is held back by the write pool reaches run as error.Canceled (t-3520)" {
     try runStalledCase(.h2c, .main_drain_parked, .cancel, "h2c cancel in main drain");
 }

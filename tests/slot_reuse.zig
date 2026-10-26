@@ -31,10 +31,13 @@ const tls = @import("tls");
 const frame = starh2.core.frame;
 const conn_mod = starh2.edge.connection;
 
-const client_deadline_ns = 10 * std.time.ns_per_s;
+const wire_client = @import("wire_client.zig");
+const client_deadline_ns = wire_client.client_deadline_ns;
 const dummy: u8 = 0;
 
-const Transport = enum { h2c, tls };
+const Transport = wire_client.Transport;
+const Wire = wire_client.Wire;
+const Counts = wire_client.Counts;
 
 fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     try resp.send(200, &.{}, "ok");
@@ -69,22 +72,30 @@ fn postPool(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteRes
 
 const post_body_len = 40 * 1024;
 
+/// A short event stream: starts (the SSE header list), writes one event, ends.
+fn sseShort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.startSse(&.{});
+    try body.writeAll("data: hi\n\n");
+    try body.finish();
+}
+
+/// A compressible body, so that with `response_compression` on, the header list
+/// needs `vary: accept-encoding` whether or not the client takes brotli.
+fn varyBody(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    try resp.send(200, &.{.{ .name = "content-type", .value = "text/plain" }}, "hello vary");
+}
+
 const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
     .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangSse } } },
     .{ .method = .GET, .path = "/render", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = renderPool } } },
     .{ .method = .POST, .path = "/post", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = postPool } } },
+    .{ .method = .GET, .path = "/sse-short", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseShort } } },
+    .{ .method = .GET, .path = "/vary", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = varyBody } } },
 };
 
-fn nowNs() u64 {
-    return zio.Timestamp.now(.monotonic).toNanoseconds();
-}
-
-fn realNow() std.Io.Timestamp {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return .fromNanoseconds(@as(i96, ts.sec) * std.time.ns_per_s + ts.nsec);
-}
+const nowNs = wire_client.nowNs;
+const realNow = wire_client.realNow;
 
 fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
     return zio.Runtime.init(gpa, .{
@@ -92,196 +103,6 @@ fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
         .executors = .exact(2),
     });
 }
-
-/// How many frames of each type a connection delivered, up to the point a
-/// scenario stops reading. A reused slot must deliver the same as a fresh one.
-const Counts = [16]u8;
-
-/// Blocking client on a raw libc socket. For TLS, received ciphertext
-/// accumulates in `in` and decrypted bytes in `plain`.
-const Wire = struct {
-    gpa: std.mem.Allocator,
-    transport: Transport,
-    fd: c_int,
-    in: [2 * tls.input_buffer_len]u8 = undefined,
-    in_len: usize = 0,
-    out: [tls.output_buffer_len]u8 = undefined,
-    rd: [tls.input_buffer_len]u8 = undefined,
-    conn: tls.nonblock.Connection = undefined,
-    plain: std.ArrayList(u8) = .empty,
-
-    const Seen = struct { ftype: u8, flags: u8, sid: u32 };
-
-    /// TCP connect only. The kernel completes it while the server's accept
-    /// loop is still parked, so a TLS handshake must wait for `handshake`.
-    fn connect(gpa: std.mem.Allocator, transport: Transport, port: u16) !*Wire {
-        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-        if (fd < 0) return error.Socket;
-        errdefer _ = std.c.close(fd);
-        var addr: std.c.sockaddr.in = .{
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = std.mem.nativeToBig(u32, 0x7f000001),
-        };
-        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Connect;
-        const tv: std.c.timeval = .{ .sec = 1, .usec = 0 };
-        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(std.c.timeval));
-        const self = try gpa.create(Wire);
-        self.* = .{ .gpa = gpa, .transport = transport, .fd = fd };
-        return self;
-    }
-
-    fn open(gpa: std.mem.Allocator, transport: Transport, port: u16) !*Wire {
-        const self = try connect(gpa, transport, port);
-        errdefer self.close();
-        try self.handshake();
-        return self;
-    }
-
-    fn close(self: *Wire) void {
-        _ = std.c.close(self.fd);
-        self.plain.deinit(self.gpa);
-        self.gpa.destroy(self);
-    }
-
-    fn handshake(self: *Wire) !void {
-        if (self.transport == .h2c) return;
-        var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(@as(i128, realNow().nanoseconds)))));
-        var hs = tls.nonblock.Client.init(.{
-            .rng = prng.random(),
-            .now = realNow(),
-            .host = "localhost",
-            .root_ca = .empty,
-            .insecure_skip_verify = true,
-            .cipher_suites = tls.config.cipher_suites.tls13,
-            .alpn_protocols = &.{"h2"},
-        });
-        while (!hs.done()) {
-            const r = try hs.run(self.in[0..self.in_len], &self.out);
-            self.consume(r.recv_pos);
-            if (r.send.len > 0) try self.sendRaw(r.send);
-            if (hs.done()) break;
-            if (r.recv_pos == 0 and r.send.len == 0) try self.fill();
-        }
-        const alpn = hs.inner.alpn_protocol orelse return error.Alpn;
-        if (!std.mem.eql(u8, alpn, "h2")) return error.Alpn;
-        self.conn = .init(hs.cipher().?);
-    }
-
-    fn fill(self: *Wire) !void {
-        if (self.in_len == self.in.len) return error.ClientBufferFull;
-        const n = std.c.recv(self.fd, self.in[self.in_len..].ptr, self.in.len - self.in_len, 0);
-        if (n == 0) return error.Eof;
-        if (n < 0) {
-            return switch (std.c.errno(n)) {
-                .AGAIN, .INTR => error.WouldBlock,
-                else => error.Eof,
-            };
-        }
-        self.in_len += @intCast(n);
-    }
-
-    fn consume(self: *Wire, n: usize) void {
-        std.mem.copyForwards(u8, self.in[0 .. self.in_len - n], self.in[n..self.in_len]);
-        self.in_len -= n;
-    }
-
-    fn sendRaw(self: *Wire, bytes: []const u8) !void {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = std.c.send(self.fd, bytes[off..].ptr, bytes.len - off, 0);
-            if (n <= 0) return error.Send;
-            off += @intCast(n);
-        }
-    }
-
-    fn send(self: *Wire, bytes: []const u8) !void {
-        if (self.transport == .h2c) return self.sendRaw(bytes);
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const r = try self.conn.encrypt(bytes[off..][0..@min(bytes.len - off, 16 * 1024)], &self.out);
-            try self.sendRaw(r.ciphertext);
-            off += r.cleartext_pos;
-        }
-    }
-
-    fn recordLen(bytes: []const u8) ?usize {
-        if (bytes.len < 5) return null;
-        const len = 5 + @as(usize, std.mem.readInt(u16, bytes[3..5], .big));
-        return if (bytes.len < len) null else len;
-    }
-
-    /// Read more plaintext. False when the server closed.
-    fn pump(self: *Wire) !bool {
-        if (self.transport == .h2c) {
-            var buf: [16 * 1024]u8 = undefined;
-            const n = std.c.recv(self.fd, &buf, buf.len, 0);
-            if (n == 0) return false;
-            if (n < 0) {
-                return switch (std.c.errno(n)) {
-                    .AGAIN, .INTR => error.WouldBlock,
-                    .CONNRESET => false,
-                    else => error.Recv,
-                };
-            }
-            try self.plain.appendSlice(self.gpa, buf[0..@intCast(n)]);
-            return true;
-        }
-        const rec_len = recordLen(self.in[0..self.in_len]) orelse {
-            self.fill() catch |err| switch (err) {
-                error.Eof => return false,
-                else => return err,
-            };
-            return true;
-        };
-        const res = try self.conn.decrypt(self.in[0..rec_len], &self.rd);
-        self.consume(rec_len);
-        if (res.closed) return false;
-        try self.plain.appendSlice(self.gpa, res.cleartext);
-        return true;
-    }
-
-    /// The next frame in wire order, or null when the server closed first.
-    fn next(self: *Wire, deadline: u64) !?Seen {
-        while (true) {
-            if (self.plain.items.len >= frame.FRAME_HEADER_LEN) {
-                const h = self.plain.items;
-                const len = (@as(usize, h[0]) << 16) | (@as(usize, h[1]) << 8) | h[2];
-                if (h.len >= 9 + len) {
-                    const seen: Seen = .{
-                        .ftype = h[3],
-                        .flags = h[4],
-                        .sid = std.mem.readInt(u32, h[5..9], .big) & 0x7fff_ffff,
-                    };
-                    self.plain.replaceRangeAssumeCapacity(0, 9 + len, &.{});
-                    return seen;
-                }
-            }
-            if (nowNs() >= deadline) return error.Deadline;
-            const more = self.pump() catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => return err,
-            };
-            if (!more) return null;
-        }
-    }
-
-    const Stop = enum { stream1_end, stream1_data, closed };
-
-    /// Read frames, counting each type, until `stop` holds. `closed` also
-    /// returns when the server closes first. Returns whether it closed.
-    fn readUntil(self: *Wire, counts: *Counts, stop: Stop) !bool {
-        const deadline = nowNs() + client_deadline_ns;
-        while (true) {
-            const s = try self.next(deadline) orelse return true;
-            if (s.ftype < counts.len) counts[s.ftype] += 1;
-            switch (stop) {
-                .stream1_end => if ((s.ftype == 0 or s.ftype == 1) and s.sid == 1 and s.flags & 1 != 0) return false,
-                .stream1_data => if (s.ftype == 0 and s.sid == 1) return false,
-                .closed => {},
-            }
-        }
-    }
-};
 
 const ftype_goaway = 7;
 
@@ -707,6 +528,10 @@ const Round = struct {
     /// Requests each connection makes after all are connected. Zero is the
     /// single probe the boot test uses.
     requests: usize = 0,
+    /// Run `http2PathScript` on each connection instead, and add the frame
+    /// kinds the server sent to `kinds`.
+    script: bool = false,
+    kinds: std.atomic.Value(u8) = .init(0),
     transport: Transport,
     port: u16,
     gpa: std.mem.Allocator,
@@ -728,7 +553,11 @@ fn roundClient(r: *Round) void {
 }
 
 fn roundClientRun(r: *Round) !void {
-    const w = try Wire.open(r.gpa, r.transport, r.port);
+    // The script does its own handshake, with its first flight pipelined.
+    const w = if (r.script)
+        try Wire.connect(r.gpa, r.transport, r.port)
+    else
+        try Wire.open(r.gpa, r.transport, r.port);
     defer w.close();
     _ = r.connected.fetchAdd(1, .release);
     const deadline = nowNs() + client_deadline_ns;
@@ -736,7 +565,9 @@ fn roundClientRun(r: *Round) !void {
         if (nowNs() >= deadline) return error.Deadline;
         std.Thread.yield() catch {};
     }
-    if (r.requests == 0) {
+    if (r.script) {
+        try http2PathScript(w, r.gpa, &r.kinds);
+    } else if (r.requests == 0) {
         _ = try probe(w, r.gpa);
     } else {
         try requestLoop(w, r.gpa, r.requests);
@@ -764,20 +595,33 @@ fn runRound(server: *starh2.Server, gpa: std.mem.Allocator, transport: Transport
 
 fn runRoundRequests(server: *starh2.Server, gpa: std.mem.Allocator, transport: Transport, n: usize, requests: usize) !void {
     var r: Round = .{ .n = n, .requests = requests, .transport = transport, .port = server.localAddress(0).getPort(), .gpa = gpa };
+    return runRoundOf(server, &r);
+}
+
+/// One round of `n` connections that each run the HTTP/2 path script. Returns
+/// the frame kinds the servers sent, as a `PathKinds` mask.
+fn runRoundScript(server: *starh2.Server, gpa: std.mem.Allocator, transport: Transport, n: usize) !u8 {
+    var r: Round = .{ .n = n, .script = true, .transport = transport, .port = server.localAddress(0).getPort(), .gpa = gpa };
+    try runRoundOf(server, &r);
+    return r.kinds.load(.acquire);
+}
+
+fn runRoundOf(server: *starh2.Server, r: *Round) !void {
+    const n = r.n;
+    const gpa = r.gpa;
     const threads = try gpa.alloc(std.Thread, n);
     defer gpa.free(threads);
-    for (threads) |*t| t.* = try std.Thread.spawn(.{}, roundClient, .{&r});
+    for (threads) |*t| t.* = try std.Thread.spawn(.{}, roundClient, .{r});
     while (r.done.load(.acquire) < n) zio.sleep(.fromMilliseconds(5)) catch {};
     for (threads) |t| t.join();
     try std.testing.expectEqual(@as(usize, 0), r.failed.load(.acquire));
     try waitIdle(server);
 }
 
-/// What boot is allowed to ask the general allocator for: the two frames the
-/// server's preface queues (SETTINGS and WINDOW_UPDATE). They are request-class
-/// memory, released through the frame path, and stage 3 moves them off the
-/// general allocator; until then they are the only calls boot may make.
-const preface_frames_per_connection = 2;
+/// What boot is allowed to ask the general allocator for: nothing. The two
+/// frames the server's preface queues (SETTINGS and WINDOW_UPDATE) are made in
+/// the connection's frame pool, after boot, by `finishBoot`.
+const preface_frames_per_connection = 0;
 
 fn runBootCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Transport) !void {
     var counting: CountingGpa = .{ .child = real };
@@ -822,8 +666,8 @@ fn runBootCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Transport)
     });
     try std.testing.expectEqual(@as(usize, n * preface_frames_per_connection), boot_1 - boot_0);
     try std.testing.expectEqual(@as(usize, n * preface_frames_per_connection), boot_2 - boot_1);
-    // Both are frames, not tables: nothing boot asks for is bigger than one.
-    try std.testing.expect(counting.boot_max_len.load(.monotonic) <= 256);
+    // Nothing at all: no table and no frame.
+    try std.testing.expectEqual(@as(usize, 0), counting.boot_max_len.load(.monotonic));
 
     server.requestShutdown();
     serve_handle.join() catch {};
@@ -1259,4 +1103,311 @@ test "request memory: h2c makes no large general-allocator call after warm-up" {
 
 test "request memory: tls makes no large general-allocator call after warm-up" {
     try runRequestMemoryCallsCase(.tls);
+}
+
+// ---------------------------------------------------------------------------
+// The whole HTTP/2 path makes no general-allocator call (slot pool stage 3).
+
+const hpack = starh2.core.hpack;
+
+/// The frame kinds the server sent that the script is meant to provoke, one
+/// bit each. A run that provoked fewer proves less, so the test checks them.
+const PathKinds = struct {
+    const settings_ack: u8 = 1;
+    const ping_ack: u8 = 2;
+    const window_update: u8 = 4;
+    const rst_stream: u8 = 8;
+    const goaway: u8 = 16;
+    const all: u8 = 31;
+};
+
+const PathStop = union(enum) {
+    stream_end: u31,
+    /// Every one of these streams ends (in any order).
+    streams_end: []const u31,
+    stream_rst: u31,
+    closed,
+};
+
+/// Read frames, noting the kinds of control frame the server sends, until
+/// `stop`.
+fn readPath(wire: *Wire, kinds: *std.atomic.Value(u8), stop: PathStop) !void {
+    const deadline = nowNs() + client_deadline_ns;
+    var ended: [8]bool = @splat(false);
+    while (true) {
+        const s = try wire.next(deadline) orelse switch (stop) {
+            .closed => return,
+            else => return error.ClosedEarly,
+        };
+        switch (s.ftype) {
+            4 => if (s.flags & 1 != 0) {
+                _ = kinds.fetchOr(PathKinds.settings_ack, .acq_rel);
+            },
+            6 => if (s.flags & 1 != 0) {
+                _ = kinds.fetchOr(PathKinds.ping_ack, .acq_rel);
+            },
+            8 => _ = kinds.fetchOr(PathKinds.window_update, .acq_rel),
+            3 => _ = kinds.fetchOr(PathKinds.rst_stream, .acq_rel),
+            7 => _ = kinds.fetchOr(PathKinds.goaway, .acq_rel),
+            else => {},
+        }
+        switch (stop) {
+            .stream_end => |sid| if (s.sid == sid and (s.ftype == 0 or s.ftype == 1) and s.flags & 1 != 0) return,
+            .streams_end => |sids| {
+                if ((s.ftype == 0 or s.ftype == 1) and s.flags & 1 != 0) {
+                    for (sids, 0..) |sid, k| {
+                        if (s.sid == sid) ended[k] = true;
+                    }
+                }
+                for (sids, 0..) |_, k| {
+                    if (!ended[k]) break;
+                } else return;
+            },
+            .stream_rst => |sid| if (s.sid == sid and s.ftype == 3) return,
+            .closed => {},
+        }
+    }
+}
+
+/// One connection's script. Every control frame the server can send comes up,
+/// in the shape a client makes it: the SETTINGS ack, a PING ack, WINDOW_UPDATE
+/// (a 40 KiB body is past half the stream window), a RST_STREAM (a request
+/// with no :path), and a GOAWAY (DATA on stream 0), after which the server
+/// closes.
+fn http2PathScript(wire: *Wire, gpa: std.mem.Allocator, kinds: *std.atomic.Value(u8)) !void {
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+
+    // A request, then a PING and a SETTINGS the server must answer.
+    var preface = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer preface.deinit(gpa);
+    try req.appendSlice(gpa, preface.items);
+    try h2c.appendHeaders(gpa, &req, 1, "/hello", true);
+    var ping_buf: [17]u8 = undefined;
+    const ping_n = try frame.Serializer.ping(&ping_buf, false, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try req.appendSlice(gpa, ping_buf[0..ping_n]);
+    var settings_buf: [9]u8 = undefined;
+    const settings_n = try frame.Serializer.settingsFrame(&settings_buf, false, &.{});
+    try req.appendSlice(gpa, settings_buf[0..settings_n]);
+    // The whole first flight leaves with the TLS Finished, so on TLS the server
+    // reads it as handshake leftover.
+    try wire.handshakeWith(req.items);
+    try readPath(wire, kinds, .{ .stream_end = 1 });
+
+    // An event stream (the SSE header list) and a response whose header list
+    // needs `vary` (compression is on, the client takes no brotli).
+    req.clearRetainingCapacity();
+    try h2c.appendHeaders(gpa, &req, 3, "/sse-short", true);
+    try h2c.appendHeaders(gpa, &req, 5, "/vary", true);
+    try wire.send(req.items);
+    try readPath(wire, kinds, .{ .streams_end = &.{ 3, 5 } });
+
+    // Incrementally indexed headers: twelve requests each put a 400-byte entry
+    // in the connection's HPACK table, which holds 4,096 bytes, so it fills,
+    // evicts its oldest entries and compacts. The last request names the
+    // newest entry by index.
+    req.clearRetainingCapacity();
+    var value: [400]u8 = undefined;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    var sid: u31 = 7;
+    for (0..indexed_requests) |k| {
+        @memset(&value, @intCast('a' + k));
+        raw.clearRetainingCapacity();
+        try appendLiteralIndexed(gpa, &raw, "x-trace", &value);
+        try appendHelloWithRaw(gpa, &req, sid, raw.items);
+        sid += 2;
+    }
+    try appendHelloWithRaw(gpa, &req, sid, &.{0x80 | 62});
+    try wire.send(req.items);
+    try readPath(wire, kinds, .{ .stream_end = sid });
+    sid += 2;
+
+    // A body past half the stream window: the server credits it back.
+    req.clearRetainingCapacity();
+    const body: [post_body_len]u8 = @splat('p');
+    try h2c.appendHeadersExtra(gpa, &req, sid, "POST", "/post", false, &.{});
+    var off: usize = 0;
+    while (off < body.len) {
+        const take = @min(body.len - off, frame.DEFAULT_MAX_FRAME_SIZE);
+        try h2c.appendData(gpa, &req, sid, body[off..][0..take], off + take == body.len);
+        off += take;
+    }
+    try wire.send(req.items);
+    try readPath(wire, kinds, .{ .stream_end = sid });
+    sid += 2;
+
+    // A request body that stops: the stream is reset when its idle time is up.
+    req.clearRetainingCapacity();
+    try h2c.appendHeadersExtra(gpa, &req, sid, "POST", "/post", false, &.{});
+    try h2c.appendData(gpa, &req, sid, "partial", false);
+    try wire.send(req.items);
+    try readPath(wire, kinds, .{ .stream_rst = sid });
+    sid += 2;
+
+    // A request the server resets: no :path.
+    req.clearRetainingCapacity();
+    const no_path = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &no_path);
+    defer gpa.free(block);
+    var fh_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{
+        .length = @intCast(block.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true, .end_stream = true },
+        .stream_id = sid,
+    }).encode(&fh_buf);
+    try req.appendSlice(gpa, &fh_buf);
+    try req.appendSlice(gpa, block);
+    try wire.send(req.items);
+    try readPath(wire, kinds, .{ .stream_rst = sid });
+
+    // A connection error: the server sends GOAWAY and closes.
+    req.clearRetainingCapacity();
+    try h2c.appendData(gpa, &req, 0, "x", false);
+    try wire.send(req.items);
+    try readPath(wire, kinds, .closed);
+}
+
+const indexed_requests = 12;
+
+/// `0x40`: a literal field that the peer's table takes in (RFC 7541 section
+/// 6.2.1), with a new name. Strings are raw, not Huffman.
+fn appendLiteralIndexed(gpa: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, value: []const u8) !void {
+    try out.append(gpa, 0x40);
+    try appendRawString(gpa, out, name);
+    try appendRawString(gpa, out, value);
+}
+
+fn appendRawString(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    if (s.len < 127) {
+        try out.append(gpa, @intCast(s.len));
+    } else {
+        try out.append(gpa, 127);
+        var rest = s.len - 127;
+        while (rest >= 128) : (rest /= 128) try out.append(gpa, @intCast(rest % 128 + 128));
+        try out.append(gpa, @intCast(rest));
+    }
+    try out.appendSlice(gpa, s);
+}
+
+/// GET /hello on `sid` whose header block is the four pseudo-headers and then
+/// `raw`, header block bytes the test wrote by hand.
+fn appendHelloWithRaw(gpa: std.mem.Allocator, out: *std.ArrayList(u8), sid: u31, raw: []const u8) !void {
+    const pseudo = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/hello" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const lead = try hpack.Encoder.encode(gpa, &pseudo);
+    defer gpa.free(lead);
+    var fh_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{
+        .length = @intCast(lead.len + raw.len),
+        .type = .headers,
+        .flags = .{ .end_headers = true, .end_stream = true },
+        .stream_id = sid,
+    }).encode(&fh_buf);
+    try out.appendSlice(gpa, &fh_buf);
+    try out.appendSlice(gpa, lead);
+    try out.appendSlice(gpa, raw);
+}
+
+fn runHttp2PathCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Transport) !void {
+    var counting: CountingGpa = .{ .child = real };
+    const gpa = counting.allocator();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        real.free(cert);
+        real.free(key);
+    }
+    const n = 4;
+    var limits = starh2.Limits.defaults;
+    limits.response_compression = true;
+    limits.request_body_idle_timeout_ns = 150 * std.time.ns_per_ms;
+    var server = try serverFor(rt, gpa, transport, limits, &cert, &key);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    // Warm-up: the slots are made (the slot pool at a new peak is the one
+    // allocation this path is allowed, and it happens here, not below), and
+    // the request blocks the load needs.
+    const kinds_1 = try runRoundScript(&server, real, transport, n);
+    const calls_1 = counting.calls.load(.monotonic);
+    const frames_1 = om.frames_built.load(.monotonic);
+    const controls_1 = starh2.core.session.control_frames_built.load(.monotonic);
+    const inserts_1 = hpack.table_insertions.load(.monotonic);
+    const lists_1 = conn_mod.h2_work.response_header_lists.load(.monotonic);
+    const leftovers_1 = conn_mod.h2_work.tls_leftovers.load(.monotonic);
+    const expiries_1 = starh2.core.session.body_idle_expiries.load(.monotonic);
+
+    // Steady state: the same slots serve the same script.
+    const kinds_2 = try runRoundScript(&server, real, transport, n);
+    const calls_2 = counting.calls.load(.monotonic);
+    const frames = om.frames_built.load(.monotonic) - frames_1;
+    const controls = starh2.core.session.control_frames_built.load(.monotonic) - controls_1;
+    const inserts = hpack.table_insertions.load(.monotonic) - inserts_1;
+    const lists = conn_mod.h2_work.response_header_lists.load(.monotonic) - lists_1;
+    const leftovers = conn_mod.h2_work.tls_leftovers.load(.monotonic) - leftovers_1;
+    const expiries = starh2.core.session.body_idle_expiries.load(.monotonic) - expiries_1;
+    try std.testing.expectEqual(@as(usize, n), server.slots.snapshot().created);
+
+    std.debug.print("{s} http/2 path: steady round made {d} general-allocator calls of any size; frames built {d}, control frames {d}, hpack insertions {d}, response header lists {d}, tls leftovers {d}, idle-body expiries {d}, frame kinds seen {b:0>5}\n", .{
+        @tagName(transport), calls_2 - calls_1, frames, controls, inserts, lists, leftovers, expiries, kinds_2,
+    });
+    // The counter is alive: the warm-up round made the slots, and that is
+    // general-allocator calls.
+    try std.testing.expect(calls_1 > 0);
+    // The script provoked every kind of control frame, in both rounds, and
+    // built frames: a zero below is then a result and not a script that
+    // stopped early.
+    try std.testing.expectEqual(PathKinds.all, kinds_1);
+    try std.testing.expectEqual(PathKinds.all, kinds_2);
+    try std.testing.expect(frames >= n * 8);
+    try std.testing.expect(controls >= n * 6);
+    try std.testing.expect(inserts >= n * indexed_requests);
+    // Every response built a header list (the SSE and Vary ones in the arena),
+    // every connection's idle body expired, and on TLS the first flight was
+    // read as handshake leftover.
+    // Per connection: /hello, /sse-short, /vary, the indexed requests, the one
+    // that names the newest entry, and the POST.
+    try std.testing.expectEqual(n * (indexed_requests + 5), lists);
+    try std.testing.expect(expiries >= n);
+    if (transport == .tls) try std.testing.expect(leftovers >= 1);
+    // And there is no call, of any size, in the steady round.
+    try std.testing.expectEqual(@as(usize, 0), calls_2 - calls_1);
+
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runHttp2PathCallsCase(transport: Transport) !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runHttp2PathCalls, .{ rt, gpa, transport });
+    try h.join();
+}
+
+const om = conn_mod.outbound_memory;
+
+test "http/2 path: h2c makes no general-allocator call of any size after warm-up" {
+    try runHttp2PathCallsCase(.h2c);
+}
+
+test "http/2 path: tls makes no general-allocator call of any size after warm-up" {
+    try runHttp2PathCallsCase(.tls);
 }

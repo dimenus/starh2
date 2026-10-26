@@ -285,6 +285,14 @@ pub const SlabPool = struct {
     pub fn rentedCount(self: *const SlabPool) usize {
         return self.rented.load(.acquire);
     }
+
+    /// Slabs free right now, read from the bitmap. Only the task that rents
+    /// (the one holding `session_mu`) can make it smaller, and returns only
+    /// make it larger, so a count that is enough stays enough until that task
+    /// rents.
+    pub fn freeCount(self: *const SlabPool) usize {
+        return self.free.freeCount();
+    }
 };
 
 const testing = std.testing;

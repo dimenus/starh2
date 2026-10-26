@@ -732,6 +732,25 @@ pub fn build(b: *std.Build) void {
     const slot_reuse_step = b.step("test-slot-reuse", "Run the connection slot gates (reuse, ordering, boot allocator calls, dirty slots, shutdown)");
     slot_reuse_step.dependOn(&run_slot_reuse_tests.step);
 
+    const outbound_memory_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/outbound_memory.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_outbound_memory_tests = b.addRunArtifact(outbound_memory_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_outbound_memory_tests.setCwd(b.path("."));
+    const outbound_memory_step = b.step("test-outbound-memory", "Run the outbound memory gates (write-pool backpressure, header blocks cut into CONTINUATION frames)");
+    outbound_memory_step.dependOn(&run_outbound_memory_tests.step);
+
     const request_memory_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/request_memory.zig"),
@@ -802,6 +821,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_admission_tests.step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);
+    test_step.dependOn(&run_outbound_memory_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");
@@ -1092,7 +1112,7 @@ pub fn build(b: *std.Build) void {
     const std_io_gate_step = b.step("std-io-gate", "Fail on any new std.Io concurrency abstraction; zio owns concurrency here");
     std_io_gate_step.dependOn(&std_io_gate_run.step);
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + every release target");
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + every release target + every artifact a named step or the install step compiles");
     ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(test_step);
     // Placement and balancer gates; each test says what it checks under the
@@ -1105,6 +1125,20 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(&h1_go_smoke_run.step);
     ci_step.dependOn(&readme_doctest_run.step);
     ci_step.dependOn(release_step);
+
+    // Every artifact that `zig build <step>` or a plain `zig build` can
+    // compile is compiled by `ci` too. A tool or example is otherwise only
+    // built by its own step, so an API change that breaks it (round 1 made
+    // `hpack.Decoder.init` fallible and broke `pipeline-bench`) passes `ci`
+    // and fails the next full build. Walking the named steps and the install
+    // step means a new artifact needs no line here to be covered.
+    {
+        var seen: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
+        var named: std.ArrayList(*std.Build.Step.Compile) = .empty;
+        collectCompiles(b.getInstallStep(), &seen, &named, b.allocator);
+        for (b.top_level_steps.values()) |tls| collectCompiles(&tls.step, &seen, &named, b.allocator);
+        for (named.items) |compile| ci_step.dependOn(&compile.step);
+    }
 
     // Per-artifact libc file for native macOS only. A global `--libc` would
     // also hit linux cross targets (`crt_dir may not be empty for linux`) and

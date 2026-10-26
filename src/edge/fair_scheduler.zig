@@ -179,6 +179,23 @@ fn headersStream(payload: []const u8) ?u31 {
     return sid;
 }
 
+/// True for a HEADERS or CONTINUATION frame that does not end its header
+/// block (no END_HEADERS): the next frame on the wire must be the next
+/// fragment of the same block, so nothing else may be emitted before it
+/// (RFC 9113 section 6.10).
+pub fn leavesBlockOpen(payload: []const u8) bool {
+    if (payload.len < frame.FRAME_HEADER_LEN) return false;
+    const typ = payload[3];
+    if (typ != @backingInt(frame.FrameType.headers) and typ != @backingInt(frame.FrameType.continuation)) return false;
+    return !frame.FrameFlags.fromByte(payload[4]).end_headers;
+}
+
+/// The stream of a CONTINUATION frame payload; null for any other frame.
+fn continuationStream(payload: []const u8) ?u31 {
+    if (payload.len < frame.FRAME_HEADER_LEN or payload[3] != @backingInt(frame.FrameType.continuation)) return null;
+    return @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
+}
+
 /// Open-addressed `u31` keys, linear probing, key 0 empty. The table is at
 /// most half full (`indexCapacity`), so a probe always meets an empty key.
 fn probeHome(shift: u5, stream_id: u31) usize {
@@ -338,6 +355,16 @@ pub const FairScheduler = struct {
     /// from `pause`: a slow peer (`pending_n > 0` with stash room) must still
     /// emit WINDOW_UPDATE. Only stash-full should set this.
     pause_control: ?*const fn (*anyopaque) bool = null,
+
+    /// A HEADERS or CONTINUATION frame went to the sink without END_HEADERS,
+    /// so the next frame out must be the next fragment of its block. While
+    /// set, `drain` pops no terminal control, forces no DATA and emits no
+    /// DATA: an RST_STREAM or a DATA frame inside a header block is a
+    /// connection error to the peer. A pause may still stop the drain inside
+    /// a block; the next drain finishes it first. The fragments are queued
+    /// back to back by one `cmdHeaders`, so the next ordinary entry is the
+    /// next fragment.
+    block_open: bool = false,
 
     /// `-Dwire-ring=true` only (t-3514): which `drain` site asked for DATA,
     /// and whether the ordinary loop last stopped on `isControlPaused`.
@@ -589,9 +616,16 @@ pub const FairScheduler = struct {
         const cap = self.ordinary_q.len;
         var kept: usize = 0;
         var k: usize = 0;
+        // The CONTINUATION fragments queued behind a dropped HEADERS go with
+        // it. Ones whose HEADERS already left stay: the peer is waiting for
+        // them.
+        var dropping_block = false;
         while (k < n) : (k += 1) {
             const e = self.ordinary_q[(self.ordinary_head + k) % cap];
-            if (headersStream(e.payload) == stream_id) {
+            const is_headers = headersStream(e.payload) == stream_id;
+            const is_fragment = dropping_block and continuationStream(e.payload) == stream_id;
+            if (is_headers or is_fragment) {
+                dropping_block = leavesBlockOpen(e.payload);
                 self.ctrl.release(e.control_n, 1);
                 if (e.ticket != 0) {
                     if (comptime observe) _ = test_dropped_ticketed_headers.fetchAdd(1, .acq_rel);
@@ -1009,41 +1043,49 @@ pub const FairScheduler = struct {
         build_data_frame: BuildDataFrame,
         build_ctx: *anyopaque,
     ) anyerror!void {
-        while (self.terminal_len > 0) {
-            if (self.isControlPaused()) break;
-            const e = self.popTerminal() orelse break;
-            self.emits_total += 1;
-            self.sink_origin_emits += 1;
-            self.recordEmitKind(.terminal_control);
-            try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
-        }
-        if (comptime wire_ring.enabled) self.diag_ctrl_break = false;
-        while (self.ordinary_len > 0) {
-            if (self.isControlPaused()) {
-                if (comptime wire_ring.enabled) self.diag_ctrl_break = true;
-                break;
+        // Terminal controls first, then ordinary ones. A header block that
+        // closes inside the ordinary loop lets the terminals that waited for
+        // it go in this same drain: nothing else would wake the actor for them.
+        while (true) {
+            while (self.terminal_len > 0 and !self.block_open) {
+                if (self.isControlPaused()) break;
+                const e = self.popTerminal() orelse break;
+                self.emits_total += 1;
+                self.sink_origin_emits += 1;
+                self.recordEmitKind(.terminal_control);
+                try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
             }
-            if (!self.isPaused() and self.shouldForceDataNow() and self.dataEligible(win_ctx, conn_win)) {
-                if (comptime wire_ring.enabled) self.diag_path = .forced;
-                if (try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) {
-                    continue;
+            if (comptime wire_ring.enabled) self.diag_ctrl_break = false;
+            while (self.ordinary_len > 0) {
+                if (self.isControlPaused()) {
+                    if (comptime wire_ring.enabled) self.diag_ctrl_break = true;
+                    break;
                 }
+                if (!self.block_open and !self.isPaused() and self.shouldForceDataNow() and self.dataEligible(win_ctx, conn_win)) {
+                    if (comptime wire_ring.enabled) self.diag_path = .forced;
+                    if (try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) {
+                        continue;
+                    }
+                }
+                const e = self.popOrdinary() orelse break;
+                self.block_open = leavesBlockOpen(e.payload);
+                self.emits_total += 1;
+                self.sink_origin_emits += 1;
+                self.recordEmitKind(.ordinary_control);
+                self.emitted_controls_since_data += 1;
+                self.ctrl.noteControl();
+                self.noteHeadersOut(e.payload) catch |err| {
+                    self.freePayload(e.payload);
+                    return err;
+                };
+                try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
             }
-            const e = self.popOrdinary() orelse break;
-            self.emits_total += 1;
-            self.sink_origin_emits += 1;
-            self.recordEmitKind(.ordinary_control);
-            self.emitted_controls_since_data += 1;
-            self.ctrl.noteControl();
-            self.noteHeadersOut(e.payload) catch |err| {
-                self.freePayload(e.payload);
-                return err;
-            };
-            try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
+            if (self.terminal_len > 0 and !self.block_open and !self.isControlPaused()) continue;
+            break;
         }
         if (comptime wire_ring.enabled) self.diag_path = .tail;
         while (true) {
-            if (self.isPaused()) return;
+            if (self.block_open or self.isPaused()) return;
             if (!try self.emitOneData(sink_ctx, sink, win_ctx, stream_win, conn_win, build_data_frame, build_ctx)) break;
         }
     }
@@ -1099,7 +1141,7 @@ pub const FairScheduler = struct {
         build_data_frame: BuildDataFrame,
         build_ctx: *anyopaque,
     ) anyerror!bool {
-        if (conn_win(win_ctx) <= 0) return false;
+        if (self.block_open or conn_win(win_ctx) <= 0) return false;
 
         if (self.framed_len > 0) {
             const head = self.framed_data_q[self.framed_head];
@@ -1642,6 +1684,154 @@ test "DATA never leaves before its stream's HEADERS when the stash frees between
     try std.testing.expectEqual(@as(u31, 7), w.events.items[0].sid);
     try std.testing.expect(!w.events.items[1].headers);
     try std.testing.expectEqual(@as(u31, 7), w.events.items[1].sid);
+}
+
+/// Records every frame `drain` emits as (type, stream, END_HEADERS).
+const FrameWire = struct {
+    gpa: std.mem.Allocator,
+    seen: std.ArrayList(Seen) = .empty,
+    /// `pause_control` answers true for this many calls after `pause_after`
+    /// calls, then false.
+    ctrl_calls: usize = 0,
+    pause_after: usize = 0,
+    pause_for: usize = 0,
+
+    const Seen = struct { typ: u8, sid: u31, end_headers: bool };
+
+    fn streamWin(_: *anyopaque, _: u31) i32 {
+        return 1 << 30;
+    }
+    fn connWin(_: *anyopaque) i32 {
+        return 1 << 30;
+    }
+    fn build(ctx: *anyopaque, sid: u31, bytes: []const u8, _: bool) anyerror![]u8 {
+        const t: *FrameWire = @ptrCast(@alignCast(ctx));
+        var f = try t.gpa.alloc(u8, frame.FRAME_HEADER_LEN + bytes.len);
+        @memset(f[0..frame.FRAME_HEADER_LEN], 0);
+        f[3] = @backingInt(frame.FrameType.data);
+        std.mem.writeInt(u32, f[5..9], sid, .big);
+        @memcpy(f[frame.FRAME_HEADER_LEN..], bytes);
+        return f;
+    }
+    fn sink(ctx: *anyopaque, payload: []u8, _: bool, _: u64, _: u32, _: usize, _: bool) anyerror!void {
+        const t: *FrameWire = @ptrCast(@alignCast(ctx));
+        defer t.gpa.free(payload);
+        try t.seen.append(t.gpa, .{
+            .typ = payload[3],
+            .sid = @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff),
+            .end_headers = payload[4] & 0x4 != 0,
+        });
+    }
+    fn ctrlPaused(ctx: *anyopaque) bool {
+        const t: *FrameWire = @ptrCast(@alignCast(ctx));
+        t.ctrl_calls += 1;
+        return t.ctrl_calls > t.pause_after and t.ctrl_calls <= t.pause_after + t.pause_for;
+    }
+    fn neverPaused(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+fn blockFrame(gpa: std.mem.Allocator, typ: frame.FrameType, sid: u31, end_headers: bool) ![]u8 {
+    var h = [_]u8{ 0, 0, 1, @backingInt(typ), if (end_headers) 0x4 else 0, 0, 0, 0, 0, 0x88 };
+    std.mem.writeInt(u32, h[5..9], sid, .big);
+    return gpa.dupe(u8, &h);
+}
+
+fn rstFrame(gpa: std.mem.Allocator, sid: u31) ![]u8 {
+    var h = [_]u8{ 0, 0, 4, @backingInt(frame.FrameType.rst_stream), 0, 0, 0, 0, 0, 0, 0, 0, 8 };
+    std.mem.writeInt(u32, h[5..9], sid, .big);
+    return gpa.dupe(u8, &h);
+}
+
+test "nothing leaves inside a header block: a terminal control, forced DATA and fresh DATA wait for its last fragment" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: FrameWire = .{ .gpa = gpa };
+    defer w.seen.deinit(gpa);
+    sched.pause = FrameWire.neverPaused;
+    sched.pause_control = FrameWire.ctrlPaused;
+    sched.pause_ctx = &w;
+
+    // Stream 9 has its HEADERS out and a body waiting: DATA is eligible the
+    // whole time. Stream 7's block is HEADERS, CONTINUATION, CONTINUATION.
+    try sched.enqueueControl(try blockFrame(gpa, .headers, 9, true), .ordinary, 0, 0);
+    try sched.drain(&w, FrameWire.sink, &w, FrameWire.streamWin, FrameWire.connWin, FrameWire.build, &w);
+    w.seen.clearRetainingCapacity();
+    const bulk: [4 * DATA_QUANTUM]u8 = @splat('b');
+    try sched.enqueueDataBytes(9, &bulk, true, 0, 0);
+    try sched.enqueueControl(try blockFrame(gpa, .headers, 7, false), .ordinary, 0, 0);
+    try sched.enqueueControl(try blockFrame(gpa, .continuation, 7, false), .ordinary, 0, 0);
+    try sched.enqueueControl(try blockFrame(gpa, .continuation, 7, true), .ordinary, 0, 0);
+
+    // The control loop's pause check is call 1 for the HEADERS pop, 2 for the
+    // first CONTINUATION: pause there, and again at the second, so the drain
+    // stops twice inside the block, and a terminal control arrives meanwhile.
+    w.ctrl_calls = 0;
+    w.pause_after = 1;
+    w.pause_for = 1;
+    try sched.drain(&w, FrameWire.sink, &w, FrameWire.streamWin, FrameWire.connWin, FrameWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 1), w.seen.items.len);
+    try std.testing.expectEqual(@backingInt(frame.FrameType.headers), w.seen.items[0].typ);
+    try std.testing.expect(sched.block_open);
+    try sched.enqueueControl(try rstFrame(gpa, 5), .terminal, 0, 0);
+
+    // The next drain finishes the block before anything else, then the
+    // terminal control, then DATA.
+    w.pause_for = 0;
+    try sched.drain(&w, FrameWire.sink, &w, FrameWire.streamWin, FrameWire.connWin, FrameWire.build, &w);
+    try std.testing.expect(!sched.block_open);
+    const typs = w.seen.items;
+    try std.testing.expectEqual(@backingInt(frame.FrameType.continuation), typs[1].typ);
+    try std.testing.expectEqual(@backingInt(frame.FrameType.continuation), typs[2].typ);
+    try std.testing.expect(typs[2].end_headers);
+    try std.testing.expectEqual(@backingInt(frame.FrameType.rst_stream), typs[3].typ);
+    try std.testing.expectEqual(@backingInt(frame.FrameType.data), typs[4].typ);
+    for (typs[0..3]) |t| try std.testing.expectEqual(@as(u31, 7), t.sid);
+    try std.testing.expect(sched.terminal_len == 0);
+}
+
+test "a stream reset drops the queued fragments of its header block with its HEADERS, and keeps a block already started" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    defer sched.deinit();
+    var w: FrameWire = .{ .gpa = gpa };
+    defer w.seen.deinit(gpa);
+    sched.pause = FrameWire.neverPaused;
+    sched.pause_control = FrameWire.neverPaused;
+    sched.pause_ctx = &w;
+
+    try sched.enqueueControl(try blockFrame(gpa, .headers, 7, false), .ordinary, 0, 0);
+    try sched.enqueueControl(try blockFrame(gpa, .continuation, 7, true), .ordinary, 0, 0);
+    try sched.enqueueControl(try blockFrame(gpa, .headers, 9, true), .ordinary, 0, 0);
+    const held_before = sched.ctrl.entries_held.load(.acquire);
+    sched.forgetStream(7);
+    try std.testing.expectEqual(held_before - 2, sched.ctrl.entries_held.load(.acquire));
+    try sched.drain(&w, FrameWire.sink, &w, FrameWire.streamWin, FrameWire.connWin, FrameWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 1), w.seen.items.len);
+    try std.testing.expectEqual(@as(u31, 9), w.seen.items[0].sid);
+
+    // HEADERS already out: the CONTINUATION behind it is the peer's due.
+    w.seen.clearRetainingCapacity();
+    w.ctrl_calls = 0;
+    w.pause_after = 1;
+    w.pause_for = 1;
+    sched.pause_control = FrameWire.ctrlPaused;
+    try sched.enqueueControl(try blockFrame(gpa, .headers, 11, false), .ordinary, 0, 0);
+    try sched.enqueueControl(try blockFrame(gpa, .continuation, 11, true), .ordinary, 0, 0);
+    try sched.drain(&w, FrameWire.sink, &w, FrameWire.streamWin, FrameWire.connWin, FrameWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 1), w.seen.items.len);
+    sched.forgetStream(11);
+    sched.pause_control = FrameWire.neverPaused;
+    try sched.drain(&w, FrameWire.sink, &w, FrameWire.streamWin, FrameWire.connWin, FrameWire.build, &w);
+    try std.testing.expectEqual(@as(usize, 2), w.seen.items.len);
+    try std.testing.expectEqual(@backingInt(frame.FrameType.continuation), w.seen.items[1].typ);
+    try std.testing.expect(!sched.block_open);
 }
 
 fn orderHeaders(gpa: std.mem.Allocator, sid: u31, end_stream: bool) ![]u8 {

@@ -39,32 +39,57 @@ pub fn lastRecordFlush(is_last: bool, flush: bool) bool {
     return is_last and flush;
 }
 
-/// Unticketed DATA keeps the immediate per-frame handoff when the scratch is
-/// empty. A single frame larger than the scratch cannot join and is also
-/// immediate. Control frames and ticketed DATA concat into one queueWire, on
-/// h2c and TLS alike.
+/// A frame small enough that at least two fit one scratch. Its own chunk would
+/// carry little (a 4 KiB response body is a quarter of a 16 KiB chunk) and the
+/// chunk is the unit the pool, the write queue and the ack channel count, so
+/// such a frame is packed with its neighbours. A bigger frame keeps its own
+/// chunk and is handed over without a copy (a full 16 KiB DATA frame is the
+/// case that exists for).
+pub fn packsWithNeighbours(payload_len: usize, capacity: usize) bool {
+    if (comptime observe) {
+        if (!test_pack_small_data.load(.acquire)) return false;
+    }
+    return payload_len <= capacity / 2;
+}
+
+const observe = @import("build_options").observe;
+
+/// Test-only (observe builds): false puts back one chunk per unticketed DATA
+/// frame, for a gate whose subject needs one completion per frame to fill the
+/// write-ack channel (`tests/ack_channel.zig`). Packing makes a chunk of four
+/// responses, which is the point of it and the opposite of what that gate needs.
+pub var test_pack_small_data: std.atomic.Value(bool) = .init(true);
+
+/// Control frames, ticketed DATA, and DATA small enough to pack
+/// (`packsWithNeighbours`) concat into one queueWire, on h2c and TLS alike.
+/// A DATA frame too big to pack, or larger than the scratch, is an immediate
+/// handoff of its own.
+///
+/// Packing unticketed DATA defers its write to the end of the drain turn that
+/// popped it, when the scratch is handed to the pump; nothing waits longer.
 pub fn frameIsBatchable(
     control_entry: bool,
     ticket: u64,
     payload_len: usize,
     capacity: usize,
 ) bool {
-    return (control_entry or ticket != 0) and payload_len <= capacity;
+    return (control_entry or ticket != 0 or packsWithNeighbours(payload_len, capacity)) and payload_len <= capacity;
 }
 
 /// Whether this frame joins the drain-turn already in `batch_len`.
 ///
-/// `frameIsBatchable` is the empty-scratch rule: unticketed DATA does not
-/// *start* a batch, so an SSE body write without a wait stays an immediate
-/// handoff. Complete oneshots skip a per-response ticket; their DATA would
-/// miss the packed write under that rule. `hold_unticketed` is the drain-turn
-/// receipt: those DATA join, including as the first byte of a new scratch
+/// `hold_unticketed` is the drain-turn receipt: unticketed DATA of any size
+/// that fits the scratch joins, including as the first byte of a new scratch
 /// after a 16 KiB overflow, so the receipt can ride the last `queueWire`.
+/// Without a receipt, unticketed DATA joins when it is small enough to pack
+/// (`packsWithNeighbours`), the same rule as `frameIsBatchable`.
 ///
-/// Do not join unticketed DATA merely because the scratch is non-empty.
-/// SSE `writeAll` puts the receipt on a trailing empty DATA after an
-/// unticketed body; joining that body onto someone else's HEADERS was a
-/// shutdown hang (lifecycle 100-stream SSE).
+/// Do not join a LARGE unticketed DATA merely because the scratch is
+/// non-empty. SSE `writeAll` puts the receipt on a trailing empty DATA after
+/// an unticketed body; joining that body onto someone else's HEADERS was a
+/// shutdown hang (lifecycle 100-stream SSE). That hang was a Connection-owned
+/// receipt, not packing as such, and the lifecycle gates run with small
+/// frames packed.
 pub fn frameJoinsInProgress(
     control_entry: bool,
     ticket: u64,
@@ -76,7 +101,7 @@ pub fn frameJoinsInProgress(
     _ = batch_len;
     if (payload_len > capacity) return false;
     if (control_entry or ticket != 0) return true;
-    return hold_unticketed;
+    return hold_unticketed or packsWithNeighbours(payload_len, capacity);
 }
 
 pub const EmitBatch = struct {
@@ -123,7 +148,20 @@ pub const EmitBatch = struct {
     ) void {
         std.debug.assert(self.wouldFit(payload.len));
         @memcpy(self.buf[self.len..][0..payload.len], payload);
-        self.len += payload.len;
+        self.adopt(payload.len, flush, control_n, control_entry);
+    }
+
+    /// The next free bytes of the scratch, for a frame that is built there
+    /// instead of copied in (`adopt` then takes it). Null when `n` does not fit.
+    pub fn tail(self: *EmitBatch, n: usize) ?[]u8 {
+        if (!self.wouldFit(n)) return null;
+        return self.buf[self.len..][0..n];
+    }
+
+    /// `copyFrame` for a frame already in the scratch at `len`: count it.
+    pub fn adopt(self: *EmitBatch, payload_len: usize, flush: bool, control_n: usize, control_entry: bool) void {
+        std.debug.assert(self.wouldFit(payload_len));
+        self.len += payload_len;
         self.needs_flush = self.needs_flush or flush;
         if (control_entry) {
             self.control_n += control_n;
@@ -170,23 +208,33 @@ pub const EmitBatch = struct {
     }
 };
 
-test "unticketed DATA is not batchable" {
-    try std.testing.expect(!frameIsBatchable(false, 0, 40, max_plaintext));
+test "small unticketed DATA is batchable, big unticketed DATA is not" {
+    // Small: packed with its neighbours.
+    try std.testing.expect(frameIsBatchable(false, 0, 40, max_plaintext));
+    try std.testing.expect(frameIsBatchable(false, 0, max_plaintext / 2, max_plaintext));
+    // Over half a scratch: it keeps its own chunk and the zero-copy handoff.
+    try std.testing.expect(!frameIsBatchable(false, 0, max_plaintext / 2 + 1, max_plaintext));
+    try std.testing.expect(!frameIsBatchable(false, 0, max_plaintext + 9, max_plaintext));
     try std.testing.expect(frameIsBatchable(true, 0, 40, max_plaintext));
     try std.testing.expect(frameIsBatchable(true, 1, 40, max_plaintext));
     try std.testing.expect(frameIsBatchable(false, 7, 40, max_plaintext));
     try std.testing.expect(!frameIsBatchable(true, 0, 50, 40));
+    // Two always fit.
+    try std.testing.expect(2 * max_plaintext / 2 <= max_plaintext);
 }
 
 test "unticketed DATA joins a drain-turn already in progress" {
-    // Empty scratch, no drain-turn receipt: SSE/body writes without a wait
-    // stay immediate. A non-empty scratch without a receipt is the same —
-    // joining here hung lifecycle SSE shutdown.
-    try std.testing.expect(!frameJoinsInProgress(false, 0, 40, max_plaintext, 0, false));
-    try std.testing.expect(!frameJoinsInProgress(false, 0, 40, max_plaintext, 10, false));
+    // Small DATA packs with or without a receipt; big DATA joins only under a
+    // live drain-turn receipt, so an SSE body write of a big frame stays an
+    // immediate handoff (joining it hung lifecycle SSE shutdown).
+    try std.testing.expect(frameJoinsInProgress(false, 0, 40, max_plaintext, 0, false));
+    try std.testing.expect(frameJoinsInProgress(false, 0, 40, max_plaintext, 10, false));
+    const big = max_plaintext / 2 + 1;
+    try std.testing.expect(!frameJoinsInProgress(false, 0, big, max_plaintext, 0, false));
+    try std.testing.expect(!frameJoinsInProgress(false, 0, big, max_plaintext, 10, false));
     // Drain-turn receipt: oneshot DATA joins, including after overflow.
-    try std.testing.expect(frameJoinsInProgress(false, 0, 40, max_plaintext, 0, true));
-    try std.testing.expect(frameJoinsInProgress(false, 0, 40, max_plaintext, 10, true));
+    try std.testing.expect(frameJoinsInProgress(false, 0, big, max_plaintext, 0, true));
+    try std.testing.expect(frameJoinsInProgress(false, 0, big, max_plaintext, 10, true));
     try std.testing.expect(frameJoinsInProgress(true, 0, 40, max_plaintext, 0, false));
     try std.testing.expect(frameJoinsInProgress(false, 7, 40, max_plaintext, 0, false));
     try std.testing.expect(!frameJoinsInProgress(false, 0, 50, 40, 10, true));

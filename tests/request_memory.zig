@@ -193,7 +193,7 @@ const Client = struct {
 
     fn open(gpa: std.mem.Allocator, port: u16) !Client {
         const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
-        var self: Client = .{ .gpa = gpa, .stream = try peer.connect(.{}), .dec = hpack.Decoder.init(gpa) };
+        var self: Client = .{ .gpa = gpa, .stream = try peer.connect(.{}), .dec = try hpack.Decoder.init(gpa) };
         errdefer self.deinit();
         var preface = try h2c.buildClientPrefaceAndSettings(gpa);
         defer preface.deinit(gpa);

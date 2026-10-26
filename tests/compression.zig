@@ -140,7 +140,7 @@ const Capture = struct {
                         if (hdr.flags.end_stream) self.end_stream = true;
                     },
                     .headers => {
-                        var dec = hpack.Decoder.init(self.gpa);
+                        var dec = try hpack.Decoder.init(self.gpa);
                         defer dec.deinit();
                         const result = try dec.decode(r.event.payload.bytes(), 100, 64 * 1024, 256, 8 * 1024);
                         defer dec.freeResult(result);

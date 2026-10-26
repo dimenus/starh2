@@ -105,6 +105,7 @@ const zio = @import("zio");
 const session_mod = @import("../core/session.zig");
 const hpack = @import("../core/hpack.zig");
 const limits_mod = @import("../core/limits.zig");
+const wire_const = @import("../core/wire_const.zig");
 const boot_plan = @import("../core/boot_plan.zig");
 const conn_slot = @import("conn_slot.zig");
 const frame = @import("../core/frame.zig");
@@ -256,6 +257,12 @@ pub var test_ack_room_pauses: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): handler flush barriers that parked for
 /// `write_ack_ch` room (`waitForAckRoom`).
 pub var test_ack_room_waits: std.atomic.Value(usize) = .init(0);
+/// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
+/// test what every other build does there.
+pub var test_allow_full_queue_push: std.atomic.Value(bool) = .init(false);
+/// Test-only (observe builds): h2c pushes refused because the write queue was
+/// full. Zero in a correct build (`pushWriteChunk`).
+pub var test_queue_push_refusals: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): pushes `pushWriteChunk` refused because the
 /// channel had no room, each one a connection failed closed. Zero in a
 /// correct build.
@@ -333,9 +340,9 @@ pub var test_run_canceled: std.atomic.Value(usize) = .init(0);
 /// parked elsewhere (the main-loop drain, a select) reaches `run` without
 /// moving this one.
 pub var test_inline_drain_canceled: std.atomic.Value(usize) = .init(0);
-/// Counts the pops an ending h2c connection held back because the write queue
-/// had no room (see `h2cPause`). A test that expects the hold-back
-/// proves it ran; removing the hooks leaves the other tests green.
+/// Counts the pops an ending h2c connection held back because the write pool
+/// or the write queue had no room (see `h2cPauseFor`). A test that expects the
+/// hold-back proves it ran; removing the hooks leaves the other tests green.
 pub var test_closing_emit_deferred: std.atomic.Value(usize) = .init(0);
 /// Test-only: true while FairScheduler sink is executing queueWire.
 threadlocal var test_in_sched_sink: bool = false;
@@ -647,16 +654,51 @@ fn tlsNetHandle(h: std.Io.net.Socket.Handle) zio.ev.Backend.NetHandle {
 /// One event in `trace_sample_every` is measured for the latency intervals, so
 /// that instrument cannot become the load. Batch counters are per-handoff, not
 /// per-request, and stay off on the official bench path.
-/// Outbound buffers that missed their pool and came from the GPA, server-wide.
-/// Always counted: each one is already a GPA call, so one more atomic add is
-/// noise. A benchmark reads these to tell which pool its allocator churn
-/// comes from.
-pub const gpa_fallbacks = struct {
-    /// `rentFrame` returned null: the frame was larger than a frame slab, or
-    /// the frame pool was empty.
-    pub var frame: std.atomic.Value(u64) = .init(0);
-    /// `leaseWriteChunk` found the write pool empty, or the chunk too large.
-    pub var write_chunk: std.atomic.Value(u64) = .init(0);
+/// Outbound frame and write-chunk memory, server-wide. Every counter is one
+/// relaxed atomic add. The refusals are the events that were a general-allocator
+/// call before stage 3 (the frame and chunk fallbacks), so they must stay 0 in
+/// a steady state; the work counters beside them must be positive in the same
+/// run, or a zero proves nothing. `/mem` on the bench server prints them.
+pub const outbound_memory = struct {
+    /// Frames `rentFrame` served, and which pool each came from.
+    pub var frames_built: std.atomic.Value(u64) = .init(0);
+    pub var frames_from_slab: std.atomic.Value(u64) = .init(0);
+    pub var frames_from_chunk: std.atomic.Value(u64) = .init(0);
+    /// ... or written straight into the drain-turn scratch (small DATA).
+    pub var frames_in_scratch: std.atomic.Value(u64) = .init(0);
+    /// Write chunks `leaseWriteChunk` handed to a batch flush or a copied frame.
+    pub var chunks_leased: std.atomic.Value(u64) = .init(0);
+    /// Write chunks handed to the pump, leased ones and owned frames alike,
+    /// counted after the push succeeded. Wire frames per chunk is the packing
+    /// measure; `chunks_leased` alone misses a frame that was built in a chunk
+    /// and sent as it is. Counted only when `test_observe` is on (debug builds
+    /// and `-Dobserve=true`): a release build adds nothing to the handoff, and
+    /// the bench `/mem` shows 0 unless it was built with `-Dobserve=true`.
+    pub var chunks_to_pump: std.atomic.Value(u64) = .init(0);
+    /// `rentFrame` found neither a slab nor a chunk it may take: the frame is
+    /// refused (`OutOfMemory` to the session).
+    pub var frames_refused: std.atomic.Value(u64) = .init(0);
+    /// `leaseWriteChunk` found the write pool empty. The drain checks room
+    /// before every pop, so this is a broken bound, not a load result.
+    pub var chunks_refused: std.atomic.Value(u64) = .init(0);
+    /// `drainEmit` turns, and the pops the scheduler declined for lack of
+    /// write-pool room (the drain resumes when a chunk comes back).
+    pub var drain_turns: std.atomic.Value(u64) = .init(0);
+    pub var drain_memory_pauses: std.atomic.Value(u64) = .init(0);
+};
+
+/// Work counters for the rest of the HTTP/2 path (stage 3 part 4), beside
+/// `outbound_memory`: a zero count of general-allocator calls means nothing in
+/// a run that did none of this work. Server-wide, relaxed; the bench server's
+/// `/mem` prints them.
+pub const h2_work = struct {
+    /// TLS connections that started with plaintext already read during the
+    /// handshake (a pipelined preface), ingested from the handshake task's own
+    /// stack with no copy.
+    pub var tls_leftovers: std.atomic.Value(u64) = .init(0);
+    /// Response header lists prepared (`prepareResponseHeaderFields`,
+    /// `appendResponseHeaders`), in the request's arena or on the stack.
+    pub var response_header_lists: std.atomic.Value(u64) = .init(0);
 };
 
 pub const trace = struct {
@@ -1111,6 +1153,10 @@ const HandlerCtx = struct {
     slot: *HandlerSlot,
     stream_id: u31,
     method: request.Method = .GET,
+    /// The request's arena: where a response's header list is built. It is
+    /// the handler's own allocator, used only on the handler's task (or on the
+    /// actor for a complete handler), never both at once.
+    arena: std.mem.Allocator,
     /// Combined Accept-Encoding field value (arena-owned), empty if absent.
     accept_encoding: []const u8 = "",
     encoder: ?*brotli.Encoder = null,
@@ -1530,7 +1576,10 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig, slot: *conn_
             if (testTakeDirtyTicket()) conn.dirtyOnPurpose(test_dirty_kind);
         }
     }
-    conn.finishBoot();
+    conn.finishBoot() catch |err| {
+        if (close_probe) diagRawPrint("t1002 finish_boot_fail {s}\n", .{@errorName(err)});
+        return;
+    };
     test_boot_ready.store(true, .release);
     conn.run() catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -1631,8 +1680,9 @@ pub const Connection = struct {
     /// touched. Written only while the mutex is held, so it needs no atomic.
     ///
     /// It proves SOMEBODY holds the mutex, not that this task does. A thread id
-    /// would be wrong: zio migrates tasks, and a holder can park inside the
-    /// critical section (`sendAccountedWire` can block on `write_ch.putOne`).
+    /// would be wrong: zio migrates tasks, and a holder can resume on another
+    /// thread inside the critical section (a push that must wait releases the
+    /// lock first: `waitForStreamSpace`, `waitForAckRoom`).
     /// That is still enough to catch the class it exists for — a call made with
     /// the mutex not held at all — which is exactly how the two sites in t-731
     /// read Session and scheduler state unsynchronized.
@@ -1667,6 +1717,14 @@ pub const Connection = struct {
     /// Set the first time a drain finds the h2c connection ending; then
     /// `h2cPause` also keeps the drain from parking on a full write queue.
     h2c_ending: bool = false,
+    /// h2c: the write queue is being emptied of its meaning. Set, before
+    /// anything else, by the two places that put something in or take
+    /// something out of the queue behind the ledger's back: the teardown's
+    /// sentinel (`stopWritePump`), which is not counted in `acks.owed`, and
+    /// `closeWriterQueues`. While it is set `h2cQueueRoom` reads the exact
+    /// length instead of trusting `owed`, and a full push is an ending
+    /// connection's, not a failed gate. Never cleared.
+    write_queue_ending: std.atomic.Value(bool) = .init(false),
     ticket_slots: []ticket_table.TicketWait = &.{},
     tickets: ticket_table.TicketTable = undefined,
     /// Indexed parallel to handlers; only valid while slot.in_use.
@@ -1744,6 +1802,17 @@ pub const Connection = struct {
     /// it spawns read it without a race. Only `notePlacement` reads it.
     actor_thread: std.Thread.Id = 0,
     frame_pool: slab_pool.SlabPool = undefined,
+    /// Slabs of `frame_pool` that only terminal frames may take. Set in `init`.
+    frame_slab_reserve: usize = 0,
+    /// True while the scheduler's `buildData` callback makes a DATA frame, the
+    /// one frame built inside a pop. See `rentFrame`. Written and read under
+    /// `session_mu`.
+    building_pop_frame: bool = false,
+    /// The drain-turn scratch while a drain runs (set by `drainEmit` and
+    /// `drainEmitReceipt`, under `session_mu`), so a small DATA frame built
+    /// inside a pop is written where it will be sent (`rentFrame`) instead of
+    /// into a pool chunk and copied. Null outside a drain.
+    pack_scratch: ?*emit_batch.EmitBatch = null,
     /// Bytes `sendAccountedWire` copied into a write chunk. A frame that
     /// already sits in one is handed over instead, so a test reads this to
     /// prove the handover happened. Written under `session_mu`.
@@ -1827,7 +1896,7 @@ pub const Connection = struct {
         try plan.array(RequestLease, leases_n);
         try plan.array(u32, try LeaseIndex.slotCount(leases_n)); // lease_index.slots
         try plan.array(u32, leases_n); // lease_index.free
-        try plan.array(u8, try limits.hpackDecodeBytes()); // hpack_scratch
+        try plan.array(u8, try limits.hpackScratchBytes()); // hpack_scratch
         try plan.array(session_mod.DispatchRequest, max_streams); // parked
         try plan.array(?zio.JoinHandle(void), max_streams);
         try plan.array(u31, max_streams); // completion_ch_buf
@@ -1861,13 +1930,13 @@ pub const Connection = struct {
         // `Server.init` checks this at boot; a connection built any other way
         // gets the same answer, not a queue its drain can overrun.
         if (config.mode == .h2c) try config.limits.checkH2cWriteQueue();
+        try config.limits.checkFramePool();
         if (config.request_pool == null) return error.RequestPoolMissing;
-        var session = try session_mod.Session.init(boot, config.gpa, config.limits);
+        var session = try session_mod.Session.initBare(boot, config.gpa, config.limits);
         errdefer {
-            // Hooks are installed below with `ctx` still unset. Session.init
-            // already queued the preface SETTINGS; deinit must gpa-free that
-            // frame rather than calling `releaseFrame` through a dangling ctx
-            // (FailingAllocator walks this path).
+            // Hooks are installed below with `ctx` still unset, and no frame
+            // exists yet (the preface is queued by `finishBoot`), so deinit has
+            // nothing to give back through `releaseFrame`.
             session.stream_hooks = null;
             session.deinit();
         }
@@ -1914,9 +1983,9 @@ pub const Connection = struct {
                 }
             }.f,
             .rentFrame = struct {
-                fn f(ctx: *anyopaque, n: usize) ?[]u8 {
+                fn f(ctx: *anyopaque, n: usize, class: session_mod.FrameClass) ?[]u8 {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
-                    return c.rentFrame(n);
+                    return c.rentFrame(n, class);
                 }
             }.f,
             .releaseFrame = struct {
@@ -1951,7 +2020,7 @@ pub const Connection = struct {
         errdefer boot.free(lease_slots);
         const lease_free = try boot.alloc(u32, request_leases.len);
         errdefer boot.free(lease_free);
-        const hpack_scratch = try boot.alloc(u8, try config.limits.hpackDecodeBytes());
+        const hpack_scratch = try boot.alloc(u8, try config.limits.hpackScratchBytes());
         errdefer boot.free(hpack_scratch);
         const parked = try boot.alloc(session_mod.DispatchRequest, config.limits.max_streams_per_connection);
         errdefer boot.free(parked);
@@ -2043,6 +2112,7 @@ pub const Connection = struct {
             .tls_read_buf = tls_read_buf,
             .tls_write_buf = tls_write_buf,
             .frame_pool = frame_pool,
+            .frame_slab_reserve = config.limits.frameSlabReserve(),
             .read_pool_n = n_chunks,
             .sid_scratch = sid_scratch,
             .inline_sids = inline_sids,
@@ -2064,7 +2134,14 @@ pub const Connection = struct {
 
     /// Hook wiring and free-list seed that `serveAccepted` and `BenchHop.open`
     /// both need after `init`. Channels only have their final address here.
-    fn finishBoot(self: *Connection) void {
+    ///
+    /// The server preface is queued here, not in `Session.initBare`, because
+    /// its frames come from this connection's frame pool and so need the hooks
+    /// that were just bound. Nothing else is queued before it, which keeps the
+    /// SETTINGS first on the wire (RFC 9113 section 3.4). It fails only if a
+    /// limit leaves the connection without a slab or a chunk for two small
+    /// frames at birth, and then the connection is not served.
+    fn finishBoot(self: *Connection) !void {
         // The doorbell buffer is an inline field, so the channel must bind it
         // here, at the struct's final address (init returns by value).
         self.doorbell = .init(&self.doorbell_buf);
@@ -2098,6 +2175,7 @@ pub const Connection = struct {
                 unreachable;
             };
         }
+        try self.session.emitServerPreface();
     }
 
     /// Release everything, in an order that cannot double-free: `quiesce`,
@@ -3681,16 +3759,11 @@ pub const Connection = struct {
 
         defer {
             if (self.diag_registered) diagDeregister(self);
-            if (h2c_started) {
-                read_pump.stop();
-                write_pump.stop();
-            }
+            if (h2c_started) read_pump.stop();
             if (self.config.mode == .tls) {
                 self.tls_write_ch.close(.graceful);
             } else {
-                _ = self.write_ch.putUncancelable(io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
-                    // A closed writer queue already terminates the pump.
-                };
+                self.stopWritePump(if (h2c_started) &write_pump else null);
             }
             self.stream.shutdown(io, .both) catch {
                 // Shutdown is best-effort; task cancellation is the authoritative unblock.
@@ -3751,7 +3824,7 @@ pub const Connection = struct {
                 fn f(ctx: *anyopaque) bool {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     const p = c.tls_driver orelse return false;
-                    return p.pending_n > 0 or p.stashFull();
+                    return p.pending_n > 0 or p.stashFull() or c.outboundMemoryPaused();
                 }
             }.f;
             // Stash-full only. pending_n must not pause WINDOW_UPDATE (stall p99).
@@ -3759,7 +3832,7 @@ pub const Connection = struct {
                 fn f(ctx: *anyopaque) bool {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     const p = c.tls_driver orelse return false;
-                    return p.stashFull();
+                    return p.stashFull() or c.outboundMemoryPaused();
                 }
             }.f;
             self.sched.pause_ctx = self;
@@ -3813,6 +3886,7 @@ pub const Connection = struct {
             try self.flushSessionIntents();
             if (self.config.tls_leftover.len != 0) {
                 std.debug.assert(self.config.mode == .tls);
+                _ = h2_work.tls_leftovers.fetchAdd(1, .monotonic);
                 if (comptime test_observe) _ = test_tls_leftover_connections.fetchAdd(1, .acq_rel);
                 try self.session.ingest(self.config.tls_leftover);
                 try self.flushSessionIntents();
@@ -4215,10 +4289,10 @@ pub const Connection = struct {
     /// (`Limits.hpackDecodeBytes`) before this returns it, and the scratch
     /// is that size.
     fn borrowHeaderListMem(self: *Connection, stream_id: u31) session_mod.HeaderListMem {
-        const need = self.hpack_scratch.buffer.len;
+        const need = self.config.limits.hpackDecodeBytes() catch unreachable;
         if (self.findLease(stream_id)) |l| {
             if (l.arena.reserve(need)) |_| {
-                return .{ .request = l.arena.allocator() };
+                return self.requestMem(l);
             } else |_| {
                 return self.scratchMem((l.arena.refusal orelse request_pool.Reason.server_cap).status());
             }
@@ -4226,12 +4300,19 @@ pub const Connection = struct {
         if (test_no_request_lease.load(.acquire)) return self.scratchMem(503);
         const lease = self.newLease(stream_id) orelse return self.scratchMem(503);
         if (lease.arena.reserve(need)) |_| {
-            return .{ .request = lease.arena.allocator() };
+            return self.requestMem(lease);
         } else |_| {
             const status = (lease.arena.refusal orelse request_pool.Reason.server_cap).status();
             self.releaseLease(lease);
             return self.scratchMem(status);
         }
+    }
+
+    /// The request's arena for the decoded list, and the slot's scratch for the
+    /// decoder's transient room, emptied for this decode.
+    fn requestMem(self: *Connection, lease: *RequestLease) session_mod.HeaderListMem {
+        self.hpack_scratch.reset();
+        return .{ .request = .{ .alloc = lease.arena.allocator(), .scratch = self.hpack_scratch.allocator() } };
     }
 
     fn scratchMem(self: *Connection, status: u16) session_mod.HeaderListMem {
@@ -4413,17 +4494,35 @@ pub const Connection = struct {
         self.sweepHandlerWaitersLocked();
     }
 
-    /// Wake a handler parked on `write_ch.putOne` (or the TLS twin) before
-    /// this task waits for `session_mu`. Close is idempotent.
+    /// Close the write queue (and the TLS twin), so a push after this fails
+    /// instead of landing in a queue nobody drains, before this task waits for
+    /// `session_mu`. Close is idempotent.
     fn closeWriterQueues(self: *Connection) void {
         std.debug.assert(self.write_ch_buf.len != 0);
         if (self.config.mode != .tls) {
             std.debug.assert(self.tls_write_buf.len == 0);
         }
+        self.write_queue_ending.store(true, .seq_cst);
         self.write_ch.close(self.config.io);
         if (self.tls_write_buf.len != 0) {
             self.tls_write_ch.close(.graceful);
         }
+    }
+
+    /// Teardown's first word to the h2c writer: stop, and wake it if it is
+    /// parked on an empty queue. The sentinel is a chunk in the queue that no
+    /// push counted in `acks.owed`, so the order is the point: the ending
+    /// flag first (it makes `h2cQueueRoom` exact and a full push forgivable),
+    /// then the pump's stop flag, then the sentinel. A push that finds the
+    /// queue full after the sentinel went in therefore finds the flag set.
+    /// The sentinel is put without waiting; a full queue already has chunks
+    /// that wake the pump.
+    fn stopWritePump(self: *Connection, pump: ?*wire_pump.WritePump) void {
+        self.write_queue_ending.store(true, .seq_cst);
+        if (pump) |p| p.stop();
+        _ = self.write_ch.putUncancelable(self.config.io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
+            // A closed writer queue already terminates the pump.
+        };
     }
 
     /// Close write queues and mark the loop to sweep on the next existing
@@ -4480,12 +4579,9 @@ pub const Connection = struct {
         return true;
     }
 
-    /// The scheduler's pause hook for an ending h2c connection: stop before a
-    /// pop when the write queue lacks the room one pop is reserved. The
-    /// scheduler asks before EVERY pop, so a drain with many entries cannot
-    /// push past the room it checked, which a single check before `drain`
-    /// could not promise.
-    /// The h2c drain's pause hooks. A pop is held back, and stays in the
+    /// The h2c drain's pause hooks. The scheduler asks before EVERY pop, so a
+    /// drain with many entries cannot push past the room it checked, which a
+    /// single check before `drain` could not promise. A pop is held back, and stays in the
     /// scheduler for the next drain, when:
     /// - `write_ack_ch` has no room for what the pop and the drain's tail can
     ///   add (`h2cAckRoom`). DATA stops one pop's room earlier than controls
@@ -4500,8 +4596,25 @@ pub const Connection = struct {
     ///   the completion. The completion that frees room wakes the actor
     ///   (`waitForActivity` selects on the channel), and every actor turn
     ///   drains again, so a held pop is never stranded.
-    /// - the connection is ending and the write queue has no room
-    ///   (`h2cEndingHasRoom`), so the drain cannot park in `putOne`.
+    /// - the write queue has no room for the pop's pushes and the tail
+    ///   (`h2cQueueRoom`), so no push waits in `putOne`. This was only the
+    ///   ending connection's rule; it is every connection's now, because a
+    ///   bare flush barrier takes a queue slot and no pool chunk, so the
+    ///   pool alone no longer bounds the queue.
+    ///
+    /// Stage 3 adds the first condition below to this one rule: the write
+    /// pool has fewer than `POP_PUSHES` free chunks (`outboundMemoryPaused`).
+    /// The three conditions are tested in the order pool, ack channel, write
+    /// queue, and a pop is held if ANY holds. None can starve another: each
+    /// holds only until a write completion, and a completion frees all three.
+    /// The pump frees the chunk's queue slot when it takes the chunk and
+    /// releases the chunk to the pool before it posts the completion; the
+    /// actor frees the ack room when it takes the completion, and that same
+    /// completion wakes the actor. So a held pop is
+    /// retried after the resource that held it has been given back, and a
+    /// condition that holds while the others do not never needs them to move.
+    /// A frame made outside a pop leaves `POP_PUSHES` chunks free, so the pool
+    /// condition cannot hold with nothing in flight to release a chunk.
     fn h2cPause(ctx: *anyopaque) bool {
         const self: *Connection = @ptrCast(@alignCast(ctx));
         return self.h2cPauseFor(0);
@@ -4513,13 +4626,43 @@ pub const Connection = struct {
     }
 
     fn h2cPauseFor(self: *Connection, reserve: usize) bool {
+        if (self.outboundMemoryPaused()) {
+            if (comptime test_observe) {
+                if (self.h2c_ending) _ = test_closing_emit_deferred.fetchAdd(1, .monotonic);
+            }
+            return true;
+        }
         if (self.ack_room_armed and !self.h2cAckRoom(reserve)) {
             if (comptime test_observe) _ = test_ack_room_pauses.fetchAdd(1, .monotonic);
             return true;
         }
-        if (!self.h2c_ending or self.h2cEndingHasRoom()) return false;
-        if (comptime test_observe) _ = test_closing_emit_deferred.fetchAdd(1, .monotonic);
+        if (self.h2cQueueRoom(h2c_queue_room_per_pop)) return false;
+        if (comptime test_observe) {
+            if (self.h2c_ending) _ = test_closing_emit_deferred.fetchAdd(1, .monotonic);
+        }
         return true;
+    }
+
+    /// Queue slots one pop may fill: its pushes and the drain's tail push.
+    const h2c_queue_room_per_pop = tls_edge.Pump.pushes_per_pop + tls_edge.Pump.tail_pushes_per_drain;
+
+    /// True when the h2c write queue has `need` free slots. Every push is made
+    /// under `session_mu`, which the caller holds, and only the pump takes
+    /// from the queue, so a count that is enough stays enough until this task
+    /// pushes. That makes the push after a true answer unable to wait.
+    ///
+    /// A queued chunk is owed a completion (`AckLedger`), so the queue never
+    /// holds more than `owed`: when `owed + need` fits, the answer is yes
+    /// without taking the queue's lock. The exact count is read only near
+    /// the bound.
+    fn h2cQueueRoom(self: *Connection, need: usize) bool {
+        std.debug.assert(self.config.mode == .h2c);
+        const capacity = self.write_ch_buf.len;
+        // `owed` bounds the queue only while every entry is counted. The
+        // teardown sentinel is not, so once the queue is ending the count is
+        // read exactly (the flag is set before the sentinel goes in).
+        if (!self.write_queue_ending.load(.acquire) and self.acks.owed.load(.acquire) + need <= capacity) return true;
+        return capacity - io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) >= need;
     }
 
     /// True when `write_ack_ch` can take the completions of every push one
@@ -4535,20 +4678,6 @@ pub const Connection = struct {
     /// Completions one pop may still add while `h2cAckRoom` holds: the pop's
     /// pushes, the drain's tail push, and the pump's terminal posts.
     const ack_room_per_pop = tls_edge.Pump.pushes_per_pop + tls_edge.Pump.tail_pushes_per_drain + wire_pump.terminal_posts;
-
-    /// True when the h2c write queue can take what one pop pushes
-    /// (`Pump.pushes_per_pop` plus `Pump.tail_pushes_per_drain`, the bound TLS
-    /// also uses). TLS gets its room by adding stash slots; h2c does not, so
-    /// `Limits.checkH2cWriteQueue` rejects a smaller queue at boot and the
-    /// reservation always fits in it.
-    fn h2cEndingHasRoom(self: *Connection) bool {
-        std.debug.assert(self.config.mode == .h2c);
-        const capacity = self.write_ch_buf.len;
-        const needed = tls_edge.Pump.pushes_per_pop + tls_edge.Pump.tail_pushes_per_drain;
-        std.debug.assert(needed == limits_mod.H2C_MIN_WRITE_QUEUE_CHUNKS);
-        std.debug.assert(capacity >= needed);
-        return capacity - io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) >= needed;
-    }
 
     fn countInUseSlots(self: *const Connection) usize {
         std.debug.assert(self.handlers.capacity() != 0);
@@ -4871,12 +5000,19 @@ pub const Connection = struct {
         try self.processIntents();
     }
 
-    /// Block a handler until `write_ack_ch` has room for one more push, the
-    /// gate a drain's pop gets from `h2cPause`. A handler's bare flush
-    /// barrier (`sendFlushTicket` with nothing pending) is the one push made
-    /// outside a drain, so it waits here first. It parks the handler, not
-    /// the barrier: the handler then waits for the barrier's ticket anyway,
-    /// and a parked handler leaves nothing behind if its stream is reset.
+    /// Block a handler until `write_ack_ch` has room for one more push AND
+    /// the write queue has a free slot for it, the gates a drain's pop gets
+    /// from `h2cPause`. A handler's bare flush barrier (`sendFlushTicket`
+    /// with nothing pending) is the one push made outside a drain, so it
+    /// waits here first. It parks the handler, not the barrier: the handler
+    /// then waits for the barrier's ticket anyway, and a parked handler leaves
+    /// nothing behind if its stream is reset. A barrier takes a queue slot and
+    /// no pool chunk, so the queue can be full while the pool is not; without
+    /// the queue gate the push itself would wait, in `putOne`, holding
+    /// `session_mu`, and the actor could not run a deadline or a graceful
+    /// shutdown. After the gate the push cannot wait: every push is made under
+    /// `session_mu`, which the caller holds from the check to the push, and
+    /// only the pump takes from the queue (`h2cQueueRoom`).
     ///
     /// Caller holds `session_mu`; like `waitForStreamSpace`, this releases
     /// and reacquires it around the wait, on the same per-slot space event.
@@ -4896,6 +5032,15 @@ pub const Connection = struct {
     /// both may read the old values. The first room check, before W1, is an
     /// ordinary `acquire` read: it only decides whether to register.
     ///
+    /// The queue half of the gate has no seq_cst pair of its own. A slot frees
+    /// when the pump takes a chunk, which the actor does not see; but that
+    /// chunk's completion is posted after the take and received by the actor
+    /// after that, and the actor's R2 (and its room check) follow its
+    /// subtract. If R1 saw the queue full, then the take came after R1, and
+    /// the chain take, post, receive, W2, R2 passes through the queue's mutex
+    /// and the channel's, so W1 happens before R2 and R2 sees the waiter. The
+    /// actor's room check then reads the queue after the take.
+    ///
     /// The event is reset BEFORE W1, so a wake that lands after the reset
     /// leaves it set and the wait returns at once. A re-read that still finds
     /// no room parks with completions still owed; each later completion runs
@@ -4909,7 +5054,7 @@ pub const Connection = struct {
         while (true) {
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
-            if (self.h2cAckRoom(0)) return;
+            if (self.barrierRoom()) return;
             // The actor is the only receiver; a handler running on it would
             // wait for itself.
             if (hctx.runs_inline) return error.WriteFailed;
@@ -4918,7 +5063,7 @@ pub const Connection = struct {
             if (event) |e| e.reset();
             _ = self.ack_room_waiters.fetchAdd(1, .seq_cst); // W1
             defer _ = self.ack_room_waiters.fetchSub(1, .seq_cst);
-            if (self.acks.owed.load(.seq_cst) + ack_room_per_pop <= self.write_ack_buf.len) return; // R1
+            if (self.acks.owed.load(.seq_cst) + ack_room_per_pop <= self.write_ack_buf.len and self.h2cQueueRoom(1)) return; // R1
             self.unlockSession(self.config.io);
             const wait_res: anyerror!void = if (event) |e| blk: {
                 const winner = zio.select(.{
@@ -4943,8 +5088,14 @@ pub const Connection = struct {
     /// `waitForAckRoom`'s proof); this load is R2.
     fn wakeAckRoomWaiters(self: *Connection) void {
         if (self.ack_room_waiters.load(.seq_cst) == 0) return;
-        if (!self.h2cAckRoom(0)) return;
+        if (!self.barrierRoom()) return;
         self.wakeAllSpace();
+    }
+
+    /// Room for one bare flush barrier: its completion in `write_ack_ch`, and
+    /// its slot in the write queue.
+    fn barrierRoom(self: *Connection) bool {
+        return self.h2cAckRoom(0) and self.h2cQueueRoom(1);
     }
 
     /// Block a handler until its stream's pending slab is below `cap`.
@@ -5105,18 +5256,18 @@ pub const Connection = struct {
         if (comptime test_observe) {
             if (test_hold_emit.load(.acquire)) return;
         }
-        // A connection that is ending must not park in `pushWriteChunk`: it
-        // would wait in `putOne` for room, holding `session_mu`, and a writer
-        // that is not moving never makes room, so the closing deadline could
-        // not fire. TLS bounds its drain with pause hooks that re-check room
-        // before every pop. h2c's hook (`h2cPause`, installed when its pumps
-        // start) checks the write queue only from the moment it is ending, so
-        // its normal drain still parks on a full queue. The install here
-        // covers a connection whose pumps never started. The frames the hook
-        // holds back stay in the scheduler, and the closing phase drains again
-        // when a write completes. Terminal Session counts as ending here
-        // because the drain inside `ingestWireChunk` runs before the closing
-        // phase has begun.
+        // The drain does not wait for memory. Pause hooks re-check room before
+        // every pop: write-pool chunks on both transports
+        // (`outboundMemoryPaused`), the stash on TLS, and on h2c the ack
+        // channel (always) and the write queue (once the connection is
+        // ending: a push would wait in `putOne` holding `session_mu`, and a
+        // writer that is not moving never makes room, so the closing deadline
+        // could not fire). The install below covers a connection whose pumps
+        // never started. The frames the hooks hold back stay in the
+        // scheduler; a write completion wakes the actor and the next drain
+        // pops them. Terminal Session counts as ending here because the drain
+        // inside `ingestWireChunk` runs before the closing phase has begun.
+        _ = outbound_memory.drain_turns.fetchAdd(1, .monotonic);
         if (self.config.mode == .h2c and !self.h2c_ending and
             (self.closing_deadline_ns != null or self.session.terminal == .goaway))
         {
@@ -5221,9 +5372,17 @@ pub const Connection = struct {
                         }
                         batch.emit.noteTicket(ticket, ticket_slot);
                     }
-                    batch.emit.copyFrame(wire, flush, control_n, control_entry);
-                    c.releaseWireBytes(payload);
+                    if (c.payloadInScratch(payload)) {
+                        // Built here by `rentFrame`, at the end of what the scratch holds.
+                        std.debug.assert(payload.ptr == batch.emit.buf.ptr + batch.emit.len);
+                        batch.emit.adopt(wire.len, flush, control_n, control_entry);
+                    } else {
+                        batch.emit.copyFrame(wire, flush, control_n, control_entry);
+                        c.releaseWireBytes(payload);
+                    }
                 } else {
+                    // `rentFrame` hands out scratch only for a frame the rule above batches.
+                    std.debug.assert(!c.payloadInScratch(payload));
                     batch.flushBatch() catch |err| {
                         c.releaseWireBytes(payload);
                         return err;
@@ -5256,6 +5415,8 @@ pub const Connection = struct {
             }
             fn buildData(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool) anyerror![]u8 {
                 const c: *Connection = @ptrCast(@alignCast(ctx));
+                c.building_pop_frame = true;
+                defer c.building_pop_frame = false;
                 const data_payload = c.session.makeDataFrame(stream_id, bytes, end) catch |err| {
                     if (err == error.FlowBlocked) return error.FlowBlocked;
                     return err;
@@ -5271,6 +5432,8 @@ pub const Connection = struct {
             .emit = .{ .buf = self.plaintext_scratch },
         };
         self.rearmCredited();
+        self.pack_scratch = &sink_ctx.emit;
+        defer self.pack_scratch = null;
         self.sched.drain(
             &sink_ctx,
             SinkCtx.sink,
@@ -5423,9 +5586,17 @@ pub const Connection = struct {
                         }
                         batch.emit.noteTicket(ticket, ticket_slot);
                     }
-                    batch.emit.copyFrame(wire, flush, control_n, control_entry);
-                    c.releaseWireBytes(payload);
+                    if (c.payloadInScratch(payload)) {
+                        // Built here by `rentFrame`, at the end of what the scratch holds.
+                        std.debug.assert(payload.ptr == batch.emit.buf.ptr + batch.emit.len);
+                        batch.emit.adopt(wire.len, flush, control_n, control_entry);
+                    } else {
+                        batch.emit.copyFrame(wire, flush, control_n, control_entry);
+                        c.releaseWireBytes(payload);
+                    }
                 } else {
+                    // `rentFrame` hands out scratch only for a frame the rule above batches.
+                    std.debug.assert(!c.payloadInScratch(payload));
                     batch.flushBatch(false) catch |err| {
                         c.releaseWireBytes(payload);
                         return err;
@@ -5459,6 +5630,8 @@ pub const Connection = struct {
             }
             fn buildData(ctx: *anyopaque, stream_id: u31, bytes: []const u8, end: bool) anyerror![]u8 {
                 const c: *Connection = @ptrCast(@alignCast(ctx));
+                c.building_pop_frame = true;
+                defer c.building_pop_frame = false;
                 // Frame DATA without enqueueing into Session intents (no nested drain).
                 const data_payload = c.session.makeDataFrame(stream_id, bytes, end) catch |err| {
                     if (err == error.FlowBlocked) return error.FlowBlocked;
@@ -5479,6 +5652,8 @@ pub const Connection = struct {
         };
         defer attached.* = sink_ctx.receipt_attached;
         self.rearmCredited();
+        self.pack_scratch = &sink_ctx.emit;
+        defer self.pack_scratch = null;
         self.sched.drain(
             &sink_ctx,
             ReceiptSink.sink,
@@ -5607,6 +5782,9 @@ pub const Connection = struct {
         errdefer while (consumed < n) : (consumed += 1) {
             self.session.releaseIntent(&self.intent_batch[consumed]);
         };
+        // The last control queued was a HEADERS or CONTINUATION without
+        // END_HEADERS, so the next one is the rest of its block.
+        var block_queued_open = false;
         while (consumed < n) {
             const it = &self.intent_batch[consumed];
             // Every processing branch consumes its current intent, including
@@ -5640,6 +5818,7 @@ pub const Connection = struct {
                             self.next_wire_slot = 0;
                             self.next_wire_ticket = 0;
                         }
+                        const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
                         self.sched.enqueueControl(f.payload, class, t, s) catch |err| switch (err) {
                             error.PoolFull, error.QueueFull => {
                                 // Payload already freed by enqueueControl. Do not
@@ -5648,13 +5827,24 @@ pub const Connection = struct {
                                 if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
                                 self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
                                 consumed = n;
+                                // A fragment refused after its block began leaves
+                                // the peer waiting for it and the scheduler
+                                // holding the connection to that block
+                                // (`FairScheduler.block_open`): there is no way
+                                // to go on. The first fragment is an ordinary
+                                // per-stream refusal, and the rest of the batch,
+                                // its other fragments, is released above.
                                 if (class == .terminal) {
                                     self.noteServerClose("ctrl_terminal_full", err);
+                                    self.writer_failed.store(true, .release);
+                                } else if (block_queued_open) {
+                                    self.noteServerClose("ctrl_fragment_full", err);
                                     self.writer_failed.store(true, .release);
                                 }
                                 return error.OutOfMemory;
                             },
                         };
+                        block_queued_open = opens_block;
                     }
                 },
                 .dispatch_request => |d| try self.dispatch(d),
@@ -5786,28 +5976,27 @@ pub const Connection = struct {
             self.writer_failed.store(true, .release);
             return error.WriteFailed;
         }
-        if (self.writeGoingAway()) {
-            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
-                return;
-            }
-            // `shutdown` and `putOne` are cancellation points. zio delivers a
-            // cancel once, so `error.Canceled` leaves as itself; any other
-            // error keeps its meaning (a failed shutdown is best effort, a
-            // closed queue is a failed write).
-            self.stream.shutdown(self.config.io, .both) catch |err| {
-                if (err == error.Canceled) return error.Canceled;
-            };
-            if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
-                return;
-            }
-            return error.WriteFailed;
+        // The push never waits. `h2cPause` leaves room in the queue for every
+        // pop's pushes and the tail, and `waitForAckRoom` for a bare barrier,
+        // and both are decided under `session_mu`, which this push holds, with
+        // only the pump taking from the queue. So a full queue here is a gate
+        // that failed: it traps in a safe build, and in any build the
+        // connection fails closed instead of parking the task that holds
+        // `session_mu`. A closed queue (the connection is going away) is a
+        // failed write, as before.
+        if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) return;
+        // A put that fails with room left in the queue is a closed queue.
+        if (io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) < self.write_ch_buf.len) return error.WriteFailed;
+        // The teardown sentinel is uncounted, so a full queue after it is the
+        // connection ending, not a gate that failed: no trap, no refusal.
+        if (self.write_queue_ending.load(.seq_cst)) return error.WriteFailed;
+        if (comptime test_observe) _ = test_queue_push_refusals.fetchAdd(1, .monotonic);
+        if (std.debug.runtime_safety and !self.writeGoingAway() and !test_allow_full_queue_push.load(.acquire)) {
+            std.debug.panic("h2c write queue is full at a push: a pause hook or the barrier gate let it through", .{});
         }
-        self.actor_site.store(4, .release);
-        self.write_ch.putOne(self.config.io, chunk) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            error.Closed => return error.WriteFailed,
-        };
-        self.actor_site.store(1, .release);
+        self.noteServerClose("queue_full", null);
+        self.writer_failed.store(true, .release);
+        return error.WriteFailed;
     }
 
     /// A frame that fits a frame slab takes one. A larger frame (a full DATA
@@ -5816,23 +6005,97 @@ pub const Connection = struct {
     /// is, with no copy. Small frames stay in `frame_pool`: most of them are
     /// copied into the drain-turn batch, and a 16 KiB chunk for each would
     /// empty the write pool (`inbound_wire_chunks_per_connection` chunks).
-    /// A HEADERS block larger than a frame slab also takes a write chunk.
-    /// When the write pool is empty the frame comes from the GPA.
-    fn rentFrame(self: *Connection, n: usize) ?[]u8 {
-        if (n <= self.frame_pool.slab_bytes) {
-            if (self.frame_pool.tryRent(self.config.io)) |slab| return slab;
-        } else if (n <= limits_mod.WIRE_CHUNK_SIZE) {
-            if (self.write_pool.tryRentIndex(self.config.io)) |idx| return self.write_pool.slabAt(idx);
+    /// A HEADERS block larger than a frame slab also takes a write chunk, and
+    /// so does a small frame when every slab is rented.
+    ///
+    /// A frame made outside a scheduler pop (a handler's HEADERS, a control
+    /// frame answering ingest) may take a chunk only while more than
+    /// `POP_PUSHES` stay free. Those frames wait in the scheduler until they
+    /// are popped, and a pop needs `POP_PUSHES` free chunks
+    /// (`outboundMemoryPaused`): if waiting frames could hold every chunk, no
+    /// pop could ever run and nothing would give a chunk back. The DATA frame
+    /// built inside a pop (`building_pop_frame`) may take any chunk the pop's
+    /// room check already counted.
+    ///
+    /// A slab is lent to a non-terminal frame only while more than
+    /// `frame_slab_reserve` stay free. The reserve is the frame pool's twin of
+    /// `ControlPool`'s terminal reserve (16 entries): the control pool admits
+    /// at most that many terminal frames beyond the ordinary share, so slabs
+    /// that only they may take mean a GOAWAY or RST_STREAM is not refused for
+    /// the slabs HEADERS, acks and WINDOW_UPDATEs hold. More than the reserve
+    /// of terminal frames at once (a flood of resets in one read) is refused
+    /// here and by the control pool alike, and the connection is torn down
+    /// without a GOAWAY, which is what a refused terminal frame has always
+    /// meant.
+    ///
+    /// Null means refused. There is no general-allocator fallback: the pools
+    /// are the bound.
+    fn rentFrame(self: *Connection, n: usize, class: session_mod.FrameClass) ?[]u8 {
+        // A small frame built in a pop is written straight into the drain-turn
+        // scratch, past what it already holds: no pool memory, no copy. The
+        // sink then only counts it (`EmitBatch.adopt`). `packsWithNeighbours`
+        // is the sink's own rule for joining, so the frame joins.
+        if (self.building_pop_frame and emit_batch.packsWithNeighbours(n, emit_batch.max_plaintext)) {
+            if (self.pack_scratch) |batch| {
+                if (batch.tail(n)) |dest| {
+                    _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
+                    _ = outbound_memory.frames_in_scratch.fetchAdd(1, .monotonic);
+                    return dest;
+                }
+            }
         }
-        _ = gpa_fallbacks.frame.fetchAdd(1, .monotonic);
+        if (n <= self.frame_pool.slab_bytes) {
+            // A terminal frame (GOAWAY, RST_STREAM) may take any slab; every
+            // other frame leaves `frame_slab_reserve` of them for it.
+            const keep: usize = if (class == .terminal) 0 else self.frame_slab_reserve;
+            if (self.frame_pool.freeCount() > keep) {
+                if (self.frame_pool.tryRent(self.config.io)) |slab| {
+                    _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
+                    _ = outbound_memory.frames_from_slab.fetchAdd(1, .monotonic);
+                    return slab;
+                }
+            }
+        }
+        if (n <= limits_mod.WIRE_CHUNK_SIZE) {
+            const keep: usize = if (self.building_pop_frame) 0 else wire_const.POP_PUSHES;
+            if (self.write_pool.freeCount() > keep) {
+                if (self.write_pool.tryRentIndex(self.config.io)) |idx| {
+                    _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
+                    _ = outbound_memory.frames_from_chunk.fetchAdd(1, .monotonic);
+                    return self.write_pool.slabAt(idx);
+                }
+            }
+        }
+        _ = outbound_memory.frames_refused.fetchAdd(1, .monotonic);
         return null;
     }
 
-    /// Return a frame buffer to where it came from: `frame_pool`,
-    /// `write_pool`, or the GPA. `buf` may be a used prefix; the pointer must
-    /// be the slab base.
+    /// True when the scheduler must not pop: the pop could push `POP_PUSHES`
+    /// chunks (the batch it flushes, and the frame itself when it is
+    /// unbatchable) and fewer are free. The chunks come back when the writer
+    /// finishes one, which posts a write completion (h2c) or advances the
+    /// stash (TLS), and either wakes the actor's select, which drains again.
+    /// Nothing waits here and no lock is held across a wait.
+    fn outboundMemoryPaused(self: *Connection) bool {
+        if (self.write_pool.freeCount() >= wire_const.POP_PUSHES) return false;
+        _ = outbound_memory.drain_memory_pauses.fetchAdd(1, .monotonic);
+        return true;
+    }
+
+    fn payloadInScratch(self: *const Connection, buf: []const u8) bool {
+        const base = @intFromPtr(self.plaintext_scratch.ptr);
+        const here = @intFromPtr(buf.ptr);
+        return here >= base and here < base + self.plaintext_scratch.len;
+    }
+
+    /// Return a frame buffer to its pool, `frame_pool` or `write_pool`. `buf`
+    /// may be a used prefix; the pointer must be the slab base. A buffer in
+    /// neither pool is a bug (every frame comes from `rentFrame`), and there
+    /// is no general allocator to hand it to.
     fn releaseWireBytes(self: *Connection, buf: []u8) void {
         if (buf.len == 0) return;
+        // Built in the drain-turn scratch: it owns no pool memory.
+        if (self.payloadInScratch(buf)) return;
         if (self.frame_pool.containsPtr(buf.ptr)) {
             self.frame_pool.release(self.config.io, self.frame_pool.slabFromPtr(buf.ptr));
             return;
@@ -5841,50 +6104,45 @@ pub const Connection = struct {
             self.write_pool.releaseIndex(self.config.io, self.write_pool.indexFromPtr(buf.ptr));
             return;
         }
-        self.config.gpa.free(buf);
+        std.debug.panic("frame buffer of {d} bytes is in neither the frame pool nor the write pool", .{buf.len});
     }
 
     /// The write chunk an owned frame buffer already is, or null for a frame
     /// slab, which is too small to be a write chunk and is copied instead.
-    /// A GPA frame is its own exact allocation, so it can travel as a
-    /// pool-less chunk: every place that frees a chunk frees `bytes` whole.
     fn frameAsWriteLease(self: *Connection, buf: []u8) ?WriteLease {
         if (self.frame_pool.containsPtr(buf.ptr)) return null;
-        if (self.write_pool.containsPtr(buf.ptr)) {
-            const idx = self.write_pool.indexFromPtr(buf.ptr);
-            return .{ .bytes = self.write_pool.slabAt(idx), .pool_index = idx };
-        }
-        return .{ .bytes = buf, .pool_index = null };
+        std.debug.assert(self.write_pool.containsPtr(buf.ptr));
+        const idx = self.write_pool.indexFromPtr(buf.ptr);
+        return .{ .bytes = self.write_pool.slabAt(idx), .pool_index = idx };
     }
 
     const WriteLease = struct {
         bytes: []u8,
-        pool_index: ?u32,
+        pool_index: u32,
     };
 
-    /// Take a write-pool chunk when one is free; otherwise GPA of exact `n`.
-    /// Never blocks: the actor must not park on the write pool (it would miss
-    /// shutdown, reads, and writer failure while WritePump may already be idle).
+    /// Take a write-pool chunk, or fail. Never blocks and never allocates: the
+    /// actor must not park on the write pool (it would miss shutdown, reads,
+    /// and writer failure while WritePump may already be idle). The drain
+    /// checks the room before every pop (`outboundMemoryPaused`), so the
+    /// pops that reach here find a chunk; the refusal counter is the proof,
+    /// and a refusal fails the connection like any other write failure.
     fn leaseWriteChunk(self: *Connection, n: usize) error{OutOfMemory}!WriteLease {
         if (n <= limits_mod.WIRE_CHUNK_SIZE) {
             if (self.write_pool.tryRentIndex(self.config.io)) |idx| {
+                _ = outbound_memory.chunks_leased.fetchAdd(1, .monotonic);
                 return .{
                     .bytes = self.write_pool.slabAt(idx),
                     .pool_index = idx,
                 };
             }
         }
-        _ = gpa_fallbacks.write_chunk.fetchAdd(1, .monotonic);
-        const buf = self.config.gpa.alloc(u8, n) catch return error.OutOfMemory;
-        return .{ .bytes = buf, .pool_index = null };
+        _ = outbound_memory.chunks_refused.fetchAdd(1, .monotonic);
+        return error.OutOfMemory;
     }
 
     fn returnWriteChunk(self: *Connection, lease: WriteLease) void {
-        if (lease.pool_index) |idx| {
-            self.write_pool.releaseIndex(self.config.io, idx);
-        } else if (lease.bytes.len != 0) {
-            self.config.gpa.free(lease.bytes);
-        }
+        self.write_pool.releaseIndex(self.config.io, lease.pool_index);
     }
 
     /// Hand `src` to the WritePump with accounting attached. With `owned` null,
@@ -5961,6 +6219,7 @@ pub const Connection = struct {
             // `err` is `WriteFailed` or `Canceled`; a cancel must not become a failed write.
             return err;
         };
+        if (comptime test_observe) _ = outbound_memory.chunks_to_pump.fetchAdd(1, .monotonic);
     }
 
     /// The single exit from protocol bytes to transport bytes. Called ONLY by
@@ -6271,6 +6530,7 @@ pub const Connection = struct {
             .slot = undefined,
             .stream_id = d.stream_id,
             .method = job.req.method,
+            .arena = a,
             .accept_encoding = accept_encoding,
         };
         job.matched = classified;
@@ -6821,8 +7081,14 @@ pub const Connection = struct {
         return .{ .compress = true, .add_vary = add_vary };
     }
 
+    /// The response's header list, in the request's arena: the handler's
+    /// headers, and for SSE, compression and Vary the fields the edge adds.
+    /// Nothing here is the general allocator, and nothing is freed one by one:
+    /// the arena goes home with the request. A failure is `ResponseRefused`,
+    /// because nothing has been queued yet and the stream can still be
+    /// answered (the arena says which cap it hit, so the answer is 500 or 503).
     fn appendResponseHeaders(
-        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
         hlist: *std.ArrayList(hpack.HeaderField),
         headers: []const request.Header,
         opts: struct {
@@ -6831,13 +7097,13 @@ pub const Connection = struct {
             add_vary: bool = false,
             strip_content_length: bool = false,
         },
-        /// Optional gpa-owned merged Vary value; caller frees after applyCommand.
-        owned_vary: *?[]u8,
     ) response.ResponseError!void {
+        // The three SSE fields, one for compression, one for Vary.
+        hlist.ensureTotalCapacityPrecise(arena, headers.len + 5) catch return error.ResponseRefused;
         if (opts.sse) {
-            hlist.append(gpa, .{ .name = "content-type", .value = "text/event-stream" }) catch return error.OutOfMemory;
-            hlist.append(gpa, .{ .name = "cache-control", .value = "no-cache" }) catch return error.OutOfMemory;
-            hlist.append(gpa, .{ .name = "x-accel-buffering", .value = "no" }) catch return error.OutOfMemory;
+            hlist.appendAssumeCapacity(.{ .name = "content-type", .value = "text/event-stream" });
+            hlist.appendAssumeCapacity(.{ .name = "cache-control", .value = "no-cache" });
+            hlist.appendAssumeCapacity(.{ .name = "x-accel-buffering", .value = "no" });
         }
         var handler_vary: ?[]const u8 = null;
         for (headers) |h| {
@@ -6847,46 +7113,45 @@ pub const Connection = struct {
                 handler_vary = h.value;
                 continue;
             }
-            hlist.append(gpa, .{ .name = h.name, .value = h.value }) catch return error.OutOfMemory;
+            hlist.appendAssumeCapacity(.{ .name = h.name, .value = h.value });
         }
         if (opts.compress) {
-            hlist.append(gpa, .{ .name = "content-encoding", .value = "br" }) catch return error.OutOfMemory;
+            hlist.appendAssumeCapacity(.{ .name = "content-encoding", .value = "br" });
         }
         if (opts.add_vary) {
-            const merged = content_coding.mergeVaryAcceptEncoding(gpa, handler_vary) catch return error.OutOfMemory;
-            owned_vary.* = merged;
-            hlist.append(gpa, .{ .name = "vary", .value = merged }) catch return error.OutOfMemory;
+            const merged = content_coding.mergeVaryAcceptEncoding(arena, handler_vary) catch return error.ResponseRefused;
+            hlist.appendAssumeCapacity(.{ .name = "vary", .value = merged });
         } else if (handler_vary) |v| {
-            hlist.append(gpa, .{ .name = "vary", .value = v }) catch return error.OutOfMemory;
+            hlist.appendAssumeCapacity(.{ .name = "vary", .value = v });
         }
+        _ = h2_work.response_header_lists.fetchAdd(1, .monotonic);
     }
 
-    const PreparedResponseHeaders = struct {
-        fields: []const hpack.HeaderField,
-        heap: bool = false,
-    };
-
+    /// `stack` serves the common response (the handler's headers and nothing the
+    /// edge adds); anything else is built in the arena. Either way the caller
+    /// frees nothing.
     fn prepareResponseHeaderFields(
-        self: *Connection,
+        arena: std.mem.Allocator,
         stack: []hpack.HeaderField,
         headers: []const request.Header,
         compress: bool,
         add_vary: bool,
         strip_content_length: bool,
         sse: bool,
-        owned_vary: *?[]u8,
-    ) response.ResponseError!PreparedResponseHeaders {
-        if (sse or compress or add_vary) {
+    ) response.ResponseError![]const hpack.HeaderField {
+        // A list the stack cannot hold (the handler's headers and a `vary`) is
+        // built in the arena like the edge-added kinds; the stack is the
+        // small-list fast path and is no bound. The bound is
+        // `Limits.response_header_fields`, checked in `Session.cmdHeaders`.
+        if (sse or compress or add_vary or headers.len >= stack.len) {
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
-            defer hlist.deinit(self.config.gpa);
-            try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
+            try appendResponseHeaders(arena, &hlist, headers, .{
                 .sse = sse,
                 .compress = compress,
                 .add_vary = add_vary,
                 .strip_content_length = strip_content_length,
-            }, owned_vary);
-            const dup = try self.config.gpa.dupe(hpack.HeaderField, hlist.items);
-            return .{ .fields = dup, .heap = true };
+            });
+            return hlist.items;
         }
         var handler_vary: ?[]const u8 = null;
         var n: usize = 0;
@@ -6896,16 +7161,36 @@ pub const Connection = struct {
                 handler_vary = h.value;
                 continue;
             }
-            if (n >= stack.len) return error.OutOfMemory;
+            // `headers.len < stack.len` above: the stack holds them and one more.
             stack[n] = .{ .name = h.name, .value = h.value };
             n += 1;
         }
         if (handler_vary) |v| {
-            if (n >= stack.len) return error.OutOfMemory;
             stack[n] = .{ .name = "vary", .value = v };
             n += 1;
         }
-        return .{ .fields = stack[0..n] };
+        _ = h2_work.response_header_lists.fetchAdd(1, .monotonic);
+        return stack[0..n];
+    }
+
+    /// What `respond_headers` failing means to the handler. `HeadersTooLarge`
+    /// and `OutOfMemory` leave nothing queued (`Session.cmdHeaders` is all or
+    /// none), so the response is refused and the stream can still be answered.
+    fn headersRefusal(err: anyerror) response.ResponseError {
+        return switch (err) {
+            error.HeadersTooLarge, error.OutOfMemory => error.ResponseRefused,
+            else => error.WriteFailed,
+        };
+    }
+
+    /// Give back the brotli encoder `prepareCompression` took, for a response
+    /// that was refused before it started.
+    fn dropEncoder(hctx: *HandlerCtx) void {
+        if (hctx.encoder) |enc| {
+            enc.destroy();
+            hctx.encoder = null;
+            hctx.compressing = false;
+        }
     }
 
     fn compressOrAbort(hctx: *HandlerCtx, stream_id: u31, input: []const u8, op: brotli.Operation, out: *std.ArrayList(u8)) response.ResponseError!void {
@@ -7046,18 +7331,15 @@ pub const Connection = struct {
             defer self.unlockSession(self.config.io);
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
             var stack_hpack: [32]hpack.HeaderField = undefined;
-            var owned_vary: ?[]u8 = null;
-            defer if (owned_vary) |v| self.config.gpa.free(v);
-            const prepared = try self.prepareResponseHeaderFields(&stack_hpack, headers, compress, add_vary, compress, false, &owned_vary);
-            defer if (prepared.heap) self.config.gpa.free(prepared.fields);
+            const fields = try prepareResponseHeaderFields(hctx.arena, &stack_hpack, headers, compress, add_vary, compress, false);
             // Compressed bodies never carry content-length — HTTP/2 length is framing.
             const t_hpack0 = if (traced) nowNs(self.config.io) else 0;
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
-                .headers = prepared.fields,
+                .headers = fields,
                 .end_stream = body_out.len == 0,
-            } }) catch return error.WriteFailed;
+            } }) catch |err| return headersRefusal(err);
             if (traced) t_hpack = nowNs(self.config.io) - t_hpack0;
             if (body_out.len > 0) {
                 const pending_len = self.sched.pendingByteLen(stream_id);
@@ -7172,21 +7454,25 @@ pub const Connection = struct {
             defer self.unlockSession(self.config.io);
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
-            defer hlist.deinit(self.config.gpa);
-            var owned_vary: ?[]u8 = null;
-            defer if (owned_vary) |v| self.config.gpa.free(v);
-            try appendResponseHeaders(self.config.gpa, &hlist, headers, .{
+            appendResponseHeaders(hctx.arena, &hlist, headers, .{
                 .sse = sse,
                 .compress = prep.compress,
                 .add_vary = prep.add_vary,
                 .strip_content_length = true, // streaming never sends content-length
-            }, &owned_vary);
+            }) catch |err| {
+                dropEncoder(hctx);
+                return err;
+            };
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
                 .headers = hlist.items,
                 .end_stream = false,
-            } }) catch return error.WriteFailed;
+            } }) catch |err| {
+                const refused = headersRefusal(err);
+                if (refused == error.ResponseRefused) dropEncoder(hctx);
+                return refused;
+            };
             self.next_wire_ticket = ticket;
             self.next_wire_slot = slot_i;
             // Enqueue and leave. Do NOT drain. writeCb already learned this:
@@ -7567,7 +7853,10 @@ pub const BenchHop = struct {
             stream.close(config.io);
             return err;
         };
-        self.conn.finishBoot();
+        self.conn.finishBoot() catch |err| {
+            self.conn.deinit();
+            return err;
+        };
     }
 
     pub fn deinit(self: *BenchHop) void {
@@ -7743,71 +8032,80 @@ fn hopBigBody(_: *anyopaque, _: *const request.Request, resp: *response.Complete
     try resp.send(200, &.{}, &body);
 }
 
-const PushProbe = struct {
-    done: std.atomic.Value(bool) = .init(false),
-    err: ?anyerror = null,
-};
-
-fn pushProbeTask(conn: *Connection, out: *PushProbe) void {
-    conn.pushWriteChunk(.{ .bytes = &.{}, .len = 0, .flush_barrier = true }) catch |err| {
-        out.err = err;
-    };
-    out.done.store(true, .release);
-}
-
 /// The same push, through the accounting wrapper every production frame uses.
-fn sendProbeTask(conn: *Connection, out: *PushProbe) void {
+fn sendSettingsAck(conn: *Connection) anyerror!void {
     var settings: [frame.FRAME_HEADER_LEN]u8 = undefined;
     const n = frame.Serializer.settingsFrame(&settings, true, &.{}) catch unreachable;
-    conn.sendAccountedWire(settings[0..n], false, 0, 0, 0, 0, 0, false, null) catch |err| {
-        out.err = err;
-    };
-    out.done.store(true, .release);
+    return conn.sendAccountedWire(settings[0..n], false, 0, 0, 0, 0, 0, false, null);
 }
 
-fn pushCancelBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    const io = rt.io();
+test "teardown's sentinel fills the h2c write queue while a handler flushes: the room check sees it and the push is an ending connection's, not a trap" {
+    // The sentinel is a chunk in the queue that no push counted in
+    // `acks.owed`. With the queue one short of full and nothing owed, the
+    // fast path of `h2cQueueRoom` (`owed + need <= capacity`) said "room", the
+    // sentinel took the last slot, and the handler's bare flush barrier found
+    // the queue full: a trap in a safe build, a failed connection in any
+    // other. Here the queue holds `capacity - 1` chunks that were never
+    // counted (what the sentinel is), and teardown's own `stopWritePump`
+    // supplies the sentinel.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
     var trap: TrapHop = undefined;
     try openTrapHop(&trap, gpa, io);
     defer trap.close();
     const conn = &trap.hop.conn;
+    const capacity = conn.write_ch_buf.len;
     const barrier: wire_pump.WireChunk = .{ .bytes = &.{}, .len = 0, .flush_barrier = true };
-    // Fill the write queue, so the next push parks in `putOne`.
+    for (0..capacity - 1) |_| try std.testing.expect(io_queue.tryPut(wire_pump.WireChunk, &conn.write_ch, io, barrier));
+    defer while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, io)) |_| {};
+
+    // Before teardown: the queue has one slot and the ledger owes nothing, so
+    // the gate says yes, and a barrier would fit.
+    try std.testing.expect(conn.h2cQueueRoom(1));
+
+    // The handler checked the gate under the lock and has not pushed yet;
+    // teardown runs now.
+    conn.stopWritePump(null);
+    try std.testing.expectEqual(capacity, io_queue.queued(wire_pump.WireChunk, &conn.write_ch, io));
+    try std.testing.expect(conn.write_queue_ending.load(.acquire));
+    // The gate is exact now, so a new check does not let a barrier through...
+    try std.testing.expect(!conn.h2cQueueRoom(1));
+    try std.testing.expect(!conn.barrierRoom());
+    // ...and the one that passed before the sentinel gets a failed write, not
+    // a trap, and not a refusal: the connection was already ending.
+    const refused_before = test_queue_push_refusals.load(.acquire);
+    try std.testing.expectError(error.WriteFailed, conn.pushWriteChunk(barrier));
+    try std.testing.expectEqual(refused_before, test_queue_push_refusals.load(.acquire));
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+}
+
+test "a push into a full h2c write queue fails the connection closed and never waits (t-3564)" {
+    // The push used to wait in `putOne` holding `session_mu` (and a cancel
+    // there had its own test, t-3520). The gates leave it room, so a full
+    // queue is a gate that failed, and it must not park the task that holds
+    // the lock: in a safe build it traps; here the trap is off to see the
+    // behavior of every other build.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    test_allow_full_queue_push.store(true, .release);
+    defer test_allow_full_queue_push.store(false, .release);
+    const barrier: wire_pump.WireChunk = .{ .bytes = &.{}, .len = 0, .flush_barrier = true };
     while (io_queue.tryPut(wire_pump.WireChunk, &conn.write_ch, io, barrier)) {}
     defer while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, io)) |_| {};
 
-    var probe: PushProbe = .{};
-    var h = try rt.spawn(pushProbeTask, .{ conn, &probe });
-    zio.sleep(.fromMilliseconds(100)) catch {};
-    // Still parked: nothing made room.
-    try std.testing.expect(!probe.done.load(.acquire));
-    h.cancel();
-    try std.testing.expect(probe.done.load(.acquire));
-    try std.testing.expectEqual(error.Canceled, probe.err orelse return error.PushReturnedOk);
-
-    // Through `sendAccountedWire`: the cancel survives its cleanup path, and
-    // the cleanup still releases the wire reservation it took.
-    var send_probe: PushProbe = .{};
-    var h2 = try rt.spawn(sendProbeTask, .{ conn, &send_probe });
-    zio.sleep(.fromMilliseconds(100)) catch {};
-    try std.testing.expect(!send_probe.done.load(.acquire));
-    h2.cancel();
-    try std.testing.expect(send_probe.done.load(.acquire));
-    try std.testing.expectEqual(error.Canceled, send_probe.err orelse return error.SendReturnedOk);
+    const refused_before = test_queue_push_refusals.load(.acquire);
+    try std.testing.expectError(error.WriteFailed, conn.pushWriteChunk(barrier));
+    try std.testing.expect(conn.writer_failed.load(.acquire));
+    try std.testing.expectEqual(refused_before + 1, test_queue_push_refusals.load(.acquire));
+    // Through `sendAccountedWire`: the failure releases the reservation it took.
+    conn.writer_failed.store(false, .release);
+    try std.testing.expectError(error.WriteFailed, sendSettingsAck(conn));
     try std.testing.expectEqual(@as(usize, 0), conn.wire_outbound_held.load(.acquire));
-}
-
-test "pushWriteChunk returns error.Canceled when its task is canceled while parked in putOne (t-3520)" {
-    // zio delivers a cancel once. A push that turned it into `WriteFailed` lost
-    // it, and `run` then never re-raised it with `zio.recancel`.
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{
-        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
-        .executors = .exact(2),
-    });
-    defer rt.deinit();
-    var h = try rt.spawn(pushCancelBody, .{ rt, gpa });
-    try h.join();
+    conn.writer_failed.store(false, .release);
 }
 
 test "an h2c connection refuses a write queue smaller than one pop's reservation (t-3520)" {
@@ -7838,7 +8136,7 @@ test "a full DATA frame is built in a write-pool chunk and reaches the pump with
     const hop = &trap.hop;
     try hop.preparePreface();
 
-    const fallbacks_before = gpa_fallbacks.frame.load(.monotonic);
+    const refused_before = outbound_memory.frames_refused.load(.monotonic);
     const copied_before = hop.conn.wire_copied_bytes;
     const block = [_]u8{ 0x82, 0x87, 0x84 }; // :method GET, :scheme https, :path /
     var headers: [frame.FRAME_HEADER_LEN + block.len]u8 = undefined;
@@ -7884,7 +8182,7 @@ test "a full DATA frame is built in a write-pool chunk and reaches the pump with
     }
     try std.testing.expectEqual(@as(usize, 48 * 1024), body_off);
     try std.testing.expectEqual(@as(usize, 3), full_frames);
-    try std.testing.expectEqual(fallbacks_before, gpa_fallbacks.frame.load(.monotonic));
+    try std.testing.expectEqual(refused_before, outbound_memory.frames_refused.load(.monotonic));
     // HEADERS and the short last DATA frame may be copied; a full frame not.
     try std.testing.expect(hop.conn.wire_copied_bytes - copied_before < 16 * 1024);
     try hop.conn.drainPendingCompleteReceipts(false);
@@ -7904,7 +8202,7 @@ test "a write-pool frame refused by the outbound budget goes back to the write p
     try trap.hop.preparePreface();
 
     const rented_before = conn.write_pool.rentedCount();
-    const full = conn.rentFrame(frame.FRAME_HEADER_LEN + 16 * 1024) orelse return error.NoWriteChunk;
+    const full = conn.rentFrame(frame.FRAME_HEADER_LEN + 16 * 1024, .ordinary) orelse return error.NoWriteChunk;
     try std.testing.expect(conn.write_pool.containsPtr(full.ptr));
     (frame.FrameHeader{ .length = 16 * 1024, .type = .data, .flags = .{}, .stream_id = 1 }).encode(full[0..frame.FRAME_HEADER_LEN]);
 
@@ -7916,6 +8214,133 @@ test "a write-pool frame refused by the outbound budget goes back to the write p
     defer test_in_sched_sink = false;
     try std.testing.expectError(error.OutOfMemory, conn.queueWire(full, false, 0, 0, 0, 0, 0, true, false));
     try std.testing.expectEqual(rented_before, conn.write_pool.rentedCount());
+}
+
+/// Give back the two preface frames the connection queued at boot, so a test
+/// that counts slabs and chunks starts from full pools.
+fn dropQueuedPreface(conn: *Connection) void {
+    for (conn.session.drainIntents()) |*it| conn.session.releaseIntent(it);
+}
+
+test "rentFrame: a queued frame leaves POP_PUSHES chunks free, a frame built in a pop may take them, and an empty pool refuses" {
+    var lim = limits_mod.Limits.defaults;
+    lim.frame_slab_bytes = 64;
+    lim.frame_slabs_per_connection = 4;
+    lim.inbound_wire_chunks_per_connection = wire_const.POP_PUSHES + 2;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    dropQueuedPreface(conn);
+    const pushes = wire_const.POP_PUSHES;
+    try std.testing.expectEqual(pushes + 2, conn.write_pool.freeCount());
+
+    const refused_before = outbound_memory.frames_refused.load(.monotonic);
+    var held: [8][]u8 = undefined;
+    var n: usize = 0;
+    defer for (held[0..n]) |buf| conn.releaseWireBytes(buf);
+
+    // The slabs the terminal reserve leaves, then chunks, down to POP_PUSHES free.
+    while (conn.frame_pool.freeCount() > conn.frame_slab_reserve) {
+        held[n] = conn.rentFrame(20, .ordinary) orelse return error.NoSlab;
+        try std.testing.expect(conn.frame_pool.containsPtr(held[n].ptr));
+        n += 1;
+    }
+    try std.testing.expect(n == 3);
+    while (conn.write_pool.freeCount() > pushes) {
+        held[n] = conn.rentFrame(20, .ordinary) orelse return error.NoChunkToSpare;
+        try std.testing.expect(conn.write_pool.containsPtr(held[n].ptr));
+        n += 1;
+    }
+    // A queued frame is refused here, small or large, with chunks still free.
+    try std.testing.expectEqual(pushes, conn.write_pool.freeCount());
+    try std.testing.expect(conn.rentFrame(20, .ordinary) == null);
+    try std.testing.expect(conn.rentFrame(limits_mod.WIRE_CHUNK_SIZE, .ordinary) == null);
+    try std.testing.expectEqual(refused_before + 2, outbound_memory.frames_refused.load(.monotonic));
+    // The scheduler would pop here: the room is exactly what a pop needs.
+    try std.testing.expect(!conn.outboundMemoryPaused());
+
+    // The DATA frame of a pop takes what the room check counted, and then the
+    // pool is empty and the next rent is refused. Nothing came from `gpa`:
+    // the test allocator would report a leak for it.
+    conn.building_pop_frame = true;
+    defer conn.building_pop_frame = false;
+    while (conn.write_pool.freeCount() > 0) {
+        held[n] = conn.rentFrame(limits_mod.WIRE_CHUNK_SIZE, .ordinary) orelse return error.NoChunkForPop;
+        n += 1;
+    }
+    try std.testing.expect(conn.rentFrame(20, .ordinary) == null);
+    // A frame above the write chunk is refused whatever is free.
+    try std.testing.expect(conn.rentFrame(limits_mod.WIRE_CHUNK_SIZE + 1, .ordinary) == null);
+    // And the drain is held back until a chunk comes home.
+    try std.testing.expect(conn.outboundMemoryPaused());
+    conn.releaseWireBytes(held[n - 1]);
+    n -= 1;
+    try std.testing.expect(conn.outboundMemoryPaused());
+    conn.releaseWireBytes(held[n - 1]);
+    n -= 1;
+    try std.testing.expect(!conn.outboundMemoryPaused());
+}
+
+test "rentFrame: a terminal frame takes the slabs that no other frame may" {
+    var lim = limits_mod.Limits.defaults;
+    lim.frame_slab_bytes = 64;
+    lim.frame_slabs_per_connection = 8;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    dropQueuedPreface(conn);
+    // A quarter of the slabs, capped at the control pool's terminal reserve.
+    try std.testing.expectEqual(@as(usize, 2), conn.frame_slab_reserve);
+
+    // The write pool is taken away so a refused slab frame cannot spill into
+    // a chunk and hide the reserve.
+    var chunks: [16]u32 = undefined;
+    var n_chunks: usize = 0;
+    defer for (chunks[0..n_chunks]) |idx| conn.write_pool.releaseIndex(std.testing.io, idx);
+    while (conn.write_pool.tryRentIndex(std.testing.io)) |idx| {
+        chunks[n_chunks] = idx;
+        n_chunks += 1;
+    }
+
+    var held: [8][]u8 = undefined;
+    var n: usize = 0;
+    defer for (held[0..n]) |buf| conn.releaseWireBytes(buf);
+    while (conn.rentFrame(17, .ordinary)) |buf| {
+        held[n] = buf;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), n);
+    // Ordinary traffic cannot take the last two; a GOAWAY and a RST can.
+    held[n] = conn.rentFrame(17, .terminal) orelse return error.TerminalFrameRefused;
+    n += 1;
+    held[n] = conn.rentFrame(13, .terminal) orelse return error.TerminalFrameRefused;
+    n += 1;
+    try std.testing.expect(conn.rentFrame(17, .terminal) == null);
+    try std.testing.expect(conn.frame_pool.freeCount() == 0);
+}
+
+test "leaseWriteChunk refuses an empty pool and an oversized chunk, and counts the refusal" {
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, std.testing.allocator, std.testing.io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    const refused_before = outbound_memory.chunks_refused.load(.monotonic);
+    const leased_before = outbound_memory.chunks_leased.load(.monotonic);
+    var leases: [64]Connection.WriteLease = undefined;
+    var n: usize = 0;
+    defer for (leases[0..n]) |l| conn.returnWriteChunk(l);
+    while (conn.write_pool.freeCount() > 0) {
+        leases[n] = try conn.leaseWriteChunk(16);
+        n += 1;
+    }
+    try std.testing.expectEqual(leased_before + n, outbound_memory.chunks_leased.load(.monotonic));
+    try std.testing.expectError(error.OutOfMemory, conn.leaseWriteChunk(16));
+    try std.testing.expectEqual(refused_before + 1, outbound_memory.chunks_refused.load(.monotonic));
+    conn.returnWriteChunk(leases[n - 1]);
+    n -= 1;
+    try std.testing.expectError(error.OutOfMemory, conn.leaseWriteChunk(limits_mod.WIRE_CHUNK_SIZE + 1));
 }
 
 test "recordFinalize first call stores 1" {
@@ -8154,6 +8579,7 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *HandlerJob {
         .terminal = &slot.terminal,
         .slot = slot,
         .stream_id = sid,
+        .arena = job.arena.allocator(),
     };
     conn.admitHandler(slot);
     std.debug.assert(slot.admitted);
@@ -8436,7 +8862,7 @@ fn bootIntoBuffer(io: std.Io, lim: limits_mod.Limits, mode: Mode, bytes: usize) 
         .request_pool = &requests,
     });
     const used = fba.end_index;
-    conn.finishBoot();
+    try conn.finishBoot();
     conn.quiesce();
     return used;
 }

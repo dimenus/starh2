@@ -3,7 +3,8 @@
 //! The two directions are deliberately asymmetric.
 //!
 //! The DECODER must be complete, because the peer chooses the encoding. It
-//! keeps a dynamic table and decodes Huffman, or it cannot read a browser.
+//! keeps a dynamic table and decodes Huffman, or it cannot read a browser. The
+//! table is `DynTable`: fixed storage the owner gives it, no allocation after.
 //! The dynamic table is connection state and not stream state: entry N of one
 //! header block can name a string that an earlier block on another stream
 //! inserted. That is why a compression fault is always a CONNECTION error. The
@@ -17,6 +18,7 @@
 //! state, which is the HPACK form of the CRIME attack, and that the encoder has
 //! no state a bug could desynchronize.
 const std = @import("std");
+const boot_plan = @import("boot_plan.zig");
 
 pub const MAX_DYNAMIC_TABLE: usize = 4096;
 pub const CompressionError = error{CompressionError};
@@ -312,6 +314,32 @@ const StrRef = struct {
         if (self.huffman) return huffDecode(allocator, self.bytes);
         return try allocator.dupe(u8, self.bytes);
     }
+
+    /// The decoded length, exactly, with no allocation. Validates the string
+    /// the way decoding does (padding, EOS), so a bad string fails here.
+    fn exactLen(self: StrRef) CompressionError!usize {
+        if (!self.huffman) return self.bytes.len;
+        return huffWalk(self.bytes, null);
+    }
+
+    /// Decode into `out`, whose length is `exactLen`.
+    fn decodeExact(self: StrRef, out: []u8) CompressionError!void {
+        if (self.huffman) {
+            const n = try huffWalk(self.bytes, out);
+            std.debug.assert(n == out.len);
+        } else {
+            std.debug.assert(self.bytes.len == out.len);
+            @memcpy(out, self.bytes);
+        }
+    }
+
+    /// A copy of exactly `n` bytes (the string's `exactLen`) in `allocator`.
+    fn materializeExact(self: StrRef, allocator: std.mem.Allocator, n: usize) (CompressionError || error{OutOfMemory})![]u8 {
+        const buf = try allocator.alloc(u8, n);
+        errdefer allocator.free(buf);
+        try self.decodeExact(buf);
+        return buf;
+    }
 };
 
 fn peekString(data: []const u8, start: *usize) CompressionError!StrRef {
@@ -355,17 +383,156 @@ fn decodeInt(data: []const u8, prefix_bits: u3, start: *usize) CompressionError!
     return value;
 }
 
-const DynEntry = struct {
-    name: []u8,
-    value: []u8,
-    size: usize,
+/// Entries put into a dynamic table, in every decoder of the process. The work
+/// counter that goes with "the table takes no general-allocator call": a zero
+/// count of calls means nothing in a run that inserted nothing. The bench
+/// server prints it on `/mem`.
+pub var table_insertions: std.atomic.Value(u64) = .init(0);
+
+/// The most entries a table of `MAX_DYNAMIC_TABLE` bytes can hold: every entry
+/// is accounted at its name, its value and 32 bytes (RFC 7541 section 4.1), so
+/// none is smaller than 32.
+pub const MAX_DYNAMIC_ENTRIES: usize = MAX_DYNAMIC_TABLE / 32;
+
+/// The decoder's dynamic table, in storage it is given and never grows.
+///
+/// `data` holds each entry's name then its value, packed, oldest entry first,
+/// from offset 0. The RFC's `+ 32` per entry is only in the size accounting
+/// (`size`, against `max_size`) and takes no byte of `data`; the table must
+/// evict at the moment the peer's does, and it has room for it because the
+/// bytes used (`used`) are always fewer than `size`. `entries` is a ring of
+/// descriptors, oldest at `first`.
+///
+/// Evicting an entry only moves `first`. The next insert then compacts: it
+/// moves what is left down to offset 0 and shifts the descriptors with it, so
+/// every name and value is one contiguous slice and the free room is one run
+/// at the tail. No call allocates; the storage came from the caller at `init`.
+///
+/// A slice returned by `name`/`value` points into `data` and is valid until the
+/// next `insert`, `clear` or `setMaxSize`. A caller that keeps a field copies it.
+pub const DynTable = struct {
+    data: []u8,
+    entries: []Entry,
+    first: usize = 0,
+    len: usize = 0,
+    used: usize = 0,
+    size: usize = 0,
+    max_size: usize = MAX_DYNAMIC_TABLE,
+
+    pub const Entry = struct {
+        off: u16,
+        name_len: u16,
+        value_len: u16,
+    };
+
+    fn entryAt(self: *const DynTable, newest_first: usize) *const Entry {
+        std.debug.assert(newest_first < self.len);
+        return &self.entries[(self.first + self.len - 1 - newest_first) % self.entries.len];
+    }
+
+    /// Entry `i`, newest first: dynamic index 0 is the most recently inserted.
+    pub fn name(self: *const DynTable, i: usize) []const u8 {
+        const e = self.entryAt(i);
+        return self.data[e.off..][0..e.name_len];
+    }
+
+    pub fn value(self: *const DynTable, i: usize) []const u8 {
+        const e = self.entryAt(i);
+        return self.data[@as(usize, e.off) + e.name_len ..][0..e.value_len];
+    }
+
+    pub fn clear(self: *DynTable) void {
+        self.first = 0;
+        self.len = 0;
+        self.used = 0;
+        self.size = 0;
+    }
+
+    fn evictOldest(self: *DynTable) void {
+        std.debug.assert(self.len > 0);
+        const e = self.entries[self.first];
+        const bytes = @as(usize, e.name_len) + e.value_len;
+        self.size -= bytes + 32;
+        self.used -= bytes;
+        self.first = (self.first + 1) % self.entries.len;
+        self.len -= 1;
+        if (self.len == 0) {
+            self.first = 0;
+            std.debug.assert(self.used == 0 and self.size == 0);
+        }
+    }
+
+    /// Move the entries to the start of `data`. Evictions leave a gap there.
+    fn compact(self: *DynTable) void {
+        if (self.len == 0) return;
+        const gap = self.entries[self.first].off;
+        if (gap == 0) return;
+        std.mem.copyForwards(u8, self.data[0..self.used], self.data[gap..][0..self.used]);
+        var k: usize = 0;
+        while (k < self.len) : (k += 1) {
+            const e = &self.entries[(self.first + k) % self.entries.len];
+            e.off -= gap;
+        }
+    }
+
+    /// Resize the table's limit, evicting from the oldest end to fit. The caller
+    /// has checked `new_size <= MAX_DYNAMIC_TABLE`.
+    pub fn setMaxSize(self: *DynTable, new_size: usize) void {
+        std.debug.assert(new_size <= MAX_DYNAMIC_TABLE);
+        self.max_size = new_size;
+        while (self.size > self.max_size) self.evictOldest();
+    }
+
+    /// Add an entry as the newest, copying `entry_name` and `entry_value` in.
+    /// Neither may point into this table.
+    ///
+    /// The `+ 32` is RFC 7541 section 4.1. It is not a guess: the accounted
+    /// size of an entry must match the peer's accounting exactly, or the two
+    /// sides evict at different moments and every later index disagrees.
+    ///
+    /// An entry larger than the whole table empties the table and is not
+    /// stored. That is the RFC's own rule, and it is why the eviction loop
+    /// below cannot spin.
+    pub fn insert(self: *DynTable, entry_name: []const u8, entry_value: []const u8) void {
+        std.debug.assert(!overlaps(self.data, entry_name) and !overlaps(self.data, entry_value));
+        const bytes = entry_name.len + entry_value.len;
+        const entry_size = bytes + 32;
+        if (entry_size > self.max_size) {
+            self.clear();
+            return;
+        }
+        while (self.size + entry_size > self.max_size) self.evictOldest();
+        self.compact();
+        // `size <= max_size <= MAX_DYNAMIC_TABLE` and `size > used + 32 * len`,
+        // so the bytes and the descriptor both fit.
+        std.debug.assert(self.used + bytes <= self.data.len);
+        std.debug.assert(self.len < self.entries.len);
+        const off = self.used;
+        @memcpy(self.data[off..][0..entry_name.len], entry_name);
+        @memcpy(self.data[off + entry_name.len ..][0..entry_value.len], entry_value);
+        self.entries[(self.first + self.len) % self.entries.len] = .{
+            .off = @intCast(off),
+            .name_len = @intCast(entry_name.len),
+            .value_len = @intCast(entry_value.len),
+        };
+        self.len += 1;
+        self.used += bytes;
+        self.size += entry_size;
+        _ = table_insertions.fetchAdd(1, .monotonic);
+    }
+
+    fn overlaps(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or haystack.len == 0) return false;
+        const h0 = @intFromPtr(haystack.ptr);
+        const n0 = @intFromPtr(needle.ptr);
+        return n0 < h0 + haystack.len and h0 < n0 + needle.len;
+    }
 };
 
 pub const Decoder = struct {
-    allocator: std.mem.Allocator,
-    dyn: std.ArrayList(DynEntry) = .empty,
-    dyn_size: usize = 0,
-    max_size: usize = MAX_DYNAMIC_TABLE,
+    /// Where `table`'s storage came from, and goes back to in `deinit`.
+    storage: std.mem.Allocator,
+    table: DynTable,
 
     pub const DecodeResult = struct {
         /// The decoded fields. With `truncated` this is a prefix of the block's
@@ -381,62 +548,30 @@ pub const Decoder = struct {
         truncated: bool = false,
     };
 
-    pub fn init(allocator: std.mem.Allocator) Decoder {
-        return .{ .allocator = allocator };
+    /// The boot allocations of `init`, in its order. See `boot_plan`.
+    pub fn planBoot(plan: *boot_plan.Plan) error{InvalidConfig}!void {
+        try plan.array(u8, MAX_DYNAMIC_TABLE);
+        try plan.array(DynTable.Entry, MAX_DYNAMIC_ENTRIES);
+    }
+
+    /// A decoder whose table is two fixed arrays from `storage`. On the live
+    /// edge that is the connection slot's boot buffer, which is rewound when
+    /// the slot is reused; nothing allocates again after this.
+    pub fn init(storage: std.mem.Allocator) error{OutOfMemory}!Decoder {
+        const data = try storage.alloc(u8, MAX_DYNAMIC_TABLE);
+        errdefer storage.free(data);
+        const entries = try storage.alloc(DynTable.Entry, MAX_DYNAMIC_ENTRIES);
+        return .{ .storage = storage, .table = .{ .data = data, .entries = entries } };
     }
 
     pub fn deinit(self: *Decoder) void {
-        self.clearDyn();
-        self.dyn.deinit(self.allocator);
-    }
-
-    fn clearDyn(self: *Decoder) void {
-        for (self.dyn.items) |e| {
-            self.allocator.free(e.name);
-            self.allocator.free(e.value);
-        }
-        self.dyn.clearRetainingCapacity();
-        self.dyn_size = 0;
+        self.storage.free(self.table.entries);
+        self.storage.free(self.table.data);
     }
 
     fn setMaxSize(self: *Decoder, new_size: usize) CompressionError!void {
         if (new_size > MAX_DYNAMIC_TABLE) return error.CompressionError;
-        self.max_size = new_size;
-        while (self.dyn_size > self.max_size and self.dyn.items.len > 0) {
-            const e = self.dyn.orderedRemove(self.dyn.items.len - 1);
-            self.dyn_size -= e.size;
-            self.allocator.free(e.name);
-            self.allocator.free(e.value);
-        }
-    }
-
-    /// The `+ 32` is RFC 7541 section 4.1. It is not a guess: the accounted
-    /// size of an entry must match the peer's accounting exactly, or the two
-    /// sides evict at different moments and every later index disagrees.
-    ///
-    /// An entry larger than the whole table empties the table and is not
-    /// stored. That is the RFC's own rule, and it is why the eviction loop
-    /// below cannot spin.
-    fn insert(self: *Decoder, name: []u8, value: []u8) (CompressionError || error{OutOfMemory})!void {
-        const size = name.len + value.len + 32;
-        if (size > self.max_size) {
-            self.allocator.free(name);
-            self.allocator.free(value);
-            self.clearDyn();
-            return;
-        }
-        while (self.dyn_size + size > self.max_size and self.dyn.items.len > 0) {
-            const e = self.dyn.orderedRemove(self.dyn.items.len - 1);
-            self.dyn_size -= e.size;
-            self.allocator.free(e.name);
-            self.allocator.free(e.value);
-        }
-        self.dyn.insert(self.allocator, 0, .{ .name = name, .value = value, .size = size }) catch {
-            self.allocator.free(name);
-            self.allocator.free(value);
-            return error.OutOfMemory;
-        };
-        self.dyn_size += size;
+        self.table.setMaxSize(new_size);
     }
 
     const Indexed = struct {
@@ -452,19 +587,17 @@ pub const Decoder = struct {
             return .{ .name = e.name, .value = e.value, .static = true };
         }
         const dyn_index = index - static_table.len - 1;
-        if (dyn_index >= self.dyn.items.len) return error.CompressionError;
-        const e = self.dyn.items[dyn_index];
-        return .{ .name = e.name, .value = e.value, .static = false };
+        if (dyn_index >= self.table.len) return error.CompressionError;
+        return .{ .name = self.table.name(dyn_index), .value = self.table.value(dyn_index), .static = false };
     }
 
     /// Static-table strings are immutable process-lifetime data. Dynamic-table
     /// strings are not: a later block can evict the entry while a request still
     /// holds the decoded field, so those must be independently owned.
     ///
-    /// `request_alloc` owns the copy. The connection dynamic table stays on
-    /// `self.allocator` (see `indexIntoTable`); mixing the two is how a handler
-    /// arena reset would free table entries, or a GPA free would free arena
-    /// strings.
+    /// `request_alloc` owns the copy. The table's strings are never handed
+    /// out (see `indexIntoTable`): a reset of the request's arena must not
+    /// reach the table, and a later insert must not change a field.
     fn copyIndexedString(src: []const u8, from_static: bool, request_alloc: std.mem.Allocator) error{OutOfMemory}!struct { []const u8, bool } {
         if (from_static) return .{ src, false };
         return .{ try request_alloc.dupe(u8, src), true };
@@ -503,16 +636,13 @@ pub const Decoder = struct {
 
     /// Copies `name`/`value` into the dynamic table. The result field keeps its
     /// own ownership; the table must not alias it.
-    fn indexIntoTable(self: *Decoder, name: []const u8, value: []const u8) (CompressionError || error{OutOfMemory})!void {
-        const n2 = try self.allocator.dupe(u8, name);
-        const v2 = self.allocator.dupe(u8, value) catch {
-            self.allocator.free(n2);
-            return error.OutOfMemory;
-        };
-        try self.insert(n2, v2);
+    fn indexIntoTable(self: *Decoder, name: []const u8, value: []const u8) void {
+        self.table.insert(name, value);
     }
 
-    /// Decode a complete header block into `self.allocator`.
+    /// Decode a complete header block into `self.storage`, which then also
+    /// serves as the transient allocator. For tests and tools: the edge calls
+    /// `decodeInto` with the request's arena and the slot's scratch.
     pub fn decode(
         self: *Decoder,
         block: []const u8,
@@ -521,7 +651,7 @@ pub const Decoder = struct {
         max_name: usize,
         max_value: usize,
     ) (CompressionError || error{OutOfMemory})!DecodeResult {
-        return self.decodeInto(self.allocator, block, max_fields, max_decoded_size, max_name, max_value);
+        return self.decodeInto(self.storage, self.storage, block, max_fields, max_decoded_size, max_name, max_value);
     }
 
     /// The most bytes `decodeInto` takes from `request_alloc`, whatever the
@@ -563,9 +693,12 @@ pub const Decoder = struct {
     /// Decode a complete header block.
     ///
     /// `request_alloc` owns the result field slice and every non-static string
-    /// in it. `self.allocator` owns the connection dynamic table. They may be
-    /// the same (tests, isolated Session). On the live edge they are not: the
-    /// table is GPA and the request list is the request's arena.
+    /// in it. The connection's dynamic table is `self.table`, in the storage it
+    /// was made with, and takes nothing from any allocator after `init`.
+    /// `scratch` is the transient room of one decode: at most
+    /// `MAX_DYNAMIC_TABLE` bytes, only for a field that is past the request's
+    /// budget and enters the table (see `literalField`), and given back before
+    /// this returns. On the live edge it is the slot's `hpack_scratch`.
     ///
     /// A policy breach is NOT an error here. A field block that exceeds
     /// `max_fields`, `max_decoded_size`, `max_name`, or `max_value` still
@@ -589,6 +722,7 @@ pub const Decoder = struct {
     pub fn decodeInto(
         self: *Decoder,
         request_alloc: std.mem.Allocator,
+        scratch: std.mem.Allocator,
         block: []const u8,
         max_fields: usize,
         max_decoded_size: usize,
@@ -624,7 +758,7 @@ pub const Decoder = struct {
                 first = false;
             } else if ((b & 0xc0) == 0x40) {
                 const idx = try decodeInt(block, 6, &i);
-                try self.literalField(request_alloc, block, idx, &i, false, true, &st);
+                try self.literalField(request_alloc, scratch, block, idx, &i, false, true, &st);
                 first = false;
             } else if ((b & 0xe0) == 0x20) {
                 // A dynamic table size update is legal only at the start of a
@@ -636,7 +770,7 @@ pub const Decoder = struct {
             } else {
                 const never = (b & 0xf0) == 0x10;
                 const idx = try decodeInt(block, 4, &i);
-                try self.literalField(request_alloc, block, idx, &i, never, false, &st);
+                try self.literalField(request_alloc, scratch, block, idx, &i, never, false, &st);
                 first = false;
             }
         }
@@ -654,11 +788,20 @@ pub const Decoder = struct {
     ///
     /// The room is judged BEFORE anything is decoded, from the strings'
     /// upper bounds: a field that cannot overrun what is left of the budget is
-    /// decoded straight into `request_alloc`. Any other is decoded on
-    /// `self.allocator`, measured exactly, and copied across only if it fits.
+    /// decoded straight into `request_alloc`, and the table copies from there.
+    ///
+    /// Any other field (past the budget's edge) is measured first: the exact
+    /// decoded lengths cost a pass over the Huffman data and no memory. Those
+    /// lengths are what the policy counts and what the table's accounting
+    /// needs. The field is then built in `request_alloc` only if it fits, and
+    /// the table is changed after that, from the built field. A field that does
+    /// not fit but enters the table is decoded into `scratch` for the copy:
+    /// it is no more than `MAX_DYNAMIC_TABLE - 32` bytes, because a larger
+    /// entry is never stored (it empties the table).
     fn literalField(
         self: *Decoder,
         request_alloc: std.mem.Allocator,
+        scratch: std.mem.Allocator,
         block: []const u8,
         idx: usize,
         i: *usize,
@@ -676,37 +819,73 @@ pub const Decoder = struct {
         if (sure_fit) {
             const field = try self.takeLiteral(request_alloc, block, idx, i, never);
             st.account(field.name.len, field.value.len);
-            if (index_it) self.indexIntoTable(field.name, field.value) catch |err| {
-                field.freeOwned(request_alloc);
-                return err;
-            };
+            if (index_it) self.indexIntoTable(field.name, field.value);
             std.debug.assert(st.fits());
             st.fields.appendAssumeCapacity(field);
             return;
         }
-        const field = try self.takeLiteral(self.allocator, block, idx, i, never);
-        defer field.freeOwned(self.allocator);
-        st.account(field.name.len, field.value.len);
-        if (index_it) try self.indexIntoTable(field.name, field.value);
-        if (!st.fits()) {
-            st.truncated = true;
+
+        // Past the budget's edge. Locate both strings, measure them exactly.
+        var p = start;
+        const name_ref: ?StrRef = if (idx == 0) try peekString(block, &p) else null;
+        const indexed_name: ?Indexed = if (idx == 0) null else try self.lookup(idx);
+        const value_ref = try peekString(block, &p);
+        i.* = p;
+        const name_len = if (name_ref) |r| try r.exactLen() else indexed_name.?.name.len;
+        const value_len = try value_ref.exactLen();
+        st.account(name_len, value_len);
+
+        if (st.fits()) {
+            // It fits after all (the upper bounds were pessimistic).
+            var name_owned = false;
+            const name: []const u8 = blk: {
+                if (name_ref) |r| {
+                    name_owned = true;
+                    break :blk try r.materializeExact(request_alloc, name_len);
+                }
+                const pair = try copyIndexedString(indexed_name.?.name, indexed_name.?.static, request_alloc);
+                name_owned = pair[1];
+                break :blk pair[0];
+            };
+            errdefer if (name_owned) request_alloc.free(name);
+            const value = try value_ref.materializeExact(request_alloc, value_len);
+            st.fields.appendAssumeCapacity(.{
+                .name = name,
+                .value = value,
+                .never_index = never,
+                .name_owned = name_owned,
+                .value_owned = true,
+            });
+            if (index_it) {
+                const f = st.fields.items[st.fields.items.len - 1];
+                self.indexIntoTable(f.name, f.value);
+            }
             return;
         }
-        // It fits after all (the upper bounds were pessimistic): copy it over.
-        const name = if (field.name_owned) try request_alloc.dupe(u8, field.name) else field.name;
-        errdefer if (field.name_owned) request_alloc.free(name);
-        const value = try request_alloc.dupe(u8, field.value);
-        st.fields.appendAssumeCapacity(.{
-            .name = name,
-            .value = value,
-            .never_index = field.never_index,
-            .name_owned = field.name_owned,
-            .value_owned = true,
-        });
+
+        st.truncated = true;
+        if (!index_it) return;
+        if (name_len + value_len + 32 > self.table.max_size) {
+            // Larger than the table: it empties the table and is not stored.
+            self.table.clear();
+            return;
+        }
+        // The field is not kept, only the table's copy of it. The name is
+        // copied out of the table (or the block) first: the insert moves the
+        // table's bytes.
+        const buf = try scratch.alloc(u8, name_len + value_len);
+        defer scratch.free(buf);
+        if (name_ref) |r| {
+            try r.decodeExact(buf[0..name_len]);
+        } else {
+            @memcpy(buf[0..name_len], indexed_name.?.name);
+        }
+        try value_ref.decodeExact(buf[name_len..]);
+        self.indexIntoTable(buf[0..name_len], buf[name_len..]);
     }
 
     pub fn freeResult(self: *Decoder, result: DecodeResult) void {
-        self.freeResultInto(self.allocator, result);
+        self.freeResultInto(self.storage, result);
     }
 
     pub fn freeResultInto(_: *Decoder, request_alloc: std.mem.Allocator, result: DecodeResult) void {
@@ -828,6 +1007,59 @@ fn neverIndexName(name: []const u8) bool {
         std.mem.eql(u8, name, "set-cookie");
 }
 
+/// Writes a window of a header block: `skip` bytes are dropped first, then
+/// bytes are kept until `out` is full. The rest is counted nowhere, so a
+/// caller that knows the block's length reads the window it wants.
+const RangeSink = struct {
+    out: []u8,
+    skip: usize,
+    written: usize = 0,
+
+    fn put(self: *RangeSink, bytes: []const u8) void {
+        var b = bytes;
+        if (self.skip >= b.len) {
+            self.skip -= b.len;
+            return;
+        }
+        b = b[self.skip..];
+        self.skip = 0;
+        const n = @min(b.len, self.out.len - self.written);
+        @memcpy(self.out[self.written..][0..n], b[0..n]);
+        self.written += n;
+    }
+
+    fn putInt(self: *RangeSink, value: usize, prefix_bits: u3, first_byte_hi: u8) void {
+        var tmp: [16]u8 = undefined;
+        var pos: usize = 0;
+        // A usize needs at most 11 bytes at a 4-bit prefix.
+        encodeIntInto(&tmp, &pos, value, prefix_bits, first_byte_hi) catch unreachable;
+        self.put(tmp[0..pos]);
+    }
+
+    fn putString(self: *RangeSink, s: []const u8) void {
+        self.putInt(s.len, 7, 0);
+        self.put(s);
+    }
+};
+
+/// `encodeFieldInto`, written through a window. The two must stay the same
+/// encoding: a test compares them over a field list.
+fn encodeFieldRange(sink: *RangeSink, f: HeaderField) void {
+    const full, const name_idx = findStatic(f.name, f.value);
+    if (full) |idx| {
+        sink.putInt(idx, 7, 0x80);
+        return;
+    }
+    const hi: u8 = if (f.never_index or neverIndexName(f.name)) 0x10 else 0x00;
+    if (name_idx) |ni| {
+        sink.putInt(ni, 4, hi);
+    } else {
+        sink.put(&.{hi});
+        sink.putString(f.name);
+    }
+    sink.putString(f.value);
+}
+
 pub const Encoder = struct {
     pub fn encodedLen(fields: []const HeaderField) error{Overflow}!usize {
         var n: usize = 0;
@@ -843,6 +1075,21 @@ pub const Encoder = struct {
         return pos;
     }
 
+    /// The bytes of the block `parts[0] ++ parts[1] ++ ...` from byte `skip`
+    /// on, as many as fit `out`. This is how a block longer than one frame
+    /// is cut into a HEADERS frame and its CONTINUATION frames with no
+    /// buffer for the whole block. Returns the bytes written.
+    pub fn encodeRange(out: []u8, parts: []const []const HeaderField, skip: usize) usize {
+        var sink: RangeSink = .{ .out = out, .skip = skip };
+        for (parts) |fields| {
+            for (fields) |f| {
+                if (sink.written == out.len) return sink.written;
+                encodeFieldRange(&sink, f);
+            }
+        }
+        return sink.written;
+    }
+
     pub fn encode(allocator: std.mem.Allocator, fields: []const HeaderField) (error{ OutOfMemory, Overflow })![]u8 {
         const n = try encodedLen(fields);
         const out = try allocator.alloc(u8, n);
@@ -856,7 +1103,7 @@ pub const Encoder = struct {
 test "RFC 7541 C.2.1 literal with indexing" {
     // Literal with incremental indexing — name "custom-key", value "custom-header"
     const block = [_]u8{ 0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79, 0x0d, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72 };
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const res = try dec.decode(&block, 100, 32 * 1024, 256, 8 * 1024);
     defer dec.freeResult(res);
@@ -867,7 +1114,7 @@ test "RFC 7541 C.2.1 literal with indexing" {
 
 test "RFC 7541 C.2.2 literal without indexing" {
     const block = [_]u8{ 0x04, 0x0c, 0x2f, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2f, 0x70, 0x61, 0x74, 0x68 };
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const res = try dec.decode(&block, 100, 32 * 1024, 256, 8 * 1024);
     defer dec.freeResult(res);
@@ -877,7 +1124,7 @@ test "RFC 7541 C.2.2 literal without indexing" {
 
 test "indexed static :method GET" {
     const block = [_]u8{0x82};
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const res = try dec.decode(&block, 100, 32 * 1024, 256, 8 * 1024);
     defer dec.freeResult(res);
@@ -885,12 +1132,44 @@ test "indexed static :method GET" {
     try std.testing.expectEqualStrings("GET", res.fields[0].value);
 }
 
+test "encodeRange cuts the block the way encodeInto writes it, at every window size" {
+    const gpa = std.testing.allocator;
+    const long: [700]u8 = @splat('v');
+    const lead = [_]HeaderField{.{ .name = ":status", .value = "200" }};
+    const rest = [_]HeaderField{
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "x-custom-name-that-is-not-in-the-static-table", .value = &long },
+        .{ .name = "set-cookie", .value = "a=b" },
+        .{ .name = ":status", .value = "404" },
+        .{ .name = "x-long", .value = &long },
+    };
+    const parts = [_][]const HeaderField{ &lead, &rest };
+    var whole: [4096]u8 = undefined;
+    var n = try Encoder.encodeInto(&whole, &lead);
+    n += try Encoder.encodeInto(whole[n..], &rest);
+    const block = whole[0..n];
+    var window: usize = 1;
+    while (window < n + 3) : (window += 37) {
+        const got = try gpa.alloc(u8, n);
+        defer gpa.free(got);
+        var off: usize = 0;
+        while (off < n) {
+            const take = Encoder.encodeRange(got[off..][0..@min(window, n - off)], &parts, off);
+            try std.testing.expectEqual(@min(window, n - off), take);
+            off += take;
+        }
+        try std.testing.expectEqualSlices(u8, block, got);
+    }
+    var past: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), Encoder.encodeRange(&past, &parts, n));
+}
+
 test "encoder roundtrip never-index cookie" {
     const fields = [_]HeaderField{.{ .name = "cookie", .value = "a=b" }};
     const enc = try Encoder.encode(std.testing.allocator, &fields);
     defer std.testing.allocator.free(enc);
     try std.testing.expect((enc[0] & 0xf0) == 0x10);
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const res = try dec.decode(enc, 100, 32 * 1024, 256, 8 * 1024);
     defer dec.freeResult(res);
@@ -899,7 +1178,7 @@ test "encoder roundtrip never-index cookie" {
 
 test "invalid index is compression error" {
     const block = [_]u8{0xff}; // indexed with large value likely OOB after decode
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     // 0xff = indexed 127 — may be OOB
     const result = dec.decode(&block, 100, 32 * 1024, 256, 8 * 1024);
@@ -913,7 +1192,7 @@ test "indexed static fields are borrowed and freeResult does not free them" {
     // count, not a decoder-reported counter.
     const block = [_]u8{ 0x82, 0x86, 0x84, 0x81, 0x82, 0x86, 0x84, 0x81 };
     var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var dec = Decoder.init(counting.allocator());
+    var dec = try Decoder.init(counting.allocator());
     defer dec.deinit();
     const res = try dec.decode(&block, 100, 32 * 1024, 256, 8 * 1024);
     defer dec.freeResult(res);
@@ -924,12 +1203,13 @@ test "indexed static fields are borrowed and freeResult does not free them" {
     try std.testing.expectEqual(static_table[1].value.ptr, res.fields[0].value.ptr);
     try std.testing.expectEqual(static_table[5].name.ptr, res.fields[1].name.ptr);
     try std.testing.expectEqual(static_table[5].value.ptr, res.fields[1].value.ptr);
-    try std.testing.expect(counting.allocations <= 2);
+    // Two allocations are the table's own storage, made by `init`.
+    try std.testing.expect(counting.allocations <= 4);
 }
 
 test "dynamic-indexed result strings survive table eviction" {
     const insert = [_]u8{ 0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79, 0x0d, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72 };
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const first = try dec.decode(&insert, 100, 32 * 1024, 256, 8 * 1024);
     dec.freeResult(first);
@@ -944,7 +1224,7 @@ test "dynamic-indexed result strings survive table eviction" {
     const resize = [_]u8{0x20}; // dynamic table size update to 0
     const emptied = try dec.decode(&resize, 100, 32 * 1024, 256, 8 * 1024);
     dec.freeResult(emptied);
-    try std.testing.expectEqual(@as(usize, 0), dec.dyn.items.len);
+    try std.testing.expectEqual(@as(usize, 0), dec.table.len);
     try std.testing.expectEqualStrings("custom-key", res.fields[0].name);
     try std.testing.expectEqualStrings("custom-header", res.fields[0].value);
 }
@@ -953,15 +1233,15 @@ test "request-list allocator is independent of the dynamic table" {
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const insert = [_]u8{ 0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79, 0x0d, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72 };
-    const res = try dec.decodeInto(arena, &insert, 100, 32 * 1024, 256, 8 * 1024);
-    try std.testing.expectEqual(@as(usize, 1), dec.dyn.items.len);
-    try std.testing.expect(res.fields[0].name.ptr != dec.dyn.items[0].name.ptr);
-    const emptied = try dec.decodeInto(arena, &[_]u8{0x20}, 100, 32 * 1024, 256, 8 * 1024);
+    const res = try dec.decodeInto(arena, arena, &insert, 100, 32 * 1024, 256, 8 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), dec.table.len);
+    try std.testing.expect(res.fields[0].name.ptr != dec.table.name(0).ptr);
+    const emptied = try dec.decodeInto(arena, arena, &[_]u8{0x20}, 100, 32 * 1024, 256, 8 * 1024);
     try std.testing.expectEqual(@as(usize, 0), emptied.fields.len);
-    try std.testing.expectEqual(@as(usize, 0), dec.dyn.items.len);
+    try std.testing.expectEqual(@as(usize, 0), dec.table.len);
     try std.testing.expectEqualStrings("custom-key", res.fields[0].name);
     try std.testing.expectEqualStrings("custom-header", res.fields[0].value);
 }
@@ -969,7 +1249,7 @@ test "request-list allocator is independent of the dynamic table" {
 test "literal indexed-name and literal-name ownership" {
     // C.2.2: name is static index 4 (:path), value is a literal.
     const indexed_name = [_]u8{ 0x04, 0x0c, 0x2f, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2f, 0x70, 0x61, 0x74, 0x68 };
-    var dec = Decoder.init(std.testing.allocator);
+    var dec = try Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const borrowed_name = try dec.decode(&indexed_name, 100, 32 * 1024, 256, 8 * 1024);
     defer dec.freeResult(borrowed_name);
@@ -1125,6 +1405,254 @@ fn testAppendString(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: [
     try list.appendSlice(allocator, body);
 }
 
+/// What the table must be, written the plain way: entries newest first, each
+/// its own pair of strings, evicted from the end while the RFC's size is over
+/// the limit.
+const ModelTable = struct {
+    gpa: std.mem.Allocator,
+    entries: std.ArrayList(struct { name: []u8, value: []u8 }) = .empty,
+    max_size: usize = MAX_DYNAMIC_TABLE,
+
+    fn deinit(self: *ModelTable) void {
+        self.clear();
+        self.entries.deinit(self.gpa);
+    }
+
+    fn clear(self: *ModelTable) void {
+        for (self.entries.items) |e| {
+            self.gpa.free(e.name);
+            self.gpa.free(e.value);
+        }
+        self.entries.clearRetainingCapacity();
+    }
+
+    fn size(self: *const ModelTable) usize {
+        var n: usize = 0;
+        for (self.entries.items) |e| n += e.name.len + e.value.len + 32;
+        return n;
+    }
+
+    fn evictToFit(self: *ModelTable, limit: usize) void {
+        while (self.size() > limit) {
+            const e = self.entries.pop().?;
+            self.gpa.free(e.name);
+            self.gpa.free(e.value);
+        }
+    }
+
+    fn insert(self: *ModelTable, name: []const u8, value: []const u8) !void {
+        const entry_size = name.len + value.len + 32;
+        if (entry_size > self.max_size) return self.clear();
+        self.evictToFit(self.max_size - entry_size);
+        const n = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(n);
+        const v = try self.gpa.dupe(u8, value);
+        errdefer self.gpa.free(v);
+        try self.entries.insert(self.gpa, 0, .{ .name = n, .value = v });
+    }
+
+    fn setMaxSize(self: *ModelTable, new_size: usize) void {
+        self.max_size = new_size;
+        self.evictToFit(new_size);
+    }
+};
+
+/// `from_start`: the entries begin at offset 0. True after an insert, which
+/// compacts; an eviction on its own (a size change) leaves the gap until then.
+fn expectTableMatches(table: *const DynTable, model: *const ModelTable, from_start: bool) !void {
+    try std.testing.expectEqual(model.entries.items.len, table.len);
+    try std.testing.expectEqual(model.size(), table.size);
+    var bytes: usize = 0;
+    for (model.entries.items, 0..) |e, i| {
+        try std.testing.expectEqualStrings(e.name, table.name(i));
+        try std.testing.expectEqualStrings(e.value, table.value(i));
+        bytes += e.name.len + e.value.len;
+    }
+    // The bytes are packed: `used` is exactly the strings, with no +32 in
+    // them, and the entries follow each other from the start of the storage.
+    try std.testing.expectEqual(bytes, table.used);
+    try std.testing.expect(table.size <= table.max_size);
+    if (table.len == 0) return;
+    var at: usize = table.entryAt(table.len - 1).off;
+    if (from_start) try std.testing.expectEqual(@as(usize, 0), at);
+    var k: usize = table.len;
+    while (k > 0) {
+        k -= 1; // oldest first
+        const e = table.entryAt(k).*;
+        try std.testing.expectEqual(at, @as(usize, e.off));
+        at += @as(usize, e.name_len) + e.value_len;
+    }
+    try std.testing.expect(at <= table.data.len);
+}
+
+test "DynTable: random inserts, evictions and size changes match a plain model, and the bytes stay packed" {
+    const gpa = std.testing.allocator;
+    var dec = try Decoder.init(gpa);
+    defer dec.deinit();
+    var model: ModelTable = .{ .gpa = gpa };
+    defer model.deinit();
+    var rng = std.Random.DefaultPrng.init(0x7ab1e);
+    const r = rng.random();
+    var bytes_buf: [MAX_DYNAMIC_TABLE + 64]u8 = undefined;
+    r.bytes(&bytes_buf);
+    var inserted: usize = 0;
+    var evicting_inserts: usize = 0;
+    var cleared_by_big: usize = 0;
+    for (0..20_000) |step| {
+        var from_start = false;
+        switch (r.uintLessThan(u8, 100)) {
+            // Most inserts are small, some fill the table, a few are bigger
+            // than it and must empty it.
+            0...89 => {
+                const cap: usize = switch (r.uintLessThan(u8, 10)) {
+                    0 => MAX_DYNAMIC_TABLE + 8,
+                    1, 2 => 1500,
+                    else => 90,
+                };
+                const name_len = r.uintLessThan(usize, cap / 3 + 1);
+                const value_len = r.uintLessThan(usize, cap + 1);
+                const name = bytes_buf[r.uintLessThan(usize, 32)..][0..name_len];
+                const value = bytes_buf[r.uintLessThan(usize, 32)..][0..value_len];
+                const before = model.entries.items.len;
+                const was_full = model.size() + name_len + value_len + 32 > model.max_size;
+                if (name_len + value_len + 32 > model.max_size and before > 0) cleared_by_big += 1;
+                if (was_full and name_len + value_len + 32 <= model.max_size) evicting_inserts += 1;
+                try model.insert(name, value);
+                dec.table.insert(name, value);
+                inserted += 1;
+                from_start = true;
+            },
+            90...94 => {
+                const new_size = switch (r.uintLessThan(u8, 4)) {
+                    0 => 0,
+                    1 => MAX_DYNAMIC_TABLE,
+                    else => r.uintLessThan(usize, MAX_DYNAMIC_TABLE + 1),
+                };
+                model.setMaxSize(new_size);
+                dec.table.setMaxSize(new_size);
+            },
+            else => {
+                // A size update through the decoder, as a block carries it.
+                const new_size = r.uintLessThan(usize, MAX_DYNAMIC_TABLE + 1);
+                var upd: [4]u8 = undefined;
+                var pos: usize = 0;
+                try encodeIntInto(&upd, &pos, new_size, 5, 0x20);
+                const res = try dec.decode(upd[0..pos], 10, 1000, 100, 100);
+                dec.freeResult(res);
+                model.setMaxSize(new_size);
+            },
+        }
+        expectTableMatches(&dec.table, &model, from_start) catch |err| {
+            std.debug.print("table differs from the model at step {d}\n", .{step});
+            return err;
+        };
+    }
+    // The sequence did what its name says: it evicted, and it emptied the
+    // table with an entry larger than it.
+    try std.testing.expect(inserted > 10_000);
+    try std.testing.expect(evicting_inserts > 500);
+    try std.testing.expect(cleared_by_big > 20);
+}
+
+test "DynTable: fill to the limit, evict the oldest, compact, and the survivors keep their bytes" {
+    const gpa = std.testing.allocator;
+    var dec = try Decoder.init(gpa);
+    defer dec.deinit();
+    const t = &dec.table;
+    // Three entries of 1,300 accounted bytes each (1,268 of storage: a
+    // 4-byte name and a 1,264-byte value) fill 3,900 of the 4,096.
+    var value: [1268 - 4]u8 = undefined;
+    for (0..3) |k| {
+        @memset(&value, @intCast('a' + k));
+        t.insert("name", &value);
+    }
+    try std.testing.expectEqual(@as(usize, 3), t.len);
+    try std.testing.expectEqual(@as(usize, 3 * 1300), t.size);
+    try std.testing.expectEqual(@as(usize, 3 * 1268), t.used);
+    // A fourth does not fit: the oldest ('a') goes, the rest move to the front.
+    @memset(&value, 'd');
+    t.insert("name", &value);
+    try std.testing.expectEqual(@as(usize, 3), t.len);
+    try std.testing.expectEqual(@as(u8, 'd'), t.value(0)[0]);
+    try std.testing.expectEqual(@as(u8, 'c'), t.value(1)[0]);
+    try std.testing.expectEqual(@as(u8, 'b'), t.value(2)[0]);
+    try std.testing.expectEqual(@as(usize, 0), t.entryAt(2).off);
+    try std.testing.expectEqual(@as(usize, 3 * 1268), t.used);
+    for (0..t.len) |i| {
+        const want: u8 = @intCast('d' - i);
+        for (t.value(i)) |b| try std.testing.expectEqual(want, b);
+        try std.testing.expectEqualStrings("name", t.name(i));
+    }
+}
+
+test "DynTable: a size update to 0 empties the table; one above the limit is a compression error" {
+    const gpa = std.testing.allocator;
+    var dec = try Decoder.init(gpa);
+    defer dec.deinit();
+    dec.table.insert("a", "b");
+    dec.table.insert("c", "d");
+    try std.testing.expectEqual(@as(usize, 2), dec.table.len);
+
+    const to_zero = try dec.decode(&[_]u8{0x20}, 10, 1000, 100, 100);
+    dec.freeResult(to_zero);
+    try std.testing.expectEqual(@as(usize, 0), dec.table.len);
+    try std.testing.expectEqual(@as(usize, 0), dec.table.size);
+    // And nothing fits until the size is raised again.
+    dec.table.insert("a", "b");
+    try std.testing.expectEqual(@as(usize, 0), dec.table.len);
+
+    // 4096 is the limit and is accepted; 4097 is not. (5-bit prefix: 31 and
+    // the rest in 7-bit groups.)
+    const at_limit = try dec.decode(&[_]u8{ 0x3f, 0xe1, 0x1f }, 10, 1000, 100, 100);
+    dec.freeResult(at_limit);
+    try std.testing.expectEqual(MAX_DYNAMIC_TABLE, dec.table.max_size);
+    try std.testing.expectError(error.CompressionError, dec.decode(&[_]u8{ 0x3f, 0xe2, 0x1f }, 10, 1000, 100, 100));
+    // A size update after the first field of a block is also an error.
+    try std.testing.expectError(error.CompressionError, dec.decode(&[_]u8{ 0x82, 0x20 }, 10, 1000, 100, 100));
+}
+
+test "a field past the request's budget still enters the table, whole, from the scratch" {
+    // A budget of one field: the second literal (incrementally indexed) is
+    // past it, so it is truncated, and the table must still get it exactly.
+    const gpa = std.testing.allocator;
+    var dec = try Decoder.init(gpa);
+    defer dec.deinit();
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    var long_value: [900]u8 = undefined;
+    for (&long_value, 0..) |*b, i| b.* = @intCast('a' + i % 26);
+    try testLiteral(&block, gpa, 0x40, "x-first", "1", false);
+    // A Huffman value, a raw name; and a name by (static) index with a Huffman value.
+    try testLiteral(&block, gpa, 0x40, "x-second", &long_value, true);
+    try testLiteral(&block, gpa, 0x40, "x-third", "3", false);
+
+    var scratch_buf: [MAX_DYNAMIC_TABLE]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&scratch_buf);
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const res = try dec.decodeInto(arena_inst.allocator(), scratch.allocator(), block.items, 1, 32 * 1024, 256, 8 * 1024);
+    try std.testing.expect(res.truncated);
+    try std.testing.expectEqual(@as(usize, 1), res.fields.len);
+    // Everything was given back to the scratch.
+    try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
+
+    try std.testing.expectEqual(@as(usize, 3), dec.table.len);
+    try std.testing.expectEqualStrings("x-third", dec.table.name(0));
+    try std.testing.expectEqualStrings("x-second", dec.table.name(1));
+    try std.testing.expectEqualSlices(u8, &long_value, dec.table.value(1));
+    try std.testing.expectEqualStrings("x-first", dec.table.name(2));
+
+    // And an entry bigger than the table, past the budget, empties it.
+    var huge: [MAX_DYNAMIC_TABLE]u8 = @splat('h');
+    var big_block: std.ArrayList(u8) = .empty;
+    defer big_block.deinit(gpa);
+    try testLiteral(&big_block, gpa, 0x40, "x-one", "1", false);
+    try testLiteral(&big_block, gpa, 0x40, "x-huge", &huge, false);
+    const res2 = try dec.decodeInto(arena_inst.allocator(), scratch.allocator(), big_block.items, 1, 32 * 1024, 256, 8 * 1024);
+    try std.testing.expect(res2.truncated or res2.policy_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), dec.table.len);
+}
+
 const bomb_limits = struct {
     const max_fields = 100;
     const max_decoded = 32 * 1024;
@@ -1136,7 +1664,7 @@ test "decode takes at most requestBytesBound from the request allocator: a table
     // One 4000-byte table entry, then 64 KiB of one-byte references to it:
     // 65,000 fields and about 260 MB if every one were materialized.
     const gpa = std.testing.allocator;
-    var dec = Decoder.init(gpa);
+    var dec = try Decoder.init(gpa);
     defer dec.deinit();
     var big: [4000 - 32 - 1]u8 = undefined;
     @memset(&big, 'v');
@@ -1156,7 +1684,7 @@ test "decode takes at most requestBytesBound from the request allocator: a table
     const buf = try gpa.alloc(u8, bound);
     defer gpa.free(buf);
     var fba = std.heap.FixedBufferAllocator.init(buf);
-    const res = try dec.decodeInto(fba.allocator(), block, bomb_limits.max_fields, bomb_limits.max_decoded, bomb_limits.max_name, bomb_limits.max_value);
+    const res = try dec.decodeInto(fba.allocator(), std.testing.allocator, block, bomb_limits.max_fields, bomb_limits.max_decoded, bomb_limits.max_name, bomb_limits.max_value);
     try std.testing.expect(res.truncated);
     try std.testing.expect(res.policy_exceeded);
     try std.testing.expect(fba.end_index <= bound);
@@ -1171,7 +1699,7 @@ test "decode takes at most requestBytesBound from the request allocator: a table
 
 test "decode takes at most requestBytesBound: a string past the budget never reaches the request allocator" {
     const gpa = std.testing.allocator;
-    var dec = Decoder.init(gpa);
+    var dec = try Decoder.init(gpa);
     defer dec.deinit();
     const bound = try Decoder.requestBytesBound(bomb_limits.max_fields, bomb_limits.max_decoded);
     const buf = try gpa.alloc(u8, bound);
@@ -1187,7 +1715,7 @@ test "decode takes at most requestBytesBound: a string past the budget never rea
             defer block.deinit(gpa);
             try testLiteral(&block, gpa, prefix, "x-big", &huge, huffman);
             var fba = std.heap.FixedBufferAllocator.init(buf);
-            const res = try dec.decodeInto(fba.allocator(), block.items, 100, bomb_limits.max_decoded, 256, 8 * 1024);
+            const res = try dec.decodeInto(fba.allocator(), std.testing.allocator, block.items, 100, bomb_limits.max_decoded, 256, 8 * 1024);
             try std.testing.expect(res.truncated);
             try std.testing.expect(res.policy_exceeded);
             try std.testing.expectEqual(@as(usize, 0), res.fields.len);
@@ -1202,7 +1730,7 @@ test "a Huffman field whose upper bound passes the budget but whose real size fi
     // upper bound 20,000. Put them after 20,000 bytes of other fields so that
     // upper + used passes 32 KiB while the real size does not.
     const gpa = std.testing.allocator;
-    var dec = Decoder.init(gpa);
+    var dec = try Decoder.init(gpa);
     defer dec.deinit();
     var plain: [20000]u8 = undefined;
     @memset(&plain, 'p');
@@ -1228,7 +1756,7 @@ test "a Huffman field whose upper bound passes the budget but whose real size fi
     defer gpa.free(buf);
     for ([_][]const u8{ block.items, block2.items }) |b| {
         var fba = std.heap.FixedBufferAllocator.init(buf);
-        const res = try dec.decodeInto(fba.allocator(), b, 100, 32 * 1024, 256, 8 * 1024);
+        const res = try dec.decodeInto(fba.allocator(), std.testing.allocator, b, 100, 32 * 1024, 256, 8 * 1024);
         try std.testing.expect(!res.truncated);
         const last = res.fields[res.fields.len - 1];
         try std.testing.expectEqualStrings("x-second", last.name);
@@ -1242,7 +1770,7 @@ test "a random block never makes decode fail on a bounded request allocator" {
     // built from valid pieces, against a decoder whose table already holds
     // large entries, each decoded in an allocator of exactly the bound.
     const gpa = std.testing.allocator;
-    var dec = Decoder.init(gpa);
+    var dec = try Decoder.init(gpa);
     defer dec.deinit();
     var seed_block: std.ArrayList(u8) = .empty;
     defer seed_block.deinit(gpa);
@@ -1276,7 +1804,7 @@ test "a random block never makes decode fail on a bounded request allocator" {
         }
         const block = built.items;
         var fba = std.heap.FixedBufferAllocator.init(buf);
-        if (dec.decodeInto(fba.allocator(), block, 100, 32 * 1024, 256, 8 * 1024)) |res| {
+        if (dec.decodeInto(fba.allocator(), std.testing.allocator, block, 100, 32 * 1024, 256, 8 * 1024)) |res| {
             decoded_ok += 1;
             HeaderField.freeOwnedSlice(fba.allocator(), res.fields);
         } else |err| {
@@ -1287,8 +1815,8 @@ test "a random block never makes decode fail on a bounded request allocator" {
         max_used = @max(max_used, fba.end_index);
         // A bad block can leave the table in any state; start over when it
         // grew past what the seed block built.
-        if (dec.dyn.items.len > 6) {
-            dec.clearDyn();
+        if (dec.table.len > 6) {
+            dec.table.clear();
             const again = try dec.decode(seed_block.items, 100, 32 * 1024, 256, 8 * 1024);
             dec.freeResult(again);
         }

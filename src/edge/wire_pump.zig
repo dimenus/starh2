@@ -195,9 +195,9 @@ pub const ReadPump = struct {
             var dest: [1][]u8 = .{buf};
             const n = reader.interface.readVec(&dest) catch {
                 self.returnIndex(idx);
-                // Unblock a write parked on a peer that already closed. The
-                // actor may be in `write_ch.putOne` holding `session_mu` and
-                // cannot observe this EOF until that put returns.
+                // Unblock a write parked on a peer that already closed, so the
+                // pump gives its queue slots and chunks back and the completions
+                // that wake a held drain arrive.
                 self.stream.shutdown(self.io, .send) catch {};
                 self.postEof();
                 return;
@@ -238,6 +238,9 @@ pub var test_fail_next_write: std.atomic.Value(bool) = .init(false);
 /// writing them, as a socket write that never completes would. Unlike
 /// `test_write_delay_ms`, it can be set after a connection is running.
 pub var test_hold_writes: std.atomic.Value(bool) = .init(false);
+/// Test-only: how many times a WritePump has entered the hold above. A test
+/// that sets the flag waits for this to rise before it relies on a held pump.
+pub var test_hold_entered: std.atomic.Value(u64) = .init(0);
 /// Test-only: monotonic ns of last successful WritePump completion that carried a ticket.
 pub var test_last_ticket_ok_ns: std.atomic.Value(u64) = .init(0);
 /// Test-only: ticket id of that completion (0 = none).
@@ -424,13 +427,19 @@ pub const WritePump = struct {
                     count += 1;
                 }
             }
-            while (test_hold_writes.load(.acquire)) {
-                self.io.sleep(.fromMilliseconds(1), .awake) catch {
-                    for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
-                    self.failDrain();
-                    self.post(.{ .shutdown = true });
-                    return;
-                };
+            if (test_hold_writes.load(.acquire)) {
+                // Tells a test the pump is in the hold, with chunks taken and
+                // none written: the flag being set is not that, because the
+                // pump may read it later than the test wrote it.
+                _ = test_hold_entered.fetchAdd(1, .release);
+                while (test_hold_writes.load(.acquire)) {
+                    self.io.sleep(.fromMilliseconds(1), .awake) catch {
+                        for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
+                        self.failDrain();
+                        self.post(.{ .shutdown = true });
+                        return;
+                    };
+                }
             }
             if (self.test_delay_ms > 0) {
                 self.io.sleep(.fromMilliseconds(@intCast(self.test_delay_ms)), .awake) catch {

@@ -5,7 +5,7 @@ fn testOne(_: void, smith: *std.testing.Smith) !void {
     @disableInstrumentation();
     var buf: [4096]u8 = undefined;
     const n = smith.slice(&buf);
-    var dec = starh2.core.hpack.Decoder.init(std.testing.allocator);
+    var dec = try starh2.core.hpack.Decoder.init(std.testing.allocator);
     defer dec.deinit();
     const res = dec.decode(buf[0..n], 100, 32 * 1024, 256, 8 * 1024) catch return;
     dec.freeResult(res);
@@ -28,7 +28,7 @@ test "fuzz hpack" {
 }
 
 test "mutation canary invalid index" {
-    var dec = starh2.core.hpack.Decoder.init(std.testing.allocator);
+    var dec = try starh2.core.hpack.Decoder.init(std.testing.allocator);
     defer dec.deinit();
     try std.testing.expectError(error.CompressionError, dec.decode(&[_]u8{0x80}, 100, 32 * 1024, 256, 8 * 1024));
 }

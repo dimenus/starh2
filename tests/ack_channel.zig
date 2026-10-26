@@ -250,11 +250,19 @@ const Case = enum { body_waves, flush_barriers };
 
 /// Wait, by yielding, until DATA has not moved for 300 ms: with completions
 /// held, the pause is what stops it.
-fn waitDataStill(client: *const Client) void {
+///
+/// The actor is slow here, not deaf: the hold keeps it from taking
+/// completions, which are also what wake it when the pump gives a write-pool
+/// chunk back. A real slow actor comes round to the held pop by itself; this
+/// one is woken the way a peer would wake it, with a PING every 10 ms, so the
+/// write-pool pause (8 chunks) is not mistaken for the ack-channel pause under
+/// test.
+fn waitDataStill(client: *Client) void {
     var last = client.data_frames.load(.acquire);
     var still_since = nowNs();
     const deadline = nowNs() + 10 * std.time.ns_per_s;
     while (!client.done.load(.acquire) and nowNs() < deadline) {
+        client.ping.store(true, .release);
         zio.sleep(.fromMilliseconds(10)) catch {};
         const now_frames = client.data_frames.load(.acquire);
         if (now_frames != last) {
@@ -286,6 +294,10 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, outbound_bytes: usize, case
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
+    // One completion per DATA frame is what fills the channel here; packing
+    // small frames into shared chunks would need 4 times the traffic.
+    starh2.edge.emit_batch.test_pack_small_data.store(false, .release);
+    defer starh2.edge.emit_batch.test_pack_small_data.store(true, .release);
     conn_mod.test_ack_room_pauses.store(0, .release);
     if (comptime @hasDecl(conn_mod, "test_ack_room_waits")) conn_mod.test_ack_room_waits.store(0, .release);
     if (comptime @hasDecl(conn_mod, "test_ack_bound_refusals")) conn_mod.test_ack_bound_refusals.store(0, .release);

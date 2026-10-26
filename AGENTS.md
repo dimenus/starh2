@@ -192,9 +192,12 @@ chunk into the send staging buffer. Do not wrap a record API beside this.
   `config.gpa`, and there is no fallback to it: over a cap the allocation
   fails with `OutOfMemory` and the stream gets a 500/503 (an RST after commit).
   The actor returns a request's blocks in `releaseSlot`, after the join, and
-  `releaseLease` asserts it is not called from a handler's task. Frames, write
-  chunks, the HPACK table and the preface frames still use `config.gpa` (stage
-  3); `tests/slot_reuse.zig` counts the large calls that must stay at zero.
+  `releaseLease` asserts it is not called from a handler's task. The HPACK
+  decoder's table is two fixed arrays in the slot's boot buffer
+  (`hpack.DynTable`: 4,096 bytes of names and values, 128 descriptors) and
+  takes no allocator after boot; the decoder's transient room for one field is
+  the slot's `hpack_scratch`. `tests/slot_reuse.zig` counts the
+  general-allocator calls that must stay at zero.
   A block returned while the pool's free resident bytes are over
   `Limits.request_pool_retain_bytes` is decommitted at once (`retired`). The
   pool mapping asks Linux for no huge pages.
@@ -202,6 +205,31 @@ chunk into the send staging buffer. Do not wrap a record API beside this.
   HTTP/1.1 is the exception: it keeps its preallocated buffers (`h1_body`) and
   has no server-wide body reservation since stage 2; t-3537 moves it onto the
   pool.
+- An outbound frame is built in a frame slab, or in a write-pool chunk when it
+  is bigger than a slab or the slabs are rented; there is no `config.gpa`
+  fallback, and a refusal is `OutOfMemory`. A frame made outside a scheduler
+  pop (a handler's HEADERS, a control frame) may take a chunk only while more
+  than `POP_PUSHES` stay free, because the drain pops only with that many free
+  (`Connection.outboundMemoryPaused`, the pause hook on h2c and TLS). The drain
+  stops there and a write completion wakes the actor to drain again: nothing
+  waits for memory and nothing waits holding `session_mu`. A header block above
+  16 KiB is a HEADERS frame plus CONTINUATION frames, and
+  `FairScheduler.block_open` lets nothing else out between them. A response
+  header list is bounded (`Limits.response_header_fields`,
+  `response_header_bytes`, checked in `Session.cmdHeaders` before it encodes),
+  is built in the request's arena (`HandlerCtx.arena`), and over the bound or
+  without frame memory is `ResponseRefused`: nothing was queued, `Response`
+  takes its commit back, and the handler's request is answered 500. The TLS
+  handshake leftover is ingested straight from the handshake task's stack
+  (`serveTlsThenBranch`), and the idle-body sweep list is a fixed `stale_ids`
+  array in the Session. Every control
+  frame (`Session.controlFrame`), the server preface included, is a frame from
+  the pools: the preface is queued by `Connection.finishBoot`, after the hooks
+  exist, and nothing may be queued before it. GOAWAY and RST_STREAM are
+  `FrameClass.terminal` and may take the `frame_slab_reserve` slabs that no
+  other frame may. `Limits.checkFramePool` (at boot, in `Connection.init` too)
+  refuses a pool that cannot hold the preface and a terminal frame: slabs of
+  at least `frame.max_control_frame_bytes` (45), and at least 4 of them.
 - Intent payloads, decoded headers, dispatch requests, scheduler leases, and
   tickets have explicit owners. Error paths must release exactly once.
 - `std.testing.FailingAllocator` is not thread-safe; fail-index/counting tests

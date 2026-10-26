@@ -573,16 +573,20 @@ test "regression: >256 sequential streams reuse concurrency on same session" {
     try std.testing.expect(sid > 512);
 }
 
-test "hpack insert OOM is OutOfMemory not CompressionError" {
+test "hpack: a request allocation that fails while decoding is OutOfMemory, not CompressionError" {
     const hpack = starh2.core.hpack;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var dec = hpack.Decoder.init(failing.allocator());
+    // The table takes no memory from anyone after `init`, so the only
+    // allocations a decode can lose are the request's: its field array
+    // (index 0) and then each string (index 1 and on).
+    var dec = try hpack.Decoder.init(std.testing.allocator);
     defer dec.deinit();
-    // Indexed name + literal value with indexing forces insert dupes.
-    // 0x40 = literal with incremental indexing, new name — will allocate.
+    // 0x40 = literal with incremental indexing, new name.
     const block = [_]u8{ 0x40, 0x01, 'a', 0x01, 'b' };
-    const result = dec.decode(&block, 10, 1000, 100, 100);
-    try std.testing.expectError(error.OutOfMemory, result);
+    for (0..3) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const result = dec.decodeInto(failing.allocator(), std.testing.allocator, &block, 10, 1000, 100, 100);
+        try std.testing.expectError(error.OutOfMemory, result);
+    }
 }
 
 

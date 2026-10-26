@@ -17,6 +17,7 @@
 //! `FramePayload`'s tag is the ownership; `FrameEvent.deinit` is the only free
 //! path — a no-op for an unowned view.
 const std = @import("std");
+const hpack = @import("hpack.zig");
 const assert = std.debug.assert;
 
 pub const FRAME_HEADER_LEN: usize = 9;
@@ -521,13 +522,39 @@ pub const Setting = struct {
 /// `max_frame_size` mirrors the parser's boot-reserved scratch buffer.
 pub fn serverPrefaceSettings(max_concurrent_streams: u32) [6]Setting {
     return .{
-        .{ .id = .header_table_size, .value = 4096 },
+        // The size of the decoder's table: the peer may use up to this much of it.
+        .{ .id = .header_table_size, .value = hpack.MAX_DYNAMIC_TABLE },
         .{ .id = .enable_push, .value = 0 },
         .{ .id = .max_concurrent_streams, .value = max_concurrent_streams },
         .{ .id = .initial_window_size, .value = 65_535 },
         .{ .id = .max_frame_size, .value = 16_384 },
         .{ .id = .max_header_list_size, .value = 32_768 },
     };
+}
+
+/// Encoded sizes of the control frames this server serializes (header
+/// included), so a pool that must hold them is judged by what goes on the
+/// wire and not by the 9-byte header.
+pub const server_preface_settings_bytes: usize = FRAME_HEADER_LEN + 6 * serverPrefaceSettings(0).len;
+pub const window_update_frame_bytes: usize = FRAME_HEADER_LEN + 4;
+pub const rst_stream_frame_bytes: usize = FRAME_HEADER_LEN + 4;
+/// GOAWAY with no debug data, which is all this server sends.
+pub const goaway_frame_bytes: usize = FRAME_HEADER_LEN + 8;
+pub const ping_frame_bytes: usize = FRAME_HEADER_LEN + 8;
+/// The largest of them: the server preface's SETTINGS.
+pub const max_control_frame_bytes: usize = @max(
+    server_preface_settings_bytes,
+    @max(@max(window_update_frame_bytes, rst_stream_frame_bytes), @max(goaway_frame_bytes, ping_frame_bytes)),
+);
+
+test "control frame sizes are what the serializers write" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(server_preface_settings_bytes, try Serializer.settingsFrame(&buf, false, &serverPrefaceSettings(256)));
+    try std.testing.expectEqual(window_update_frame_bytes, try Serializer.windowUpdate(&buf, 1, 1));
+    try std.testing.expectEqual(rst_stream_frame_bytes, try Serializer.rstStream(&buf, 1, .cancel));
+    try std.testing.expectEqual(goaway_frame_bytes, try Serializer.goaway(&buf, 1, .no_error, &.{}));
+    try std.testing.expectEqual(ping_frame_bytes, try Serializer.ping(&buf, false, &@as([8]u8, @splat(0))));
+    try std.testing.expectEqual(server_preface_settings_bytes, max_control_frame_bytes);
 }
 
 test "encodedOnWireLen reads the header, not the slab tail" {

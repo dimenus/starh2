@@ -1135,9 +1135,23 @@ fn writeGpaCounters(w: *std.Io.Writer, c: *CountingGpa) !void {
         first = false;
         try w.print("[{d},{d}]", .{ i, gap });
     }
-    try w.print("],\"fallbacks\":{{\"frame\":{d},\"write_chunk\":{d}}}", .{
-        conn_mod.gpa_fallbacks.frame.load(.monotonic),
-        conn_mod.gpa_fallbacks.write_chunk.load(.monotonic),
+    const om = conn_mod.outbound_memory;
+    try w.print("],\"outbound\":{{\"frames_built\":{d},\"frames_from_slab\":{d},\"frames_from_chunk\":{d},\"frames_in_scratch\":{d},\"chunks_leased\":{d},\"chunks_to_pump\":{d},\"frames_refused\":{d},\"chunks_refused\":{d},\"drain_turns\":{d},\"drain_memory_pauses\":{d},\"control_frames\":{d},\"hpack_insertions\":{d},\"tls_leftovers\":{d},\"response_header_lists\":{d},\"body_idle_expiries\":{d}}}", .{
+        om.frames_built.load(.monotonic),
+        om.frames_from_slab.load(.monotonic),
+        om.frames_from_chunk.load(.monotonic),
+        om.frames_in_scratch.load(.monotonic),
+        om.chunks_leased.load(.monotonic),
+        om.chunks_to_pump.load(.monotonic),
+        om.frames_refused.load(.monotonic),
+        om.chunks_refused.load(.monotonic),
+        om.drain_turns.load(.monotonic),
+        om.drain_memory_pauses.load(.monotonic),
+        starh2.core.session.control_frames_built.load(.monotonic),
+        starh2.core.hpack.table_insertions.load(.monotonic),
+        conn_mod.h2_work.tls_leftovers.load(.monotonic),
+        conn_mod.h2_work.response_header_lists.load(.monotonic),
+        starh2.core.session.body_idle_expiries.load(.monotonic),
     });
 }
 

@@ -47,7 +47,7 @@ test "bound terms use concrete sizes and capacities" {
     try std.testing.expect(b.terms.h1_body > 0);
 
     var no_chunks = lim;
-    no_chunks.inbound_wire_chunks_per_connection = 1;
+    no_chunks.inbound_wire_chunks_per_connection = starh2.core.limits.MIN_WRITE_POOL_CHUNKS;
     const b2 = try no_chunks.resourceUpperBound();
     try std.testing.expect(b.terms.slot_boot > b2.terms.slot_boot);
     try std.testing.expect(b.allocator_bytes > b2.allocator_bytes);
@@ -410,4 +410,34 @@ test "h2c: a write queue smaller than one pop's reservation is rejected at boot 
         .limits = lim,
     });
     server.deinit(gpa);
+}
+
+test "frame pool: settings that cannot hold the preface and a terminal frame are InvalidConfig, the smallest that can are accepted" {
+    const frame = starh2.core.frame;
+    var lim = starh2.Limits.defaults;
+    // The biggest control frame is the preface SETTINGS, 45 bytes: judged by
+    // the encoded frame, not by the 9-byte header the old check used.
+    try std.testing.expectEqual(@as(usize, 45), frame.max_control_frame_bytes);
+
+    lim.frame_slab_bytes = frame.FRAME_HEADER_LEN;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim.frame_slab_bytes = frame.window_update_frame_bytes;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim.frame_slab_bytes = frame.max_control_frame_bytes - 1;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim.frame_slab_bytes = frame.max_control_frame_bytes;
+    _ = try lim.resourceUpperBound();
+
+    // Under 4 slabs the terminal reserve is 0 (a quarter of the pool).
+    for ([_]usize{ 0, 1, 2, 3 }) |slabs| {
+        lim.frame_slabs_per_connection = slabs;
+        try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    }
+    lim.frame_slabs_per_connection = 4;
+    _ = try lim.resourceUpperBound();
+    try std.testing.expectEqual(@as(usize, 1), lim.frameSlabReserve());
+    // The reserve is capped at the control pool's, and the preface still fits above it.
+    lim.frame_slabs_per_connection = 4096;
+    try std.testing.expectEqual(starh2.core.limits.TERMINAL_CONTROL_RESERVE_ENTRIES, lim.frameSlabReserve());
+    _ = try lim.resourceUpperBound();
 }
