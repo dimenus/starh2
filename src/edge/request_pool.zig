@@ -1368,13 +1368,24 @@ test "an alignment above a page takes a block sized for the padding, and a block
     al.free(p);
     try testing.expectEqual(@as(usize, 128 * 1024), a.held);
     // A second one, in a request that already holds a first block: the new
-    // block is not the first, and goes home at once on the tail free.
-    const q = try al.alignedAlloc(u8, .fromByteUnits(256 * 1024), 100 * 1024);
+    // block is not the first, and goes home at once on the tail free. A fresh
+    // arena whose first block (64 KiB) is nearly full, so no address in it
+    // can hold 100 KiB: otherwise, when the mapping happens to put a 256 KiB
+    // boundary inside a held block with room after it, the arena rightly
+    // bumps there, and the result depends on where the OS placed the mapping
+    // (t-3568).
+    var c = Arena.init(&pool, &budget);
+    defer c.release();
+    const cl = c.allocator();
+    const first = try cl.alloc(u8, 60 * 1024);
+    try testing.expectEqual(@as(usize, 64 * 1024), c.held);
+    const q = try cl.alignedAlloc(u8, .fromByteUnits(256 * 1024), 100 * 1024);
     try testing.expectEqual(@as(usize, 0), @intFromPtr(q.ptr) % (256 * 1024));
-    try testing.expectEqual(@as(?Reason, null), a.refusal);
-    try testing.expectEqual(@as(usize, 128 * 1024 + 512 * 1024), a.held);
-    al.free(q);
-    try testing.expectEqual(@as(usize, 128 * 1024), a.held);
+    try testing.expectEqual(@as(?Reason, null), c.refusal);
+    try testing.expectEqual(@as(usize, 64 * 1024 + 512 * 1024), c.held);
+    cl.free(q);
+    try testing.expectEqual(@as(usize, 64 * 1024), c.held);
+    cl.free(first);
     // An alignment past what the largest class can hold is not a server cap
     // and not a memory error: the request would be over its own cap. (On an
     // arena with no block yet, so no address in a held block can happen to
