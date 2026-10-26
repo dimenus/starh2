@@ -38,6 +38,18 @@
 # `init` is glibc malloc on Linux). RSS_SERVER_ENV is prepended to the server
 # command, e.g. RSS_SERVER_ENV="GLIBC_TUNABLES=glibc.malloc.trim_threshold=268435456".
 #
+# On Linux /mem is fetched at every phase end even without RSS_COUNT_GPA, and
+# the pool's touched_bytes must be a number in it (curl is then required). A
+# failed, empty or HTTP-error fetch there makes the phase invalid.
+#
+# RSS_NO_THP=1 starts the server with --no-thp (Linux prctl PR_SET_THP_DISABLE
+# for the whole process; the ready line must say "thp_disabled":1, or the run
+# stops). With THP `always` RSS partly measures the kernel's huge-page choice,
+# so run an A/B with it on for every arm. RSS_SERVER_ARGS is split into words
+# and appended to the server command, e.g.
+# RSS_SERVER_ARGS="--request-bytes-per-server 4294967296 --request-pool-retain-bytes 67108864"
+# so a run can set the request pool's caps without a wrapper script.
+#
 # RSS_COUNT_GPA=1 runs the server with --count-gpa and reads /mem at each
 # phase end (saved as mem-<phase>-<cycle>.json): the bytes the server has
 # allocated and not freed. RSS that rises while live bytes stay flat is the
@@ -81,9 +93,12 @@ SERVER_CPUS=${RSS_SERVER_CPUS:-}
 CLIENT_CPUS=${RSS_CLIENT_CPUS:-}
 EXECUTORS=${RSS_EXECUTORS:-}
 COUNT_GPA=${RSS_COUNT_GPA:-0}
+NO_THP=${RSS_NO_THP:-0}
+SERVER_ARGS=${RSS_SERVER_ARGS:-}
 
 tools=(h2load go)
-[ "$COUNT_GPA" = 1 ] && tools+=(curl)
+# /mem is fetched with curl when counting, and on Linux always (touched_bytes).
+{ [ "$COUNT_GPA" = 1 ] || [ "$(uname -s)" = Linux ]; } && tools+=(curl)
 for tool in "${tools[@]}"; do
   command -v "$tool" >/dev/null || { echo "rss-stability: $tool not found" >&2; exit 2; }
 done
@@ -141,26 +156,59 @@ srv_cmd+=(env $SERVER_ENV "$BIN" --port 0 --mode tls --cert "$CERT" --key "$KEY"
   --sse-interval-ms "$SSE_INTERVAL_MS" --max-connections $((SSE + LOAD_C + POST_C + CHURN_C + 64)))
 [ -n "$EXECUTORS" ] && srv_cmd+=(--executors "$EXECUTORS")
 [ "$COUNT_GPA" = 1 ] && srv_cmd+=(--count-gpa)
+[ "$NO_THP" = 1 ] && srv_cmd+=(--no-thp)
+# shellcheck disable=SC2206
+[ -n "$SERVER_ARGS" ] && srv_cmd+=($SERVER_ARGS)
 "${srv_cmd[@]}" > "$OUT/server.out" 2> "$OUT/server.err" &
 SRV=$!
 for _ in $(seq 100); do grep -q '"ready":true' "$OUT/server.out" 2>/dev/null && break; sleep 0.1; done
 grep -q '"ready":true' "$OUT/server.out" || { echo "rss-stability: server never printed its ready line" >&2; exit 2; }
 # The ready line names the allocator the server really runs with.
 grep -q "\"gpa\":\"$GPA\"" "$OUT/server.out" || { echo "rss-stability: server is not on gpa=$GPA: $(cat "$OUT/server.out")" >&2; exit 2; }
+if [ "$NO_THP" = 1 ]; then
+  grep -q '"thp_disabled":1' "$OUT/server.out" || { echo "rss-stability: RSS_NO_THP=1 but the server did not disable THP: $(cat "$OUT/server.out")" >&2; exit 2; }
+fi
 PORT=$(grep -o '"port":[0-9]*' "$OUT/server.out" | cut -d: -f2)
 BASE=https://127.0.0.1:$PORT
 if [ "$COUNT_GPA" = 1 ]; then
   grep -q '"count_gpa":1' "$OUT/server.out" || { echo "rss-stability: server is not counting its allocator: $(cat "$OUT/server.out")" >&2; exit 2; }
 fi
 
-# Live bytes from /mem in KB, or "-" when not counting. A failed read is
-# "?", and fails the run below: a missing number must not read as flat.
-live_kb() { # live_kb <label>: also keeps the whole /mem reply as mem-<label>.json
-  [ "$COUNT_GPA" = 1 ] || { echo -; return; }
-  local b
-  curl -sk --http2 --max-time 5 "$BASE/mem" > "$OUT/mem-$1.json"
-  b=$(grep -o '"live_bytes":[0-9]*' "$OUT/mem-$1.json" | cut -d: -f2)
+# What /mem says, as one cell for the rows: live bytes in KB, "-" when there is
+# nothing to report, "?" when a number that must be there is not. A "?" fails
+# the run below: a missing number must not read as flat.
+#
+# Two separate checks. live_bytes is read only with RSS_COUNT_GPA=1 (without
+# --count-gpa the server has none). The pool's touched_bytes (mincore) is
+# checked on Linux whenever the reply has a request_pool, whatever
+# RSS_COUNT_GPA says: there it must be a number, and a null is a failure
+# ("touched_bytes_error"), not "not available", so a run that cannot read it is
+# not a result.
+mem_value() { # mem_value <reply file> <uname -s> <count_gpa 0|1>
+  local f=$1 os=$2 count=$3 b=
+  if [ "$os" = Linux ] && grep -q '"request_pool"' "$f" && ! grep -q '"touched_bytes":[0-9]' "$f"; then
+    echo "rss-stability: /mem reply $f has no touched_bytes on Linux: $(grep -o '"touched_bytes[a-z_]*":[^,}]*' "$f" | tr '\n' ' ')" >&2
+    echo "?"
+    return
+  fi
+  [ "$count" = 1 ] || { echo -; return; }
+  b=$(grep -o '"live_bytes":[0-9]*' "$f" | cut -d: -f2)
   if [ -z "$b" ]; then echo "?"; else echo $((b / 1024)); fi
+}
+
+live_kb() { # live_kb <label>: also keeps the whole /mem reply as mem-<label>.json
+  local os
+  os=$(uname -s)
+  [ "$COUNT_GPA" = 1 ] || [ "$os" = Linux ] || { echo -; return; }
+  # --fail: an HTTP error is a failed fetch, not a reply. A failed or empty
+  # fetch is "?" (the phase is invalid) wherever /mem is required, so a server
+  # that stopped answering cannot read as a clean run.
+  if ! curl -sk --fail --http2 --max-time 5 "$BASE/mem" > "$OUT/mem-$1.json" || [ ! -s "$OUT/mem-$1.json" ]; then
+    echo "rss-stability: /mem fetch failed or empty at $1" >&2
+    echo "?"
+    return
+  fi
+  mem_value "$OUT/mem-$1.json" "$os" "$COUNT_GPA"
 }
 
 PHASE_FILE=$OUT/phase
@@ -236,7 +284,7 @@ for c in $(seq "$CYCLES"); do
   churn_live=$(live_kb churn-$c)
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$load_end" "$idle_end" "$churn_end" "$load_live" "$idle_live" "$churn_live" >> "$OUT/rows.tsv"
   for v in "$load_live" "$idle_live" "$churn_live"; do
-    if [ "$v" = "?" ]; then echo "INVALID cycle $c: /mem gave no live_bytes" >&2; bad=1; fi
+    if [ "$v" = "?" ]; then echo "INVALID cycle $c: /mem gave no live_bytes (or, on Linux, no touched_bytes)" >&2; bad=1; fi
   done
   echo "cycle $c: load_end=${load_end} KB idle_end=${idle_end} KB churn_end=${churn_end} KB live load/idle/churn=${load_live}/${idle_live}/${churn_live} KB (churn waves=$w)"
 done

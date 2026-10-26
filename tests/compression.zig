@@ -500,7 +500,9 @@ test "five MiB one-shot br round-trip keeps server alive" {
                 .{ .method = .GET, .path = "/big", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendFiveMiBHandler } } },
                 .{ .method = .GET, .path = "/t", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendTextHandler } } },
             };
-            try runServer(rt, gpa, &routes, enableCompressionLimits(.{}), struct {
+            // The handler takes 5 MiB from the request's arena: an 8 MiB block,
+            // beside the first 64 KiB block, so the per-request cap must be 16.
+            try runServer(rt, gpa, &routes, enableCompressionLimits(.{ .request_arena_bytes = 16 * 1024 * 1024 }), struct {
                 fn go(server: *starh2.Server, _: *zio.Runtime, alloc: std.mem.Allocator) !void {
                     const port = server.localAddress(0).getPort();
                     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);

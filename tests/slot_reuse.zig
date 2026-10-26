@@ -1,4 +1,6 @@
-//! Gates for pooled connection slots (stage 1: boot memory).
+//! Gates for pooled connection slots (stage 1: boot memory) and, at the end,
+//! for the request memory pool that takes the general allocator off the
+//! request path (stage 2).
 //!
 //! A slot is reused by running `Connection.init` again over rewound memory, so
 //! the questions these tests ask are about the seams around that, not about
@@ -48,9 +50,30 @@ fn hangSse(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anye
     }
 }
 
+/// Takes request memory the way a render does: an `ArrayList` grown to 300 KiB
+/// from the request's arena. The response is small, so no frame leaves the
+/// frame slabs for the general allocator (which stage 3 still allows).
+fn renderPool(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    var list: std.ArrayList(u8) = .empty;
+    const row: [100]u8 = @splat('r');
+    while (list.items.len < 300 * 1024) try list.appendSlice(req.arena, &row);
+    try resp.send(200, &.{}, "ok");
+}
+
+/// Copies the body out of one arena into the same arena.
+fn postPool(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    const copy = try req.arena.dupe(u8, req.body);
+    if (copy.len != post_body_len) return error.BodyLengthChanged;
+    try resp.send(200, &.{}, "ok");
+}
+
+const post_body_len = 40 * 1024;
+
 const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
     .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangSse } } },
+    .{ .method = .GET, .path = "/render", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = renderPool } } },
+    .{ .method = .POST, .path = "/post", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = postPool } } },
 };
 
 fn nowNs() u64 {
@@ -457,6 +480,7 @@ const Rig = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     slabs: starh2.edge.slab_pool.SlabPool,
+    requests: starh2.edge.request_pool.RequestPool,
     accounting: conn_mod.GlobalAccounting,
     pool: starh2.edge.conn_slot.SlotPool,
     limits: starh2.Limits,
@@ -470,6 +494,7 @@ const Rig = struct {
             .gpa = self.gpa,
             .accounting = &self.accounting,
             .slab_pool = &self.slabs,
+            .request_pool = &self.requests,
         };
     }
 };
@@ -519,17 +544,18 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .gpa = gpa,
         .io = io,
         .slabs = try starh2.edge.slab_pool.SlabPool.init(gpa, io, starh2.Limits.defaults.outbound_bytes_per_stream, 8),
+        .requests = try starh2.edge.request_pool.RequestPool.init(starh2.Limits.defaults.requestPoolConfig()),
         .accounting = .{
             .max_streams = starh2.Limits.defaults.max_streams_per_server,
             .reaper_capacity = starh2.Limits.defaults.cancellation_reaper_jobs,
             .max_outbound_bytes = starh2.Limits.defaults.outbound_bytes_per_server,
-            .max_request_bytes = starh2.Limits.defaults.request_bytes_per_server,
             .max_handshakes = starh2.Limits.defaults.concurrent_tls_handshakes,
         },
         .pool = undefined,
         .limits = starh2.Limits.defaults,
     };
     defer rig.slabs.deinit(gpa);
+    defer rig.requests.deinit();
     rig.pool = try starh2.edge.conn_slot.SlotPool.init(gpa, 1, try rig.limits.slotBootBytes(.h2c));
     defer rig.pool.deinit();
 
@@ -593,7 +619,7 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), pooled.len);
     try std.testing.expectEqual(@as(usize, 0), rig.accounting.active_streams.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), rig.accounting.outbound_bytes.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), rig.accounting.request_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), rig.requests.held_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), rig.accounting.reaper_reserved.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), rig.slabs.rentedCount());
 }
@@ -623,6 +649,10 @@ test "slot reuse: h2c after a cancel behaves like a fresh slot" {
 const CountingGpa = struct {
     child: std.mem.Allocator,
     calls: std.atomic.Value(usize) = .init(0),
+    /// Calls for at least `large_call_bytes`: bigger than any control frame,
+    /// header table entry or preface frame, so a call this large in a steady
+    /// state is a table or a request's memory.
+    large_calls: std.atomic.Value(usize) = .init(0),
     boot_calls: std.atomic.Value(usize) = .init(0),
     boot_max_len: std.atomic.Value(usize) = .init(0),
 
@@ -637,8 +667,11 @@ const CountingGpa = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    const large_call_bytes = 1024;
+
     fn note(self: *CountingGpa, len: usize) void {
         _ = self.calls.fetchAdd(1, .monotonic);
+        if (len >= large_call_bytes) _ = self.large_calls.fetchAdd(1, .monotonic);
         if (conn_mod.test_in_boot) {
             _ = self.boot_calls.fetchAdd(1, .monotonic);
             _ = self.boot_max_len.fetchMax(len, .monotonic);
@@ -671,6 +704,9 @@ const CountingGpa = struct {
 
 const Round = struct {
     n: usize,
+    /// Requests each connection makes after all are connected. Zero is the
+    /// single probe the boot test uses.
+    requests: usize = 0,
     transport: Transport,
     port: u16,
     gpa: std.mem.Allocator,
@@ -684,7 +720,8 @@ const Round = struct {
 /// before every one has its response, so the server holds `n` connections at
 /// once in every round and needs exactly `n` slots.
 fn roundClient(r: *Round) void {
-    roundClientRun(r) catch {
+    roundClientRun(r) catch |err| {
+        std.debug.print("round client failed: {s}\n", .{@errorName(err)});
         _ = r.failed.fetchAdd(1, .monotonic);
     };
     _ = r.done.fetchAdd(1, .release);
@@ -699,7 +736,11 @@ fn roundClientRun(r: *Round) !void {
         if (nowNs() >= deadline) return error.Deadline;
         std.Thread.yield() catch {};
     }
-    _ = try probe(w, r.gpa);
+    if (r.requests == 0) {
+        _ = try probe(w, r.gpa);
+    } else {
+        try requestLoop(w, r.gpa, r.requests);
+    }
     _ = r.served.fetchAdd(1, .release);
     while (r.served.load(.acquire) < r.n) {
         if (nowNs() >= deadline) return error.Deadline;
@@ -718,7 +759,11 @@ fn waitIdle(server: *starh2.Server) !void {
 }
 
 fn runRound(server: *starh2.Server, gpa: std.mem.Allocator, transport: Transport, n: usize) !void {
-    var r: Round = .{ .n = n, .transport = transport, .port = server.localAddress(0).getPort(), .gpa = gpa };
+    return runRoundRequests(server, gpa, transport, n, 0);
+}
+
+fn runRoundRequests(server: *starh2.Server, gpa: std.mem.Allocator, transport: Transport, n: usize, requests: usize) !void {
+    var r: Round = .{ .n = n, .requests = requests, .transport = transport, .port = server.localAddress(0).getPort(), .gpa = gpa };
     const threads = try gpa.alloc(std.Thread, n);
     defer gpa.free(threads);
     for (threads) |*t| t.* = try std.Thread.spawn(.{}, roundClient, .{&r});
@@ -1068,4 +1113,150 @@ test "slots: shutdown with slots in use and slots free returns and frees every s
     defer rt.deinit();
     var h = try rt.spawn(runShutdown, .{ rt, gpa });
     try h.join();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: request memory is never the general allocator.
+
+/// Read frames until stream `sid` ends (END_STREAM or a reset). True when the
+/// server closed first.
+fn readStreamEnd(wire: *Wire, sid: u31) !bool {
+    const deadline = nowNs() + client_deadline_ns;
+    while (true) {
+        const s = try wire.next(deadline) orelse return true;
+        if (s.sid != sid) continue;
+        if (s.ftype == 3) return error.StreamReset;
+        if ((s.ftype == 0 or s.ftype == 1) and s.flags & 1 != 0) return false;
+    }
+}
+
+/// `n` requests on one connection, one after the other: renders that take
+/// 300 KiB of request memory, and 40 KiB bodies that are copied.
+fn requestLoop(wire: *Wire, gpa: std.mem.Allocator, n: usize) !void {
+    const body: [post_body_len]u8 = @splat('p');
+    var sid: u31 = 1;
+    for (0..n) |i| {
+        var req: std.ArrayList(u8) = .empty;
+        defer req.deinit(gpa);
+        if (i == 0) {
+            var preface = try h2c.buildClientPrefaceAndSettings(gpa);
+            defer preface.deinit(gpa);
+            try req.appendSlice(gpa, preface.items);
+        }
+        if (i % 2 == 0) {
+            try h2c.appendHeaders(gpa, &req, sid, "/render", true);
+        } else {
+            try h2c.appendHeadersExtra(gpa, &req, sid, "POST", "/post", false, &.{});
+            // Frames of at most the default maximum frame size.
+            var off: usize = 0;
+            while (off < body.len) {
+                const take = @min(body.len - off, frame.DEFAULT_MAX_FRAME_SIZE);
+                try h2c.appendData(gpa, &req, sid, body[off..][0..take], off + take == body.len);
+                off += take;
+            }
+        }
+        try wire.send(req.items);
+        if (try readStreamEnd(wire, sid)) return error.ClosedEarly;
+        sid += 2;
+    }
+}
+
+fn runRequestMemoryCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Transport) !void {
+    var counting: CountingGpa = .{ .child = real };
+    const gpa = counting.allocator();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        real.free(cert);
+        real.free(key);
+    }
+    const n = 4;
+    const per_conn = 8;
+    var server = try serverFor(rt, gpa, transport, starh2.Limits.defaults, &cert, &key);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    // One connection alone, one render and one post: what a single request
+    // can hold at its peak, in class bytes. This is the unit the pool's size
+    // is judged in below.
+    try runRoundRequests(&server, real, transport, 1, 2);
+    const one = server.requests.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), one.held_bytes);
+    const per_request_peak = one.held_high;
+    try std.testing.expect(per_request_peak >= 512 * 1024);
+
+    // Warm-up: the slots, and the request blocks the load needs, are made.
+    // Its large calls are the control: the counter does see large calls.
+    const large_0 = counting.large_calls.load(.monotonic);
+    try runRoundRequests(&server, real, transport, n, per_conn);
+    const large_1 = counting.large_calls.load(.monotonic);
+    const calls_1 = counting.calls.load(.monotonic);
+    const pool_1 = server.requests.snapshot();
+    try std.testing.expect(large_1 > large_0);
+
+    // Steady state: the same connections' worth of the same requests.
+    try runRoundRequests(&server, real, transport, n, per_conn);
+    const large_2 = counting.large_calls.load(.monotonic);
+    const calls_2 = counting.calls.load(.monotonic);
+    const pool_2 = server.requests.snapshot();
+
+    // The requests really took their memory from the pool: 300 KiB renders
+    // are 512 KiB blocks, and every request held a first block.
+    try std.testing.expect(pool_2.held_high >= 512 * 1024);
+    var used: u64 = 0;
+    for (pool_2.classes[0..pool_2.class_count]) |c| used += c.made + c.reused;
+    try std.testing.expect(used >= n * per_conn * 2);
+    // The pool holds what the CONCURRENT requests need and no more: `n`
+    // connections run one request each at a time, so no more than `n` times
+    // one request's peak is ever resident, however many requests ran. (A count
+    // of blocks made would be flatter but also flaky, since how the `n`
+    // connections interleave decides the peak.)
+    try std.testing.expect(pool_2.resident_high <= n * per_request_peak);
+    for (pool_2.refused) |r| try std.testing.expectEqual(@as(u64, 0), r);
+    _ = pool_1;
+    // Everything is home once the work is done.
+    try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
+
+    // How request memory is told apart from the per-request calls stage 3
+    // still has: those are control frames (the first 40 calls of a steady
+    // round were 9, 13 and 45 bytes: a frame header, a WINDOW_UPDATE and the
+    // two preface frames), all under `large_call_bytes`, while every piece of
+    // request memory is at least a 64 KiB block. So a steady state with no
+    // large call made no request-memory call. The requests are shaped so
+    // that nothing else is large: the responses are two bytes, and the client
+    // sends no header that enters the HPACK table.
+    std.debug.print("{s} request memory: steady round made {d} large and {d} small general-allocator calls for {d} requests; pool held at most {d} KiB\n", .{
+        @tagName(transport),
+        large_2 - large_1,
+        (calls_2 - calls_1) - (large_2 - large_1),
+        n * per_conn,
+        pool_2.held_high / 1024,
+    });
+    try std.testing.expectEqual(@as(usize, 0), large_2 - large_1);
+
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runRequestMemoryCallsCase(transport: Transport) !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runRequestMemoryCalls, .{ rt, gpa, transport });
+    try h.join();
+}
+
+test "request memory: h2c makes no large general-allocator call after warm-up" {
+    try runRequestMemoryCallsCase(.h2c);
+}
+
+test "request memory: tls makes no large general-allocator call after warm-up" {
+    try runRequestMemoryCallsCase(.tls);
 }

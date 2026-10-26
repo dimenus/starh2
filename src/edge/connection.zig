@@ -124,6 +124,7 @@ const fair_scheduler = @import("fair_scheduler.zig");
 const io_queue = @import("io_queue.zig");
 pub const Balancer = @import("balancer.zig").Balancer;
 const slab_pool = @import("slab_pool.zig");
+const request_pool = @import("request_pool.zig");
 const Touched = @import("touched.zig").Touched;
 const flow = @import("../core/flow.zig");
 
@@ -262,9 +263,12 @@ var no_shutdown_event: zio.Event = .init;
 var no_ack_hold_event: zio.Event = .init;
 var hold_dummy_completion_buf: [1]u31 = undefined;
 var hold_dummy_completion_ch: zio.Channel(u31) = .init(&hold_dummy_completion_buf);
-/// Test-only: when true, `borrowHeaderListAlloc` finds no free lease, so the
+/// Test-only: when true, `borrowHeaderListMem` finds no free lease, so the
 /// next HEADERS takes Session's refuse-without-memory path.
 pub var test_no_request_lease: std.atomic.Value(bool) = .init(false);
+/// Test-only: when true, the allocations that build a handler job fail as if
+/// the request's memory had run out, so dispatch takes its refusal path.
+pub var test_fail_dispatch_alloc: std.atomic.Value(bool) = .init(false);
 /// Test-only: delay write pump by N ms.
 pub var test_write_delay_ms: u64 = 0;
 /// Test-only: fail write pump after N successful writes (0 = never).
@@ -342,6 +346,12 @@ pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
 /// stray or double `clear` asserts instead of corrupting the chain
 /// (`zig-pkg/zio-*/src/task.zig` `TaskLocal.set`/`clear`).
 var shutdown_sweep: zio.TaskLocal(void) = .{};
+/// Set on a task handler's task, from the start of `runHandlerJob` to its end
+/// (observe builds only). A request's blocks go back to the pool from the
+/// actor, after the join; `releaseLease` asserts it is not called from inside
+/// a handler's task. A thread-local would be wrong here: a handler yields and
+/// can resume on another thread.
+var handler_job_marker: zio.TaskLocal(void) = .{};
 /// Test-only gate that parks the actor immediately before its event-driven wait.
 pub var test_hold_before_actor_wait: std.atomic.Value(bool) = .init(false);
 pub var test_actor_waiting: std.Io.Event = .unset;
@@ -803,6 +813,11 @@ pub const ConnConfig = struct {
     accounting: ?*GlobalAccounting = null,
     /// Server-wide outbound DATA slabs, borrowed for this connection's lifetime.
     slab_pool: *slab_pool.SlabPool,
+    /// Server-wide request memory. Every HTTP/2 request's header list, body
+    /// and handler allocations come from here and nowhere else; there is no
+    /// fallback to `gpa`. Required for h2c and TLS (`Connection.init` fails
+    /// without it); h1c keeps its own buffers and ignores it.
+    request_pool: ?*request_pool.RequestPool = null,
     /// Server-wide brotli encoder pool when response compression is enabled.
     compression_pool: ?*brotli.Pool = null,
     /// True when accept path reserved a concurrent TLS handshake slot.
@@ -829,8 +844,6 @@ pub const GlobalAccounting = struct {
     reaper_capacity: usize,
     outbound_bytes: std.atomic.Value(usize) = .init(0),
     max_outbound_bytes: usize,
-    request_bytes: std.atomic.Value(usize) = .init(0),
-    max_request_bytes: usize,
     active_handshakes: std.atomic.Value(usize) = .init(0),
     max_handshakes: usize,
     /// Accept loops parked because the connection or handshake limit is full
@@ -884,21 +897,6 @@ pub const GlobalAccounting = struct {
     pub fn releaseOutbound(self: *GlobalAccounting, n: usize) void {
         if (n == 0) return;
         const prev = self.outbound_bytes.fetchSub(n, .acq_rel);
-        std.debug.assert(prev >= n);
-    }
-
-    pub fn tryReserveRequest(self: *GlobalAccounting, n: usize) bool {
-        if (n == 0) return true;
-        while (true) {
-            const cur = self.request_bytes.load(.acquire);
-            if (cur > self.max_request_bytes or self.max_request_bytes - cur < n) return false;
-            if (self.request_bytes.cmpxchgWeak(cur, cur + n, .acq_rel, .acquire) == null) return true;
-        }
-    }
-
-    pub fn releaseRequest(self: *GlobalAccounting, n: usize) void {
-        if (n == 0) return;
-        const prev = self.request_bytes.fetchSub(n, .acq_rel);
         std.debug.assert(prev >= n);
     }
 
@@ -1106,24 +1104,161 @@ const SendTrace = struct {
     hpack: u64,
 };
 
-/// A decoded-but-not-dispatched request's memory, keyed by stream. The arena
-/// is the request's: HPACK decodes its header block into it, dispatch moves it
-/// into the handler job, where it backs `Request.arena`, and `finishHandlerJob`
-/// frees it. Request memory therefore lives exactly as long as the request,
-/// not as long as a slot or the connection, and a request needs no slot to
-/// own its headers. Entries stay put while Session decodes into one, because
-/// `arena.allocator()` points at the entry.
+/// Probes `LeaseIndex.find` made (observe builds only): every lease it looked
+/// at. A test reads the count to show a lookup does not scan.
+pub var test_lease_probes: std.atomic.Value(u64) = .init(0);
+
+/// How a stream id finds its `RequestLease` in O(1), and how a new request
+/// finds a free one. Both are tables sized at boot (`Connection.planBoot`),
+/// owned by the actor.
+///
+/// Chosen over keeping the lease where the stream already lives: the stream is
+/// a `core` type (`Session.streams`), and `core` has no knowledge of the edge,
+/// so a lease position there would be an edge field in the protocol layer.
+/// This is an open-addressing table of lease positions (plus one; zero is
+/// empty), keyed by the lease's own `stream_id`, with linear probing and
+/// backward-shift deletion, so it has no tombstones and never fills: it has at
+/// least two slots per lease. `free` is a stack of the positions of touched
+/// leases that hold no request, so taking a lease for a new request does not
+/// scan either. `Touched` itself only grows, which is why the free stack is
+/// needed.
+const LeaseIndex = struct {
+    slots: []u32,
+    free: []u32,
+    free_len: usize = 0,
+    bits: u5,
+
+    /// Number of index slots for `leases_n` leases: a power of two of at
+    /// least twice as many. Also checks the size fits.
+    fn slotCount(leases_n: usize) error{InvalidConfig}!usize {
+        const want = try boot_plan.mul(leases_n, 2);
+        const n = std.math.ceilPowerOfTwo(usize, @max(want, 2)) catch return error.InvalidConfig;
+        if (n > (@as(usize, 1) << 31)) return error.InvalidConfig;
+        return n;
+    }
+
+    fn init(slots: []u32, free: []u32) LeaseIndex {
+        @memset(slots, 0);
+        return .{ .slots = slots, .free = free, .bits = @intCast(std.math.log2_int(usize, slots.len)) };
+    }
+
+    fn home(self: *const LeaseIndex, stream_id: u31) usize {
+        const h: u32 = @as(u32, stream_id) *% 2654435761;
+        return h >> @intCast(32 - @as(u6, self.bits));
+    }
+
+    fn find(self: *const LeaseIndex, leases: []const RequestLease, stream_id: u31) ?u32 {
+        const mask = self.slots.len - 1;
+        var i = self.home(stream_id);
+        while (true) : (i = (i + 1) & mask) {
+            const v = self.slots[i];
+            if (v == 0) return null;
+            if (comptime test_observe) _ = test_lease_probes.fetchAdd(1, .monotonic);
+            if (leases[v - 1].stream_id == stream_id) return v - 1;
+        }
+    }
+
+    fn insert(self: *LeaseIndex, leases: []const RequestLease, pos: u32) void {
+        const mask = self.slots.len - 1;
+        var i = self.home(leases[pos].stream_id);
+        while (self.slots[i] != 0) i = (i + 1) & mask;
+        self.slots[i] = pos + 1;
+    }
+
+    /// Remove `stream_id`'s entry; call while the lease still has its id.
+    fn remove(self: *LeaseIndex, leases: []const RequestLease, stream_id: u31) void {
+        const mask = self.slots.len - 1;
+        var i = self.home(stream_id);
+        while (true) : (i = (i + 1) & mask) {
+            const v = self.slots[i];
+            std.debug.assert(v != 0);
+            if (leases[v - 1].stream_id == stream_id) break;
+        }
+        // Backward shift: pull later entries of the probe run into the hole
+        // unless they already sit between their home slot and the hole.
+        var j = i;
+        while (true) {
+            j = (j + 1) & mask;
+            const v = self.slots[j];
+            if (v == 0) break;
+            const k = self.home(leases[v - 1].stream_id);
+            const between = if (i <= j) (i < k and k <= j) else (i < k or k <= j);
+            if (!between) {
+                self.slots[i] = v;
+                i = j;
+            }
+        }
+        self.slots[i] = 0;
+    }
+
+    fn takeFree(self: *LeaseIndex) ?u32 {
+        if (self.free_len == 0) return null;
+        self.free_len -= 1;
+        return self.free[self.free_len];
+    }
+
+    fn putFree(self: *LeaseIndex, pos: u32) void {
+        self.free[self.free_len] = pos;
+        self.free_len += 1;
+    }
+};
+
+/// A request's memory, keyed by stream. The arena is the request's: HPACK
+/// decodes its header block into it, the body is appended to it, and after
+/// dispatch it backs `Request.arena` for the handler. The lease is the
+/// arena's home and stays put and occupied until `releaseSlot` has joined the
+/// handler (`releaseLease`), so the handler's `HandlerJob` holds a pointer and
+/// nothing is copied or moved between the actor and the handler. A request
+/// that never dispatches gives its blocks back where its lease is released
+/// (`releaseHeaderList`, `quiesce`).
 const RequestLease = struct {
     stream_id: u31 = 0,
-    arena: std.heap.ArenaAllocator = undefined,
+    /// True once dispatch handed the arena to a `HandlerJob`. From then on only
+    /// `releaseSlot` gives the lease back, after the handler was joined.
+    in_job: bool = false,
+    arena: request_pool.Arena = undefined,
 };
+
+/// The request's Accept-Encoding lines as one value (RFC 9110 section 5.3
+/// lets repeated lines be combined with ", "). One line is used as it is,
+/// since it already lives in the request's arena; two or more are joined into
+/// one allocation.
+fn joinAcceptEncodingLines(a: std.mem.Allocator, headers: []const request.Header) error{OutOfMemory}![]const u8 {
+    var count: usize = 0;
+    var total: usize = 0;
+    var only: []const u8 = "";
+    for (headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) continue;
+        count += 1;
+        total += h.value.len;
+        only = h.value;
+    }
+    if (count == 0) return "";
+    if (count == 1) return only;
+    const out = try a.alloc(u8, total + 2 * (count - 1));
+    var off: usize = 0;
+    var seen: usize = 0;
+    for (headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) continue;
+        @memcpy(out[off..][0..h.value.len], h.value);
+        off += h.value.len;
+        seen += 1;
+        if (seen < count) {
+            out[off] = ',';
+            out[off + 1] = ' ';
+            off += 2;
+        }
+    }
+    std.debug.assert(off == out.len);
+    return out;
+}
 
 /// Per-slot handler state, reserved at connection boot so dispatch never heap-allocates a job.
 const HandlerJob = struct {
     conn: *Connection,
-    /// The request's own memory, moved in from `request_leases` at dispatch
-    /// and freed by `finishHandlerJob`.
-    arena: std.heap.ArenaAllocator,
+    /// The request's own memory: its lease's arena. Allocated from on the
+    /// handler's task, returned by the actor in `releaseSlot`.
+    arena: *request_pool.Arena,
     stream_id: u31,
     owned_request: session_mod.DispatchRequest,
     req: request.Request,
@@ -1410,11 +1545,22 @@ pub const Connection = struct {
     /// Untouched until a slot is first dispatched: dispatch assigns the whole
     /// job, so nothing is set up at connect.
     handler_jobs: []HandlerJob,
-    /// Requests decoded but not yet dispatched. One more than the stream
-    /// limit, because Session decodes a block before it checks the limit
-    /// (the HPACK table must advance either way). Written on first use, like
+    /// Requests decoded but not yet released: waiting for dispatch, parked,
+    /// or running (a lease is released with its handler slot). One more than
+    /// twice the stream limit. Session decodes a block before it checks the
+    /// stream limit (the HPACK table must advance either way), which is the
+    /// one more; and the peer may open a stream as soon as it reads the
+    /// previous one's END_STREAM while that stream's handler still holds its
+    /// lease, which makes the other half. Written on first use, like
     /// `handlers`. Actor-only.
     request_leases: Touched(RequestLease),
+    /// Stream id to lease, and the free leases. See `LeaseIndex`. Actor-only.
+    lease_index: LeaseIndex,
+    /// Where a header block is decoded when the pool has no memory for its
+    /// request: sized for the largest decode (`Limits.hpackDecodeBytes`), so
+    /// the decode cannot fail, and the HPACK table advances either way.
+    /// Actor-only, under `session_mu`.
+    hpack_scratch: std.heap.FixedBufferAllocator,
     /// Requests waiting for a handler slot, oldest first (a ring). The peer
     /// may open a stream as soon as it reads the previous one's END_STREAM,
     /// while that stream's handler is still running, so a slot can be busy
@@ -1479,7 +1625,9 @@ pub const Connection = struct {
     outbound_held: std.atomic.Value(usize) = .init(0),
     pending_outbound_held: std.atomic.Value(usize) = .init(0),
     wire_outbound_held: std.atomic.Value(usize) = .init(0),
-    request_held: std.atomic.Value(usize) = .init(0),
+    /// What this connection's requests hold, in class bytes. Atomic because
+    /// the handlers run on other executors. Shares `Limits.request_bytes_per_connection`.
+    request_budget: request_pool.ConnBudget,
     handshake_held: bool = false,
     /// True once `queueWire` has seen the connection's first wire bytes.
     /// Written under `session_mu`, like every `queueWire` call.
@@ -1610,7 +1758,7 @@ pub const Connection = struct {
         // `Plan.hashMap` for the streams.
         const ticket_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
         const read_ch_n = try boot_plan.add(n_chunks, 1);
-        const leases_n = try boot_plan.add(max_streams, 1);
+        const leases_n = try boot_plan.add(try boot_plan.mul(max_streams, 2), 1);
         const read_chunk_bytes = try boot_plan.mul(n_chunks, limits_mod.WIRE_CHUNK_SIZE);
         try session_mod.Session.planBoot(plan, limits);
         try plan.array(wire_pump.WireChunk, read_ch_n); // read_ch_buf
@@ -1618,6 +1766,9 @@ pub const Connection = struct {
         try plan.array(HandlerSlot, max_streams);
         try plan.array(HandlerJob, max_streams);
         try plan.array(RequestLease, leases_n);
+        try plan.array(u32, try LeaseIndex.slotCount(leases_n)); // lease_index.slots
+        try plan.array(u32, leases_n); // lease_index.free
+        try plan.array(u8, try limits.hpackDecodeBytes()); // hpack_scratch
         try plan.array(session_mod.DispatchRequest, max_streams); // parked
         try plan.array(?zio.JoinHandle(void), max_streams);
         try plan.array(u31, max_streams); // completion_ch_buf
@@ -1651,6 +1802,7 @@ pub const Connection = struct {
         // `Server.init` checks this at boot; a connection built any other way
         // gets the same answer, not a queue its drain can overrun.
         if (config.mode == .h2c) try config.limits.checkH2cWriteQueue();
+        if (config.request_pool == null) return error.RequestPoolMissing;
         var session = try session_mod.Session.init(boot, config.gpa, config.limits);
         errdefer {
             // Hooks are installed below with `ctx` still unset. Session.init
@@ -1675,10 +1827,25 @@ pub const Connection = struct {
                     if (c.config.accounting) |a| a.releaseStream();
                 }
             }.f,
-            .headerListAlloc = struct {
-                fn f(ctx: *anyopaque, stream_id: u31) ?std.mem.Allocator {
+            .headerListMem = struct {
+                fn f(ctx: *anyopaque, stream_id: u31) session_mod.HeaderListMem {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
-                    return c.borrowHeaderListAlloc(stream_id);
+                    return c.borrowHeaderListMem(stream_id);
+                }
+            }.f,
+            .requestAlloc = struct {
+                fn f(ctx: *anyopaque, stream_id: u31) std.mem.Allocator {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    const lease = c.findLease(stream_id) orelse
+                        std.debug.panic("body for stream {d} with no request memory", .{stream_id});
+                    return lease.arena.allocator();
+                }
+            }.f,
+            .memoryRefusalStatus = struct {
+                fn f(ctx: *anyopaque, stream_id: u31) u16 {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    const lease = c.findLease(stream_id) orelse return 503;
+                    return (lease.arena.refusal orelse request_pool.Reason.server_cap).status();
                 }
             }.f,
             .discardHeaderList = struct {
@@ -1710,21 +1877,6 @@ pub const Connection = struct {
                 }
             }.f,
         };
-        if (config.accounting != null) {
-            session.stream_hooks.?.tryReserveRequest = struct {
-                fn f(ctx: *anyopaque, n: usize) bool {
-                    const c: *Connection = @ptrCast(@alignCast(ctx));
-                    return c.tryReserveRequestBytes(n);
-                }
-            }.f;
-            session.stream_hooks.?.releaseRequest = struct {
-                fn f(ctx: *anyopaque, n: usize) void {
-                    const c: *Connection = @ptrCast(@alignCast(ctx));
-                    c.releaseRequestBytes(n);
-                }
-            }.f;
-        }
-
         // + 1: the EOF sentinel must fit even with every pool chunk queued.
         const read_ch_buf = try boot.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + 1);
         errdefer boot.free(read_ch_buf);
@@ -1734,8 +1886,14 @@ pub const Connection = struct {
         errdefer boot.free(handlers);
         const handler_jobs = try boot.alloc(HandlerJob, config.limits.max_streams_per_connection);
         errdefer boot.free(handler_jobs);
-        const request_leases = try boot.alloc(RequestLease, config.limits.max_streams_per_connection + 1);
+        const request_leases = try boot.alloc(RequestLease, config.limits.max_streams_per_connection * 2 + 1);
         errdefer boot.free(request_leases);
+        const lease_slots = try boot.alloc(u32, try LeaseIndex.slotCount(request_leases.len));
+        errdefer boot.free(lease_slots);
+        const lease_free = try boot.alloc(u32, request_leases.len);
+        errdefer boot.free(lease_free);
+        const hpack_scratch = try boot.alloc(u8, try config.limits.hpackDecodeBytes());
+        errdefer boot.free(hpack_scratch);
         const parked = try boot.alloc(session_mod.DispatchRequest, config.limits.max_streams_per_connection);
         errdefer boot.free(parked);
         const handler_joins = try boot.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
@@ -1809,6 +1967,9 @@ pub const Connection = struct {
             .handlers = .init(handlers),
             .handler_jobs = handler_jobs,
             .request_leases = .init(request_leases),
+            .lease_index = .init(lease_slots, lease_free),
+            .hpack_scratch = .init(hpack_scratch),
+            .request_budget = .init(config.limits.request_bytes_per_connection),
             .parked = parked,
             .handler_joins = handler_joins,
             .completion_ch_buf = completion_ch_buf,
@@ -2024,10 +2185,7 @@ pub const Connection = struct {
         // Session is gone, so a lease left here is a request it never handed
         // to dispatch nor dropped (a teardown with HEADERS still pending).
         for (self.request_leases.slice()) |*l| {
-            if (l.stream_id != 0) {
-                l.arena.deinit();
-                l.stream_id = 0;
-            }
+            if (l.stream_id != 0) self.releaseLease(l);
         }
         const held = self.outbound_held.load(.acquire);
         const pending_held = self.pending_outbound_held.load(.acquire);
@@ -2068,7 +2226,7 @@ pub const Connection = struct {
     fn dirtyOnPurpose(self: *Connection, kind: DirtyKind) void {
         switch (kind) {
             .write_chunk_rented => _ = self.write_pool.tryRentIndex(self.config.io),
-            .request_bytes_reserved => _ = self.request_held.fetchAdd(1, .acq_rel),
+            .request_bytes_reserved => _ = self.request_budget.held.fetchAdd(1, .acq_rel),
             .stream_still_admitted => self.session.active_streams += 1,
             // Only the "is it null" of the join is read, never the handle.
             .handler_join_held => self.handler_joins[0] = @as(zio.JoinHandle(void), undefined),
@@ -2094,7 +2252,7 @@ pub const Connection = struct {
     ///   write channels (drained first), a queued scheduler frame and a held
     ///   data slab (`releaseHeld`), a request lease (cleared).
     /// - Reachable only through a bookkeeping bug, because `quiesce` does not
-    ///   check it: request bytes still reserved (`request_held`), streams
+    ///   check it: request bytes still reserved (`request_budget`), streams
     ///   still admitted (`session.active_streams`), a handler join still held
     ///   (`handler_joins`), and the completion channel (a reaper can post to
     ///   it from another thread after the drain). No known path sets any of
@@ -2124,7 +2282,7 @@ pub const Connection = struct {
         if (self.outbound_held.load(.acquire) != 0 or
             self.pending_outbound_held.load(.acquire) != 0 or
             self.wire_outbound_held.load(.acquire) != 0) return "outbound bytes still reserved";
-        if (self.request_held.load(.acquire) != 0) return "request bytes still reserved";
+        if (self.request_budget.held.load(.acquire) != 0) return "request bytes still reserved";
         if (self.session.active_streams != 0) return "streams still admitted";
         if (self.handshake_held) return "handshake slot still held";
         if (!self.socket_closed.load(.acquire)) return "socket still open";
@@ -2151,6 +2309,9 @@ pub const Connection = struct {
         boot.free(self.handler_jobs);
         boot.free(self.parked);
         boot.free(self.request_leases.storage);
+        boot.free(self.lease_index.slots);
+        boot.free(self.lease_index.free);
+        boot.free(self.hpack_scratch.buffer);
         boot.free(self.handler_joins);
         boot.free(self.completion_ch_buf);
         if (self.write_ack_buf.len != 0) boot.free(self.write_ack_buf);
@@ -2166,27 +2327,6 @@ pub const Connection = struct {
         if (self.space_events.len != 0) boot.free(self.space_events);
         if (self.deadline_events.len != 0) boot.free(self.deadline_events);
         if (self.intent_batch.len != 0) boot.free(self.intent_batch);
-    }
-
-    fn tryReserveRequestBytes(self: *Connection, n: usize) bool {
-        if (n == 0) return true;
-        const lim = self.config.limits.request_bytes_per_connection;
-        while (true) {
-            const cur = self.request_held.load(.acquire);
-            if (cur > lim or lim - cur < n) return false;
-            if (self.config.accounting) |a| {
-                if (!a.tryReserveRequest(n)) return false;
-            }
-            if (self.request_held.cmpxchgWeak(cur, cur + n, .acq_rel, .acquire) == null) return true;
-            if (self.config.accounting) |a| a.releaseRequest(n);
-        }
-    }
-
-    fn releaseRequestBytes(self: *Connection, n: usize) void {
-        if (n == 0) return;
-        const prev = self.request_held.fetchSub(n, .acq_rel);
-        std.debug.assert(prev >= n);
-        if (self.config.accounting) |a| a.releaseRequest(n);
     }
 
     const OutboundKind = enum { pending, wire };
@@ -3904,38 +4044,88 @@ pub const Connection = struct {
         std.debug.assert(slot.admitted);
     }
 
-    /// The allocator `stream_id`'s header block decodes into: its existing
-    /// lease (trailers), or a new request arena. Null only when the lease
-    /// table is full, which the stream limit should make unreachable; Session
-    /// then refuses the stream rather than decode it into shared memory.
-    /// Actor-only.
-    fn borrowHeaderListAlloc(self: *Connection, stream_id: u31) ?std.mem.Allocator {
-        var free: ?*RequestLease = null;
-        for (self.request_leases.slice()) |*l| {
-            if (l.stream_id == stream_id) return l.arena.allocator();
-            if (free == null and l.stream_id == 0) free = l;
-        }
-        if (test_no_request_lease.load(.acquire)) return null;
-        const lease = free orelse self.request_leases.touchNext(.{}) orelse return null;
-        lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.gpa) };
-        return lease.arena.allocator();
+    /// Test-only: a lease the way dispatch leaves one, already handed to a job.
+    fn borrowTestLease(self: *Connection, stream_id: u31) *RequestLease {
+        const lease = self.newLease(stream_id) orelse std.debug.panic("no free test lease", .{});
+        lease.in_job = true;
+        return lease;
     }
 
-    /// Free `stream_id`'s request memory: a decode Session dropped, or a
-    /// dispatch that refused the stream. No-op once dispatch took the arena.
+    /// A free lease for `stream_id`, entered in the index: from the free stack,
+    /// else the next untouched one. Null when all are busy.
+    fn newLease(self: *Connection, stream_id: u31) ?*RequestLease {
+        const lease = if (self.lease_index.takeFree()) |pos|
+            &self.request_leases.storage[pos]
+        else
+            self.request_leases.touchNext(.{}) orelse return null;
+        lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.request_pool.?, &self.request_budget) };
+        self.lease_index.insert(self.request_leases.storage, self.leasePos(lease));
+        return lease;
+    }
+
+    fn leasePos(self: *Connection, lease: *RequestLease) u32 {
+        return @intCast(lease - self.request_leases.storage.ptr);
+    }
+
+    /// The lease holding `stream_id`'s request memory. Actor-only.
+    fn findLease(self: *Connection, stream_id: u31) ?*RequestLease {
+        const pos = self.lease_index.find(self.request_leases.storage, stream_id) orelse return null;
+        return &self.request_leases.storage[pos];
+    }
+
+    /// Where `stream_id`'s header block decodes: its existing lease (trailers),
+    /// or a new one. When the pool has no memory for it, or every lease is
+    /// busy (which the lease table's size should make unreachable), the block
+    /// still has to be decoded, so the HPACK table advances; that is
+    /// `hpack_scratch`, and the status the stream is then answered with.
     /// Actor-only.
+    ///
+    /// Either way the decode cannot run out of memory afterwards: the lease
+    /// has been given room for the largest decode there can be
+    /// (`Limits.hpackDecodeBytes`) before this returns it, and the scratch
+    /// is that size.
+    fn borrowHeaderListMem(self: *Connection, stream_id: u31) session_mod.HeaderListMem {
+        const need = self.hpack_scratch.buffer.len;
+        if (self.findLease(stream_id)) |l| {
+            if (l.arena.reserve(need)) |_| {
+                return .{ .request = l.arena.allocator() };
+            } else |_| {
+                return self.scratchMem((l.arena.refusal orelse request_pool.Reason.server_cap).status());
+            }
+        }
+        if (test_no_request_lease.load(.acquire)) return self.scratchMem(503);
+        const lease = self.newLease(stream_id) orelse return self.scratchMem(503);
+        if (lease.arena.reserve(need)) |_| {
+            return .{ .request = lease.arena.allocator() };
+        } else |_| {
+            const status = (lease.arena.refusal orelse request_pool.Reason.server_cap).status();
+            self.releaseLease(lease);
+            return self.scratchMem(status);
+        }
+    }
+
+    fn scratchMem(self: *Connection, status: u16) session_mod.HeaderListMem {
+        self.hpack_scratch.reset();
+        return .{ .scratch = .{ .alloc = self.hpack_scratch.allocator(), .status = status } };
+    }
+
+    /// Give back `stream_id`'s request memory if no handler holds it: a decode
+    /// Session dropped, or a dispatch that refused the stream. A lease that
+    /// dispatch handed to a job is left alone; `releaseSlot` returns it after
+    /// the handler was joined. Actor-only.
     fn releaseHeaderList(self: *Connection, stream_id: u31) void {
-        const arena = self.takeRequestArena(stream_id) orelse return;
-        arena.deinit();
+        const lease = self.findLease(stream_id) orelse return;
+        if (lease.in_job) return;
+        self.releaseLease(lease);
     }
 
-    fn takeRequestArena(self: *Connection, stream_id: u31) ?std.heap.ArenaAllocator {
-        for (self.request_leases.slice()) |*l| {
-            if (l.stream_id != stream_id) continue;
-            l.stream_id = 0;
-            return l.arena;
-        }
-        return null;
+    fn releaseLease(self: *Connection, lease: *RequestLease) void {
+        if (comptime test_observe) std.debug.assert(handler_job_marker.get() == null);
+        lease.arena.release();
+        self.lease_index.remove(self.request_leases.storage, lease.stream_id);
+        lease.stream_id = 0;
+        lease.in_job = false;
+        self.lease_index.putFree(self.leasePos(lease));
     }
 
     fn slotIndex(self: *Connection, stream_id: u31) ?usize {
@@ -3977,6 +4167,10 @@ pub const Connection = struct {
         }
         if (self.handler_joins[i]) |*handle| handle.join();
         self.handler_joins[i] = null;
+        // The handler has stopped, so nothing allocates from the request's
+        // arena any more. The actor gives its blocks back, here and nowhere
+        // else, so a block is returned by the thread that took it.
+        if (self.findLease(stream_id)) |lease| self.releaseLease(lease);
         if (slot.reaper_reserved) {
             if (self.config.accounting) |a| a.releaseReaper();
             slot.reaper_reserved = false;
@@ -5574,12 +5768,11 @@ pub const Connection = struct {
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
 
-    /// Drop a dispatch-intent payload that never became a job: free the
-    /// request's arena (headers) if dispatch has not taken it, and the body,
-    /// which is always GPA-owned.
+    /// Drop a dispatch-intent payload that never became a job: give back the
+    /// request's memory, which holds its headers and its body, unless dispatch
+    /// has already handed it to a job.
     fn releaseDispatchRequest(self: *Connection, d: session_mod.DispatchRequest) void {
         self.releaseHeaderList(d.stream_id);
-        if (d.body.len != 0) self.config.gpa.free(d.body);
     }
 
     /// Build a handler job. Actor-only, under `session_mu`.
@@ -5666,6 +5859,23 @@ pub const Connection = struct {
         }
     }
 
+    /// The request's memory ran out while its job was being built. Answer the
+    /// stream and give the slot, and with it the request's memory, back. The
+    /// answer is queued as an intent; the next drain sends it (see the spawn
+    /// failure below for why this does not drain here). Returns true: `d` is
+    /// consumed.
+    fn refuseDispatchForMemory(self: *Connection, d: session_mod.DispatchRequest, lease: *RequestLease) bool {
+        const status = (lease.arena.refusal orelse request_pool.Reason.server_cap).status();
+        self.session.applyCommand(.{ .respond_headers = .{
+            .stream_id = d.stream_id,
+            .status = status,
+            .headers = &.{},
+            .end_stream = true,
+        } }) catch {};
+        std.debug.assert(self.releaseSlot(d.stream_id));
+        return true;
+    }
+
     /// The body of `dispatch`. Returns false, with `d` still the caller's,
     /// when no handler slot is free; every other outcome (a handler started,
     /// or the stream refused) consumes `d`.
@@ -5712,33 +5922,31 @@ pub const Connection = struct {
         // Session decodes every dispatched request into a lease (it refuses
         // the stream when there is none), so a miss here is a broken
         // invariant, and its strings would be memory nobody owns.
-        const arena = self.takeRequestArena(d.stream_id) orelse
-            std.debug.panic("dispatch of stream {d} without a request arena", .{d.stream_id});
+        const lease = self.findLease(d.stream_id) orelse
+            std.debug.panic("dispatch of stream {d} without request memory", .{d.stream_id});
+        lease.in_job = true;
         job.* = .{
             .conn = self,
-            .arena = arena,
+            .arena = &lease.arena,
             .stream_id = d.stream_id,
             .owned_request = undefined,
             .req = undefined,
             .resp = undefined,
             .matched = .not_found,
         };
-        errdefer job.arena.deinit();
         const a = job.arena.allocator();
 
         // The strings are already in this arena; only the handler-facing
-        // arrays are built here.
-        const headers: []request.Header = if (d.headers.len == 0)
-            &.{}
-        else
-            try a.alloc(request.Header, d.headers.len);
+        // arrays are built here. Running out of memory is an answer to the
+        // stream, never a connection error: the request is refused (500 when
+        // it hit its own cap, 503 for the others) and its memory goes back.
+        if (test_fail_dispatch_alloc.load(.acquire)) return self.refuseDispatchForMemory(d, lease);
+        const headers = a.alloc(request.Header, d.headers.len) catch return self.refuseDispatchForMemory(d, lease);
         for (d.headers, 0..) |h, i| headers[i] = .{ .name = h.name, .value = h.value };
-
-        const trailers: []request.Header = if (d.trailers.len == 0)
-            &.{}
-        else
-            try a.alloc(request.Header, d.trailers.len);
+        const trailers = a.alloc(request.Header, d.trailers.len) catch return self.refuseDispatchForMemory(d, lease);
         for (d.trailers, 0..) |h, i| trailers[i] = .{ .name = h.name, .value = h.value };
+        // Repeated Accept-Encoding lines are one value (RFC 9110).
+        const accept_encoding = joinAcceptEncodingLines(a, headers) catch return self.refuseDispatchForMemory(d, lease);
 
         job.req = .{
             .method = .parse(d.method),
@@ -5765,19 +5973,6 @@ pub const Connection = struct {
             .abortFn = abortCb,
             .waitUntilFn = waitUntilCb,
         };
-        // Combine repeated Accept-Encoding lines (RFC 9110) into one value.
-        var ae_parts: std.ArrayList([]const u8) = .empty;
-        defer ae_parts.deinit(a);
-        for (headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) {
-                ae_parts.append(a, h.value) catch {};
-            }
-        }
-        const accept_encoding = if (ae_parts.items.len == 0)
-            ""
-        else
-            content_coding.joinAcceptEncoding(a, ae_parts.items) catch "";
-
         // HandlerCtx: Response.ctx points at job-local ctx with stable terminal pointer.
         job.hctx = .{
             .conn = self,
@@ -5919,15 +6114,18 @@ pub const Connection = struct {
             if (self.config.balancer) |b| b.noteHandlerEnd(self.config.exec_index.?);
         }
         if (comptime test_observe) _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
-        // Runs on whichever task finished the job, so it must not touch the
-        // actor's lease table: the arena (headers included) is the job's own.
-        job.arena.deinit();
-        if (job.owned_request.body.len != 0) self.config.gpa.free(job.owned_request.body);
+        // Runs on whichever task finished the job. It frees nothing: the
+        // request's memory (headers, body, whatever the handler allocated) is
+        // in blocks of the request pool, and the actor returns them in
+        // `releaseSlot`, after the join.
     }
 
     fn runHandlerJob(job: *HandlerJob) void {
         notePlacement(job.conn.actor_thread);
         probeNote(.handler_start);
+        var marker: @TypeOf(handler_job_marker).Node = .unset;
+        if (comptime test_observe) handler_job_marker.set(&marker, {});
+        defer if (comptime test_observe) handler_job_marker.clear(&marker);
         defer finishHandlerJob(job);
         runHandlerJobBody(job);
     }
@@ -5961,8 +6159,12 @@ pub const Connection = struct {
                 run_res catch {
                     if (job.slot.terminal.getCause() != null) return;
                     if (!job.resp.committed) {
-                        // The original handler error remains terminal if the fallback cannot write.
-                        job.resp.send(500, &.{}, "internal error") catch {};
+                        // The original handler error remains terminal if the
+                        // fallback cannot write. A handler that failed because
+                        // the request's memory ran out says which cap: its own
+                        // is a 500, the connection's and the server's a 503.
+                        const status: u16 = if (job.arena.refusal) |r| r.status() else 500;
+                        job.resp.send(status, &.{}, "internal error") catch {};
                     } else if (!job.resp.finished) {
                         self.withSession(struct {
                             fn go(c: *Connection, sid: u31) void {
@@ -7191,6 +7393,8 @@ test "t-894 leftover write acks: skip Forced is visible, Forced then deinit is q
     const limits = limits_mod.Limits.defaults;
     var slabs = try slab_pool.SlabPool.init(gpa, io, limits.outbound_bytes_per_stream, 8);
     defer slabs.deinit(gpa);
+    var requests = try testRequestPool();
+    defer requests.deinit();
 
     const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try bind.listen(io, .{ .reuse_address = true });
@@ -7214,6 +7418,7 @@ test "t-894 leftover write acks: skip Forced is visible, Forced then deinit is q
         .router = .{ .routes = &.{} },
         .gpa = gpa,
         .slab_pool = &slabs,
+        .request_pool = &requests,
     }) catch |err| {
         peer.close(io);
         return err;
@@ -7426,10 +7631,17 @@ test "recordFinalize first call stores 1" {
     try std.testing.expectEqual(@as(u8, 1), slot.finalize_count.load(.acquire));
 }
 
+/// A small request pool for the tests that need a Connection and make no
+/// requests of their own.
+fn testRequestPool() !request_pool.RequestPool {
+    return request_pool.RequestPool.init(.{ .server_bytes = 16 * 1024 * 1024, .arena_bytes = 4 * 1024 * 1024, .retain_bytes = 16 * 1024 * 1024 });
+}
+
 const TrapHop = struct {
     hop: BenchHop,
     peer: std.Io.net.Stream,
     slabs: slab_pool.SlabPool,
+    requests: request_pool.RequestPool,
     gpa: std.mem.Allocator,
     io: std.Io,
 
@@ -7437,6 +7649,7 @@ const TrapHop = struct {
         self.hop.deinit();
         self.peer.close(self.io);
         self.slabs.deinit(self.gpa);
+        self.requests.deinit();
     }
 };
 
@@ -7453,6 +7666,8 @@ fn openTrapHopLimits(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: 
     out.io = io;
     out.slabs = try slab_pool.SlabPool.init(gpa, io, limits_mod.Limits.defaults.outbound_bytes_per_stream, 8);
     errdefer out.slabs.deinit(gpa);
+    out.requests = try testRequestPool();
+    errdefer out.requests.deinit();
     const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try bind.listen(io, .{ .reuse_address = true });
     const dest = listener.socket.address;
@@ -7474,22 +7689,87 @@ fn openTrapHopLimits(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: 
         .router = .{ .routes = routes },
         .gpa = gpa,
         .slab_pool = &out.slabs,
+        .request_pool = &out.requests,
     }) catch |err| {
         peer.close(io);
         return err;
     };
 }
 
+test "lease lookup does not scan: after a burst that touched every lease, a find costs a probe or two" {
+    const gpa = std.testing.allocator;
+    var lim = limits_mod.Limits.defaults;
+    lim.max_streams_per_connection = 8;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    const n = conn.request_leases.capacity();
+    try std.testing.expectEqual(@as(usize, 2 * 8 + 1), n);
+
+    // The burst: every lease busy, then every lease released.
+    var sid: u31 = 1;
+    for (0..n) |_| {
+        _ = conn.newLease(sid) orelse return error.LeaseTableTooSmall;
+        sid += 2;
+    }
+    try std.testing.expectEqual(n, conn.request_leases.touched);
+    try std.testing.expect(conn.newLease(sid) == null);
+    var id: u31 = 1;
+    for (0..n) |_| {
+        conn.releaseLease(conn.findLease(id).?);
+        id += 2;
+    }
+    // Free leases come from the stack: nothing more is touched.
+    try std.testing.expectEqual(n, conn.lease_index.free_len);
+
+    // Now a few requests are live among the touched leases, against a model.
+    var model = std.AutoHashMap(u31, void).init(gpa);
+    defer model.deinit();
+    var rng = std.Random.DefaultPrng.init(0x1ea5e);
+    var next: u31 = 1001;
+    var lookups: u64 = 0;
+    test_lease_probes.store(0, .monotonic);
+    for (0..4000) |_| {
+        if (model.count() < n and (model.count() == 0 or rng.random().boolean())) {
+            _ = conn.newLease(next) orelse return error.LeaseTableTooSmall;
+            try model.put(next, {});
+            next += 2;
+        } else {
+            var it = model.keyIterator();
+            var pick = rng.random().uintLessThan(usize, model.count());
+            while (it.next()) |k| : (pick -|= 1) {
+                if (pick == 0) {
+                    const k_id = k.*;
+                    conn.releaseLease(conn.findLease(k_id).?);
+                    _ = model.remove(k_id);
+                    break;
+                }
+            }
+        }
+        // Every live id is found, and a released one is not.
+        var alive = model.keyIterator();
+        while (alive.next()) |k| {
+            lookups += 1;
+            try std.testing.expectEqual(k.*, conn.findLease(k.*).?.stream_id);
+        }
+        lookups += 1;
+        try std.testing.expect(conn.findLease(next + 2) == null);
+    }
+    try std.testing.expectEqual(n, conn.request_leases.touched);
+    const probes = test_lease_probes.load(.monotonic);
+    std.debug.print("lease lookups: {d} lookups made {d} probes over {d} leases (touched {d})\n", .{ lookups, probes, n, conn.request_leases.touched });
+    // A scan of the touched leases would cost about n / 2 per hit; the table
+    // costs about one. Allow three.
+    try std.testing.expect(probes <= 3 * lookups);
+    var left = model.keyIterator();
+    while (left.next()) |k| conn.releaseLease(conn.findLease(k.*).?);
+}
+
 /// Axis E arm: two `finishHandlerJob` calls on one slot admitted through
-/// `admitHandler`. Body is DebugAllocator-owned so a finalize after free
-/// is a double-free, not a silent second panic on a helper.
+/// `admitHandler`. The second must panic in `recordFinalize`.
 pub fn testTrapDoubleFinalize(io: std.Io) void {
-    var dbg = std.heap.DebugAllocator(.{
-        .never_unmap = true,
-        .retain_metadata = true,
-        .safety = true,
-    }).init;
-    const gpa = dbg.allocator();
+    const gpa = std.heap.page_allocator;
     var trap: TrapHop = undefined;
     openTrapHop(&trap, gpa, io) catch std.debug.panic("trap hop open failed", .{});
     defer trap.close();
@@ -7497,11 +7777,11 @@ pub fn testTrapDoubleFinalize(io: std.Io) void {
     const i = trap.hop.conn.slotIndex(1) orelse std.debug.panic("trap slotIndex failed", .{});
     const job = &trap.hop.conn.handler_jobs[i];
     job.conn = &trap.hop.conn;
-    job.arena = .init(gpa);
+    job.arena = &trap.hop.conn.borrowTestLease(1).arena;
     job.task_counted = false;
     job.stream_id = 1;
     job.slot = slot;
-    const body = gpa.dupe(u8, "trap-body") catch std.debug.panic("trap body dupe failed", .{});
+    const body = job.arena.allocator().dupe(u8, "trap-body") catch std.debug.panic("trap body dupe failed", .{});
     job.owned_request = .{
         .stream_id = 1,
         .method = "GET",
@@ -7560,7 +7840,7 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *HandlerJob {
     const i = conn.slotIndex(sid) orelse std.debug.panic("trap slotIndex failed", .{});
     const job = &conn.handler_jobs[i];
     job.conn = conn;
-    job.arena = .init(conn.config.gpa);
+    job.arena = &conn.borrowTestLease(sid).arena;
     job.task_counted = false;
     job.stream_id = sid;
     job.slot = slot;
@@ -7841,6 +8121,8 @@ fn bootIntoBuffer(io: std.Io, lim: limits_mod.Limits, mode: Mode, bytes: usize) 
 
     var slabs = try slab_pool.SlabPool.init(gpa, io, lim.outbound_bytes_per_stream, 8);
     defer slabs.deinit(gpa);
+    var requests = try testRequestPool();
+    defer requests.deinit();
     // `Connection.init` only checks that a TLS connection has an acceptor.
     var acceptor: tls_edge.Acceptor = undefined;
     const pair = try SocketPair.open(io);
@@ -7857,6 +8139,7 @@ fn bootIntoBuffer(io: std.Io, lim: limits_mod.Limits, mode: Mode, bytes: usize) 
         .tls_acceptor = if (mode == .tls) &acceptor else null,
         .gpa = gpa,
         .slab_pool = &slabs,
+        .request_pool = &requests,
     });
     const used = fba.end_index;
     conn.finishBoot();

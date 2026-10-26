@@ -130,7 +130,7 @@ fn waitAccountingZeroAt(server: *starh2.Server, timeout_ms: u64, caller_line: us
         const streams = server.accounting.active_streams.load(.acquire);
         const reaper = server.accounting.reaper_reserved.load(.acquire);
         const outbound = server.accounting.outbound_bytes.load(.acquire);
-        const request = server.accounting.request_bytes.load(.acquire);
+        const request = server.requests.held_bytes.load(.acquire);
         const live = starh2.edge.connection.test_observed_live_handlers.load(.acquire);
         const slots = starh2.edge.connection.test_observed_slots_in_use.load(.acquire);
         if (streams == 0 and reaper == 0 and outbound == 0 and request == 0 and live == 0 and slots == 0) return;
@@ -307,7 +307,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), server.accounting.request_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_handshakes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_observed_live_handlers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_observed_slots_in_use.load(.acquire));
@@ -406,7 +406,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), server.accounting.request_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), c.test_observed_live_handlers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), c.test_observed_slots_in_use.load(.acquire));
 }
@@ -1226,8 +1226,9 @@ test "a reset drops a stream's queued HEADERS and fails their ticket (t-3514)" {
     };
 }
 
-/// A stream that gets no request memory is refused, and the connection goes
-/// on: Session still decoded its block, so the HPACK table stays in step.
+/// A stream that gets no request memory is answered with a 503, and the
+/// connection goes on: Session still decoded its block (into the connection's
+/// scratch), so the HPACK table stays in step.
 fn runRefusedWithoutRequestMemory(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
@@ -1267,7 +1268,8 @@ fn runRefusedWithoutRequestMemory(rt: *zio.Runtime, gpa: std.mem.Allocator) !voi
     defer first.deinit(gpa);
     try h2c.appendHeaders(gpa, &first, 1, "/complete", true);
     try writeAllStreamAt(stream, first.items, @src());
-    try std.testing.expectEqual(StreamOutcome.reset, try awaitStreamOutcome(stream, 1, 2_000));
+    // A response with END_STREAM, not an RST: the stream is answered.
+    try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 1, 2_000));
 
     c.test_no_request_lease.store(false, .release);
     var second: std.ArrayList(u8) = .empty;
@@ -1304,14 +1306,12 @@ const CountingDbg = std.heap.DebugAllocator(.{
     .enable_memory_limit = true,
 });
 
-fn liveBytes(dbg: *CountingDbg) usize {
-    return @atomicLoad(usize, &dbg.total_requested_bytes, .monotonic);
-}
-
 /// Request memory lives as long as the request. A handler's `req.arena` used
 /// to be its slot's arena, reset with `.retain_capacity`, so every slot kept
-/// its largest request's memory until the connection closed.
-fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator, dbg: *CountingDbg) !void {
+/// its largest request's memory until the connection closed. It is now blocks
+/// of the server's request pool, and they must be back in it as soon as the
+/// handler's slot is released, with the connection still open.
+fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
@@ -1350,9 +1350,9 @@ fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator, dbg: 
     try writeAllStreamAt(stream, wire.items, @src());
     try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, 1, 2_000));
     try waitAccountingZeroAt(&server, 2_000, @src().line);
-    // The connection is up and idle: everything it holds for its own life is
-    // counted here.
-    const baseline = liveBytes(dbg);
+    // The connection is up and idle. The pool must hold nothing for it.
+    try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
+    const held_high_before = server.requests.snapshot().held_high;
 
     const paths = [_][]const u8{ "/big-task", "/big-complete" };
     for (paths, 0..) |path, k| {
@@ -1363,13 +1363,17 @@ fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator, dbg: 
         try writeAllStreamAt(stream, req.items, @src());
         try std.testing.expectEqual(StreamOutcome.ended, try awaitStreamOutcome(stream, sid, 2_000));
         try waitAccountingZeroAt(&server, 2_000, @src().line);
-        const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% 2 * std.time.ns_per_s;
-        while (liveBytes(dbg) > baseline + big_request_bytes / 4) {
-            if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
-                std.debug.print("{s}: live bytes {d} after the request, {d} before it, with the connection still open\n", .{ path, liveBytes(dbg), baseline });
-                return error.RequestMemoryOutlivedRequest;
-            }
-            zio.sleep(.fromMilliseconds(5)) catch {};
+        // The request really held its megabyte in the pool (the high-water
+        // mark moved by at least that), and gave all of it back while the
+        // connection is still open.
+        const snap = server.requests.snapshot();
+        if (snap.held_high < held_high_before + big_request_bytes) {
+            std.debug.print("{s}: the request held at most {d} bytes of the pool; the check did not fire\n", .{ path, snap.held_high });
+            return error.RequestNeverUsedThePool;
+        }
+        if (snap.held_bytes != 0) {
+            std.debug.print("{s}: {d} pool bytes held after the request, with the connection still open\n", .{ path, snap.held_bytes });
+            return error.RequestMemoryOutlivedRequest;
         }
     }
 }
@@ -1386,7 +1390,7 @@ test "request memory is freed when its handler finishes, not when the connection
         .executors = .exact(4),
     });
     defer rt.deinit();
-    var handle = try rt.spawn(runRequestMemoryFreedAtFinish, .{ rt, gpa, &dbg });
+    var handle = try rt.spawn(runRequestMemoryFreedAtFinish, .{ rt, gpa });
     handle.join() catch |err| {
         std.debug.print("request memory: {s}\n", .{@errorName(err)});
         return err;
@@ -1517,7 +1521,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
-        try std.testing.expectEqual(@as(usize, 0), server.accounting.request_bytes.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_observed_live_handlers.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_observed_slots_in_use.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_queue_wire_bypass.load(.acquire));
@@ -1754,8 +1758,11 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
         .outbound_bytes_per_stream = 4 * 1024,
         .outbound_bytes_per_connection = 16 * 1024,
         .outbound_bytes_per_server = 16 * 1024,
-        .request_bytes_per_connection = 16 * 1024,
-        .request_bytes_per_server = 16 * 1024,
+        .request_bytes_per_connection = 128 * 1024,
+        .request_bytes_per_server = 256 * 1024,
+        .request_arena_bytes = 256 * 1024,
+        .request_pool_retain_bytes = 256 * 1024,
+        .request_body_bytes = 1024,
         // Leave room above the 4 KiB terminal reserve for ordinary SETTINGS.
         .control_bytes_per_connection = 8 * 1024,
         .control_entries_per_connection = 32,

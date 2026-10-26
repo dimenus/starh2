@@ -239,12 +239,10 @@ pub fn huffmanPair(sym: u8) struct { code: u32, bits: u8 } {
     return .{ .code = huff_pairs[sym].code, .bits = huff_pairs[sym].bits };
 }
 
-fn huffDecode(allocator: std.mem.Allocator, encoded: []const u8) (CompressionError || error{OutOfMemory})![]u8 {
-    // Appendix B shortest code is 5 bits, so decoded.len <= encoded.len * 8 / 5.
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.ensureTotalCapacityPrecise(allocator, (encoded.len * 8) / 5);
-
+/// Walk a Huffman string. Returns its decoded length; writes the bytes to
+/// `out` when given one. `out` must hold `huffUpper(encoded.len)` bytes.
+fn huffWalk(encoded: []const u8, out: ?[]u8) CompressionError!usize {
+    var n: usize = 0;
     var node: u16 = 0;
     var leftover: u32 = 0;
     var leftover_bits: u8 = 0;
@@ -261,7 +259,8 @@ fn huffDecode(allocator: std.mem.Allocator, encoded: []const u8) (CompressionErr
             if (sym == huff_decode_none) continue;
             // EOS inside a string is a compression error (RFC 7541 §5.2).
             if (sym == 256) return error.CompressionError;
-            out.appendAssumeCapacity(@intCast(sym));
+            if (out) |o| o[n] = @intCast(sym);
+            n += 1;
             node = 0;
             leftover = 0;
             leftover_bits = 0;
@@ -276,18 +275,58 @@ fn huffDecode(allocator: std.mem.Allocator, encoded: []const u8) (CompressionErr
         const pad_mask: u32 = (@as(u32, 1) << @intCast(leftover_bits)) - 1;
         if (leftover != pad_mask) return error.CompressionError;
     }
-    return try out.toOwnedSlice(allocator);
+    return n;
 }
 
-fn decodeString(allocator: std.mem.Allocator, data: []const u8, start: *usize) (CompressionError || error{OutOfMemory})![]u8 {
+/// Appendix B's shortest code is 5 bits, so a Huffman string of `encoded_len`
+/// bytes decodes to at most this many bytes.
+fn huffUpper(encoded_len: usize) usize {
+    return encoded_len * 8 / 5;
+}
+
+fn huffDecode(allocator: std.mem.Allocator, encoded: []const u8) (CompressionError || error{OutOfMemory})![]u8 {
+    if (encoded.len == 0) return try allocator.alloc(u8, 0);
+    const buf = try allocator.alloc(u8, huffUpper(encoded.len));
+    errdefer allocator.free(buf);
+    const n = try huffWalk(encoded, buf);
+    if (n == buf.len) return buf;
+    // The allocation was the upper bound. Shrinking in place keeps the bytes
+    // that were not used available to a request arena, whose tail this is.
+    if (allocator.remap(buf, n)) |shrunk| return shrunk;
+    const exact = try allocator.dupe(u8, buf[0..n]);
+    allocator.free(buf);
+    return exact;
+}
+
+/// A string literal located in a header block and not yet decoded.
+const StrRef = struct {
+    huffman: bool,
+    bytes: []const u8,
+
+    /// The most bytes the decoded string can take. Exact for a raw string.
+    fn upper(self: StrRef) usize {
+        return if (self.huffman) huffUpper(self.bytes.len) else self.bytes.len;
+    }
+
+    fn materialize(self: StrRef, allocator: std.mem.Allocator) (CompressionError || error{OutOfMemory})![]u8 {
+        if (self.huffman) return huffDecode(allocator, self.bytes);
+        return try allocator.dupe(u8, self.bytes);
+    }
+};
+
+fn peekString(data: []const u8, start: *usize) CompressionError!StrRef {
     if (start.* >= data.len) return error.CompressionError;
     const huffman = (data[start.*] & 0x80) != 0;
     const len = try decodeInt(data, 7, start);
-    if (start.* + len > data.len) return error.CompressionError;
+    if (len > data.len - start.*) return error.CompressionError;
     const slice = data[start.* .. start.* + len];
     start.* += len;
-    if (huffman) return huffDecode(allocator, slice);
-    return try allocator.dupe(u8, slice);
+    return .{ .huffman = huffman, .bytes = slice };
+}
+
+fn decodeString(allocator: std.mem.Allocator, data: []const u8, start: *usize) (CompressionError || error{OutOfMemory})![]u8 {
+    const ref = try peekString(data, start);
+    return ref.materialize(allocator);
 }
 
 fn decodeInt(data: []const u8, prefix_bits: u3, start: *usize) CompressionError!usize {
@@ -329,9 +368,17 @@ pub const Decoder = struct {
     max_size: usize = MAX_DYNAMIC_TABLE,
 
     pub const DecodeResult = struct {
+        /// The decoded fields. With `truncated` this is a prefix of the block's
+        /// fields and not all of them.
         fields: []HeaderField,
         decoded_size: usize,
         policy_exceeded: bool = false,
+        /// The block held more fields, or more decoded bytes, than the limits
+        /// allow, so only a prefix was materialized. The decoder still read
+        /// the whole block, because its table must stay in step with the
+        /// peer's. A caller has no use for the fields of a truncated result:
+        /// it is a request to refuse.
+        truncated: bool = false,
     };
 
     pub fn init(allocator: std.mem.Allocator) Decoder {
@@ -465,11 +512,6 @@ pub const Decoder = struct {
         try self.insert(n2, v2);
     }
 
-    fn appendField(request_alloc: std.mem.Allocator, fields: *std.ArrayList(HeaderField), field: HeaderField) error{OutOfMemory}!void {
-        errdefer field.freeOwned(request_alloc);
-        try fields.append(request_alloc, field);
-    }
-
     /// Decode a complete header block into `self.allocator`.
     pub fn decode(
         self: *Decoder,
@@ -482,12 +524,48 @@ pub const Decoder = struct {
         return self.decodeInto(self.allocator, block, max_fields, max_decoded_size, max_name, max_value);
     }
 
+    /// The most bytes `decodeInto` takes from `request_alloc`, whatever the
+    /// block says: the field array at full capacity plus the strings, which
+    /// are held to `max_decoded_size`. An allocator with this much room cannot
+    /// make `decodeInto` fail. `alignment_slack` covers the field array's
+    /// alignment inside a block that is not empty.
+    pub fn requestBytesBound(max_fields: usize, max_decoded_size: usize) error{Overflow}!usize {
+        const alignment_slack = @alignOf(HeaderField);
+        const array = try std.math.mul(usize, max_fields, @sizeOf(HeaderField));
+        return try std.math.add(usize, try std.math.add(usize, array, max_decoded_size), alignment_slack);
+    }
+
+    const DecodeState = struct {
+        fields: std.ArrayList(HeaderField) = .empty,
+        decoded_size: usize = 0,
+        /// Fields in the block so far, whether or not they were materialized.
+        seen: usize = 0,
+        policy: bool = false,
+        truncated: bool = false,
+        max_fields: usize,
+        max_decoded_size: usize,
+        max_name: usize,
+        max_value: usize,
+
+        /// Count a field against the policy limits.
+        fn account(st: *DecodeState, name_len: usize, value_len: usize) void {
+            st.decoded_size +|= name_len +| value_len +| 32;
+            if (st.seen >= st.max_fields or st.decoded_size > st.max_decoded_size or name_len > st.max_name or value_len > st.max_value) st.policy = true;
+            st.seen += 1;
+        }
+
+        /// Whether the field just counted may be materialized.
+        fn fits(st: *const DecodeState) bool {
+            return !st.truncated and st.fields.items.len < st.fields.capacity and st.decoded_size <= st.max_decoded_size;
+        }
+    };
+
     /// Decode a complete header block.
     ///
     /// `request_alloc` owns the result field slice and every non-static string
     /// in it. `self.allocator` owns the connection dynamic table. They may be
     /// the same (tests, isolated Session). On the live edge they are not: the
-    /// table is GPA and the request list is the handler-job arena.
+    /// table is GPA and the request list is the request's arena.
     ///
     /// A policy breach is NOT an error here. A field block that exceeds
     /// `max_fields`, `max_decoded_size`, `max_name`, or `max_value` still
@@ -497,6 +575,17 @@ pub const Decoder = struct {
     /// block on the connection. So the decoder always finishes its work, and
     /// `Session` turns the flag into a 431 response for that one stream while
     /// the connection survives.
+    ///
+    /// What it takes from `request_alloc` is bounded, whatever the block says
+    /// (`requestBytesBound`). A block can be 64 KiB of one-byte references to
+    /// a 4 KiB table entry, which decodes to 256 MiB; the request's memory
+    /// must not grow with that, because the table has to be advanced and the
+    /// request refused even when the request cannot get any memory. So the
+    /// field array is sized once, strings are materialized only while the
+    /// running decoded size stays within `max_decoded_size`, and past that the
+    /// result is `truncated` and later fields are only run through the table.
+    /// A field near the edge is decoded on the decoder's allocator first
+    /// (`literalField`), so an oversized string never touches `request_alloc`.
     pub fn decodeInto(
         self: *Decoder,
         request_alloc: std.mem.Allocator,
@@ -506,34 +595,36 @@ pub const Decoder = struct {
         max_name: usize,
         max_value: usize,
     ) (CompressionError || error{OutOfMemory})!DecodeResult {
-        var fields: std.ArrayList(HeaderField) = .empty;
+        var st: DecodeState = .{
+            .max_fields = max_fields,
+            .max_decoded_size = max_decoded_size,
+            .max_name = max_name,
+            .max_value = max_value,
+        };
         errdefer {
-            HeaderField.freeOwnedSlice(request_alloc, fields.items);
-            fields.deinit(request_alloc);
+            HeaderField.freeOwnedSlice(request_alloc, st.fields.items);
+            st.fields.deinit(request_alloc);
         }
-        var decoded_size: usize = 0;
-        var policy = false;
+        // Each field takes at least one byte of the block, so a block never
+        // has more fields than bytes.
+        try st.fields.ensureTotalCapacityPrecise(request_alloc, @min(max_fields, block.len));
         var i: usize = 0;
         var first = true;
         while (i < block.len) {
             const b = block[i];
             if ((b & 0x80) != 0) {
                 const idx = try decodeInt(block, 7, &i);
-                const field = try takeIndexed(try self.lookup(idx), request_alloc);
-                decoded_size += field.name.len + field.value.len + 32;
-                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
-                try appendField(request_alloc, &fields, field);
+                const pair = try self.lookup(idx);
+                st.account(pair.name.len, pair.value.len);
+                if (st.fits()) {
+                    st.fields.appendAssumeCapacity(try takeIndexed(pair, request_alloc));
+                } else {
+                    st.truncated = true;
+                }
                 first = false;
             } else if ((b & 0xc0) == 0x40) {
                 const idx = try decodeInt(block, 6, &i);
-                const field = try self.takeLiteral(request_alloc, block, idx, &i, false);
-                decoded_size += field.name.len + field.value.len + 32;
-                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
-                self.indexIntoTable(field.name, field.value) catch |err| {
-                    field.freeOwned(request_alloc);
-                    return err;
-                };
-                try appendField(request_alloc, &fields, field);
+                try self.literalField(request_alloc, block, idx, &i, false, true, &st);
                 first = false;
             } else if ((b & 0xe0) == 0x20) {
                 // A dynamic table size update is legal only at the start of a
@@ -545,18 +636,73 @@ pub const Decoder = struct {
             } else {
                 const never = (b & 0xf0) == 0x10;
                 const idx = try decodeInt(block, 4, &i);
-                const field = try self.takeLiteral(request_alloc, block, idx, &i, never);
-                decoded_size += field.name.len + field.value.len + 32;
-                if (fields.items.len >= max_fields or decoded_size > max_decoded_size or field.name.len > max_name or field.value.len > max_value) policy = true;
-                try appendField(request_alloc, &fields, field);
+                try self.literalField(request_alloc, block, idx, &i, never, false, &st);
                 first = false;
             }
         }
         return .{
-            .fields = try fields.toOwnedSlice(request_alloc),
-            .decoded_size = decoded_size,
-            .policy_exceeded = policy,
+            .fields = try st.fields.toOwnedSlice(request_alloc),
+            .decoded_size = st.decoded_size,
+            .policy_exceeded = st.policy,
+            .truncated = st.truncated,
         };
+    }
+
+    /// One literal representation: count it, add it to the table when it is
+    /// an incremental-indexing one, and materialize it into `request_alloc`
+    /// if the budget has room.
+    ///
+    /// The room is judged BEFORE anything is decoded, from the strings'
+    /// upper bounds: a field that cannot overrun what is left of the budget is
+    /// decoded straight into `request_alloc`. Any other is decoded on
+    /// `self.allocator`, measured exactly, and copied across only if it fits.
+    fn literalField(
+        self: *Decoder,
+        request_alloc: std.mem.Allocator,
+        block: []const u8,
+        idx: usize,
+        i: *usize,
+        never: bool,
+        index_it: bool,
+        st: *DecodeState,
+    ) (CompressionError || error{OutOfMemory})!void {
+        const start = i.*;
+        var pos = start;
+        const name_upper = if (idx == 0) (try peekString(block, &pos)).upper() else (try self.lookup(idx)).name.len;
+        const value_upper = (try peekString(block, &pos)).upper();
+        const room = st.max_decoded_size -| st.decoded_size;
+        const sure_fit = !st.truncated and st.fields.items.len < st.fields.capacity and
+            name_upper +| value_upper +| 32 <= room;
+        if (sure_fit) {
+            const field = try self.takeLiteral(request_alloc, block, idx, i, never);
+            st.account(field.name.len, field.value.len);
+            if (index_it) self.indexIntoTable(field.name, field.value) catch |err| {
+                field.freeOwned(request_alloc);
+                return err;
+            };
+            std.debug.assert(st.fits());
+            st.fields.appendAssumeCapacity(field);
+            return;
+        }
+        const field = try self.takeLiteral(self.allocator, block, idx, i, never);
+        defer field.freeOwned(self.allocator);
+        st.account(field.name.len, field.value.len);
+        if (index_it) try self.indexIntoTable(field.name, field.value);
+        if (!st.fits()) {
+            st.truncated = true;
+            return;
+        }
+        // It fits after all (the upper bounds were pessimistic): copy it over.
+        const name = if (field.name_owned) try request_alloc.dupe(u8, field.name) else field.name;
+        errdefer if (field.name_owned) request_alloc.free(name);
+        const value = try request_alloc.dupe(u8, field.value);
+        st.fields.appendAssumeCapacity(.{
+            .name = name,
+            .value = value,
+            .never_index = field.never_index,
+            .name_owned = field.name_owned,
+            .value_owned = true,
+        });
     }
 
     pub fn freeResult(self: *Decoder, result: DecodeResult) void {
@@ -929,4 +1075,225 @@ test "Encoder.encode allocates exactly once" {
     defer counting.allocator().free(enc);
     try std.testing.expectEqual(@as(usize, 1), counting.allocations);
     try std.testing.expectEqual(try Encoder.encodedLen(&fields), enc.len);
+}
+
+/// Encode `s` as a Huffman string literal body (RFC 7541 section 5.2), for
+/// the tests below. Returns the encoded bytes.
+fn testHuffmanEncode(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var acc: u64 = 0;
+    var bits: u8 = 0;
+    for (s) |c| {
+        const pair = huffmanPair(c);
+        acc = (acc << @intCast(pair.bits)) | pair.code;
+        bits += pair.bits;
+        while (bits >= 8) {
+            bits -= 8;
+            try out.append(allocator, @intCast((acc >> @intCast(bits)) & 0xff));
+        }
+    }
+    if (bits > 0) {
+        const pad: u8 = 8 - bits;
+        acc = (acc << @intCast(pad)) | ((@as(u64, 1) << @intCast(pad)) - 1);
+        try out.append(allocator, @intCast(acc & 0xff));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// `0x40`, a new name and a value, raw, as a literal with incremental indexing.
+fn testLiteral(list: *std.ArrayList(u8), allocator: std.mem.Allocator, prefix: u8, name: []const u8, value: []const u8, value_huffman: bool) !void {
+    try list.append(allocator, prefix);
+    try testAppendString(list, allocator, name, false);
+    try testAppendString(list, allocator, value, value_huffman);
+}
+
+fn testAppendString(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8, huffman: bool) !void {
+    const body = if (huffman) try testHuffmanEncode(allocator, s) else s;
+    defer if (huffman) allocator.free(body);
+    // 7-bit prefix integer.
+    var len = body.len;
+    const flag: u8 = if (huffman) 0x80 else 0;
+    if (len < 127) {
+        try list.append(allocator, flag | @as(u8, @intCast(len)));
+    } else {
+        try list.append(allocator, flag | 127);
+        len -= 127;
+        while (len >= 128) : (len /= 128) try list.append(allocator, @intCast(len % 128 + 128));
+        try list.append(allocator, @intCast(len));
+    }
+    try list.appendSlice(allocator, body);
+}
+
+const bomb_limits = struct {
+    const max_fields = 100;
+    const max_decoded = 32 * 1024;
+    const max_name = 256;
+    const max_value = 8 * 1024;
+};
+
+test "decode takes at most requestBytesBound from the request allocator: a table bomb" {
+    // One 4000-byte table entry, then 64 KiB of one-byte references to it:
+    // 65,000 fields and about 260 MB if every one were materialized.
+    const gpa = std.testing.allocator;
+    var dec = Decoder.init(gpa);
+    defer dec.deinit();
+    var big: [4000 - 32 - 1]u8 = undefined;
+    @memset(&big, 'v');
+    var insert: std.ArrayList(u8) = .empty;
+    defer insert.deinit(gpa);
+    try testLiteral(&insert, gpa, 0x40, "x", &big, false);
+    const seeded = try dec.decode(insert.items, 100, 32 * 1024, 256, 8 * 1024);
+    dec.freeResult(seeded);
+
+    const block = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(block);
+    @memset(block, 0xbe); // indexed, 62 + 1 + 0x3e... the first dynamic entry
+    block[0] = 0x80 | 62;
+    @memset(block[1..], 0x80 | 62);
+
+    const bound = try Decoder.requestBytesBound(bomb_limits.max_fields, bomb_limits.max_decoded);
+    const buf = try gpa.alloc(u8, bound);
+    defer gpa.free(buf);
+    var fba = std.heap.FixedBufferAllocator.init(buf);
+    const res = try dec.decodeInto(fba.allocator(), block, bomb_limits.max_fields, bomb_limits.max_decoded, bomb_limits.max_name, bomb_limits.max_value);
+    try std.testing.expect(res.truncated);
+    try std.testing.expect(res.policy_exceeded);
+    try std.testing.expect(fba.end_index <= bound);
+    // 4000 + 1 + 32 bytes per field: eight fields fit 32 KiB.
+    try std.testing.expect(res.fields.len >= 1 and res.fields.len <= 9);
+    try std.testing.expect(res.decoded_size > 32 * 1024);
+    // The table is intact: the same reference still decodes.
+    const again = try dec.decode(&[_]u8{0x80 | 62}, 100, 32 * 1024, 256, 8 * 1024);
+    defer dec.freeResult(again);
+    try std.testing.expectEqual(@as(usize, 4000 - 32 - 1), again.fields[0].value.len);
+}
+
+test "decode takes at most requestBytesBound: a string past the budget never reaches the request allocator" {
+    const gpa = std.testing.allocator;
+    var dec = Decoder.init(gpa);
+    defer dec.deinit();
+    const bound = try Decoder.requestBytesBound(bomb_limits.max_fields, bomb_limits.max_decoded);
+    const buf = try gpa.alloc(u8, bound);
+    defer gpa.free(buf);
+
+    // A 60 KB raw value, and a 60 KB value in Huffman form (about 45 KB
+    // encoded, 60 KB decoded): both larger than the 32 KiB budget.
+    var huge: [60 * 1024]u8 = undefined;
+    @memset(&huge, 'a');
+    for ([_]bool{ false, true }) |huffman| {
+        for ([_]u8{ 0x40, 0x00, 0x10 }) |prefix| {
+            var block: std.ArrayList(u8) = .empty;
+            defer block.deinit(gpa);
+            try testLiteral(&block, gpa, prefix, "x-big", &huge, huffman);
+            var fba = std.heap.FixedBufferAllocator.init(buf);
+            const res = try dec.decodeInto(fba.allocator(), block.items, 100, bomb_limits.max_decoded, 256, 8 * 1024);
+            try std.testing.expect(res.truncated);
+            try std.testing.expect(res.policy_exceeded);
+            try std.testing.expectEqual(@as(usize, 0), res.fields.len);
+            // Only the (empty) field array was taken.
+            try std.testing.expect(fba.end_index <= 100 * @sizeOf(HeaderField));
+        }
+    }
+}
+
+test "a Huffman field whose upper bound passes the budget but whose real size fits is kept" {
+    // 20,000 'e' characters Huffman-encode to 20,000 * 5 / 8 = 12,500 bytes,
+    // upper bound 20,000. Put them after 20,000 bytes of other fields so that
+    // upper + used passes 32 KiB while the real size does not.
+    const gpa = std.testing.allocator;
+    var dec = Decoder.init(gpa);
+    defer dec.deinit();
+    var plain: [20000]u8 = undefined;
+    @memset(&plain, 'p');
+    var e_run: [12000]u8 = undefined;
+    @memset(&e_run, 'e');
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    try testLiteral(&block, gpa, 0x00, "x-first", &plain, false);
+    try testLiteral(&block, gpa, 0x00, "x-second", &e_run, true);
+    // 20000 + 7 + 32 + 12000 + 8 + 32 < 32768; the upper bound of the second
+    // is 12000 (raw) vs the Huffman string's 7500 encoded bytes -> upper 12000.
+    // Make it fail the cheap test by adding a third field first.
+    var block2: std.ArrayList(u8) = .empty;
+    defer block2.deinit(gpa);
+    try testLiteral(&block2, gpa, 0x00, "x-first", &plain, false);
+    var filler: [600]u8 = undefined;
+    @memset(&filler, 'f');
+    try testLiteral(&block2, gpa, 0x00, "x-filler", &filler, false);
+    try testLiteral(&block2, gpa, 0x00, "x-second", &e_run, true);
+
+    const bound = try Decoder.requestBytesBound(100, 32 * 1024);
+    const buf = try gpa.alloc(u8, bound);
+    defer gpa.free(buf);
+    for ([_][]const u8{ block.items, block2.items }) |b| {
+        var fba = std.heap.FixedBufferAllocator.init(buf);
+        const res = try dec.decodeInto(fba.allocator(), b, 100, 32 * 1024, 256, 8 * 1024);
+        try std.testing.expect(!res.truncated);
+        const last = res.fields[res.fields.len - 1];
+        try std.testing.expectEqualStrings("x-second", last.name);
+        try std.testing.expectEqualSlices(u8, &e_run, last.value);
+        try std.testing.expect(fba.end_index <= bound);
+    }
+}
+
+test "a random block never makes decode fail on a bounded request allocator" {
+    // Not a proof, an adversarial sample: blocks of random bytes and blocks
+    // built from valid pieces, against a decoder whose table already holds
+    // large entries, each decoded in an allocator of exactly the bound.
+    const gpa = std.testing.allocator;
+    var dec = Decoder.init(gpa);
+    defer dec.deinit();
+    var seed_block: std.ArrayList(u8) = .empty;
+    defer seed_block.deinit(gpa);
+    var v: [1500]u8 = undefined;
+    @memset(&v, 'z');
+    try testLiteral(&seed_block, gpa, 0x40, "alpha", &v, false);
+    try testLiteral(&seed_block, gpa, 0x40, "beta", &v, true);
+    const seeded = try dec.decode(seed_block.items, 100, 32 * 1024, 256, 8 * 1024);
+    dec.freeResult(seeded);
+
+    const bound = try Decoder.requestBytesBound(100, 32 * 1024);
+    const buf = try gpa.alloc(u8, bound);
+    defer gpa.free(buf);
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    var value_buf: [3000]u8 = undefined;
+    @memset(&value_buf, 'q');
+    var decoded_ok: usize = 0;
+    var max_used: usize = 0;
+    for (0..4000) |_| {
+        var built: std.ArrayList(u8) = .empty;
+        defer built.deinit(gpa);
+        const pieces = rng.random().uintLessThan(usize, 60);
+        for (0..pieces) |_| {
+            switch (rng.random().uintLessThan(u8, 5)) {
+                0 => try built.append(gpa, 0x80 | (62 + rng.random().uintLessThan(u8, 2))),
+                1 => try built.append(gpa, 0x80 | (1 + rng.random().uintLessThan(u8, 61))),
+                2 => try testLiteral(&built, gpa, 0x40, "n", value_buf[0..rng.random().uintLessThan(usize, 3000)], rng.random().boolean()),
+                3 => try testLiteral(&built, gpa, 0x00, "x-name", value_buf[0..rng.random().uintLessThan(usize, 3000)], rng.random().boolean()),
+                else => try built.append(gpa, rng.random().int(u8)),
+            }
+        }
+        const block = built.items;
+        var fba = std.heap.FixedBufferAllocator.init(buf);
+        if (dec.decodeInto(fba.allocator(), block, 100, 32 * 1024, 256, 8 * 1024)) |res| {
+            decoded_ok += 1;
+            HeaderField.freeOwnedSlice(fba.allocator(), res.fields);
+        } else |err| {
+            // A compression error is the peer's fault. Running out of room is ours.
+            try std.testing.expect(err == error.CompressionError);
+        }
+        try std.testing.expect(fba.end_index <= bound);
+        max_used = @max(max_used, fba.end_index);
+        // A bad block can leave the table in any state; start over when it
+        // grew past what the seed block built.
+        if (dec.dyn.items.len > 6) {
+            dec.clearDyn();
+            const again = try dec.decode(seed_block.items, 100, 32 * 1024, 256, 8 * 1024);
+            dec.freeResult(again);
+        }
+    }
+    try std.testing.expect(decoded_ok > 100);
+    // The sample reached the budget, or it proved nothing about it.
+    try std.testing.expect(max_used > 32 * 1024 / 2);
 }

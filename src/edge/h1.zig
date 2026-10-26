@@ -126,7 +126,6 @@ const H1Conn = struct {
     finished: bool = false,
     no_payload: bool = false,
     resp_status: u16 = 0,
-    request_held: usize = 0,
     socket_closed: bool = false,
     dispatch_headers: []request.Header = &.{},
 
@@ -157,7 +156,6 @@ const H1Conn = struct {
 
     fn deinit(self: *H1Conn) void {
         std.debug.assert(!self.slot.in_use);
-        std.debug.assert(self.request_held == 0);
         if (self.tls_pump) |p| {
             p.shutdownCq();
         }
@@ -413,13 +411,6 @@ fn serveOne(self: *H1Conn) !bool {
                     try writeError(self, 413);
                     return false;
                 }
-                if (self.config.accounting) |a| {
-                    if (!a.tryReserveRequest(body.len)) {
-                        try writeError(self, 413);
-                        return false;
-                    }
-                    self.request_held = body.len;
-                }
             }
 
             var headers: []const request.Header = head.headers;
@@ -435,7 +426,6 @@ fn serveOne(self: *H1Conn) !bool {
                     self.path_q_buf,
                 );
                 if (v.status != 0) {
-                    releaseRequest(self);
                     try writeError(self, v.status);
                     return false;
                 }
@@ -453,18 +443,10 @@ fn serveOne(self: *H1Conn) !bool {
             }
 
             try dispatch(self, head, body, headers, path, query, authority);
-            releaseRequest(self);
             if (test_channel_mutation == .m3_ignore_close) self.want_close = false;
             if (self.want_close or close_after) return false;
             return true;
         },
-    }
-}
-
-fn releaseRequest(self: *H1Conn) void {
-    if (self.request_held != 0) {
-        if (self.config.accounting) |a| a.releaseRequest(self.request_held);
-        self.request_held = 0;
     }
 }
 

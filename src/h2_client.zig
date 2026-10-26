@@ -168,6 +168,20 @@ pub fn buildClientHelloWindow(
     return try wire.toOwnedSlice(gpa);
 }
 
+/// One DATA frame. The caller keeps `bytes` within the peer's frame size.
+pub fn appendData(gpa: std.mem.Allocator, wire: *std.ArrayList(u8), stream_id: u31, bytes: []const u8, end_stream: bool) !void {
+    var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    const fh = frame.FrameHeader{
+        .length = @intCast(bytes.len),
+        .type = .data,
+        .flags = .{ .end_stream = end_stream },
+        .stream_id = stream_id,
+    };
+    fh.encode(&hdr_buf);
+    try wire.appendSlice(gpa, &hdr_buf);
+    try wire.appendSlice(gpa, bytes);
+}
+
 pub fn appendWindowUpdate(gpa: std.mem.Allocator, wire: *std.ArrayList(u8), stream_id: u31, incr: u31) !void {
     var buf: [13]u8 = undefined;
     const n = try frame.Serializer.windowUpdate(&buf, stream_id, incr);

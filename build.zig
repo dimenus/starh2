@@ -716,6 +716,22 @@ pub fn build(b: *std.Build) void {
     const slot_reuse_step = b.step("test-slot-reuse", "Run the connection slot gates (reuse, ordering, boot allocator calls, dirty slots, shutdown)");
     slot_reuse_step.dependOn(&run_slot_reuse_tests.step);
 
+    const request_memory_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/request_memory.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_request_memory_tests = b.addRunArtifact(request_memory_tests);
+    const request_memory_step = b.step("test-request-memory", "Run the request memory gates (caps and their statuses, a header block decoded without memory, blocks coming home)");
+    request_memory_step.dependOn(&run_request_memory_tests.step);
+
     const admission_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/admission.zig"),
@@ -768,6 +784,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_goaway_delivery_tests.step);
     test_step.dependOn(&run_admission_tests.step);
     test_step.dependOn(&run_slot_reuse_tests.step);
+    test_step.dependOn(&run_request_memory_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");

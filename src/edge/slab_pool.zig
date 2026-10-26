@@ -37,11 +37,118 @@
 const std = @import("std");
 const boot_plan = @import("../core/boot_plan.zig");
 
+/// A fixed array of bits with atomic access. `FreeBitmap` is one of these plus
+/// the claim protocol; `RequestPool` keeps a second one beside it to mark
+/// which blocks are resident.
+pub const AtomicBits = struct {
+    words: []std.atomic.Value(u64),
+
+    pub fn wordCount(capacity: usize) usize {
+        return (capacity + 63) / 64;
+    }
+
+    pub fn get(self: AtomicBits, idx: u32) bool {
+        const mask = @as(u64, 1) << @as(u6, @intCast(idx % 64));
+        return self.words[idx / 64].load(.acquire) & mask != 0;
+    }
+
+    /// Returns the previous value of the bit.
+    pub fn set(self: AtomicBits, idx: u32) bool {
+        const mask = @as(u64, 1) << @as(u6, @intCast(idx % 64));
+        return self.words[idx / 64].fetchOr(mask, .acq_rel) & mask != 0;
+    }
+
+    /// Returns the previous value of the bit.
+    pub fn clear(self: AtomicBits, idx: u32) bool {
+        const mask = @as(u64, 1) << @as(u6, @intCast(idx % 64));
+        return self.words[idx / 64].fetchAnd(~mask, .acq_rel) & mask != 0;
+    }
+
+    pub fn count(self: AtomicBits) usize {
+        var n: usize = 0;
+        for (self.words) |*w| n += @popCount(w.load(.acquire));
+        return n;
+    }
+};
+
+/// The free map of a pool: a set bit is a free index. `claim` takes the
+/// LOWEST free index, which is the whole point of this type (see the file
+/// header: a FIFO list would walk the pool and fault every page).
+pub const FreeBitmap = struct {
+    bits: AtomicBits,
+    capacity: usize,
+
+    /// Every one of `capacity` indices free. `words` must hold
+    /// `AtomicBits.wordCount(capacity)` words; the bits past `capacity` stay
+    /// clear, so a claim can never return an index that does not exist.
+    pub fn initAllFree(words: []std.atomic.Value(u64), capacity: usize) FreeBitmap {
+        std.debug.assert(words.len == AtomicBits.wordCount(capacity));
+        for (words, 0..) |*word, wi| {
+            const remaining = capacity - wi * 64;
+            const valid_bits = @min(remaining, 64);
+            const bits = if (valid_bits == 64)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @intCast(valid_bits)) - 1;
+            word.* = .init(bits);
+        }
+        return .{ .bits = .{ .words = words }, .capacity = capacity };
+    }
+
+    /// Take the lowest free index, or null when none is free.
+    pub fn claim(self: *FreeBitmap) ?u32 {
+        return self.claimWhere(null, false);
+    }
+
+    /// Take the lowest free index whose bit in `other` equals `other_set`.
+    ///
+    /// `other` is read without holding the index, so by the time the claim
+    /// lands the other bit may have changed: a caller that cares must read it
+    /// again after the claim, when it owns the index. (Two takers can move one
+    /// index through claim, change and release between this read and this
+    /// compare-exchange, and the word then looks unchanged.)
+    pub fn claimWhere(self: *FreeBitmap, other: ?AtomicBits, other_set: bool) ?u32 {
+        for (self.bits.words, 0..) |*word, wi| {
+            var bits = word.load(.acquire);
+            while (true) {
+                var candidates = bits;
+                if (other) |o| {
+                    const ow = o.words[wi].load(.acquire);
+                    candidates &= if (other_set) ow else ~ow;
+                }
+                if (candidates == 0) break;
+                const bit: u6 = @intCast(@ctz(candidates));
+                const mask = @as(u64, 1) << bit;
+                const next = bits & ~mask;
+                if (word.cmpxchgWeak(bits, next, .acq_rel, .acquire)) |observed| {
+                    bits = observed;
+                    continue;
+                }
+                const idx = wi * 64 + bit;
+                std.debug.assert(idx < self.capacity);
+                return @intCast(idx);
+            }
+        }
+        return null;
+    }
+
+    /// Give an index back. A double return trips the assert.
+    pub fn release(self: *FreeBitmap, idx: u32) void {
+        std.debug.assert(idx < self.capacity);
+        const was_free = self.bits.set(idx);
+        std.debug.assert(!was_free);
+    }
+
+    pub fn freeCount(self: *const FreeBitmap) usize {
+        return self.bits.count();
+    }
+};
+
 pub const SlabPool = struct {
     storage: []u8,
     slab_bytes: usize,
     capacity: usize,
-    free_words: []std.atomic.Value(u64),
+    free: FreeBitmap,
     /// Observable so a test and `deinit` can prove every slab came home.
     rented: std.atomic.Value(usize) = .init(0),
 
@@ -51,7 +158,7 @@ pub const SlabPool = struct {
         if (capacity > boot_plan.max_count) return error.InvalidConfig;
         const total = try boot_plan.mul(slab_bytes, capacity);
         try plan.array(u8, total);
-        try plan.array(std.atomic.Value(u64), (capacity + 63) / 64);
+        try plan.array(std.atomic.Value(u64), AtomicBits.wordCount(capacity));
     }
 
     /// One contiguous allocation for the bytes, one atomic free bitmap.
@@ -64,24 +171,14 @@ pub const SlabPool = struct {
         std.debug.assert(capacity <= std.math.maxInt(u32));
         const storage = try gpa.alloc(u8, slab_bytes * capacity);
         errdefer gpa.free(storage);
-        const word_count = (capacity + 63) / 64;
-        const free_words = try gpa.alloc(std.atomic.Value(u64), word_count);
+        const free_words = try gpa.alloc(std.atomic.Value(u64), AtomicBits.wordCount(capacity));
         errdefer gpa.free(free_words);
-        for (free_words, 0..) |*word, wi| {
-            const remaining = capacity - wi * 64;
-            const valid_bits = @min(remaining, 64);
-            const bits = if (valid_bits == 64)
-                std.math.maxInt(u64)
-            else
-                (@as(u64, 1) << @intCast(valid_bits)) - 1;
-            word.* = .init(bits);
-        }
 
         return .{
             .storage = storage,
             .slab_bytes = slab_bytes,
             .capacity = capacity,
-            .free_words = free_words,
+            .free = .initAllFree(free_words, capacity),
         };
     }
 
@@ -91,7 +188,7 @@ pub const SlabPool = struct {
     pub fn deinit(self: *SlabPool, gpa: std.mem.Allocator) void {
         self.assertAllReturned();
         gpa.free(self.storage);
-        gpa.free(self.free_words);
+        gpa.free(self.free.bits.words);
         self.* = undefined;
     }
 
@@ -116,23 +213,9 @@ pub const SlabPool = struct {
     /// Same lowest-free-bit claim, same backpressure meaning of null.
     pub fn tryRentIndex(self: *SlabPool, io: std.Io) ?u32 {
         _ = io;
-        for (self.free_words, 0..) |*word, wi| {
-            var bits = word.load(.acquire);
-            while (bits != 0) {
-                const bit: u6 = @intCast(@ctz(bits));
-                const mask = @as(u64, 1) << bit;
-                const next = bits & ~mask;
-                if (word.cmpxchgWeak(bits, next, .acq_rel, .acquire)) |observed| {
-                    bits = observed;
-                    continue;
-                }
-                const idx = wi * 64 + bit;
-                std.debug.assert(idx < self.capacity);
-                _ = self.rented.fetchAdd(1, .acq_rel);
-                return @intCast(idx);
-            }
-        }
-        return null;
+        const idx = self.free.claim() orelse return null;
+        _ = self.rented.fetchAdd(1, .acq_rel);
+        return idx;
     }
 
     pub fn slabAt(self: *SlabPool, idx: u32) []u8 {
@@ -194,13 +277,9 @@ pub const SlabPool = struct {
     pub fn releaseIndex(self: *SlabPool, io: std.Io, idx: u32) void {
         _ = io;
         std.debug.assert(idx < self.capacity);
-        const wi = idx / 64;
-        const bit: u6 = @intCast(idx % 64);
-        const mask = @as(u64, 1) << bit;
         const prev = self.rented.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
-        const old = self.free_words[wi].fetchOr(mask, .release);
-        std.debug.assert(old & mask == 0);
+        self.free.release(idx);
     }
 
     pub fn rentedCount(self: *const SlabPool) usize {
@@ -369,4 +448,41 @@ test "index rent reuses the lowest free index, so one writer at a time touches o
     try testing.expectEqual(@as(u32, 0), pool.tryRentIndex(testing.io).?);
     pool.releaseIndex(testing.io, 0);
     pool.releaseIndex(testing.io, b);
+}
+
+test "FreeBitmap claims the lowest free index and refuses past capacity" {
+    var words: [2]std.atomic.Value(u64) = undefined;
+    var map = FreeBitmap.initAllFree(&words, 70);
+    try testing.expectEqual(@as(usize, 70), map.freeCount());
+    var taken: [70]u32 = undefined;
+    for (&taken, 0..) |*t, i| {
+        t.* = map.claim().?;
+        try testing.expectEqual(@as(u32, @intCast(i)), t.*);
+    }
+    try testing.expectEqual(@as(?u32, null), map.claim());
+    try testing.expectEqual(@as(usize, 0), map.freeCount());
+    map.release(65);
+    map.release(3);
+    try testing.expectEqual(@as(?u32, 3), map.claim());
+    try testing.expectEqual(@as(?u32, 65), map.claim());
+}
+
+test "FreeBitmap claimWhere takes the lowest free index with the other bit as asked" {
+    var free_words: [2]std.atomic.Value(u64) = undefined;
+    var other_words: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
+    var map = FreeBitmap.initAllFree(&free_words, 100);
+    const other: AtomicBits = .{ .words = &other_words };
+    // Indices 5 and 70 have the other bit set.
+    try testing.expect(!other.set(5));
+    try testing.expect(!other.set(70));
+    try testing.expectEqual(@as(?u32, 5), map.claimWhere(other, true));
+    try testing.expectEqual(@as(?u32, 70), map.claimWhere(other, true));
+    try testing.expectEqual(@as(?u32, null), map.claimWhere(other, true));
+    // Without the bit, 0 is first, and the already claimed 5 is skipped.
+    try testing.expectEqual(@as(?u32, 0), map.claimWhere(other, false));
+    map.release(5);
+    // 5 is free again but has the bit set, so a "clear" claim skips it.
+    try testing.expectEqual(@as(?u32, 1), map.claimWhere(other, false));
+    try testing.expect(other.clear(5));
+    try testing.expectEqual(@as(?u32, 2), map.claimWhere(other, false));
 }

@@ -35,8 +35,13 @@
 //! An inbound `FrameEvent` is released by `handleFrame` through `deinit`: a
 //! scratch borrow is a no-op there, a test `gpa` payload is freed there.
 //! An `Intent` carries owned memory: a frame payload, or a decoded request.
-//! Header-list bytes on the live edge are arena-backed (the handler-job arena
-//! leased at decode); isolated Session tests still GPA-own them. `pushIntent`
+//! A request's memory (its header list and its body) is, on the live edge, one
+//! arena of server-wide pool blocks, borrowed through `StreamHooks`: the
+//! decode and every DATA append go into it, the dispatch intent points into
+//! it, and nothing in it is freed item by item. When the edge has none to give
+//! (`HeaderListMem.scratch`) the stream is answered 500/503 and the request is
+//! never dispatched. Only an isolated Session in a test (no `headerListMem`
+//! hook) GPA-owns request memory item by item. `pushIntent`
 //! transfers that ownership only when it returns success, so an
 //! `error.PoolExhausted` leaves the caller still owning the payload. Whoever
 //! drains an intent must release it with `releaseIntent` exactly once.
@@ -146,6 +151,20 @@ pub const CloseProbeEvent = struct {
 };
 pub var close_probe_fn: ?*const fn (ev: CloseProbeEvent) void = null;
 
+/// Where a header block is decoded.
+pub const HeaderListMem = union(enum) {
+    /// The request's own memory. It lives as long as the request.
+    request: std.mem.Allocator,
+    /// The edge could not give the request any memory (the pool refused its
+    /// first block, or it has no lease for it). The block is decoded here
+    /// only so the HPACK table stays in step with the peer's, the decoded
+    /// fields are read to validate the request and then forgotten, and the
+    /// stream is answered with `status`. The edge resets this allocator at
+    /// its next call, so the fields must not outlive the call that decoded
+    /// them.
+    scratch: struct { alloc: std.mem.Allocator, status: u16 },
+};
+
 pub const Session = struct {
     /// Heap that outlives any one ingest or command.
     gpa: std.mem.Allocator,
@@ -237,16 +256,23 @@ pub const Session = struct {
         ctx: *anyopaque,
         tryAdmit: *const fn (*anyopaque) bool,
         onRelease: *const fn (*anyopaque) void,
-        tryReserveRequest: ?*const fn (*anyopaque, usize) bool = null,
-        releaseRequest: ?*const fn (*anyopaque, usize) void = null,
         /// Route body cap for this method and path. Null hook uses `Limits.request_body_bytes`.
         requestBodyCap: ?*const fn (*anyopaque, method: []const u8, path: []const u8) usize = null,
-        /// Allocator for one stream's decoded request-list (not the dynamic
-        /// table): the request's own memory. Null means the edge has none to
-        /// give; Session still decodes the block (the table must advance) and
-        /// then refuses the stream.
-        headerListAlloc: ?*const fn (*anyopaque, u31) ?std.mem.Allocator = null,
-        /// Reset that allocator after a decode that will not be dispatched.
+        /// Where one stream's decoded request list goes (not the dynamic
+        /// table). Null means the request's memory is `Session.gpa`, which only
+        /// an isolated Session in a test does: on the live edge the hook is
+        /// always set, and request memory is never the general allocator.
+        headerListMem: ?*const fn (*anyopaque, u31) HeaderListMem = null,
+        /// The allocator of the request memory `stream_id` already has, which
+        /// is true from the moment its headers were decoded: the body is
+        /// appended into it.
+        requestAlloc: ?*const fn (*anyopaque, u31) std.mem.Allocator = null,
+        /// The status a stream gets when its request memory ran out (500 when
+        /// the request itself hit its cap, 503 for the other caps). Null means
+        /// 503.
+        memoryRefusalStatus: ?*const fn (*anyopaque, u31) u16 = null,
+        /// Give back `stream_id`'s request memory: a decode Session dropped, or
+        /// a request that will never be dispatched.
         discardHeaderList: ?*const fn (*anyopaque, u31) void = null,
         /// Rent a boot-reserved outbound frame buffer. `n` is the on-wire size.
         /// Returns a full slab of whichever pool the edge picks for `n`
@@ -297,16 +323,34 @@ pub const Session = struct {
         return global;
     }
 
-    fn headerListAllocator(self: *Session, stream_id: u31) ?std.mem.Allocator {
+    fn headerListMem(self: *Session, stream_id: u31) HeaderListMem {
         if (self.stream_hooks) |h| {
-            if (h.headerListAlloc) |f| return f(h.ctx, stream_id);
+            if (h.headerListMem) |f| return f(h.ctx, stream_id);
+        }
+        return .{ .request = self.gpa };
+    }
+
+    /// True for an isolated Session: request memory (header lists and bodies)
+    /// is then owned item by item and freed with `gpa`. On the live edge it
+    /// belongs to the request's arena, and nothing in it is freed one by one.
+    fn headerListIsGpa(self: *const Session) bool {
+        if (self.stream_hooks) |h| return h.headerListMem == null;
+        return true;
+    }
+
+    /// The allocator a body is appended to.
+    fn bodyAllocator(self: *Session, stream_id: u31) std.mem.Allocator {
+        if (self.stream_hooks) |h| {
+            if (h.requestAlloc) |f| return f(h.ctx, stream_id);
         }
         return self.gpa;
     }
 
-    fn headerListIsGpa(self: *const Session) bool {
-        if (self.stream_hooks) |h| return h.headerListAlloc == null;
-        return true;
+    fn memoryRefusalStatus(self: *Session, stream_id: u31) u16 {
+        if (self.stream_hooks) |h| {
+            if (h.memoryRefusalStatus) |f| return f(h.ctx, stream_id);
+        }
+        return 503;
     }
 
     fn discardHeaderList(self: *Session, stream_id: u31) void {
@@ -335,7 +379,10 @@ pub const Session = struct {
         self.gpa.free(buf);
     }
 
-    fn dropDecoded(self: *Session, stream_id: u31, decoded: hpack.Decoder.DecodeResult) void {
+    /// `scratch`: the block was decoded into the edge's scratch, which owns
+    /// nothing and is reset by itself.
+    fn dropDecoded(self: *Session, stream_id: u31, decoded: hpack.Decoder.DecodeResult, scratch: bool) void {
+        if (scratch) return;
         if (self.headerListIsGpa()) {
             self.decoder.freeResult(decoded);
             return;
@@ -360,10 +407,10 @@ pub const Session = struct {
         }
         if (self.pending_bodies.fetchRemove(stream_id)) |e| {
             var list = e.value;
-            if (self.stream_hooks) |h| {
-                if (h.releaseRequest) |rel| rel(h.ctx, list.items.len);
-            }
-            list.deinit(self.gpa);
+            // On the edge the body is in the request's arena, which was
+            // given back with the header list above (or is, by whoever holds
+            // the lease).
+            if (self.headerListIsGpa()) list.deinit(self.gpa);
         }
     }
 
@@ -457,10 +504,7 @@ pub const Session = struct {
         self.clearIntents();
         var bit = self.pending_bodies.iterator();
         while (bit.next()) |e| {
-            if (self.stream_hooks) |h| {
-                if (h.releaseRequest) |rel| rel(h.ctx, e.value_ptr.items.len);
-            }
-            e.value_ptr.deinit(self.gpa);
+            if (self.headerListIsGpa()) e.value_ptr.deinit(self.gpa);
         }
         var hit = self.pending_headers.iterator();
         while (hit.next()) |e| {
@@ -525,7 +569,7 @@ pub const Session = struct {
                 } else {
                     self.discardHeaderList(d.stream_id);
                 }
-                self.gpa.free(d.body);
+                if (self.headerListIsGpa()) self.gpa.free(d.body);
             },
             else => {},
         }
@@ -1227,23 +1271,18 @@ pub const Session = struct {
                 // Discard overflow bytes; do not retain or dispatch.
                 // 413 immediately on byte cap+1 — continue discard through remote END_STREAM.
                 try self.emitEarlyReject(hdr.stream_id, 413);
-            } else {
-                if (self.stream_hooks) |h| {
-                    if (h.tryReserveRequest) |tr| {
-                        if (!tr(h.ctx, data.len)) {
-                            s.refused_before_dispatch = true;
-                            s.early_status = 413;
-                            try self.emitEarlyReject(hdr.stream_id, 413);
-                        } else {
-                            errdefer if (h.releaseRequest) |rel| rel(h.ctx, data.len);
-                            try body.appendSlice(self.gpa, data);
-                        }
-                    } else {
-                        try body.appendSlice(self.gpa, data);
-                    }
-                } else {
-                    try body.appendSlice(self.gpa, data);
-                }
+            } else if (body.appendSlice(self.bodyAllocator(hdr.stream_id), data)) |_| {} else |err| {
+                // The request's memory ran out. An isolated Session has only
+                // the allocator's error to give. On the edge the stream is
+                // answered (500 for its own cap, 503 for the others) and
+                // everything the request held is given back at once; the
+                // connection goes on to serve its other streams.
+                if (self.headerListIsGpa()) return err;
+                const status = self.memoryRefusalStatus(hdr.stream_id);
+                s.refused_before_dispatch = true;
+                s.early_status = status;
+                self.dropPendingRequest(hdr.stream_id);
+                try self.emitEarlyReject(hdr.stream_id, status);
             }
         }
 
@@ -1433,8 +1472,18 @@ pub const Session = struct {
     /// header-list hook. Success hands the slice to an intent or to
     /// `pending_headers` / `pending_trailers`.
     fn finishHeaderBlock(self: *Session, stream_id: u31, block: []const u8) !void {
-        const leased = self.headerListAllocator(stream_id);
-        const req_alloc = leased orelse self.gpa;
+        const mem = self.headerListMem(stream_id);
+        const req_alloc = switch (mem) {
+            .request => |a| a,
+            .scratch => |sc| sc.alloc,
+        };
+        // Set when the edge had no memory for this request. The block is
+        // decoded anyway (the table must advance), and the stream is answered
+        // with this status instead of being dispatched.
+        const scratch_status: ?u16 = switch (mem) {
+            .request => null,
+            .scratch => |sc| sc.status,
+        };
         const decoded = self.decoder.decodeInto(
             req_alloc,
             block,
@@ -1443,7 +1492,7 @@ pub const Session = struct {
             256,
             self.limits.regular_field_value_bytes,
         ) catch |err| {
-            self.discardHeaderList(stream_id);
+            if (scratch_status == null) self.discardHeaderList(stream_id);
             if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .hpack_decode_fail, .code = if (err == error.OutOfMemory) .internal_error else .compression_error, .stream_id = stream_id });
             if (err == error.OutOfMemory) {
                 try self.failConnection(.internal_error);
@@ -1452,23 +1501,16 @@ pub const Session = struct {
             }
             return;
         };
-        if (leased == null) {
-            // Decoded only to keep the HPACK table in step with the peer.
-            self.decoder.freeResultInto(self.gpa, decoded);
-            try self.emitRst(stream_id, .refused_stream);
-            return;
-        }
-
         var s_ptr = self.streams.getPtr(stream_id);
         if (s_ptr == null) {
             if (self.active_streams >= self.limits.max_streams_per_connection) {
-                self.dropDecoded(stream_id, decoded);
+                self.dropDecoded(stream_id, decoded, scratch_status != null);
                 try self.emitRst(stream_id, .refused_stream);
                 return;
             }
             if (self.stream_hooks) |h| {
                 if (!h.tryAdmit(h.ctx)) {
-                    self.dropDecoded(stream_id, decoded);
+                    self.dropDecoded(stream_id, decoded, scratch_status != null);
                     try self.emitRst(stream_id, .refused_stream);
                     return;
                 }
@@ -1487,25 +1529,39 @@ pub const Session = struct {
         if (s.headers_done) {
             // Trailers only legal while remote half is still open, and MUST carry END_STREAM.
             if (!self.header_end_stream) {
-                self.dropDecoded(stream_id, decoded);
+                self.dropDecoded(stream_id, decoded, scratch_status != null);
                 try self.emitRst(stream_id, .protocol_error);
                 return;
             }
             if (s.end_stream_remote or s.state == .half_closed_remote or s.state == .closed) {
-                self.dropDecoded(stream_id, decoded);
+                self.dropDecoded(stream_id, decoded, scratch_status != null);
                 try self.emitRst(stream_id, .stream_closed);
+                return;
+            }
+            // Trailers too large to keep, or no memory to keep them in: the
+            // request cannot be dispatched whole, so it is answered and
+            // everything it held (headers and body too) goes back now.
+            if (decoded.truncated or scratch_status != null) {
+                const st = scratch_status orelse 431;
+                self.dropDecoded(stream_id, decoded, scratch_status != null);
+                self.dropPendingRequest(stream_id);
+                s.refused_before_dispatch = true;
+                s.early_status = st;
+                s.onHeaders(true) catch {};
+                try self.emitEarlyReject(stream_id, st);
+                self.releaseConcurrency(stream_id, .no_error);
                 return;
             }
             for (decoded.fields) |f| {
                 if (f.name.len > 0 and f.name[0] == ':') {
-                    self.dropDecoded(stream_id, decoded);
+                    self.dropDecoded(stream_id, decoded, scratch_status != null);
                     try self.emitRst(stream_id, .protocol_error);
                     return;
                 }
             }
             // Early-rejected streams: trailers close remote; ensure the one HTTP response exists.
             if (s.early_status) |st| {
-                self.dropDecoded(stream_id, decoded);
+                self.dropDecoded(stream_id, decoded, scratch_status != null);
                 // The early-reject state is already terminal and owns the response.
                 s.onHeaders(true) catch {};
                 try self.emitEarlyReject(stream_id, st);
@@ -1513,7 +1569,7 @@ pub const Session = struct {
                 return;
             }
             s.onHeaders(true) catch |err| {
-                self.dropDecoded(stream_id, decoded);
+                self.dropDecoded(stream_id, decoded, scratch_status != null);
                 try self.emitRst(stream_id, stream_mod.Stream.toErrorCode(err));
                 return;
             };
@@ -1523,8 +1579,20 @@ pub const Session = struct {
             return;
         }
 
+        // More fields or decoded bytes than the limits allow: only a prefix of
+        // the block was kept, and a prefix cannot be validated. It is a 431.
+        if (decoded.truncated) {
+            self.dropDecoded(stream_id, decoded, scratch_status != null);
+            s.refused_before_dispatch = true;
+            s.early_status = 431;
+            s.onHeaders(self.header_end_stream) catch {};
+            try self.emitEarlyReject(stream_id, 431);
+            self.releaseConcurrency(stream_id, .no_error);
+            return;
+        }
+
         const parsed = fields.validateRequestFields(decoded.fields) catch |err| {
-            self.dropDecoded(stream_id, decoded);
+            self.dropDecoded(stream_id, decoded, scratch_status != null);
             if (err == error.PathTooLong) {
                 s.refused_before_dispatch = true;
                 s.early_status = 414;
@@ -1550,15 +1618,24 @@ pub const Session = struct {
             }
         }
 
+        // No memory for the request: the other refusals above say more about
+        // the request than this does, so they win.
+        if (s.early_status == null) {
+            if (scratch_status) |st| {
+                s.refused_before_dispatch = true;
+                s.early_status = st;
+            }
+        }
+
         s.content_length = parsed.content_length;
         const early = s.early_status;
         s.onHeaders(self.header_end_stream) catch |err| {
-            self.dropDecoded(stream_id, decoded);
+            self.dropDecoded(stream_id, decoded, scratch_status != null);
             try self.emitRst(stream_id, stream_mod.Stream.toErrorCode(err));
             return;
         };
         if (early) |st| {
-            self.dropDecoded(stream_id, decoded);
+            self.dropDecoded(stream_id, decoded, scratch_status != null);
             try self.emitEarlyReject(stream_id, st);
             self.releaseConcurrency(stream_id, .no_error);
         } else {
@@ -1601,9 +1678,9 @@ pub const Session = struct {
         const body = blk: {
             if (body_entry) |e| {
                 var list = e.value;
-                if (self.stream_hooks) |h| {
-                    if (h.releaseRequest) |rel| rel(h.ctx, list.items.len);
-                }
+                // On the edge the body stays where it was appended: in the
+                // request's arena, which the dispatch carries.
+                if (!self.headerListIsGpa()) break :blk list.items;
                 break :blk list.toOwnedSlice(self.gpa) catch |err| {
                     list.deinit(self.gpa);
                     // Preserve the original allocation error if fail-closed signaling also allocates.
@@ -1613,7 +1690,7 @@ pub const Session = struct {
             }
             break :blk &.{};
         };
-        var body_owned = body.len != 0;
+        var body_owned = body.len != 0 and self.headerListIsGpa();
         errdefer if (body_owned) self.gpa.free(body);
 
         const parsed = fields.validateRequestFields(hdrs.value) catch {
@@ -1659,7 +1736,7 @@ pub const Session = struct {
                 self.discardHeaderList(stream_id);
             }
         };
-        var body_owned = body.len != 0;
+        var body_owned = body.len != 0 and self.headerListIsGpa();
         errdefer if (body_owned) self.gpa.free(body);
         var trailers_owned = trailers.len != 0;
         errdefer if (trailers_owned) {

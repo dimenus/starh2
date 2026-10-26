@@ -31,6 +31,7 @@ const connection = @import("connection.zig");
 const conn_slot = @import("conn_slot.zig");
 const h1 = @import("h1.zig");
 const slab_pool = @import("slab_pool.zig");
+const request_pool = @import("request_pool.zig");
 const brotli = @import("../http/brotli.zig");
 const tls_edge = @import("tls.zig");
 pub const EndpointAddress = std.Io.net.IpAddress;
@@ -119,6 +120,10 @@ pub const Server = struct {
     /// Server-wide outbound DATA slabs. Shared so an idle connection holds
     /// none, and capped so the ceiling stays computable.
     slabs: slab_pool.SlabPool,
+    /// Server-wide request memory: every request's header list, body and
+    /// handler allocations. See `request_pool.zig`. Connections hold a pointer
+    /// to it, so the server must not move once `serve` runs.
+    requests: request_pool.RequestPool,
     /// Server-wide brotli encoder contexts. Present only when
     /// `limits.response_compression` is on; handlers borrow through ConnConfig.
     compression_pool: ?brotli.Pool = null,
@@ -209,6 +214,14 @@ pub const Server = struct {
         ) catch return error.OutOfMemory;
         errdefer slabs.deinit(gpa);
 
+        // Reserves the pool's address space now, so a mapping the OS refuses
+        // is a boot error here and never a request error later.
+        var requests = request_pool.RequestPool.init(config.limits.requestPoolConfig()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidConfig => return error.InvalidConfig,
+        };
+        errdefer requests.deinit();
+
         var compression_pool: ?brotli.Pool = null;
         if (config.limits.response_compression) {
             compression_pool = brotli.Pool.init(
@@ -247,11 +260,11 @@ pub const Server = struct {
                 .max_streams = config.limits.max_streams_per_server,
                 .reaper_capacity = config.limits.cancellation_reaper_jobs,
                 .max_outbound_bytes = config.limits.outbound_bytes_per_server,
-                .max_request_bytes = config.limits.request_bytes_per_server,
                 .max_handshakes = config.limits.concurrent_tls_handshakes,
             },
             .reaper = reaper,
             .slabs = slabs,
+            .requests = requests,
             .compression_pool = compression_pool,
             .balancer = config.balancer,
             .slots = slots,
@@ -603,6 +616,7 @@ pub const Server = struct {
                 .reaper = if (self.reaper) |*pool| pool else null,
                 .accounting = &self.accounting,
                 .slab_pool = &self.slabs,
+                .request_pool = &self.requests,
                 .compression_pool = if (self.compression_pool) |*pool| pool else null,
                 .handshake_held = handshake_held,
             };
@@ -697,7 +711,6 @@ pub const Server = struct {
         std.debug.assert(self.accounting.active_streams.load(.acquire) == 0);
         std.debug.assert(self.accounting.reaper_reserved.load(.acquire) == 0);
         std.debug.assert(self.accounting.outbound_bytes.load(.acquire) == 0);
-        std.debug.assert(self.accounting.request_bytes.load(.acquire) == 0);
         std.debug.assert(self.accounting.active_handshakes.load(.acquire) == 0);
         if (self.compression_pool) |*pool| {
             std.debug.assert(pool.liveCount() == 0);
@@ -711,6 +724,9 @@ pub const Server = struct {
         // Asserts every slab came home; a connection teardown that missed one
         // fails here rather than silently shrinking the pool.
         self.slabs.deinit(gpa);
+        // Same for request blocks: one still out is a request that never gave
+        // its memory back.
+        self.requests.deinit();
         // Every slot must be back (or leaked on purpose): the connections are
         // gone, so one still out would be a connection that never gave its
         // slot back.

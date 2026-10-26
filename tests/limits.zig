@@ -79,8 +79,11 @@ test "counting allocator: Server.init under published ceiling" {
         .outbound_bytes_per_stream = 4 * 1024,
         .outbound_bytes_per_connection = 16 * 1024,
         .outbound_bytes_per_server = 64 * 1024,
-        .request_bytes_per_connection = 16 * 1024,
-        .request_bytes_per_server = 64 * 1024,
+        .request_bytes_per_connection = 128 * 1024,
+        .request_bytes_per_server = 256 * 1024,
+        .request_arena_bytes = 256 * 1024,
+        .request_pool_retain_bytes = 256 * 1024,
+        .request_body_bytes = 1024,
         .control_bytes_per_connection = 8 * 1024,
         .control_entries_per_connection = 32,
         .stream_tombstones = 16,
@@ -137,8 +140,11 @@ test "fail-index iteration: Server.init fails closed" {
         .outbound_bytes_per_stream = 1024,
         .outbound_bytes_per_connection = 4 * 1024,
         .outbound_bytes_per_server = 8 * 1024,
-        .request_bytes_per_connection = 4 * 1024,
-        .request_bytes_per_server = 8 * 1024,
+        .request_bytes_per_connection = 128 * 1024,
+        .request_bytes_per_server = 256 * 1024,
+        .request_arena_bytes = 256 * 1024,
+        .request_pool_retain_bytes = 256 * 1024,
+        .request_body_bytes = 1024,
         .control_bytes_per_connection = 8 * 1024,
         .control_entries_per_connection = 32,
         .stream_tombstones = 4,
@@ -203,8 +209,11 @@ test "counting allocator peak under live hello stays under ceiling" {
         .outbound_bytes_per_stream = 4 * 1024,
         .outbound_bytes_per_connection = 16 * 1024,
         .outbound_bytes_per_server = 64 * 1024,
-        .request_bytes_per_connection = 16 * 1024,
-        .request_bytes_per_server = 64 * 1024,
+        .request_bytes_per_connection = 128 * 1024,
+        .request_bytes_per_server = 256 * 1024,
+        .request_arena_bytes = 256 * 1024,
+        .request_pool_retain_bytes = 256 * 1024,
+        .request_body_bytes = 1024,
         .control_bytes_per_connection = 8 * 1024,
         .control_entries_per_connection = 32,
         .stream_tombstones = 16,
@@ -331,32 +340,47 @@ test "counting allocator peak under live hello stays under ceiling" {
 // Which caps a consumer may raise, and what each costs in resourceUpperBound:
 // - `request_body_bytes` — 413 threshold, and H1 per-connection body_buf plus
 //   carry suffix. A new value moves `terms.h1_body` and `allocator_bytes`.
-// - `request_bytes_per_connection` / `request_bytes_per_server` — H2 concurrent
-//   body residency. To admit S streams each holding a full body of size B: set
-//   `request_bytes_per_connection >= B*S` and keep `request_bytes_per_server`
-//   at least that connection ceiling (else InvalidConfig).
-// - `max_streams_per_connection` — multiplies handler/ticket/map terms AND the
-//   B*S product above when bodies are saturated.
+//   An H2 body is buffered in the request's arena, so the arena cap
+//   (`request_arena_bytes`) must be large enough for it, which boot checks
+//   (`Limits.bodyArenaBytes`).
+// - `request_bytes_per_server` — the request pool: the most RESIDENT bytes it
+//   holds, counted once in `terms.request_pool`. It must be at least the
+//   arena cap. Raising it is what moves the bound.
+// - `request_bytes_per_connection` — one connection's share of that pool. It
+//   costs nothing in the bound, because the pool is already counted once.
+// - `max_streams_per_connection` — multiplies handler/ticket/map terms.
 test "raised request_body_bytes: publish concurrent body memory cost" {
     const B: usize = 2 * 1024 * 1024; // 2 MiB — qmdsync-class body
     var lim = starh2.Limits.defaults;
     const base = try lim.resourceUpperBound();
 
     lim.request_body_bytes = B;
+    // The default arena (4 MiB) cannot buffer a 2 MiB body: the last growth
+    // step of its list holds the first block and an old and a new block, 12 MiB.
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim.request_arena_bytes = try lim.bodyArenaBytes();
+    try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), lim.request_arena_bytes);
     const body_only = try lim.resourceUpperBound();
     try std.testing.expect(body_only.terms.h1_body > base.terms.h1_body);
     try std.testing.expect(body_only.allocator_bytes > base.allocator_bytes);
+    // The pool is unchanged: the same resident cap.
+    try std.testing.expectEqual(base.terms.request_pool, body_only.terms.request_pool);
 
+    // A larger per-connection share is free: it is a slice of the pool.
     const S = lim.max_streams_per_connection;
-    const need_conn = B * S; // 2 MiB * 256 = 512 MiB
-    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), need_conn);
-
-    lim.request_bytes_per_connection = need_conn;
-    lim.request_bytes_per_server = @max(lim.request_bytes_per_server, need_conn);
+    lim.request_bytes_per_connection = B * S; // 512 MiB
+    lim.request_bytes_per_server = @max(lim.request_bytes_per_server, lim.request_bytes_per_connection);
     const full = try lim.resourceUpperBound();
-    try std.testing.expect(full.allocator_bytes > body_only.allocator_bytes);
-    const delta = full.allocator_bytes - body_only.allocator_bytes;
-    try std.testing.expect(delta >= need_conn);
+    // Only the pool term moved, by exactly the cap that was raised.
+    try std.testing.expectEqual(
+        lim.request_bytes_per_server + try lim.requestPoolConfig().bitmapBytes(),
+        full.terms.request_pool,
+    );
+    try std.testing.expect(full.terms.request_pool > body_only.terms.request_pool);
+    var share_only = lim;
+    share_only.request_bytes_per_connection = lim.request_bytes_per_connection / 2;
+    const half = try share_only.resourceUpperBound();
+    try std.testing.expectEqual(full.allocator_bytes, half.allocator_bytes);
 }
 
 test "h2c: a write queue smaller than one pop's reservation is rejected at boot (t-3520)" {

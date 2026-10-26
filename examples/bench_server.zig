@@ -750,6 +750,13 @@ const Args = struct {
     listen_backlog: ?u31 = null,
     max_connections: ?usize = null,
     tls_handshakes: ?usize = null,
+    /// The three request-memory caps (`Limits.request_*`). Null keeps the
+    /// default of each.
+    request_bytes_per_connection: ?usize = null,
+    request_bytes_per_server: ?usize = null,
+    request_arena_bytes: ?usize = null,
+    /// `Limits.request_pool_retain_bytes`. Must not pass the server cap.
+    request_pool_retain_bytes: ?usize = null,
 };
 
 /// `--placement-log`: one line per placed connection, with the peer port (so
@@ -854,6 +861,16 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.max_connections = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--tls-handshakes")) {
             out.tls_handshakes = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--request-bytes-per-connection")) {
+            out.request_bytes_per_connection = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--request-bytes-per-server")) {
+            out.request_bytes_per_server = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--request-pool-retain-bytes")) {
+            out.request_pool_retain_bytes = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--no-thp")) {
+            // Parsed by parseRuntimeArgs: it must run before any thread starts.
+        } else if (std.mem.eql(u8, a, "--request-arena-bytes")) {
+            out.request_arena_bytes = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--diag-stuck")) {
             // Diagnosis: record each handler's and actor's blocking point
             // for /stuck (connection.diag_stuck; off by default because it
@@ -1005,17 +1022,69 @@ const CountingGpa = struct {
 };
 var g_counting: ?*CountingGpa = null;
 
-/// `/mem`: the `--count-gpa` counters as one JSON line, or 404 without it.
-/// `classes` lists each size class that has seen an allocation as
+/// `/mem`: one JSON line. With `--count-gpa` it starts with the allocator's
+/// counters. `classes` lists each size class that has seen an allocation as
 /// [log2 upper bound, calls, bytes, live bytes]. `threads` lists, per OS
 /// thread in first-use order, [bytes allocated, bytes freed] in blocks
 /// under 64 KiB. `thread_gap` lists, per size class, [log2 upper bound,
-/// summed per-thread excess of allocated over freed bytes].
+/// summed per-thread excess of allocated over freed bytes]. It always ends
+/// with `request_pool`: the request memory pool's own counters (the pool is
+/// not the allocator, so `--count-gpa` does not see it). `classes` there is
+/// [block bytes, made, reused, reclaimed, retired] per class; `resident`
+/// counts every block that may have pages, free or in use, and is what the
+/// server cap bounds; `held` counts the blocks requests hold now; `retired`
+/// counts blocks decommitted on return (the retain limit). `touched_bytes` is
+/// the pool's really resident bytes from `mincore` over the class mappings
+/// (Linux): with huge pages it can be far above `resident`. Elsewhere it is
+/// `null` and `touched_bytes_note` says it is not available; a `mincore`
+/// failure on Linux is `null` with `touched_bytes_error` naming it.
+var g_requests: ?*const starh2.edge.request_pool.RequestPool = null;
+
 fn memHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
-    const c = g_counting orelse return resp.send(404, &.{}, "run with --count-gpa\n");
     const buf = try req.arena.alloc(u8, 32 * 1024);
     var w: std.Io.Writer = .fixed(buf);
-    try w.print("{{\"live_bytes\":{d},\"alloc_calls\":{d},\"classes\":[", .{ c.live.load(.monotonic), c.calls.load(.monotonic) });
+    try w.writeAll("{");
+    if (g_counting) |c| {
+        try writeGpaCounters(&w, c);
+        try w.writeAll(",");
+    }
+    try w.writeAll("\"request_pool\":");
+    try writePoolCounters(&w, g_requests orelse return resp.send(500, &.{}, "no request pool\n"));
+    try w.writeAll("}\n");
+    try resp.send(200, &.{}, w.buffered());
+}
+
+fn writePoolCounters(w: *std.Io.Writer, pool: *const starh2.edge.request_pool.RequestPool) !void {
+    const s = pool.snapshot();
+    try w.print("{{\"resident\":{d},\"resident_high\":{d},\"held\":{d},\"held_high\":{d},\"refused\":{{\"request_cap\":{d},\"connection_cap\":{d},\"server_cap\":{d}}},\"classes\":[", .{
+        s.resident_bytes,
+        s.resident_high,
+        s.held_bytes,
+        s.held_high,
+        s.refused[@backingInt(starh2.edge.request_pool.Reason.request_cap)],
+        s.refused[@backingInt(starh2.edge.request_pool.Reason.connection_cap)],
+        s.refused[@backingInt(starh2.edge.request_pool.Reason.server_cap)],
+    });
+    for (s.classes[0..s.class_count], 0..) |c, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.print("[{d},{d},{d},{d},{d}]", .{ c.size, c.made, c.reused, c.reclaimed, c.retired });
+    }
+    try w.writeAll("],");
+    if (pool.touchedBytes()) |maybe| {
+        if (maybe) |n| {
+            try w.print("\"touched_bytes\":{d}}}", .{n});
+        } else {
+            try w.writeAll("\"touched_bytes\":null,\"touched_bytes_note\":\"not available on this OS\"}");
+        }
+    } else |err| {
+        // A failure on an OS that can answer is not "not available".
+        try w.print("\"touched_bytes\":null,\"touched_bytes_error\":\"{s}\"}}", .{@errorName(err)});
+    }
+}
+
+/// The `--count-gpa` counters, without the surrounding braces.
+fn writeGpaCounters(w: *std.Io.Writer, c: *CountingGpa) !void {
+    try w.print("\"live_bytes\":{d},\"alloc_calls\":{d},\"classes\":[", .{ c.live.load(.monotonic), c.calls.load(.monotonic) });
     var first = true;
     for (0..CountingGpa.classes) |i| {
         const calls = c.class_calls[i].load(.monotonic);
@@ -1053,11 +1122,10 @@ fn memHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteR
         first = false;
         try w.print("[{d},{d}]", .{ i, gap });
     }
-    try w.print("],\"fallbacks\":{{\"frame\":{d},\"write_chunk\":{d}}}}}\n", .{
+    try w.print("],\"fallbacks\":{{\"frame\":{d},\"write_chunk\":{d}}}", .{
         conn_mod.gpa_fallbacks.frame.load(.monotonic),
         conn_mod.gpa_fallbacks.write_chunk.load(.monotonic),
     });
-    try resp.send(200, &.{}, w.buffered());
 }
 
 const RuntimeArgs = struct {
@@ -1066,7 +1134,30 @@ const RuntimeArgs = struct {
     executors: ?u8 = null,
     announce_running_wakes: bool = true,
     batch_wake_sleepers: bool = true,
+    no_thp: bool = false,
 };
+
+/// `--no-thp` took effect: the ready line says so, so a harness never trusts a
+/// flag that was parsed and not applied.
+var g_thp_disabled: bool = false;
+
+/// Linux `prctl(PR_SET_THP_DISABLE)`: the whole process gets no transparent
+/// huge pages (inherited by threads started afterwards, and applied to the
+/// address space for all of them). With THP `always` a touched page of a large
+/// mapping is a 2 MiB page, and RSS then measures the kernel's choice more than
+/// the server's. Anywhere but Linux this is an error.
+fn disableThp() !void {
+    if (comptime @import("builtin").os.tag != .linux) {
+        std.debug.print("--no-thp is Linux only\n", .{});
+        return error.UnsupportedOs;
+    }
+    const rc = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_THP_DISABLE), 1, 0, 0, 0);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        std.debug.print("prctl(PR_SET_THP_DISABLE) failed: {t}\n", .{std.os.linux.errno(rc)});
+        return error.ThpDisableFailed;
+    }
+    g_thp_disabled = true;
+}
 
 fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !RuntimeArgs {
     var out: RuntimeArgs = .{};
@@ -1094,6 +1185,8 @@ fn parseRuntimeArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Run
             };
         } else if (std.mem.eql(u8, a, "--count-gpa")) {
             out.count_gpa = true;
+        } else if (std.mem.eql(u8, a, "--no-thp")) {
+            out.no_thp = true;
         }
     }
     return out;
@@ -1374,6 +1467,10 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     if (args.listen_backlog) |v| limits.listen_backlog = v;
     if (args.max_connections) |v| limits.max_connections = v;
     if (args.tls_handshakes) |v| limits.concurrent_tls_handshakes = v;
+    if (args.request_bytes_per_connection) |v| limits.request_bytes_per_connection = v;
+    if (args.request_bytes_per_server) |v| limits.request_bytes_per_server = v;
+    if (args.request_arena_bytes) |v| limits.request_arena_bytes = v;
+    if (args.request_pool_retain_bytes) |v| limits.request_pool_retain_bytes = v;
 
     var server = try starh2.Server.init(server_gpa, rt.io(), .{
         .endpoints = &.{ep},
@@ -1383,6 +1480,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .balancer = if (balancer_storage) |*b| b else null,
     });
     defer server.deinit(server_gpa);
+    g_requests = &server.requests;
 
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, server_gpa });
     try server.waitUntilListening(5 * std.time.ns_per_s);
@@ -1396,7 +1494,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\",\"count_gpa\":{d}}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\",\"count_gpa\":{d},\"thp_disabled\":{d}}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1416,6 +1514,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             limits.concurrent_tls_handshakes,
             @tagName(g_gpa_choice),
             @as(u8, @intFromBool(g_counting != null)),
+            @as(u8, @intFromBool(g_thp_disabled)),
         },
     );
     defer gpa.free(ready);
@@ -1435,6 +1534,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
 
 pub fn main(init: std.process.Init) !void {
     const runtime_args = try parseRuntimeArgs(init.gpa, init.minimal.args);
+    if (runtime_args.no_thp) try disableThp();
     const chosen = switch (runtime_args.gpa) {
         .init => init.gpa,
         .smp => std.heap.smp_allocator,

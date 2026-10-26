@@ -186,8 +186,22 @@ chunk into the send staging buffer. Do not wrap a record API beside this.
   when the connection ends. `Limits.slotBootBytes` is the buffer's size. A new
   boot allocation needs a matching line, in the same order, in the component's
   `planBoot`, or the exact-fit test in `edge/connection.zig` fails. Never grow
-  a table in the boot buffer, and never rely on its bytes being zero. What a
-  request allocates still comes from `config.gpa`.
+  a table in the boot buffer, and never rely on its bytes being zero.
+- A request's header list, body and handler allocations (`Request.arena`) are
+  blocks of the server-wide `RequestPool` (`src/edge/request_pool.zig`), never
+  `config.gpa`, and there is no fallback to it: over a cap the allocation
+  fails with `OutOfMemory` and the stream gets a 500/503 (an RST after commit).
+  The actor returns a request's blocks in `releaseSlot`, after the join, and
+  `releaseLease` asserts it is not called from a handler's task. Frames, write
+  chunks, the HPACK table and the preface frames still use `config.gpa` (stage
+  3); `tests/slot_reuse.zig` counts the large calls that must stay at zero.
+  A block returned while the pool's free resident bytes are over
+  `Limits.request_pool_retain_bytes` is decommitted at once (`retired`). The
+  pool mapping asks Linux for no huge pages.
+  `./zb build test-request-memory` runs the cap, decode and blocks-home gates.
+  HTTP/1.1 is the exception: it keeps its preallocated buffers (`h1_body`) and
+  has no server-wide body reservation since stage 2; t-3537 moves it onto the
+  pool.
 - Intent payloads, decoded headers, dispatch requests, scheduler leases, and
   tickets have explicit owners. Error paths must release exactly once.
 - `std.testing.FailingAllocator` is not thread-safe; fail-index/counting tests

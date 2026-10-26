@@ -1063,7 +1063,6 @@ fn runAbortMidUpload(
         io.sleep(.fromMilliseconds(20), .awake) catch {};
     }
     try std.testing.expectEqual(@as(usize, 0), acct.active_streams.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), acct.request_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), acct.reaper_reserved.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), peak);
 }
@@ -2459,6 +2458,9 @@ fn namedExpect100BodyAfterContinue(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
     lim.max_streams_per_connection = 8;
     lim.max_streams_per_server = 8;
     lim.request_body_bytes = 4 * 1024 * 1024;
+    // The arena a 4 MiB HTTP/2 body would need. Boot refuses a smaller one
+    // even though this server only speaks HTTP/1.1.
+    lim.request_arena_bytes = try lim.bodyArenaBytes();
     lim.outbound_bytes_per_stream = 2 * 1024 * 1024;
     lim.outbound_bytes_per_connection = 2 * 1024 * 1024;
     lim.request_body_idle_timeout_ns = 5 * std.time.ns_per_s;

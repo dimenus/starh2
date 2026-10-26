@@ -26,6 +26,8 @@ const wire_const = @import("wire_const.zig");
 const boot_plan = @import("boot_plan.zig");
 const connection = @import("../edge/connection.zig");
 const conn_slot = @import("../edge/conn_slot.zig");
+const request_pool = @import("../edge/request_pool.zig");
+const hpack = @import("hpack.zig");
 
 /// How an accepted socket is served. `h1c` is plain HTTP/1.1 and takes no
 /// connection slot.
@@ -49,6 +51,13 @@ pub const Terms = struct {
     slot_boot: usize = 0,
     on_demand_conn: usize = 0,
     on_demand_server: usize = 0,
+    /// The request memory pool, counted once: the most RESIDENT bytes it can
+    /// hold (`request_bytes_per_server`; a block that is decommitted is not
+    /// resident) plus its bitmaps. The address space it reserves is about
+    /// `class_count` times that, and is not counted: untouched pages are not
+    /// memory. The per-connection share, `request_bytes_per_connection`, is a
+    /// slice of this term and adds nothing to it.
+    request_pool: usize = 0,
     reaper_jobs: usize = 0,
     /// The slot objects themselves (each holds a whole `Connection`) plus the
     /// two lists the pool keeps, the free list and the quarantine, each sized
@@ -112,8 +121,30 @@ pub const Limits = struct {
     outbound_bytes_per_stream: usize = 64 * 1024,
     outbound_bytes_per_connection: usize = 4 * 1024 * 1024,
     outbound_bytes_per_server: usize = 256 * 1024 * 1024,
-    request_bytes_per_connection: usize = 8 * 1024 * 1024,
+    /// The most CLASS bytes (see `request_pool`) one connection's requests
+    /// hold at once, headers and bodies and what handlers allocate. One
+    /// connection must not be able to take the whole pool. 64 MiB lets a
+    /// connection run 16 concurrent requests that each render 1 MiB bodies
+    /// (about 3 MiB each) with room to spare.
+    request_bytes_per_connection: usize = 64 * 1024 * 1024,
+    /// The most RESIDENT bytes the request pool holds, in use or free. See
+    /// `request_pool.RequestPool` for what counts and what is reclaimed.
     request_bytes_per_server: usize = 256 * 1024 * 1024,
+    /// The most class bytes ONE request holds: its headers, its body and
+    /// everything its handler allocates from `Request.arena`. Over it, the
+    /// allocation fails with `OutOfMemory` and the request gets a 500 (an
+    /// RST_STREAM once its response is committed). A power of two, at least
+    /// 64 KiB, and large enough to buffer a body of `request_body_bytes`
+    /// (`bodyArenaBytes`). It is also the largest block class.
+    request_arena_bytes: usize = 4 * 1024 * 1024,
+    /// The most FREE resident bytes the request pool keeps (resident minus
+    /// held). A block returned while the pool is over this is decommitted at
+    /// once, so a burst of large renders does not leave its blocks resident
+    /// until the next burst. Above the limit a request pays one madvise and
+    /// fresh page faults for a block, which is what `munmap` cost for every
+    /// buffer above 32 KiB before the pool; below it, reuse is free. At most
+    /// `request_bytes_per_server`.
+    request_pool_retain_bytes: usize = 64 * 1024 * 1024,
     /// Reserved HTTP/1.1 request-head size per connection. A head over this
     /// bound is 431; the buffer never grows. Each connection allocates this
     /// size three times: `head_buf`, `name_scratch`, and the head prefix of
@@ -156,9 +187,9 @@ pub const Limits = struct {
     query_component_bytes: usize = 16 * 1024,
     /// Per-stream decoded body cap (413). Each H1 connection reserves this
     /// size twice (`body_buf` and the body suffix of `carry_buf`). A new
-    /// value moves `terms.h1_body` and `allocator_bytes`. H2 concurrent body
-    /// residency stays on `request_bytes_per_connection` /
-    /// `request_bytes_per_server`.
+    /// value moves `terms.h1_body` and `allocator_bytes`. An H2 body lives in
+    /// the request's arena and counts against `request_arena_bytes`, which
+    /// must be large enough for it.
     request_body_bytes: usize = 256 * 1024,
     /// Outbound DATA slabs for the WHOLE SERVER, each `outbound_bytes_per_stream`
     /// bytes. Slabs are rented when a stream first queues DATA and returned when
@@ -249,6 +280,41 @@ pub const Limits = struct {
         return plan.end;
     }
 
+    /// The most a header-block decode takes from a request's arena (see
+    /// `hpack.Decoder.requestBytesBound`). A request that holds this much free
+    /// room cannot fail to decode.
+    pub fn hpackDecodeBytes(self: Limits) error{InvalidConfig}!usize {
+        return hpack.Decoder.requestBytesBound(self.header_fields, self.decoded_header_bytes) catch error.InvalidConfig;
+    }
+
+    /// The size of a request's first block: the smallest class that holds the
+    /// block header and one decode (`hpackDecodeBytes`).
+    pub fn firstBlockBytes(self: Limits) error{InvalidConfig}!usize {
+        const need = try checkedAdd(request_pool.header_bytes, try self.hpackDecodeBytes());
+        const rounded = std.math.ceilPowerOfTwo(usize, need) catch return error.InvalidConfig;
+        return @max(rounded, request_pool.min_block_bytes);
+    }
+
+    /// The smallest `request_arena_bytes` that can buffer a body of exactly
+    /// `request_body_bytes`.
+    ///
+    /// The body is an `ArrayList` appended to as DATA arrives. At its last
+    /// growth step the request holds its first block, the block the list is
+    /// leaving and the block it is entering. The list grows by a half plus 64
+    /// bytes and a block takes a 64-byte header, so with `p` the class of
+    /// `body + header`, the block left is at most `p` and the block entered at
+    /// most `2p`. A test (`the largest legal body fits the arena bound`)
+    /// appends a body of exactly that size and checks the peak.
+    pub fn bodyArenaBytes(self: Limits) error{InvalidConfig}!usize {
+        const p = std.math.ceilPowerOfTwo(usize, try checkedAdd(self.request_body_bytes, request_pool.header_bytes)) catch return error.InvalidConfig;
+        const need = try checkedAdd(try self.firstBlockBytes(), try checkedMul(p, 3));
+        return std.math.ceilPowerOfTwo(usize, need) catch error.InvalidConfig;
+    }
+
+    pub fn requestPoolConfig(self: Limits) request_pool.Config {
+        return .{ .server_bytes = self.request_bytes_per_server, .arena_bytes = self.request_arena_bytes, .retain_bytes = self.request_pool_retain_bytes };
+    }
+
     pub fn resourceUpperBound(self: Limits) error{InvalidConfig}!ResourceUpperBound {
         if (self.max_connections == 0 or self.max_streams_per_connection == 0) return error.InvalidConfig;
         if (self.max_streams_per_server == 0) return error.InvalidConfig;
@@ -268,6 +334,16 @@ pub const Limits = struct {
         if (self.outbound_bytes_per_stream > self.outbound_bytes_per_connection) return error.InvalidConfig;
         if (self.outbound_bytes_per_connection > self.outbound_bytes_per_server) return error.InvalidConfig;
         if (self.request_bytes_per_connection > self.request_bytes_per_server) return error.InvalidConfig;
+        // The request pool's own shape: the arena cap is a power of two of at
+        // least one block, and the server cap holds at least one request.
+        try self.requestPoolConfig().check();
+        // A request must be able to hold its first block, and a body of the
+        // largest legal size, or the limits promise what the pool refuses.
+        const first_block = try self.firstBlockBytes();
+        if (self.request_arena_bytes < try self.bodyArenaBytes()) return error.InvalidConfig;
+        // A connection that cannot hold one first block refuses every request.
+        if (self.request_bytes_per_connection < first_block) return error.InvalidConfig;
+        if (first_block > self.request_arena_bytes) return error.InvalidConfig;
         // Ordinary SETTINGS/HEADERS must fit without consuming the terminal
         // GOAWAY/RST/ACK reserve. Without a reserve, a connection that fills its
         // control pool cannot emit the GOAWAY that says why, so it fails silent
@@ -312,7 +388,9 @@ pub const Limits = struct {
         terms.slot_boot = @max(slot_h2c, slot_tls);
         // Runtime ceilings that are not part of the slot: the per-connection
         // request, outbound and control budgets.
-        terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, self.control_bytes_per_connection));
+        // The request budget is a share of the server pool and costs nothing
+        // extra.
+        terms.on_demand_conn = try checkedAdd(self.outbound_bytes_per_connection, self.control_bytes_per_connection);
         // head_buf, name_scratch, and the head prefix of carry_buf (init in edge/h1.zig).
         terms.h1_head = try checkedMul(self.max_connections, try checkedMul(self.h1_head_bytes, 3));
         // body_buf plus the body-sized suffix of carry_buf (init in edge/h1.zig).
@@ -343,10 +421,11 @@ pub const Limits = struct {
         const slab_bytes = bound.pendingSlabBytes(self.outbound_slabs_per_server, self.outbound_bytes_per_stream) catch return error.InvalidConfig;
         terms.outbound_slabs = slab_bytes;
         terms.compression_contexts = try checkedMul(self.compression_contexts_per_server, self.compression_context_bytes);
-        terms.on_demand_server = try checkedAdd(slab_bytes, try checkedAdd(self.outbound_bytes_per_server, self.request_bytes_per_server));
+        terms.on_demand_server = try checkedAdd(slab_bytes, self.outbound_bytes_per_server);
+        terms.request_pool = try checkedAdd(self.request_bytes_per_server, try self.requestPoolConfig().bitmapBytes());
         const allocator_bytes = try checkedAdd(
             server_static,
-            try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, try checkedAdd(terms.on_demand_server, terms.compression_contexts))),
+            try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, try checkedAdd(terms.on_demand_server, try checkedAdd(terms.request_pool, terms.compression_contexts)))),
         );
 
         // Maximum std.Io task topology: accept loops + per-connection
@@ -617,4 +696,105 @@ test "extreme limits are InvalidConfig, never a panic or a small wrong size" {
     sum.control_entries_per_connection = top;
     sum.max_streams_per_connection = 1;
     try std.testing.expectError(error.InvalidConfig, sum.slotBootBytes(.h2c));
+}
+
+test "the request pool is counted once, and the per-connection share costs nothing" {
+    const base = try Limits.defaults.resourceUpperBound();
+    try std.testing.expect(base.terms.request_pool >= Limits.defaults.request_bytes_per_server);
+
+    // Not per connection.
+    var half = Limits.defaults;
+    half.max_connections = Limits.defaults.max_connections / 2;
+    try std.testing.expectEqual(base.terms.request_pool, (try half.resourceUpperBound()).terms.request_pool);
+
+    // It tracks the server cap, by exactly the bytes moved plus the bitmaps.
+    var more = Limits.defaults;
+    more.request_bytes_per_server = Limits.defaults.request_bytes_per_server * 2;
+    const bigger = try more.resourceUpperBound();
+    const bitmaps_before = try Limits.defaults.requestPoolConfig().bitmapBytes();
+    const bitmaps_after = try more.requestPoolConfig().bitmapBytes();
+    try std.testing.expectEqual(
+        base.terms.request_pool + Limits.defaults.request_bytes_per_server + (bitmaps_after - bitmaps_before),
+        bigger.terms.request_pool,
+    );
+    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+
+    // The connection's share is a slice of the pool: it does not move the bound.
+    var share = Limits.defaults;
+    share.request_bytes_per_connection = Limits.defaults.request_bytes_per_connection / 2;
+    try std.testing.expectEqual(base.allocator_bytes, (try share.resourceUpperBound()).allocator_bytes);
+}
+
+test "the request pool's limits that cannot work are refused at boot" {
+    const d = Limits.defaults;
+    var l = d;
+    // The arena cap: a power of two of at least one block.
+    l.request_arena_bytes = 48 * 1024;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    l.request_arena_bytes = 3 * 1024 * 1024;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    // The server cap holds at least one request.
+    l = d;
+    l.request_bytes_per_server = d.request_arena_bytes / 2;
+    l.request_bytes_per_connection = l.request_bytes_per_server;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    // A connection holds at least one first block.
+    l = d;
+    l.request_bytes_per_connection = 32 * 1024;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    // The connection's share is part of the server's.
+    l = d;
+    l.request_bytes_per_connection = d.request_bytes_per_server + 1;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    // A body the arena cannot buffer.
+    l = d;
+    l.request_body_bytes = 2 * 1024 * 1024;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    l.request_arena_bytes = try l.bodyArenaBytes();
+    _ = try l.resourceUpperBound();
+    // A decode that cannot fit the largest block.
+    l = d;
+    l.decoded_header_bytes = 8 * 1024 * 1024;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    // The defaults: one first block is the smallest class.
+    try std.testing.expectEqual(@as(usize, 64 * 1024), try d.firstBlockBytes());
+}
+
+test "the largest legal body fits the arena bound" {
+    // The bound `bodyArenaBytes` rests on a claim about how an ArrayList grows
+    // through the arena. Check it by doing it: for several body sizes, take the
+    // first block a decode reserves, append the body in DATA-frame sized pieces
+    // to exactly `request_body_bytes`, and check nothing was refused and the
+    // peak fits.
+    for ([_]usize{ 1024, 16 * 1024, 64 * 1024, 100_000, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024 }) |body_bytes| {
+        var lim = Limits.defaults;
+        lim.request_body_bytes = body_bytes;
+        lim.request_arena_bytes = try lim.bodyArenaBytes();
+        lim.request_bytes_per_server = @max(lim.request_bytes_per_server, lim.request_arena_bytes);
+        lim.request_bytes_per_connection = lim.request_bytes_per_server;
+        _ = try lim.resourceUpperBound();
+        var pool = try request_pool.RequestPool.init(lim.requestPoolConfig());
+        defer pool.deinit();
+        var budget = request_pool.ConnBudget.init(lim.request_bytes_per_connection);
+        var arena = request_pool.Arena.init(&pool, &budget);
+        defer arena.release();
+        const al = arena.allocator();
+        try arena.reserve(try lim.hpackDecodeBytes());
+        // What a decode leaves behind: part of the reserved room used.
+        _ = try al.alloc(u8, 3000);
+        var body: std.ArrayList(u8) = .empty;
+        const piece: [16 * 1024]u8 = @splat('b');
+        var left = body_bytes;
+        while (left > 0) {
+            const take = @min(left, piece.len);
+            try body.appendSlice(al, piece[0..take]);
+            left -= take;
+        }
+        try std.testing.expectEqual(body_bytes, body.items.len);
+        try std.testing.expectEqual(@as(?request_pool.Reason, null), arena.refusal);
+        try std.testing.expect(arena.peak <= lim.request_arena_bytes);
+        // The cap is not wildly loose either: half of it is not enough for the
+        // larger bodies, or the formula would be paying for nothing.
+        if (body_bytes >= 256 * 1024) try std.testing.expect(arena.peak > lim.request_arena_bytes / 4);
+    }
 }

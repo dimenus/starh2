@@ -65,6 +65,7 @@ pub const edge = struct {
     pub const emit_batch = @import("edge/emit_batch.zig");
     pub const fair_scheduler = @import("edge/fair_scheduler.zig");
     pub const slab_pool = @import("edge/slab_pool.zig");
+    pub const request_pool = @import("edge/request_pool.zig");
     pub const conn_slot = @import("edge/conn_slot.zig");
     pub const touched = @import("edge/touched.zig");
     pub const wire_ring = @import("edge/wire_ring.zig");
@@ -134,6 +135,7 @@ test {
     _ = edge.emit_batch;
     _ = edge.fair_scheduler;
     _ = edge.slab_pool;
+    _ = edge.request_pool;
     _ = edge.touched;
     _ = edge.wire_ring;
     _ = core.bound_shapes;
