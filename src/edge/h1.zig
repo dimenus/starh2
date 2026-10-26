@@ -171,10 +171,8 @@ const H1Conn = struct {
             self.stream.close(self.io);
             self.socket_closed = true;
         }
-        if (self.tls) |t| {
-            t.deinit();
-            self.gpa.destroy(t);
-        }
+        // The caller owns the `Conn`'s memory (a connection slot's buffer).
+        if (self.tls) |t| t.deinit();
         self.arena.deinit();
         self.gpa.free(self.head_buf);
         self.gpa.free(self.body_buf);
@@ -209,10 +207,7 @@ pub fn serve(
 ) std.Io.Cancelable!void {
     var conn: H1Conn = undefined;
     initConn(&conn, stream, config, tls) catch {
-        if (tls) |t| {
-            t.deinit();
-            config.gpa.destroy(t);
-        }
+        if (tls) |t| t.deinit();
         stream.close(config.io);
         return;
     };

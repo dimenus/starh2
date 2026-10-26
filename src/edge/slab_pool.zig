@@ -35,6 +35,7 @@
 //! keeps resident memory proportional to concurrent writers while preserving
 //! the same hard capacity and allocation-free hot path.
 const std = @import("std");
+const boot_plan = @import("../core/boot_plan.zig");
 
 pub const SlabPool = struct {
     storage: []u8,
@@ -43,6 +44,15 @@ pub const SlabPool = struct {
     free_words: []std.atomic.Value(u64),
     /// Observable so a test and `deinit` can prove every slab came home.
     rented: std.atomic.Value(usize) = .init(0),
+
+    /// The two allocations of `init`, in its order. See `boot_plan`.
+    pub fn planBoot(plan: *boot_plan.Plan, slab_bytes: usize, capacity: usize) error{InvalidConfig}!void {
+        // `init` asserts the capacity fits a `u32` slab index.
+        if (capacity > boot_plan.max_count) return error.InvalidConfig;
+        const total = try boot_plan.mul(slab_bytes, capacity);
+        try plan.array(u8, total);
+        try plan.array(std.atomic.Value(u64), (capacity + 63) / 64);
+    }
 
     /// One contiguous allocation for the bytes, one atomic free bitmap.
     /// Both are sized at boot and never grow, so the pool's own cost is exactly
@@ -79,10 +89,16 @@ pub const SlabPool = struct {
     /// this point is a lease some teardown path forgot, and the assert names it
     /// here rather than letting the next process reuse freed bytes.
     pub fn deinit(self: *SlabPool, gpa: std.mem.Allocator) void {
-        std.debug.assert(self.rented.load(.acquire) == 0);
+        self.assertAllReturned();
         gpa.free(self.storage);
         gpa.free(self.free_words);
         self.* = undefined;
+    }
+
+    /// The check `deinit` makes, for an owner that rewinds the pool's memory
+    /// instead of freeing it.
+    pub fn assertAllReturned(self: *const SlabPool) void {
+        std.debug.assert(self.rented.load(.acquire) == 0);
     }
 
     /// Take a slab, or null when the pool is empty. Never allocates.

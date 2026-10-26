@@ -240,7 +240,7 @@ const SessionCtx = struct {
     next_stream_id: u31,
 
     fn init(self: *SessionCtx, gpa: std.mem.Allocator) !void {
-        self.session = try starh2.Session.init(gpa, .{});
+        self.session = try starh2.Session.init(gpa, gpa, .{});
         errdefer self.session.deinit();
         self.next_stream_id = 1;
 

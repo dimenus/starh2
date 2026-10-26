@@ -23,8 +23,13 @@
 const std = @import("std");
 const bound = @import("bound_shapes.zig");
 const wire_const = @import("wire_const.zig");
-const ticket_table = @import("../edge/ticket_table.zig");
-const wire_pump = @import("../edge/wire_pump.zig");
+const boot_plan = @import("boot_plan.zig");
+const connection = @import("../edge/connection.zig");
+const conn_slot = @import("../edge/conn_slot.zig");
+
+/// How an accepted socket is served. `h1c` is plain HTTP/1.1 and takes no
+/// connection slot.
+pub const ConnMode = enum { h2c, tls, h1c };
 
 pub const ResourceUpperBound = struct {
     allocator_bytes: usize,
@@ -37,25 +42,17 @@ pub const ResourceUpperBound = struct {
 };
 
 pub const Terms = struct {
-    handlers: usize = 0,
-    handler_jobs: usize = 0,
-    joins: usize = 0,
-    tickets: usize = 0,
-    write_acks: usize = 0,
-    wire_descs: usize = 0,
-    read_payload: usize = 0,
-    write_payload: usize = 0,
-    /// TLS: the CQ driver's single ciphertext read buffer. One fixed
-    /// `TLS_CIPHER_CHUNK_SIZE` buffer per connection; the chunk pool and the
-    /// work queue it fed are gone with the CompletionQueue driver.
-    tls_cipher_payload: usize = 0,
-    frame_slabs: usize = 0,
-    stream_maps: usize = 0,
-    pending_maps: usize = 0,
+    /// One connection slot's boot buffer, `slotBootBytes`, for the larger of
+    /// the two HTTP/2 modes. Everything a connection allocates at boot is in
+    /// this one term: the arrays, both slab pools, the scheduler and Session
+    /// tables, the TLS buffers.
+    slot_boot: usize = 0,
     on_demand_conn: usize = 0,
     on_demand_server: usize = 0,
     reaper_jobs: usize = 0,
-    /// Retained for source compatibility; std.Io.Group removed the heap slot table.
+    /// The slot objects themselves (each holds a whole `Connection`) plus the
+    /// two lists the pool keeps, the free list and the quarantine, each sized
+    /// to `max_connections`. The boot buffer of each slot is `slot_boot`.
     conn_slots: usize = 0,
     routes: usize = 0,
     certs: usize = 0,
@@ -70,11 +67,6 @@ pub const Terms = struct {
     h1_body: usize = 0,
 };
 
-/// Must match `edge.connection.HandlerSlot` — comptime-asserted in connection.zig.
-pub const HANDLER_SLOT_SIZE: usize = 32;
-pub const HANDLER_JOB_SIZE: usize = 648;
-/// Must match `edge.connection.RequestLease` — comptime-asserted in connection.zig.
-pub const REQUEST_LEASE_SIZE: usize = 40;
 /// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
 pub const REAPER_JOB_SIZE: usize = 40;
 
@@ -152,9 +144,6 @@ pub const Limits = struct {
     certificate_chain_bytes: usize = 64 * 1024,
     private_key_bytes: usize = 16 * 1024,
     tls_handshake_scratch_bytes: usize = 256 * 1024,
-    /// Per-connection TLS stream buffers (tcp in/out + tls in/out). Floor is
-    /// `TLS_CONN_BUFFER_BYTES`; the default leaves headroom for the SSL object.
-    tls_stream_bytes: usize = 256 * 1024,
     cancellation_reaper_tasks: usize = 64,
     cancellation_reaper_jobs: usize = 4_096,
     decoded_header_bytes: usize = 32 * 1024,
@@ -247,6 +236,19 @@ pub const Limits = struct {
         if (self.inbound_wire_chunks_per_connection < H2C_MIN_WRITE_QUEUE_CHUNKS) return error.InvalidConfig;
     }
 
+    /// The size of a connection slot's boot buffer for `mode`: exactly the
+    /// bytes `Connection.init` takes from it (and, for TLS, the `Conn` taken
+    /// before it), including alignment padding. One byte less and the boot
+    /// fails with OutOfMemory; one byte more is memory every slot pays and
+    /// never uses. The exact-fit test in `edge/connection.zig` boots into both. `resourceUpperBound`
+    /// counts the slot from this same function.
+    pub fn slotBootBytes(self: Limits, mode: ConnMode) error{InvalidConfig}!usize {
+        if (mode == .h1c) return 0;
+        var plan: boot_plan.Plan = .{};
+        try connection.planSlotBoot(&plan, self, mode);
+        return plan.end;
+    }
+
     pub fn resourceUpperBound(self: Limits) error{InvalidConfig}!ResourceUpperBound {
         if (self.max_connections == 0 or self.max_streams_per_connection == 0) return error.InvalidConfig;
         if (self.max_streams_per_server == 0) return error.InvalidConfig;
@@ -276,7 +278,6 @@ pub const Limits = struct {
         if (self.close_flush_timeout_ns == 0) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.listen_backlog == 0) return error.InvalidConfig;
-        if (self.tls_stream_bytes < TLS_CONN_BUFFER_BYTES) return error.InvalidConfig;
         if (self.frame_slab_bytes < 9) return error.InvalidConfig;
         if (self.frame_slabs_per_connection == 0) return error.InvalidConfig;
         // A server with no slabs can never write DATA.
@@ -301,78 +302,23 @@ pub const Limits = struct {
         if (self.response_compression and self.compression_contexts_per_server == 0) return error.InvalidConfig;
         if (self.h1_head_bytes == 0) return error.InvalidConfig;
 
-        // Rung-4 enforcement: these sizes are load-bearing inputs to the bound,
-        // so a struct that gains a field must break the BUILD and not the
-        // number. A drifted size is invisible in a passing test suite.
-        comptime {
-            if (@sizeOf(ticket_table.TicketWait) != bound.TICKET_WAIT_SIZE) @compileError("TicketWait size drift");
-            if (@sizeOf(wire_pump.WriteCompletion) != bound.WRITE_COMPLETION_SIZE) @compileError("WriteCompletion size drift");
-            if (@sizeOf(wire_pump.WireChunk) != bound.WIRE_CHUNK_DESC_SIZE) @compileError("WireChunk size drift");
-        }
-
         var terms: Terms = .{};
-        const n_chunks = self.inbound_wire_chunks_per_connection;
-        const ticket_n = try checkedAdd(self.control_entries_per_connection, self.max_streams_per_connection);
 
-        terms.read_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
-        terms.write_payload = try checkedMul(n_chunks, WIRE_CHUNK_SIZE);
-        terms.tls_cipher_payload = wire_const.TLS_CIPHER_CHUNK_SIZE;
-        terms.frame_slabs = try checkedMul(self.frame_slabs_per_connection, self.frame_slab_bytes);
-        // Read channel (n + 1 for the EOF sentinel), write channel (n), and
-        // the TLS write stash (n + its extra slots), as `Connection.init`
-        // allocates them. The stash is counted for every connection because
-        // the bound does not know which endpoints are TLS.
-        const wire_desc_n = try checkedAdd(try checkedMul(n_chunks, 3), 1 + wire_const.TLS_STASH_EXTRA_SLOTS);
-        terms.wire_descs = try checkedMul(wire_desc_n, bound.WIRE_CHUNK_DESC_SIZE);
-        terms.handlers = try checkedMul(self.max_streams_per_connection, HANDLER_SLOT_SIZE);
-        terms.handler_jobs = try checkedMul(self.max_streams_per_connection, HANDLER_JOB_SIZE);
-        terms.joins = try checkedMul(self.max_streams_per_connection, bound.JOIN_HANDLE_SIZE);
-        const completion_ids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        terms.write_acks = try checkedMul(ticket_n, bound.WRITE_COMPLETION_SIZE);
-        terms.tickets = try checkedMul(ticket_n, bound.TICKET_WAIT_SIZE);
-        const plain_scratch: usize = TLS_PLAINTEXT_SCRATCH_SIZE;
-        const sid_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        const inline_sids = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
-        // Request leases (decoded, not dispatched) plus the parked-request ring.
-        const header_leases = try checkedAdd(
-            try checkedMul(self.max_streams_per_connection + 1, REQUEST_LEASE_SIZE),
-            try checkedMul(self.max_streams_per_connection, bound.DISPATCH_REQUEST_SIZE),
-        );
-        const read_free = try checkedMul(n_chunks, @sizeOf(u32));
-        // The write pool is a SlabPool: one free bit per chunk, in u64 words.
-        const write_free = try checkedMul((n_chunks + 63) / 64, @sizeOf(u64));
-        terms.stream_maps = bound.streamMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
-        const pending_slots = bound.pendingWriteMapBytes(self.max_streams_per_connection) catch return error.InvalidConfig;
-        // Slabs are server-wide now, so they are NOT part of the per-connection
-        // term. Counting them here is what made the bound scale with
-        // connections instead of with concurrent work.
-        terms.pending_maps = pending_slots;
-        const tombstones = try checkedMul(self.stream_tombstones, 8);
-        const header_maps_one = bound.hashMapBytes(u31, usize, self.max_streams_per_connection) catch return error.InvalidConfig;
-        const header_maps = try checkedMul(header_maps_one, 3); // pending hdr/body/trailer maps
-        const intents = try checkedMul(self.intent_entries_per_connection, bound.INTENT_SIZE);
-        const sched_rings = try checkedAdd(
-            try checkedMul(self.control_entries_per_connection, bound.CONTROL_ENTRY_SIZE),
-            try checkedAdd(
-                try checkedMul(@max(self.control_entries_per_connection / 8, 16), bound.CONTROL_ENTRY_SIZE),
-                try checkedMul(self.control_entries_per_connection, @sizeOf(bound.FramedDataEntryShape)),
-            ),
-        );
-        const space_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
-        const deadline_events = try checkedMul(self.max_streams_per_connection, bound.EVENT_SIZE);
-        const deadline_state = deadline_events;
-        // `Session.credit_ids`, the send-credit journal for `FairScheduler.rearm`.
-        const sched_scratch = try checkedMul(self.max_streams_per_connection, @sizeOf(u31));
+        // One slot per connection, sized for whichever HTTP/2 mode is larger
+        // because the bound does not know which endpoints are TLS. h1c takes
+        // no slot (its buffers are the `h1_*` terms below).
+        const slot_h2c = try self.slotBootBytes(.h2c);
+        const slot_tls = try self.slotBootBytes(.tls);
+        terms.slot_boot = @max(slot_h2c, slot_tls);
+        // Runtime ceilings that are not part of the slot: the per-connection
+        // request, outbound and control budgets.
+        terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, self.control_bytes_per_connection));
         // head_buf, name_scratch, and the head prefix of carry_buf (init in edge/h1.zig).
         terms.h1_head = try checkedMul(self.max_connections, try checkedMul(self.h1_head_bytes, 3));
         // body_buf plus the body-sized suffix of carry_buf (init in edge/h1.zig).
         terms.h1_body = try checkedMul(self.max_connections, try checkedMul(self.request_body_bytes, 2));
-        terms.on_demand_conn = try checkedAdd(self.request_bytes_per_connection, try checkedAdd(self.outbound_bytes_per_connection, try checkedAdd(self.control_bytes_per_connection, try checkedAdd(self.tls_stream_bytes, try checkedAdd(header_maps, intents)))));
-
-        const sid_and_inline = try checkedAdd(sid_scratch, inline_sids);
-        const per_conn_core = try checkedAdd(terms.read_payload, try checkedAdd(terms.wire_descs, try checkedAdd(terms.handlers, try checkedAdd(terms.handler_jobs, try checkedAdd(terms.joins, try checkedAdd(completion_ids, try checkedAdd(terms.write_acks, try checkedAdd(terms.tickets, try checkedAdd(plain_scratch, try checkedAdd(sid_and_inline, try checkedAdd(header_leases, try checkedAdd(read_free, try checkedAdd(terms.on_demand_conn, try checkedAdd(terms.stream_maps, try checkedAdd(terms.pending_maps, try checkedAdd(tombstones, try checkedAdd(sched_rings, try checkedAdd(space_events, try checkedAdd(deadline_state, sched_scratch)))))))))))))))))));
         const h1_per_conn = try checkedAdd(try checkedMul(self.h1_head_bytes, 3), try checkedMul(self.request_body_bytes, 2));
-        const per_conn = try checkedAdd(per_conn_core, try checkedAdd(terms.write_payload, try checkedAdd(terms.frame_slabs, try checkedAdd(write_free, try checkedAdd(terms.tls_cipher_payload, h1_per_conn)))));
+        const per_conn = try checkedAdd(terms.slot_boot, try checkedAdd(terms.on_demand_conn, h1_per_conn));
 
         terms.routes = try checkedAdd(
             self.max_route_path_bytes,
@@ -380,7 +326,10 @@ pub const Limits = struct {
         );
         terms.certs = try checkedAdd(self.certificate_chain_bytes, self.private_key_bytes);
         terms.reaper_jobs = try checkedMul(self.cancellation_reaper_jobs, REAPER_JOB_SIZE);
-        terms.conn_slots = 0;
+        terms.conn_slots = try checkedMul(
+            self.max_connections,
+            try checkedAdd(@sizeOf(conn_slot.ConnSlot), 2 * @sizeOf(*conn_slot.ConnSlot)),
+        );
         terms.tls_scratch = try checkedMul(self.concurrent_tls_handshakes, self.tls_handshake_scratch_bytes);
         const endpoint_slot = try checkedAdd(
             bound.ENDPOINT_CONFIG_SIZE,
@@ -420,22 +369,39 @@ pub const Limits = struct {
     }
 };
 
-test "mutation canary: frame_slabs term moves with the limit" {
+test "mutation canary: the slot term moves with each limit that sizes a boot table" {
     const base = try Limits.defaults.resourceUpperBound();
-    try std.testing.expect(base.terms.frame_slabs > 0);
-    try std.testing.expect(base.terms.write_payload > 0);
-    var more = Limits.defaults;
-    more.frame_slabs_per_connection = Limits.defaults.frame_slabs_per_connection * 2;
-    const bigger = try more.resourceUpperBound();
-    try std.testing.expect(bigger.terms.frame_slabs > base.terms.frame_slabs);
-    try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+    try std.testing.expect(base.terms.slot_boot > 0);
+    // Every limit below sizes something `Connection.init` allocates at boot.
+    // A table that dropped out of the plan would leave its limit unable to
+    // move the slot, and the bound would still look reasonable.
+    inline for (.{
+        "frame_slabs_per_connection",
+        "frame_slab_bytes",
+        "inbound_wire_chunks_per_connection",
+        "max_streams_per_connection",
+        "control_entries_per_connection",
+        "intent_entries_per_connection",
+        "stream_tombstones",
+        "compressed_header_bytes",
+    }) |name| {
+        var more = Limits.defaults;
+        @field(more, name) = @field(Limits.defaults, name) * 2;
+        // The reaper queue must stay at least the global stream cap, and the
+        // global cap at least the per-connection one.
+        more.max_streams_per_server = @max(more.max_streams_per_server, more.max_streams_per_connection);
+        more.cancellation_reaper_jobs = @max(more.cancellation_reaper_jobs, more.max_streams_per_server);
+        more.outbound_slabs_per_server = @max(more.outbound_slabs_per_server, more.max_streams_per_server);
+        const bigger = try more.resourceUpperBound();
+        try std.testing.expect(bigger.terms.slot_boot > base.terms.slot_boot);
+        try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+    }
 }
 
 test "defaults resource bound" {
     const b = try Limits.defaults.resourceUpperBound();
     try std.testing.expect(b.allocator_bytes > 0);
-    try std.testing.expect(b.terms.handlers > 0);
-    try std.testing.expect(b.terms.tickets > 0);
+    try std.testing.expect(b.terms.slot_boot > 0);
     try std.testing.expect(b.terms.tasks > 0);
 }
 
@@ -481,20 +447,26 @@ test "rejects reaper jobs below global streams" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
-test "mutation canary: dropping handlers term shrinks bound" {
+test "mutation canary: dropping the slot term shrinks the bound" {
     const b = try Limits.defaults.resourceUpperBound();
-    try std.testing.expect(b.terms.handlers > 0);
-    try std.testing.expect(b.terms.tickets > 0);
-    try std.testing.expect(b.terms.write_acks > 0);
-    try std.testing.expect(b.terms.stream_maps > 0);
+    try std.testing.expect(b.terms.slot_boot > 0);
     try std.testing.expect(b.terms.on_demand_server > 0);
     var tiny = Limits.defaults;
     tiny.max_streams_per_connection = 1;
     tiny.max_streams_per_server = 64;
     tiny.cancellation_reaper_jobs = 64;
     const b2 = try tiny.resourceUpperBound();
-    try std.testing.expect(b.terms.handlers > b2.terms.handlers);
+    try std.testing.expect(b.terms.slot_boot > b2.terms.slot_boot);
     try std.testing.expect(b.allocator_bytes > b2.allocator_bytes);
+}
+
+test "the slot is counted per connection, so halving connections halves it" {
+    const wide = try Limits.defaults.resourceUpperBound();
+    var half = Limits.defaults;
+    half.max_connections = Limits.defaults.max_connections / 2;
+    const narrow = try half.resourceUpperBound();
+    try std.testing.expectEqual(wide.terms.slot_boot, narrow.terms.slot_boot);
+    try std.testing.expect(wide.allocator_bytes > narrow.allocator_bytes);
 }
 
 test "mutation canary: compression_contexts term moves with the limit" {
@@ -571,10 +543,78 @@ test "rejects zero h1_head_bytes" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
-test "the tls cipher term is exactly the driver's single read buffer" {
-    // The chunk pool is gone; a term that silently kept counting it would
-    // overstate the bound by (n-1) buffers per connection. Pin the exact
-    // value so a resurrected pool moves this test.
-    const base = try Limits.defaults.resourceUpperBound();
-    try std.testing.expectEqual(wire_const.TLS_CIPHER_CHUNK_SIZE, base.terms.tls_cipher_payload);
+test "a TLS slot is larger than an h2c slot by the handshake Conn and the TLS buffers" {
+    // The TLS slot holds what h2c does, plus the handshake `Conn` and the
+    // driver's read buffer and write stash. The bound takes the larger.
+    const lim = Limits.defaults;
+    const h2c_bytes = try lim.slotBootBytes(.h2c);
+    const tls_bytes = try lim.slotBootBytes(.tls);
+    try std.testing.expect(tls_bytes > h2c_bytes);
+    try std.testing.expect(tls_bytes - h2c_bytes >= @sizeOf(@import("../edge/tls.zig").Conn) + wire_const.TLS_CIPHER_CHUNK_SIZE);
+    try std.testing.expectEqual(@as(usize, 0), try lim.slotBootBytes(.h1c));
+    const b = try lim.resourceUpperBound();
+    try std.testing.expectEqual(tls_bytes, b.terms.slot_boot);
+}
+
+test "extreme limits are InvalidConfig, never a panic or a small wrong size" {
+    // Each limit is an operator's number. The plan adds and multiplies them,
+    // so a value at the top of `usize` used to overflow inside the plan, which
+    // `resourceUpperBound` reaches before it can say InvalidConfig.
+    const top = std.math.maxInt(usize);
+    const past_u32: usize = std.math.maxInt(u32) + 1;
+    inline for (.{
+        "inbound_wire_chunks_per_connection",
+        "max_streams_per_connection",
+        "control_entries_per_connection",
+        "intent_entries_per_connection",
+        "stream_tombstones",
+        "frame_slabs_per_connection",
+        "frame_slab_bytes",
+        "compressed_header_bytes",
+    }) |name| {
+        for ([_]usize{ top, top - 1, top / 2 + 1 }) |v| {
+            var lim = Limits.defaults;
+            @field(lim, name) = v;
+            // A size may be huge but must never be small: every unit of every
+            // one of these limits is at least a byte of the plan.
+            inline for (.{ ConnMode.h2c, ConnMode.tls }) |mode| {
+                if (lim.slotBootBytes(mode)) |n| {
+                    try std.testing.expect(n >= v);
+                } else |err| {
+                    try std.testing.expectEqual(error.InvalidConfig, err);
+                }
+            }
+            try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+        }
+    }
+    // The counts `init` narrows to `u32` are refused one past it, where the
+    // byte sizes alone would still fit a `usize`.
+    inline for (.{ "inbound_wire_chunks_per_connection", "max_streams_per_connection" }) |name| {
+        var lim = Limits.defaults;
+        @field(lim, name) = past_u32;
+        try std.testing.expectError(error.InvalidConfig, lim.slotBootBytes(.h2c));
+        try std.testing.expectError(error.InvalidConfig, lim.slotBootBytes(.tls));
+    }
+    // A plan whose end lands within an alignment of the top of `usize`: the
+    // header block is the last Session table, so sizing it to leave k bytes
+    // below the top puts the next table's alignment step on the edge.
+    const session_mod = @import("session.zig");
+    var probe: boot_plan.Plan = .{};
+    var small = Limits.defaults;
+    small.compressed_header_bytes = 1;
+    try session_mod.Session.planBoot(&probe, small);
+    // The block is `max(one frame, compressed_header_bytes)` bytes and has
+    // alignment 1, so everything before it ends where the block starts.
+    const block_start = probe.end - @import("frame.zig").DEFAULT_MAX_FRAME_SIZE;
+    for (0..70) |k| {
+        var edge = Limits.defaults;
+        edge.compressed_header_bytes = top - block_start - k;
+        try std.testing.expectError(error.InvalidConfig, edge.slotBootBytes(.h2c));
+        try std.testing.expectError(error.InvalidConfig, edge.slotBootBytes(.tls));
+    }
+    // A sum of two limits that overflows only as a sum.
+    var sum = Limits.defaults;
+    sum.control_entries_per_connection = top;
+    sum.max_streams_per_connection = 1;
+    try std.testing.expectError(error.InvalidConfig, sum.slotBootBytes(.h2c));
 }

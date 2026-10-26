@@ -691,6 +691,25 @@ pub fn build(b: *std.Build) void {
     const goaway_delivery_step = b.step("test-goaway-delivery", "Run the GOAWAY delivery gates (connection error and graceful shutdown)");
     goaway_delivery_step.dependOn(&run_goaway_delivery_tests.step);
 
+    const slot_reuse_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/slot_reuse.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_slot_reuse_tests = b.addRunArtifact(slot_reuse_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_slot_reuse_tests.setCwd(b.path("."));
+    const slot_reuse_step = b.step("test-slot-reuse", "Run the connection slot gates (reuse, ordering, boot allocator calls, dirty slots, shutdown)");
+    slot_reuse_step.dependOn(&run_slot_reuse_tests.step);
+
     const admission_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/admission.zig"),
@@ -742,6 +761,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tls_preface_tests.step);
     test_step.dependOn(&run_goaway_delivery_tests.step);
     test_step.dependOn(&run_admission_tests.step);
+    test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");

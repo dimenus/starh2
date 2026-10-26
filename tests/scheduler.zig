@@ -233,7 +233,6 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
 test "connection ControlPool constants match FairScheduler" {
     const cp = starh2.edge.control_pool;
     try std.testing.expectEqual(@as(usize, 64), cp.CONTROL_BEFORE_DATA);
-    try std.testing.expectEqual(@sizeOf(starh2.edge.connection.HandlerSlot), starh2.core.limits.HANDLER_SLOT_SIZE);
 }
 
 test "zero stream window does not block other stream or control (session)" {
@@ -241,7 +240,7 @@ test "zero stream window does not block other stream or control (session)" {
     const Session = starh2.Session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();
@@ -359,7 +358,7 @@ test "drain emits pending DATA after Session dropped the stream" {
     const Session = starh2.Session;
     const flow = starh2.core.flow;
     const fs = starh2.edge.fair_scheduler;
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();
@@ -443,7 +442,7 @@ test "drain does not emit pending DATA after a RST tombstone" {
     const Session = starh2.Session;
     const flow = starh2.core.flow;
     const fs = starh2.edge.fair_scheduler;
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();

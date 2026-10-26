@@ -48,6 +48,7 @@ pub const core = struct {
     pub const limits = @import("core/limits.zig");
     pub const rates = @import("core/rates.zig");
     pub const bound_shapes = @import("core/bound_shapes.zig");
+    pub const boot_plan = @import("core/boot_plan.zig");
     pub const wire_const = @import("core/wire_const.zig");
 };
 
@@ -64,6 +65,7 @@ pub const edge = struct {
     pub const emit_batch = @import("edge/emit_batch.zig");
     pub const fair_scheduler = @import("edge/fair_scheduler.zig");
     pub const slab_pool = @import("edge/slab_pool.zig");
+    pub const conn_slot = @import("edge/conn_slot.zig");
     pub const touched = @import("edge/touched.zig");
 };
 
@@ -133,6 +135,8 @@ test {
     _ = edge.slab_pool;
     _ = edge.touched;
     _ = core.bound_shapes;
+    _ = core.boot_plan;
+    _ = edge.conn_slot;
     _ = physical_cpus;
     _ = http.request;
     _ = http.response;

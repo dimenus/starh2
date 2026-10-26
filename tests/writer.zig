@@ -136,7 +136,7 @@ test "ticket wait maps peer RST tombstone before SlotTerminal cause (t-718)" {
     const response = starh2.http.response;
     const gpa = std.testing.allocator;
 
-    var session = try session_mod.Session.init(gpa, .{ .stream_tombstones = 8 });
+    var session = try session_mod.Session.init(gpa, gpa, .{ .stream_tombstones = 8 });
     defer session.deinit();
     {
         const preface = session.drainIntents();

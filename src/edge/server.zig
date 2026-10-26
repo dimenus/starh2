@@ -28,6 +28,7 @@ const zio = @import("zio");
 const limits_mod = @import("../core/limits.zig");
 const router_mod = @import("../http/router.zig");
 const connection = @import("connection.zig");
+const conn_slot = @import("conn_slot.zig");
 const h1 = @import("h1.zig");
 const slab_pool = @import("slab_pool.zig");
 const brotli = @import("../http/brotli.zig");
@@ -122,6 +123,9 @@ pub const Server = struct {
     /// `limits.response_compression` is on; handlers borrow through ConnConfig.
     compression_pool: ?brotli.Pool = null,
     balancer: ?*connection.Balancer = null,
+    /// Connection slots: the boot memory h2c and TLS connections reuse. See
+    /// `conn_slot.zig`.
+    slots: conn_slot.SlotPool,
     listeners_bound: usize = 0,
     bind_state: std.atomic.Value(BindState) = .init(.pending),
     bind_event: std.Io.Event = .unset,
@@ -216,6 +220,20 @@ pub const Server = struct {
             );
         }
 
+        // One slot size for the whole server: the largest any endpoint needs.
+        // A server with only h1c endpoints makes no slots.
+        var slot_boot_bytes: usize = 0;
+        for (config.endpoints) |ep| {
+            const mode: connection.Mode = switch (ep) {
+                .tls => .tls,
+                .h2c_prior_knowledge => .h2c,
+                .h1c => .h1c,
+            };
+            slot_boot_bytes = @max(slot_boot_bytes, config.limits.slotBootBytes(mode) catch return error.InvalidConfig);
+        }
+        var slots = conn_slot.SlotPool.init(gpa, config.limits.max_connections, slot_boot_bytes) catch return error.OutOfMemory;
+        errdefer slots.deinit();
+
         var self: Server = .{
             .gpa = gpa,
             .io = io,
@@ -236,6 +254,7 @@ pub const Server = struct {
             .slabs = slabs,
             .compression_pool = compression_pool,
             .balancer = config.balancer,
+            .slots = slots,
         };
         self.router = .{ .routes = self.routes };
         return self;
@@ -393,21 +412,40 @@ pub const Server = struct {
         while (!ready(self, mode)) try a.admission_cond.wait(&a.admission_mu);
     }
 
-    fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
-        defer self.releaseConnection();
+    /// `slot` is null exactly for h1c, which keeps its own buffers.
+    ///
+    /// The defers run bottom to top, and the order is the point: the slot is
+    /// reset and pushed first, the balancer's count next, and the connection's
+    /// admission last. Admission released first would let the accept loop see
+    /// room, find the free list empty, and make a second slot. A safe build
+    /// checks the order at the moment admission is released, whatever the
+    /// scheduling: `slot_back` is set only after `recycle` has put the slot on
+    /// the free list or in the quarantine.
+    fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig, slot: ?*conn_slot.ConnSlot) std.Io.Cancelable!void {
+        var slot_back = slot == null;
+        defer {
+            if (std.debug.runtime_safety and !slot_back) {
+                @panic("connection admission released before its slot was returned");
+            }
+            self.releaseConnection();
+        }
         defer if (config.balancer) |b| b.releaseConn(config.exec_index.?);
+        defer if (slot) |sl| {
+            _ = self.slots.recycle(sl);
+            slot_back = true;
+        };
         connection.probeNote(.conn_entry);
         if (config.mode == .h1c) return h1.serve(stream, config, null, &.{});
-        if (config.mode == .tls) return serveTlsThenBranch(stream, config);
-        return connection.serveAccepted(stream, config);
+        if (config.mode == .tls) return serveTlsThenBranch(stream, config, slot.?);
+        return connection.serveAccepted(stream, config, slot.?);
     }
 
-    fn serveTlsThenBranch(stream: std.Io.net.Stream, config: connection.ConnConfig) std.Io.Cancelable!void {
+    fn serveTlsThenBranch(stream: std.Io.net.Stream, config: connection.ConnConfig, slot: *conn_slot.ConnSlot) std.Io.Cancelable!void {
         const acceptor = config.tls_acceptor orelse {
             stream.close(config.io);
             return;
         };
-        const tls_conn = config.gpa.create(tls_edge.Conn) catch {
+        const tls_conn = slot.createTlsConn() catch {
             if (config.handshake_held) {
                 if (config.accounting) |a| a.releaseHandshake();
             }
@@ -419,7 +457,6 @@ pub const Server = struct {
 
         handshakeWithTimeout(tls_conn, config) catch |err| {
             tls_conn.deinit();
-            config.gpa.destroy(tls_conn);
             if (config.handshake_held) {
                 if (config.accounting) |a| a.releaseHandshake();
             }
@@ -438,7 +475,6 @@ pub const Server = struct {
         if (tls_edge.isHttp2Alpn(tls_conn.selectedAlpn())) {
             const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {
                 tls_conn.deinit();
-                config.gpa.destroy(tls_conn);
                 stream.close(config.io);
                 return;
             };
@@ -446,7 +482,7 @@ pub const Server = struct {
             cfg.handshake_held = false;
             cfg.tls_ready = tls_conn;
             cfg.tls_leftover = owned;
-            connection.serveAccepted(stream, cfg) catch |err| {
+            connection.serveAccepted(stream, cfg, slot) catch |err| {
                 if (owned.len != 0) config.gpa.free(owned);
                 return err;
             };
@@ -456,7 +492,6 @@ pub const Server = struct {
 
         const owned = if (leftover_n == 0) &.{} else config.gpa.dupe(u8, leftover) catch {
             tls_conn.deinit();
-            config.gpa.destroy(tls_conn);
             stream.close(config.io);
             return;
         };
@@ -546,6 +581,16 @@ pub const Server = struct {
                 return err;
             };
             const handshake_held = mode == .tls;
+            // h1c keeps its own buffers and takes no slot. No slot is either
+            // out of memory or, once `max_connections` slots exist and the
+            // clean check holds some back, the cap: the connection is closed,
+            // handshake slot first and admission second, as on a spawn failure.
+            const slot: ?*conn_slot.ConnSlot = if (mode == .h1c) null else self.slots.take() catch {
+                if (handshake_held) self.accounting.releaseHandshake();
+                self.releaseConnection();
+                stream.close(self.io);
+                continue;
+            };
             var config: connection.ConnConfig = .{
                 .io = self.io,
                 .mode = mode,
@@ -570,7 +615,7 @@ pub const Server = struct {
                 if (b.reserve()) |ei| {
                     config.balancer = b;
                     config.exec_index = ei;
-                    if (zio.Group.fromStd(connection_group).spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config })) |_| {
+                    if (zio.Group.fromStd(connection_group).spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config, slot })) |_| {
                         b.notePlaced(ei, stream.socket.address.getPort());
                         continue;
                     } else |_| {
@@ -585,13 +630,16 @@ pub const Server = struct {
             // the same group and with the same fallback.
             if (comptime connection.placement_check) {
                 if (connection.probeConnPlacement()) |placement| {
-                    if (zio.Group.fromStd(connection_group).spawnInto(placement, connEntry, .{ self, stream, config })) |_| {
+                    if (zio.Group.fromStd(connection_group).spawnInto(placement, connEntry, .{ self, stream, config, slot })) |_| {
                         continue;
                     } else |_| {}
                 }
             }
-            connection_group.concurrent(self.io, connEntry, .{ self, stream, config }) catch {
+            connection_group.concurrent(self.io, connEntry, .{ self, stream, config, slot }) catch {
                 if (handshake_held) self.accounting.releaseHandshake();
+                // The slot goes back before admission is released, for the
+                // reason `connEntry` gives.
+                if (slot) |sl| _ = self.slots.recycle(sl);
                 self.releaseConnection();
                 stream.close(self.io);
                 continue;
@@ -663,6 +711,10 @@ pub const Server = struct {
         // Asserts every slab came home; a connection teardown that missed one
         // fails here rather than silently shrinking the pool.
         self.slabs.deinit(gpa);
+        // Every slot must be back (or leaked on purpose): the connections are
+        // gone, so one still out would be a connection that never gave its
+        // slot back.
+        self.slots.deinit();
         if (self.tls_acceptor) |*auth| auth.deinit();
         self.* = undefined;
     }

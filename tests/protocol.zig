@@ -42,13 +42,13 @@ test "session fragmentation invariance" {
     const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
     try wire.appendSlice(std.testing.allocator, sbuf[0..sn]);
 
-    var s1 = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var s1 = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer s1.deinit();
     freeIntents(s1.drainIntents());
     try s1.ingest(wire.items);
     freeIntents(s1.drainIntents());
 
-    var s2 = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var s2 = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer s2.deinit();
     freeIntents(s2.drainIntents());
     for (wire.items) |b| {
@@ -62,7 +62,7 @@ test "session fragmentation invariance" {
 test "error corpus: push_promise is connection PROTOCOL_ERROR" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -82,7 +82,7 @@ test "error corpus: push_promise is connection PROTOCOL_ERROR" {
 
 test "graceful two-phase GOAWAY" {
     const session_mod = starh2.core.session;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
     try session.applyCommand(.graceful_phase1);
@@ -111,7 +111,7 @@ test "session handles GET /hello headers end_stream" {
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
 
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -177,7 +177,7 @@ test "RST_STREAM on a stream the server already closed is tolerated (RFC 9113 5.
     const hpack = starh2.core.hpack;
     const gpa = std.testing.allocator;
 
-    var session = try session_mod.Session.init(gpa, .defaults);
+    var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -239,7 +239,7 @@ test "RST_STREAM on a never-opened stream is still a connection error" {
     const frame = starh2.core.frame;
     const gpa = std.testing.allocator;
 
-    var session = try session_mod.Session.init(gpa, .defaults);
+    var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -275,7 +275,7 @@ test "WINDOW_UPDATE on a stream the server already closed is tolerated (RFC 9113
     const hpack = starh2.core.hpack;
     const gpa = std.testing.allocator;
 
-    var session = try session_mod.Session.init(gpa, .defaults);
+    var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -329,7 +329,7 @@ test "WINDOW_UPDATE on a never-opened stream is still a connection error" {
     const frame = starh2.core.frame;
     const gpa = std.testing.allocator;
 
-    var session = try session_mod.Session.init(gpa, .defaults);
+    var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -365,7 +365,7 @@ test "DATA on a closed stream is a STREAM error, not a connection error (RFC 911
     const hpack = starh2.core.hpack;
     const gpa = std.testing.allocator;
 
-    var session = try session_mod.Session.init(gpa, .defaults);
+    var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 

@@ -1,4 +1,3 @@
-src/core/bound_shapes.zig std.Io.Event 1
 src/edge/connection.zig std.Io.Event 2
 src/edge/connection.zig std.Io.Mutex 1
 src/edge/connection.zig std.Io.Queue 3

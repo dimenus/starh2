@@ -45,6 +45,7 @@ const control_pool = @import("control_pool.zig");
 const slab_pool = @import("slab_pool.zig");
 const Touched = @import("touched.zig").Touched;
 const frame = @import("../core/frame.zig");
+const boot_plan = @import("../core/boot_plan.zig");
 
 /// One round-robin turn. It matches the HTTP/2 default max frame size, so a
 /// quantum is exactly one DATA frame and the scheduler never has to split a
@@ -233,6 +234,26 @@ pub const FairScheduler = struct {
         return f(self.pause_ctx);
     }
 
+    /// The allocations of `init`, in its order. See `boot_plan`.
+    pub fn planBoot(
+        plan: *boot_plan.Plan,
+        terminal_cap: usize,
+        ordinary_cap: usize,
+        max_streams: usize,
+    ) error{InvalidConfig}!void {
+        // `init` asserts this, and `indexCapacity` doubles it.
+        if (max_streams >= none) return error.InvalidConfig;
+        try plan.array(ControlEntry, @max(terminal_cap, 1));
+        try plan.array(ControlEntry, @max(ordinary_cap, 1));
+        try plan.array(FramedDataEntry, @max(ordinary_cap, 1));
+        try plan.array(DataPending, max_streams);
+        const idx_cap = indexCapacity(max_streams);
+        try plan.array(u31, idx_cap);
+        try plan.array(u32, idx_cap);
+        try plan.array(u32, max_streams);
+        try plan.array(u32, max_streams);
+    }
+
     pub fn init(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -288,17 +309,25 @@ pub const FairScheduler = struct {
         self.gpa.free(payload);
     }
 
-    pub fn deinit(self: *FairScheduler) void {
+    /// Release what the scheduler still holds outside its own tables: queued
+    /// payloads (through `freePayload`) and the slabs of pending DATA, which
+    /// go back to the shared pool. A connection slot calls this and rewinds
+    /// the tables' memory; `deinit` is this plus the frees.
+    pub fn releaseHeld(self: *FairScheduler) void {
         while (self.popTerminal()) |e| self.freePayload(e.payload);
         while (self.popOrdinary()) |e| self.freePayload(e.payload);
         while (self.popFramed()) |e| self.freePayload(e.payload);
-        self.gpa.free(self.terminal_q);
-        self.gpa.free(self.ordinary_q);
-        self.gpa.free(self.framed_data_q);
         // A slot still holding a slab here means some teardown path missed it.
         // Return them rather than leaking into the shared pool, where the loss
         // would starve every other connection instead of just this one.
         for (self.pending_slots.slice()) |*slot| self.returnSlab(slot);
+    }
+
+    pub fn deinit(self: *FairScheduler) void {
+        self.releaseHeld();
+        self.gpa.free(self.terminal_q);
+        self.gpa.free(self.ordinary_q);
+        self.gpa.free(self.framed_data_q);
         self.gpa.free(self.pending_slots.storage);
         self.gpa.free(self.idx_keys);
         self.gpa.free(self.idx_vals);

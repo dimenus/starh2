@@ -29,7 +29,7 @@ fn prefaceSettings(wire: *std.ArrayList(u8)) !void {
 test "regression: idle DATA is connection PROTOCOL_ERROR" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -54,7 +54,7 @@ test "regression: path query limit+1 yields early 414" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -120,7 +120,7 @@ test "regression: body limit+1 yields early 413 not dispatch" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -186,7 +186,7 @@ test "regression: route body cap 413s H2 DATA without retaining overflow" {
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
     const cap: usize = 16 * 1024;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     const Hooks = struct {
         fn admit(_: *anyopaque) bool {
@@ -278,7 +278,7 @@ test "regression: half-closed-remote HEADERS is STREAM_CLOSED" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -332,7 +332,7 @@ test "regression: 414 immediate without remote END_STREAM" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -399,7 +399,7 @@ test "regression: 413 immediate on DATA byte before END_STREAM" {
     const hpack = starh2.core.hpack;
     var limits = starh2.Limits.defaults;
     limits.request_body_bytes = 64;
-    var session = try session_mod.Session.init(std.testing.allocator, limits);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, limits);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -451,7 +451,7 @@ test "regression: early-reject stream ending in trailers still gets one response
     const hpack = starh2.core.hpack;
     var limits = starh2.Limits.defaults;
     limits.request_body_bytes = 8;
-    var session = try session_mod.Session.init(std.testing.allocator, limits);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, limits);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -512,7 +512,7 @@ test "regression: >256 sequential streams reuse concurrency on same session" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     freeIntents(session.drainIntents());
 
@@ -596,7 +596,7 @@ test "raised request_body_bytes: 413 on content-length and on cap+1" {
 
     // Trigger A: content-length proves overflow before any DATA.
     {
-        var session = try session_mod.Session.init(std.testing.allocator, limits);
+        var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, limits);
         defer session.deinit();
         freeIntents(session.drainIntents());
         var cl_buf: [32]u8 = undefined;
@@ -641,7 +641,7 @@ test "raised request_body_bytes: 413 on content-length and on cap+1" {
 
     // Trigger B: no content-length; byte cap+1 on DATA emits 413 immediately.
     {
-        var session = try session_mod.Session.init(std.testing.allocator, limits);
+        var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, limits);
         defer session.deinit();
         freeIntents(session.drainIntents());
         const fields = [_]hpack.HeaderField{

@@ -19,7 +19,7 @@ fn testOne(_: void, smith: *std.testing.Smith) !void {
     @disableInstrumentation();
     var buf: [4096]u8 = undefined;
     const n = smith.slice(&buf);
-    var session = try starh2.core.session.Session.init(std.testing.allocator, .defaults);
+    var session = try starh2.core.session.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer {
         freeIntents(&session, session.drainIntents());
         session.deinit();
@@ -58,7 +58,7 @@ test "fuzz session" {
 }
 
 test "mutation canary illegal stream" {
-    var session = try starh2.core.session.Session.init(std.testing.allocator, .defaults);
+    var session = try starh2.core.session.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer {
         freeIntents(&session, session.drainIntents());
         session.deinit();
@@ -74,7 +74,7 @@ test "mutation canary illegal stream" {
 }
 
 test "mutation canary requires SETTINGS as first peer frame" {
-    var session = try starh2.core.session.Session.init(std.testing.allocator, .defaults);
+    var session = try starh2.core.session.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer {
         freeIntents(&session, session.drainIntents());
         session.deinit();
@@ -90,7 +90,7 @@ test "mutation canary requires SETTINGS as first peer frame" {
 }
 
 test "mutation canary requires CONTINUATION without interleaving" {
-    var session = try starh2.core.session.Session.init(std.testing.allocator, .defaults);
+    var session = try starh2.core.session.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer {
         freeIntents(&session, session.drainIntents());
         session.deinit();
@@ -108,7 +108,7 @@ test "mutation canary requires CONTINUATION without interleaving" {
 }
 
 test "mutation canary rejects connection flow-window overflow" {
-    var session = try starh2.core.session.Session.init(std.testing.allocator, .defaults);
+    var session = try starh2.core.session.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer {
         freeIntents(&session, session.drainIntents());
         session.deinit();

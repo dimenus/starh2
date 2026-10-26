@@ -1668,7 +1668,7 @@ test "regression: stream map drops closed streams (bounded history)" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     // free intents
     {
@@ -1751,7 +1751,7 @@ test "regression: stream map drops closed streams (bounded history)" {
 test "rates: SETTINGS flood trips ENHANCE_YOUR_CALM" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
-    var session = try session_mod.Session.init(std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();
@@ -1810,7 +1810,7 @@ test "rates: completed HEADERS do not trip ENHANCE_YOUR_CALM" {
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
     const gpa = std.testing.allocator;
-    var session = try session_mod.Session.init(gpa, .defaults);
+    var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     drainSessionIntents(gpa, &session);
     var rates: starh2.core.rates.RateLimiter = .{};
@@ -1856,7 +1856,7 @@ test "rates: RST flood trips ENHANCE_YOUR_CALM" {
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
     const gpa = std.testing.allocator;
-    var session = try session_mod.Session.init(gpa, .defaults);
+    var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     drainSessionIntents(gpa, &session);
     var rates: starh2.core.rates.RateLimiter = .{};

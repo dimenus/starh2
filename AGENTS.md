@@ -179,11 +179,15 @@ chunk into the send staging buffer. Do not wrap a record API beside this.
 - Packing stays in `emit_batch` (16 KiB concat). The pump encrypts one record
   per write chunk, only when the whole record fits the staging buffer;
   otherwise it parks on the CQ (t-2655). Do not split records to fill space.
-- Per-connection TLS Io buffers are bounded by `Limits.tls_stream_bytes`
-  (floor `TLS_CONN_BUFFER_BYTES` = `in_buf` + `out_buf`, one maximum TLS
-  record each). The ciphertext
-  chunk pool and work queue are separate declared terms
-  (`tls_cipher_chunks_per_connection`).
+- A connection boots from a slot (`src/edge/conn_slot.zig`): every table that
+  lives as long as the connection and never changes size, the TLS `Conn`
+  included, comes from the slot's `FixedBufferAllocator` through the `boot`
+  parameter of `Connection.init` and `Session.init`, and the slot rewinds it
+  when the connection ends. `Limits.slotBootBytes` is the buffer's size. A new
+  boot allocation needs a matching line, in the same order, in the component's
+  `planBoot`, or the exact-fit test in `edge/connection.zig` fails. Never grow
+  a table in the boot buffer, and never rely on its bytes being zero. What a
+  request allocates still comes from `config.gpa`.
 - Intent payloads, decoded headers, dispatch requests, scheduler leases, and
   tickets have explicit owners. Error paths must release exactly once.
 - `std.testing.FailingAllocator` is not thread-safe; fail-index/counting tests

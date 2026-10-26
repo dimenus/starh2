@@ -24,31 +24,23 @@ test "control capacity must leave ordinary space above terminal reserve" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
-test "tls stream buffers cover one connection's Io scratch" {
-    var lim = starh2.Limits.defaults;
-    lim.tls_stream_bytes = starh2.core.limits.TLS_CONN_BUFFER_BYTES - 1;
-    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
-}
-
 test "bound terms use concrete sizes and capacities" {
     const lim = starh2.Limits.defaults;
     const b = try lim.resourceUpperBound();
-    try std.testing.expect(b.terms.handlers > 0);
-    try std.testing.expect(b.terms.joins > 0);
-    try std.testing.expect(b.terms.tickets > 0);
-    try std.testing.expect(b.terms.write_acks > 0);
-    try std.testing.expect(b.terms.wire_descs > 0);
-    try std.testing.expect(b.terms.read_payload > 0);
-    try std.testing.expect(b.terms.stream_maps > 0);
-    try std.testing.expect(b.terms.pending_maps > 0);
+    try std.testing.expect(b.terms.slot_boot > 0);
     try std.testing.expect(b.terms.on_demand_conn > 0);
     try std.testing.expect(b.terms.on_demand_server > 0);
     try std.testing.expect(b.terms.reaper_jobs > 0);
-    try std.testing.expectEqual(@as(usize, 0), b.terms.conn_slots);
+    // Every slot object and the pool's two lists are in the bound, not only
+    // the boot buffer each slot owns.
+    try std.testing.expect(b.terms.conn_slots >= lim.max_connections * @sizeOf(starh2.edge.conn_slot.ConnSlot));
+    var fewer = lim;
+    fewer.max_connections = lim.max_connections / 2;
+    const bf = try fewer.resourceUpperBound();
+    try std.testing.expect(bf.terms.conn_slots < b.terms.conn_slots);
     try std.testing.expect(b.terms.routes > 0);
     try std.testing.expect(b.terms.certs > 0);
     try std.testing.expect(b.terms.tls_scratch > 0);
-    try std.testing.expect(b.terms.tls_cipher_payload > 0);
     try std.testing.expect(b.terms.endpoints_listeners > 0);
     try std.testing.expect(b.terms.tasks > 0);
     try std.testing.expect(b.terms.h1_head > 0);
@@ -57,7 +49,7 @@ test "bound terms use concrete sizes and capacities" {
     var no_chunks = lim;
     no_chunks.inbound_wire_chunks_per_connection = 1;
     const b2 = try no_chunks.resourceUpperBound();
-    try std.testing.expect(b.terms.read_payload > b2.terms.read_payload);
+    try std.testing.expect(b.terms.slot_boot > b2.terms.slot_boot);
     try std.testing.expect(b.allocator_bytes > b2.allocator_bytes);
 
     var tiny_streams = lim;
@@ -65,8 +57,7 @@ test "bound terms use concrete sizes and capacities" {
     tiny_streams.max_streams_per_server = 64;
     tiny_streams.cancellation_reaper_jobs = 64;
     const b3 = try tiny_streams.resourceUpperBound();
-    try std.testing.expect(b.terms.handlers > b3.terms.handlers);
-    try std.testing.expect(b.terms.stream_maps > b3.terms.stream_maps);
+    try std.testing.expect(b.terms.slot_boot > b3.terms.slot_boot);
 
     var no_tls = lim;
     no_tls.concurrent_tls_handshakes = 1;
@@ -74,10 +65,7 @@ test "bound terms use concrete sizes and capacities" {
     const b4 = try no_tls.resourceUpperBound();
     try std.testing.expect(b.terms.tls_scratch > b4.terms.tls_scratch);
 
-    try std.testing.expectEqual(@sizeOf(starh2.edge.connection.HandlerSlot), starh2.core.limits.HANDLER_SLOT_SIZE);
     try std.testing.expectEqual(@sizeOf(starh2.edge.connection.ReaperJob), starh2.core.limits.REAPER_JOB_SIZE);
-    try std.testing.expectEqual(@sizeOf(starh2.edge.wire_pump.WriteCompletion), starh2.core.bound_shapes.WRITE_COMPLETION_SIZE);
-    try std.testing.expectEqual(@sizeOf(starh2.edge.wire_pump.WireChunk), starh2.core.bound_shapes.WIRE_CHUNK_DESC_SIZE);
 }
 
 test "counting allocator: Server.init under published ceiling" {
@@ -336,12 +324,6 @@ test "counting allocator peak under live hello stays under ceiling" {
     const peak = counting.allocated_bytes;
     try std.testing.expect(peak <= ceiling.allocator_bytes);
     try std.testing.expect(peak > 0);
-}
-
-test "Intent and ControlEntry sizes feed resourceUpperBound" {
-    try std.testing.expect(starh2.core.bound_shapes.INTENT_SIZE >= 16);
-    try std.testing.expect(starh2.core.bound_shapes.CONTROL_ENTRY_SIZE >= 16);
-    try std.testing.expectEqual(@sizeOf(starh2.edge.fair_scheduler.ControlEntry), starh2.core.bound_shapes.CONTROL_ENTRY_SIZE);
 }
 
 // Raised body-cap cost card (t-480), plus the H1 reservation.

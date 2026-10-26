@@ -48,6 +48,7 @@ const stream_mod = @import("stream.zig");
 const flow = @import("flow.zig");
 const limits_mod = @import("limits.zig");
 const rates_mod = @import("rates.zig");
+const boot_plan = @import("boot_plan.zig");
 
 /// Work that the edge must perform. `Session` decides; the edge executes.
 /// An intent never contains a callback or a pointer back into edge state, so
@@ -148,6 +149,14 @@ pub var close_probe_fn: ?*const fn (ev: CloseProbeEvent) void = null;
 pub const Session = struct {
     /// Heap that outlives any one ingest or command.
     gpa: std.mem.Allocator,
+    /// Where `init` took the tables that exist for the connection's whole life
+    /// and never change size: the intent ring, the parser scratch, the stream
+    /// and pending maps, the tombstone ring, the header block. On the live edge
+    /// this is the connection slot's buffer, which is rewound when the slot is
+    /// reused, so nothing may grow a table through `gpa` or through this
+    /// allocator after `init` (`putBounded`, `appendHeaderBlock`, `addTombstone`
+    /// each prove why they cannot). In a test it is the same allocator as `gpa`.
+    boot: std.mem.Allocator,
     limits: limits_mod.Limits,
     parser: frame.Parser,
     decoder: hpack.Decoder,
@@ -249,6 +258,37 @@ pub const Session = struct {
         releaseFrame: ?*const fn (*anyopaque, []u8) void = null,
     };
 
+    /// Insert into one of the maps that `init` sized once, in the boot buffer.
+    ///
+    /// std grows a map when an insert of a NEW key finds `available == 0`, and
+    /// `available` is the map's load limit minus its live entries; a remove
+    /// gives its slot back at once, so tombstones never cause a grow. Growth is
+    /// therefore reachable only with more live entries than `init` made room
+    /// for, which is `max_streams_per_connection`. Every map here is keyed by
+    /// a stream that is in `streams`, and `streams` takes a new key only below
+    /// that limit (`finishHeaderBlock` checks `active_streams` first), and
+    /// `releaseConcurrency` removes the stream from all of them together. A
+    /// grow would reallocate through the boot allocator, which a connection
+    /// slot rewinds, so a violation is a panic and not an allocation.
+    fn putBounded(map: anytype, key: u31, value: anytype) void {
+        if (map.unmanaged.available == 0 and !map.contains(key)) {
+            @panic("session map insert past the capacity it was sized for");
+        }
+        map.putAssumeCapacity(key, value);
+    }
+
+    /// Append to the header block without growing it. `init` sized the block
+    /// to the larger of one frame and `compressed_header_bytes`: the first
+    /// fragment is at most one frame (the parser refuses a bigger one), and
+    /// `consumeContinuation` rejects any fragment that would take the block
+    /// past `compressed_header_bytes` before it calls this.
+    fn appendHeaderBlock(self: *Session, bytes: []const u8) void {
+        if (self.header_block.items.len + bytes.len > self.header_block.capacity) {
+            @panic("header block append past the capacity it was sized for");
+        }
+        self.header_block.appendSliceAssumeCapacity(bytes);
+    }
+
     fn routeBodyCap(self: *const Session, method: []const u8, path: []const u8) usize {
         const global = self.limits.request_body_bytes;
         if (self.stream_hooks) |h| {
@@ -327,36 +367,68 @@ pub const Session = struct {
         }
     }
 
-    pub fn init(gpa: std.mem.Allocator, limits: limits_mod.Limits) !Session {
-        const intent_cap = @max(limits.intent_entries_per_connection, 16);
-        const intent_storage = try gpa.alloc(Intent, intent_cap);
+    fn intentCapacityFor(limits: limits_mod.Limits) usize {
+        return @max(limits.intent_entries_per_connection, 16);
+    }
+
+    /// The largest the header block can get. The first HEADERS fragment is at
+    /// most one frame (the parser refuses a bigger frame), and
+    /// `consumeContinuation` refuses to take the block past
+    /// `compressed_header_bytes`. So the block never needs more than the
+    /// larger of the two, and `appendHeaderBlock` never has to grow it.
+    fn headerBlockCapacityFor(limits: limits_mod.Limits) usize {
+        return @max(@as(usize, frame.DEFAULT_MAX_FRAME_SIZE), limits.compressed_header_bytes);
+    }
+
+    /// The boot allocations of `init`, in its order. See `boot_plan`.
+    pub fn planBoot(plan: *boot_plan.Plan, limits: limits_mod.Limits) error{InvalidConfig}!void {
+        const max_streams = limits.max_streams_per_connection;
+        try plan.array(Intent, intentCapacityFor(limits));
+        try plan.array(u8, frame.DEFAULT_MAX_FRAME_SIZE); // parser scratch
+        try plan.hashMap(u31, stream_mod.Stream, max_streams);
+        try plan.array(u31, @max(max_streams, 1)); // credit_ids
+        try plan.array(Tombstone, limits.stream_tombstones);
+        try plan.hashMap(u31, std.ArrayList(u8), max_streams);
+        try plan.hashMap(u31, []hpack.HeaderField, max_streams);
+        try plan.hashMap(u31, []hpack.HeaderField, max_streams);
+        try plan.hashMap(u31, u64, max_streams);
+        try plan.array(u8, headerBlockCapacityFor(limits));
+    }
+
+    /// `boot` holds the fixed tables (see the field); `gpa` holds everything a
+    /// request or a response allocates, including the two preface frames
+    /// queued here. On the live edge `boot` is a slot's buffer and `gpa` the
+    /// server allocator.
+    pub fn init(boot: std.mem.Allocator, gpa: std.mem.Allocator, limits: limits_mod.Limits) !Session {
+        const intent_storage = try boot.alloc(Intent, intentCapacityFor(limits));
         var intent_storage_owned = true;
-        errdefer if (intent_storage_owned) gpa.free(intent_storage);
+        errdefer if (intent_storage_owned) boot.free(intent_storage);
         var s: Session = .{
             .gpa = gpa,
+            .boot = boot,
             .limits = limits,
-            .parser = try frame.Parser.initReserved(gpa, frame.DEFAULT_MAX_FRAME_SIZE),
+            .parser = try frame.Parser.initReserved(boot, frame.DEFAULT_MAX_FRAME_SIZE),
             .decoder = hpack.Decoder.init(gpa),
-            .streams = std.AutoHashMap(u31, stream_mod.Stream).init(gpa),
+            .streams = std.AutoHashMap(u31, stream_mod.Stream).init(boot),
             .tombstones = .empty,
             .intent_storage = intent_storage,
             .intent_len = 0,
             .terminal_reserve = 2,
-            .pending_bodies = std.AutoHashMap(u31, std.ArrayList(u8)).init(gpa),
-            .pending_headers = std.AutoHashMap(u31, []hpack.HeaderField).init(gpa),
-            .pending_trailers = std.AutoHashMap(u31, []hpack.HeaderField).init(gpa),
-            .body_idle_ns = std.AutoHashMap(u31, u64).init(gpa),
+            .pending_bodies = std.AutoHashMap(u31, std.ArrayList(u8)).init(boot),
+            .pending_headers = std.AutoHashMap(u31, []hpack.HeaderField).init(boot),
+            .pending_trailers = std.AutoHashMap(u31, []hpack.HeaderField).init(boot),
+            .body_idle_ns = std.AutoHashMap(u31, u64).init(boot),
         };
         intent_storage_owned = false;
         errdefer s.deinit();
         try s.streams.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
-        s.credit_ids = try gpa.alloc(u31, @max(limits.max_streams_per_connection, 1));
-        try s.tombstones.ensureTotalCapacity(gpa, limits.stream_tombstones);
+        s.credit_ids = try boot.alloc(u31, @max(limits.max_streams_per_connection, 1));
+        try s.tombstones.ensureTotalCapacityPrecise(boot, limits.stream_tombstones);
         try s.pending_bodies.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_headers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_trailers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.body_idle_ns.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
-        try s.header_block.ensureTotalCapacity(gpa, frame.DEFAULT_MAX_FRAME_SIZE);
+        try s.header_block.ensureTotalCapacityPrecise(boot, headerBlockCapacityFor(limits));
         // The preface is queued at construction, before the peer has said
         // anything. RFC 9113 requires the server's SETTINGS to be the first
         // frame it sends, and the only way to guarantee that is to make it the
@@ -367,7 +439,11 @@ pub const Session = struct {
         return s;
     }
 
-    pub fn deinit(self: *Session) void {
+    /// Give back everything this session took from `gpa`, and the admissions
+    /// it still holds, but none of the fixed tables from `boot`. A connection
+    /// slot calls this and then rewinds its buffer, so after this returns the
+    /// session must not be used again; `deinit` is this plus the boot frees.
+    pub fn releaseRuntime(self: *Session) void {
         // Connection teardown must release every still-admitted stream exactly once.
         var sit = self.streams.iterator();
         while (sit.next()) |e| {
@@ -377,13 +453,8 @@ pub const Session = struct {
                 if (self.stream_hooks) |h| h.onRelease(h.ctx);
             }
         }
-        self.parser.deinit();
         self.decoder.deinit();
         self.clearIntents();
-        if (self.intent_storage.len != 0) self.gpa.free(self.intent_storage);
-        if (self.credit_ids.len != 0) self.gpa.free(self.credit_ids);
-        self.tombstones.deinit(self.gpa);
-        self.header_block.deinit(self.gpa);
         var bit = self.pending_bodies.iterator();
         while (bit.next()) |e| {
             if (self.stream_hooks) |h| {
@@ -391,7 +462,6 @@ pub const Session = struct {
             }
             e.value_ptr.deinit(self.gpa);
         }
-        self.pending_bodies.deinit();
         var hit = self.pending_headers.iterator();
         while (hit.next()) |e| {
             if (self.headerListIsGpa()) {
@@ -399,7 +469,6 @@ pub const Session = struct {
                 self.gpa.free(e.value_ptr.*);
             }
         }
-        self.pending_headers.deinit();
         var tit = self.pending_trailers.iterator();
         while (tit.next()) |e| {
             if (self.headerListIsGpa()) {
@@ -407,6 +476,30 @@ pub const Session = struct {
                 self.gpa.free(e.value_ptr.*);
             }
         }
+        // Forget the entries just released, so a second pass could not free
+        // them again.
+        self.pending_bodies.clearRetainingCapacity();
+        self.pending_headers.clearRetainingCapacity();
+        self.pending_trailers.clearRetainingCapacity();
+        self.streams.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.releaseRuntime();
+        self.freeBoot();
+    }
+
+    /// Free the fixed tables one at a time, for a session that was not booted
+    /// into a slot. `releaseRuntime` has run, and must not run again: it frees
+    /// the HPACK decoder.
+    pub fn freeBoot(self: *Session) void {
+        self.parser.deinit();
+        if (self.intent_storage.len != 0) self.boot.free(self.intent_storage);
+        if (self.credit_ids.len != 0) self.boot.free(self.credit_ids);
+        self.tombstones.deinit(self.boot);
+        self.header_block.deinit(self.boot);
+        self.pending_bodies.deinit();
+        self.pending_headers.deinit();
         self.pending_trailers.deinit();
         self.body_idle_ns.deinit();
         self.streams.deinit();
@@ -713,6 +806,10 @@ pub const Session = struct {
         // every normal response while preserving the peer/local RST code.
         self.addTombstone(stream_id, tombstone_code) catch {};
         self.dropPendingRequest(stream_id);
+        // A stream that ends mid-body (RST, early reject) leaves its idle
+        // clock behind otherwise, and a peer that opens and resets streams
+        // would fill a map that is sized for the live ones (`putBounded`).
+        _ = self.body_idle_ns.remove(stream_id);
         _ = self.streams.remove(stream_id);
         self.stream_removes += 1;
     }
@@ -737,7 +834,9 @@ pub const Session = struct {
         const capacity = self.limits.stream_tombstones;
         if (capacity == 0) return;
         if (self.tombstones.items.len < capacity) {
-            try self.tombstones.append(self.gpa, .{ .id = id, .code = code });
+            // `init` sized the list to exactly `stream_tombstones`, so this
+            // append cannot allocate: a table in the boot buffer never grows.
+            self.tombstones.appendAssumeCapacity(.{ .id = id, .code = code });
             return;
         }
         self.tombstones.items[self.tombstone_next] = .{ .id = id, .code = code };
@@ -1118,7 +1217,7 @@ pub const Session = struct {
         // counted, and dropped — never retained and never dispatched.
         if (s.early_status == null and !s.refused_before_dispatch and s.headers_done) {
             var body = self.pending_bodies.getPtr(hdr.stream_id) orelse blk: {
-                try self.pending_bodies.put(hdr.stream_id, .empty);
+                putBounded(&self.pending_bodies, hdr.stream_id, std.ArrayList(u8).empty);
                 break :blk self.pending_bodies.getPtr(hdr.stream_id).?;
             };
             const cap = s.request_body_cap orelse self.limits.request_body_bytes;
@@ -1154,7 +1253,7 @@ pub const Session = struct {
         };
 
         if (!hdr.flags.end_stream) {
-            try self.body_idle_ns.put(hdr.stream_id, self.edge_now_ns);
+            putBounded(&self.body_idle_ns, hdr.stream_id, self.edge_now_ns);
         } else {
             _ = self.body_idle_ns.remove(hdr.stream_id);
         }
@@ -1283,7 +1382,7 @@ pub const Session = struct {
         self.continuation_count = 0;
         self.header_end_stream = hdr.flags.end_stream;
         if (!hdr.flags.end_headers) {
-            try self.header_block.appendSlice(self.gpa, fragment);
+            self.appendHeaderBlock(fragment);
             self.expect_continuation = hdr.stream_id;
             if (self.field_block_started_ns == 0) self.field_block_started_ns = self.edge_now_ns;
             return;
@@ -1300,7 +1399,7 @@ pub const Session = struct {
             try self.failConnection(.enhance_your_calm);
             return;
         }
-        try self.header_block.appendSlice(self.gpa, payload);
+        self.appendHeaderBlock(payload);
         if (!hdr.flags.end_headers) return;
         const sid = self.expect_continuation.?;
         self.expect_continuation = null;
@@ -1378,7 +1477,7 @@ pub const Session = struct {
             errdefer if (credit_held) {
                 if (self.stream_hooks) |h| h.onRelease(h.ctx);
             };
-            try self.streams.put(stream_id, .{ .id = stream_id, .window = .{ .send = self.peer_initial_window } });
+            putBounded(&self.streams, stream_id, stream_mod.Stream{ .id = stream_id, .window = .{ .send = self.peer_initial_window } });
             credit_held = false;
             self.active_streams += 1;
             s_ptr = self.streams.getPtr(stream_id);
@@ -1418,7 +1517,7 @@ pub const Session = struct {
                 try self.emitRst(stream_id, stream_mod.Stream.toErrorCode(err));
                 return;
             };
-            try self.pending_trailers.put(stream_id, decoded.fields);
+            putBounded(&self.pending_trailers, stream_id, decoded.fields);
             try self.maybeDispatch(stream_id);
             self.releaseConcurrency(stream_id, .no_error);
             return;
@@ -1469,7 +1568,7 @@ pub const Session = struct {
                 // fields through a hash map and validate them a second time.
                 try self.dispatchOwnedRequest(stream_id, parsed, decoded.fields, &.{}, &.{});
             } else {
-                try self.pending_headers.put(stream_id, decoded.fields);
+                putBounded(&self.pending_headers, stream_id, decoded.fields);
             }
             self.releaseConcurrency(stream_id, .no_error);
         }
@@ -1700,7 +1799,7 @@ pub const Session = struct {
 };
 
 test "tombstones overwrite oldest in place" {
-    var session = try Session.init(std.testing.allocator, .{ .stream_tombstones = 2 });
+    var session = try Session.init(std.testing.allocator, std.testing.allocator, .{ .stream_tombstones = 2 });
     defer session.deinit();
 
     try session.addTombstone(1, .cancel);
@@ -1716,7 +1815,7 @@ test "tombstones overwrite oldest in place" {
 }
 
 test "makeDataFrame still frames DATA after the stream map entry is gone" {
-    var session = try Session.init(std.testing.allocator, .defaults);
+    var session = try Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     const body = "Hello, World!";
     try session.streams.put(1, .{
@@ -1742,7 +1841,7 @@ test "makeDataFrame still frames DATA after the stream map entry is gone" {
 }
 
 test "respond_headers after RST is StreamClosed" {
-    var session = try Session.init(std.testing.allocator, .defaults);
+    var session = try Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();
@@ -1779,7 +1878,7 @@ test "stream churn keeps free slots in the stream map" {
     // std's HashMap fills its free slots with tombstones, and each new-id
     // lookup then probes the whole table before it misses.
     const gpa = std.testing.allocator;
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     const live = 64;
     var next: u31 = 1;
@@ -1806,7 +1905,7 @@ test "stream churn keeps free slots in the stream map" {
 }
 
 test "session preface and settings ack" {
-    var session = try Session.init(std.testing.allocator, .defaults);
+    var session = try Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     const intents = session.drainIntents();
     defer {
@@ -1824,7 +1923,7 @@ test "session preface and settings ack" {
 test "the preface advertises the configured stream limit" {
     var limits = limits_mod.Limits.defaults;
     limits.max_streams_per_connection = 37;
-    var session = try Session.init(std.testing.allocator, limits);
+    var session = try Session.init(std.testing.allocator, std.testing.allocator, limits);
     defer session.deinit();
     const intents = session.drainIntents();
     defer freeTestIntents(std.testing.allocator, intents);
@@ -1846,7 +1945,7 @@ test "the preface advertises the configured stream limit" {
 }
 
 test "bad preface" {
-    var session = try Session.init(std.testing.allocator, .defaults);
+    var session = try Session.init(std.testing.allocator, std.testing.allocator, .defaults);
     defer session.deinit();
     const intents = session.drainIntents();
     for (intents) |*it| {
@@ -1874,7 +1973,7 @@ test "bad preface" {
 test "SETTINGS_INITIAL_WINDOW_SIZE negative send window holds queued DATA (real ingest)" {
     const gpa = std.testing.allocator;
     const hpack_mod = @import("hpack.zig");
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();
@@ -2042,7 +2141,7 @@ test "intent capacity: flood fails closed without silent drop" {
     const gpa = std.testing.allocator;
     var limits = limits_mod.Limits.defaults;
     limits.intent_entries_per_connection = 8; // 6 usable + 2 terminal reserve
-    var session = try Session.init(gpa, limits);
+    var session = try Session.init(gpa, gpa, limits);
     defer session.deinit();
     {
         const boot = session.drainIntents();
@@ -2121,7 +2220,7 @@ test "respond HEADERS allocates only the final frame" {
     var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = counting.allocator();
     const hpack_mod = @import("hpack.zig");
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();
@@ -2229,7 +2328,7 @@ fn ingestPrefaceAndSettings(session: *Session, gpa: std.mem.Allocator) !void {
 
 test "single-frame END_HEADERS does not copy into header_block" {
     const gpa = std.testing.allocator;
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     try ingestPrefaceAndSettings(&session, gpa);
 
@@ -2281,7 +2380,7 @@ test "single-frame END_HEADERS does not copy into header_block" {
 
 test "HEADERS without END_HEADERS still assembles in header_block" {
     const gpa = std.testing.allocator;
-    var session = try Session.init(gpa, .defaults);
+    var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     try ingestPrefaceAndSettings(&session, gpa);
 
@@ -2307,4 +2406,60 @@ test "HEADERS without END_HEADERS still assembles in header_block" {
     try session.ingest(wire.items);
     try std.testing.expectEqual(block.len, session.header_block.items.len);
     try std.testing.expectEqual(@as(?u31, 1), session.expect_continuation);
+}
+
+test "streams reset mid-body leave no table entry, so the boot-sized tables never fill" {
+    // The tables live in a buffer sized to exactly what `planBoot` names, so a
+    // table that tried to grow could not: `putBounded` would panic first. A
+    // peer that opens a stream, sends body bytes without END_STREAM and resets
+    // it does this once per stream id, with no limit on the ids. Before
+    // `releaseConcurrency` removed the idle clock, `body_idle_ns` kept one
+    // entry per such stream and filled up after a handful.
+    const gpa = std.testing.allocator;
+    var limits: limits_mod.Limits = .defaults;
+    limits.max_streams_per_connection = 4;
+    var plan: boot_plan.Plan = .{};
+    try Session.planBoot(&plan, limits);
+    const buffer = try gpa.alignedAlloc(u8, .fromByteUnits(boot_plan.slot_align), plan.end);
+    defer gpa.free(buffer);
+    var fba: std.heap.FixedBufferAllocator = .init(buffer);
+    var session = try Session.init(fba.allocator(), gpa, limits);
+    defer session.releaseRuntime();
+    try std.testing.expectEqual(plan.end, fba.end_index);
+    try ingestPrefaceAndSettings(&session, gpa);
+
+    const hdr_fields = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/upload" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    const block = try hpack.Encoder.encode(gpa, &hdr_fields);
+    defer gpa.free(block);
+
+    // Many times the capacity of any of the tables.
+    var i: u31 = 0;
+    while (i < 100) : (i += 1) {
+        const sid: u31 = 1 + 2 * i;
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        (frame.FrameHeader{ .length = @intCast(block.len), .type = .headers, .flags = .{ .end_headers = true }, .stream_id = sid }).encode(&hdr_buf);
+        try wire.appendSlice(gpa, &hdr_buf);
+        try wire.appendSlice(gpa, block);
+        (frame.FrameHeader{ .length = 1, .type = .data, .flags = .{}, .stream_id = sid }).encode(&hdr_buf);
+        try wire.appendSlice(gpa, &hdr_buf);
+        try wire.append(gpa, 'x');
+        var rst: [13]u8 = undefined;
+        const rn = try frame.Serializer.rstStream(&rst, sid, .cancel);
+        try wire.appendSlice(gpa, rst[0..rn]);
+        session.edge_now_ns = 1_000_000 + i;
+        try session.ingest(wire.items);
+        freeTestIntents(gpa, session.drainIntents());
+
+        try std.testing.expectEqual(@as(u32, 0), session.streams.count());
+        try std.testing.expectEqual(@as(u32, 0), session.pending_bodies.count());
+        try std.testing.expectEqual(@as(u32, 0), session.pending_headers.count());
+        try std.testing.expectEqual(@as(u32, 0), session.body_idle_ns.count());
+    }
 }

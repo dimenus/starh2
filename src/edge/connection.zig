@@ -105,7 +105,8 @@ const zio = @import("zio");
 const session_mod = @import("../core/session.zig");
 const hpack = @import("../core/hpack.zig");
 const limits_mod = @import("../core/limits.zig");
-const bound_shapes = @import("../core/bound_shapes.zig");
+const boot_plan = @import("../core/boot_plan.zig");
+const conn_slot = @import("conn_slot.zig");
 const frame = @import("../core/frame.zig");
 const request = @import("../http/request.zig");
 const response = @import("../http/response.zig");
@@ -775,7 +776,7 @@ pub const trace = struct {
     }
 };
 
-pub const Mode = enum { h2c, tls, h1c };
+pub const Mode = limits_mod.ConnMode;
 
 pub const ConnConfig = struct {
     /// Set together when the accept loop placed this connection with
@@ -1196,28 +1197,6 @@ pub const ReaperJob = struct {
 };
 
 comptime {
-    if (@sizeOf(HandlerSlot) != limits_mod.HANDLER_SLOT_SIZE) {
-        @compileError("HANDLER_SLOT_SIZE must match @sizeOf(HandlerSlot)");
-    }
-    if (@sizeOf(RequestLease) != limits_mod.REQUEST_LEASE_SIZE) {
-        @compileError(std.fmt.comptimePrint(
-            "REQUEST_LEASE_SIZE must match @sizeOf(RequestLease) (got {d})",
-            .{@sizeOf(RequestLease)},
-        ));
-    }
-    if (@sizeOf(HandlerJob) != limits_mod.HANDLER_JOB_SIZE) {
-        @compileError(std.fmt.comptimePrint(
-            "HANDLER_JOB_SIZE must match @sizeOf(HandlerJob) (got {d})",
-            .{@sizeOf(HandlerJob)},
-        ));
-    }
-    const join_elem = std.meta.Elem(@FieldType(Connection, "handler_joins"));
-    if (@sizeOf(join_elem) != bound_shapes.JOIN_HANDLE_SIZE) {
-        @compileError(std.fmt.comptimePrint(
-            "JOIN_HANDLE_SIZE must match the handler_joins element (got {d})",
-            .{@sizeOf(join_elem)},
-        ));
-    }
     if (@sizeOf(ReaperJob) != limits_mod.REAPER_JOB_SIZE) {
         @compileError(std.fmt.comptimePrint(
             "REAPER_JOB_SIZE must match @sizeOf(ReaperJob) (got {d})",
@@ -1296,27 +1275,84 @@ pub const ReaperPool = struct {
     }
 };
 
-/// Entry point for one accepted socket. Owns the `Connection` for its whole
-/// life, so `defer conn.deinit()` is the single cleanup point.
+/// The byte layout of a slot's boot buffer for `mode`: the TLS `Conn` first,
+/// when there is one, then everything `Connection.init` takes. `mode` must be
+/// an HTTP/2 mode. `Limits.slotBootBytes` returns its end.
+pub fn planSlotBoot(plan: *boot_plan.Plan, limits: limits_mod.Limits, mode: Mode) error{InvalidConfig}!void {
+    std.debug.assert(mode != .h1c);
+    if (mode == .tls) try plan.array(tls_edge.Conn, 1);
+    try Connection.planBoot(plan, limits, mode);
+}
+
+/// What a test leaves behind on purpose after `quiesce`, so it can watch
+/// `recycle` refuse the slot. Each names one condition `dirtiness` checks.
+/// They are the conditions `quiesce` does NOT already stop on (see the table
+/// on `dirtiness`), plus one it does, to show the check itself works.
+pub const DirtyKind = enum {
+    write_chunk_rented,
+    request_bytes_reserved,
+    stream_still_admitted,
+    handler_join_held,
+    completion_queued,
+};
+
+/// Test-only: how many of the next connections to end in a slot are dirtied,
+/// and how. Counted in Debug and `-Dobserve=true`.
+pub var test_dirty_remaining: std.atomic.Value(usize) = .init(0);
+pub var test_dirty_kind: DirtyKind = .write_chunk_rented;
+
+fn testTakeDirtyTicket() bool {
+    var n = test_dirty_remaining.load(.acquire);
+    while (n > 0) {
+        n = test_dirty_remaining.cmpxchgWeak(n, n - 1, .acq_rel, .acquire) orelse return true;
+    }
+    return false;
+}
+
+/// Test-only, thread-local: true while this thread is inside the boot of a
+/// connection. The boot path never yields, so a counting allocator can read
+/// this to tell a general-allocator call made by boot from one made by a
+/// request. Counted in Debug and `-Dobserve=true`.
+pub threadlocal var test_in_boot: bool = false;
+
+/// Entry point for one accepted socket. Boots the `Connection` into `slot`
+/// and runs it. The slot owns the connection's memory; this function ends the
+/// connection (`quiesce`) and leaves the slot to its caller to `recycle`.
 ///
 /// The stream hook context is patched after construction because the hooks need
 /// a pointer to the `Connection`, which does not exist while `Session.init`
 /// runs. The read-chunk free list is seeded here rather than in `init` for the
 /// same reason: the queues are only live once the struct has its final address.
-pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cancelable!void {
-    var conn = Connection.init(stream, config) catch |err| {
+pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig, slot: *conn_slot.ConnSlot) std.Io.Cancelable!void {
+    if (comptime test_observe) test_in_boot = true;
+    const booted = Connection.init(slot.bootAllocator(), stream, config);
+    if (comptime test_observe) test_in_boot = false;
+    slot.conn = booted catch |err| {
         if (close_probe) diagRawPrint("t1002 init_fail {s}\n", .{@errorName(err)});
         if (config.handshake_held) {
             if (config.accounting) |a| a.releaseHandshake();
         }
-        if (config.tls_ready) |t| {
-            t.deinit();
-            config.gpa.destroy(t);
-        }
+        if (config.tls_ready) |t| t.deinit();
         stream.close(config.io);
         return;
     };
-    defer conn.deinit();
+    slot.state = .booted;
+    if (std.debug.runtime_safety) {
+        // Every connection, under whatever limits it runs with, checks that
+        // `planBoot` still names what `init` took. The exact-fit test covers
+        // a few limits; this covers every one a test or a server uses.
+        const planned = config.limits.slotBootBytes(config.mode) catch unreachable;
+        if (slot.fba.end_index != planned) {
+            std.debug.panic("slot boot used {d} bytes, planBoot says {d}: a boot allocation and its plan disagree", .{ slot.fba.end_index, planned });
+        }
+    }
+    const conn = &slot.conn;
+    defer {
+        conn.quiesce();
+        if (comptime test_observe) {
+            if (testTakeDirtyTicket()) conn.dirtyOnPurpose(test_dirty_kind);
+        }
+    }
     conn.finishBoot();
     test_boot_ready.store(true, .release);
     conn.run() catch |err| switch (err) {
@@ -1335,9 +1371,15 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig) std.Io.Cance
     };
 }
 
-const Connection = struct {
+pub const Connection = struct {
     stream: std.Io.net.Stream,
     config: ConnConfig,
+    /// Where `init` took the boot tables below (arrays, both slab pools, the
+    /// scheduler's tables, Session's fixed maps). On the live edge it is the
+    /// connection slot's buffer, which `ConnSlot.recycle` rewinds, so `quiesce`
+    /// frees none of it; `deinit` frees it for a connection built outside a
+    /// slot.
+    boot: std.mem.Allocator,
     session: session_mod.Session,
     read_ch_buf: []wire_pump.WireChunk,
     write_ch_buf: []wire_pump.WireChunk,
@@ -1553,12 +1595,59 @@ const Connection = struct {
         end_stream: bool,
     };
 
-    fn init(stream: std.Io.net.Stream, config: ConnConfig) !Connection {
+    /// The boot allocations of `init`, in its order, after the TLS `Conn` when
+    /// the mode has one. See `boot_plan`; the exact-fit test at the end of this
+    /// file is what keeps it equal to `init`.
+    fn planBoot(plan: *boot_plan.Plan, limits: limits_mod.Limits, mode: Mode) error{InvalidConfig}!void {
+        const max_streams = limits.max_streams_per_connection;
+        const n_chunks = limits.inbound_wire_chunks_per_connection;
+        // `init` narrows both counts to `u32`. The plan refuses a larger one
+        // where the count is used: `SlabPool.planBoot` for the chunks and
+        // `Plan.hashMap` for the streams.
+        const ticket_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
+        const read_ch_n = try boot_plan.add(n_chunks, 1);
+        const leases_n = try boot_plan.add(max_streams, 1);
+        const read_chunk_bytes = try boot_plan.mul(n_chunks, limits_mod.WIRE_CHUNK_SIZE);
+        try session_mod.Session.planBoot(plan, limits);
+        try plan.array(wire_pump.WireChunk, read_ch_n); // read_ch_buf
+        try plan.array(wire_pump.WireChunk, n_chunks); // write_ch_buf
+        try plan.array(HandlerSlot, max_streams);
+        try plan.array(HandlerJob, max_streams);
+        try plan.array(RequestLease, leases_n);
+        try plan.array(session_mod.DispatchRequest, max_streams); // parked
+        try plan.array(?zio.JoinHandle(void), max_streams);
+        try plan.array(u31, max_streams); // completion_ch_buf
+        try plan.array(wire_pump.WriteCompletion, ticket_n);
+        try plan.array(ticket_table.TicketWait, ticket_n);
+        try plan.array(u8, emit_batch.max_plaintext);
+        try plan.array(u8, read_chunk_bytes); // read_chunk_storage
+        try plan.array(u32, n_chunks); // read_free_buf
+        try slab_pool.SlabPool.planBoot(plan, limits_mod.WIRE_CHUNK_SIZE, n_chunks); // write_pool
+        if (mode == .tls) {
+            try plan.array(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
+            try plan.array(wire_pump.WireChunk, try boot_plan.add(n_chunks, tls_edge.Pump.extra_stash_slots));
+        }
+        try slab_pool.SlabPool.planBoot(plan, limits.frame_slab_bytes, limits.frame_slabs_per_connection); // frame_pool
+        try plan.array(u31, max_streams); // sid_scratch
+        try plan.array(u31, max_streams); // inline_sids
+        try plan.array(zio.Event, max_streams); // space_events
+        try plan.array(zio.Event, max_streams); // deadline_events
+        try plan.array(session_mod.Intent, @max(limits.intent_entries_per_connection, 16)); // intent_batch
+        try fair_scheduler.FairScheduler.planBoot(
+            plan,
+            @max(limits.control_entries_per_connection / 8, 16),
+            limits.control_entries_per_connection,
+            max_streams,
+        );
+    }
+
+    /// `boot` serves every allocation that lives as long as the connection and
+    /// never changes size; `config.gpa` serves the rest. See the `boot` field.
+    fn init(boot: std.mem.Allocator, stream: std.Io.net.Stream, config: ConnConfig) !Connection {
         // `Server.init` checks this at boot; a connection built any other way
         // gets the same answer, not a queue its drain can overrun.
         if (config.mode == .h2c) try config.limits.checkH2cWriteQueue();
-        const gpa = config.gpa;
-        var session = try session_mod.Session.init(gpa, config.limits);
+        var session = try session_mod.Session.init(boot, config.gpa, config.limits);
         errdefer {
             // Hooks are installed below with `ctx` still unset. Session.init
             // already queued the preface SETTINGS; deinit must gpa-free that
@@ -1633,61 +1722,61 @@ const Connection = struct {
         }
 
         // + 1: the EOF sentinel must fit even with every pool chunk queued.
-        const read_ch_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + 1);
-        errdefer gpa.free(read_ch_buf);
-        const write_ch_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
-        errdefer gpa.free(write_ch_buf);
-        const handlers = try gpa.alloc(HandlerSlot, config.limits.max_streams_per_connection);
-        errdefer gpa.free(handlers);
-        const handler_jobs = try gpa.alloc(HandlerJob, config.limits.max_streams_per_connection);
-        errdefer gpa.free(handler_jobs);
-        const request_leases = try gpa.alloc(RequestLease, config.limits.max_streams_per_connection + 1);
-        errdefer gpa.free(request_leases);
-        const parked = try gpa.alloc(session_mod.DispatchRequest, config.limits.max_streams_per_connection);
-        errdefer gpa.free(parked);
-        const handler_joins = try gpa.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
-        errdefer gpa.free(handler_joins);
-        const completion_ch_buf = try gpa.alloc(u31, config.limits.max_streams_per_connection);
-        errdefer gpa.free(completion_ch_buf);
-        const write_ack_buf = try gpa.alloc(wire_pump.WriteCompletion, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
-        errdefer gpa.free(write_ack_buf);
-        const ticket_slots = try gpa.alloc(ticket_table.TicketWait, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
-        errdefer gpa.free(ticket_slots);
-        const plaintext_scratch = try gpa.alloc(u8, emit_batch.max_plaintext);
-        errdefer gpa.free(plaintext_scratch);
+        const read_ch_buf = try boot.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + 1);
+        errdefer boot.free(read_ch_buf);
+        const write_ch_buf = try boot.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection);
+        errdefer boot.free(write_ch_buf);
+        const handlers = try boot.alloc(HandlerSlot, config.limits.max_streams_per_connection);
+        errdefer boot.free(handlers);
+        const handler_jobs = try boot.alloc(HandlerJob, config.limits.max_streams_per_connection);
+        errdefer boot.free(handler_jobs);
+        const request_leases = try boot.alloc(RequestLease, config.limits.max_streams_per_connection + 1);
+        errdefer boot.free(request_leases);
+        const parked = try boot.alloc(session_mod.DispatchRequest, config.limits.max_streams_per_connection);
+        errdefer boot.free(parked);
+        const handler_joins = try boot.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
+        errdefer boot.free(handler_joins);
+        const completion_ch_buf = try boot.alloc(u31, config.limits.max_streams_per_connection);
+        errdefer boot.free(completion_ch_buf);
+        const write_ack_buf = try boot.alloc(wire_pump.WriteCompletion, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
+        errdefer boot.free(write_ack_buf);
+        const ticket_slots = try boot.alloc(ticket_table.TicketWait, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
+        errdefer boot.free(ticket_slots);
+        const plaintext_scratch = try boot.alloc(u8, emit_batch.max_plaintext);
+        errdefer boot.free(plaintext_scratch);
         const n_chunks: u32 = @intCast(config.limits.inbound_wire_chunks_per_connection);
-        const read_chunk_storage = try gpa.alloc(u8, @as(usize, n_chunks) * limits_mod.WIRE_CHUNK_SIZE);
-        errdefer gpa.free(read_chunk_storage);
-        const read_free_buf = try gpa.alloc(u32, n_chunks);
-        errdefer gpa.free(read_free_buf);
-        var write_pool = try slab_pool.SlabPool.init(gpa, config.io, limits_mod.WIRE_CHUNK_SIZE, n_chunks);
-        errdefer write_pool.deinit(gpa);
+        const read_chunk_storage = try boot.alloc(u8, @as(usize, n_chunks) * limits_mod.WIRE_CHUNK_SIZE);
+        errdefer boot.free(read_chunk_storage);
+        const read_free_buf = try boot.alloc(u32, n_chunks);
+        errdefer boot.free(read_free_buf);
+        var write_pool = try slab_pool.SlabPool.init(boot, config.io, limits_mod.WIRE_CHUNK_SIZE, n_chunks);
+        errdefer write_pool.deinit(boot);
 
         var tls_read_buf: []u8 = &.{};
         var tls_write_buf: []wire_pump.WireChunk = &.{};
         if (config.mode == .tls) {
-            tls_read_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
-            errdefer gpa.free(tls_read_buf);
-            tls_write_buf = try gpa.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + tls_edge.Pump.extra_stash_slots);
-            errdefer gpa.free(tls_write_buf);
+            tls_read_buf = try boot.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
+            errdefer boot.free(tls_read_buf);
+            tls_write_buf = try boot.alloc(wire_pump.WireChunk, config.limits.inbound_wire_chunks_per_connection + tls_edge.Pump.extra_stash_slots);
+            errdefer boot.free(tls_write_buf);
         }
         var frame_pool = try slab_pool.SlabPool.init(
-            gpa,
+            boot,
             config.io,
             config.limits.frame_slab_bytes,
             config.limits.frame_slabs_per_connection,
         );
-        errdefer frame_pool.deinit(gpa);
-        const sid_scratch = try gpa.alloc(u31, config.limits.max_streams_per_connection);
-        errdefer gpa.free(sid_scratch);
-        const inline_sids = try gpa.alloc(u31, config.limits.max_streams_per_connection);
-        errdefer gpa.free(inline_sids);
-        const space_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
-        errdefer gpa.free(space_events);
-        const deadline_events = try gpa.alloc(zio.Event, config.limits.max_streams_per_connection);
-        errdefer gpa.free(deadline_events);
-        const intent_batch = try gpa.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
-        errdefer gpa.free(intent_batch);
+        errdefer frame_pool.deinit(boot);
+        const sid_scratch = try boot.alloc(u31, config.limits.max_streams_per_connection);
+        errdefer boot.free(sid_scratch);
+        const inline_sids = try boot.alloc(u31, config.limits.max_streams_per_connection);
+        errdefer boot.free(inline_sids);
+        const space_events = try boot.alloc(zio.Event, config.limits.max_streams_per_connection);
+        errdefer boot.free(space_events);
+        const deadline_events = try boot.alloc(zio.Event, config.limits.max_streams_per_connection);
+        errdefer boot.free(deadline_events);
+        const intent_batch = try boot.alloc(session_mod.Intent, @max(config.limits.intent_entries_per_connection, 16));
+        errdefer boot.free(intent_batch);
 
         if (config.mode == .tls) {
             if (config.tls_acceptor == null) return error.InvalidConfig;
@@ -1695,7 +1784,7 @@ const Connection = struct {
 
         const term_cap = @max(config.limits.control_entries_per_connection / 8, 16);
         var sched = try fair_scheduler.FairScheduler.init(
-            gpa,
+            boot,
             config.io,
             config.limits.control_bytes_per_connection,
             config.limits.control_entries_per_connection,
@@ -1709,6 +1798,7 @@ const Connection = struct {
         var self: Connection = .{
             .stream = stream,
             .config = config,
+            .boot = boot,
             .session = session,
             .read_ch_buf = read_ch_buf,
             .write_ch_buf = write_ch_buf,
@@ -1779,9 +1869,21 @@ const Connection = struct {
         }
     }
 
-    /// Release everything, in an order that cannot double-free.
+    /// Release everything, in an order that cannot double-free: `quiesce`,
+    /// then free the boot memory. For a connection built outside a slot; a slot
+    /// calls `quiesce` and rewinds its buffer instead.
+    fn deinit(self: *Connection) void {
+        self.quiesce();
+        self.freeBoot();
+    }
+
+    /// Everything `deinit` does except free the boot memory: end the
+    /// connection's use of the server (handshake slot, streams, slabs, reaper
+    /// tokens, socket) and prove the books balance. After it returns the
+    /// connection holds nothing outside its own boot memory, and the slot may
+    /// rewind that. Do not use the connection afterwards.
     ///
-    /// Every channel is drained BEFORE its backing buffer is freed. Queued
+    /// Every channel is drained BEFORE its backing buffer is released. Queued
     /// read chunks return their pool index; queued write chunks return a
     /// write-pool index or free a GPA fallback, then release wire bytes.
     /// Write-ack leftovers are NOT drained here: `drainWriteAcksForced` is
@@ -1794,9 +1896,9 @@ const Connection = struct {
     /// The closing asserts are the leak detector: the two outbound parts must
     /// sum to the whole, and both must be zero. A mismatch means some path
     /// released the wrong kind, which no test would otherwise notice.
-    fn deinit(self: *Connection) void {
+    fn quiesce(self: *Connection) void {
         const io = self.config.io;
-        // Must not free while handlers still live.
+        // Must not release while handlers still live.
         const live_n = self.live_handlers.load(.acquire);
         if (std.debug.runtime_safety and live_n != 0) {
             std.debug.panic("deinit with live_handlers={d}", .{live_n});
@@ -1806,7 +1908,7 @@ const Connection = struct {
             if (self.config.accounting) |a| a.releaseHandshake();
             self.handshake_held = false;
         }
-        // Drain channels before freeing their backing buffers.
+        // Drain channels before their backing buffers are released.
         while (io_queue.tryGet(wire_pump.WireChunk, &self.write_ch, io)) |chunk| {
             if (chunk.pool_index) |idx| {
                 self.write_pool.releaseIndex(io, idx);
@@ -1873,7 +1975,7 @@ const Connection = struct {
         }
         self.assertWriteAcksDrained();
 
-        self.session.deinit();
+        self.session.releaseRuntime();
         const RelCtx = struct {
             c: *Connection,
             fn cb(ctx: *anyopaque, _: u31, pw: *fair_scheduler.DataPending) void {
@@ -1896,43 +1998,26 @@ const Connection = struct {
             if (ps.len > leak_slot_max) leak_slot_max = ps.len;
             leak_slot_n += 1;
         }
-        self.sched.deinit();
-        self.frame_pool.deinit(self.config.gpa);
+        self.sched.releaseHeld();
+        self.frame_pool.assertAllReturned();
+        self.write_pool.assertAllReturned();
         if (self.tls) |tls_conn| {
+            // The slot (or whoever created it) owns the memory.
             tls_conn.deinit();
-            self.config.gpa.destroy(tls_conn);
             self.tls = null;
         }
 
-        self.config.gpa.free(self.read_ch_buf);
-        self.config.gpa.free(self.write_ch_buf);
-        self.config.gpa.free(self.handlers.storage);
-        self.config.gpa.free(self.handler_jobs);
         // The sweep released every parked request; a request still here would
         // be a teardown path that skipped it.
         std.debug.assert(self.parked_len == 0);
-        self.config.gpa.free(self.parked);
         // Session is gone, so a lease left here is a request it never handed
         // to dispatch nor dropped (a teardown with HEADERS still pending).
         for (self.request_leases.slice()) |*l| {
-            if (l.stream_id != 0) l.arena.deinit();
+            if (l.stream_id != 0) {
+                l.arena.deinit();
+                l.stream_id = 0;
+            }
         }
-        self.config.gpa.free(self.request_leases.storage);
-        self.config.gpa.free(self.handler_joins);
-        self.config.gpa.free(self.completion_ch_buf);
-        if (self.write_ack_buf.len != 0) self.config.gpa.free(self.write_ack_buf);
-        if (self.ticket_slots.len != 0) self.config.gpa.free(self.ticket_slots);
-        if (self.plaintext_scratch.len != 0) self.config.gpa.free(self.plaintext_scratch);
-        if (self.read_chunk_storage.len != 0) self.config.gpa.free(self.read_chunk_storage);
-        if (self.read_free_buf.len != 0) self.config.gpa.free(self.read_free_buf);
-        self.write_pool.deinit(self.config.gpa);
-        if (self.tls_read_buf.len != 0) self.config.gpa.free(self.tls_read_buf);
-        if (self.tls_write_buf.len != 0) self.config.gpa.free(self.tls_write_buf);
-        if (self.sid_scratch.len != 0) self.config.gpa.free(self.sid_scratch);
-        if (self.inline_sids.len != 0) self.config.gpa.free(self.inline_sids);
-        if (self.space_events.len != 0) self.config.gpa.free(self.space_events);
-        if (self.deadline_events.len != 0) self.config.gpa.free(self.deadline_events);
-        if (self.intent_batch.len != 0) self.config.gpa.free(self.intent_batch);
         const held = self.outbound_held.load(.acquire);
         const pending_held = self.pending_outbound_held.load(.acquire);
         const wire_held = self.wire_outbound_held.load(.acquire);
@@ -1966,6 +2051,110 @@ const Connection = struct {
             self.stream.close(io);
             self.socket_closed.store(true, .release);
         }
+    }
+
+    /// Leave one condition `dirtiness` checks set, for a test.
+    fn dirtyOnPurpose(self: *Connection, kind: DirtyKind) void {
+        switch (kind) {
+            .write_chunk_rented => _ = self.write_pool.tryRentIndex(self.config.io),
+            .request_bytes_reserved => _ = self.request_held.fetchAdd(1, .acq_rel),
+            .stream_still_admitted => self.session.active_streams += 1,
+            // Only the "is it null" of the join is read, never the handle.
+            .handler_join_held => self.handler_joins[0] = @as(zio.JoinHandle(void), undefined),
+            .completion_queued => self.completion_ch.trySend(1) catch unreachable,
+        }
+    }
+
+    /// Why this connection, after `quiesce`, still must not have its slot
+    /// reused; null when it left nothing behind.
+    ///
+    /// Judged by what a stranger could still touch, not by what the teardown
+    /// meant to do. Most conditions are a second net behind `quiesce`, which
+    /// stops on them first; four are not checked by `quiesce` at all, so only
+    /// this sees them. For each condition, whether `quiesce` can return with
+    /// it set (in a safe build, the only build this runs in):
+    ///
+    /// - Unreachable, `quiesce` panics or asserts first: live handlers, live
+    ///   task handlers, a handler slot in use, outbound bytes reserved (all
+    ///   three counters), a rented write-pool chunk, a rented frame-pool slab,
+    ///   a parked request, undrained write acks.
+    /// - Unreachable, `quiesce` clears or empties it: a held handshake slot
+    ///   (released), an open socket (closed last), the read, write and TLS
+    ///   write channels (drained first), a queued scheduler frame and a held
+    ///   data slab (`releaseHeld`), a request lease (cleared).
+    /// - Reachable only through a bookkeeping bug, because `quiesce` does not
+    ///   check it: request bytes still reserved (`request_held`), streams
+    ///   still admitted (`session.active_streams`), a handler join still held
+    ///   (`handler_joins`), and the completion channel (a reaper can post to
+    ///   it from another thread after the drain). No known path sets any of
+    ///   them. These are what this check is for, and each has a test that
+    ///   leaves it set (`DirtyKind`).
+    pub fn dirtiness(self: *Connection) ?[]const u8 {
+        if (self.live_handlers.load(.acquire) != 0) return "handler still live";
+        if (self.live_task_handlers.load(.acquire) != 0) return "task handler still live";
+        for (self.handlers.slice()) |h| {
+            if (h.in_use) return "handler slot still in use";
+        }
+        for (self.handlers.slice(), 0..) |_, i| {
+            if (self.handler_joins[i] != null) return "handler join still held";
+        }
+        if (self.write_pool.rentedCount() != 0) return "write pool chunk still rented";
+        if (self.frame_pool.rentedCount() != 0) return "frame pool slab still rented";
+        if (self.sched.terminal_len != 0 or self.sched.ordinary_len != 0 or self.sched.framed_len != 0) {
+            return "scheduler still holds a queued frame";
+        }
+        for (self.sched.pending_slots.slice()) |ps| {
+            if (ps.slab.len != 0) return "scheduler still holds a data slab";
+        }
+        if (self.parked_len != 0) return "parked request";
+        for (self.request_leases.slice()) |l| {
+            if (l.stream_id != 0) return "request lease still held";
+        }
+        if (self.outbound_held.load(.acquire) != 0 or
+            self.pending_outbound_held.load(.acquire) != 0 or
+            self.wire_outbound_held.load(.acquire) != 0) return "outbound bytes still reserved";
+        if (self.request_held.load(.acquire) != 0) return "request bytes still reserved";
+        if (self.session.active_streams != 0) return "streams still admitted";
+        if (self.handshake_held) return "handshake slot still held";
+        if (!self.socket_closed.load(.acquire)) return "socket still open";
+        if (io_queue.chanLen(wire_pump.WireChunk, &self.read_ch) != 0) return "read channel not empty";
+        if (io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) != 0) return "write channel not empty";
+        if (self.tls_write_buf.len != 0 and io_queue.chanLen(wire_pump.WireChunk, &self.tls_write_ch) != 0) {
+            return "tls write channel not empty";
+        }
+        if (io_queue.chanLen(u31, &self.completion_ch) != 0) return "completion channel not empty";
+        if (io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch) != 0) return "write ack channel not empty";
+        return null;
+    }
+
+    /// Free the boot memory one allocation at a time, for a connection that
+    /// was not booted into a slot. `quiesce` has run.
+    fn freeBoot(self: *Connection) void {
+        const boot = self.boot;
+        self.sched.deinit();
+        self.frame_pool.deinit(boot);
+        self.session.freeBoot();
+        boot.free(self.read_ch_buf);
+        boot.free(self.write_ch_buf);
+        boot.free(self.handlers.storage);
+        boot.free(self.handler_jobs);
+        boot.free(self.parked);
+        boot.free(self.request_leases.storage);
+        boot.free(self.handler_joins);
+        boot.free(self.completion_ch_buf);
+        if (self.write_ack_buf.len != 0) boot.free(self.write_ack_buf);
+        if (self.ticket_slots.len != 0) boot.free(self.ticket_slots);
+        if (self.plaintext_scratch.len != 0) boot.free(self.plaintext_scratch);
+        if (self.read_chunk_storage.len != 0) boot.free(self.read_chunk_storage);
+        if (self.read_free_buf.len != 0) boot.free(self.read_free_buf);
+        self.write_pool.deinit(boot);
+        if (self.tls_read_buf.len != 0) boot.free(self.tls_read_buf);
+        if (self.tls_write_buf.len != 0) boot.free(self.tls_write_buf);
+        if (self.sid_scratch.len != 0) boot.free(self.sid_scratch);
+        if (self.inline_sids.len != 0) boot.free(self.inline_sids);
+        if (self.space_events.len != 0) boot.free(self.space_events);
+        if (self.deadline_events.len != 0) boot.free(self.deadline_events);
+        if (self.intent_batch.len != 0) boot.free(self.intent_batch);
     }
 
     fn tryReserveRequestBytes(self: *Connection, n: usize) bool {
@@ -6863,7 +7052,7 @@ pub const BenchHop = struct {
     /// Initialize into `self`. `finishBoot` takes pointers to this Connection,
     /// so this must not return a by-value hop — a move would dangle the hooks.
     pub fn open(self: *BenchHop, stream: std.Io.net.Stream, config: ConnConfig) !void {
-        self.conn = Connection.init(stream, config) catch |err| {
+        self.conn = Connection.init(config.gpa, stream, config) catch |err| {
             stream.close(config.io);
             return err;
         };
@@ -7604,4 +7793,103 @@ pub fn testTrapErrorPathFreeze(io: std.Io) void {
     trap.hop.conn.teardownExhaustive();
     std.debug.assert(trap.hop.conn.countInUseSlots() == 0);
     std.debug.print("error-path freeze ok\n", .{});
+}
+
+/// A connected socket pair on loopback, for a test that boots a connection
+/// without serving it.
+const SocketPair = struct {
+    accepted: std.Io.net.Stream,
+    peer: std.Io.net.Stream,
+
+    fn open(io: std.Io) !SocketPair {
+        const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = try bind.listen(io, .{ .reuse_address = true });
+        defer listener.socket.close(io);
+        const peer = try listener.socket.address.connect(io, .{ .mode = .stream });
+        errdefer peer.close(io);
+        const accepted = try listener.accept(io);
+        return .{ .accepted = accepted, .peer = peer };
+    }
+};
+
+/// Boot one connection into a buffer of exactly `bytes` and end it. Returns
+/// how much of the buffer the boot used, or the boot's error.
+fn bootIntoBuffer(io: std.Io, lim: limits_mod.Limits, mode: Mode, bytes: usize) !usize {
+    const gpa = std.testing.allocator;
+    const buffer = try gpa.alignedAlloc(u8, .fromByteUnits(boot_plan.slot_align), bytes);
+    defer gpa.free(buffer);
+    var fba: std.heap.FixedBufferAllocator = .init(buffer);
+    const boot = fba.allocator();
+
+    var slabs = try slab_pool.SlabPool.init(gpa, io, lim.outbound_bytes_per_stream, 8);
+    defer slabs.deinit(gpa);
+    // `Connection.init` only checks that a TLS connection has an acceptor.
+    var acceptor: tls_edge.Acceptor = undefined;
+    const pair = try SocketPair.open(io);
+    defer pair.peer.close(io);
+    errdefer pair.accepted.close(io);
+
+    // A TLS slot holds the handshake `Conn` first, as `ConnSlot.createTlsConn` does.
+    if (mode == .tls) _ = try boot.create(tls_edge.Conn);
+    var conn = try Connection.init(boot, pair.accepted, .{
+        .io = io,
+        .mode = mode,
+        .limits = lim,
+        .router = .{ .routes = &.{} },
+        .tls_acceptor = if (mode == .tls) &acceptor else null,
+        .gpa = gpa,
+        .slab_pool = &slabs,
+    });
+    const used = fba.end_index;
+    conn.finishBoot();
+    conn.quiesce();
+    return used;
+}
+
+fn fitLimits(which: enum { defaults, small, large, header_block_below_frame }) limits_mod.Limits {
+    var lim = limits_mod.Limits.defaults;
+    switch (which) {
+        .defaults => {},
+        .small => {
+            lim.max_streams_per_connection = 4;
+            lim.inbound_wire_chunks_per_connection = limits_mod.H2C_MIN_WRITE_QUEUE_CHUNKS;
+            lim.frame_slab_bytes = 64;
+            lim.frame_slabs_per_connection = 4;
+            lim.control_bytes_per_connection = 8 * 1024;
+            lim.control_entries_per_connection = 32;
+            lim.intent_entries_per_connection = 20;
+            lim.stream_tombstones = 3;
+        },
+        // Sizes that are not powers of two, so the hash maps round up and the
+        // alignment padding between tables differs from the defaults.
+        .large => {
+            lim.max_streams_per_connection = 1000;
+            lim.inbound_wire_chunks_per_connection = 24;
+            lim.frame_slab_bytes = 700;
+            lim.frame_slabs_per_connection = 333;
+            lim.control_entries_per_connection = 1999;
+            lim.intent_entries_per_connection = 3001;
+            lim.stream_tombstones = 5001;
+            lim.compressed_header_bytes = 100_001;
+        },
+        // `compressed_header_bytes` under one frame: the block is still sized
+        // for a full first fragment.
+        .header_block_below_frame => lim.compressed_header_bytes = 1000,
+    }
+    return lim;
+}
+
+test "slot boot buffer: slotBootBytes is an exact fit for every mode and limits" {
+    const io = std.testing.io;
+    inline for (.{ .defaults, .small, .large, .header_block_below_frame }) |which| {
+        const lim = fitLimits(which);
+        inline for (.{ Mode.h2c, Mode.tls }) |mode| {
+            const need = try lim.slotBootBytes(mode);
+            std.debug.print("slot fit {s} {s}: {d} bytes\n", .{ @tagName(which), @tagName(mode), need });
+            // Exactly the planned size boots, and the boot uses all of it.
+            try std.testing.expectEqual(need, try bootIntoBuffer(io, lim, mode, need));
+            // One byte less cannot hold the last allocation.
+            try std.testing.expectError(error.OutOfMemory, bootIntoBuffer(io, lim, mode, need - 1));
+        }
+    }
 }
