@@ -72,6 +72,47 @@ pub const WriteCompletion = struct {
     complete_batch_receipt: bool = false,
 };
 
+/// Completions the actor owes the h2c ack channel room for: chunks pushed to
+/// `WritePump` that will post one (`postsCompletion`), minus completions the
+/// actor has received (`countsChunk`). The pump's own terminal posts
+/// (`fail_all`, `shutdown`) are not counted; they are `terminal_posts` at most.
+/// `high_water` is the largest `owed` seen, for `--close-reason`.
+pub const AckLedger = struct {
+    owed: std.atomic.Value(usize) = .init(0),
+    high_water: std.atomic.Value(usize) = .init(0),
+
+    pub fn add(self: *AckLedger) void {
+        const now = self.owed.fetchAdd(1, .acq_rel) + 1;
+        var hw = self.high_water.load(.monotonic);
+        while (now > hw) hw = self.high_water.cmpxchgWeak(hw, now, .monotonic, .monotonic) orelse break;
+    }
+
+    /// seq_cst, not acq_rel: this subtract is one half of the store-buffer
+    /// handshake in `Connection.waitForAckRoom`, and only seq_cst on all four
+    /// of its operations rules out both sides reading the other's old value.
+    pub fn sub(self: *AckLedger) void {
+        const prev = self.owed.fetchSub(1, .seq_cst);
+        std.debug.assert(prev != 0);
+    }
+};
+
+/// Completions `WritePump.run` posts that belong to no chunk: `failDrain`'s
+/// `fail_all` and the final `shutdown`, once each per pump life.
+pub const terminal_posts: usize = 2;
+
+/// Whether the pump posts a completion when it finishes `chunk`. The same
+/// test as `WritePump.releaseChunk`, so the ledger counts what the channel
+/// receives.
+pub fn postsCompletion(chunk: WireChunk) bool {
+    return chunk.ticket_count != 0 or chunk.ticket != 0 or chunk.outbound_release != 0 or chunk.control_entries != 0;
+}
+
+/// Whether a received completion is a chunk's (counted in `AckLedger`)
+/// rather than a terminal post, which carries no ticket and no accounting.
+pub fn countsChunk(c: WriteCompletion) bool {
+    return c.ticket_count != 0 or c.ticket != 0 or c.outbound_release != 0 or c.control_entries != 0;
+}
+
 pub const WireChunk = struct {
     bytes: []u8 = &.{},
     len: usize = 0,
@@ -242,9 +283,14 @@ pub const WritePump = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     from_actor: *std.Io.Queue(WireChunk),
-    /// A zio channel: the actor selects on it, so a post IS the wake. The
-    /// capacity is the proven outstanding-ack bound; `post` never parks.
+    /// A zio channel: the actor selects on it, so a post IS the wake. `post`
+    /// never parks, so its room is kept by the producers: on h2c a drain
+    /// holds a pop back until the channel can take every completion that pop
+    /// can add (`Connection.h2cPause`, counted in `AckLedger`).
     completions: *zio.Channel(WriteCompletion),
+    /// The connection's count of completions owed, printed if `post` ever
+    /// finds the channel full. Tests that drive a pump alone leave it null.
+    ledger: ?*const AckLedger = null,
     gpa: std.mem.Allocator,
     /// When set, `WireChunk.pool_index` is returned here instead of `gpa.free`.
     /// Tests that feed GPA-owned chunks leave this null.
@@ -257,9 +303,12 @@ pub const WritePump = struct {
     fn post(self: *WritePump, c: WriteCompletion) void {
         _ = diag_acks.posted_release.fetchAdd(c.outbound_release, .monotonic);
         self.completions.trySend(c) catch |err| switch (err) {
-            // A dropped completion is a hung handler; a full channel means the
-            // capacity proof is wrong. Fail loudly, never silently.
-            error.WouldBlock => @panic("write ack channel over proven capacity"),
+            // A dropped completion is a hung handler; a full channel means a
+            // chunk was pushed past the pause rule. Fail loudly, never silently.
+            error.WouldBlock => if (self.ledger) |l|
+                std.debug.panic("write ack channel over proven capacity: capacity={d} owed={d} high_water={d}", .{ self.completions.impl.capacity, l.owed.load(.acquire), l.high_water.load(.acquire) })
+            else
+                @panic("write ack channel over proven capacity"),
             error.Closed => {
                 // Ack channel closure means connection teardown will release queued ownership.
             },
@@ -275,9 +324,7 @@ pub const WritePump = struct {
         } else if (chunk.bytes.len != 0) {
             self.gpa.free(chunk.bytes);
         }
-        const has_ticket = chunk.ticket_count != 0 or chunk.ticket != 0;
-        const has_acct = chunk.outbound_release != 0 or chunk.control_entries != 0;
-        if (has_ticket or has_acct or fail_all) {
+        if (postsCompletion(chunk) or fail_all) {
             var written_ns: u64 = 0;
             if (ok and chunk.ticket != 0) {
                 written_ns = nowNs(self.io);

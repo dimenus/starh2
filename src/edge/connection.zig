@@ -242,6 +242,24 @@ fn probeHandlerPlacement() zio.Placement {
 pub var test_force_spawn_fail: bool = false;
 /// Test-only: when true, actor skips draining completion_ch (sticky until cleared).
 pub var test_hold_completion_drain: std.atomic.Value(bool) = .init(false);
+/// Test-only: when true, the actor takes no write completion off
+/// `write_ack_ch` (sticky until cleared), so a test can make the one receiver
+/// slower than the drains that feed the pump. A real actor is that slow when
+/// one drain turn pushes many chunks. After clearing it, wake the actor the
+/// way a peer would (any inbound frame). Observe builds only.
+pub var test_hold_ack_receive: std.atomic.Value(bool) = .init(false);
+var hold_dummy_ack_buf: [1]wire_pump.WriteCompletion = undefined;
+var hold_dummy_ack_ch: zio.Channel(wire_pump.WriteCompletion) = .init(&hold_dummy_ack_buf);
+/// Test-only (observe builds): h2c drains held back because `write_ack_ch`
+/// had no room for another pop.
+pub var test_ack_room_pauses: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): handler flush barriers that parked for
+/// `write_ack_ch` room (`waitForAckRoom`).
+pub var test_ack_room_waits: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): pushes `pushWriteChunk` refused because the
+/// channel had no room, each one a connection failed closed. Zero in a
+/// correct build.
+pub var test_ack_bound_refusals: std.atomic.Value(usize) = .init(0);
 /// Test-only: while true, `drainEmit` emits nothing, so frames a handler
 /// queued stay in the scheduler (a reset can then arrive before them).
 /// Compiled out unless `test_observe`.
@@ -316,7 +334,7 @@ pub var test_run_canceled: std.atomic.Value(usize) = .init(0);
 /// moving this one.
 pub var test_inline_drain_canceled: std.atomic.Value(usize) = .init(0);
 /// Counts the pops an ending h2c connection held back because the write queue
-/// had no room (see `h2cEndingPause`). A test that expects the hold-back
+/// had no room (see `h2cPause`). A test that expects the hold-back
 /// proves it ran; removing the hooks leaves the other tests green.
 pub var test_closing_emit_deferred: std.atomic.Value(usize) = .init(0);
 /// Test-only: true while FairScheduler sink is executing queueWire.
@@ -361,6 +379,26 @@ pub var test_polling_canary_tick_ns: std.atomic.Value(u64) = .init(0);
 /// Bench `--diag`: print one line when the actor parks with scheduler or TLS
 /// work still sitting in userspace. Off unless the benchmark server sets it.
 pub var diag_park: bool = false;
+
+/// Bench `--close-reason`: one `CLOSE_REASON` line for each connection the
+/// server ends, printed at the FIRST site that ends it, with the error that
+/// site saw and the outbound budget at that moment. Session protocol errors
+/// print as `site=session_goaway` with the GOAWAY code. A connection whose
+/// handlers were refused outbound budget also prints one `STREAM_BUDGET`
+/// line at teardown, ended or not. A peer close usually prints as
+/// `by=write_failed` (`ack_fail_all`): the next socket write fails, and a
+/// real write error looks the same from here. Off by default; unlike
+/// `--diag` it prints nothing per stream, so it can stay on under a rate run.
+///
+///   CLOSE_REASON conn=<id> mode=<h2c|tls> by=<server|write_failed> site=<site> err=<error|-> goaway=<code|->
+///     held=<b> pending=<b> wire=<b> lim=<b> stream_budget_refusals=<n>
+///     wire_refused=<n|-> [at_refusal held=<b> pending=<b> wire=<b> deferred_pending=<b>]
+///
+/// `wire_refused` is the size of a sink handoff that `sendAccountedWire`
+/// could not reserve wire bytes for, and `at_refusal` the budget then:
+/// `deferred_pending` is the pending bytes of the frame being handed off,
+/// which stay charged until the sink accepts it.
+pub var close_reason: bool = false;
 
 /// t-1002 probe: trace the connection-close path of every connection under a
 /// full h2spec run. Off unless the conformance server sets it (from
@@ -1616,6 +1654,19 @@ pub const Connection = struct {
     completion_ch: zio.Channel(u31) = undefined,
     write_ack_buf: []wire_pump.WriteCompletion = &.{},
     write_ack_ch: zio.Channel(wire_pump.WriteCompletion) = undefined,
+    /// h2c only: completions owed room in `write_ack_ch` (see `AckLedger`).
+    /// Producers add under `session_mu`; the actor subtracts on receive.
+    acks: wire_pump.AckLedger = .{},
+    /// Set when the h2c WritePump starts: from then on `h2cPause` holds a
+    /// pop back when `write_ack_ch` has no room for it. A harness without a
+    /// pump (`BenchHop`) leaves it false.
+    ack_room_armed: bool = false,
+    /// Handlers parked in `waitForAckRoom`. The actor wakes them when it
+    /// takes a completion; see that function for the ordering.
+    ack_room_waiters: std.atomic.Value(u32) = .init(0),
+    /// Set the first time a drain finds the h2c connection ending; then
+    /// `h2cPause` also keeps the drain from parking on a full write queue.
+    h2c_ending: bool = false,
     ticket_slots: []ticket_table.TicketWait = &.{},
     tickets: ticket_table.TicketTable = undefined,
     /// Indexed parallel to handlers; only valid while slot.in_use.
@@ -1636,6 +1687,14 @@ pub const Connection = struct {
     /// Set when a write completion reports failure; actor owns handler terminal transition.
     writer_failed: std.atomic.Value(bool) = .init(false),
     writer_fail_handled: bool = false,
+    /// `--close-reason`: set by the first `noteServerClose`, so only the
+    /// first site that ends the connection prints.
+    close_reason_noted: bool = false,
+    /// Handler writes refused for lack of connection outbound budget
+    /// (`enqueuePending`). Each refusal fails one stream. Under `session_mu`.
+    stream_budget_refusals: u32 = 0,
+    /// The first sink handoff refused wire bytes, kept for `--close-reason`.
+    wire_refusal: ?WireRefusal = null,
     /// Capacity waiters: one `zio.Event` per HandlerSlot (sparse IDs safe).
     space_events: []zio.Event = &.{},
     /// Time waiters. Occupancy and time are different waits; do not overload
@@ -2435,12 +2494,47 @@ pub const Connection = struct {
         return true;
     }
 
+    const WireRefusal = struct { n: usize, held: usize, pending: usize, wire: usize, deferred_pending: usize };
+
+    /// Every site that ends the connection from this side calls this just
+    /// before it sets `writer_failed`; see `close_reason`.
+    fn noteServerClose(self: *Connection, comptime site: []const u8, err: ?anyerror) void {
+        if (diag_park) diagRawPrint("WFSET " ++ site ++ " conn={x}\n", .{@intFromPtr(self) & 0xffff});
+        self.printCloseReason(site, if (err) |e| @errorName(e) else "-", "-");
+    }
+
+    fn printCloseReason(self: *Connection, comptime site: []const u8, err: []const u8, goaway: []const u8) void {
+        if (!close_reason or self.close_reason_noted) return;
+        self.close_reason_noted = true;
+        var refusal_buf: [160]u8 = undefined;
+        const refusal: []const u8 = if (self.wire_refusal) |r|
+            std.fmt.bufPrint(&refusal_buf, "{d} at_refusal held={d} pending={d} wire={d} deferred_pending={d}", .{ r.n, r.held, r.pending, r.wire, r.deferred_pending }) catch "?"
+        else
+            "-";
+        // A failed socket write is how this side first sees most peer
+        // closes: h2load hangs up after its last response, and the next
+        // write fails. So it is not counted as the server ending it.
+        const by = comptime if (std.mem.eql(u8, site, "ack_fail_all")) "write_failed" else "server";
+        diagRawPrint("CLOSE_REASON conn={x} mode={s} by=" ++ by ++ " site=" ++ site ++ " err={s} goaway={s} held={d} pending={d} wire={d} lim={d} stream_budget_refusals={d} wire_refused={s}\n", .{
+            @intFromPtr(self) & 0xffffff,
+            @tagName(self.config.mode),
+            err,
+            goaway,
+            self.outbound_held.load(.acquire),
+            self.pending_outbound_held.load(.acquire),
+            self.wire_outbound_held.load(.acquire),
+            self.config.limits.outbound_bytes_per_connection,
+            self.stream_budget_refusals,
+            refusal,
+        });
+    }
+
     fn applyWriteAck(self: *Connection, ack: wire_pump.WriteCompletion) bool {
         _ = wire_pump.diag_acks.applied_release.fetchAdd(ack.outbound_release, .monotonic);
         self.applyOutboundRelease(ack.outbound_release, .wire);
         if (ack.control_entries != 0) self.applyControlRelease(ack.control_release, ack.control_entries);
         if (ack.fail_all) {
-            if (diag_park) diagRawPrint("WFSET ack_fail_all conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+            self.noteServerClose("ack_fail_all", null);
             self.writer_failed.store(true, .release);
             self.tickets.failAll();
             // Ticket events are set before this flag; drainPendingCompleteReceipts
@@ -2455,7 +2549,7 @@ pub const Connection = struct {
                 // A malformed chain would strand at least one synchronous
                 // write forever. Fail every waiter instead of converting
                 // internal metadata corruption into a silent hang.
-                if (diag_park) diagRawPrint("WFSET ack_fail_all2 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                self.noteServerClose("ack_fail_all2", null);
                 self.writer_failed.store(true, .release);
                 self.tickets.failAll();
                 self.complete_receipts_fail_all.store(true, .release);
@@ -2491,6 +2585,12 @@ pub const Connection = struct {
     }
 
     fn takeWriteAck(self: *Connection, ack: wire_pump.WriteCompletion) void {
+        // TLS applies its acks here too (`ack_apply`), but they never pass
+        // through `write_ack_ch`, so only h2c counts them.
+        if (self.config.mode == .h2c and wire_pump.countsChunk(ack)) {
+            self.acks.sub();
+            self.wakeAckRoomWaiters();
+        }
         if (shouldHoldCompleteAck(ack) and self.held_ack_n < complete_receipt_capacity) {
             self.stashCompleteAck(ack);
             return;
@@ -2528,9 +2628,24 @@ pub const Connection = struct {
     /// consumed on the same turn.
     fn drainWriteAcks(self: *Connection) void {
         self.flushHeldWriteAcks();
+        if (ackReceiveHeld()) return;
         while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
             self.takeWriteAck(ack);
         }
+    }
+
+    /// The channel the actor selects on for write completions. Under
+    /// `test_hold_ack_receive` it is a channel nothing posts to, so the
+    /// completions stay in `write_ack_ch`, the way the completion hold leaves
+    /// handler completions buffered.
+    fn ackReceiveCh(self: *Connection) *zio.Channel(wire_pump.WriteCompletion) {
+        if (ackReceiveHeld()) return &hold_dummy_ack_ch;
+        return &self.write_ack_ch;
+    }
+
+    fn ackReceiveHeld() bool {
+        if (comptime !test_observe) return false;
+        return test_hold_ack_receive.load(.acquire);
     }
 
     /// Occupancy Forced has not yet applied. `deinit` panics when this is
@@ -2561,6 +2676,10 @@ pub const Connection = struct {
         self.held_ack_n = 0;
         test_complete_receipt_ack_held.store(false, .release);
         while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
+            if (wire_pump.countsChunk(ack)) {
+                self.acks.sub();
+                self.wakeAckRoomWaiters();
+            }
             _ = self.applyWriteAck(ack);
         }
     }
@@ -2760,7 +2879,7 @@ pub const Connection = struct {
                 continue;
             }
             const winner = try zio.select(.{
-                .acks = self.write_ack_ch.asyncReceive(),
+                .acks = self.ackReceiveCh().asyncReceive(),
                 .bell = self.doorbell.asyncReceive(),
             });
             switch (winner) {
@@ -3414,7 +3533,7 @@ pub const Connection = struct {
         }
         const winner = try zio.select(.{
             .reads = self.read_ch.asyncReceive(),
-            .acks = self.write_ack_ch.asyncReceive(),
+            .acks = self.ackReceiveCh().asyncReceive(),
             .comps = comps_ch.asyncReceive(),
             .bell = self.doorbell.asyncReceive(),
             .ack_hold = ack_hold_ev,
@@ -3501,9 +3620,9 @@ pub const Connection = struct {
     ///   TLS pump from stalling on a full inbound buffer; dropping means a peer
     ///   that keeps talking cannot restart the work the sweep just stopped.
     /// - Writes are driven the normal way: `driveTlsTurn` on TLS, the WritePump
-    ///   on h2c. On h2c, once the connection is ending, `drainEmit` installs
-    ///   scheduler pause hooks (`h2cEndingPause`) that stop each pop that lacks
-    ///   room in the write queue: a push would park the actor in `putOne`, and
+    ///   on h2c. On h2c, once the connection is ending, the scheduler pause
+    ///   hook (`h2cPause`) also stops each pop that lacks room in the write
+    ///   queue: a push would park the actor in `putOne`, and
     ///   the deadline could not fire. The frames wait in the scheduler, and a
     ///   write completion wakes the actor to try again.
     /// - `closeFlushed` ends the phase when `outboundFlushed` (every chunk acked,
@@ -3663,6 +3782,7 @@ pub const Connection = struct {
                 .stream = self.stream,
                 .from_actor = &self.write_ch,
                 .completions = &self.write_ack_ch,
+                .ledger = &self.acks,
                 .gpa = gpa,
                 .free_indices = &self.write_pool,
                 .test_delay_ms = test_write_delay_ms,
@@ -3671,6 +3791,10 @@ pub const Connection = struct {
             read_handle = try zio.spawnInto(connPlacement(), runReadPump, .{ self, &read_pump });
             write_handle = try zio.spawnInto(connPlacement(), runWritePump, .{ self, &write_pump });
             h2c_started = true;
+            self.ack_room_armed = true;
+            self.sched.pause = h2cPauseData;
+            self.sched.pause_control = h2cPause;
+            self.sched.pause_ctx = self;
         }
 
         // The server preface (SETTINGS, queued by `Session.init`) leaves the
@@ -3777,7 +3901,7 @@ pub const Connection = struct {
                     // be retried and cannot be un-debited, so the connection's
                     // window state no longer matches the peer's. The only
                     // correct move left is to close.
-                    if (diag_park) diagRawPrint("WFSET loop_drain_catch conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                    self.noteServerClose("loop_drain_catch", err);
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                 };
@@ -3929,6 +4053,12 @@ pub const Connection = struct {
         }
         zio.beginShield();
         defer zio.endShield();
+        if (close_reason and self.config.mode == .h2c) {
+            diagRawPrint("ACK_LEDGER conn={x} high_water={d} capacity={d} owed={d}\n", .{ @intFromPtr(self) & 0xffffff, self.acks.high_water.load(.acquire), self.write_ack_buf.len, self.acks.owed.load(.acquire) });
+        }
+        if (close_reason and self.stream_budget_refusals != 0) {
+            diagRawPrint("STREAM_BUDGET conn={x} mode={s} stream_budget_refusals={d} lim={d} server_ended={}\n", .{ @intFromPtr(self) & 0xffffff, @tagName(self.config.mode), self.stream_budget_refusals, self.config.limits.outbound_bytes_per_connection, self.close_reason_noted });
+        }
         if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), self.sched.pendingCount(), close_probe_parked.load(.acquire) });
         self.finishTerminalInline(self.teardown_inline_n);
         self.teardown_inline_n = 0;
@@ -4355,12 +4485,56 @@ pub const Connection = struct {
     /// scheduler asks before EVERY pop, so a drain with many entries cannot
     /// push past the room it checked, which a single check before `drain`
     /// could not promise.
-    fn h2cEndingPause(ctx: *anyopaque) bool {
+    /// The h2c drain's pause hooks. A pop is held back, and stays in the
+    /// scheduler for the next drain, when:
+    /// - `write_ack_ch` has no room for what the pop and the drain's tail can
+    ///   add (`h2cAckRoom`). DATA stops one pop's room earlier than controls
+    ///   (`h2cPauseData`), so a RST_STREAM or GOAWAY can still leave while
+    ///   DATA waits: controls pack many to a chunk, and a terminal control
+    ///   that cannot be queued fails the connection. The WritePump posts a
+    ///   completion for every chunk with `trySend`, and a full channel is a
+    ///   panic in the pump.
+    ///   Nothing else bounds the completions in flight: the pump frees a
+    ///   chunk's queue slot and its pool chunk BEFORE it posts, and a chunk
+    ///   holds only its own wire bytes (at least 9) until the actor applies
+    ///   the completion. The completion that frees room wakes the actor
+    ///   (`waitForActivity` selects on the channel), and every actor turn
+    ///   drains again, so a held pop is never stranded.
+    /// - the connection is ending and the write queue has no room
+    ///   (`h2cEndingHasRoom`), so the drain cannot park in `putOne`.
+    fn h2cPause(ctx: *anyopaque) bool {
         const self: *Connection = @ptrCast(@alignCast(ctx));
-        if (self.h2cEndingHasRoom()) return false;
+        return self.h2cPauseFor(0);
+    }
+
+    fn h2cPauseData(ctx: *anyopaque) bool {
+        const self: *Connection = @ptrCast(@alignCast(ctx));
+        return self.h2cPauseFor(ack_room_per_pop);
+    }
+
+    fn h2cPauseFor(self: *Connection, reserve: usize) bool {
+        if (self.ack_room_armed and !self.h2cAckRoom(reserve)) {
+            if (comptime test_observe) _ = test_ack_room_pauses.fetchAdd(1, .monotonic);
+            return true;
+        }
+        if (!self.h2c_ending or self.h2cEndingHasRoom()) return false;
         if (comptime test_observe) _ = test_closing_emit_deferred.fetchAdd(1, .monotonic);
         return true;
     }
+
+    /// True when `write_ack_ch` can take the completions of every push one
+    /// pop and the drain's tail can make, beside the pump's own terminal
+    /// posts. Every push is counted in `acks` before it is made, under
+    /// `session_mu`, which every drain holds; the actor subtracts without it,
+    /// so a concurrent change only makes this answer more cautious.
+    fn h2cAckRoom(self: *Connection, reserve: usize) bool {
+        const owed = self.acks.owed.load(.acquire);
+        return owed + ack_room_per_pop + reserve <= self.write_ack_buf.len;
+    }
+
+    /// Completions one pop may still add while `h2cAckRoom` holds: the pop's
+    /// pushes, the drain's tail push, and the pump's terminal posts.
+    const ack_room_per_pop = tls_edge.Pump.pushes_per_pop + tls_edge.Pump.tail_pushes_per_drain + wire_pump.terminal_posts;
 
     /// True when the h2c write queue can take what one pop pushes
     /// (`Pump.pushes_per_pop` plus `Pump.tail_pushes_per_drain`, the bound TLS
@@ -4697,6 +4871,82 @@ pub const Connection = struct {
         try self.processIntents();
     }
 
+    /// Block a handler until `write_ack_ch` has room for one more push, the
+    /// gate a drain's pop gets from `h2cPause`. A handler's bare flush
+    /// barrier (`sendFlushTicket` with nothing pending) is the one push made
+    /// outside a drain, so it waits here first. It parks the handler, not
+    /// the barrier: the handler then waits for the barrier's ticket anyway,
+    /// and a parked handler leaves nothing behind if its stream is reset.
+    ///
+    /// Caller holds `session_mu`; like `waitForStreamSpace`, this releases
+    /// and reacquires it around the wait, on the same per-slot space event.
+    ///
+    /// No lost wake. Four operations decide whether a parking handler is
+    /// woken, and all four are seq_cst:
+    ///   handler  W1: `ack_room_waiters.fetchAdd`, then R1: `acks.owed.load`
+    ///   actor    W2: `acks.owed.fetchSub` (`AckLedger.sub`), then
+    ///            R2: `ack_room_waiters.load` (`wakeAckRoomWaiters`)
+    /// seq_cst operations have one total order that keeps each side's
+    /// program order (W1 before R1, W2 before R2). If R1 misses W2 (the
+    /// handler reads the old `owed` and parks), then R1 comes before W2 in
+    /// that order, so W1 < R1 < W2 < R2, and R2 sees W1: the actor finds a
+    /// waiter and wakes it. If R2 misses W1, then W2 < R2 < W1 < R1, and R1
+    /// sees the subtract. So at least one side sees the other. With acquire
+    /// or acq_rel on any of the four this is the store-buffer pattern, and
+    /// both may read the old values. The first room check, before W1, is an
+    /// ordinary `acquire` read: it only decides whether to register.
+    ///
+    /// The event is reset BEFORE W1, so a wake that lands after the reset
+    /// leaves it set and the wait returns at once. A re-read that still finds
+    /// no room parks with completions still owed; each later completion runs
+    /// R2 again. If none comes, the writer failed or the connection is ending:
+    /// a failed write (`applyWriteAck`), `handleWriterFailed` and teardown
+    /// (`publishTeardownWakes`, which also sets `dead`) all call
+    /// `wakeAllSpace`.
+    fn waitForAckRoom(self: *Connection, hctx: *HandlerCtx, stream_id: u31) response.ResponseError!void {
+        if (!self.ack_room_armed) return;
+        const terminal = hctx.terminal;
+        while (true) {
+            if (terminal.getCause()) |c| return response.causeToError(c);
+            if (self.writer_failed.load(.acquire)) return error.WriteFailed;
+            if (self.h2cAckRoom(0)) return;
+            // The actor is the only receiver; a handler running on it would
+            // wait for itself.
+            if (hctx.runs_inline) return error.WriteFailed;
+            if (comptime test_observe) _ = test_ack_room_waits.fetchAdd(1, .monotonic);
+            const event = if (self.spaceIndex(stream_id)) |i| &self.space_events[i] else null;
+            if (event) |e| e.reset();
+            _ = self.ack_room_waiters.fetchAdd(1, .seq_cst); // W1
+            defer _ = self.ack_room_waiters.fetchSub(1, .seq_cst);
+            if (self.acks.owed.load(.seq_cst) + ack_room_per_pop <= self.write_ack_buf.len) return; // R1
+            self.unlockSession(self.config.io);
+            const wait_res: anyerror!void = if (event) |e| blk: {
+                const winner = zio.select(.{
+                    .space = e,
+                    .dead = &self.dead,
+                }) catch break :blk error.Canceled;
+                break :blk switch (winner) {
+                    .space => {},
+                    .dead => error.Canceled,
+                };
+            } else error.Canceled;
+            self.lockSessionUncancelable(self.config.io);
+            if (terminal.getCause()) |c| return response.causeToError(c);
+            if (self.writer_failed.load(.acquire)) return error.WriteFailed;
+            wait_res catch return error.Canceled;
+        }
+    }
+
+    /// Actor, after taking a completion: wake handlers parked in
+    /// `waitForAckRoom` once there is room for them.
+    /// The caller has just subtracted from `acks.owed` (W2 in
+    /// `waitForAckRoom`'s proof); this load is R2.
+    fn wakeAckRoomWaiters(self: *Connection) void {
+        if (self.ack_room_waiters.load(.seq_cst) == 0) return;
+        if (!self.h2cAckRoom(0)) return;
+        self.wakeAllSpace();
+    }
+
     /// Block a handler until its stream's pending slab is below `cap`.
     ///
     /// `enqueuePending` passes `outbound_bytes_per_stream` (the memory bound).
@@ -4803,6 +5053,7 @@ pub const Connection = struct {
             if (room == 0) continue;
             const take = @min(bytes.len - off, room);
             if (!self.tryReserveOutboundBytes(take, .pending)) {
+                self.stream_budget_refusals +|= 1;
                 // t-1022 probe: name the site that turns a write into a
                 // per-stream abort, with the budget state at that moment.
                 if (diag_park) diagRawPrint("WFAIL budget sid={d} held={d} pend_held={d} wire_held={d} lim={d} sched_pending={d}\n", .{ stream_id, self.outbound_held.load(.acquire), self.pending_outbound_held.load(.acquire), self.wire_outbound_held.load(.acquire), self.config.limits.outbound_bytes_per_connection, self.sched.pendingCount() });
@@ -4858,17 +5109,20 @@ pub const Connection = struct {
         // would wait in `putOne` for room, holding `session_mu`, and a writer
         // that is not moving never makes room, so the closing deadline could
         // not fire. TLS bounds its drain with pause hooks that re-check room
-        // before every pop. h2c gets the same hooks, but only from the moment
-        // it is ending, so its normal drain is unchanged. The frames the hooks
-        // hold back stay in the scheduler, and the closing phase drains again
+        // before every pop. h2c's hook (`h2cPause`, installed when its pumps
+        // start) checks the write queue only from the moment it is ending, so
+        // its normal drain still parks on a full queue. The install here
+        // covers a connection whose pumps never started. The frames the hook
+        // holds back stay in the scheduler, and the closing phase drains again
         // when a write completes. Terminal Session counts as ending here
         // because the drain inside `ingestWireChunk` runs before the closing
         // phase has begun.
-        if (self.config.mode == .h2c and self.sched.pause_control == null and
+        if (self.config.mode == .h2c and !self.h2c_ending and
             (self.closing_deadline_ns != null or self.session.terminal == .goaway))
         {
-            self.sched.pause = h2cEndingPause;
-            self.sched.pause_control = h2cEndingPause;
+            self.h2c_ending = true;
+            self.sched.pause = h2cPauseData;
+            self.sched.pause_control = h2cPause;
             self.sched.pause_ctx = self;
         }
         if (diag_park) {
@@ -5031,14 +5285,14 @@ pub const Connection = struct {
                 self.pending_data_outbound_release = 0;
                 self.pending_data_wake_sid = 0;
             }
-            if (diag_park) diagRawPrint("WFSET data_sink_catch conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+            self.noteServerClose("data_sink_catch", err);
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
             return err;
         };
         if (!sink_ctx.emit.empty()) self.assertTailRoom("drain batch");
         sink_ctx.flushBatch() catch |err| {
-            if (diag_park) diagRawPrint("WFSET data_sink_catch2 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+            self.noteServerClose("data_sink_catch2", err);
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
             return err;
@@ -5239,7 +5493,7 @@ pub const Connection = struct {
                 self.pending_data_outbound_release = 0;
                 self.pending_data_wake_sid = 0;
             }
-            if (diag_park) diagRawPrint("WFSET emit_fail1 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+            self.noteServerClose("emit_fail1", err);
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
             return err;
@@ -5248,7 +5502,7 @@ pub const Connection = struct {
             if (!sink_ctx.emit.empty()) {
                 if (sink_ctx.emit.ticket_count != 0) {
                     self.tickets.linkCompletion(sink_ctx.emit.last_ticket_slot, sink_ctx.receipt_slot) catch {
-                        if (diag_park) diagRawPrint("WFSET emit_fail2 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                        self.noteServerClose("emit_fail2", null);
                         self.writer_failed.store(true, .release);
                         self.handleWriterFailed();
                         return error.WriteFailed;
@@ -5257,7 +5511,7 @@ pub const Connection = struct {
                 sink_ctx.emit.noteTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot);
                 self.assertTailRoom("receipt batch");
                 sink_ctx.flushBatch(true) catch |err| {
-                    if (diag_park) diagRawPrint("WFSET emit_fail3 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                    self.noteServerClose("emit_fail3", err);
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                     return err;
@@ -5266,7 +5520,7 @@ pub const Connection = struct {
             } else if (sink_ctx.queued_any) {
                 self.assertTailRoom("bare receipt");
                 self.sendFlushTicket(sink_ctx.receipt_ticket, sink_ctx.receipt_slot, true) catch |err| {
-                    if (diag_park) diagRawPrint("WFSET emit_fail4 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                    self.noteServerClose("emit_fail4", err);
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                     return err;
@@ -5277,7 +5531,7 @@ pub const Connection = struct {
         } else {
             if (!sink_ctx.emit.empty()) self.assertTailRoom("receipt drain batch");
             sink_ctx.flushBatch(false) catch |err| {
-                if (diag_park) diagRawPrint("WFSET emit_fail5 conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                self.noteServerClose("emit_fail5", err);
                 self.writer_failed.store(true, .release);
                 self.handleWriterFailed();
                 return err;
@@ -5394,8 +5648,10 @@ pub const Connection = struct {
                                 if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
                                 self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
                                 consumed = n;
-                                if (diag_park) diagRawPrint("WFSET ctrl_terminal_full conn={x}\n", .{ @intFromPtr(self) & 0xffff });
-                                if (class == .terminal) self.writer_failed.store(true, .release);
+                                if (class == .terminal) {
+                                    self.noteServerClose("ctrl_terminal_full", err);
+                                    self.writer_failed.store(true, .release);
+                                }
                                 return error.OutOfMemory;
                             },
                         };
@@ -5404,7 +5660,11 @@ pub const Connection = struct {
                 .dispatch_request => |d| try self.dispatch(d),
                 .early_reject => {},
                 .stream_reset => |r| self.applyStreamResetIntent(r),
-                .connection_error => {
+                .connection_error => |ce| {
+                    if (close_reason) {
+                        var code_buf: [12]u8 = undefined;
+                        self.printCloseReason("session_goaway", "-", std.fmt.bufPrint(&code_buf, "{d}", .{@intFromEnum(ce.code)}) catch "?");
+                    }
                     if (close_probe) diagRawPrint("t1002 conn={x} intent_connection_error parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
                     for (self.handlers.slice()) |*slot| {
                         if (!slot.in_use) continue;
@@ -5435,6 +5695,14 @@ pub const Connection = struct {
         self.assertSessionHeld("processIntentsWithReceipt");
         try self.materializeIntents();
         try self.drainEmitReceipt(ticket, slot, attached);
+    }
+
+    /// A handler's flush with nothing pending: one bare barrier, pushed only
+    /// once the ack channel has room for it (`waitForAckRoom`). Every other
+    /// push is a drain's, gated by `h2cPause`. Caller holds `session_mu`.
+    fn pushBareBarrier(self: *Connection, hctx: *HandlerCtx, stream_id: u31, ticket: u64, slot: u32) response.ResponseError!void {
+        try self.waitForAckRoom(hctx, stream_id);
+        self.sendFlushTicket(ticket, slot, false) catch return error.WriteFailed;
     }
 
     fn sendFlushTicket(self: *Connection, ticket: u64, slot: u32, complete_batch_receipt: bool) anyerror!void {
@@ -5501,6 +5769,22 @@ pub const Connection = struct {
                 return error.WriteFailed;
             };
             return;
+        }
+        // Counted before the push: the pump may post its completion, and the
+        // actor receive it, before the push returns.
+        const counted = wire_pump.postsCompletion(chunk);
+        if (counted) self.acks.add();
+        errdefer if (counted) self.acks.sub();
+        // `h2cPause` and `waitForAckRoom` keep this from firing. If a push
+        // ever passes the channel's room (one made outside both gates, or a
+        // pop that pushed more than `pushes_per_pop`), refuse it in every
+        // build: the pump would panic on a completion it cannot post, so the
+        // connection fails closed instead.
+        if (self.ack_room_armed and self.acks.owed.load(.acquire) + wire_pump.terminal_posts > self.write_ack_buf.len) {
+            if (comptime test_observe) _ = test_ack_bound_refusals.fetchAdd(1, .monotonic);
+            self.noteServerClose("ack_bound", null);
+            self.writer_failed.store(true, .release);
+            return error.WriteFailed;
         }
         if (self.writeGoingAway()) {
             if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
@@ -5636,6 +5920,13 @@ pub const Connection = struct {
         };
         if (owned) |o| std.debug.assert(o.bytes.ptr == src.ptr and src.len <= o.bytes.len);
         if (!self.tryReserveOutboundBytes(src.len, .wire)) {
+            if (self.wire_refusal == null) self.wire_refusal = .{
+                .n = src.len,
+                .held = self.outbound_held.load(.acquire),
+                .pending = self.pending_outbound_held.load(.acquire),
+                .wire = self.wire_outbound_held.load(.acquire),
+                .deferred_pending = self.pending_data_outbound_release,
+            };
             if (owned) |o| self.returnWriteChunk(o);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return error.OutOfMemory;
@@ -6353,7 +6644,7 @@ pub const Connection = struct {
                     // intents. Emitting it without a receipt would skip the
                     // lifecycle boundary, so fail this connection closed.
                     reservation_failed = true;
-                    if (diag_park) diagRawPrint("WFSET inline_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                    self.noteServerClose("inline_fail", null);
                     self.writer_failed.store(true, .release);
                     self.handleWriterFailed();
                 }
@@ -7124,10 +7415,10 @@ pub const Connection = struct {
                         pw.flush_slot = slot_i;
                         pw.flush_remain = pw.len;
                     } else {
-                        self.sendFlushTicket(ticket, slot_i, false) catch return error.WriteFailed;
+                        try self.pushBareBarrier(hctx, stream_id, ticket, slot_i);
                     }
                 } else {
-                    self.sendFlushTicket(ticket, slot_i, false) catch return error.WriteFailed;
+                    try self.pushBareBarrier(hctx, stream_id, ticket, slot_i);
                 }
             } else if (wire_bytes.len != 0 or end) {
                 self.enqueuePending(stream_id, wire_bytes, end, if (need_ticket) ticket else 0, if (need_ticket) slot_i else 0, hctx) catch |err| return err;
@@ -7234,10 +7525,10 @@ pub const Connection = struct {
                     pw.flush_slot = slot_i;
                     pw.flush_remain = pw.len;
                 } else {
-                    self.sendFlushTicket(ticket, slot_i, false) catch return error.WriteFailed;
+                    try self.pushBareBarrier(hctx, stream_id, ticket, slot_i);
                 }
             } else {
-                self.sendFlushTicket(ticket, slot_i, false) catch return error.WriteFailed;
+                try self.pushBareBarrier(hctx, stream_id, ticket, slot_i);
             }
             self.processIntents() catch {
                 self.failClosedOnIntentError();
@@ -7329,6 +7620,9 @@ pub const BenchHop = struct {
     /// already-signaled slot. Readiness is the ticket event, not a count.
     fn drainLocalWrites(self: *BenchHop) void {
         while (io_queue.tryGet(wire_pump.WireChunk, &self.conn.write_ch, self.conn.config.io)) |chunk| {
+            // Applied here, with no pump and no channel: the completion is
+            // received the moment the chunk is.
+            if (wire_pump.postsCompletion(chunk)) self.conn.acks.sub();
             self.completeLocalWrite(chunk);
         }
     }
@@ -7354,7 +7648,7 @@ pub const BenchHop = struct {
                 .complete_batch_receipt = chunk.complete_batch_receipt,
             };
             if (!self.conn.completeAckTickets(ack)) {
-                if (diag_park) diagRawPrint("WFSET local_writes_fail conn={x}\n", .{ @intFromPtr(self) & 0xffff });
+                self.conn.noteServerClose("local_writes_fail", null);
                 self.conn.writer_failed.store(true, .release);
                 self.conn.tickets.failAll();
                 self.conn.complete_receipts_fail_all.store(true, .release);

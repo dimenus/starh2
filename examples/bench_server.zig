@@ -757,6 +757,13 @@ const Args = struct {
     request_arena_bytes: ?usize = null,
     /// `Limits.request_pool_retain_bytes`. Must not pass the server cap.
     request_pool_retain_bytes: ?usize = null,
+    /// `Limits.outbound_bytes_per_connection`. Null keeps the default.
+    outbound_bytes_per_connection: ?usize = null,
+    /// `Limits.control_entries_per_connection`. The terminal control queue
+    /// (GOAWAY, RST_STREAM) is an eighth of it, at least 16.
+    control_entries_per_connection: ?usize = null,
+    /// `--close-reason`: see `connection.close_reason`.
+    close_reason: bool = false,
 };
 
 /// `--placement-log`: one line per placed connection, with the peer port (so
@@ -805,6 +812,12 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.batch_wake_sleepers = false;
         } else if (std.mem.eql(u8, a, "--diag")) {
             out.diag = true;
+        } else if (std.mem.eql(u8, a, "--close-reason")) {
+            out.close_reason = true;
+        } else if (std.mem.eql(u8, a, "--outbound-bytes-per-connection")) {
+            out.outbound_bytes_per_connection = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--control-entries-per-connection")) {
+            out.control_entries_per_connection = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--self-drive-oneshots")) {
             const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidSelfDriveCount;
@@ -1382,6 +1395,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const args = try parseArgs(gpa, process_args);
     g_sse_interval_ms = args.sse_interval_ms;
     starh2.edge.connection.diag_park = args.diag;
+    starh2.edge.connection.close_reason = args.close_reason;
     starh2.edge.tls_edge.diag_wait = args.diag;
     // t-1022: the close-path probe names the error a dying actor exits with
     // (`run_err <name>`); the silent serveAccepted catch was the last blind
@@ -1471,6 +1485,8 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     if (args.request_bytes_per_server) |v| limits.request_bytes_per_server = v;
     if (args.request_arena_bytes) |v| limits.request_arena_bytes = v;
     if (args.request_pool_retain_bytes) |v| limits.request_pool_retain_bytes = v;
+    if (args.outbound_bytes_per_connection) |v| limits.outbound_bytes_per_connection = v;
+    if (args.control_entries_per_connection) |v| limits.control_entries_per_connection = v;
 
     var server = try starh2.Server.init(server_gpa, rt.io(), .{
         .endpoints = &.{ep},

@@ -697,6 +697,22 @@ pub fn build(b: *std.Build) void {
     const goaway_delivery_step = b.step("test-goaway-delivery", "Run the GOAWAY delivery gates (connection error and graceful shutdown)");
     goaway_delivery_step.dependOn(&run_goaway_delivery_tests.step);
 
+    const ack_channel_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ack_channel.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_ack_channel_tests = b.addRunArtifact(ack_channel_tests);
+    const ack_channel_step = b.step("test-ack-channel", "Run the h2c write-ack channel bound gate (t-3561)");
+    ack_channel_step.dependOn(&run_ack_channel_tests.step);
+
     const slot_reuse_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/slot_reuse.zig"),
@@ -782,6 +798,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_handshake_tests.step);
     test_step.dependOn(&run_tls_preface_tests.step);
     test_step.dependOn(&run_goaway_delivery_tests.step);
+    test_step.dependOn(&run_ack_channel_tests.step);
     test_step.dependOn(&run_admission_tests.step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);
