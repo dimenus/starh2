@@ -18,8 +18,10 @@
 //! (`wire_pump.test_hold_writes` on h2c, `test_hold_stash` on TLS) and the
 //! handlers' DATA fills the write memory, every handler aborts (M server
 //! RSTs), and a graceful shutdown queues its GOAWAYs. Before t-3562 the 33rd
-//! abort overflowed the 32-entry ring. The holds park the TLS actor, which is
-//! fine here: these failures come from handlers, not from reads.
+//! abort overflowed the 32-entry ring. On h2c all M RSTs and the graceful
+//! GOAWAY wait in the ring together. The TLS hold parks the actor: the RSTs
+//! (from handlers) still wait, but the first ones reach the stash before it
+//! is full, and the GOAWAY (from the actor) is queued after the hold.
 //!
 //! The other scenarios need the actor to READ during the stall, so they use
 //! the stall a real peer makes: the client stops reading (with a small receive
@@ -576,6 +578,10 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     };
 
     const retired_0 = conn_mod.test_rst_retired.load(.monotonic);
+    const ended_blocked_0 = conn_mod.test_closing_ended_deadline_blocked.load(.monotonic);
+    const ended_flushed_0 = conn_mod.test_closing_ended_deadline_flushed.load(.monotonic);
+    const ended_failed_0 = conn_mod.test_closing_ended_writer_failed.load(.monotonic);
+    const ended_eof_0 = conn_mod.test_closing_ended_peer_eof.load(.monotonic);
     // Every response has its HEADERS out before the stall.
     try waitStarted(&c, m);
 
@@ -718,6 +724,23 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         try std.testing.expectEqual(t_frames, high_held);
         try std.testing.expectEqual(t_frames - 1, rst_paused);
         try std.testing.expectEqual(@as(usize, 0), full);
+        std.debug.print("T3562-unread-ended blocked={d} flushed={d} writer_failed={d} close_ms={d}\n", .{
+            conn_mod.test_closing_ended_deadline_blocked.load(.monotonic) - ended_blocked_0,
+            conn_mod.test_closing_ended_deadline_flushed.load(.monotonic) - ended_flushed_0,
+            conn_mod.test_closing_ended_writer_failed.load(.monotonic) - ended_failed_0,
+            (closed_ns - bound_ns) / std.time.ns_per_ms,
+        });
+        // It ended because the closing deadline passed, once, and not by a
+        // writer failure or a peer EOF. The output was not delivered either
+        // way: still in the server (`blocked`) or in its kernel send queue
+        // behind a client that never reads (`flushed`, which is what both
+        // systems show: the lingering close waits for an EOF that never
+        // comes).
+        const by_deadline = (conn_mod.test_closing_ended_deadline_blocked.load(.monotonic) - ended_blocked_0) +
+            (conn_mod.test_closing_ended_deadline_flushed.load(.monotonic) - ended_flushed_0);
+        try std.testing.expectEqual(@as(usize, 1), by_deadline);
+        try std.testing.expectEqual(ended_failed_0, conn_mod.test_closing_ended_writer_failed.load(.monotonic));
+        try std.testing.expectEqual(ended_eof_0, conn_mod.test_closing_ended_peer_eof.load(.monotonic));
         try std.testing.expect(closed_ns - bound_ns <= unread_close_ns + unread_close_slack_ns);
         server.requestShutdown();
         serve_handle.join() catch {};
@@ -733,11 +756,20 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     try std.testing.expect(c.eof);
     switch (scenario) {
         .server_failures => {
-            // Every abort's RST waited in the ring. On TLS the stash takes a
-            // few terminal frames before it is full, and those were queued
-            // before the pause.
-            try std.testing.expect(rst_paused + 16 >= m);
-            try std.testing.expect(high_held + 16 >= m);
+            if (transport == .h2c) {
+                // All M RSTs and the graceful GOAWAY waited in the ring
+                // together, during the hold.
+                try std.testing.expectEqual(m, rst_paused);
+                try std.testing.expectEqual(m + 1, high_held);
+            } else {
+                // TLS proves less, and its name says so: the drain that
+                // filled the stash took the first RSTs into it before the
+                // pause (one in every run so far), and the hold parks the
+                // actor, which is what queues the graceful GOAWAY, so that
+                // GOAWAY is queued after the hold.
+                try std.testing.expect(rst_paused + 16 >= m);
+                try std.testing.expect(high_held + 16 >= m);
+            }
             try expectRsts(&c, 1, m, 1);
             try std.testing.expectEqual(m, c.rst_total);
             try std.testing.expect(c.goaways >= 2);
@@ -994,7 +1026,7 @@ test "server failures in one stall, h2c: M aborts and the graceful GOAWAY all fi
     try runCaseTop(.h2c, .server_failures);
 }
 
-test "server failures in one stall, tls: M aborts and the graceful GOAWAY all fit, one RST per stream" {
+test "server failures in one stall, tls: the M aborts' RSTs wait in the ring and the stash, one RST per stream, the graceful GOAWAY after the hold" {
     try runCaseTop(.tls, .server_failures);
 }
 

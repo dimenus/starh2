@@ -312,6 +312,15 @@ pub var test_sndbuf_bytes: std.atomic.Value(u32) = .init(0);
 /// Test-only (observe builds): handlers parked in `waitForAckRoom` right now,
 /// waiting for room in the stash (TLS) or the write queue (h2c).
 pub var test_room_waiting: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): how closing phases ended in `closeFlushed`:
+/// the writer failed; the deadline passed with output still not written
+/// (`blocked`) or with all of it in the kernel and the peer not closing
+/// (`flushed`); the peer closed after a lingering close (h2c: on TLS a peer
+/// EOF ends the turn before `closeFlushed` runs).
+pub var test_closing_ended_writer_failed: std.atomic.Value(usize) = .init(0);
+pub var test_closing_ended_deadline_blocked: std.atomic.Value(usize) = .init(0);
+pub var test_closing_ended_deadline_flushed: std.atomic.Value(usize) = .init(0);
+pub var test_closing_ended_peer_eof: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): server RST_STREAMs dropped from the terminal
 /// ring because the peer reset the same stream first (`retireTerminalRst`).
 pub var test_rst_retired: std.atomic.Value(usize) = .init(0);
@@ -4987,12 +4996,23 @@ pub const Connection = struct {
     /// side or the closing deadline passes (a lingering close).
     fn closeFlushed(self: *Connection, deadline_ns: u64) bool {
         self.assertSessionHeld("closeFlushed");
-        if (self.writer_failed.load(.acquire)) return true;
-        if (nowNs(self.config.io) >= deadline_ns) return true;
+        if (self.writer_failed.load(.acquire)) {
+            if (comptime test_observe) _ = test_closing_ended_writer_failed.fetchAdd(1, .monotonic);
+            return true;
+        }
+        if (nowNs(self.config.io) >= deadline_ns) {
+            if (comptime test_observe) {
+                if (self.outboundFlushed()) _ = test_closing_ended_deadline_flushed.fetchAdd(1, .monotonic) else _ = test_closing_ended_deadline_blocked.fetchAdd(1, .monotonic);
+            }
+            return true;
+        }
         if (!self.outboundFlushed()) return false;
         if (!self.closing_write_shut) {
             self.closing_write_shut = true;
             self.stream.shutdown(self.config.io, .send) catch {};
+        }
+        if (comptime test_observe) {
+            if (self.closing_peer_eof) _ = test_closing_ended_peer_eof.fetchAdd(1, .monotonic);
         }
         return self.closing_peer_eof;
     }
