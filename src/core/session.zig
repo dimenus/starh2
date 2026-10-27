@@ -66,12 +66,6 @@ pub const Intent = union(enum) {
     connection_closed,
     /// Exactly one early HTTP response (431/414/413); no handler dispatch.
     early_reject: struct { stream_id: u31, status: u16 },
-    /// The peer reset a stream this server had already reset, and the two
-    /// RST_STREAMs crossed. The peer counts the stream closed, so the server's
-    /// RST, if it still waits unwritten in the terminal ring, tells it nothing
-    /// and only holds one of the `Limits.terminalFrames` slots: the edge drops
-    /// it (`FairScheduler.retireTerminalRst`).
-    retire_rst: u31,
 };
 
 pub const OutboundFrame = struct {
@@ -150,12 +144,8 @@ const Tombstone = struct {
 
 /// How a stream ended, for what a later event on it still owes the peer.
 const Ending = enum(u8) {
-    /// The peer knows: both sides ended it, or the peer reset it.
+    /// Ended, by either side.
     closed,
-    /// This server queued an RST_STREAM for it. Until the peer resets the
-    /// stream too, that RST may still wait unwritten; a crossed peer RST
-    /// retires it (`Intent.retire_rst`).
-    server_rst,
     /// The server's last frame for it carried END_STREAM, and the edge
     /// refused that frame, so it was never written: the peer still counts the
     /// stream open, and an RST is owed (`Session.resetRefusedEnd`).
@@ -352,6 +342,9 @@ pub const Session = struct {
         /// Return a buffer from `rentFrame`. Pointer-range decides which
         /// pool; a prefix of a slab is reconstructed to the full lease.
         releaseFrame: ?*const fn (*anyopaque, []u8) void = null,
+        /// Drop the unwritten RST_STREAM for this stream from the edge's
+        /// terminal ring, if one waits there (`retireUnwrittenRst`).
+        retireRst: ?*const fn (*anyopaque, u31) void = null,
     };
 
     /// Insert into one of the maps that `init` sized once, in the boot buffer.
@@ -888,7 +881,8 @@ pub const Session = struct {
             };
             const res = maybe orelse return chunk.len;
             try self.handleFrame(res.event);
-            std.debug.assert(self.intent_len - queued <= limits_mod.INTENTS_PER_FRAME_MAX);
+            // Saturating: a crossed peer RST can remove a queued RST (`retireUnwrittenRst`).
+            std.debug.assert(self.intent_len -| queued <= limits_mod.INTENTS_PER_FRAME_MAX);
             remaining = remaining[res.consumed..];
             // The connection is ending and its GOAWAY is queued. The rest
             // of the chunk would only add intents (a flood of refused
@@ -1134,7 +1128,7 @@ pub const Session = struct {
             }
         }
         try self.pushIntentOrFailClosed(.{ .stream_reset = .{ .stream_id = stream_id, .code = code, .from_peer = false } });
-        const ending: Ending = if (queued) .server_rst else .closed;
+        const ending: Ending = .closed;
         if (self.streams.getPtr(stream_id)) |s| {
             s.onRst();
             self.releaseConcurrency(stream_id, code, ending);
@@ -1240,15 +1234,8 @@ pub const Session = struct {
                     // The stream is already gone, its concurrency credit
                     // already released, and the handler (if any) already
                     // canceled when the stream closed. If it closed because
-                    // this server reset it, the two RSTs crossed: the peer
-                    // now counts the stream closed, and the server's RST, if
-                    // it still waits, is retired.
-                    if (self.tombstonePtr(hdr.stream_id)) |t| {
-                        if (t.ending == .server_rst) {
-                            t.ending = .closed;
-                            try self.pushIntentOrFailClosed(.{ .retire_rst = hdr.stream_id });
-                        }
-                    }
+                    // this server reset it, the two RSTs crossed.
+                    self.retireUnwrittenRst(hdr.stream_id);
                 } else {
                     // IDLE: a stream id the peer has never opened has no state
                     // to reset, so this is a genuine protocol violation
@@ -2200,6 +2187,36 @@ pub const Session = struct {
         return out;
     }
 
+    /// The peer reset `stream_id`, which this connection no longer has: the
+    /// peer counts it closed. An RST_STREAM this server queued for it and has
+    /// not written tells the peer nothing and holds one of the
+    /// `Limits.terminalFrames` slots, so it is dropped now, during ingest,
+    /// before a refusal later in the same read chunk needs the slot: from the
+    /// intent queue if it is still there, and from the edge's terminal ring
+    /// (`StreamHooks.retireRst`). Whether this server reset the stream is not
+    /// looked up in the tombstones, which a busy connection overwrites: the
+    /// search by id answers it. O(intents + T), and a peer RST is rate
+    /// limited.
+    fn retireUnwrittenRst(self: *Session, stream_id: u31) void {
+        var kept: usize = 0;
+        for (self.intent_storage[0..self.intent_len]) |*it| {
+            const drop = switch (it.*) {
+                .outbound_frame => |f| f.typ == .rst_stream and f.stream_id == stream_id,
+                else => false,
+            };
+            if (drop) {
+                self.releaseIntent(it);
+                continue;
+            }
+            self.intent_storage[kept] = it.*;
+            kept += 1;
+        }
+        self.intent_len = kept;
+        if (self.stream_hooks) |h| {
+            if (h.retireRst) |f| f(h.ctx, stream_id);
+        }
+    }
+
     fn tombstonePtr(self: *Session, id: u31) ?*Tombstone {
         for (self.tombstones.items) |*t| {
             if (t.id == id) return t;
@@ -2403,7 +2420,7 @@ test "respond_headers after RST is StreamClosed" {
 }
 
 /// Counts of what a drained batch holds, then frees it.
-const TerminalCounts = struct { rst: usize = 0, goaway: usize = 0, stream_reset: usize = 0, connection_error: usize = 0, retire_rst: usize = 0 };
+const TerminalCounts = struct { rst: usize = 0, goaway: usize = 0, stream_reset: usize = 0, connection_error: usize = 0 };
 
 fn countTerminalIntents(gpa: std.mem.Allocator, session: *Session) TerminalCounts {
     const intents = session.drainIntents();
@@ -2417,7 +2434,6 @@ fn countTerminalIntents(gpa: std.mem.Allocator, session: *Session) TerminalCount
         },
         .stream_reset => c.stream_reset += 1,
         .connection_error => c.connection_error += 1,
-        .retire_rst => c.retire_rst += 1,
         else => {},
     };
     return c;
@@ -2990,28 +3006,49 @@ fn ingestPrefaceAndSettings(session: *Session, gpa: std.mem.Allocator) !void {
     freeTestIntents(gpa, session.drainIntents());
 }
 
-test "a peer RST that crosses this server's RST retires it, once; one that crosses a normal end retires nothing (t-3562)" {
+var test_retired_ids: [4]u31 = undefined;
+var test_retired_n: usize = 0;
+
+fn testRetireRst(_: *anyopaque, sid: u31) void {
+    test_retired_ids[test_retired_n] = sid;
+    test_retired_n += 1;
+}
+
+fn testAdmitAll(_: *anyopaque) bool {
+    return true;
+}
+
+fn testNoRelease(_: *anyopaque) void {}
+
+test "a crossed peer RST drops this server's unwritten RST at once, from the intent queue and through the edge, with no tombstone (t-3562)" {
     const gpa = std.testing.allocator;
-    var session = try Session.init(gpa, gpa, .defaults);
+    var limits = limits_mod.Limits.defaults;
+    limits.stream_tombstones = 0;
+    var session = try Session.init(gpa, gpa, limits);
     defer session.deinit();
+    var ctx: u8 = 0;
+    session.stream_hooks = .{ .ctx = &ctx, .tryAdmit = testAdmitAll, .onRelease = testNoRelease, .retireRst = testRetireRst };
+    test_retired_n = 0;
     try ingestPrefaceAndSettings(&session, gpa);
     try openTestStream(&session, 1);
     session.highest_peer_stream = 3;
+    // The server resets stream 1; its RST is still in the intent queue.
     try session.emitRst(1, .cancel);
-    // Stream 3 ended normally.
-    try session.addTombstone(3, .no_error, .closed);
-    _ = countTerminalIntents(gpa, &session);
-
+    // The peer resets 1 (crossed), then 3 (a stream that ended long ago:
+    // with no tombstones kept, nothing remembers it).
     var peer: [frame.rst_stream_frame_bytes]u8 = undefined;
     _ = try frame.Serializer.rstStream(&peer, 1, .cancel);
-    try session.ingest(&peer);
     try session.ingest(&peer);
     _ = try frame.Serializer.rstStream(&peer, 3, .cancel);
     try session.ingest(&peer);
     const c = countTerminalIntents(gpa, &session);
-    try std.testing.expectEqual(@as(usize, 1), c.retire_rst);
+    // The queued RST is gone; its local reset stays.
     try std.testing.expectEqual(@as(usize, 0), c.rst);
-    try std.testing.expectEqual(@as(usize, 0), c.stream_reset);
+    try std.testing.expectEqual(@as(usize, 1), c.stream_reset);
+    // The edge is asked for both ids: it searches its ring by id.
+    try std.testing.expectEqual(@as(usize, 2), test_retired_n);
+    try std.testing.expectEqual(@as(u31, 1), test_retired_ids[0]);
+    try std.testing.expectEqual(@as(u31, 3), test_retired_ids[1]);
     try std.testing.expect(session.terminal == .none);
 }
 

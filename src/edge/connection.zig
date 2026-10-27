@@ -2183,6 +2183,15 @@ pub const Connection = struct {
                     c.releaseWireBytes(buf);
                 }
             }.f,
+            .retireRst = struct {
+                fn f(ctx: *anyopaque, stream_id: u31) void {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    const dropped = c.sched.retireTerminalRst(stream_id);
+                    if (comptime test_observe) {
+                        if (dropped) _ = test_rst_retired.fetchAdd(1, .monotonic);
+                    }
+                }
+            }.f,
             .requestBodyCap = struct {
                 fn f(ctx: *anyopaque, method: []const u8, path: []const u8) usize {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
@@ -6514,7 +6523,6 @@ pub const Connection = struct {
                     if (diag_park) _ = diag_reset_after_ctrl_fail.fetchAdd(1, .monotonic);
                     self.applyStreamResetIntent(r);
                 },
-                .retire_rst => |sid| _ = self.sched.retireTerminalRst(sid),
                 .outbound_frame => |f| {
                     // Its waiter must hear that the frame will never go.
                     if (f.ticket.id != 0) self.tickets.wake(f.ticket.slot, f.ticket.id, false);
@@ -6689,12 +6697,6 @@ pub const Connection = struct {
                 .dispatch_request => |d| try self.dispatch(d),
                 .early_reject => {},
                 .stream_reset => |r| self.applyStreamResetIntent(r),
-                .retire_rst => |sid| {
-                    const dropped = self.sched.retireTerminalRst(sid);
-                    if (comptime test_observe) {
-                        if (dropped) _ = test_rst_retired.fetchAdd(1, .monotonic);
-                    }
-                },
                 .connection_error => |ce| {
                     if (close_reason) {
                         var code_buf: [12]u8 = undefined;
@@ -10581,6 +10583,69 @@ test "a ticket travels with its own frame: a leftover HEADERS does not take the 
     try std.testing.expect(conn.tickets.isSignaled(a[1]));
     try std.testing.expect(conn.tickets.isSignaled(b[1]));
     try conn.drainPendingCompleteReceipts(false);
+}
+
+/// M server RSTs wait in the terminal ring (the drain is held), then one
+/// read chunk carries the peer's RSTs for 3 of those streams and 3 new
+/// streams that `tryAdmit` refuses. The crossed RSTs must free their slots
+/// during the ingest, or the 3rd refusal finds none.
+fn crossedInOneChunkCase(tombstones: usize) !void {
+    const gpa = std.testing.allocator;
+    var lim = limits_mod.Limits.defaults;
+    lim.stream_tombstones = tombstones;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    test_hold_emit.store(true, .release);
+    defer test_hold_emit.store(false, .release);
+    const m = lim.max_streams_per_connection;
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        for (0..m) |i| {
+            const sid: u31 = @intCast(1 + 2 * i);
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        for (0..m) |i| try conn.session.applyCommand(.{ .reset_stream = .{ .stream_id = @intCast(1 + 2 * i), .code = .cancel } });
+        try conn.materializeIntents();
+    }
+    try std.testing.expectEqual(m, conn.sched.terminal_len);
+    conn.session.stream_hooks.?.tryAdmit = refuseEveryAdmit;
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        var rst: [frame.rst_stream_frame_bytes]u8 = undefined;
+        _ = try frame.Serializer.rstStream(&rst, sid, .cancel);
+        try wire.appendSlice(gpa, &rst);
+    }
+    for (0..3) |i| {
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try wire.appendSlice(gpa, hopRequestFrame(&req, @intCast(1 + 2 * (m + i))));
+    }
+    try trapIngest(conn, wire.items);
+    try std.testing.expect(conn.session.terminal == .none);
+    // M - 3 old RSTs and the 3 refusals.
+    try std.testing.expectEqual(m, conn.sched.terminal_len);
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        var k: usize = 0;
+        while (k < conn.sched.terminal_len) : (k += 1) {
+            const e = conn.sched.terminal_q[(conn.sched.terminal_head + k) % conn.sched.terminal_q.len];
+            try std.testing.expect(std.mem.readInt(u32, e.payload[5..9], .big) & 0x7fff_ffff != sid);
+        }
+    }
+}
+
+test "crossed RSTs free their terminal slots during the ingest of the same read chunk (t-3562)" {
+    try crossedInOneChunkCase(limits_mod.Limits.defaults.stream_tombstones);
+}
+
+test "the same when the streams' tombstones were evicted (t-3562)" {
+    try crossedInOneChunkCase(2);
 }
 
 test "a limit that breaks the terminal bound is InvalidConfig, not a small wrong store (t-3562)" {
