@@ -245,3 +245,146 @@ retires the queued RST (item 3); (11) the intent boot check removed with the
 default back at 512 (item 2). Full `./zb build test` each. Report in
 `tools/t3562-report.md` (overwrite). End with the status line the prompt
 gives, as the last line of your reply, not inside a list.
+
+## Round 3 (review of b6fb950; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at b6fb950. Mac: gates pass on a clean cache (ci: only
+the libcxx probes fail); the `t3562` binary passed 30/30 alone and 30/30
+three at a time. My mutation (the edge drops the rest of a read chunk after
+a short `ingestSome`) fails 7 tests and crashes 1. **Linux (nachos, a fresh
+tree): the full suite passed once, but the `t3562` binary failed 20 of 30
+alone and 24 of 30 three at a time.** Two failure kinds, quoted from the
+logs (`/tmp/t62b-a*.log` on nachos):
+
+- 12 of 20: `flood during a stall` (both transports) reaches the bound
+  (`ring_high=259 rst_paused=258 terminal_full=0`), then
+  `rst_total=0 goaways=0 goaway_code=0 eof=true close_ms=0 data_frames=0`,
+  and `t3562: stream 513 got 0 RST_STREAM, want 1`. The client got NOTHING:
+  no RST and no GOAWAY. That is the failure this task exists to remove.
+- 8 of 20: `flood during a stall, tls` times out at "waiting for the
+  terminal ring to reach T", `T3562-flood-timeout ring_high=251
+  rst_paused=45`: the stall did not hold.
+- Also seen in a PASSING run: `flood during a stall that never ends, tls`
+  closed at `unread_close_ms=4` (h2c in the same run: 999). So the TLS
+  connection did not wait for its closing deadline, and the test passed.
+
+Ryan decided two points in this round (items 3 and 4). Fix everything as
+new commits on top of b6fb950. The round 1 and 2 rules still apply.
+**Linux is a required gate from now on** (recipe at the end).
+
+1. **The peer gets nothing on Linux (first; evidence before any fix).**
+   Find why the connection ends within ~1 ms of reaching T with nothing
+   delivered. Instrument; do not guess: the `CLOSE_REASON` (by, site), when
+   the server closes the socket relative to the GOAWAY being written, how
+   many bytes are unread in the server's receive buffer at close, whether
+   the test client half-closes, and whether the ReadPump shuts `.send` on
+   a read EOF or error (both reviewers point at that path). An unverified
+   hypothesis to test, NOT a fact: on Linux, closing a socket with unread
+   received bytes sends a TCP RST, and the peer then drops data it has not
+   read yet. Show the evidence line, then fix it so a flooding peer
+   receives its GOAWAY(ENHANCE_YOUR_CALM) before the close (Ryan's
+   decision: "goaway then close"). If the cause is pre-existing, say so
+   and fix it anyway: the GOAWAY is this task's deliverable.
+2. **The stall tests must hold the stall on both systems.** The TLS flood
+   on Linux lost the stall (`rst_paused=45`). Both reviewers: the stall is
+   proved by ONE sighting of a pause, and the TLS "every flusher waits"
+   counter stays raised during the 2 ms sleep after a SUCCESSFUL flush, so
+   it can read "all waiting" while none is blocked; the h2c
+   `crossed_resets` and `flood` cases have the same one-sighting shape
+   (the recorded 1-in-30 Mac flake). Synchronize on a sustained blocked
+   state: count only flushes that are blocked waiting for room, and on h2c
+   wait until the write pump is blocked and the queue is full, before the
+   aborts or the flood. Then assert exact counts. Gate: the `t3562` binary
+   30/30 alone and 30/30 three at a time, on the Mac AND on Linux.
+3. **An ordinary refusal inside a batch (Ryan: fix it in this branch).**
+   Pre-existing at c30c99b. When `enqueueControl` refuses an ORDINARY frame
+   (a PING or SETTINGS ack, a WINDOW_UPDATE, a response HEADERS),
+   `materializeBatch` calls `finishIntentsAfterEnqueueFail` on the whole
+   rest of the batch, which releases other streams' dispatches, RSTs,
+   early-reject HEADERS and even a GOAWAY, unsent and unanswered. On the
+   read path it then returns the error up through `ingestAndProcess`
+   (`try self.processIntents()`) and `ingestWireChunk`, and `run` tears the
+   connection down with no GOAWAY, while the actor's main loop treats the
+   same error as per-stream (`failClosedOnIntentError`). **Fix:** drop only
+   the refused frame and the CONTINUATION fragments of its own block; keep
+   processing the rest of the batch; an ordinary refusal never ends the
+   connection from the read path (only a terminal refusal may). Every
+   stream whose final frame is dropped gets one RST: the handler path
+   already does (633839a); an early-reject HEADERS refused while the
+   stream is still in the map has no handler, so the edge must queue it.
+   Test: during a stall that pins the ordinary share, the peer sends a PING
+   and new requests in one chunk; the connection is kept, and every stream
+   gets its response or one RST.
+4. **The ticket travels with its frame (Ryan's decision).** Today
+   `next_wire_ticket` attaches to whatever outbound frame is materialized
+   first. That is right only if the intent queue is empty when a handler's
+   lock section starts, and it is not: `sendCb` (`fits_without_wait`
+   branch) queues HEADERS, then `enqueuePending` -> `reserveBudget` ->
+   `parkForBudget` unlocks `session_mu` with those HEADERS still queued,
+   and an error return from `enqueuePending` also leaves them queued. Then
+   another handler's ticket goes onto the first handler's frame. The same
+   leftover breaks `ingestAndProcess`'s "the queue is empty on every call"
+   panic at a small M. **Fix:** carry the ticket in the intent of the frame
+   it belongs to, and delete the implicit hand-off; the wrong attachment
+   must become impossible to write, not a convention. Keep DATA behind its
+   HEADERS (t-482). Test: handler A parks for connection budget with its
+   HEADERS queued; handler B sends an empty response with a ticket; B's
+   ticket completes with B's frame and A's with A's.
+5. **Retire a crossed RST at once, and without the tombstone (astra; Fable
+   agrees on the eviction half).** (a) The `retire_rst` intent frees
+   nothing until it is materialized, but `queueRst` rents a terminal slot
+   during ingest (`self.controlFrame(buf, .terminal)`). So in ONE read
+   chunk, a peer that cancels 3 streams the server already reset and opens
+   3 new ones that `tryAdmit` refuses at ingest gets ENHANCE_YOUR_CALM with
+   at most M streams open. The `crossed_resets` test misses it because its
+   new failures come at dispatch. (b) The retire runs only if the stream's
+   `server_rst` tombstone is still in the 1,024-entry ring. **Fix:** on a
+   peer RST for a stream that is not in the map, retire the unwritten
+   server RST for that id during ingest (a callback like `controlFrame`),
+   by searching the terminal ring by id; do not consult the tombstone.
+   O(T) per peer RST, which is rate limited. Tests: the one-chunk case of
+   (a) at defaults; the evicted case if a test can reach it in under 2 s.
+6. **The unaccepted END_STREAM is an obligation, not history (astra; Fable
+   on the zero case).** `resetRefusedEnd` reconstructs "the edge refused
+   this final HEADERS" from a `.closed/.no_error` tombstone. With
+   `stream_tombstones = 0` (accepted today) nothing is found and the peer
+   waits forever; and if the peer cancels the stream between the queuing
+   and the refusal, an RST goes to a stream the peer counts closed. **Fix:**
+   track the obligation where it is created (the final HEADERS waiting for
+   acceptance) and clear it on acceptance or on a peer RST; do not read it
+   back from the tombstone ring. If `Tombstone.ending` is then no longer
+   needed, remove it: it widened every tombstone from 8 to 12 bytes, 4,096
+   bytes per connection (a fifth of this task's memory, named in no commit
+   message). If it stays, name it in the commit message.
+7. **Test claims (astra).** The "stall that never ends" tests accept an
+   immediate close (see the TLS 4 ms run above): require the closing
+   deadline to expire with output blocked and no writer failure, by the
+   close reason. `server_failures` allows 16 RSTs outside the pause, and on
+   TLS the graceful GOAWAY is only queued after the hold ends: prove M RSTs
+   and the graceful GOAWAY wait together, or rename the test to what it
+   proves.
+8. **Small (Fable).** `fair_scheduler.zig` ~193: `rstStream` was inserted
+   under `continuationStream`'s doc comment; move it. The observe-build
+   pause probe (`connection.zig` ~5976) calls `outboundMemoryPaused`, which
+   bumps the production counter `drain_memory_pauses`; read the pause
+   without the side effect.
+
+Rerun mutations 1 to 16 from rounds 1 and 2, plus: (17) the ticket attaches
+to the first frame materialized again (item 4); (18) an ordinary refusal
+releases the rest of the batch again (item 3); (19) the crossed RST retire
+is deferred to materialization again (item 5a); (20) the END_STREAM
+obligation is read from the tombstone again (item 6); (21) the item 1 fix
+undone. Full `./zb build test` each, on the Mac. Report the
+`slotBootBytes` at defaults by running it.
+
+### The Linux gate (nachos)
+
+Copy the committed tree; do not reuse an old directory:
+
+    git archive HEAD | ssh nachos 'rm -rf ~/src/s-t62-r3 && mkdir -p ~/src/s-t62-r3 && tar -x -C ~/src/s-t62-r3'
+    ssh nachos 'cp ~/src/s-t62b/testdata/*.pem ~/src/s-t62-r3/testdata/ && cp -R ~/src/s-t62b/zig-pkg ~/src/s-t62-r3/'
+    ssh nachos 'export PATH=$HOME/.local/share/mise/shims:$PATH; cd ~/src/s-t62-r3 && ./zb build test'
+
+Then run the built `t3562` binary (`.zig-cache/o/*/t3562`) 30 times alone
+and 10 rounds of 3 at once, by exit code and by "All 9 tests passed" (or
+the new count). Report the counts and quote one line of any failure.
