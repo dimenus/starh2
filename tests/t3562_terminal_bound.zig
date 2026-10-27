@@ -222,6 +222,7 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
 const max_sid = 4096;
 const alive_ping = [8]u8{ 't', '3', '5', '6', '2', 'l', 'i', 'v' };
 const batch_ping = [8]u8{ 't', '3', '5', '6', '2', 'b', 'a', 't' };
+const nudge_ping = [8]u8{ 't', '3', '5', '6', '2', 'n', 'u', 'd' };
 
 const Client = struct {
     gpa: std.mem.Allocator,
@@ -250,6 +251,10 @@ const Client = struct {
     batch_streams: usize = 0,
     send_alive: std.atomic.Value(bool) = .init(false),
     alive_sent: bool = false,
+    /// PINGs the test asked for, and sent: each wakes the server's actor,
+    /// whose drain then fills what the blocked writer left of the queue.
+    nudges: std.atomic.Value(u32) = .init(0),
+    nudged: u32 = 0,
     /// Streams that ended for the client: a HEADERS with END_STREAM or an
     /// RST_STREAM, whichever came first.
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -310,6 +315,12 @@ fn clientRun(c: *Client) !void {
             for (0..c.batch_streams) |i| try h2c.appendHeaders(c.gpa, &more, @intCast(1 + 2 * (c.streams + 1 + i)), c.path, true);
             try w.send(more.items);
             c.batch_sent.store(true, .release);
+        }
+        while (c.nudged < c.nudges.load(.acquire)) {
+            var ping: [17]u8 = undefined;
+            _ = try frame.Serializer.ping(&ping, false, &nudge_ping);
+            try w.send(&ping);
+            c.nudged += 1;
         }
         if (!c.alive_sent and c.send_alive.load(.acquire)) {
             var ping: [17]u8 = undefined;
@@ -488,6 +499,25 @@ fn expectRsts(c: *const Client, first: usize, n: usize, want: u8) !void {
     }
 }
 
+/// Wait until `test_stalled`, nudging the actor with a client PING every
+/// 100 ms while it is not.
+fn waitStalled(c: *Client) !void {
+    const deadline = nowNs() + client_deadline_ns;
+    var next_nudge = nowNs() + 100 * std.time.ns_per_ms;
+    while (!conn_mod.test_stalled.load(.acquire)) {
+        const now = nowNs();
+        if (now >= deadline) {
+            std.debug.print("t3562: timed out waiting for the writer blocked with no room (nudges={d} writing={d})\n", .{ c.nudges.load(.acquire), wire_pump.test_writing.load(.acquire) });
+            return error.Deadline;
+        }
+        if (now >= next_nudge) {
+            _ = c.nudges.fetchAdd(1, .acq_rel);
+            next_nudge = now + 100 * std.time.ns_per_ms;
+        }
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+}
+
 fn ringAtLeast(n: usize) bool {
     return conn_mod.test_terminal_ring_high.load(.acquire) >= n;
 }
@@ -562,11 +592,11 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         const writers = if (transport == .tls) m / 2 else m;
         try waitFor("every writer to write its DATA", atLeast(&wrote, writers), reached);
         if (transport == .tls) try waitFor("a flush parked for stash room", atLeast(&conn_mod.test_room_waiting, 1), reached);
-        try waitFor("the writer blocked with no room", {}, struct {
-            fn f(_: void) bool {
-                return conn_mod.test_stalled.load(.acquire);
-            }
-        }.f);
+        // The gauge is computed by a drain. The last drain can come before
+        // the writer blocks; the writer then takes chunks off the queue and
+        // blocks in its write, and nothing wakes the actor to fill the queue
+        // again. A PING from the client (it can still write) wakes it.
+        try waitStalled(&c);
     } else {
         // Hold the writer, then let the handlers write: the DATA fills the
         // write memory, which pauses the terminal loop.

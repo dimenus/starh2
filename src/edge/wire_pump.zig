@@ -501,7 +501,11 @@ pub const WritePump = struct {
                 writer.interface.writeAll(slices[0])
             else
                 writer.interface.writeVecAll(slices[0..count]);
-            if (comptime observe) _ = test_writing.fetchSub(1, .acq_rel);
+            // Counted down after the flush below: with a small buffer the
+            // write may land in `write_buf`, and the flush is what blocks.
+            defer if (comptime observe) {
+                _ = test_writing.fetchSub(1, .acq_rel);
+            };
             write_result catch |err| {
                 if (close_probe) probePrint("t1002 pump={x} write_err {s}\n", .{ @intFromPtr(self), @errorName(err) });
                 for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
