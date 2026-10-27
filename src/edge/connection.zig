@@ -6703,10 +6703,7 @@ pub const Connection = struct {
                     };
                     block_queued_open = opens_block;
                     if (comptime test_observe) {
-                        if (f.typ == .rst_stream) {
-                            const pc = self.sched.pause_control;
-                            if (pc != null and pc.?(self.sched.pause_ctx)) _ = test_rst_queued_paused.fetchAdd(1, .monotonic);
-                        }
+                        if (f.typ == .rst_stream and self.controlPausedNow()) _ = test_rst_queued_paused.fetchAdd(1, .monotonic);
                         if (class == .terminal) {
                             const len = self.sched.terminal_len;
                             var high = test_terminal_ring_high.load(.monotonic);
@@ -7000,6 +6997,17 @@ pub const Connection = struct {
     /// `outboundMemoryPaused` without counting a pause.
     fn outboundMemoryLow(self: *const Connection) bool {
         return self.write_pool.freeCount() < wire_const.POP_PUSHES;
+    }
+
+    /// The scheduler's control pause (`pause_control`) as the hooks would
+    /// answer it, without what the hooks count (`drain_memory_pauses`, the
+    /// test pause counters). For observe-build probes.
+    fn controlPausedNow(self: *Connection) bool {
+        if (self.tls_driver) |p| return p.stashFull() or self.outboundMemoryLow();
+        if (self.config.mode != .h2c or self.sched.pause_control == null) return false;
+        if (self.outboundMemoryLow()) return true;
+        if (self.ack_room_armed and !self.h2cAckRoom(0)) return true;
+        return !self.h2cQueueRoom(h2c_queue_room_per_pop);
     }
 
     /// See `test_stalled`. Reads only; counts nothing.

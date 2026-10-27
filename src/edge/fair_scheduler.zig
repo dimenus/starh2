@@ -190,12 +190,13 @@ pub fn leavesBlockOpen(payload: []const u8) bool {
     return !frame.FrameFlags.fromByte(payload[4]).end_headers;
 }
 
-/// The stream of a CONTINUATION frame payload; null for any other frame.
+/// The stream of an RST_STREAM frame payload; null for any other frame.
 fn rstStream(payload: []const u8) ?u31 {
     if (payload.len < frame.FRAME_HEADER_LEN or payload[3] != @backingInt(frame.FrameType.rst_stream)) return null;
     return @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
 }
 
+/// The stream of a CONTINUATION frame payload; null for any other frame.
 fn continuationStream(payload: []const u8) ?u31 {
     if (payload.len < frame.FRAME_HEADER_LEN or payload[3] != @backingInt(frame.FrameType.continuation)) return null;
     return @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
