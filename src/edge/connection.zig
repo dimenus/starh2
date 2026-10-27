@@ -6671,7 +6671,7 @@ pub const Connection = struct {
                                 // the stream is reset (a handler waiting on
                                 // it is woken by the reset). The RST is
                                 // queued, and this call's next round sends it.
-                                .headers => self.session.resetRefusedHeaders(f.stream_id) catch {},
+                                .headers => self.session.resetRefusedHeaders(f.stream_id, f.owes_rst_if_refused) catch {},
                                 .window_update => self.session.refusedWindowUpdate(f.stream_id, wu_increment),
                                 // A SETTINGS or PING ack, a graceful PING:
                                 // dropped. The peer may time out waiting for
