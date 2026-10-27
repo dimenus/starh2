@@ -151,3 +151,97 @@ comment in a test file to force a rerun. You cannot run Linux.
 - Do not push. Do not file, close or edit tasks; list what you would file.
 - Report in `tools/t3562-report.md` (not committed). End with the status line the
   prompt gives, as the last line of your reply, not inside a list.
+
+## Round 2 (review of b018439; gpt-6-astra, Grok 4.7, and the orchestrator)
+
+Orchestrator's runs at b018439: Mac gates pass (ci: only the libcxx probes
+fail). The bound held in every run that got past setup (`ring_high` never
+above T, `terminal_full` 0, one RST per stream, the right GOAWAY codes). My
+mutation (room for 2 GOAWAYs, not 3) fails 11 tests. But the new tests are
+FLAKY: the `t3562` binary failed 1 of 10 on the Mac and **6 of 10 on Linux**,
+and one full Mac `test` run failed, always at "timed out waiting for every
+handler to start its response", on both transports. Fix as new commits on top.
+The round 1 rules still apply.
+
+1. **The setup flake (first; evidence before any fix).** Make the setup
+   timeout print why: for each handler, whether `resp.start` returned and with
+   which error, and the counters that explain a refusal (ordinary `PoolFull`,
+   `tryAdmit` refusals, handler-slot refusals). Run until it fails and show
+   the line. Both reviewers note the ordinary share is 256 = M, so M HEADERS
+   plus an ack can be `PoolFull` (it was 240 at the base: the same ceiling).
+   If that is the cause: it is a per-stream failure of a well-behaved peer's
+   burst, a pre-existing limit, and NOT this task. The orchestrator files it.
+   Set the test's ordinary share explicitly (`control_entries_per_connection`
+   = M + the slack you show is needed), with a comment that says why. If the
+   cause is anything else, STOP and report it with the evidence.
+   Then run the `t3562` binary 30 times and report the count.
+2. **The intent queue misclassifies the server's own resets as a flood
+   (high; both).** Each RST takes 2 intents, and they pile up for a whole
+   `Session.ingest` or a whole batch before `processIntents`. At the default
+   512, the 254th RST in one batch hits `intent_room < 5` and sends
+   ENHANCE_YOUR_CALM to a well-behaved peer: `finishGraceful` (resets every
+   live stream, then materializes once), server-wide `tryAdmit` refusals of
+   one chunk's HEADERS, and deferred task-spawn failures. At M = 1024 one
+   chunk of 1024 admitted header-only requests already overflows (one
+   `dispatch_request` each). **Fix (decided):** derive the minimum intent
+   room from M and check it at boot (`InvalidConfig` below it). Count every
+   producer that can co-queue in ONE batch for a well-behaved peer: up to M
+   stream opens (1 intent admitted, 2 refused), the RSTs and GOAWAYs of the
+   terminal bound (2 per RST), and the ack/ordinary intents one chunk can add
+   (derive their bound from the rate limiter or the frame sizes; show it).
+   Raise the default `intent_entries_per_connection` to meet it. After that,
+   the `< 5` rule may fire only for a peer past T. Tests: a well-behaved
+   peer at defaults whose M streams are all refused by `tryAdmit` in one
+   chunk keeps its connection; the same at M = 1024; a graceful shutdown with
+   M live streams sends M RSTs and no ENHANCE_YOUR_CALM. Report the memory of
+   the larger intent queue.
+3. **A peer's RST does not retire a queued server RST (high; astra).** In a
+   stall, the server queues RSTs; the peer cancels those streams itself
+   (counts them closed) and opens new ones, which fail and need RSTs. The
+   peer RST path (`session.zig` near 1095, "There is nothing to do. The
+   stream is already gone") leaves the server's unsent RST queued, so the
+   ring can hold RSTs for streams the peer no longer counts open, and a
+   conforming peer reaches ENHANCE_YOUR_CALM. **Fix:** when the peer resets
+   a stream whose server RST is not yet written, drop that queued RST (the
+   ring entry, its terminal share and its store slot; any pending intent for
+   it too). Test: M server RSTs queued in a stall, the peer resets all M and
+   opens new streams that fail; no ENHANCE_YOUR_CALM, connection kept.
+4. **A refused final HEADERS leaves the peer waiting forever (high; astra).**
+   An empty response (`cmdHeaders` with end_stream) calls
+   `localEndStream` + `releaseConcurrency`, which tombstones the stream with
+   `.no_error` before the scheduler accepts the HEADERS. If `enqueueControl`
+   then refuses it, the handler's recovery RST (`connection.zig` near 7469)
+   is suppressed by `rstOwed` (tombstoned), and the client gets neither.
+   **Fix:** a locally planned END_STREAM must not count as closed for
+   `rstOwed` until its HEADERS is accepted; on refusal, the recovery RST must
+   go. Test first: show it hangs at b018439 (a deadline that FAILS), then
+   passes.
+5. **Absence of a tombstone must not authorize an RST for an old ID (medium;
+   astra).** Tombstones are an overwrite ring; a delayed handler reset can
+   arrive after its stream's tombstone was evicted and queue an RST for a
+   stream the peer counts closed. **Fix:** an absent, untombstoned ID gets an
+   RST only when the caller is refusing a NEW stream (the refusal paths say
+   so explicitly); for any other absent ID, `rstOwed` is false. Recheck the
+   handler's terminal cause under the lock before a delayed reset.
+6. **Ticket table (low; astra).** No terminal frame creates a ticket owner;
+   it can only carry a handler's existing ticket. Restore the ticket table to
+   ordinary entries + streams in `planBoot` and `init`, unless you find a
+   terminal path that creates a new ticket owner (then show it). Expected
+   cost after this: about 13.5 KB per connection plus item 2's intents;
+   measure `slotBootBytes` again by running it.
+7. **The stall tests do not prove the stall (medium; both).** Record that
+   `pause_control` was true when the RSTs were queued (an observe counter
+   read by the test), and assert the expected stream IDs, not a count over
+   all odd IDs. The flood scenarios ingest the flood after the hold is
+   released, so they do not test a flood during a stall: either make the
+   actor ingest while the writer is still held (if the design allows it;
+   astra notes the TLS stash hold parks the actor), or rename them to say
+   they test the bound after a stall, not during it. Check that the
+   connection closes by its closing deadline (`close_flush_timeout_ns`).
+
+Rerun round 1's mutations 1 to 8, plus: (9) `rstOwed` trusts the `.no_error`
+tombstone of an unaccepted END_STREAM (item 4); (10) the peer RST no longer
+retires the queued RST (item 3); (11) the intent boot check removed with the
+default back at 512 (item 2). Full `./zb build test` each. Report in
+`tools/t3562-report.md` (overwrite). End with the status line the prompt
+gives, as the last line of your reply, not inside a list.
