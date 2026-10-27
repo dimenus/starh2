@@ -306,11 +306,17 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         .server_failures => {
             // M server RSTs, then the graceful GOAWAY.
             abort_gate.store(true, .release);
-            try waitFor("every handler to abort", m, struct {
+            waitFor("every handler to abort", m, struct {
                 fn f(x: usize) bool {
                     return aborted.load(.acquire) >= x;
                 }
-            }.f);
+            }.f) catch |err| {
+                std.debug.print("T3562-abort-timeout aborted={d} of {d} terminal_full={d} ring_high={d}\n", .{
+                    aborted.load(.acquire),                                  m,
+                    conn_mod.test_ctrl_terminal_full.load(.monotonic) - full_0, conn_mod.test_terminal_ring_high.load(.acquire),
+                });
+                return err;
+            };
             zio.sleep(.fromMilliseconds(300)) catch {};
             server.requestShutdown();
             zio.sleep(.fromMilliseconds(300)) catch {};
