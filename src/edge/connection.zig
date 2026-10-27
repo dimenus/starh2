@@ -1824,6 +1824,8 @@ pub const Connection = struct {
     /// Closing phase, actor only: everything queued has reached the kernel and
     /// the send side is shut (`closeFlushed`), and the peer's EOF has arrived.
     closing_write_shut: bool = false,
+    /// Set by the first `materializeIntents`; see `unlockSession`.
+    intents_materialized: bool = false,
     closing_peer_eof: bool = false,
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
@@ -2042,9 +2044,6 @@ pub const Connection = struct {
     receipt_ready_stamp: [complete_receipt_capacity]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0), .init(0) },
     receipt_ready_stamp_w: std.atomic.Value(usize) = .init(0),
     receipt_ready_stamp_r: usize = 0,
-    /// Next outbound wire frame (HEADERS/control/DATA) receives this ticket once.
-    next_wire_ticket: u64 = 0,
-    next_wire_slot: u32 = 0,
     pending_ticket: ?PendingTicketAttach = null,
     /// Quantum bytes to release from handler outbound after successful DATA sink.
     pending_data_outbound_release: usize = 0,
@@ -6516,6 +6515,11 @@ pub const Connection = struct {
                     self.applyStreamResetIntent(r);
                 },
                 .retire_rst => |sid| _ = self.sched.retireTerminalRst(sid),
+                .outbound_frame => |f| {
+                    // Its waiter must hear that the frame will never go.
+                    if (f.ticket.id != 0) self.tickets.wake(f.ticket.slot, f.ticket.id, false);
+                    self.session.releaseIntent(it);
+                },
                 else => self.session.releaseIntent(it),
             }
         }
@@ -6550,17 +6554,15 @@ pub const Connection = struct {
     /// resets or answers its stream. They are drained here, in further rounds,
     /// before this returns, also after a round fails (the first error is
     /// returned at the end), so the session queue is empty whenever a lock
-    /// section ends. Two things rest on that: the next section starts its
-    /// batch from an empty queue (`Limits.intentEntriesMin`), and a handler's
-    /// ticket parked in `next_wire_ticket` reaches that handler's own frame,
-    /// the first one it materializes, not a leftover RST of another stream
-    /// (that handler's refused HEADERS then released the ticket while the RST
-    /// still carried it, and the drain failed the connection in
-    /// `linkCompletion`). Nothing in a round may materialize the queue itself:
-    /// the batch it would drain into is the one being read.
+    /// section ends (`unlockSession` asserts it), and the next section starts
+    /// its batch from an empty queue (`Limits.intentEntriesMin`). A ticket
+    /// does not depend on it: it travels in its own frame's intent
+    /// (`OutboundFrame.ticket`). Nothing in a round may materialize the queue
+    /// itself: the batch it would drain into is the one being read.
     fn materializeIntents(self: *Connection) anyerror!void {
         self.assertSessionHeld("materializeIntents");
         var first_err: ?anyerror = null;
+        self.intents_materialized = true;
         while (true) {
             const n = self.session.drainIntentsInto(self.intent_batch);
             if (n == 0) break;
@@ -6568,14 +6570,7 @@ pub const Connection = struct {
                 if (first_err == null) first_err = err;
             };
         }
-        if (first_err) |err| {
-            // The frame the ticket was parked for may have been dropped with
-            // the rest of the failed batch. Its caller fails and releases the
-            // reservation, so no later frame may take it.
-            self.next_wire_ticket = 0;
-            self.next_wire_slot = 0;
-            return err;
-        }
+        if (first_err) |err| return err;
     }
 
     fn materializeBatch(self: *Connection, n: usize) anyerror!void {
@@ -6605,14 +6600,9 @@ pub const Connection = struct {
                         std.debug.panic("framed DATA reached the connection scheduler: no budget credit (stream {d}); handlers write through enqueuePending", .{f.stream_id});
                     }
                     const class = fair_scheduler.FairScheduler.classifyControl(f.typ, f.flags);
-                    var t: u64 = 0;
-                    var s: u32 = 0;
-                    if (self.next_wire_ticket != 0) {
-                        t = self.next_wire_ticket;
-                        s = self.next_wire_slot;
-                        self.next_wire_slot = 0;
-                        self.next_wire_ticket = 0;
-                    }
+                    // The frame's own ticket, if a handler waits on it.
+                    const t = f.ticket.id;
+                    const s = f.ticket.slot;
                     const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
                     // The payload is freed by a refusal; what a refused
                     // WINDOW_UPDATE gave is read first.
@@ -7351,6 +7341,7 @@ pub const Connection = struct {
             .status = status,
             .headers = &.{},
             .end_stream = true,
+            .ticket = .none,
         } }) catch {};
         std.debug.assert(self.releaseSlot(d.stream_id));
         return true;
@@ -8068,6 +8059,14 @@ pub const Connection = struct {
     /// `inline_n`, the inline entry in `grantBudgetLocked`), and changes made
     /// with no `session_mu` at all (wire releases on the actor).
     fn unlockSession(self: *Connection, io: std.Io) void {
+        // Every lock section materializes what it queued before it lets go,
+        // so the next one starts its batch from an empty queue: the intent
+        // bound (`Limits.intentEntriesMin`) counts one batch at a time.
+        // (From the first materialization on: until then the preface that
+        // `Session.init` queued waits for the boot flush.)
+        if (std.debug.runtime_safety and self.intents_materialized and self.session.intentLen() != 0) {
+            std.debug.panic("session_mu released with {d} intents queued", .{self.session.intentLen()});
+        }
         // Cleared while the mutex is still held, or the next holder would see a
         // stale false.
         self.session_held = false;
@@ -8515,11 +8514,14 @@ pub const Connection = struct {
             const fields = try prepareResponseHeaderFields(hctx.arena, &stack_hpack, headers, compress, add_vary, compress, false);
             // Compressed bodies never carry content-length — HTTP/2 length is framing.
             const t_hpack0 = if (traced) nowNs(self.config.io) else 0;
+            // With a body, the ticket goes with the last DATA
+            // (`enqueuePending`); without one, with these HEADERS.
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
                 .headers = fields,
                 .end_stream = body_out.len == 0,
+                .ticket = if (body_out.len == 0) .{ .id = ticket, .slot = slot_i } else .none,
             } }) catch |err| return headersRefusal(err);
             if (traced) t_hpack = nowNs(self.config.io) - t_hpack0;
             if (body_out.len > 0) {
@@ -8527,16 +8529,21 @@ pub const Connection = struct {
                 const fits_without_wait = pending_len < self.config.limits.outbound_bytes_per_stream and
                     body_out.len <= self.config.limits.outbound_bytes_per_stream - pending_len;
                 if (hctx.runs_inline or fits_without_wait) {
-                    // Stage DATA first, then place HEADERS in the ordinary
-                    // control queue. Drain is left to the actor (task) or to
-                    // `runPendingInline` after the whole complete batch encodes.
-                    // Complete handlers carry no per-response ticket: the
-                    // drain-turn receipt is reserved after this encode loop.
-                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx) catch |err| return err;
+                    // Place HEADERS in the ordinary control queue, then stage
+                    // DATA (the scheduler holds DATA until its HEADERS left,
+                    // t-482). Drain is left to the actor (task) or to
+                    // `runPendingInline` after the whole complete batch
+                    // encodes. Complete handlers carry no per-response ticket:
+                    // the drain-turn receipt is reserved after this encode
+                    // loop. HEADERS first, because `enqueuePending` may
+                    // release `session_mu` (stream space, connection budget),
+                    // and no lock section may end with intents queued
+                    // (`unlockSession`).
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;
                     };
+                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx) catch |err| return err;
                 } else {
                     // A body that can fill the stream slab may release this
                     // lock while waiting for capacity. Materialize HEADERS
@@ -8552,10 +8559,6 @@ pub const Connection = struct {
                     };
                 }
             } else {
-                if (ticket != 0) {
-                    self.next_wire_ticket = ticket;
-                    self.next_wire_slot = slot_i;
-                }
                 if (hctx.runs_inline) {
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
@@ -8604,11 +8607,10 @@ pub const Connection = struct {
     /// `text/event-stream`, `no-cache`, and `x-accel-buffering: no` for
     /// intermediaries that would otherwise hold events until a buffer fills.
     ///
-    /// `next_wire_ticket` is how the ticket reaches a frame that this function
-    /// does not build. The HEADERS frame is produced inside `Session`, so the
-    /// ticket is parked on the connection and `processIntents` attaches it to
-    /// the next outbound frame it creates. This is safe only because the whole
-    /// sequence runs under `session_mu` on one task.
+    /// The HEADERS frame is built inside `Session`, so the ticket goes in the
+    /// `respond_headers` command and travels on that frame's intent
+    /// (`OutboundFrame.ticket`): it can only complete, or fail, with this
+    /// response's HEADERS.
     fn startCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, sse: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
@@ -8649,13 +8651,12 @@ pub const Connection = struct {
                 .status = status,
                 .headers = hlist.items,
                 .end_stream = false,
+                .ticket = .{ .id = ticket, .slot = slot_i },
             } }) catch |err| {
                 const refused = headersRefusal(err);
                 if (refused == error.ResponseRefused) dropEncoder(hctx);
                 return refused;
             };
-            self.next_wire_ticket = ticket;
-            self.next_wire_slot = slot_i;
             // Enqueue and leave. Do NOT drain. writeCb already learned this:
             // 200 task handlers each processIntents/drainEmit is one HEADERS
             // chunk apiece into carried+tls_write_ch (cap 8). The tenth
@@ -10532,6 +10533,54 @@ fn gracefulFinishCase(m: usize) !void {
 test "a graceful shutdown with M live streams sends M RSTs and no ENHANCE_YOUR_CALM (t-3562)" {
     try gracefulFinishCase(limits_mod.Limits.defaults.max_streams_per_connection);
     try gracefulFinishCase(1024);
+}
+
+test "a ticket travels with its own frame: a leftover HEADERS does not take the next handler's ticket (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    const a = try conn.reserveTicket();
+    const b = try conn.reserveTicket();
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        for ([_]u31{ 1, 3 }) |sid| {
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        // Handler A's HEADERS, left queued (what a park in the middle of a
+        // command used to do), then handler B's empty response.
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &.{}, .end_stream = false, .ticket = .{ .id = a[0], .slot = a[1] } } });
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 3, .status = 204, .headers = &.{}, .end_stream = true, .ticket = .{ .id = b[0], .slot = b[1] } } });
+        try conn.materializeIntents();
+        // Each scheduler entry carries its own stream's ticket.
+        var seen: usize = 0;
+        var k: usize = 0;
+        while (k < conn.sched.ordinary_len) : (k += 1) {
+            const e = conn.sched.ordinary_q[(conn.sched.ordinary_head + k) % conn.sched.ordinary_q.len];
+            const sid = std.mem.readInt(u32, e.payload[5..9], .big) & 0x7fff_ffff;
+            if (sid == 1) {
+                try std.testing.expectEqual(a[0], e.ticket);
+                seen += 1;
+            }
+            if (sid == 3) {
+                try std.testing.expectEqual(b[0], e.ticket);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+    }
+    // Written: both tickets complete.
+    var wire: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer wire.deinit();
+    try trapCollect(&trap, &wire);
+    try std.testing.expect(conn.tickets.isSignaled(a[1]));
+    try std.testing.expect(conn.tickets.isSignaled(b[1]));
+    try conn.drainPendingCompleteReceipts(false);
 }
 
 test "a limit that breaks the terminal bound is InvalidConfig, not a small wrong store (t-3562)" {

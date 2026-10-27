@@ -311,8 +311,8 @@ test "zero stream window does not block other stream or control (session)" {
             else => {},
         };
     }
-    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &.{}, .end_stream = false } });
-    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 3, .status = 200, .headers = &.{}, .end_stream = false } });
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 200, .headers = &.{}, .end_stream = false } });
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 3, .status = 200, .headers = &.{}, .end_stream = false } });
     {
         const more = session.drainIntents();
         for (more) |*it| switch (it.*) {

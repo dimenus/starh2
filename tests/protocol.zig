@@ -211,7 +211,7 @@ test "RST_STREAM on a stream the server already closed is tolerated (RFC 9113 5.
 
     // The server completes the response, which closes stream 1 and drops it
     // from the live map.
-    try session.applyCommand(.{ .respond_headers = .{
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &.{},
@@ -306,7 +306,7 @@ test "WINDOW_UPDATE on a stream the server already closed is tolerated (RFC 9113
     try session.ingest(wire.items);
     freeIntents(session.drainIntents());
 
-    try session.applyCommand(.{ .respond_headers = .{
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &.{},

@@ -79,6 +79,20 @@ pub const OutboundFrame = struct {
     flags: frame.FrameFlags = .{},
     stream_id: u31 = 0,
     payload: []u8, // session-owned; released after write
+    /// The write ticket a handler waits on, carried by the frame it belongs
+    /// to: only `respond_headers` sets it, on the first frame of its own
+    /// block. The edge hands it to the scheduler with this frame, or fails it
+    /// if the frame is refused.
+    ticket: WireTicket = .none,
+};
+
+/// A handler's write ticket and its table slot (`Connection.tickets`). `id`
+/// 0 is no ticket.
+pub const WireTicket = struct {
+    id: u64,
+    slot: u32,
+
+    pub const none: WireTicket = .{ .id = 0, .slot = 0 };
 };
 
 pub const DispatchRequest = struct {
@@ -103,6 +117,10 @@ pub const AppCommand = union(enum) {
         status: u16,
         headers: []const hpack.HeaderField,
         end_stream: bool,
+        /// The ticket the handler waits on for these HEADERS, or `.none`. It
+        /// travels on the block's first frame, so it can only complete or
+        /// fail with this response.
+        ticket: WireTicket,
     },
     respond_data: struct {
         stream_id: u31,
@@ -884,7 +902,7 @@ pub const Session = struct {
     pub fn applyCommand(self: *Session, cmd: AppCommand) !void {
         if (self.terminal != .none) return;
         switch (cmd) {
-            .respond_headers => |r| try self.cmdHeaders(r.stream_id, r.status, r.headers, r.end_stream),
+            .respond_headers => |r| try self.cmdHeaders(r.stream_id, r.status, r.headers, r.end_stream, r.ticket),
             .respond_data => |r| try self.cmdData(r.stream_id, r.data, r.end_stream),
             .reset_stream => |r| try self.emitRst(r.stream_id, r.code),
             .ping => |opaque_data| {
@@ -1619,7 +1637,7 @@ pub const Session = struct {
         s.early_status = status;
         try self.pushIntentOrFailClosed(.{ .early_reject = .{ .stream_id = stream_id, .status = status } });
         // Also emit the HTTP response frames now so core stays self-contained for tests.
-        try self.cmdHeaders(stream_id, status, &.{}, true);
+        try self.cmdHeaders(stream_id, status, &.{}, true, .none);
     }
 
     fn isTombstoned(self: *const Session, id: u31) bool {
@@ -2069,7 +2087,7 @@ pub const Session = struct {
     /// `OutOfMemory`) leaves nothing queued and the caller may still answer
     /// the stream with something else. A half-queued block would be one the
     /// peer waits on forever.
-    fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool) !void {
+    fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool, ticket: WireTicket) !void {
         // A RST tombstone already released the map entry. Emitting HEADERS
         // after that is how a handler that took `session_mu` late queued a
         // body the scheduler can never emit (TLS stall: pending DATA, tomb_rst).
@@ -2123,6 +2141,7 @@ pub const Session = struct {
                 .payload = out,
                 .stream_id = stream_id,
                 .flags = flags,
+                .ticket = if (k == 0) ticket else .none,
             } }) catch unreachable;
         }
         built = 0;
@@ -2274,7 +2293,7 @@ test "response header bound: a block of exactly response_header_bytes is queued,
     var session = try headerBoundSession(gpa, gpa, limits);
     defer session.deinit();
 
-    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{
+    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &over,
@@ -2284,7 +2303,7 @@ test "response header bound: a block of exactly response_header_bytes is queued,
     // The stream is still open: the caller may answer it another way.
     try std.testing.expect(session.streams.get(1) != null);
 
-    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &fits, .end_stream = true } });
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 200, .headers = &fits, .end_stream = true } });
     try std.testing.expectEqual(@as(usize, 1), session.intentLen());
     freeTestIntents(gpa, session.drainIntents());
 }
@@ -2297,10 +2316,10 @@ test "response header bound: response_header_fields counts :status, and a respon
     defer session.deinit();
     const two = [_]hpack.HeaderField{ .{ .name = "x-a", .value = "1" }, .{ .name = "x-b", .value = "2" } };
     const three = [_]hpack.HeaderField{ .{ .name = "x-a", .value = "1" }, .{ .name = "x-b", .value = "2" }, .{ .name = "x-c", .value = "3" } };
-    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &three, .end_stream = false } }));
+    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 200, .headers = &three, .end_stream = false } }));
     try std.testing.expectEqual(@as(usize, 0), session.intentLen());
     // :status and two more is three fields: at the bound.
-    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &two, .end_stream = false } });
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 200, .headers = &two, .end_stream = false } });
     try std.testing.expectEqual(@as(usize, 1), session.intentLen());
     freeTestIntents(gpa, session.drainIntents());
 }
@@ -2321,7 +2340,7 @@ test "a header block above one frame is cut into HEADERS and CONTINUATION frames
     {
         var session = try headerBoundSession(gpa, gpa, limits);
         defer session.deinit();
-        try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &wide, .end_stream = true } });
+        try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 200, .headers = &wide, .end_stream = true } });
         const intents = session.drainIntents();
         defer freeTestIntents(gpa, intents);
         try std.testing.expectEqual(@as(usize, 3), intents.len);
@@ -2345,7 +2364,7 @@ test "a header block above one frame is cut into HEADERS and CONTINUATION frames
     var session = try headerBoundSession(failing.allocator(), gpa, limits);
     defer session.deinit();
     failing.fail_index = failing.alloc_index + 2;
-    try std.testing.expectError(error.OutOfMemory, session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &wide, .end_stream = true } }));
+    try std.testing.expectError(error.OutOfMemory, session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 200, .headers = &wide, .end_stream = true } }));
     try std.testing.expectEqual(@as(usize, 0), session.intentLen());
     try std.testing.expect(session.streams.get(1) != null);
 }
@@ -2375,7 +2394,7 @@ test "respond_headers after RST is StreamClosed" {
         };
     }
     try std.testing.expect(session.streams.get(1) == null);
-    try std.testing.expectError(error.StreamClosed, session.applyCommand(.{ .respond_headers = .{
+    try std.testing.expectError(error.StreamClosed, session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &.{},
@@ -2469,7 +2488,7 @@ test "a delayed reset of a stream whose tombstone was evicted queues no RST, and
     // Three streams end normally; the ring keeps the last two.
     for ([_]u31{ 1, 3, 5 }) |sid| {
         try openTestStream(&session, sid);
-        try session.applyCommand(.{ .respond_headers = .{ .stream_id = sid, .status = 204, .headers = &.{}, .end_stream = true } });
+        try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = sid, .status = 204, .headers = &.{}, .end_stream = true } });
     }
     try std.testing.expect(!session.isTombstoned(1));
     _ = countTerminalIntents(gpa, &session);
@@ -2675,7 +2694,7 @@ test "SETTINGS_INITIAL_WINDOW_SIZE negative send window holds queued DATA (real 
             else => {},
         };
     }
-    try session.applyCommand(.{ .respond_headers = .{
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &.{},
@@ -2923,7 +2942,7 @@ test "respond HEADERS allocates only the final frame" {
 
     const extra = [_]hpack_mod.HeaderField{.{ .name = "content-type", .value = "text/plain" }};
     const before = counting.allocations;
-    try session.applyCommand(.{ .respond_headers = .{
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &extra,
@@ -3003,7 +3022,7 @@ test "a refused final HEADERS is reset once: the tombstone of its END_STREAM doe
     _ = countTerminalIntents(gpa, &session);
     try openTestStream(&session, 1);
     // An empty response: HEADERS with END_STREAM closes the stream here.
-    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 204, .headers = &.{}, .end_stream = true } });
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 204, .headers = &.{}, .end_stream = true } });
     try std.testing.expect(!session.streams.contains(1));
     _ = countTerminalIntents(gpa, &session);
     // The handler's reset of a stream that ended normally queues no frame.

@@ -559,7 +559,7 @@ test "regression: >256 sequential streams reuse concurrency on same session" {
             }
         }
         if (respond_sid) |rsid| {
-            session.applyCommand(.{ .respond_headers = .{
+            session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
                 .stream_id = rsid,
                 .status = 200,
                 .headers = &.{},
