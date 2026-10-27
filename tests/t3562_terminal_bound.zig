@@ -296,6 +296,10 @@ fn clientRun(c: *Client) !void {
         if (!reading) {
             if (c.read_gate.load(.acquire)) {
                 reading = true;
+                // In every stall scenario, a peer that writes while the server
+                // may already be closing: on Linux, data that reaches a closed
+                // socket is answered with a reset, which drops what the client
+                // has not read yet, the GOAWAY included (`closeFlushed`).
                 var ping: [17]u8 = undefined;
                 _ = try frame.Serializer.ping(&ping, false, &alive_ping);
                 try w.send(&ping);
@@ -578,10 +582,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             };
             bound_ns = nowNs();
             if (scenario == .flood_unread) {
-                // Nothing can be written: only the closing deadline ends it.
-                // (h2c ends sooner: its writer is torn down about 100 ms after
-                // the GOAWAY is queued, close reason write_failed/ack_fail_all.
-                // This bound is an upper one.)
+                // Nothing can be delivered: only the closing deadline ends it.
                 const Live = struct { server: *starh2.Server };
                 waitFor("the connection to close", Live{ .server = &server }, struct {
                     fn f(x: Live) bool {

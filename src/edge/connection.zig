@@ -1806,6 +1806,10 @@ pub const Connection = struct {
     /// frames it already queued: the time after which it stops waiting for the
     /// peer. Null while the connection is open. See `runBody` ("Closing phase").
     closing_deadline_ns: ?u64 = null,
+    /// Closing phase, actor only: everything queued has reached the kernel and
+    /// the send side is shut (`closeFlushed`), and the peer's EOF has arrived.
+    closing_write_shut: bool = false,
+    closing_peer_eof: bool = false,
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
     session_mu: std.Io.Mutex = .init,
@@ -4402,7 +4406,10 @@ pub const Connection = struct {
             const chunk = maybe_chunk.?;
             // Closing phase: read and drop (an EOF too: the write side may
             // still be open, and the GOAWAY is for a peer that half-closed).
+            // The EOF is noted: once the output is flushed it ends the
+            // lingering close (`closeFlushed`).
             if (self.closing_deadline_ns != null) {
+                if (chunk.len == 0 and chunk.bytes.len == 0) self.closing_peer_eof = true;
                 self.recycleReadChunk(chunk);
                 continue;
             }
@@ -4942,12 +4949,29 @@ pub const Connection = struct {
     }
 
     /// The ONE place that decides the closing phase is over: everything queued
-    /// has been written, or the deadline passed, or the writer failed.
+    /// was written and the peer closed, or the deadline passed, or the writer
+    /// failed.
+    ///
+    /// Written means handed to the kernel, not delivered: on Linux the send
+    /// queue takes hundreds of KiB from a peer that is not reading, GOAWAY
+    /// included. Closing the socket then is not enough. If the peer writes
+    /// anything after the close (a WINDOW_UPDATE, a PING), the kernel answers
+    /// with a TCP RST (`TCPAbortOnData`), and the peer drops everything it has
+    /// not read yet, the GOAWAY with it: on nachos the flood test's client got
+    /// ECONNRESET with nothing read in about half the runs. So once flushed
+    /// the send side is shut (a FIN after the queued bytes), the actor keeps
+    /// reading and dropping, and the socket is closed when the peer closes its
+    /// side or the closing deadline passes (a lingering close).
     fn closeFlushed(self: *Connection, deadline_ns: u64) bool {
         self.assertSessionHeld("closeFlushed");
         if (self.writer_failed.load(.acquire)) return true;
         if (nowNs(self.config.io) >= deadline_ns) return true;
-        return self.outboundFlushed();
+        if (!self.outboundFlushed()) return false;
+        if (!self.closing_write_shut) {
+            self.closing_write_shut = true;
+            self.stream.shutdown(self.config.io, .send) catch {};
+        }
+        return self.closing_peer_eof;
     }
 
     /// True when nothing is left between Session and the socket: no intent,
