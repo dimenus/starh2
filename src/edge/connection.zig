@@ -291,6 +291,12 @@ pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
 /// stall really queued the frames it means to, and that none went past T.
 /// Counted in Debug and `-Dobserve=true`.
 pub var test_terminal_ring_high: std.atomic.Value(usize) = .init(0);
+/// Test-only: ORDINARY control frames (HEADERS and the like) the scheduler
+/// refused, by the pool (`PoolFull`) and by the ring (`QueueFull`). A handler
+/// whose response is refused sees `WriteFailed`. Counted in Debug and
+/// `-Dobserve=true`.
+pub var test_ctrl_ordinary_pool_full: std.atomic.Value(usize) = .init(0);
+pub var test_ctrl_ordinary_queue_full: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): actors that are inside their park select right
 /// now. Raised immediately before `zio.select` in `waitForActivity` and lowered
 /// right after it returns. A test whose handler must act while the actor is
@@ -6501,6 +6507,11 @@ pub const Connection = struct {
                             // drop the rest of the batch: the next intent is
                             // often `stream_reset` for this same RST.
                             if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
+                            if (comptime test_observe) {
+                                if (class != .terminal) {
+                                    if (err == error.PoolFull) _ = test_ctrl_ordinary_pool_full.fetchAdd(1, .monotonic) else _ = test_ctrl_ordinary_queue_full.fetchAdd(1, .monotonic);
+                                }
+                            }
                             self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
                             consumed = n;
                             // A fragment refused after its block began leaves

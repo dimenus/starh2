@@ -45,23 +45,39 @@ const client_deadline_ns = wire_client.client_deadline_ns;
 
 const dummy: u8 = 0;
 
+/// Ordinary control entries above M that the setup needs (see `runCase`).
+const ordinary_slack = 16;
+
 var started: std.atomic.Value(usize) = .init(0);
 var data_gate: std.atomic.Value(bool) = .init(false);
 var abort_gate: std.atomic.Value(bool) = .init(false);
 var aborted: std.atomic.Value(usize) = .init(0);
+/// Handlers whose `resp.start` returned an error, and the first such error.
+var start_failed: std.atomic.Value(usize) = .init(0);
+var first_start_err: std.atomic.Value(u16) = .init(0);
+/// Handlers that ran at all.
+var entered: std.atomic.Value(usize) = .init(0);
 
 fn resetGlobals() void {
     started.store(0, .release);
     data_gate.store(false, .release);
     abort_gate.store(false, .release);
     aborted.store(0, .release);
+    start_failed.store(0, .release);
+    first_start_err.store(0, .release);
+    entered.store(0, .release);
 }
 
 /// Starts its response (the HEADERS are written before the hold), writes a
 /// few KiB when the data gate opens (that fills the write memory, which
 /// pauses the terminal loop), and aborts when the abort gate opens.
 fn stall(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    var body = try resp.start(200, &.{});
+    _ = entered.fetchAdd(1, .acq_rel);
+    var body = resp.start(200, &.{}) catch |err| {
+        _ = start_failed.fetchAdd(1, .acq_rel);
+        _ = first_start_err.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+        return err;
+    };
     _ = started.fetchAdd(1, .acq_rel);
     while (!data_gate.load(.acquire)) try zio.sleep(.fromMilliseconds(2));
     const chunk: [2048]u8 = @splat('x');
@@ -247,6 +263,15 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     // Room for 2 intents per RST, so that T is the limit that fires.
     if (scenario != .flood_intents) limits.intent_entries_per_connection = 2048;
     const m = limits.max_streams_per_connection;
+    // The ordinary share holds a frame until its write completes, so M HEADERS
+    // in flight plus the server preface, the SETTINGS ack and a WINDOW_UPDATE
+    // fill a share of exactly M: with `control_entries_per_connection` = M, one
+    // run in about ten got `PoolFull` on a HEADERS and that handler's
+    // `resp.start` failed with `WriteFailed` (T3562-setup-timeout line,
+    // `ordinary_pool_full=1`). That is a limit of the ordinary share, older
+    // than t-3562 (it was 240 at c30c99b), and not what this gate tests, so the
+    // share gets slack here. The final assert checks that the slack was enough.
+    limits.control_entries_per_connection = m + ordinary_slack;
     const t_frames = try limits.terminalFrames();
     try std.testing.expectEqual(m + 3, t_frames);
 
@@ -264,6 +289,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     defer abort_gate.store(true, .release);
 
     const full_0 = conn_mod.test_ctrl_terminal_full.load(.monotonic);
+    const ordinary_full_0 = conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic);
     conn_mod.test_terminal_ring_high.store(0, .release);
 
     var c: Client = .{
@@ -283,11 +309,25 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     };
 
     // Every response has its HEADERS written before the hold.
-    try waitFor("every handler to start its response", m, struct {
+    waitFor("every handler to start its response", m, struct {
         fn f(x: usize) bool {
             return started.load(.acquire) >= x;
         }
-    }.f);
+    }.f) catch |err| {
+        const code = first_start_err.load(.acquire);
+        std.debug.print("T3562-setup-timeout m={d} entered={d} started={d} start_failed={d} first_start_err={s} client_done={} client_err={s} ordinary_pool_full={d} ordinary_queue_full={d}\n", .{
+            m,
+            entered.load(.acquire),
+            started.load(.acquire),
+            start_failed.load(.acquire),
+            if (code == 0) "-" else @errorName(@errorFromInt(code)),
+            c.done.load(.acquire),
+            if (c.err) |e| @errorName(e) else "-",
+            conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic),
+            conn_mod.test_ctrl_ordinary_queue_full.load(.monotonic),
+        });
+        return err;
+    };
 
     // Hold the writer, then let the handlers write: the DATA fills the write
     // memory, which pauses the terminal loop.
@@ -350,6 +390,8 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     });
 
     if (c.err) |e| return e;
+    // The slack was enough: no ordinary frame was refused by the pool.
+    try std.testing.expectEqual(ordinary_full_0, conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic));
     // The failure is not a terminal frame that could not be queued.
     try std.testing.expectEqual(@as(usize, 0), full);
     // The instrument ran: the stall queued the frames, and none went past T.
