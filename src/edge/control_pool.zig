@@ -5,18 +5,26 @@
 //! SETTINGS produces a matching flood of acks, so an unbounded control queue is
 //! a memory target that costs the peer almost nothing.
 //!
-//! The pool is split rather than merely capped. Ordinary controls may use only
-//! `max - reserve`; terminal frames may use the whole pool. The reserved slice
-//! is what guarantees a connection can always emit the GOAWAY or RST_STREAM
-//! that ENDS the flood. Without it, the frame that stops the attack is the one
-//! frame the attack has already made impossible.
+//! The pool is two shares in one counter. Ordinary controls may use only the
+//! ordinary share (`Limits.control_*_per_connection`). Terminal frames
+//! (GOAWAY, RST_STREAM) may use the whole pool: the ordinary share plus a
+//! terminal share of their own, `Limits.terminalFrames` entries and
+//! `Limits.terminalBytes` bytes. Ordinary frames never hold more than the
+//! ordinary share, so the terminal share is always free for the frames that
+//! END a flood. Without it, the frame that stops the attack is the one frame
+//! the attack has already made impossible.
+//!
+//! The terminal share is T = M + 3 because a well-behaved peer can have at
+//! most M unwritten RST_STREAMs (one per stream it still counts as open) and
+//! three GOAWAYs outstanding; see `Limits.terminalFrames`. The terminal ring
+//! (`FairScheduler.terminal_q`) and the terminal frame store
+//! (`Connection.terminal_store`) hold the same T.
 //!
 //! Occupancy is held from the moment a frame is queued until its write
 //! completes, and not merely until it is emitted. Bytes waiting in the write
 //! queue are real memory, so releasing them at emit time would report capacity
 //! the connection does not have.
 const std = @import("std");
-const limits_mod = @import("../core/limits.zig");
 
 /// The starvation bound. Controls drain before DATA, so a peer that keeps a
 /// control frame always available would otherwise stop every response body on
@@ -24,33 +32,45 @@ const limits_mod = @import("../core/limits.zig");
 /// this many controls the scheduler forces one DATA quantum, which converts
 /// unbounded starvation into a bounded delay.
 pub const CONTROL_BEFORE_DATA: usize = 64;
-pub const TERMINAL_CONTROL_RESERVE_BYTES = limits_mod.TERMINAL_CONTROL_RESERVE_BYTES;
-pub const TERMINAL_CONTROL_RESERVE_ENTRIES = limits_mod.TERMINAL_CONTROL_RESERVE_ENTRIES;
-
 pub const ControlPool = struct {
+    /// Ordinary share plus terminal share.
     max_bytes: usize,
     max_entries: usize,
+    terminal_bytes: usize,
+    terminal_entries: usize,
     bytes_held: std.atomic.Value(usize) = .init(0),
     entries_held: std.atomic.Value(usize) = .init(0),
     controls_since_data: usize = 0,
 
-    pub fn init(max_bytes: usize, max_entries: usize) ControlPool {
-        return .{ .max_bytes = max_bytes, .max_entries = max_entries };
+    /// The ordinary share and the terminal share are separate arguments, so
+    /// no caller can size the pool without saying how much is terminal.
+    pub fn init(ordinary_bytes: usize, ordinary_entries: usize, terminal_bytes: usize, terminal_entries: usize) ControlPool {
+        return .{
+            .max_bytes = ordinary_bytes + terminal_bytes,
+            .max_entries = ordinary_entries + terminal_entries,
+            .terminal_bytes = terminal_bytes,
+            .terminal_entries = terminal_entries,
+        };
     }
 
     pub fn ordinaryCaps(self: *const ControlPool) struct { bytes: usize, entries: usize } {
-        if (self.max_bytes <= TERMINAL_CONTROL_RESERVE_BYTES or self.max_entries <= TERMINAL_CONTROL_RESERVE_ENTRIES) {
-            return .{ .bytes = 0, .entries = 0 };
-        }
         return .{
-            .bytes = self.max_bytes - TERMINAL_CONTROL_RESERVE_BYTES,
-            .entries = self.max_entries - TERMINAL_CONTROL_RESERVE_ENTRIES,
+            .bytes = self.max_bytes - self.terminal_bytes,
+            .entries = self.max_entries - self.terminal_entries,
         };
+    }
+
+    /// Entries and bytes not held by anything. Terminal admission reads it.
+    pub fn freeEntries(self: *const ControlPool) usize {
+        return self.max_entries - @min(self.max_entries, self.entries_held.load(.acquire));
+    }
+
+    pub fn freeBytes(self: *const ControlPool) usize {
+        return self.max_bytes - @min(self.max_bytes, self.bytes_held.load(.acquire));
     }
 
     pub fn tryReserveOrdinary(self: *ControlPool, n: usize) bool {
         const caps = self.ordinaryCaps();
-        if (caps.bytes == 0 or caps.entries == 0) return false;
         while (true) {
             const cur_e = self.entries_held.load(.acquire);
             const cur_b = self.bytes_held.load(.acquire);
@@ -68,7 +88,7 @@ pub const ControlPool = struct {
         return self.entries_held.load(.acquire) < self.ordinaryCaps().entries;
     }
 
-    /// Terminal / required ACK / SETTINGS ACK — may consume the reserved slice.
+    /// Terminal / required ACK / SETTINGS ACK — may consume the terminal share.
     pub fn tryReserveTerminal(self: *ControlPool, n: usize) bool {
         while (true) {
             const cur_e = self.entries_held.load(.acquire);
@@ -106,11 +126,14 @@ pub const ControlPool = struct {
 
 };
 
+const test_terminal_entries: usize = 16;
+const test_terminal_bytes: usize = 4 * 1024;
+
 test "ordinary pool leaves terminal reserve" {
-    var pool = ControlPool.init(64 * 1024, 256);
+    var pool = ControlPool.init(64 * 1024, 256, test_terminal_bytes, test_terminal_entries);
     const caps = pool.ordinaryCaps();
-    try std.testing.expectEqual(@as(usize, 64 * 1024 - TERMINAL_CONTROL_RESERVE_BYTES), caps.bytes);
-    try std.testing.expectEqual(@as(usize, 256 - TERMINAL_CONTROL_RESERVE_ENTRIES), caps.entries);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), caps.bytes);
+    try std.testing.expectEqual(@as(usize, 256), caps.entries);
 
     var i: usize = 0;
     while (i < caps.entries) : (i += 1) {
@@ -128,7 +151,7 @@ test "ordinary pool leaves terminal reserve" {
 // asserts both directions: DATA is forced often enough, and no gap ever
 // exceeds the bound.
 test "10k nonterminal controls force DATA at <=64 gaps" {
-    var pool = ControlPool.init(64 * 1024, 256);
+    var pool = ControlPool.init(64 * 1024, 256, test_terminal_bytes, test_terminal_entries);
     var max_gap: usize = 0;
     var gap: usize = 0;
     var data_quanta: usize = 0;
@@ -148,7 +171,7 @@ test "10k nonterminal controls force DATA at <=64 gaps" {
 }
 
 test "exact occupancy release asserts once" {
-    var pool = ControlPool.init(64 * 1024, 256);
+    var pool = ControlPool.init(64 * 1024, 256, test_terminal_bytes, test_terminal_entries);
     try std.testing.expect(pool.tryReserveOrdinary(100));
     try std.testing.expectEqual(@as(usize, 100), pool.bytes_held.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), pool.entries_held.load(.acquire));
@@ -162,7 +185,7 @@ test "release of N entries matches N reserves" {
     // stays held until that write completes, so the completion must release
     // every reserved entry, not a bool's worth. Releasing 1 after 3 reserves
     // would leak two entries for the life of the connection.
-    var pool = ControlPool.init(64 * 1024, 256);
+    var pool = ControlPool.init(64 * 1024, 256, test_terminal_bytes, test_terminal_entries);
     try std.testing.expect(pool.tryReserveOrdinary(10));
     try std.testing.expect(pool.tryReserveOrdinary(20));
     try std.testing.expect(pool.tryReserveOrdinary(30));
@@ -176,7 +199,7 @@ test "releasing one entry after three reserves leaves occupancy that starves ord
     // The bool-shaped WireChunk. The completion looks successful and the
     // connection stays up, while two slots never return. A later HEADERS then
     // hits PoolFull on a connection that is not actually full.
-    var pool = ControlPool.init(64 * 1024, 256);
+    var pool = ControlPool.init(64 * 1024, 256, test_terminal_bytes, test_terminal_entries);
     const caps = pool.ordinaryCaps();
     try std.testing.expect(pool.tryReserveOrdinary(10));
     try std.testing.expect(pool.tryReserveOrdinary(20));
@@ -191,7 +214,7 @@ test "releasing one entry after three reserves leaves occupancy that starves ord
 }
 
 test "byte-only release does not drop an entry" {
-    var pool = ControlPool.init(64 * 1024, 256);
+    var pool = ControlPool.init(64 * 1024, 256, test_terminal_bytes, test_terminal_entries);
     try std.testing.expect(pool.tryReserveOrdinary(100));
     pool.release(100, 0);
     try std.testing.expectEqual(@as(usize, 0), pool.bytes_held.load(.acquire));

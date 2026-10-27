@@ -161,12 +161,20 @@ pub var control_frames_built: std.atomic.Value(u64) = .init(0);
 /// process: the work counter for the idle-sweep list. The bench server prints it.
 pub var body_idle_expiries: std.atomic.Value(u64) = .init(0);
 
-/// What a frame is for, when the edge decides which buffer it gets. A GOAWAY
-/// or RST_STREAM is `terminal`: the frame that ends a flood, or a connection,
-/// must not be refused for the memory the flood already took, so the edge keeps
-/// slabs for these that every other frame leaves alone (the frame pool twin of
-/// `ControlPool`'s terminal reserve).
-pub const FrameClass = enum { ordinary, terminal };
+/// What a frame is for, when the edge decides which buffer it gets.
+///
+/// An RST_STREAM and a graceful GOAWAY are `terminal`; the GOAWAY that ends
+/// the connection is `final_goaway`. Neither is built in a frame slab: the
+/// edge has a store of `Limits.terminalFrames` fixed slots for them, and
+/// admits a `terminal` frame only while one slot, one terminal ring entry and
+/// one pool entry stay free for the final GOAWAY. So the frame that ends a
+/// flood is never refused for the room the flood already took.
+///
+/// A refused `terminal` frame means the peer holds more unwritten terminal
+/// frames than a well-behaved peer can (`Limits.terminalFrames`); the session
+/// answers it with `failConnection(.enhance_your_calm)`. A refused
+/// `final_goaway` is a broken invariant.
+pub const FrameClass = enum { ordinary, terminal, final_goaway };
 
 /// Where a header block is decoded.
 pub const HeaderListMem = union(enum) {
@@ -674,7 +682,7 @@ pub const Session = struct {
         const last = self.last_processed_stream;
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, .internal_error, &.{});
-        const p = self.controlFrame(buf[0..n], .terminal) catch return error.OutOfMemory;
+        const p = self.controlFrame(buf[0..n], .final_goaway) catch return error.OutOfMemory;
         self.pushIntent(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } }) catch {
             self.freeFrame(p);
             self.terminal = .{ .goaway = .{ .code = .internal_error, .last_stream_id = last } };
@@ -836,10 +844,18 @@ pub const Session = struct {
         }
     }
 
+    /// A graceful GOAWAY (phase 1 or 2). The edge refuses it only when the peer
+    /// has too many unwritten terminal frames, and then the connection ends
+    /// with ENHANCE_YOUR_CALM instead.
     fn emitGoawayNoTerminal(self: *Session, last: u31, code: frame.ErrorCode) !void {
         var buf: [32]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, code, &.{});
-        const p = try self.controlFrame(buf[0..n], .terminal);
+        const p = self.controlFrame(buf[0..n], .terminal) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try self.failConnection(.enhance_your_calm);
+                return;
+            },
+        };
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } });
     }
 
@@ -847,6 +863,8 @@ pub const Session = struct {
         if (self.grace_phase != .none or self.terminal != .none) return;
         // Graceful shutdown: GOAWAY NO_ERROR with last-stream-ID 2^31-1, then PING.
         try self.emitGoawayNoTerminal(std.math.maxInt(u31), .no_error);
+        // The GOAWAY may have ended the connection instead (flood).
+        if (self.terminal != .none) return;
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.ping(&buf, false, &self.grace_ping);
         const p = try self.controlFrame(buf[0..n], .ordinary);
@@ -855,10 +873,13 @@ pub const Session = struct {
         self.grace_ping_acked = false;
     }
 
+    /// At most once: phase 2 is one of the three GOAWAYs `Limits.terminalFrames`
+    /// counts.
     fn beginGracefulPhase2(self: *Session) !void {
-        if (self.terminal != .none) return;
+        if (self.terminal != .none or self.grace_phase == .phase2) return;
         const last = self.highest_peer_stream;
         try self.emitGoawayNoTerminal(last, .no_error);
+        if (self.terminal != .none) return;
         self.goaway_ceiling = last;
         self.grace_phase = .phase2;
     }
@@ -871,11 +892,17 @@ pub const Session = struct {
         try self.failConnectionWith(code, self.last_processed_stream);
     }
 
+    /// The GOAWAY that ends the connection, at most once: a second failure in
+    /// the same read chunk finds `terminal` set and queues nothing, because the
+    /// first GOAWAY already said why. This is the third of the GOAWAYs
+    /// `Limits.terminalFrames` counts, and the edge keeps a slot, a ring entry
+    /// and a pool entry free for it (`FrameClass.final_goaway`).
     fn failConnectionWith(self: *Session, code: frame.ErrorCode, last: u31) !void {
         if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .fail_connection, .code = code, .stream_id = last });
+        if (self.terminal != .none) return;
         var buf: [32]u8 = undefined;
         const n = try frame.Serializer.goaway(&buf, last, code, &.{});
-        const p = try self.controlFrame(buf[0..n], .terminal);
+        const p = try self.controlFrame(buf[0..n], .final_goaway);
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .goaway, .payload = p } });
         try self.pushIntentOrFailClosed(.{ .connection_error = .{ .code = code, .last_stream_id = last } });
         self.terminal = .{ .goaway = .{ .code = code, .last_stream_id = last } };
@@ -917,11 +944,53 @@ pub const Session = struct {
         self.stream_removes += 1;
     }
 
+    /// Whether an RST_STREAM for `stream_id` still has something to tell the
+    /// peer: the peer counts the stream open, no RST for it is queued yet, and
+    /// the connection is not already ending.
+    ///
+    /// This is what makes `Limits.terminalFrames` true. Every RST that waits
+    /// unwritten is for a DISTINCT stream the peer cannot have closed, because
+    /// the RST is what closes it, so a well-behaved peer (at most
+    /// `max_streams_per_connection` streams open in its view) never has more
+    /// than M of them. The three cases:
+    /// - A stream in the map is open for the peer unless it is `.closed`.
+    /// - A stream not in the map was either closed (it has a tombstone: a
+    ///   normal end, a peer RST, or an RST this server queued) or was refused
+    ///   before it was admitted. A refused stream has no map entry, so
+    ///   `emitRst` tombstones it when it queues the RST, and a second refusal
+    ///   of the same id finds the tombstone.
+    /// - Once `terminal` is set the GOAWAY already covers every stream, and
+    ///   more RSTs would only use the room the final GOAWAY was kept.
+    /// A tombstone evicted from the bounded ring can let a very old closed id
+    /// pass this test. Only a server-side reset of a stream that long gone
+    /// reaches it (the peer cannot name such an id: HEADERS on it is a
+    /// connection error), and the flood limit still bounds the result.
+    fn rstOwed(self: *const Session, stream_id: u31) bool {
+        if (self.terminal != .none) return false;
+        if (self.streams.getPtr(stream_id)) |s| return s.state != .closed;
+        return !self.isTombstoned(stream_id);
+    }
+
+    /// Queue an RST_STREAM at most once per stream (`rstOwed`), and always run
+    /// the local half: the `stream_reset` intent (scheduler cleanup, waking the
+    /// handler) and the concurrency release happen whether or not a frame was
+    /// queued, because the slow-consumer sweep and the handler paths need them
+    /// for a stream that is already closed on the wire.
+    ///
+    /// A frame the edge refuses (`controlFrame` OutOfMemory) means the peer
+    /// holds more unwritten terminal frames than a well-behaved peer can
+    /// (`Limits.terminalFrames`): the connection ends with ENHANCE_YOUR_CALM.
     fn emitRst(self: *Session, stream_id: u31, code: frame.ErrorCode) !void {
-        var buf: [13]u8 = undefined;
-        const n = try frame.Serializer.rstStream(&buf, stream_id, code);
-        const p = try self.controlFrame(buf[0..n], .terminal);
-        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .rst_stream, .payload = p, .stream_id = stream_id } });
+        if (self.rstOwed(stream_id)) {
+            var buf: [13]u8 = undefined;
+            const n = try frame.Serializer.rstStream(&buf, stream_id, code);
+            if (self.controlFrame(buf[0..n], .terminal)) |p| {
+                try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .rst_stream, .payload = p, .stream_id = stream_id } });
+                if (!self.streams.contains(stream_id)) try self.addTombstone(stream_id, code);
+            } else |err| switch (err) {
+                error.OutOfMemory => try self.failConnection(.enhance_your_calm),
+            }
+        }
         try self.pushIntentOrFailClosed(.{ .stream_reset = .{ .stream_id = stream_id, .code = code, .from_peer = false } });
         if (self.streams.getPtr(stream_id)) |s| {
             s.onRst();

@@ -99,8 +99,10 @@ pub const MIN_WRITE_POOL_CHUNKS: usize = wire_const.POP_PUSHES + 1;
 /// The most frames one response header block may be cut into. `cmdHeaders`
 /// builds them all or none, so it keeps their buffers in a fixed array.
 pub const MAX_HEADER_FRAGMENTS: usize = 8;
-pub const TERMINAL_CONTROL_RESERVE_BYTES: usize = 4 * 1024;
-pub const TERMINAL_CONTROL_RESERVE_ENTRIES: usize = 16;
+/// The GOAWAYs one connection may queue: graceful phase 1, graceful phase 2,
+/// and the final one that ends the connection (`Session.beginGracefulPhase1`,
+/// `beginGracefulPhase2`, `failConnectionWith`). Each is queued at most once.
+pub const TERMINAL_GOAWAYS: usize = 3;
 
 /// Lower bound on `compression_context_bytes` for a quality/window pair.
 ///
@@ -114,6 +116,13 @@ pub fn minBrotliContextBytes(window_bits: u8, quality: u8) usize {
     // 1 MiB fixed slack covers multi-flush SSE residency (q5/w19 ~2.2 MiB peak).
     const q: usize = quality;
     return window_bytes * 4 + q * 128 * 1024 + 1024 * 1024;
+}
+
+comptime {
+    // `terminalBytes` counts a GOAWAY as `goaway_frame_bytes`, which has no
+    // debug data. If the server ever sends debug data, T's bytes and the
+    // terminal store's slots are too small and this must change with it.
+    if (frame.goaway_frame_bytes != frame.FRAME_HEADER_LEN + 8) @compileError("GOAWAY carries debug data: terminal byte room and the terminal store slot size are derived without it");
 }
 
 pub const Limits = struct {
@@ -179,6 +188,11 @@ pub const Limits = struct {
     /// size three times: `head_buf`, `name_scratch`, and the head prefix of
     /// `carry_buf`.
     h1_head_bytes: usize = 16 * 1024,
+    /// The ORDINARY control-frame share of one connection (SETTINGS acks, PING
+    /// acks, WINDOW_UPDATE, HEADERS). Terminal frames (RST_STREAM, GOAWAY)
+    /// have a room of their own on top of it, derived from
+    /// `max_streams_per_connection` (`terminalFrames`, `terminalBytes`), so
+    /// these two numbers never shrink the room a connection has to end itself.
     control_bytes_per_connection: usize = 64 * 1024,
     control_entries_per_connection: usize = 256,
     stream_tombstones: usize = 1_024,
@@ -306,30 +320,51 @@ pub const Limits = struct {
         if (self.inbound_wire_chunks_per_connection < H2C_MIN_WRITE_QUEUE_CHUNKS) return error.InvalidConfig;
     }
 
-    /// Slabs of the frame pool that only terminal frames (GOAWAY, RST_STREAM)
-    /// may take: a quarter of the pool, at most the 16 entries `ControlPool`
-    /// reserves. `Connection.init` reads it from here.
-    pub fn frameSlabReserve(self: Limits) usize {
-        return @min(TERMINAL_CONTROL_RESERVE_ENTRIES, self.frame_slabs_per_connection / 4);
+    /// T: the most terminal frames (RST_STREAM and GOAWAY) a well-behaved
+    /// peer's connection can need unwritten at once.
+    ///
+    /// A well-behaved peer never has more than `max_streams_per_connection`
+    /// (M) streams open in its own view, and an unwritten RST_STREAM is for a
+    /// stream the peer still counts as open, because the RST is what closes
+    /// it. `Session.emitRst` queues at most one RST per stream, so M RSTs are
+    /// the most that can wait. Add the `TERMINAL_GOAWAYS` GOAWAYs and
+    /// T = M + 3. This is the one number: the terminal ring, the control
+    /// pool's terminal share and the terminal frame store all hold T, and
+    /// `Connection.init` refuses to boot if they differ. More than T is a peer
+    /// that is not well-behaved.
+    pub fn terminalFrames(self: Limits) error{InvalidConfig}!usize {
+        return checkedAdd(self.max_streams_per_connection, TERMINAL_GOAWAYS);
+    }
+
+    /// The control pool bytes for T terminal frames: M RST_STREAMs and three
+    /// GOAWAYs. A GOAWAY carries no debug data in this server, which the
+    /// comptime check below keeps true.
+    pub fn terminalBytes(self: Limits) error{InvalidConfig}!usize {
+        return checkedAdd(
+            try checkedMul(self.max_streams_per_connection, frame.rst_stream_frame_bytes),
+            TERMINAL_GOAWAYS * frame.goaway_frame_bytes,
+        );
+    }
+
+    /// The control pool's whole room: the ordinary share plus the terminal
+    /// share. Ordinary frames may use only the first part.
+    pub fn controlPoolEntries(self: Limits) error{InvalidConfig}!usize {
+        return checkedAdd(self.control_entries_per_connection, try self.terminalFrames());
+    }
+
+    pub fn controlPoolBytes(self: Limits) error{InvalidConfig}!usize {
+        return checkedAdd(self.control_bytes_per_connection, try self.terminalBytes());
     }
 
     /// Boot check for the frame pool. A connection queues its two preface
-    /// frames (SETTINGS, WINDOW_UPDATE) at birth and must always be able to
-    /// make a GOAWAY or RST_STREAM, so the pool has to hold them:
-    /// - a slab holds the biggest control frame (the preface SETTINGS, 45
-    ///   bytes; sized by encoded frames, not by their 9-byte header), because a
-    ///   control frame that does not fit a slab needs a write chunk, and the
-    ///   chunks are not reserved for them;
-    /// - the terminal reserve is above zero, which a pool under 4 slabs does
-    ///   not give, and the two preface frames fit above it (they are ordinary
-    ///   frames).
-    /// Anything smaller passed `resourceUpperBound` before and then could not
-    /// boot a connection.
+    /// frames (SETTINGS, WINDOW_UPDATE) at birth, and a slab holds the biggest
+    /// control frame (the preface SETTINGS, 45 bytes; sized by encoded frames,
+    /// not by their 9-byte header), because a control frame that does not fit
+    /// a slab needs a write chunk, and the chunks are not reserved for them.
+    /// Terminal frames do not use this pool (`Connection.terminal_store`).
     pub fn checkFramePool(self: Limits) error{InvalidConfig}!void {
         if (self.frame_slab_bytes < frame.max_control_frame_bytes) return error.InvalidConfig;
-        const reserve = self.frameSlabReserve();
-        if (reserve == 0) return error.InvalidConfig;
-        if (self.frame_slabs_per_connection < reserve + 2) return error.InvalidConfig;
+        if (self.frame_slabs_per_connection < 2) return error.InvalidConfig;
     }
 
     /// The size of a connection slot's boot buffer for `mode`: exactly the
@@ -432,11 +467,12 @@ pub const Limits = struct {
         if (self.request_bytes_per_connection < first_block) return error.InvalidConfig;
         if (first_block > self.request_arena_bytes) return error.InvalidConfig;
         // Ordinary SETTINGS/HEADERS must fit without consuming the terminal
-        // GOAWAY/RST/ACK reserve. Without a reserve, a connection that fills its
-        // control pool cannot emit the GOAWAY that says why, so it fails silent
-        // instead of fail-closed.
-        if (self.control_bytes_per_connection <= TERMINAL_CONTROL_RESERVE_BYTES) return error.InvalidConfig;
-        if (self.control_entries_per_connection <= TERMINAL_CONTROL_RESERVE_ENTRIES) return error.InvalidConfig;
+        // GOAWAY/RST room, which is derived (`terminalFrames`) and added on top
+        // of these two numbers, so they only have to be above zero.
+        if (self.control_bytes_per_connection == 0) return error.InvalidConfig;
+        if (self.control_entries_per_connection == 0) return error.InvalidConfig;
+        _ = try self.controlPoolEntries();
+        _ = try self.controlPoolBytes();
         // Zero would close before the GOAWAY is written, the defect this limit exists to remove.
         if (self.close_flush_timeout_ns == 0) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
@@ -476,7 +512,7 @@ pub const Limits = struct {
         // request, outbound and control budgets.
         // The request budget is a share of the server pool and costs nothing
         // extra.
-        terms.on_demand_conn = try checkedAdd(self.outbound_bytes_per_connection, self.control_bytes_per_connection);
+        terms.on_demand_conn = try checkedAdd(self.outbound_bytes_per_connection, try self.controlPoolBytes());
         // head_buf, name_scratch, and the head prefix of carry_buf (init in edge/h1.zig).
         terms.h1_head = try checkedMul(self.max_connections, try checkedMul(self.h1_head_bytes, 3));
         // body_buf plus the body-sized suffix of carry_buf (init in edge/h1.zig).

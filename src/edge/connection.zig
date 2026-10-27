@@ -115,6 +115,7 @@ const limits_mod = @import("../core/limits.zig");
 const wire_const = @import("../core/wire_const.zig");
 const boot_plan = @import("../core/boot_plan.zig");
 const conn_slot = @import("conn_slot.zig");
+const builtin = @import("builtin");
 const frame = @import("../core/frame.zig");
 const request = @import("../http/request.zig");
 const response = @import("../http/response.zig");
@@ -718,6 +719,8 @@ pub const outbound_memory = struct {
     /// Frames `rentFrame` served, and which pool each came from.
     pub var frames_built: std.atomic.Value(u64) = .init(0);
     pub var frames_from_slab: std.atomic.Value(u64) = .init(0);
+    /// ... or from the terminal store (RST_STREAM and GOAWAY).
+    pub var frames_from_terminal_store: std.atomic.Value(u64) = .init(0);
     pub var frames_from_chunk: std.atomic.Value(u64) = .init(0);
     /// ... or written straight into the drain-turn scratch (small DATA).
     pub var frames_in_scratch: std.atomic.Value(u64) = .init(0);
@@ -1938,8 +1941,14 @@ pub const Connection = struct {
     /// it spawns read it without a race. Only `notePlacement` reads it.
     actor_thread: std.Thread.Id = 0,
     frame_pool: slab_pool.SlabPool = undefined,
-    /// Slabs of `frame_pool` that only terminal frames may take. Set in `init`.
-    frame_slab_reserve: usize = 0,
+    /// Where RST_STREAM and GOAWAY frames are built: `Limits.terminalFrames`
+    /// (T) fixed slots, each as big as the biggest terminal frame (a GOAWAY
+    /// with no debug data). They never take a frame slab or a write chunk, so
+    /// no other frame can leave a terminal frame without room. A slot is taken
+    /// when the frame is built (`rentTerminal`, which refuses past the bound)
+    /// and returned when the frame's bytes are copied out or written
+    /// (`releaseWireBytes`).
+    terminal_store: slab_pool.SlabPool = undefined,
     /// True while the scheduler's `buildData` callback makes a DATA frame, the
     /// one frame built inside a pop. See `rentFrame`. Written and read under
     /// `session_mu`.
@@ -2020,7 +2029,8 @@ pub const Connection = struct {
         // `init` narrows both counts to `u32`. The plan refuses a larger one
         // where the count is used: `SlabPool.planBoot` for the chunks and
         // `Plan.hashMap` for the streams.
-        const ticket_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
+        const ticket_n = try boot_plan.add(try limits.controlPoolEntries(), max_streams);
+        const ack_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
         const read_ch_n = try boot_plan.add(n_chunks, 1);
         const leases_n = try boot_plan.add(try boot_plan.mul(max_streams, 2), 1);
         const read_chunk_bytes = try boot_plan.mul(n_chunks, limits_mod.WIRE_CHUNK_SIZE);
@@ -2036,7 +2046,7 @@ pub const Connection = struct {
         try plan.array(session_mod.DispatchRequest, max_streams); // parked
         try plan.array(?zio.JoinHandle(void), max_streams);
         try plan.array(u31, max_streams); // completion_ch_buf
-        try plan.array(wire_pump.WriteCompletion, ticket_n);
+        try plan.array(wire_pump.WriteCompletion, ack_n);
         try plan.array(ticket_table.TicketWait, ticket_n);
         try plan.array(u8, emit_batch.max_plaintext);
         try plan.array(u8, read_chunk_bytes); // read_chunk_storage
@@ -2047,6 +2057,7 @@ pub const Connection = struct {
             try plan.array(wire_pump.WireChunk, try boot_plan.add(n_chunks, tls_edge.Pump.extra_stash_slots));
         }
         try slab_pool.SlabPool.planBoot(plan, limits.frame_slab_bytes, limits.frame_slabs_per_connection); // frame_pool
+        try slab_pool.SlabPool.planBoot(plan, frame.goaway_frame_bytes, try limits.terminalFrames()); // terminal_store
         try plan.array(u31, max_streams); // sid_scratch
         try plan.array(u31, max_streams); // inline_sids
         try plan.array(zio.Event, max_streams); // space_events
@@ -2054,7 +2065,7 @@ pub const Connection = struct {
         try plan.array(session_mod.Intent, @max(limits.intent_entries_per_connection, 16)); // intent_batch
         try fair_scheduler.FairScheduler.planBoot(
             plan,
-            @max(limits.control_entries_per_connection / 8, 16),
+            try limits.terminalFrames(),
             limits.control_entries_per_connection,
             max_streams,
         );
@@ -2166,7 +2177,7 @@ pub const Connection = struct {
         errdefer boot.free(completion_ch_buf);
         const write_ack_buf = try boot.alloc(wire_pump.WriteCompletion, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
         errdefer boot.free(write_ack_buf);
-        const ticket_slots = try boot.alloc(ticket_table.TicketWait, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
+        const ticket_slots = try boot.alloc(ticket_table.TicketWait, try config.limits.controlPoolEntries() + config.limits.max_streams_per_connection);
         errdefer boot.free(ticket_slots);
         const plaintext_scratch = try boot.alloc(u8, emit_batch.max_plaintext);
         errdefer boot.free(plaintext_scratch);
@@ -2193,6 +2204,9 @@ pub const Connection = struct {
             config.limits.frame_slabs_per_connection,
         );
         errdefer frame_pool.deinit(boot);
+        const terminal_frames = try config.limits.terminalFrames();
+        var terminal_store = try slab_pool.SlabPool.init(boot, config.io, frame.goaway_frame_bytes, terminal_frames);
+        errdefer terminal_store.deinit(boot);
         const sid_scratch = try boot.alloc(u31, config.limits.max_streams_per_connection);
         errdefer boot.free(sid_scratch);
         const inline_sids = try boot.alloc(u31, config.limits.max_streams_per_connection);
@@ -2208,18 +2222,22 @@ pub const Connection = struct {
             if (config.tls_acceptor == null) return error.InvalidConfig;
         }
 
-        const term_cap = @max(config.limits.control_entries_per_connection / 8, 16);
         var sched = try fair_scheduler.FairScheduler.init(
             boot,
             config.io,
             config.limits.control_bytes_per_connection,
             config.limits.control_entries_per_connection,
-            term_cap,
-            config.limits.control_entries_per_connection,
+            try config.limits.terminalBytes(),
+            terminal_frames,
             config.limits.max_streams_per_connection,
             config.slab_pool,
         );
         errdefer sched.deinit();
+        // One number sizes all three, and a construction that ever stops doing
+        // so must not boot: the bound `Limits.terminalFrames` derives holds
+        // only while the ring, the pool's terminal share and the store agree.
+        if (sched.terminal_q.len != terminal_frames or sched.ctrl.terminal_entries != terminal_frames or
+            terminal_store.capacity != terminal_frames) return error.InvalidConfig;
 
         var self: Connection = .{
             .stream = stream,
@@ -2248,7 +2266,7 @@ pub const Connection = struct {
             .tls_read_buf = tls_read_buf,
             .tls_write_buf = tls_write_buf,
             .frame_pool = frame_pool,
-            .frame_slab_reserve = config.limits.frameSlabReserve(),
+            .terminal_store = terminal_store,
             .read_pool_n = n_chunks,
             .sid_scratch = sid_scratch,
             .inline_sids = inline_sids,
@@ -2445,6 +2463,7 @@ pub const Connection = struct {
         }
         self.sched.releaseHeld();
         self.frame_pool.assertAllReturned();
+        self.terminal_store.assertAllReturned();
         self.write_pool.assertAllReturned();
         if (self.tls) |tls_conn| {
             // The slot (or whoever created it) owns the memory.
@@ -2547,6 +2566,7 @@ pub const Connection = struct {
         }
         if (self.write_pool.rentedCount() != 0) return "write pool chunk still rented";
         if (self.frame_pool.rentedCount() != 0) return "frame pool slab still rented";
+        if (self.terminal_store.rentedCount() != 0) return "terminal frame store slot still rented";
         if (self.sched.terminal_len != 0 or self.sched.ordinary_len != 0 or self.sched.framed_len != 0) {
             return "scheduler still holds a queued frame";
         }
@@ -2580,6 +2600,7 @@ pub const Connection = struct {
     fn freeBoot(self: *Connection) void {
         const boot = self.boot;
         self.sched.deinit();
+        self.terminal_store.deinit(boot);
         self.frame_pool.deinit(boot);
         self.session.freeBoot();
         boot.free(self.read_ch_buf);
@@ -6689,20 +6710,14 @@ pub const Connection = struct {
     /// built inside a pop (`building_pop_frame`) may take any chunk the pop's
     /// room check already counted.
     ///
-    /// A slab is lent to a non-terminal frame only while more than
-    /// `frame_slab_reserve` stay free. The reserve is the frame pool's twin of
-    /// `ControlPool`'s terminal reserve (16 entries): the control pool admits
-    /// at most that many terminal frames beyond the ordinary share, so slabs
-    /// that only they may take mean a GOAWAY or RST_STREAM is not refused for
-    /// the slabs HEADERS, acks and WINDOW_UPDATEs hold. More than the reserve
-    /// of terminal frames at once (a flood of resets in one read) is refused
-    /// here and by the control pool alike, and the connection is torn down
-    /// without a GOAWAY, which is what a refused terminal frame has always
-    /// meant.
+    /// A terminal frame (RST_STREAM, GOAWAY) never comes from here: it is
+    /// built in `terminal_store` (`rentTerminal`), so the slabs and chunks the
+    /// other frames take cannot leave it without room.
     ///
     /// Null means refused. There is no general-allocator fallback: the pools
     /// are the bound.
     fn rentFrame(self: *Connection, n: usize, class: session_mod.FrameClass) ?[]u8 {
+        if (class != .ordinary) return self.rentTerminal(n, class);
         // A small frame built in a pop is written straight into the drain-turn
         // scratch, past what it already holds: no pool memory, no copy. The
         // sink then only counts it (`EmitBatch.adopt`). `packsWithNeighbours`
@@ -6717,15 +6732,10 @@ pub const Connection = struct {
             }
         }
         if (n <= self.frame_pool.slab_bytes) {
-            // A terminal frame (GOAWAY, RST_STREAM) may take any slab; every
-            // other frame leaves `frame_slab_reserve` of them for it.
-            const keep: usize = if (class == .terminal) 0 else self.frame_slab_reserve;
-            if (self.frame_pool.freeCount() > keep) {
-                if (self.frame_pool.tryRent(self.config.io)) |slab| {
-                    _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
-                    _ = outbound_memory.frames_from_slab.fetchAdd(1, .monotonic);
-                    return slab;
-                }
+            if (self.frame_pool.tryRent(self.config.io)) |slab| {
+                _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
+                _ = outbound_memory.frames_from_slab.fetchAdd(1, .monotonic);
+                return slab;
             }
         }
         if (n <= limits_mod.WIRE_CHUNK_SIZE) {
@@ -6739,6 +6749,50 @@ pub const Connection = struct {
             }
         }
         _ = outbound_memory.frames_refused.fetchAdd(1, .monotonic);
+        return null;
+    }
+
+    /// Build room for one terminal frame in `terminal_store`, or null when the
+    /// peer holds more unwritten terminal frames than a well-behaved peer can
+    /// (`Limits.terminalFrames`, T). Runs under `session_mu`, like every frame
+    /// build.
+    ///
+    /// The final GOAWAY (`.final_goaway`) may take the last slot. Every other
+    /// terminal frame is admitted only while the final GOAWAY would still have
+    /// room in all three places it needs:
+    /// - a store slot;
+    /// - a terminal ring entry (a ring frame holds a store slot, so the store
+    ///   bounds the ring);
+    /// - a pool entry. Pool entries are held until the write completes, longer
+    ///   than a store slot, so the check counts the pool's own free entries
+    ///   and the frames built but not queued yet (`rented - terminal_len`).
+    ///   A frame in flight that still holds a slot (one with a flush ticket is
+    ///   written from its slot) is counted twice, which only makes this check
+    ///   refuse a little early.
+    /// Bytes need no check of their own: at most M RSTs and three GOAWAYs fit
+    /// in T entries, and `Limits.terminalBytes` is exactly that.
+    /// A refused final GOAWAY is a broken invariant, and loud in Debug.
+    fn rentTerminal(self: *Connection, n: usize, class: session_mod.FrameClass) ?[]u8 {
+        std.debug.assert(class != .ordinary);
+        std.debug.assert(n <= self.terminal_store.slab_bytes);
+        const keep: usize = if (class == .final_goaway) 0 else 1;
+        const rented = self.terminal_store.rentedCount();
+        const unqueued = rented -| self.sched.terminal_len;
+        const admitted = self.terminal_store.freeCount() > keep and
+            self.sched.ctrl.freeEntries() > unqueued + keep;
+        if (admitted) {
+            if (self.terminal_store.tryRent(self.config.io)) |slot| {
+                _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
+                _ = outbound_memory.frames_from_terminal_store.fetchAdd(1, .monotonic);
+                return slot;
+            }
+        }
+        _ = outbound_memory.frames_refused.fetchAdd(1, .monotonic);
+        if (class == .final_goaway and builtin.mode == .debug) {
+            std.debug.panic("the final GOAWAY was refused (store free {d}, pool free {d}, ring {d}): the terminal bound is broken", .{
+                self.terminal_store.freeCount(), self.sched.ctrl.freeEntries(), self.sched.terminal_len,
+            });
+        }
         return null;
     }
 
@@ -6762,7 +6816,7 @@ pub const Connection = struct {
 
     /// Return a frame buffer to its pool, `frame_pool` or `write_pool`. `buf`
     /// may be a used prefix; the pointer must be the slab base. A buffer in
-    /// neither pool is a bug (every frame comes from `rentFrame`), and there
+    /// no pool is a bug (every frame comes from `rentFrame`), and there
     /// is no general allocator to hand it to.
     fn releaseWireBytes(self: *Connection, buf: []u8) void {
         if (buf.len == 0) return;
@@ -6770,6 +6824,10 @@ pub const Connection = struct {
         if (self.payloadInScratch(buf)) return;
         if (self.frame_pool.containsPtr(buf.ptr)) {
             self.frame_pool.release(self.config.io, self.frame_pool.slabFromPtr(buf.ptr));
+            return;
+        }
+        if (self.terminal_store.containsPtr(buf.ptr)) {
+            self.terminal_store.release(self.config.io, self.terminal_store.slabFromPtr(buf.ptr));
             return;
         }
         if (self.write_pool.containsPtr(buf.ptr)) {
@@ -6782,7 +6840,7 @@ pub const Connection = struct {
     /// The write chunk an owned frame buffer already is, or null for a frame
     /// slab, which is too small to be a write chunk and is copied instead.
     fn frameAsWriteLease(self: *Connection, buf: []u8) ?WriteLease {
-        if (self.frame_pool.containsPtr(buf.ptr)) return null;
+        if (self.frame_pool.containsPtr(buf.ptr) or self.terminal_store.containsPtr(buf.ptr)) return null;
         std.debug.assert(self.write_pool.containsPtr(buf.ptr));
         const idx = self.write_pool.indexFromPtr(buf.ptr);
         return .{ .bytes = self.write_pool.slabAt(idx), .pool_index = idx };
@@ -9941,13 +9999,13 @@ test "rentFrame: a queued frame leaves POP_PUSHES chunks free, a frame built in 
     var n: usize = 0;
     defer for (held[0..n]) |buf| conn.releaseWireBytes(buf);
 
-    // The slabs the terminal reserve leaves, then chunks, down to POP_PUSHES free.
-    while (conn.frame_pool.freeCount() > conn.frame_slab_reserve) {
+    // Every slab (terminal frames have a store of their own), then chunks, down to POP_PUSHES free.
+    while (conn.frame_pool.freeCount() > 0) {
         held[n] = conn.rentFrame(20, .ordinary) orelse return error.NoSlab;
         try std.testing.expect(conn.frame_pool.containsPtr(held[n].ptr));
         n += 1;
     }
-    try std.testing.expect(n == 3);
+    try std.testing.expect(n == 4);
     while (conn.write_pool.freeCount() > pushes) {
         held[n] = conn.rentFrame(20, .ordinary) orelse return error.NoChunkToSpare;
         try std.testing.expect(conn.write_pool.containsPtr(held[n].ptr));
@@ -9983,20 +10041,23 @@ test "rentFrame: a queued frame leaves POP_PUSHES chunks free, a frame built in 
     try std.testing.expect(!conn.outboundMemoryPaused());
 }
 
-test "rentFrame: a terminal frame takes the slabs that no other frame may" {
+test "rentFrame: a terminal frame never needs a frame slab or a write chunk, and the last slot is the final GOAWAY's" {
     var lim = limits_mod.Limits.defaults;
     lim.frame_slab_bytes = 64;
     lim.frame_slabs_per_connection = 8;
+    lim.max_streams_per_connection = 4;
+    lim.max_streams_per_server = 16;
+    lim.cancellation_reaper_jobs = 16;
     var trap: TrapHop = undefined;
     try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
     defer trap.close();
     const conn = &trap.hop.conn;
     dropQueuedPreface(conn);
-    // A quarter of the slabs, capped at the control pool's terminal reserve.
-    try std.testing.expectEqual(@as(usize, 2), conn.frame_slab_reserve);
+    const t = try lim.terminalFrames();
+    try std.testing.expectEqual(@as(usize, 7), t);
+    try std.testing.expectEqual(t, conn.terminal_store.capacity);
 
-    // The write pool is taken away so a refused slab frame cannot spill into
-    // a chunk and hide the reserve.
+    // Take every chunk and every slab away: ordinary traffic has used all of them.
     var chunks: [16]u32 = undefined;
     var n_chunks: usize = 0;
     defer for (chunks[0..n_chunks]) |idx| conn.write_pool.releaseIndex(std.testing.io, idx);
@@ -10004,22 +10065,28 @@ test "rentFrame: a terminal frame takes the slabs that no other frame may" {
         chunks[n_chunks] = idx;
         n_chunks += 1;
     }
+    var slabs: [8][]u8 = undefined;
+    var n_slabs: usize = 0;
+    defer for (slabs[0..n_slabs]) |buf| conn.releaseWireBytes(buf);
+    while (conn.rentFrame(17, .ordinary)) |buf| {
+        slabs[n_slabs] = buf;
+        n_slabs += 1;
+    }
+    try std.testing.expect(conn.rentFrame(17, .ordinary) == null);
 
     var held: [8][]u8 = undefined;
     var n: usize = 0;
     defer for (held[0..n]) |buf| conn.releaseWireBytes(buf);
-    while (conn.rentFrame(17, .ordinary)) |buf| {
-        held[n] = buf;
-        n += 1;
+    // T - 1 RSTs and graceful GOAWAYs fit, each from the store.
+    while (n < t - 1) : (n += 1) {
+        held[n] = conn.rentFrame(if (n % 2 == 0) 13 else 17, .terminal) orelse return error.TerminalFrameRefused;
+        try std.testing.expect(conn.terminal_store.containsPtr(held[n].ptr));
     }
-    try std.testing.expectEqual(@as(usize, 6), n);
-    // Ordinary traffic cannot take the last two; a GOAWAY and a RST can.
-    held[n] = conn.rentFrame(17, .terminal) orelse return error.TerminalFrameRefused;
+    // The last slot is kept for the GOAWAY that ends the connection.
+    try std.testing.expect(conn.rentFrame(13, .terminal) == null);
+    held[n] = conn.rentFrame(17, .final_goaway) orelse return error.FinalGoawayRefused;
     n += 1;
-    held[n] = conn.rentFrame(13, .terminal) orelse return error.TerminalFrameRefused;
-    n += 1;
-    try std.testing.expect(conn.rentFrame(17, .terminal) == null);
-    try std.testing.expect(conn.frame_pool.freeCount() == 0);
+    try std.testing.expectEqual(@as(usize, 0), conn.terminal_store.freeCount());
 }
 
 test "leaseWriteChunk refuses an empty pool and an oversized chunk, and counts the refusal" {

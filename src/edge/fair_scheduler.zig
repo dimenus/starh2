@@ -429,18 +429,20 @@ pub const FairScheduler = struct {
     pub fn init(
         gpa: std.mem.Allocator,
         io: std.Io,
-        ctrl_bytes: usize,
-        ctrl_entries: usize,
-        terminal_cap: usize,
-        ordinary_cap: usize,
+        ordinary_bytes: usize,
+        ordinary_entries: usize,
+        terminal_bytes: usize,
+        terminal_entries: usize,
         max_streams: usize,
         pool: *slab_pool.SlabPool,
     ) !FairScheduler {
-        const tq = try gpa.alloc(ControlEntry, @max(terminal_cap, 1));
+        // The terminal ring and the pool's terminal share are one argument, so
+        // they cannot disagree (`Limits.terminalFrames`).
+        const tq = try gpa.alloc(ControlEntry, @max(terminal_entries, 1));
         errdefer gpa.free(tq);
-        const oq = try gpa.alloc(ControlEntry, @max(ordinary_cap, 1));
+        const oq = try gpa.alloc(ControlEntry, @max(ordinary_entries, 1));
         errdefer gpa.free(oq);
-        const fq = try gpa.alloc(FramedDataEntry, @max(ordinary_cap, 1));
+        const fq = try gpa.alloc(FramedDataEntry, @max(ordinary_entries, 1));
         errdefer gpa.free(fq);
         std.debug.assert(max_streams < none);
         const slots = try gpa.alloc(DataPending, max_streams);
@@ -461,7 +463,7 @@ pub const FairScheduler = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .ctrl = control_pool.ControlPool.init(ctrl_bytes, ctrl_entries),
+            .ctrl = control_pool.ControlPool.init(ordinary_bytes, ordinary_entries, terminal_bytes, terminal_entries),
             .terminal_q = tq,
             .ordinary_q = oq,
             .framed_data_q = fq,
@@ -1294,7 +1296,7 @@ test "scheduler queues own payloads and hold control until complete" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     const p = try gpa.dupe(u8, "helloctl");
     try sched.enqueueControl(p, .ordinary, 0, 0);
@@ -1307,7 +1309,7 @@ test "a stream rents one slab on its first bytes, and none before" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 1024, 4);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
 
     // An idle scheduler holds nothing. This is the whole point of the pool.
@@ -1329,7 +1331,7 @@ test "the per-stream cap is the pool's slab length" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 4);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
 
     try sched.enqueueDataBytes(1, &@as([40]u8, @splat('a')), false, 0, 0);
@@ -1344,7 +1346,7 @@ test "ticket requires an existing DATA frame instead of stranding" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 2);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
 
     try std.testing.expectError(
@@ -1366,7 +1368,7 @@ test "pool exhaustion is its own error, and strands no slot" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 2);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
 
     try sched.enqueueDataBytes(1, "a", false, 0, 0);
@@ -1385,7 +1387,7 @@ test "removePending returns the slab" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 2);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 4, &pool);
     defer sched.deinit();
 
     try sched.enqueueDataBytes(1, "abc", false, 0, 0);
@@ -1407,7 +1409,7 @@ test "deinit returns every slab it still holds" {
     var pool = try testPool(gpa, 64, 4);
     defer pool.deinit(gpa);
     {
-        var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+        var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 4, &pool);
         defer sched.deinit();
         try sched.enqueueDataBytes(1, "abc", false, 0, 0);
         try sched.enqueueDataBytes(3, "def", false, 0, 0);
@@ -1472,7 +1474,7 @@ test "tier 3 serves ready streams round robin, newcomers in arrival order, not b
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1493,7 +1495,7 @@ test "a newcomer goes out before a running stream's next quantum, and newcomers 
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1515,7 +1517,7 @@ test "a quantum that spends the last connection credit does not strand its strea
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa, .conn = DATA_QUANTUM };
     defer w.deinit();
@@ -1539,7 +1541,7 @@ test "a stream blocked on its own window waits for rearm, and only rearm" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1569,7 +1571,7 @@ test "blocked streams cost no window query on the emit path" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 16);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 16, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 16, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1595,7 +1597,7 @@ test "index delete keeps a colliding key reachable" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 4, &pool);
     defer sched.deinit();
 
     // Three odd ids with the same home slot, so they share one probe cluster.
@@ -1663,7 +1665,7 @@ test "DATA never leaves before its stream's HEADERS when the stash frees between
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1748,7 +1750,7 @@ test "nothing leaves inside a header block: a terminal control, forced DATA and 
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: FrameWire = .{ .gpa = gpa };
     defer w.seen.deinit(gpa);
@@ -1798,7 +1800,7 @@ test "a stream reset drops the queued fragments of its header block with its HEA
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: FrameWire = .{ .gpa = gpa };
     defer w.seen.deinit(gpa);
@@ -1853,7 +1855,7 @@ test "the anti-starvation yield does not send DATA before its stream's HEADERS" 
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1890,7 +1892,7 @@ test "a stream waiting for its HEADERS is not visited, and is served once they l
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1918,7 +1920,7 @@ test "HEADERS state outlives a slot freed between writes, and ends at END_STREAM
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1942,7 +1944,7 @@ test "a reset ends the HEADERS state; trailers do not gate and end it too" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1967,7 +1969,7 @@ test "framed DATA waits for its stream's HEADERS too" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -2004,7 +2006,7 @@ test "a reset before its queued HEADERS reaches the sink leaves no started entry
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
     const max_streams = 8;
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, max_streams, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, max_streams, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -2031,7 +2033,7 @@ test "a reset drops only that stream's queued HEADERS, with its ticket and contr
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
