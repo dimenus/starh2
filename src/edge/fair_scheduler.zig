@@ -530,8 +530,13 @@ pub const FairScheduler = struct {
         return e;
     }
 
+    /// A terminal frame holds its pool share until it leaves the ring
+    /// (`ControlPool`), so every pop gives the share back, the drain's and the
+    /// teardown's alike. The entry's `control_n` is not the sink's to release.
     pub fn popTerminal(self: *FairScheduler) ?ControlEntry {
-        return popRing(ControlEntry, self.terminal_q, &self.terminal_head, &self.terminal_len);
+        const e = popRing(ControlEntry, self.terminal_q, &self.terminal_head, &self.terminal_len) orelse return null;
+        self.ctrl.releaseTerminal(e.control_n);
+        return e;
     }
     pub fn popOrdinary(self: *FairScheduler) ?ControlEntry {
         return popRing(ControlEntry, self.ordinary_q, &self.ordinary_head, &self.ordinary_len);
@@ -852,7 +857,7 @@ pub const FairScheduler = struct {
                 .ticket_slot = ticket_slot,
                 .control_n = n,
             }) catch {
-                self.ctrl.release(n, 1);
+                self.ctrl.releaseTerminal(n);
                 self.freePayload(payload);
                 return error.QueueFull;
             };
@@ -1055,7 +1060,8 @@ pub const FairScheduler = struct {
                 self.emits_total += 1;
                 self.sink_origin_emits += 1;
                 self.recordEmitKind(.terminal_control);
-                try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
+                // Not a counted control entry: its share was given back by the pop.
+                try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, 0, false);
             }
             if (comptime wire_ring.enabled) self.diag_ctrl_break = false;
             while (self.ordinary_len > 0) {

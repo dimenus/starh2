@@ -822,6 +822,11 @@ pub const Session = struct {
             if (maybe) |res| {
                 try self.handleFrame(res.event);
                 remaining = remaining[res.consumed..];
+                // The connection is ending and its GOAWAY is queued. The rest
+                // of the chunk would only add intents (a flood of refused
+                // streams would fill the intent queue before the GOAWAY
+                // could be written).
+                if (self.terminal != .none) return;
             } else break;
         }
     }
@@ -981,7 +986,18 @@ pub const Session = struct {
     /// holds more unwritten terminal frames than a well-behaved peer can
     /// (`Limits.terminalFrames`): the connection ends with ENHANCE_YOUR_CALM.
     fn emitRst(self: *Session, stream_id: u31, code: frame.ErrorCode) !void {
-        if (self.rstOwed(stream_id)) {
+        // An RST takes two intents (the frame and the local reset). The
+        // connection error that ends a flood takes the two terminal intents
+        // (GOAWAY and connection_error, which sit in the reserve and move the
+        // ordinary limit's room down by two) and then the local reset, so it
+        // needs 3 of the room that is left. A peer that fills the intent queue
+        // with RSTs in one read chunk is flooding, and it is answered like any
+        // other flood while that room remains: below 5, an RST would leave
+        // less than the 3 the connection error needs.
+        const intent_room = self.intent_storage.len -| self.terminal_reserve -| self.intent_len;
+        if (intent_room < 5) {
+            if (self.rstOwed(stream_id)) try self.failConnection(.enhance_your_calm);
+        } else if (self.rstOwed(stream_id)) {
             var buf: [13]u8 = undefined;
             const n = try frame.Serializer.rstStream(&buf, stream_id, code);
             if (self.controlFrame(buf[0..n], .terminal)) |p| {
@@ -2232,6 +2248,118 @@ test "respond_headers after RST is StreamClosed" {
         .headers = &.{},
         .end_stream = true,
     } }));
+}
+
+/// Counts of what a drained batch holds, then frees it.
+const TerminalCounts = struct { rst: usize = 0, goaway: usize = 0, stream_reset: usize = 0, connection_error: usize = 0 };
+
+fn countTerminalIntents(gpa: std.mem.Allocator, session: *Session) TerminalCounts {
+    const intents = session.drainIntents();
+    defer freeTestIntents(gpa, intents);
+    var c: TerminalCounts = .{};
+    for (intents) |it| switch (it) {
+        .outbound_frame => |f| switch (f.typ) {
+            .rst_stream => c.rst += 1,
+            .goaway => c.goaway += 1,
+            else => {},
+        },
+        .stream_reset => c.stream_reset += 1,
+        .connection_error => c.connection_error += 1,
+        else => {},
+    };
+    return c;
+}
+
+fn openTestStream(session: *Session, id: u31) !void {
+    try session.streams.put(id, .{ .id = id, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+    session.active_streams += 1;
+}
+
+test "a stream is reset on the wire once: a second reset runs its local half and queues no frame (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    _ = countTerminalIntents(gpa, &session);
+    try openTestStream(&session, 1);
+
+    // The handler's reset, then the slow-consumer sweep's, for the same stream.
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .cancel } });
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 1), c.rst);
+    // The local half ran both times: the scheduler and the handler hear of both.
+    try std.testing.expectEqual(@as(usize, 2), c.stream_reset);
+    try std.testing.expectEqual(@as(usize, 0), session.active_streams);
+}
+
+test "a reset of a stream closed in both directions queues no frame, and its local cleanup still runs (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    _ = countTerminalIntents(gpa, &session);
+    // Stream 3 ended normally: it has a tombstone and no map entry.
+    try session.addTombstone(3, .no_error);
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 3, .code = .cancel } });
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 0), c.rst);
+    try std.testing.expectEqual(@as(usize, 1), c.stream_reset);
+
+    // The same for an entry still in the map but closed.
+    try session.streams.put(5, .{ .id = 5, .state = .closed, .window = .{ .send = flow.INITIAL_WINDOW } });
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 5, .code = .cancel } });
+    const d = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 0), d.rst);
+    try std.testing.expectEqual(@as(usize, 1), d.stream_reset);
+}
+
+test "a refused stream has no map entry, and is reset once because the RST tombstones it (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    _ = countTerminalIntents(gpa, &session);
+    try session.emitRst(7, .refused_stream);
+    try session.emitRst(7, .refused_stream);
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 1), c.rst);
+    try std.testing.expectEqual(@as(usize, 2), c.stream_reset);
+    try std.testing.expect(session.isTombstoned(7));
+}
+
+test "each GOAWAY role is queued at most once (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    _ = countTerminalIntents(gpa, &session);
+
+    // Graceful phase 1 and phase 2, each asked for twice.
+    try session.applyCommand(.graceful_phase1);
+    try session.applyCommand(.graceful_phase1);
+    try session.applyCommand(.graceful_phase2);
+    try session.applyCommand(.graceful_phase2);
+    const graceful = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 2), graceful.goaway);
+
+    // The connection error, raised twice in one read chunk.
+    try session.failConnection(.protocol_error);
+    try session.failConnection(.compression_error);
+    const final = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 1), final.goaway);
+    try std.testing.expectEqual(@as(usize, 1), final.connection_error);
+    try std.testing.expectEqual(frame.ErrorCode.protocol_error, session.terminal.goaway.code);
+}
+
+test "after the connection error an RST is not queued, and its local half still runs (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    _ = countTerminalIntents(gpa, &session);
+    try openTestStream(&session, 1);
+    try session.failConnection(.protocol_error);
+    _ = countTerminalIntents(gpa, &session);
+    try session.emitRst(1, .cancel);
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 0), c.rst);
+    try std.testing.expectEqual(@as(usize, 1), c.stream_reset);
 }
 
 test "stream churn keeps free slots in the stream map" {

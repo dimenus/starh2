@@ -286,6 +286,11 @@ pub var test_budget_doorbell_rings: std.atomic.Value(usize) = .init(0);
 /// queue (`ctrl_terminal_full`, the reset burst that ends a connection). A test
 /// that relies on the terminal queue not overflowing asserts it did not move.
 pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
+/// Test-only: the most frames the terminal ring has held at once, over every
+/// connection since the test last stored 0. A bound test reads it to prove the
+/// stall really queued the frames it means to, and that none went past T.
+/// Counted in Debug and `-Dobserve=true`.
+pub var test_terminal_ring_high: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): actors that are inside their park select right
 /// now. Raised immediately before `zio.select` in `waitForActivity` and lowered
 /// right after it returns. A test whose handler must act while the actor is
@@ -3108,7 +3113,6 @@ pub const Connection = struct {
         }
         // Drain control queues without writing (connection is dead).
         while (self.sched.popTerminal()) |e| {
-            self.sched.ctrl.release(e.control_n, 1);
             self.sched.freePayload(e.payload);
         }
         while (self.sched.popOrdinary()) |e| {
@@ -6518,6 +6522,13 @@ pub const Connection = struct {
                         },
                     };
                     block_queued_open = opens_block;
+                    if (comptime test_observe) {
+                        if (class == .terminal) {
+                            const len = self.sched.terminal_len;
+                            var high = test_terminal_ring_high.load(.monotonic);
+                            while (len > high) high = test_terminal_ring_high.cmpxchgWeak(high, len, .monotonic, .monotonic) orelse break;
+                        }
+                    }
                 },
                 .dispatch_request => |d| try self.dispatch(d),
                 .early_reject => {},
@@ -6759,28 +6770,22 @@ pub const Connection = struct {
     ///
     /// The final GOAWAY (`.final_goaway`) may take the last slot. Every other
     /// terminal frame is admitted only while the final GOAWAY would still have
-    /// room in all three places it needs:
-    /// - a store slot;
-    /// - a terminal ring entry (a ring frame holds a store slot, so the store
-    ///   bounds the ring);
-    /// - a pool entry. Pool entries are held until the write completes, longer
-    ///   than a store slot, so the check counts the pool's own free entries
-    ///   and the frames built but not queued yet (`rented - terminal_len`).
-    ///   A frame in flight that still holds a slot (one with a flush ticket is
-    ///   written from its slot) is counted twice, which only makes this check
-    ///   refuse a little early.
-    /// Bytes need no check of their own: at most M RSTs and three GOAWAYs fit
-    /// in T entries, and `Limits.terminalBytes` is exactly that.
+    /// room. One store slot is enough to say so in all three places it needs:
+    /// a frame holds its store slot from the build until it is copied out at
+    /// the pop, and holds its terminal ring entry and its terminal pool share
+    /// from the queueing until the same pop. So the slots rented are at least
+    /// the ring entries and the pool entries held, and a free slot is a free
+    /// ring entry and a free pool entry. (A frame with a flush ticket is
+    /// written from its slot and keeps it longer, which only makes the check
+    /// refuse a little early.) Bytes need no check of their own: at most M
+    /// RSTs and three GOAWAYs fit in T entries, and `Limits.terminalBytes` is
+    /// exactly that.
     /// A refused final GOAWAY is a broken invariant, and loud in Debug.
     fn rentTerminal(self: *Connection, n: usize, class: session_mod.FrameClass) ?[]u8 {
         std.debug.assert(class != .ordinary);
         std.debug.assert(n <= self.terminal_store.slab_bytes);
         const keep: usize = if (class == .final_goaway) 0 else 1;
-        const rented = self.terminal_store.rentedCount();
-        const unqueued = rented -| self.sched.terminal_len;
-        const admitted = self.terminal_store.freeCount() > keep and
-            self.sched.ctrl.freeEntries() > unqueued + keep;
-        if (admitted) {
+        if (self.terminal_store.freeCount() > keep) {
             if (self.terminal_store.tryRent(self.config.io)) |slot| {
                 _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
                 _ = outbound_memory.frames_from_terminal_store.fetchAdd(1, .monotonic);
@@ -6789,8 +6794,8 @@ pub const Connection = struct {
         }
         _ = outbound_memory.frames_refused.fetchAdd(1, .monotonic);
         if (class == .final_goaway and builtin.mode == .debug) {
-            std.debug.panic("the final GOAWAY was refused (store free {d}, pool free {d}, ring {d}): the terminal bound is broken", .{
-                self.terminal_store.freeCount(), self.sched.ctrl.freeEntries(), self.sched.terminal_len,
+            std.debug.panic("the final GOAWAY was refused (store free {d}, ring {d}): the terminal bound is broken", .{
+                self.terminal_store.freeCount(), self.sched.terminal_len,
             });
         }
         return null;
@@ -10087,6 +10092,48 @@ test "rentFrame: a terminal frame never needs a frame slab or a write chunk, and
     held[n] = conn.rentFrame(17, .final_goaway) orelse return error.FinalGoawayRefused;
     n += 1;
     try std.testing.expectEqual(@as(usize, 0), conn.terminal_store.freeCount());
+}
+
+test "the terminal ring, the pool's terminal share and the frame store all hold T = M + 3 (t-3562)" {
+    for ([_]usize{ 1, 256, 1024 }) |m| {
+        var lim = limits_mod.Limits.defaults;
+        lim.max_streams_per_connection = m;
+        lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
+        lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
+        lim.outbound_slabs_per_server = @max(lim.outbound_slabs_per_server, lim.max_streams_per_server);
+        var trap: TrapHop = undefined;
+        try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
+        defer trap.close();
+        const conn = &trap.hop.conn;
+        try std.testing.expectEqual(m + 3, try lim.terminalFrames());
+        try std.testing.expectEqual(m + 3, conn.sched.terminal_q.len);
+        try std.testing.expectEqual(m + 3, conn.sched.ctrl.terminal_entries);
+        try std.testing.expectEqual(m + 3, conn.terminal_store.capacity);
+        // Bytes: M RSTs and three GOAWAYs, nothing else.
+        try std.testing.expectEqual(m * frame.rst_stream_frame_bytes + 3 * frame.goaway_frame_bytes, conn.sched.ctrl.terminal_bytes);
+        try std.testing.expectEqual(try lim.terminalBytes(), conn.sched.ctrl.terminal_bytes);
+        // The ordinary share is the config value, whatever T is.
+        try std.testing.expectEqual(lim.control_entries_per_connection, conn.sched.ctrl.max_entries);
+        try std.testing.expectEqual(lim.control_bytes_per_connection, conn.sched.ctrl.max_bytes);
+    }
+}
+
+test "a limit that breaks the terminal bound is InvalidConfig, not a small wrong store (t-3562)" {
+    const top = std.math.maxInt(usize);
+    for ([_]usize{ top, top - 1, top - 2 }) |m| {
+        var lim = limits_mod.Limits.defaults;
+        lim.max_streams_per_connection = m;
+        try std.testing.expectError(error.InvalidConfig, lim.terminalFrames());
+        try std.testing.expectError(error.InvalidConfig, lim.slotBootBytes(.h2c));
+        try std.testing.expectError(error.InvalidConfig, lim.slotBootBytes(.tls));
+        try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    }
+    // M * 13 overflows while M + 3 does not.
+    var lim = limits_mod.Limits.defaults;
+    lim.max_streams_per_connection = top / 13 + 1;
+    _ = try lim.terminalFrames();
+    try std.testing.expectError(error.InvalidConfig, lim.terminalBytes());
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
 test "leaseWriteChunk refuses an empty pool and an oversized chunk, and counts the refusal" {

@@ -5,14 +5,20 @@
 //! SETTINGS produces a matching flood of acks, so an unbounded control queue is
 //! a memory target that costs the peer almost nothing.
 //!
-//! The pool is two shares in one counter. Ordinary controls may use only the
-//! ordinary share (`Limits.control_*_per_connection`). Terminal frames
-//! (GOAWAY, RST_STREAM) may use the whole pool: the ordinary share plus a
-//! terminal share of their own, `Limits.terminalFrames` entries and
-//! `Limits.terminalBytes` bytes. Ordinary frames never hold more than the
-//! ordinary share, so the terminal share is always free for the frames that
-//! END a flood. Without it, the frame that stops the attack is the one frame
-//! the attack has already made impossible.
+//! The pool is two shares with a counter each, so neither can starve the
+//! other. Ordinary controls (`Limits.control_*_per_connection`) are held from
+//! the moment a frame is queued until its write completes, and not merely until
+//! it is emitted: bytes waiting in the write queue are real memory, so releasing
+//! them at emit time would report capacity the connection does not have.
+//!
+//! Terminal frames (GOAWAY, RST_STREAM) have a share of their own,
+//! `Limits.terminalFrames` entries and `Limits.terminalBytes` bytes, so a
+//! connection can always emit the frame that ENDS a flood, and a pile of
+//! server-driven resets can never take the room a PING or SETTINGS ack needs.
+//! A terminal frame holds its share from the moment it is queued until it is
+//! popped from the terminal ring, which is when its bytes move into the write
+//! memory (`outbound_memory`), a pool that is bounded and pauses the pop when
+//! it is full. Holding it longer would count the same bytes twice.
 //!
 //! The terminal share is T = M + 3 because a well-behaved peer can have at
 //! most M unwritten RST_STREAMs (one per stream it still counts as open) and
@@ -20,10 +26,6 @@
 //! (`FairScheduler.terminal_q`) and the terminal frame store
 //! (`Connection.terminal_store`) hold the same T.
 //!
-//! Occupancy is held from the moment a frame is queued until its write
-//! completes, and not merely until it is emitted. Bytes waiting in the write
-//! queue are real memory, so releasing them at emit time would report capacity
-//! the connection does not have.
 const std = @import("std");
 
 /// The starvation bound. Controls drain before DATA, so a peer that keeps a
@@ -33,74 +35,61 @@ const std = @import("std");
 /// unbounded starvation into a bounded delay.
 pub const CONTROL_BEFORE_DATA: usize = 64;
 pub const ControlPool = struct {
-    /// Ordinary share plus terminal share.
+    /// The ordinary share.
     max_bytes: usize,
     max_entries: usize,
+    /// The terminal share.
     terminal_bytes: usize,
     terminal_entries: usize,
     bytes_held: std.atomic.Value(usize) = .init(0),
     entries_held: std.atomic.Value(usize) = .init(0),
+    terminal_bytes_held: std.atomic.Value(usize) = .init(0),
+    terminal_entries_held: std.atomic.Value(usize) = .init(0),
     controls_since_data: usize = 0,
 
-    /// The ordinary share and the terminal share are separate arguments, so
-    /// no caller can size the pool without saying how much is terminal.
+    /// The two shares are separate arguments, so no caller can size the pool
+    /// without saying how much is terminal.
     pub fn init(ordinary_bytes: usize, ordinary_entries: usize, terminal_bytes: usize, terminal_entries: usize) ControlPool {
         return .{
-            .max_bytes = ordinary_bytes + terminal_bytes,
-            .max_entries = ordinary_entries + terminal_entries,
+            .max_bytes = ordinary_bytes,
+            .max_entries = ordinary_entries,
             .terminal_bytes = terminal_bytes,
             .terminal_entries = terminal_entries,
         };
     }
 
     pub fn ordinaryCaps(self: *const ControlPool) struct { bytes: usize, entries: usize } {
-        return .{
-            .bytes = self.max_bytes - self.terminal_bytes,
-            .entries = self.max_entries - self.terminal_entries,
-        };
-    }
-
-    /// Entries and bytes not held by anything. Terminal admission reads it.
-    pub fn freeEntries(self: *const ControlPool) usize {
-        return self.max_entries - @min(self.max_entries, self.entries_held.load(.acquire));
-    }
-
-    pub fn freeBytes(self: *const ControlPool) usize {
-        return self.max_bytes - @min(self.max_bytes, self.bytes_held.load(.acquire));
+        return .{ .bytes = self.max_bytes, .entries = self.max_entries };
     }
 
     pub fn tryReserveOrdinary(self: *ControlPool, n: usize) bool {
-        const caps = self.ordinaryCaps();
-        while (true) {
-            const cur_e = self.entries_held.load(.acquire);
-            const cur_b = self.bytes_held.load(.acquire);
-            if (cur_e >= caps.entries) return false;
-            if (cur_b > caps.bytes or caps.bytes - cur_b < n) return false;
-            if (self.entries_held.cmpxchgWeak(cur_e, cur_e + 1, .acq_rel, .acquire) != null) continue;
-            if (self.bytes_held.cmpxchgWeak(cur_b, cur_b + n, .acq_rel, .acquire) == null) return true;
-            _ = self.entries_held.fetchSub(1, .acq_rel);
-        }
+        return reserve(&self.entries_held, &self.bytes_held, self.max_entries, self.max_bytes, n);
     }
 
     /// True when one more ordinary entry fits. Bytes are not checked: the
     /// caller does not know its frame's size yet.
     pub fn hasOrdinaryEntry(self: *const ControlPool) bool {
-        return self.entries_held.load(.acquire) < self.ordinaryCaps().entries;
+        return self.entries_held.load(.acquire) < self.max_entries;
     }
 
-    /// Terminal / required ACK / SETTINGS ACK — may consume the terminal share.
+    /// A GOAWAY or RST_STREAM of `n` wire bytes, from the terminal share.
     pub fn tryReserveTerminal(self: *ControlPool, n: usize) bool {
+        return reserve(&self.terminal_entries_held, &self.terminal_bytes_held, self.terminal_entries, self.terminal_bytes, n);
+    }
+
+    fn reserve(entries_held: *std.atomic.Value(usize), bytes_held: *std.atomic.Value(usize), max_entries: usize, max_bytes: usize, n: usize) bool {
         while (true) {
-            const cur_e = self.entries_held.load(.acquire);
-            const cur_b = self.bytes_held.load(.acquire);
-            if (cur_e >= self.max_entries) return false;
-            if (cur_b > self.max_bytes or self.max_bytes - cur_b < n) return false;
-            if (self.entries_held.cmpxchgWeak(cur_e, cur_e + 1, .acq_rel, .acquire) != null) continue;
-            if (self.bytes_held.cmpxchgWeak(cur_b, cur_b + n, .acq_rel, .acquire) == null) return true;
-            _ = self.entries_held.fetchSub(1, .acq_rel);
+            const cur_e = entries_held.load(.acquire);
+            const cur_b = bytes_held.load(.acquire);
+            if (cur_e >= max_entries) return false;
+            if (cur_b > max_bytes or max_bytes - cur_b < n) return false;
+            if (entries_held.cmpxchgWeak(cur_e, cur_e + 1, .acq_rel, .acquire) != null) continue;
+            if (bytes_held.cmpxchgWeak(cur_b, cur_b + n, .acq_rel, .acquire) == null) return true;
+            _ = entries_held.fetchSub(1, .acq_rel);
         }
     }
 
+    /// Give back ordinary occupancy when its write completes.
     pub fn release(self: *ControlPool, n: usize, entries: usize) void {
         if (entries != 0) {
             const prev = self.entries_held.fetchSub(entries, .acq_rel);
@@ -110,6 +99,14 @@ pub const ControlPool = struct {
             const prev = self.bytes_held.fetchSub(n, .acq_rel);
             std.debug.assert(prev >= n);
         }
+    }
+
+    /// Give back one terminal frame's share when it leaves the terminal ring.
+    pub fn releaseTerminal(self: *ControlPool, n: usize) void {
+        const prev_e = self.terminal_entries_held.fetchSub(1, .acq_rel);
+        std.debug.assert(prev_e >= 1);
+        const prev_b = self.terminal_bytes_held.fetchSub(n, .acq_rel);
+        std.debug.assert(prev_b >= n);
     }
 
     pub fn noteControl(self: *ControlPool) void {
@@ -129,7 +126,7 @@ pub const ControlPool = struct {
 const test_terminal_entries: usize = 16;
 const test_terminal_bytes: usize = 4 * 1024;
 
-test "ordinary pool leaves terminal reserve" {
+test "ordinary and terminal shares do not starve each other" {
     var pool = ControlPool.init(64 * 1024, 256, test_terminal_bytes, test_terminal_entries);
     const caps = pool.ordinaryCaps();
     try std.testing.expectEqual(@as(usize, 64 * 1024), caps.bytes);
@@ -140,9 +137,19 @@ test "ordinary pool leaves terminal reserve" {
         try std.testing.expect(pool.tryReserveOrdinary(1));
     }
     try std.testing.expect(!pool.tryReserveOrdinary(1));
-    // Terminal/ACK still fits in reserved slice.
+    // The terminal share is its own: a full ordinary share does not touch it,
+    // and terminal frames do not touch the ordinary counter.
+    var held: usize = 0;
+    while (held < test_terminal_entries) : (held += 1) {
+        try std.testing.expect(pool.tryReserveTerminal(1));
+    }
+    try std.testing.expect(!pool.tryReserveTerminal(1));
+    try std.testing.expectEqual(caps.entries, pool.entries_held.load(.acquire));
+    pool.releaseTerminal(1);
     try std.testing.expect(pool.tryReserveTerminal(1));
-    try std.testing.expectEqual(caps.entries + 1, pool.entries_held.load(.acquire));
+    // And the other way: a full terminal share leaves ordinary frames alone.
+    pool.release(1, 1);
+    try std.testing.expect(pool.tryReserveOrdinary(1));
 }
 
 // The fairness gate. It replaced a `simulateFairnessGaps` helper that ignored
