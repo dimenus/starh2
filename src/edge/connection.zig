@@ -291,6 +291,12 @@ pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
 /// stall really queued the frames it means to, and that none went past T.
 /// Counted in Debug and `-Dobserve=true`.
 pub var test_terminal_ring_high: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): RST_STREAM frames the scheduler took while its
+/// control pause (`pause_control`) was on, so they waited in the terminal
+/// ring; and the times the control pause answered true. A stall test reads
+/// them to prove its RSTs were queued during the stall, not after it.
+pub var test_rst_queued_paused: std.atomic.Value(usize) = .init(0);
+pub var test_control_pause_seen: std.atomic.Value(u64) = .init(0);
 /// Test-only: ORDINARY control frames (HEADERS and the like) the scheduler
 /// refused, by the pool (`PoolFull`) and by the ring (`QueueFull`). A handler
 /// whose response is refused sees `WriteFailed`. Counted in Debug and
@@ -2089,6 +2095,7 @@ pub const Connection = struct {
         // gets the same answer, not a queue its drain can overrun.
         if (config.mode == .h2c) try config.limits.checkH2cWriteQueue();
         try config.limits.checkFramePool();
+        try config.limits.checkIntentQueue();
         if (config.request_pool == null) return error.RequestPoolMissing;
         var session = try session_mod.Session.initBare(boot, config.gpa, config.limits);
         errdefer {
@@ -3378,6 +3385,37 @@ pub const Connection = struct {
         return .go;
     }
 
+    /// Ingest `bytes` and process the intents, as many rounds as it takes.
+    /// `Session.ingestSome` stops at a frame boundary when the intent queue has
+    /// less room than one frame can need, so the queue is materialized and
+    /// ingest goes on with the rest; one read chunk can then never fill the
+    /// queue (`Limits.intentEntriesMin`). Caller holds `session_mu`.
+    fn ingestAndProcess(self: *Connection, bytes: []const u8) !void {
+        self.assertSessionHeld("ingestAndProcess");
+        const io = self.config.io;
+        var rest = bytes;
+        while (true) {
+            const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
+            const taken = try self.session.ingestSome(rest);
+            if (trace.enabled) {
+                _ = trace.ingest_ns.fetchAdd(nowNs(io) -% ingest_t0, .monotonic);
+                _ = trace.ingest_n.fetchAdd(1, .monotonic);
+            }
+            // The queue is empty on every call (each round below drains it),
+            // and boot keeps it at least one frame's room, so a round that
+            // takes nothing is a broken invariant, not a slow peer.
+            if (taken == 0 and rest.len != 0) std.debug.panic("ingest took nothing from {d} bytes with {d} of {d} intents queued: the intent queue is below Limits.intentEntriesMin", .{ rest.len, self.session.intentLen(), self.session.intentCapacity() });
+            rest = rest[taken..];
+            const intent_t0 = if (trace.enabled) nowNs(io) else 0;
+            try self.processIntents();
+            if (trace.enabled) {
+                _ = trace.intent_ns.fetchAdd(nowNs(io) -% intent_t0, .monotonic);
+                _ = trace.intent_n.fetchAdd(1, .monotonic);
+            }
+            if (rest.len == 0) return;
+        }
+    }
+
     /// Ingest one already-taken inbound chunk. Caller recycles the chunk.
     /// Returns true when Session became terminal.
     fn ingestWireChunk(self: *Connection, chunk: wire_pump.WireChunk) !bool {
@@ -3385,20 +3423,7 @@ pub const Connection = struct {
         self.lockSessionUncancelable(io);
         defer self.unlockSession(io);
         self.session.edge_now_ns = nowNs(io);
-        {
-            const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
-            try self.session.ingest(chunk.bytes[0..chunk.len]);
-            if (trace.enabled) {
-                _ = trace.ingest_ns.fetchAdd(nowNs(io) -% ingest_t0, .monotonic);
-                _ = trace.ingest_n.fetchAdd(1, .monotonic);
-            }
-            const intent_t0 = if (trace.enabled) nowNs(io) else 0;
-            try self.processIntents();
-            if (trace.enabled) {
-                _ = trace.intent_ns.fetchAdd(nowNs(io) -% intent_t0, .monotonic);
-                _ = trace.intent_n.fetchAdd(1, .monotonic);
-            }
-        }
+        try self.ingestAndProcess(chunk.bytes[0..chunk.len]);
         // Start closing here, under the hold ingest already has, so the
         // inline queue is frozen before anything can run those handlers.
         self.beginClosingIfTerminal();
@@ -4146,7 +4171,11 @@ pub const Connection = struct {
                 fn f(ctx: *anyopaque) bool {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     const p = c.tls_driver orelse return false;
-                    return p.stashFull() or c.outboundMemoryPaused();
+                    const paused = p.stashFull() or c.outboundMemoryPaused();
+                    if (comptime test_observe) {
+                        if (paused) _ = test_control_pause_seen.fetchAdd(1, .monotonic);
+                    }
+                    return paused;
                 }
             }.f;
             self.sched.pause_ctx = self;
@@ -4204,8 +4233,7 @@ pub const Connection = struct {
                 std.debug.assert(self.config.mode == .tls);
                 _ = h2_work.tls_leftovers.fetchAdd(1, .monotonic);
                 if (comptime test_observe) _ = test_tls_leftover_connections.fetchAdd(1, .acq_rel);
-                try self.session.ingest(self.config.tls_leftover);
-                try self.flushSessionIntents();
+                try self.ingestAndProcess(self.config.tls_leftover);
             }
             // A connection error in the first flight starts the closing phase
             // here, under the lock: its GOAWAY is stashed behind the SETTINGS
@@ -4502,8 +4530,7 @@ pub const Connection = struct {
             self.lockSessionUncancelable(self.config.io);
             {
                 defer self.unlockSession(self.config.io);
-                try self.session.ingest(chunk.bytes[0..chunk.len]);
-                try self.processIntents();
+                try self.ingestAndProcess(chunk.bytes[0..chunk.len]);
                 // A bad preface is a connection error. Return to the main
                 // loop, which delivers its GOAWAY.
                 if (self.session.terminal != .none) {
@@ -4971,7 +4998,11 @@ pub const Connection = struct {
     /// condition cannot hold with nothing in flight to release a chunk.
     fn h2cPause(ctx: *anyopaque) bool {
         const self: *Connection = @ptrCast(@alignCast(ctx));
-        return self.h2cPauseFor(0);
+        const paused = self.h2cPauseFor(0);
+        if (comptime test_observe) {
+            if (paused) _ = test_control_pause_seen.fetchAdd(1, .monotonic);
+        }
+        return paused;
     }
 
     fn h2cPauseData(ctx: *anyopaque) bool {
@@ -5936,6 +5967,12 @@ pub const Connection = struct {
             self.sched.pause_control = h2cPause;
             self.sched.pause_ctx = self;
         }
+        if (comptime test_observe) {
+            // The scheduler asks the control pause only when it has a control
+            // frame to pop. Asked here too, at every drain, it tells a stall
+            // test the stall has formed before the test queues anything.
+            if (self.sched.pause_control) |pc| _ = pc(self.sched.pause_ctx);
+        }
         if (diag_park) {
             const now = nowNs(self.config.io);
             if (diag_last_drain_ns != 0) diag_prev_drain_gap_ns = now -% diag_last_drain_ns;
@@ -6463,9 +6500,24 @@ pub const Connection = struct {
     ///
     /// DATA never goes straight to the wire here. It enters the scheduler, so
     /// that fairness between streams is decided in one place.
+    ///
+    /// A batch can queue intents of its own: a dispatch that is refused (a
+    /// failed handler spawn, a refused reaper reservation, no request memory)
+    /// resets or answers its stream. They are drained here, in further rounds,
+    /// before this returns, so the session queue is empty whenever a lock
+    /// section ends, and the next section starts its batch from an empty
+    /// queue (`Limits.intentEntriesMin`). Nothing in a round may materialize
+    /// the queue itself: the batch it would drain into is the one being read.
     fn materializeIntents(self: *Connection) anyerror!void {
         self.assertSessionHeld("materializeIntents");
-        const n = self.session.drainIntentsInto(self.intent_batch);
+        while (true) {
+            const n = self.session.drainIntentsInto(self.intent_batch);
+            if (n == 0) return;
+            try self.materializeBatch(n);
+        }
+    }
+
+    fn materializeBatch(self: *Connection, n: usize) anyerror!void {
         var consumed: usize = 0;
         errdefer while (consumed < n) : (consumed += 1) {
             self.session.releaseIntent(&self.intent_batch[consumed]);
@@ -6534,6 +6586,10 @@ pub const Connection = struct {
                     };
                     block_queued_open = opens_block;
                     if (comptime test_observe) {
+                        if (f.typ == .rst_stream) {
+                            const pc = self.sched.pause_control;
+                            if (pc != null and pc.?(self.sched.pause_ctx)) _ = test_rst_queued_paused.fetchAdd(1, .monotonic);
+                        }
                         if (class == .terminal) {
                             const len = self.sched.terminal_len;
                             var high = test_terminal_ring_high.load(.monotonic);
@@ -7102,6 +7158,15 @@ pub const Connection = struct {
     /// `dispatchParked` resumes it when a slot frees. A request never
     /// overtakes one that is already waiting.
     fn dispatch(self: *Connection, d: session_mod.DispatchRequest) anyerror!void {
+        // The stream ended later in the same batch (the peer reset it, or a
+        // stream error closed it): there is no one to answer, so the request
+        // is dropped, as `dispatchParked` drops one that waited. Running it
+        // would also let one batch refuse more dispatches than it has live
+        // streams, and each refusal queues intents (`Limits.intentEntriesMin`).
+        if (self.session.streams.get(d.stream_id) == null) {
+            self.releaseDispatchRequest(d);
+            return;
+        }
         if (self.parked_len == 0 and try self.tryDispatch(d)) return;
         self.park(d);
     }
@@ -7193,8 +7258,10 @@ pub const Connection = struct {
         if (!complete_inline) {
             if (self.config.accounting) |acct| {
                 if (!acct.tryReserveReaper()) {
+                    // Queued, not processed: this can run inside
+                    // `materializeIntents`, whose batch a nested drain would
+                    // overwrite. That loop, or the caller's, sends it.
                     self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
-                    try self.processIntents();
                     return true;
                 }
                 reaper_reserved = true;
@@ -7356,7 +7423,7 @@ pub const Connection = struct {
             // Refuse rather than run on the actor: a blocking task handler
             // (SSE) would stop ingest, TLS, and FairScheduler on this socket.
             // Do not processIntents here: we are inside materializeIntents and
-            // the intent batch is live. The RST is picked up on the next drain.
+            // the intent batch is live. Its next round sends the RST.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
             finishHandlerJob(job);
             return true;
@@ -10112,6 +10179,7 @@ test "the terminal ring, the pool's terminal share and the frame store all hold 
         lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
         lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
         lim.outbound_slabs_per_server = @max(lim.outbound_slabs_per_server, lim.max_streams_per_server);
+        lim.intent_entries_per_connection = @max(lim.intent_entries_per_connection, try lim.intentEntriesMin());
         var trap: TrapHop = undefined;
         try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
         defer trap.close();
@@ -10127,6 +10195,205 @@ test "the terminal ring, the pool's terminal share and the frame store all hold 
         try std.testing.expectEqual(lim.control_entries_per_connection, conn.sched.ctrl.max_entries);
         try std.testing.expectEqual(lim.control_bytes_per_connection, conn.sched.ctrl.max_bytes);
     }
+}
+
+/// Limits for M streams per connection, with the server-wide caps and the
+/// intent queue raised to what boot asks for M.
+fn limitsForStreams(m: usize) !limits_mod.Limits {
+    var lim = limits_mod.Limits.defaults;
+    lim.max_streams_per_connection = m;
+    lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
+    lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
+    lim.outbound_slabs_per_server = @max(lim.outbound_slabs_per_server, lim.max_streams_per_server);
+    lim.intent_entries_per_connection = @max(lim.intent_entries_per_connection, try lim.intentEntriesMin());
+    return lim;
+}
+
+/// Feed `bytes` through the edge's own ingest loop, as one read chunk.
+fn trapIngest(conn: *Connection, bytes: []const u8) !void {
+    conn.lockSessionUncancelable(conn.config.io);
+    defer conn.unlockSession(conn.config.io);
+    try conn.ingestAndProcess(bytes);
+}
+
+/// What the server wrote, frame by frame, after the actor's turns so far.
+const TrapWire = struct {
+    rst_per_sid: std.AutoHashMap(u31, usize),
+    rst: usize = 0,
+    goaway_codes: [4]u32 = @splat(0),
+    goaways: usize = 0,
+
+    fn deinit(self: *TrapWire) void {
+        self.rst_per_sid.deinit();
+    }
+};
+
+/// Emit everything the scheduler holds and read it off the write queue, with
+/// no WritePump: drain, parse, complete, until nothing more comes.
+fn trapCollect(trap: *TrapHop, out: *TrapWire) !void {
+    const conn = &trap.hop.conn;
+    while (true) {
+        {
+            conn.lockSessionUncancelable(conn.config.io);
+            defer conn.unlockSession(conn.config.io);
+            try conn.drainEmit();
+        }
+        var took = false;
+        while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, conn.config.io)) |chunk| {
+            took = true;
+            var rest = chunk.bytes[0..chunk.len];
+            while (rest.len >= frame.FRAME_HEADER_LEN) {
+                const h = frame.FrameHeader.decode(rest[0..frame.FRAME_HEADER_LEN]);
+                const body = rest[frame.FRAME_HEADER_LEN..][0..h.length];
+                switch (h.type) {
+                    .rst_stream => {
+                        out.rst += 1;
+                        const e = try out.rst_per_sid.getOrPutValue(h.stream_id, 0);
+                        e.value_ptr.* += 1;
+                    },
+                    .goaway => {
+                        if (out.goaways < out.goaway_codes.len) out.goaway_codes[out.goaways] = std.mem.readInt(u32, body[4..8], .big);
+                        out.goaways += 1;
+                    },
+                    else => {},
+                }
+                rest = rest[frame.FRAME_HEADER_LEN + h.length ..];
+            }
+            if (wire_pump.postsCompletion(chunk)) conn.acks.sub();
+            trap.hop.completeLocalWrite(chunk);
+        }
+        if (!took) return;
+    }
+}
+
+fn refuseEveryAdmit(_: *anyopaque) bool {
+    return false;
+}
+
+/// M streams opened in one read chunk, every one refused by the server-wide
+/// admission (`tryAdmit`): M RSTs, 2M intents from one chunk.
+fn refusedBurstCase(m: usize) !void {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, try limitsForStreams(m));
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    conn.session.stream_hooks.?.tryAdmit = refuseEveryAdmit;
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    for (0..m) |i| {
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try wire.appendSlice(gpa, hopRequestFrame(&req, @intCast(1 + 2 * i)));
+    }
+    try trapIngest(conn, wire.items);
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(m, seen.rst);
+    for (0..m) |i| try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(@intCast(1 + 2 * i)));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "M streams refused by tryAdmit in one read chunk keep the connection: one RST each, no GOAWAY (t-3562)" {
+    try refusedBurstCase(limits_mod.Limits.defaults.max_streams_per_connection);
+}
+
+test "the same at M = 1024, with the intent queue boot asks for (t-3562)" {
+    try refusedBurstCase(1024);
+}
+
+test "a rapid reset under the rate limit in one read chunk keeps the connection: ingest stops and drains (t-3562)" {
+    // Every pair is a request and the peer's RST_STREAM for it: two intents
+    // (the dispatch and the local reset) for 25 bytes, so one 16 KiB chunk
+    // holds far more intents than the queue. The rate limit allows 1,000
+    // RST_STREAMs at once; 600 stay under it.
+    const gpa = std.testing.allocator;
+    // A complete handler runs inline, on the actor, so this needs no executor.
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &routes, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    const pairs = 600;
+    try std.testing.expect(2 * pairs > conn.session.intentCapacity());
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    for (0..pairs) |i| {
+        const sid: u31 = @intCast(1 + 2 * i);
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try wire.appendSlice(gpa, hopRequestFrame(&req, sid));
+        var rst: [frame.rst_stream_frame_bytes]u8 = undefined;
+        _ = try frame.Serializer.rstStream(&rst, sid, .cancel);
+        try wire.appendSlice(gpa, &rst);
+    }
+    try std.testing.expect(wire.items.len <= limits_mod.WIRE_CHUNK_SIZE);
+    try trapIngest(conn, wire.items);
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), conn.session.intentLen());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.active_streams);
+    // Requests the ingest stop let through before their reset run inline;
+    // let them finish so the connection closes clean.
+    try conn.runPendingInline();
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    // A peer's reset is never answered with one.
+    try std.testing.expectEqual(@as(usize, 0), seen.rst);
+    try conn.drainPendingCompleteReceipts(false);
+}
+
+/// A graceful shutdown that ends with M streams still open: the finish resets
+/// every one of them in one batch (2M intents) after the two graceful GOAWAYs.
+fn gracefulFinishCase(m: usize) !void {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, try limitsForStreams(m));
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        // Open streams whose handlers have not answered (no dispatch: the
+        // finish walks the session's map, which is what this needs).
+        for (0..m) |i| {
+            const sid: u31 = @intCast(1 + 2 * i);
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        try conn.session.applyCommand(.graceful_phase1);
+        try conn.processIntents();
+        try conn.session.applyCommand(.graceful_phase2);
+        try conn.processIntents();
+        try conn.finishGraceful();
+        try std.testing.expect(conn.session.terminal == .none);
+    }
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(m, seen.rst);
+    for (0..m) |i| try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(@intCast(1 + 2 * i)));
+    try std.testing.expectEqual(@as(usize, 2), seen.goaways);
+    for (seen.goaway_codes[0..2]) |code| try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.no_error)), code);
+}
+
+test "a graceful shutdown with M live streams sends M RSTs and no ENHANCE_YOUR_CALM (t-3562)" {
+    try gracefulFinishCase(limits_mod.Limits.defaults.max_streams_per_connection);
+    try gracefulFinishCase(1024);
 }
 
 test "a limit that breaks the terminal bound is InvalidConfig, not a small wrong store (t-3562)" {

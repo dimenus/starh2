@@ -103,6 +103,32 @@ pub const MAX_HEADER_FRAGMENTS: usize = 8;
 /// and the final one that ends the connection (`Session.beginGracefulPhase1`,
 /// `beginGracefulPhase2`, `failConnectionWith`). Each is queued at most once.
 pub const TERMINAL_GOAWAYS: usize = 3;
+/// Intent slots only a GOAWAY or the connection error may take
+/// (`Session.pushIntent`), so a connection that fills its intent queue can
+/// still say why it closes.
+pub const TERMINAL_INTENT_RESERVE: usize = 2;
+/// The free ordinary intent slots `Session.emitRst` wants before it queues an
+/// RST: its own two intents (the frame and the local reset), then the local
+/// reset of the connection error that ends a flood. Below this, the queue is
+/// full because the peer is past the bound, and the RST is answered with
+/// ENHANCE_YOUR_CALM instead.
+pub const RST_INTENT_ROOM: usize = 5;
+/// The most intents one inbound frame adds, the connection error it may end
+/// with included. The largest case is a DATA frame that takes its stream past
+/// the body cap: the `early_reject` intent and its response HEADERS (at most
+/// `MAX_HEADER_FRAGMENTS` frames), then the stream and the connection
+/// WINDOW_UPDATE, then the two terminal intents of a connection error (the
+/// rate limit is charged after the frame is handled). Every other frame adds
+/// less: a refused or reset stream two, an admitted request one, a SETTINGS or
+/// PING its ack, a peer RST_STREAM its local reset. `Session.ingestSome`
+/// asserts the bound after every frame.
+pub const INTENTS_PER_FRAME_MAX: usize = 1 + MAX_HEADER_FRAGMENTS + 2 + TERMINAL_INTENT_RESERVE;
+/// The free ordinary intent slots `Session.ingestSome` wants before it takes
+/// the next frame: one frame's worth, and after it the room `emitRst` checks
+/// for. With less, ingest stops at the frame boundary and the edge
+/// materializes the queue before it goes on, so a read chunk never fills the
+/// queue, whatever it holds.
+pub const INGEST_FRAME_ROOM: usize = INTENTS_PER_FRAME_MAX + RST_INTENT_ROOM;
 
 /// Lower bound on `compression_context_bytes` for a quality/window pair.
 ///
@@ -251,8 +277,9 @@ pub const Limits = struct {
     /// slabs on every connection — 16 MiB each at the defaults — whether the
     /// connection wrote one byte or saturated every stream.
     outbound_slabs_per_server: usize = 4_096,
-    /// Intent backlog entries per connection (session).
-    intent_entries_per_connection: usize = 512,
+    /// Intent queue entries per connection (session). At least
+    /// `intentEntriesMin`, which boot checks.
+    intent_entries_per_connection: usize = 520,
     /// Concurrent live brotli encoder contexts server-wide. Each context is
     /// rented for the lifetime of one compressed response (including an SSE
     /// stream) and returned when that response finishes or aborts.
@@ -354,6 +381,41 @@ pub const Limits = struct {
 
     pub fn controlPoolBytes(self: Limits) error{InvalidConfig}!usize {
         return checkedAdd(self.control_bytes_per_connection, try self.terminalBytes());
+    }
+
+    /// The fewest intents the session queue must hold, so that a well-behaved
+    /// peer is never taken for a flood (`Session.emitRst` answers a nearly
+    /// full queue with ENHANCE_YOUR_CALM) and never fails closed on a full
+    /// queue.
+    ///
+    /// The queue fills between two drains, and the edge drains at the end of
+    /// every lock section that pushes, so it must hold the largest single
+    /// batch, from empty:
+    ///
+    /// - A read chunk does not count, whatever it holds: `Session.ingestSome`
+    ///   stops at a frame boundary while fewer than `INGEST_FRAME_ROOM` slots
+    ///   are free, and the edge drains before it goes on. The queue only has
+    ///   to take one frame and the RST room after it.
+    /// - A reset of every live stream at once: the graceful finish
+    ///   (`Connection.finishGraceful`), the request body idle sweep
+    ///   (`Session.checkIdleDeadlines`), or the dispatch refusals of a batch
+    ///   (a failed handler spawn, a refused reaper reservation), which
+    ///   `Connection.materializeIntents` drains in the same call. Each stream
+    ///   is reset once in such a batch, because a reset takes it out of the
+    ///   map and every one of these walks the map (a dispatch of a stream
+    ///   that has already left it is dropped, not refused). Two intents per
+    ///   stream (the RST and its local reset): 2M. The last RST still wants
+    ///   `RST_INTENT_ROOM` free, and the terminal reserve sits on top.
+    /// - A handler's command: at most one response header block
+    ///   (`MAX_HEADER_FRAGMENTS`), less than one frame's worth.
+    pub fn intentEntriesMin(self: Limits) error{InvalidConfig}!usize {
+        const resets = try checkedAdd(try checkedMul(self.max_streams_per_connection, 2), RST_INTENT_ROOM);
+        return checkedAdd(@max(resets, INGEST_FRAME_ROOM), TERMINAL_INTENT_RESERVE);
+    }
+
+    /// Boot check for the intent queue (`intentEntriesMin`).
+    pub fn checkIntentQueue(self: Limits) error{InvalidConfig}!void {
+        if (self.intent_entries_per_connection < try self.intentEntriesMin()) return error.InvalidConfig;
     }
 
     /// Boot check for the frame pool. A connection queues its two preface
@@ -478,6 +540,7 @@ pub const Limits = struct {
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.listen_backlog == 0) return error.InvalidConfig;
         try self.checkFramePool();
+        try self.checkIntentQueue();
         // A server with no slabs can never write DATA.
         if (self.outbound_slabs_per_server == 0) return error.InvalidConfig;
         // Every admitted stream can hold at most one slab, and global stream
@@ -593,10 +656,30 @@ test "mutation canary: the slot term moves with each limit that sizes a boot tab
         more.max_streams_per_server = @max(more.max_streams_per_server, more.max_streams_per_connection);
         more.cancellation_reaper_jobs = @max(more.cancellation_reaper_jobs, more.max_streams_per_server);
         more.outbound_slabs_per_server = @max(more.outbound_slabs_per_server, more.max_streams_per_server);
+        // The intent queue must hold a reset of every live stream.
+        more.intent_entries_per_connection = @max(more.intent_entries_per_connection, try more.intentEntriesMin());
         const bigger = try more.resourceUpperBound();
         try std.testing.expect(bigger.terms.slot_boot > base.terms.slot_boot);
         try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
     }
+}
+
+test "the intent queue holds a reset of every live stream, and boot refuses less (t-3562)" {
+    var lim = Limits.defaults;
+    try lim.checkIntentQueue();
+    // 2 per stream, the room the last RST checks for, and the terminal reserve.
+    try std.testing.expectEqual(2 * lim.max_streams_per_connection + RST_INTENT_ROOM + TERMINAL_INTENT_RESERVE, try lim.intentEntriesMin());
+    lim.intent_entries_per_connection = (try lim.intentEntriesMin()) - 1;
+    try std.testing.expectError(error.InvalidConfig, lim.checkIntentQueue());
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    // M = 1024 does not fit the default queue.
+    lim = Limits.defaults;
+    lim.max_streams_per_connection = 1024;
+    try std.testing.expectError(error.InvalidConfig, lim.checkIntentQueue());
+    // A tiny M still needs one frame's room for ingest to make progress.
+    lim = Limits.defaults;
+    lim.max_streams_per_connection = 1;
+    try std.testing.expectEqual(INGEST_FRAME_ROOM + TERMINAL_INTENT_RESERVE, try lim.intentEntriesMin());
 }
 
 test "defaults resource bound" {

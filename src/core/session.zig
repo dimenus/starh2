@@ -238,7 +238,7 @@ pub const Session = struct {
     /// is closing. Without the reserve the failure path needs the resource it
     /// just ran out of, so the connection would die silently and the peer would
     /// see only a dropped socket.
-    terminal_reserve: usize = 2,
+    terminal_reserve: usize = limits_mod.TERMINAL_INTENT_RESERVE,
     highest_peer_stream: u31 = 0,
     last_processed_stream: u31 = 0,
     active_streams: usize = 0,
@@ -528,7 +528,7 @@ pub const Session = struct {
             .tombstones = .empty,
             .intent_storage = intent_storage,
             .intent_len = 0,
-            .terminal_reserve = 2,
+            .terminal_reserve = limits_mod.TERMINAL_INTENT_RESERVE,
             .pending_bodies = std.AutoHashMap(u31, std.ArrayList(u8)).init(boot),
             .pending_headers = std.AutoHashMap(u31, []hpack.HeaderField).init(boot),
             .pending_trailers = std.AutoHashMap(u31, []hpack.HeaderField).init(boot),
@@ -656,6 +656,11 @@ pub const Session = struct {
         if (self.intent_len >= limit) return error.PoolExhausted;
         self.intent_storage[self.intent_len] = intent;
         self.intent_len += 1;
+    }
+
+    /// Free intent slots for an ordinary (non-terminal) intent.
+    fn ordinaryIntentRoom(self: *const Session) usize {
+        return self.intent_storage.len -| self.terminal_reserve -| self.intent_len;
     }
 
     fn pushIntentOrFailClosed(self: *Session, intent: Intent) !void {
@@ -799,8 +804,29 @@ pub const Session = struct {
         self.sent_preface = true;
     }
 
+    /// Ingest the whole of `chunk`, for a caller that drains the intents only
+    /// at the end. A chunk whose frames would fill the intent queue is
+    /// `error.IntentQueueFull` here, not a dropped tail; the edge uses
+    /// `ingestSome`, which stops and lets it drain.
     pub fn ingest(self: *Session, chunk: []const u8) !void {
-        if (self.terminal != .none) return;
+        if (try self.ingestSome(chunk) != chunk.len) return error.IntentQueueFull;
+    }
+
+    /// Ingest frames from `chunk` and return how many bytes were taken.
+    ///
+    /// Fewer than `chunk.len` means the intent queue has less free room than
+    /// one frame can need (`limits.INGEST_FRAME_ROOM`), and the rest of the
+    /// chunk starts at a frame boundary: the caller materializes the intents,
+    /// then calls again with the rest. So no read chunk fills the queue,
+    /// whatever frames it holds; without the stop, a chunk of HEADERS and
+    /// RST_STREAM pairs (a rapid reset under the rate limit) or of refused
+    /// streams queued more intents than the queue holds, and the connection
+    /// of a peer within every limit failed closed or got ENHANCE_YOUR_CALM.
+    /// A partial frame at the end is kept by the parser and counts as taken.
+    /// Once the connection is ending the rest of the chunk is dropped and
+    /// counts as taken too.
+    pub fn ingestSome(self: *Session, chunk: []const u8) !usize {
+        if (self.terminal != .none) return chunk.len;
         // Rehash moves entries, so it runs here, before any `*Stream` from
         // `streams.getPtr` exists. O(capacity) once per capacity/2 removes.
         if (self.stream_removes * 2 >= self.streams.capacity()) {
@@ -809,6 +835,8 @@ pub const Session = struct {
         }
         var remaining = chunk;
         while (remaining.len > 0) {
+            if (self.ordinaryIntentRoom() < limits_mod.INGEST_FRAME_ROOM) return chunk.len - remaining.len;
+            const queued = self.intent_len;
             const maybe = self.parser.ingestOne(remaining) catch |err| {
                 const code: frame.ErrorCode = switch (err) {
                     error.ProtocolError => .protocol_error,
@@ -817,18 +845,19 @@ pub const Session = struct {
                     error.NeedMore => unreachable,
                 };
                 try self.failConnection(code);
-                return;
+                return chunk.len;
             };
-            if (maybe) |res| {
-                try self.handleFrame(res.event);
-                remaining = remaining[res.consumed..];
-                // The connection is ending and its GOAWAY is queued. The rest
-                // of the chunk would only add intents (a flood of refused
-                // streams would fill the intent queue before the GOAWAY
-                // could be written).
-                if (self.terminal != .none) return;
-            } else break;
+            const res = maybe orelse return chunk.len;
+            try self.handleFrame(res.event);
+            std.debug.assert(self.intent_len - queued <= limits_mod.INTENTS_PER_FRAME_MAX);
+            remaining = remaining[res.consumed..];
+            // The connection is ending and its GOAWAY is queued. The rest
+            // of the chunk would only add intents (a flood of refused
+            // streams would fill the intent queue before the GOAWAY
+            // could be written).
+            if (self.terminal != .none) return chunk.len;
         }
+        return chunk.len;
     }
 
     pub fn applyCommand(self: *Session, cmd: AppCommand) !void {
@@ -990,12 +1019,12 @@ pub const Session = struct {
         // connection error that ends a flood takes the two terminal intents
         // (GOAWAY and connection_error, which sit in the reserve and move the
         // ordinary limit's room down by two) and then the local reset, so it
-        // needs 3 of the room that is left. A peer that fills the intent queue
-        // with RSTs in one read chunk is flooding, and it is answered like any
-        // other flood while that room remains: below 5, an RST would leave
-        // less than the 3 the connection error needs.
-        const intent_room = self.intent_storage.len -| self.terminal_reserve -| self.intent_len;
-        if (intent_room < 5) {
+        // needs 3 of the room that is left: below `RST_INTENT_ROOM` an RST
+        // would leave less than that. The queue holds every batch a
+        // well-behaved peer can cause (`Limits.intentEntriesMin`), and a read
+        // chunk stops before it fills it (`ingestSome`), so a queue this full
+        // means a peer past the bound, answered like any other flood.
+        if (self.ordinaryIntentRoom() < limits_mod.RST_INTENT_ROOM) {
             if (self.rstOwed(stream_id)) try self.failConnection(.enhance_your_calm);
         } else if (self.rstOwed(stream_id)) {
             var buf: [13]u8 = undefined;
@@ -1961,8 +1990,7 @@ pub const Session = struct {
         const n_frames = @max(1, (block_len + max_payload - 1) / max_payload);
         // `Limits.check` keeps the bound within `MAX_HEADER_FRAGMENTS` frames.
         std.debug.assert(n_frames <= limits_mod.MAX_HEADER_FRAGMENTS);
-        const intent_room = self.intent_storage.len -| self.terminal_reserve -| self.intent_len;
-        if (intent_room < n_frames) return error.OutOfMemory;
+        if (self.ordinaryIntentRoom() < n_frames) return error.OutOfMemory;
 
         var bufs: [limits_mod.MAX_HEADER_FRAGMENTS][]u8 = undefined;
         var built: usize = 0;
