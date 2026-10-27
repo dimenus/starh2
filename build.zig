@@ -751,6 +751,25 @@ pub fn build(b: *std.Build) void {
     const outbound_memory_step = b.step("test-outbound-memory", "Run the outbound memory gates (write-pool backpressure, header blocks cut into CONTINUATION frames)");
     outbound_memory_step.dependOn(&run_outbound_memory_tests.step);
 
+    const outbound_budget_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/outbound_budget.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_outbound_budget_tests = b.addRunArtifact(outbound_budget_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_outbound_budget_tests.setCwd(b.path("."));
+    const outbound_budget_step = b.step("test-outbound-budget", "Run the connection outbound budget gates (a full budget parks a writer in arrival order; the server cap refuses; an inline job waits)");
+    outbound_budget_step.dependOn(&run_outbound_budget_tests.step);
+
     const request_memory_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/request_memory.zig"),
@@ -822,6 +841,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);
     test_step.dependOn(&run_outbound_memory_tests.step);
+    test_step.dependOn(&run_outbound_budget_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");

@@ -24,6 +24,29 @@ test "control capacity must leave ordinary space above terminal reserve" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
+test "the connection budget must hold the whole write pool and one stream's cap (t-3538)" {
+    // A full budget parks the writer; that is safe only if the wire side alone
+    // can never be the whole budget, because the wire side is what an ack
+    // frees. The wire side is the write pool, so the budget holds the pool and
+    // a stream's cap. One byte short is refused, exactly enough is accepted.
+    var lim = starh2.Limits.defaults;
+    lim.inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS;
+    lim.outbound_bytes_per_stream = 64 * 1024;
+    const pool_bytes = lim.inbound_wire_chunks_per_connection * starh2.core.limits.WIRE_CHUNK_SIZE;
+    const enough = pool_bytes + lim.outbound_bytes_per_stream;
+    lim.outbound_bytes_per_connection = enough;
+    lim.outbound_bytes_per_server = enough;
+    _ = try lim.resourceUpperBound();
+    lim.outbound_bytes_per_connection = enough - 1;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    // The default write pool at the default budget is far inside it.
+    _ = try starh2.Limits.defaults.resourceUpperBound();
+    // A bigger pool needs a bigger budget.
+    lim.outbound_bytes_per_connection = enough;
+    lim.inbound_wire_chunks_per_connection += 1;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
 test "bound terms use concrete sizes and capacities" {
     const lim = starh2.Limits.defaults;
     const b = try lim.resourceUpperBound();
@@ -77,8 +100,9 @@ test "counting allocator: Server.init under published ceiling" {
         .cancellation_reaper_tasks = 2,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
-        .outbound_bytes_per_connection = 16 * 1024,
-        .outbound_bytes_per_server = 64 * 1024,
+        // The write pool (3 chunks) and one stream's cap must fit the budget.
+        .outbound_bytes_per_connection = 64 * 1024,
+        .outbound_bytes_per_server = 128 * 1024,
         .request_bytes_per_connection = 128 * 1024,
         .request_bytes_per_server = 256 * 1024,
         .request_arena_bytes = 256 * 1024,
@@ -138,8 +162,8 @@ test "fail-index iteration: Server.init fails closed" {
         .cancellation_reaper_tasks = 1,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 1024,
-        .outbound_bytes_per_connection = 4 * 1024,
-        .outbound_bytes_per_server = 8 * 1024,
+        .outbound_bytes_per_connection = 64 * 1024,
+        .outbound_bytes_per_server = 128 * 1024,
         .request_bytes_per_connection = 128 * 1024,
         .request_bytes_per_server = 256 * 1024,
         .request_arena_bytes = 256 * 1024,
@@ -207,8 +231,9 @@ test "counting allocator peak under live hello stays under ceiling" {
         .cancellation_reaper_tasks = 2,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
-        .outbound_bytes_per_connection = 16 * 1024,
-        .outbound_bytes_per_server = 64 * 1024,
+        // The write pool (3 chunks) and one stream's cap must fit the budget.
+        .outbound_bytes_per_connection = 64 * 1024,
+        .outbound_bytes_per_server = 128 * 1024,
         .request_bytes_per_connection = 128 * 1024,
         .request_bytes_per_server = 256 * 1024,
         .request_arena_bytes = 256 * 1024,

@@ -257,6 +257,31 @@ pub var test_ack_room_pauses: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): handler flush barriers that parked for
 /// `write_ack_ch` room (`waitForAckRoom`).
 pub var test_ack_room_waits: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): handlers that parked for connection outbound
+/// budget (`parkForBudget`), and the budget grants made. `test_budget_grant_log`
+/// keeps the stream id of each grant, newest at `grants % len`, so a test can
+/// read the order the queue served its waiters in.
+pub var test_budget_waits: std.atomic.Value(usize) = .init(0);
+pub var test_budget_grants: std.atomic.Value(usize) = .init(0);
+pub var test_budget_grant_log: [64]std.atomic.Value(u32) = @splat(.init(0));
+/// Test-only (observe builds): times `runPendingInline` held a complete job
+/// back for lack of connection budget.
+pub var test_inline_budget_gated: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): doorbell rings made by a budget grant to an
+/// inline entry. The grant of the entry being admitted in the same call rings
+/// nothing.
+pub var test_budget_doorbell_rings: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): terminal control frames the scheduler could not
+/// queue (`ctrl_terminal_full`, the reset burst that ends a connection). A test
+/// that relies on the terminal queue not overflowing asserts it did not move.
+pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): while true, the TLS driver holds the chunks that
+/// sit in the stash (pushed by a drain, not yet taken for writing). Beside
+/// `wire_pump.test_hold_writes`, which holds a batch the driver already took,
+/// it lets a test see a chunk in each place. `test_hold_stash_entered` counts
+/// the times the driver stopped there.
+pub var test_hold_stash: std.atomic.Value(bool) = .init(false);
+pub var test_hold_stash_entered: std.atomic.Value(u64) = .init(0);
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
 pub var test_allow_full_queue_push: std.atomic.Value(bool) = .init(false);
@@ -685,6 +710,15 @@ pub const outbound_memory = struct {
     /// write-pool room (the drain resumes when a chunk comes back).
     pub var drain_turns: std.atomic.Value(u64) = .init(0);
     pub var drain_memory_pauses: std.atomic.Value(u64) = .init(0);
+    /// Handler writes refused because the SERVER's outbound byte cap
+    /// (`outbound_bytes_per_server`) was full, and because the server's
+    /// outbound slab pool was empty (`SlabsExhausted`). Each resets the
+    /// writer's stream. A full CONNECTION budget is not here: that parks the
+    /// handler. Server-wide exhaustion is overload shedding, not
+    /// backpressure: no release on this connection would make room, so
+    /// waiting could not end.
+    pub var server_cap_refusals: std.atomic.Value(u64) = .init(0);
+    pub var slab_pool_refusals: std.atomic.Value(u64) = .init(0);
 };
 
 /// Work counters for the rest of the HTTP/2 path (stage 3 part 4), beside
@@ -1047,7 +1081,37 @@ pub const HandlerSlot = struct {
     /// Set when `live_handlers` is incremented. `errdefer releaseSlot` before
     /// that point is rollback, not a missing finalize.
     admitted: bool = false,
+    /// This handler's place in the connection's budget queue
+    /// (`Connection.parkForBudget`). Guarded by `Connection.budget_mu`; idle
+    /// whenever the handler is not inside that function.
+    budget: BudgetWait = .{},
 };
+
+/// One handler's wait for connection outbound budget. The entry lives in the
+/// handler's slot, so the queue allocates nothing.
+///
+/// A parked task writer and a gated inline job wait in the SAME queue, in
+/// arrival order; only what a grant wakes differs.
+///
+/// - `queued`: in the queue, owed `need` bytes, not yet reserved.
+/// - `granted`: `need` bytes are reserved for this handler (connection and
+///   server counters) and the handler has not looked yet. The handler owns
+///   them from here: it copies them into its slab, or gives them back.
+/// - `refused`: the hand-over hit the SERVER cap, so nothing is reserved.
+///   Nothing on this connection would ever retry it, so it is woken to fail.
+pub const BudgetWait = struct {
+    pub const State = enum(u8) { idle, queued, granted, refused };
+    state: State = .idle,
+    need: usize = 0,
+    /// The waiter is a complete (inline) job, not a parked task writer. The
+    /// actor runs it, so a grant rings the actor's doorbell instead of waking
+    /// a handler, and the actor takes the outcome (`inlineBudget`).
+    is_inline: bool = false,
+    /// Slot index of the next waiter, or `budget_none`.
+    next: u32 = budget_none,
+};
+
+const budget_none: u32 = std.math.maxInt(u32);
 
 /// The blocking point a task handler is parked at, for `diagHandlerState`.
 pub const DiagWait = enum(u8) {
@@ -1172,6 +1236,16 @@ const HandlerCtx = struct {
     /// one TLS record. This is per handler on purpose: a task handler on the
     /// same connection can be writing while the actor runs a complete batch.
     runs_inline: bool = false,
+    /// Budget bytes `runPendingInline` reserved for this inline job (reserved
+    /// as pending, so a write only spends them; the unused part goes back when
+    /// the job ends). The actor must not park, so an inline job never waits for
+    /// budget: the gate waits for room BEFORE it runs the job. A complete
+    /// handler's whole body fits one stream's slab, so one stream's cap is all
+    /// it can write.
+    inline_credit: usize = 0,
+    /// The gate found the SERVER cap full: the job runs with no credit and its
+    /// first body write is refused like any server-cap refusal.
+    inline_shed: bool = false,
     /// `1` means encode succeeded. The drain-turn receipt is reserved after
     /// the inline batch, not per response.
     deferred_ticket: u64 = 0,
@@ -1731,9 +1805,32 @@ pub const Connection = struct {
     handler_joins: []?zio.JoinHandle(void) = &.{},
     preface_deadline: ?std.Io.Timestamp = null,
     /// Connection-local outbound/request reservations — actor applies write acks under atomics.
+    ///
+    /// The budget counts DATA payload bytes a handler wrote, once, from the
+    /// write until the ack of the chunk that carried them (see
+    /// `tryReserveOutboundBytes`). `pending` is the part still waiting in the
+    /// scheduler (or being framed in the drain that holds `session_mu`),
+    /// `wire` the part handed to the write pump. Always
+    /// `outbound_held == pending_outbound_held + wire_outbound_held`.
     outbound_held: std.atomic.Value(usize) = .init(0),
     pending_outbound_held: std.atomic.Value(usize) = .init(0),
     wire_outbound_held: std.atomic.Value(usize) = .init(0),
+    /// FIFO of handlers waiting for budget (`BudgetWait`, linked through the
+    /// handler slots). Lock order: `session_mu`, then `budget_mu`; the lock is
+    /// never held across a wait and never takes `session_mu`, because wire
+    /// releases run on the actor with no `session_mu` (h2c `drainWriteAcks`,
+    /// TLS acks in the driver turn).
+    budget_mu: zio.Mutex = .init,
+    budget_head: u32 = budget_none,
+    budget_tail: u32 = budget_none,
+    /// Entries in the queue. A release reads it to skip `budget_mu` when no
+    /// one waits; see `wakeBudgetWaiters` for the ordering.
+    budget_waiters: std.atomic.Value(u32) = .init(0),
+    /// Largest `outbound_held` seen, for `--close-reason`. Only kept while
+    /// `close_reason` is on.
+    outbound_high_water: std.atomic.Value(usize) = .init(0),
+    /// Times a handler parked for budget, for `--close-reason`.
+    budget_parks: std.atomic.Value(u32) = .init(0),
     /// What this connection's requests hold, in class bytes. Atomic because
     /// the handlers run on other executors. Shares `Limits.request_bytes_per_connection`.
     request_budget: request_pool.ConnBudget,
@@ -1751,8 +1848,6 @@ pub const Connection = struct {
     /// Handler writes refused for lack of connection outbound budget
     /// (`enqueuePending`). Each refusal fails one stream. Under `session_mu`.
     stream_budget_refusals: u32 = 0,
-    /// The first sink handoff refused wire bytes, kept for `--close-reason`.
-    wire_refusal: ?WireRefusal = null,
     /// Capacity waiters: one `zio.Event` per HandlerSlot (sparse IDs safe).
     space_events: []zio.Event = &.{},
     /// Time waiters. Occupancy and time are different waits; do not overload
@@ -2324,6 +2419,11 @@ pub const Connection = struct {
         for (self.request_leases.slice()) |*l| {
             if (l.stream_id != 0) self.releaseLease(l);
         }
+        // Every waiter leaves the queue before its handler returns, and every
+        // handler is gone by now. A name left here is a grant nobody returned.
+        if (self.budget_waiters.load(.acquire) != 0 or self.budget_head != budget_none) {
+            std.debug.panic("budget waiters at deinit: waiters={d}", .{self.budget_waiters.load(.acquire)});
+        }
         const held = self.outbound_held.load(.acquire);
         const pending_held = self.pending_outbound_held.load(.acquire);
         const wire_held = self.wire_outbound_held.load(.acquire);
@@ -2419,6 +2519,7 @@ pub const Connection = struct {
         if (self.outbound_held.load(.acquire) != 0 or
             self.pending_outbound_held.load(.acquire) != 0 or
             self.wire_outbound_held.load(.acquire) != 0) return "outbound bytes still reserved";
+        if (self.budget_waiters.load(.acquire) != 0 or self.budget_head != budget_none) return "budget waiter still queued";
         if (self.request_budget.held.load(.acquire) != 0) return "request bytes still reserved";
         if (self.session.active_streams != 0) return "streams still admitted";
         if (self.handshake_held) return "handshake slot still held";
@@ -2468,16 +2569,34 @@ pub const Connection = struct {
 
     const OutboundKind = enum { pending, wire };
 
-    fn tryReserveOutboundBytes(self: *Connection, n: usize, kind: OutboundKind) bool {
-        if (n == 0) return true;
+    /// Why a reservation was not made. The two differ in what a handler may do
+    /// about them: a full connection budget is backpressure (park, a release
+    /// will come), the server cap is overload (refuse, nothing on this
+    /// connection will ever make room for it).
+    const ReserveResult = enum { ok, connection_full, server_full };
+
+    /// The budget counts DATA payload bytes a handler wrote, ONCE. The bytes
+    /// are reserved here, at the handler's write (`enqueuePending`), as
+    /// `pending`; the drain TRANSFERS them to `wire` when the chunk that
+    /// carries them goes to the pump (`transferOutbound`, no reserve); the
+    /// ack of that chunk releases them. Frame headers, HEADERS, CONTINUATION
+    /// and control frames are not charged: the control pool, the frame pool
+    /// and the write pool already bound them.
+    ///
+    /// A byte is not charged again when its frame moves to the wire. The move
+    /// changes neither the total nor the server counter, so it cannot fail,
+    /// and another connection cannot take the gap that a "release, then
+    /// reserve" move would leave.
+    fn tryReserveOutboundBytes(self: *Connection, n: usize, kind: OutboundKind) ReserveResult {
+        if (n == 0) return .ok;
         const lim = self.config.limits.outbound_bytes_per_connection;
         while (true) {
-            const cur = self.outbound_held.load(.acquire);
-            if (cur > lim or lim - cur < n) return false;
+            const cur = self.outbound_held.load(.seq_cst);
+            if (cur > lim or lim - cur < n) return .connection_full;
             if (self.config.accounting) |a| {
-                if (!a.tryReserveOutbound(n)) return false;
+                if (!a.tryReserveOutbound(n)) return .server_full;
             }
-            if (self.outbound_held.cmpxchgWeak(cur, cur + n, .acq_rel, .acquire) == null) {
+            if (self.outbound_held.cmpxchgWeak(cur, cur + n, .seq_cst, .seq_cst) == null) {
                 switch (kind) {
                     .pending => {
                         const kind_prev = self.pending_outbound_held.fetchAdd(n, .acq_rel);
@@ -2488,10 +2607,28 @@ pub const Connection = struct {
                         std.debug.assert(kind_prev <= lim - n);
                     },
                 }
-                return true;
+                if (close_reason) self.noteOutboundHighWater(cur + n);
+                return .ok;
             }
             if (self.config.accounting) |a| a.releaseOutbound(n);
         }
+    }
+
+    fn noteOutboundHighWater(self: *Connection, held: usize) void {
+        var hw = self.outbound_high_water.load(.monotonic);
+        while (held > hw) hw = self.outbound_high_water.cmpxchgWeak(hw, held, .monotonic, .monotonic) orelse break;
+    }
+
+    /// Move `n` bytes from `pending` to `wire`: the bytes left the scheduler
+    /// for a chunk the pump now owns. The total and the server counter do not
+    /// change, so this never reserves and never fails.
+    fn transferOutbound(self: *Connection, n: usize) void {
+        if (n == 0) return;
+        const prev = self.pending_outbound_held.fetchSub(n, .acq_rel);
+        if (std.debug.runtime_safety and prev < n) {
+            std.debug.panic("outbound over-transfer: n={d} pending_before={d} total_held={d}", .{ n, prev, self.outbound_held.load(.acquire) });
+        }
+        _ = self.wire_outbound_held.fetchAdd(n, .acq_rel);
     }
 
     fn applyOutboundRelease(self: *Connection, n: usize, kind: OutboundKind) void {
@@ -2512,9 +2649,68 @@ pub const Connection = struct {
             );
         }
         std.debug.assert(kind_prev >= n);
-        const prev = self.outbound_held.fetchSub(n, .acq_rel);
+        const prev = self.outbound_held.fetchSub(n, .seq_cst);
         std.debug.assert(prev >= n);
         if (self.config.accounting) |a| a.releaseOutbound(n);
+        // The one function every release passes through (drain failure, ack,
+        // slow consumer, reset, writer failure, teardown), so no release site
+        // can forget to hand the room to a waiter.
+        self.wakeBudgetWaiters();
+    }
+
+    /// A release just made room: give it to the waiters, in arrival order.
+    ///
+    /// No lost wake. The waiter queues itself (`budget_waiters.fetchAdd`) and
+    /// then reads `outbound_held` (the grant attempt in `parkForBudget`); the
+    /// releaser lowers `outbound_held` and then reads `budget_waiters`. All
+    /// four are seq_cst, so they have one total order that keeps each side's
+    /// program order: either the waiter's read sees the release (it takes the
+    /// room itself) or the releaser's read sees the waiter (it takes
+    /// `budget_mu` and hands the room over). The count read is the whole
+    /// cost of a release while no one waits.
+    fn wakeBudgetWaiters(self: *Connection) void {
+        if (self.budget_waiters.load(.seq_cst) == 0) return;
+        self.budget_mu.lockUncancelable();
+        defer self.budget_mu.unlock();
+        self.grantBudgetLocked(budget_none);
+    }
+
+    /// Hand reservations to the head of the queue while its whole `need`
+    /// fits, FIFO. A grant is a reservation made for the waiter (connection
+    /// and server counters), so the woken handler finds its bytes taken and
+    /// no one can take them first. Wake only the waiter that got something:
+    /// no wake-all, so a release does not start a herd. `budget_mu` held.
+    ///
+    /// `admitting` is the slot index of an inline entry that is being admitted
+    /// by the caller in this same critical section, or `budget_none`. Its
+    /// grant is taken by the caller on return, so it does not ring the
+    /// doorbell; a grant made later, by a release, does.
+    fn grantBudgetLocked(self: *Connection, admitting: u32) void {
+        while (self.budget_head != budget_none) {
+            const i = self.budget_head;
+            const slot = &self.handlers.storage[i];
+            std.debug.assert(slot.budget.state == .queued);
+            const outcome = self.tryReserveOutboundBytes(slot.budget.need, .pending);
+            if (outcome == .connection_full) return;
+            // `server_full` fails the head here. The server counter does not
+            // move for a release on this connection alone, so leaving the
+            // head queued would strand it.
+            slot.budget.state = if (outcome == .ok) .granted else .refused;
+            self.budget_head = slot.budget.next;
+            if (self.budget_head == budget_none) self.budget_tail = budget_none;
+            slot.budget.next = budget_none;
+            _ = self.budget_waiters.fetchSub(1, .seq_cst);
+            if (comptime test_observe) {
+                const n = test_budget_grants.fetchAdd(1, .monotonic);
+                test_budget_grant_log[n % test_budget_grant_log.len].store(slot.stream_id, .monotonic);
+            }
+            if (!slot.budget.is_inline) {
+                self.space_events[i].set();
+            } else if (i != admitting) {
+                if (comptime test_observe) _ = test_budget_doorbell_rings.fetchAdd(1, .monotonic);
+                self.ring();
+            }
+        }
     }
 
     fn applyControlRelease(self: *Connection, n: usize, entries: u32) void {
@@ -2572,8 +2768,6 @@ pub const Connection = struct {
         return true;
     }
 
-    const WireRefusal = struct { n: usize, held: usize, pending: usize, wire: usize, deferred_pending: usize };
-
     /// Every site that ends the connection from this side calls this just
     /// before it sets `writer_failed`; see `close_reason`.
     fn noteServerClose(self: *Connection, comptime site: []const u8, err: ?anyerror) void {
@@ -2584,16 +2778,11 @@ pub const Connection = struct {
     fn printCloseReason(self: *Connection, comptime site: []const u8, err: []const u8, goaway: []const u8) void {
         if (!close_reason or self.close_reason_noted) return;
         self.close_reason_noted = true;
-        var refusal_buf: [160]u8 = undefined;
-        const refusal: []const u8 = if (self.wire_refusal) |r|
-            std.fmt.bufPrint(&refusal_buf, "{d} at_refusal held={d} pending={d} wire={d} deferred_pending={d}", .{ r.n, r.held, r.pending, r.wire, r.deferred_pending }) catch "?"
-        else
-            "-";
         // A failed socket write is how this side first sees most peer
         // closes: h2load hangs up after its last response, and the next
         // write fails. So it is not counted as the server ending it.
         const by = comptime if (std.mem.eql(u8, site, "ack_fail_all")) "write_failed" else "server";
-        diagRawPrint("CLOSE_REASON conn={x} mode={s} by=" ++ by ++ " site=" ++ site ++ " err={s} goaway={s} held={d} pending={d} wire={d} lim={d} stream_budget_refusals={d} wire_refused={s}\n", .{
+        diagRawPrint("CLOSE_REASON conn={x} mode={s} by=" ++ by ++ " site=" ++ site ++ " err={s} goaway={s} held={d} pending={d} wire={d} lim={d} high_water={d} budget_parks={d} stream_budget_refusals={d}\n", .{
             @intFromPtr(self) & 0xffffff,
             @tagName(self.config.mode),
             err,
@@ -2602,8 +2791,9 @@ pub const Connection = struct {
             self.pending_outbound_held.load(.acquire),
             self.wire_outbound_held.load(.acquire),
             self.config.limits.outbound_bytes_per_connection,
+            self.outbound_high_water.load(.acquire),
+            self.budget_parks.load(.acquire),
             self.stream_budget_refusals,
-            refusal,
         });
     }
 
@@ -3422,6 +3612,12 @@ pub const Connection = struct {
         if (pump.pending_n > 0) {
             if (!pump.drivePending()) return true;
         }
+        if (comptime test_observe) {
+            if (test_hold_stash.load(.acquire) and !pump.write_ch.isEmpty()) {
+                _ = test_hold_stash_entered.fetchAdd(1, .release);
+                while (test_hold_stash.load(.acquire)) try self.config.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
         while (pump.pending_n == 0) {
             const chunk = if (pump.carried) |c| blk: {
                 pump.carried = null;
@@ -4130,8 +4326,12 @@ pub const Connection = struct {
         if (close_reason and self.config.mode == .h2c) {
             diagRawPrint("ACK_LEDGER conn={x} high_water={d} capacity={d} owed={d}\n", .{ @intFromPtr(self) & 0xffffff, self.acks.high_water.load(.acquire), self.write_ack_buf.len, self.acks.owed.load(.acquire) });
         }
-        if (close_reason and self.stream_budget_refusals != 0) {
-            diagRawPrint("STREAM_BUDGET conn={x} mode={s} stream_budget_refusals={d} lim={d} server_ended={}\n", .{ @intFromPtr(self) & 0xffffff, @tagName(self.config.mode), self.stream_budget_refusals, self.config.limits.outbound_bytes_per_connection, self.close_reason_noted });
+        if (close_reason) {
+            // One line per connection, even when nothing was refused: a run
+            // whose budget never filled proves nothing about the budget, so
+            // the high-water (largest bytes held at once) is printed beside
+            // the limit, with how many writes parked and how many were refused.
+            diagRawPrint("STREAM_BUDGET conn={x} mode={s} stream_budget_refusals={d} lim={d} high_water={d} budget_parks={d} server_ended={}\n", .{ @intFromPtr(self) & 0xffffff, @tagName(self.config.mode), self.stream_budget_refusals, self.config.limits.outbound_bytes_per_connection, self.outbound_high_water.load(.acquire), self.budget_parks.load(.acquire), self.close_reason_noted });
         }
         if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), self.sched.pendingCount(), close_probe_parked.load(.acquire) });
         self.finishTerminalInline(self.teardown_inline_n);
@@ -4386,6 +4586,7 @@ pub const Connection = struct {
             if (self.config.accounting) |a| a.releaseReaper();
             slot.reaper_reserved = false;
         }
+        self.assertBudgetEntryIdle(slot, i);
         slot.in_use = false;
         slot.admitted = false;
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
@@ -4393,6 +4594,29 @@ pub const Connection = struct {
         slot.completion_owner.store(reported, .release);
         std.debug.assert(!slot.in_use);
         return true;
+    }
+
+    /// A slot goes back to the pool with its budget entry idle and out of the
+    /// queue: a queued entry would leave a freed slot linked, and a granted one
+    /// would leak its bytes. This does NOT repair either; it stops, with the
+    /// stream and the state, so the path that missed the entry is found. Safe
+    /// builds only.
+    fn assertBudgetEntryIdle(self: *Connection, slot: *HandlerSlot, index: usize) void {
+        if (!std.debug.runtime_safety) return;
+        self.budget_mu.lockUncancelable();
+        defer self.budget_mu.unlock();
+        const linked = self.budget_head == index or self.budget_tail == index or blk: {
+            var cur = self.budget_head;
+            while (cur != budget_none) : (cur = self.handlers.storage[cur].budget.next) {
+                if (cur == index) break :blk true;
+            }
+            break :blk false;
+        };
+        if (slot.budget.state != .idle or linked) {
+            std.debug.panic("handler slot sid={d} released with a budget entry: state={s} inline={} linked={} need={d}", .{
+                slot.stream_id, @tagName(slot.budget.state), slot.budget.is_inline, linked, slot.budget.need,
+            });
+        }
     }
 
     /// Stop a handler because its stream is over — a peer RST, or a local
@@ -4422,6 +4646,10 @@ pub const Connection = struct {
     fn wakeHandlerWaiters(self: *Connection, stream_id: u31) void {
         self.assertSessionHeld("wakeHandlerWaiters");
         std.debug.assert(stream_id != 0);
+        // A complete job waiting for budget (queued, or granted and not yet
+        // run) leaves the queue with its stream, and a grant goes back, once.
+        // A parked task writer leaves by itself when it wakes below.
+        if (self.slotIndex(stream_id)) |i| self.abandonInlineBudget(&self.handlers.storage[i], i);
         if (self.sched.findPending(stream_id)) |pw| {
             if (pw.flush_ticket != 0) {
                 const t = pw.flush_ticket;
@@ -4574,9 +4802,13 @@ pub const Connection = struct {
     fn outboundFlushed(self: *Connection) bool {
         if (self.session.intentLen() != 0) return false;
         if (!self.sched.idle()) return false;
-        if (self.wire_outbound_held.load(.acquire) != 0) return false;
+        // Not `wire_outbound_held`: the budget counts DATA payload bytes only,
+        // so a chunk of headers and controls (a GOAWAY is the one that
+        // matters here) holds none of it. The transport's own counts say
+        // whether everything is written: h2c, the completions still owed for
+        // pushed chunks; TLS, the stash, the staged records and the send.
         if (self.config.mode == .tls) return self.tls_driver.?.writesDrained();
-        return true;
+        return self.acks.owed.load(.acquire) == 0;
     }
 
     /// The h2c drain's pause hooks. The scheduler asks before EVERY pop, so a
@@ -5173,14 +5405,23 @@ pub const Connection = struct {
     ///
     /// A body of any size is copied in cap-sized pieces, so an arbitrarily
     /// large response never needs an arbitrarily large buffer. Per piece:
-    /// reserve the outbound bytes, copy into the slab, then set
-    /// `sched_refilled` and wake the actor. The flag is set BEFORE the wake for
-    /// the reason given in the module header — an event edge can be erased by
-    /// the actor's reset, a flag cannot.
+    /// wait for room in the stream's slab, then for room in the connection's
+    /// budget (`reserveBudget`; a full budget parks the handler, it does not
+    /// fail the write), copy into the slab, then set `sched_refilled` and
+    /// wake the actor. The flag is set BEFORE the wake for the reason given
+    /// in the module header — an event edge can be erased by the actor's
+    /// reset, a flag cannot.
+    ///
+    /// Slab room comes first, and `take` is what that room allows, so a
+    /// waiter never asks the budget for more than one stream's cap. The
+    /// order also keeps a parked handler from holding budget while it waits
+    /// for something else: it holds none until it is granted, and then it
+    /// only copies.
     ///
     /// The trailing zero-length enqueue is not redundant. It carries the
     /// END_STREAM marker or the flush ticket for a body whose bytes are all
     /// already queued, and for an empty body it is the only enqueue there is.
+    /// It carries no payload, so it costs no budget and never waits for it.
     fn enqueuePending(
         self: *Connection,
         stream_id: u31,
@@ -5203,16 +5444,14 @@ pub const Connection = struct {
             const room = cap - self.sched.pendingByteLen(stream_id);
             if (room == 0) continue;
             const take = @min(bytes.len - off, room);
-            if (!self.tryReserveOutboundBytes(take, .pending)) {
-                self.stream_budget_refusals +|= 1;
-                // t-1022 probe: name the site that turns a write into a
-                // per-stream abort, with the budget state at that moment.
-                if (diag_park) diagRawPrint("WFAIL budget sid={d} held={d} pend_held={d} wire_held={d} lim={d} sched_pending={d}\n", .{ stream_id, self.outbound_held.load(.acquire), self.pending_outbound_held.load(.acquire), self.wire_outbound_held.load(.acquire), self.config.limits.outbound_bytes_per_connection, self.sched.pendingCount() });
-                return error.OutOfMemory;
-            }
-            self.sched.enqueueDataBytes(stream_id, bytes[off..][0..take], false, 0, 0) catch {
+            try self.reserveBudget(hctx, stream_id, take);
+            self.sched.enqueueDataBytes(stream_id, bytes[off..][0..take], false, 0, 0) catch |err| {
                 if (diag_park) diagRawPrint("WFAIL slab sid={d} sched_pending={d}\n", .{ stream_id, self.sched.pendingCount() });
                 self.applyOutboundRelease(take, .pending);
+                // The server's slab pool is empty. Like the server byte cap,
+                // that is shed load: no release on this connection brings a
+                // slab back, so the write is refused and not parked.
+                if (err == error.SlabsExhausted) self.noteHardRefusal(&outbound_memory.slab_pool_refusals);
                 return error.OutOfMemory;
             };
             off += take;
@@ -5227,6 +5466,246 @@ pub const Connection = struct {
             self.sched_refilled.store(true, .release);
             self.ring();
         }
+    }
+
+    /// A write the server refused for lack of SERVER-wide memory (its byte
+    /// cap or its slab pool). Under `session_mu`.
+    fn noteHardRefusal(self: *Connection, counter: *std.atomic.Value(u64)) void {
+        self.stream_budget_refusals +|= 1;
+        _ = counter.fetchAdd(1, .monotonic);
+    }
+
+    /// Reserve `need` budget bytes for a handler's write, as pending. Returns
+    /// with the bytes reserved and `session_mu` held, or with an error and
+    /// nothing reserved. May release `session_mu` while it waits.
+    ///
+    /// - An inline (complete) handler spends the credit the gate reserved for
+    ///   it (`runPendingInline`). It never waits: the actor would be waiting
+    ///   for itself.
+    /// - A task handler takes the room if no one is queued. A newcomer joins
+    ///   the tail whenever the queue is not empty, even if room exists, or a
+    ///   stream of small writes could starve a large one for ever. The
+    ///   emptiness read is a snapshot: two arrivals at the same instant have
+    ///   no order to keep.
+    /// - Otherwise it parks (`parkForBudget`).
+    fn reserveBudget(self: *Connection, hctx: *HandlerCtx, stream_id: u31, need: usize) response.ResponseError!void {
+        if (hctx.runs_inline) {
+            if (need <= hctx.inline_credit) {
+                hctx.inline_credit -= need;
+                return;
+            }
+            if (hctx.inline_shed) {
+                self.noteHardRefusal(&outbound_memory.server_cap_refusals);
+                return error.OutOfMemory;
+            }
+            // The gate reserved a whole stream's cap and a complete handler
+            // cannot write more: a gate that let a job through without it.
+            return error.WriteFailed;
+        }
+        if (self.budget_waiters.load(.seq_cst) == 0) {
+            switch (self.tryReserveOutboundBytes(need, .pending)) {
+                .ok => return,
+                .server_full => {
+                    self.noteHardRefusal(&outbound_memory.server_cap_refusals);
+                    return error.OutOfMemory;
+                },
+                .connection_full => {},
+            }
+        }
+        return self.parkForBudget(hctx, stream_id, need);
+    }
+
+    /// Wait in the budget queue until `need` bytes are reserved for this
+    /// handler. The lock protocol is `waitForStreamSpace`'s: check the
+    /// terminal cause and the writer, reset the event, unlock `session_mu`,
+    /// select on the event and `dead`, relock uncancelably, check again.
+    ///
+    /// What the queue guarantees:
+    /// - FIFO with a hand-over. The releaser reserves the bytes FOR the head
+    ///   (`grantBudgetLocked`) before it wakes it, so the woken handler finds
+    ///   them taken and no newcomer can take them first. A large write is not
+    ///   starved by small ones, and a write that needs more than one release
+    ///   to fit is not woken until it can proceed (no herd, no retry loop).
+    /// - A large body parks again at the TAIL for each of its pieces, so
+    ///   streams take turns (round robin by construction).
+    /// - Every exit unlinks the entry and gives an unused grant back, exactly
+    ///   once (`abandonBudget`): a cancel, a stream reset, the connection
+    ///   ending, a slow-consumer kill, a failed writer.
+    ///
+    /// Nothing here waits on anything that waits on the budget. The handler
+    /// holds no budget while it waits. The budget is held by pending bytes
+    /// (the drain moves them on, or the slow-consumer deadline kills their
+    /// stream), by wire bytes (bounded by the write pool, see
+    /// `Limits.resourceUpperBound`; the ack frees them) and by granted bytes whose
+    /// handler only needs `session_mu` to copy them.
+    fn parkForBudget(self: *Connection, hctx: *HandlerCtx, stream_id: u31, need: usize) response.ResponseError!void {
+        const io = self.config.io;
+        const terminal = hctx.terminal;
+        if (terminal.getCause()) |c| return response.causeToError(c);
+        if (self.writer_failed.load(.acquire)) return error.WriteFailed;
+        const i = self.spaceIndex(stream_id) orelse return error.Canceled;
+        const slot = &self.handlers.storage[i];
+        const event = &self.space_events[i];
+        self.queueForBudget(slot, i, need, false);
+        var parked = false;
+        while (true) {
+            const state = self.takeBudgetOutcome(slot, event);
+            switch (state) {
+                .granted => return self.acceptGrant(terminal, need),
+                .refused => {
+                    self.noteHardRefusal(&outbound_memory.server_cap_refusals);
+                    return error.OutOfMemory;
+                },
+                .queued => {},
+                .idle => unreachable,
+            }
+            if (terminal.getCause()) |c| {
+                self.abandonBudget(slot, i);
+                return response.causeToError(c);
+            }
+            if (self.writer_failed.load(.acquire)) {
+                self.abandonBudget(slot, i);
+                return error.WriteFailed;
+            }
+            if (!parked) {
+                parked = true;
+                _ = self.budget_parks.fetchAdd(1, .monotonic);
+                if (comptime test_observe) _ = test_budget_waits.fetchAdd(1, .monotonic);
+            }
+            self.unlockSession(io);
+            const wait_res: anyerror!void = blk: {
+                const winner = zio.select(.{
+                    .space = event,
+                    .dead = &self.dead,
+                }) catch break :blk error.Canceled;
+                break :blk switch (winner) {
+                    .space => {},
+                    .dead => error.Canceled,
+                };
+            };
+            self.lockSessionUncancelable(io);
+            wait_res catch {
+                self.abandonBudget(slot, i);
+                if (terminal.getCause()) |c| return response.causeToError(c);
+                return error.Canceled;
+            };
+        }
+    }
+
+    /// The handler found `need` bytes reserved for it. A reset or a failed
+    /// writer that arrived with the grant wins, and the bytes go back.
+    fn acceptGrant(self: *Connection, terminal: *response.SlotTerminal, need: usize) response.ResponseError!void {
+        if (terminal.getCause()) |c| {
+            self.applyOutboundRelease(need, .pending);
+            return response.causeToError(c);
+        }
+        if (self.writer_failed.load(.acquire)) {
+            self.applyOutboundRelease(need, .pending);
+            return error.WriteFailed;
+        }
+    }
+
+    /// Join the tail of the budget queue, then try the hand-over once: a
+    /// release may have landed before this entry was visible to it, and the
+    /// head may be this entry.
+    fn queueForBudget(self: *Connection, slot: *HandlerSlot, index: usize, need: usize, is_inline: bool) void {
+        const event = &self.space_events[index];
+        self.budget_mu.lockUncancelable();
+        defer self.budget_mu.unlock();
+        if (!is_inline) event.reset();
+        self.linkBudgetLocked(slot, index, need, is_inline);
+        self.grantBudgetLocked(budget_none);
+    }
+
+    /// Put an idle entry at the tail of the queue. `budget_mu` held.
+    fn linkBudgetLocked(self: *Connection, slot: *HandlerSlot, index: usize, need: usize, is_inline: bool) void {
+        std.debug.assert(slot.budget.state == .idle);
+        slot.budget = .{ .state = .queued, .need = need, .is_inline = is_inline };
+        if (self.budget_tail == budget_none) {
+            self.budget_head = @intCast(index);
+        } else {
+            self.handlers.storage[self.budget_tail].budget.next = @intCast(index);
+        }
+        self.budget_tail = @intCast(index);
+        _ = self.budget_waiters.fetchAdd(1, .seq_cst);
+    }
+
+    /// What became of this entry. A grant or a refusal is taken (the entry is
+    /// idle again, the handler owns the outcome); a still queued entry has
+    /// its event reset under the lock a grant sets it under, so a grant after
+    /// this call is not erased.
+    fn takeBudgetOutcome(self: *Connection, slot: *HandlerSlot, event: ?*zio.Event) @TypeOf(slot.budget.state) {
+        self.budget_mu.lockUncancelable();
+        defer self.budget_mu.unlock();
+        return takeBudgetOutcomeLocked(slot, event);
+    }
+
+    fn takeBudgetOutcomeLocked(slot: *HandlerSlot, event: ?*zio.Event) @TypeOf(slot.budget.state) {
+        const st = slot.budget.state;
+        switch (st) {
+            .queued => if (event) |e| e.reset(),
+            .granted, .refused => slot.budget.state = .idle,
+            .idle => unreachable,
+        }
+        return st;
+    }
+
+    /// Leave the budget queue without the bytes: unlink a queued entry, or
+    /// give back a grant the handler no longer wants. Either way the entry is
+    /// idle afterwards and the bytes are released once. The release is done
+    /// outside `budget_mu` because it hands the room to the next waiter.
+    fn abandonBudget(self: *Connection, slot: *HandlerSlot, index: usize) void {
+        self.budget_mu.lockUncancelable();
+        const give_back = self.abandonBudgetLocked(slot, index);
+        self.budget_mu.unlock();
+        self.applyOutboundRelease(give_back, .pending);
+    }
+
+    /// `abandonBudget` for a complete job's entry only: whether the entry is
+    /// one, and in what state, is read under the lock (a parked task writer
+    /// owns its entry's fields, and the hand-over writes them from another
+    /// thread). A stream's reset and the teardown sweep call this for every
+    /// slot.
+    fn abandonInlineBudget(self: *Connection, slot: *HandlerSlot, index: usize) void {
+        self.budget_mu.lockUncancelable();
+        const give_back = if (slot.budget.is_inline and slot.budget.state != .idle)
+            self.abandonBudgetLocked(slot, index)
+        else
+            0;
+        self.budget_mu.unlock();
+        self.applyOutboundRelease(give_back, .pending);
+    }
+
+    /// Unlink a queued entry or take back a grant; the entry is idle after.
+    /// Returns the bytes to release once the lock is dropped. `budget_mu` held.
+    fn abandonBudgetLocked(self: *Connection, slot: *HandlerSlot, index: usize) usize {
+        var give_back: usize = 0;
+        switch (slot.budget.state) {
+            .queued => self.unlinkBudgetLocked(@intCast(index)),
+            .granted => give_back = slot.budget.need,
+            .refused, .idle => {},
+        }
+        slot.budget = .{};
+        // The entry that left may have been a head that did not fit and
+        // that held back a follower that does. No release is coming to
+        // wake that follower (behind closed stream windows the next one
+        // can be the slow-consumer deadline), so hand over room now.
+        self.grantBudgetLocked(budget_none);
+        return give_back;
+    }
+
+    fn unlinkBudgetLocked(self: *Connection, index: u32) void {
+        var prev: u32 = budget_none;
+        var cur = self.budget_head;
+        while (cur != budget_none and cur != index) {
+            prev = cur;
+            cur = self.handlers.storage[cur].budget.next;
+        }
+        std.debug.assert(cur == index);
+        const next = self.handlers.storage[index].budget.next;
+        if (prev == budget_none) self.budget_head = next else self.handlers.storage[prev].budget.next = next;
+        if (self.budget_tail == index) self.budget_tail = prev;
+        _ = self.budget_waiters.fetchSub(1, .seq_cst);
     }
 
     /// Single FairScheduler drain: terminal → ordinary(+forced DATA) → DRR DATA.
@@ -5295,6 +5774,7 @@ pub const Connection = struct {
                 ticket_count: u32,
                 control_n: usize,
                 control_entries: u32,
+                credit: usize,
                 owns_payload: bool,
             ) anyerror!void {
                 // A completed batch is still scheduler-originated output even
@@ -5310,6 +5790,7 @@ pub const Connection = struct {
                     ticket_count,
                     control_n,
                     control_entries,
+                    credit,
                     owns_payload,
                     false,
                 );
@@ -5330,6 +5811,7 @@ pub const Connection = struct {
                     taken.ticket_count,
                     taken.control_n,
                     taken.control_entries,
+                    taken.payload_credit,
                     false,
                 );
             }
@@ -5345,6 +5827,16 @@ pub const Connection = struct {
             ) anyerror!void {
                 const batch: *@This() = @ptrCast(@alignCast(ctx));
                 const c = batch.c;
+                // The frame's DATA payload (`buildData`), still counted as
+                // pending. From here this function owns it: it goes to the
+                // batch or to `queueWire`, which release it if they fail, and
+                // the early returns below release it themselves. The side
+                // channel is cleared first so the drain's error path cannot
+                // release it a second time.
+                const credit = c.pending_data_outbound_release;
+                const wake_sid = c.pending_data_wake_sid;
+                c.pending_data_outbound_release = 0;
+                c.pending_data_wake_sid = 0;
                 if (emit_batch.frameIsBatchable(
                     control_entry,
                     ticket,
@@ -5355,6 +5847,7 @@ pub const Connection = struct {
                     if (!batch.emit.wouldFit(wire.len)) {
                         batch.flushBatch() catch |err| {
                             c.releaseWireBytes(payload);
+                            c.applyOutboundRelease(credit, .pending);
                             return err;
                         };
                     }
@@ -5367,6 +5860,7 @@ pub const Connection = struct {
                                     batch.emit.control_entries = 0;
                                 }
                                 c.releaseWireBytes(payload);
+                                c.applyOutboundRelease(credit, .pending);
                                 return error.WriteFailed;
                             };
                         }
@@ -5375,9 +5869,9 @@ pub const Connection = struct {
                     if (c.payloadInScratch(payload)) {
                         // Built here by `rentFrame`, at the end of what the scratch holds.
                         std.debug.assert(payload.ptr == batch.emit.buf.ptr + batch.emit.len);
-                        batch.emit.adopt(wire.len, flush, control_n, control_entry);
+                        batch.emit.adopt(wire.len, flush, control_n, control_entry, credit);
                     } else {
-                        batch.emit.copyFrame(wire, flush, control_n, control_entry);
+                        batch.emit.copyFrame(wire, flush, control_n, control_entry, credit);
                         c.releaseWireBytes(payload);
                     }
                 } else {
@@ -5385,6 +5879,7 @@ pub const Connection = struct {
                     std.debug.assert(!c.payloadInScratch(payload));
                     batch.flushBatch() catch |err| {
                         c.releaseWireBytes(payload);
+                        c.applyOutboundRelease(credit, .pending);
                         return err;
                     };
                     try batch.queue(
@@ -5395,15 +5890,13 @@ pub const Connection = struct {
                         if (ticket != 0) 1 else 0,
                         control_n,
                         if (control_entry) 1 else 0,
+                        credit,
                         true,
                     );
                 }
-                if (!control_entry and c.pending_data_outbound_release != 0) {
-                    c.applyOutboundRelease(c.pending_data_outbound_release, .pending);
-                    c.wakeStreamSpace(c.pending_data_wake_sid);
-                    c.pending_data_outbound_release = 0;
-                    c.pending_data_wake_sid = 0;
-                }
+                // The frame left its slab, so the stream has room again. This
+                // is the stream's wake; the budget's is `applyOutboundRelease`.
+                if (credit != 0) c.wakeStreamSpace(wake_sid);
             }
             fn streamWin(ctx: *anyopaque, stream_id: u31) i32 {
                 const c: *Connection = @ptrCast(@alignCast(ctx));
@@ -5448,6 +5941,9 @@ pub const Connection = struct {
                 self.pending_data_outbound_release = 0;
                 self.pending_data_wake_sid = 0;
             }
+            // Frames the batch took before the failure never reached a chunk.
+            self.applyOutboundRelease(sink_ctx.emit.payload_credit, .pending);
+            sink_ctx.emit.payload_credit = 0;
             self.noteServerClose("data_sink_catch", err);
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
@@ -5494,6 +5990,7 @@ pub const Connection = struct {
                 ticket_count: u32,
                 control_n: usize,
                 control_entries: u32,
+                credit: usize,
                 owns_payload: bool,
                 complete_batch_receipt: bool,
             ) anyerror!void {
@@ -5511,6 +6008,7 @@ pub const Connection = struct {
                     ticket_count,
                     control_n,
                     control_entries,
+                    credit,
                     owns_payload,
                     complete_batch_receipt,
                 );
@@ -5534,6 +6032,7 @@ pub const Connection = struct {
                     taken.ticket_count,
                     taken.control_n,
                     taken.control_entries,
+                    taken.payload_credit,
                     false,
                     complete_batch_receipt,
                 );
@@ -5550,13 +6049,17 @@ pub const Connection = struct {
             ) anyerror!void {
                 const batch: *@This() = @ptrCast(@alignCast(ctx));
                 const c = batch.c;
-                // Body bytes were reserved at enqueuePending; release only after the
-                // sink accepted the framed lease. Wire chunk.outbound_release tracks
-                // the framed size reserved in sendAccountedWire (acked separately).
-                //
-                // Several HEADERS may share one plaintext. Occupancy is still
-                // held until the write completes; control_entries is how many
-                // reserved slots that completion must return.
+                // The frame's DATA payload (`buildData`), still counted as
+                // pending, and owned from here exactly as in `drainEmit`'s
+                // sink. The chunk's own release is this credit, acked
+                // separately. Several HEADERS may share one plaintext.
+                // Occupancy is still held until the write completes;
+                // control_entries is how many reserved slots that completion
+                // must return.
+                const credit = c.pending_data_outbound_release;
+                const wake_sid = c.pending_data_wake_sid;
+                c.pending_data_outbound_release = 0;
+                c.pending_data_wake_sid = 0;
                 if (emit_batch.frameJoinsInProgress(
                     control_entry,
                     ticket,
@@ -5569,6 +6072,7 @@ pub const Connection = struct {
                     if (!batch.emit.wouldFit(wire.len)) {
                         batch.flushBatch(false) catch |err| {
                             c.releaseWireBytes(payload);
+                            c.applyOutboundRelease(credit, .pending);
                             return err;
                         };
                     }
@@ -5581,6 +6085,7 @@ pub const Connection = struct {
                                     batch.emit.control_entries = 0;
                                 }
                                 c.releaseWireBytes(payload);
+                                c.applyOutboundRelease(credit, .pending);
                                 return error.WriteFailed;
                             };
                         }
@@ -5589,9 +6094,9 @@ pub const Connection = struct {
                     if (c.payloadInScratch(payload)) {
                         // Built here by `rentFrame`, at the end of what the scratch holds.
                         std.debug.assert(payload.ptr == batch.emit.buf.ptr + batch.emit.len);
-                        batch.emit.adopt(wire.len, flush, control_n, control_entry);
+                        batch.emit.adopt(wire.len, flush, control_n, control_entry, credit);
                     } else {
-                        batch.emit.copyFrame(wire, flush, control_n, control_entry);
+                        batch.emit.copyFrame(wire, flush, control_n, control_entry, credit);
                         c.releaseWireBytes(payload);
                     }
                 } else {
@@ -5599,6 +6104,7 @@ pub const Connection = struct {
                     std.debug.assert(!c.payloadInScratch(payload));
                     batch.flushBatch(false) catch |err| {
                         c.releaseWireBytes(payload);
+                        c.applyOutboundRelease(credit, .pending);
                         return err;
                     };
                     try batch.queue(
@@ -5609,16 +6115,12 @@ pub const Connection = struct {
                         if (ticket != 0) 1 else 0,
                         control_n,
                         if (control_entry) 1 else 0,
+                        credit,
                         true,
                         false,
                     );
                 }
-                if (!control_entry and c.pending_data_outbound_release != 0) {
-                    c.applyOutboundRelease(c.pending_data_outbound_release, .pending);
-                    c.wakeStreamSpace(c.pending_data_wake_sid);
-                    c.pending_data_outbound_release = 0;
-                    c.pending_data_wake_sid = 0;
-                }
+                if (credit != 0) c.wakeStreamSpace(wake_sid);
             }
             fn streamWin(ctx: *anyopaque, stream_id: u31) i32 {
                 const c: *Connection = @ptrCast(@alignCast(ctx));
@@ -5668,6 +6170,9 @@ pub const Connection = struct {
                 self.pending_data_outbound_release = 0;
                 self.pending_data_wake_sid = 0;
             }
+            // Frames the batch took before the failure never reached a chunk.
+            self.applyOutboundRelease(sink_ctx.emit.payload_credit, .pending);
+            sink_ctx.emit.payload_credit = 0;
             self.noteServerClose("emit_fail1", err);
             self.writer_failed.store(true, .release);
             self.handleWriterFailed();
@@ -5677,6 +6182,8 @@ pub const Connection = struct {
             if (!sink_ctx.emit.empty()) {
                 if (sink_ctx.emit.ticket_count != 0) {
                     self.tickets.linkCompletion(sink_ctx.emit.last_ticket_slot, sink_ctx.receipt_slot) catch {
+                        self.applyOutboundRelease(sink_ctx.emit.payload_credit, .pending);
+                        sink_ctx.emit.payload_credit = 0;
                         self.noteServerClose("emit_fail2", null);
                         self.writer_failed.store(true, .release);
                         self.handleWriterFailed();
@@ -5793,59 +6300,53 @@ pub const Connection = struct {
             switch (it.*) {
                 .outbound_frame => |f| {
                     if (f.typ == .data) {
-                        // No direct queueWire — framed DATA enters FairScheduler queue.
-                        var t: u64 = 0;
-                        var s: u32 = 0;
-                        if (self.next_wire_ticket != 0) {
-                            t = self.next_wire_ticket;
-                            s = self.next_wire_slot;
-                            self.next_wire_ticket = 0;
-                            self.next_wire_slot = 0;
-                        }
-                        self.sched.enqueueFramedData(f.payload, f.stream_id, f.flags.end_stream, t, s) catch {
+                        // Already-framed DATA (`Session.cmdData`, the
+                        // `respond_data` command) has no pending reservation,
+                        // so it would reach the wire with no budget credit and
+                        // the counters would stop meaning what they say. No
+                        // production code produces it: handlers write through
+                        // `enqueuePending`, and only tests and the session's
+                        // own harnesses use `respond_data`. A connection that
+                        // meets it stops loudly instead of drifting.
+                        std.debug.panic("framed DATA reached the connection scheduler: no budget credit (stream {d}); handlers write through enqueuePending", .{f.stream_id});
+                    }
+                    const class = fair_scheduler.FairScheduler.classifyControl(f.typ, f.flags);
+                    var t: u64 = 0;
+                    var s: u32 = 0;
+                    if (self.next_wire_ticket != 0) {
+                        t = self.next_wire_ticket;
+                        s = self.next_wire_slot;
+                        self.next_wire_slot = 0;
+                        self.next_wire_ticket = 0;
+                    }
+                    const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
+                    self.sched.enqueueControl(f.payload, class, t, s) catch |err| switch (err) {
+                        error.PoolFull, error.QueueFull => {
+                            // Payload already freed by enqueueControl. Do not
+                            // drop the rest of the batch: the next intent is
+                            // often `stream_reset` for this same RST.
                             if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
                             self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
                             consumed = n;
+                            // A fragment refused after its block began leaves
+                            // the peer waiting for it and the scheduler
+                            // holding the connection to that block
+                            // (`FairScheduler.block_open`): there is no way
+                            // to go on. The first fragment is an ordinary
+                            // per-stream refusal, and the rest of the batch,
+                            // its other fragments, is released above.
+                            if (class == .terminal) {
+                                if (comptime test_observe) _ = test_ctrl_terminal_full.fetchAdd(1, .monotonic);
+                                self.noteServerClose("ctrl_terminal_full", err);
+                                self.writer_failed.store(true, .release);
+                            } else if (block_queued_open) {
+                                self.noteServerClose("ctrl_fragment_full", err);
+                                self.writer_failed.store(true, .release);
+                            }
                             return error.OutOfMemory;
-                        };
-                    } else {
-                        const class = fair_scheduler.FairScheduler.classifyControl(f.typ, f.flags);
-                        var t: u64 = 0;
-                        var s: u32 = 0;
-                        if (self.next_wire_ticket != 0) {
-                            t = self.next_wire_ticket;
-                            s = self.next_wire_slot;
-                            self.next_wire_slot = 0;
-                            self.next_wire_ticket = 0;
-                        }
-                        const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
-                        self.sched.enqueueControl(f.payload, class, t, s) catch |err| switch (err) {
-                            error.PoolFull, error.QueueFull => {
-                                // Payload already freed by enqueueControl. Do not
-                                // drop the rest of the batch: the next intent is
-                                // often `stream_reset` for this same RST.
-                                if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
-                                self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
-                                consumed = n;
-                                // A fragment refused after its block began leaves
-                                // the peer waiting for it and the scheduler
-                                // holding the connection to that block
-                                // (`FairScheduler.block_open`): there is no way
-                                // to go on. The first fragment is an ordinary
-                                // per-stream refusal, and the rest of the batch,
-                                // its other fragments, is released above.
-                                if (class == .terminal) {
-                                    self.noteServerClose("ctrl_terminal_full", err);
-                                    self.writer_failed.store(true, .release);
-                                } else if (block_queued_open) {
-                                    self.noteServerClose("ctrl_fragment_full", err);
-                                    self.writer_failed.store(true, .release);
-                                }
-                                return error.OutOfMemory;
-                            },
-                        };
-                        block_queued_open = opens_block;
-                    }
+                        },
+                    };
+                    block_queued_open = opens_block;
                 },
                 .dispatch_request => |d| try self.dispatch(d),
                 .early_reject => {},
@@ -6150,6 +6651,14 @@ pub const Connection = struct {
     /// With `owned` set, `src` is the start of `owned.bytes` and that chunk
     /// goes to the pump as is; this function then owns it on every path.
     ///
+    /// `credit` is the DATA payload bytes `src` carries, still counted as
+    /// pending. The chunk carries them to the pump (`outbound_release`) and
+    /// the ack releases exactly those; the frames' headers and the controls in
+    /// `src` are not the budget's bytes. This function owns the credit on
+    /// every path: it transfers it to the wire side before the push (the pump
+    /// may ack, and the actor apply the ack, before the push returns) and
+    /// releases it if the chunk never reaches the pump.
+    ///
     /// The chunk carries the release amounts rather than a callback, so the
     /// pump needs no access to `Connection`. The actor applies them when the
     /// write completes. That is the whole reason the pumps can run without
@@ -6168,6 +6677,7 @@ pub const Connection = struct {
         control_n: usize,
         control_entries: u32,
         complete_batch_receipt: bool,
+        credit: usize,
         owned: ?WriteLease,
     ) anyerror!void {
         const send_t0 = if (trace.enabled) nowNs(self.config.io) else 0;
@@ -6177,20 +6687,9 @@ pub const Connection = struct {
             _ = trace.send_bytes.fetchAdd(src.len, .monotonic);
         };
         if (owned) |o| std.debug.assert(o.bytes.ptr == src.ptr and src.len <= o.bytes.len);
-        if (!self.tryReserveOutboundBytes(src.len, .wire)) {
-            if (self.wire_refusal == null) self.wire_refusal = .{
-                .n = src.len,
-                .held = self.outbound_held.load(.acquire),
-                .pending = self.pending_outbound_held.load(.acquire),
-                .wire = self.wire_outbound_held.load(.acquire),
-                .deferred_pending = self.pending_data_outbound_release,
-            };
-            if (owned) |o| self.returnWriteChunk(o);
-            if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
-            return error.OutOfMemory;
-        }
+        std.debug.assert(credit <= src.len);
         const lease = if (owned) |o| o else self.leaseWriteChunk(src.len) catch |err| {
-            self.applyOutboundRelease(src.len, .wire);
+            self.applyOutboundRelease(credit, .pending);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             return err;
         };
@@ -6200,6 +6699,7 @@ pub const Connection = struct {
             self.wire_copied_bytes += src.len;
         }
         if (trace.enabled) _ = trace.records.fetchAdd(1, .monotonic);
+        self.transferOutbound(credit);
         self.pushWriteChunk(.{
             .bytes = lease.bytes,
             .len = src.len,
@@ -6208,12 +6708,12 @@ pub const Connection = struct {
             .ticket_slot = ticket_slot,
             .ticket_count = ticket_count,
             .complete_batch_receipt = complete_batch_receipt,
-            .outbound_release = src.len,
+            .outbound_release = credit,
             .control_release = control_n,
             .control_entries = control_entries,
             .pool_index = lease.pool_index,
         }) catch |err| {
-            self.applyOutboundRelease(src.len, .wire);
+            self.applyOutboundRelease(credit, .wire);
             if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
             self.returnWriteChunk(lease);
             // `err` is `WriteFailed` or `Canceled`; a cancel must not become a failed write.
@@ -6285,6 +6785,7 @@ pub const Connection = struct {
         ticket_count: u32,
         control_n: usize,
         control_entries: u32,
+        credit: usize,
         owns_bytes: bool,
         complete_batch_receipt: bool,
     ) anyerror!void {
@@ -6309,12 +6810,13 @@ pub const Connection = struct {
             const fail_after = test_force_wire_fail_after.load(.acquire);
             if (fail_after != 0 and sends + 1 >= fail_after) {
                 if (control_entries != 0) self.applyControlRelease(control_n, control_entries);
+                self.applyOutboundRelease(credit, .pending);
                 return error.WriteFailed;
             }
         }
         const owned = if (owns_bytes) self.frameAsWriteLease(bytes) else null;
         if (owned != null) bytes_held = false;
-        try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries, complete_batch_receipt, owned);
+        try self.sendAccountedWire(plain, flush, ticket, ticket_slot, ticket_count, control_n, control_entries, complete_batch_receipt, credit, owned);
         if (trace_batch) self.trace_queued_ns.store(nowNs(self.config.io), .release);
     }
 
@@ -6801,6 +7303,39 @@ pub const Connection = struct {
         return if (later >= earlier) later - earlier else 0;
     }
 
+    const InlineBudget = enum { run, shed, wait };
+
+    /// Where a complete job stands in the budget queue. The admission
+    /// decision is made under `budget_mu`, like a task writer's: the job joins
+    /// the tail and the hand-over runs once, so with an empty queue and room
+    /// the job is granted at once, and otherwise it waits its turn. Called by
+    /// the actor only. `.wait` leaves the entry queued; the actor asks again
+    /// on a later turn (a grant rings the doorbell).
+    fn inlineBudget(self: *Connection, slot: *HandlerSlot, index: usize) InlineBudget {
+        // One critical section: the state is read, the entry joins the tail
+        // if it is idle, the hand-over runs once and the outcome is taken. A
+        // grant made to this entry in this very call is taken here and rings
+        // nothing (`grantBudgetLocked`).
+        self.budget_mu.lockUncancelable();
+        defer self.budget_mu.unlock();
+        const fresh = slot.budget.state == .idle;
+        if (fresh) {
+            self.linkBudgetLocked(slot, index, self.config.limits.outbound_bytes_per_stream, true);
+            self.grantBudgetLocked(@intCast(index));
+        }
+        return switch (takeBudgetOutcomeLocked(slot, null)) {
+            .granted => .run,
+            .refused => .shed,
+            .queued => blk: {
+                if (fresh) {
+                    if (comptime test_observe) _ = test_inline_budget_gated.fetchAdd(1, .monotonic);
+                }
+                break :blk .wait;
+            },
+            .idle => unreachable,
+        };
+    }
+
     /// Complete handlers skip spawn. They are queued under `session_mu` and
     /// run here with the lock released. Encode one drain-turn, attach one
     /// receipt, finish every job of the batch, return to the actor loop. The
@@ -6846,15 +7381,56 @@ pub const Connection = struct {
         var i: usize = 0;
         while (i < queued_n) : (i += 1) {
             const sid = self.inline_sids[i];
-            const job = if (self.slotIndex(sid)) |idx| &self.handler_jobs[idx] else continue;
+            const idx = self.slotIndex(sid) orelse continue;
+            const job = &self.handler_jobs[idx];
             if (!self.sched.ctrl.hasOrdinaryEntry()) {
                 if (trace.enabled) _ = trace.inline_ctrl_full_n.fetchAdd(1, .monotonic);
                 if (comptime test_observe) _ = test_observed_inline_ctrl_full.fetchAdd(1, .monotonic);
                 break;
             }
+            // Budget gate. The actor must not park, so a complete handler
+            // never waits for budget on its own task: it takes a place in the
+            // budget queue, the same FIFO the parked task writers wait in
+            // (`inlineBudget`), and the actor stops the batch at the first job
+            // whose entry is not granted. A grant reserves one stream's cap
+            // for the job (as pending, so its write only spends it) and rings
+            // the doorbell; the actor runs the job on its next turn. A complete
+            // body fits one stream's slab, so the cap is all the job can write.
+            //
+            // One queue is what keeps both properties: a job cannot take room
+            // ahead of writers that arrived before it (a room check outside
+            // the queue could, in the window between a release and its
+            // hand-over), and it cannot wait for ever behind a stream of
+            // writers that keep the queue non-empty (it is served in order).
+            //
+            // A stream that is already over (reset, connection ending) takes no
+            // budget: the handler fails at its first check.
+            job.hctx.inline_credit = 0;
+            job.hctx.inline_shed = false;
+            if (job.slot.terminal.getCause() != null) {
+                // The entry may be queued, or granted by a release on the way
+                // here (`handleWriterFailed` sets the causes and releases
+                // pending DATA, and calls nothing that abandons it). Whatever
+                // its state, it ends here, before the job runs.
+                self.abandonInlineBudget(job.slot, idx);
+            } else {
+                switch (self.inlineBudget(job.slot, idx)) {
+                    .run => job.hctx.inline_credit = self.config.limits.outbound_bytes_per_stream,
+                    // The server cap is not waited for: no release on this
+                    // connection makes room, so the job runs with no credit and
+                    // its body write is refused (`inline_shed`), like a task
+                    // handler's.
+                    .shed => job.hctx.inline_shed = true,
+                    .wait => break,
+                }
+            }
             if (comptime test_observe) _ = test_observed_inline_jobs.fetchAdd(1, .monotonic);
             job.hctx.runs_inline = true;
             runHandlerJobBody(job);
+            // Give back what the job did not write.
+            const unused = job.hctx.inline_credit;
+            job.hctx.inline_credit = 0;
+            self.applyOutboundRelease(unused, .pending);
         }
         const batch_n = i;
         if (batch_n == 0) return;
@@ -8036,7 +8612,7 @@ fn hopBigBody(_: *anyopaque, _: *const request.Request, resp: *response.Complete
 fn sendSettingsAck(conn: *Connection) anyerror!void {
     var settings: [frame.FRAME_HEADER_LEN]u8 = undefined;
     const n = frame.Serializer.settingsFrame(&settings, true, &.{}) catch unreachable;
-    return conn.sendAccountedWire(settings[0..n], false, 0, 0, 0, 0, 0, false, null);
+    return conn.sendAccountedWire(settings[0..n], false, 0, 0, 0, 0, 0, false, 0, null);
 }
 
 test "teardown's sentinel fills the h2c write queue while a handler flushes: the room check sees it and the push is an ending connection's, not a trap" {
@@ -8189,10 +8765,11 @@ test "a full DATA frame is built in a write-pool chunk and reaches the pump with
     try std.testing.expect(!hop.conn.writer_failed.load(.acquire));
 }
 
-test "a write-pool frame refused by the outbound budget goes back to the write pool" {
+test "a write-pool frame the write queue refuses goes back to the write pool, and its budget credit with it" {
     // `queueWire` hands an owned write-pool frame to `sendAccountedWire`,
-    // which then owns it on every path. Its first exit is the budget check,
-    // before any lease exists, so the chunk must be returned there by hand.
+    // which then owns it on every path, and the credit it carries too. The
+    // push is the exit that can still fail once the credit moved to the wire
+    // side, so the chunk must be returned and the credit released from there.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var trap: TrapHop = undefined;
@@ -8206,14 +8783,804 @@ test "a write-pool frame refused by the outbound budget goes back to the write p
     try std.testing.expect(conn.write_pool.containsPtr(full.ptr));
     (frame.FrameHeader{ .length = 16 * 1024, .type = .data, .flags = .{}, .stream_id = 1 }).encode(full[0..frame.FRAME_HEADER_LEN]);
 
-    const lim = conn.config.limits.outbound_bytes_per_connection;
-    const held = conn.outbound_held.load(.acquire);
-    try std.testing.expect(conn.tryReserveOutboundBytes(lim - held, .wire));
-    defer conn.applyOutboundRelease(lim - held, .wire);
+    const credit: usize = 16 * 1024;
+    const held_before = conn.outbound_held.load(.acquire);
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(credit, .pending));
+    conn.closeWriterQueues();
     test_in_sched_sink = true;
     defer test_in_sched_sink = false;
-    try std.testing.expectError(error.OutOfMemory, conn.queueWire(full, false, 0, 0, 0, 0, 0, true, false));
+    try std.testing.expectError(error.WriteFailed, conn.queueWire(full, false, 0, 0, 0, 0, 0, credit, true, false));
     try std.testing.expectEqual(rented_before, conn.write_pool.rentedCount());
+    try std.testing.expectEqual(held_before, conn.outbound_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), conn.pending_outbound_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), conn.wire_outbound_held.load(.acquire));
+}
+
+/// One request for `/` on `sid`: HEADERS with END_STREAM and END_HEADERS.
+fn hopRequestFrame(out: *[frame.FRAME_HEADER_LEN + 3]u8, sid: u31) []const u8 {
+    const block = [_]u8{ 0x82, 0x87, 0x84 }; // :method GET, :scheme https, :path /
+    (frame.FrameHeader{
+        .length = block.len,
+        .type = .headers,
+        .flags = .{ .end_stream = true, .end_headers = true },
+        .stream_id = sid,
+    }).encode(out[0..frame.FRAME_HEADER_LEN]);
+    @memcpy(out[frame.FRAME_HEADER_LEN..], &block);
+    return out;
+}
+
+fn hopHundredBytes(_: *anyopaque, _: *const request.Request, resp: *response.CompleteResponse) anyerror!void {
+    const body: [100]u8 = @splat('h');
+    try resp.send(200, &.{}, &body);
+}
+
+/// Everything the pump was handed, read before any of it is acked.
+const HopChunks = struct {
+    chunks: [16]wire_pump.WireChunk = undefined,
+    n: usize = 0,
+    credit: usize = 0,
+    wire_bytes: usize = 0,
+
+    fn take(hop: *BenchHop) HopChunks {
+        var out: HopChunks = .{};
+        while (io_queue.tryGet(wire_pump.WireChunk, &hop.conn.write_ch, hop.conn.config.io)) |chunk| {
+            out.chunks[out.n] = chunk;
+            out.n += 1;
+            out.credit += chunk.outbound_release;
+            out.wire_bytes += chunk.len;
+        }
+        return out;
+    }
+
+    /// The pump's side of it: every chunk written and its completion applied.
+    fn ackAll(self: *HopChunks, hop: *BenchHop) void {
+        for (self.chunks[0..self.n]) |chunk| {
+            if (wire_pump.postsCompletion(chunk)) hop.conn.acks.sub();
+            hop.completeLocalWrite(chunk);
+        }
+        self.n = 0;
+    }
+};
+
+fn expectBudget(conn: *Connection, pending: usize, wire: usize) !void {
+    try std.testing.expectEqual(pending + wire, conn.outbound_held.load(.acquire));
+    try std.testing.expectEqual(pending, conn.pending_outbound_held.load(.acquire));
+    try std.testing.expectEqual(wire, conn.wire_outbound_held.load(.acquire));
+}
+
+test "budget: a DATA frame with no payload carries no credit and still posts a completion" {
+    // An empty END_STREAM DATA frame is nine bytes of header and nothing for
+    // the budget. The completion is not about the budget: it returns the
+    // write-pool chunk to a drain that waits for one, so the pump must post it
+    // and the ledger must count it, whatever the chunk's credit is.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, io);
+    defer trap.close();
+    const hop = &trap.hop;
+    const conn = &hop.conn;
+    try hop.preparePreface();
+
+    var empty_data: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{ .length = 0, .type = .data, .flags = .{ .end_stream = true }, .stream_id = 1 }).encode(&empty_data);
+    try std.testing.expectEqual(@as(usize, 0), conn.acks.owed.load(.acquire));
+    try conn.sendAccountedWire(&empty_data, false, 0, 0, 0, 0, 0, false, 0, null);
+    try std.testing.expectEqual(@as(usize, 1), conn.acks.owed.load(.acquire));
+    try expectBudget(conn, 0, 0);
+
+    var got = HopChunks.take(hop);
+    try std.testing.expectEqual(@as(usize, 1), got.n);
+    try std.testing.expectEqual(@as(usize, 0), got.chunks[0].outbound_release);
+    try std.testing.expect(wire_pump.postsCompletion(got.chunks[0]));
+    got.ackAll(hop);
+    try std.testing.expectEqual(@as(usize, 0), conn.acks.owed.load(.acquire));
+
+    // The pump's terminal posts and the shutdown sentinel are not chunks'.
+    try std.testing.expect(!wire_pump.postsCompletion(.{}));
+    try std.testing.expect(!wire_pump.countsChunk(.{ .fail_all = true }));
+    try std.testing.expect(wire_pump.countsChunk(.{ .wire_len = frame.FRAME_HEADER_LEN }));
+}
+
+test "budget: a DATA frame is counted once, pending until the pump has it, wire until its ack, never both" {
+    // The old rule charged a frame again when it moved to the wire, so the
+    // total briefly held 48 KiB plus the frames' headers on top of the 48 KiB
+    // still pending. The total must not move at all when the drain hands the
+    // frames over, and the chunks must carry the payload, not the frame bytes.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopBigBody } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    try hop.preparePreface();
+
+    var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+    {
+        hop.conn.lockSessionUncancelable(io);
+        defer hop.conn.unlockSession(io);
+        hop.conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        try hop.conn.session.ingest(hopRequestFrame(&req, 1));
+        try hop.conn.processIntents();
+    }
+    try expectBudget(&hop.conn, 0, 0);
+    try hop.conn.runPendingInline();
+
+    const payload: usize = 48 * 1024;
+    // The gate reserved a whole stream's cap for the job and took back the
+    // 16 KiB it did not write; the 48 KiB it wrote went to the pump.
+    try expectBudget(&hop.conn, 0, payload);
+    var got = HopChunks.take(hop);
+    try std.testing.expectEqual(payload, got.credit);
+    // Frame headers, HEADERS and the rest are on the wire and not in the budget.
+    try std.testing.expect(got.wire_bytes > payload + 3 * frame.FRAME_HEADER_LEN);
+    try expectBudget(&hop.conn, 0, payload);
+    got.ackAll(hop);
+    try expectBudget(&hop.conn, 0, 0);
+    try hop.conn.drainPendingCompleteReceipts(false);
+}
+
+test "budget: a packed batch of small DATA frames and controls releases exactly its payload" {
+    // Three responses share one drain turn, so HEADERS and DATA frames of
+    // three streams leave in the same chunk. The ack must return the 300
+    // payload bytes: returning the chunk's length (what the old rule did)
+    // over-releases, and the safe build traps on it.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    try hop.preparePreface();
+
+    {
+        hop.conn.lockSessionUncancelable(io);
+        defer hop.conn.unlockSession(io);
+        hop.conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        for ([_]u31{ 1, 3, 5 }) |sid| try hop.conn.session.ingest(hopRequestFrame(&req, sid));
+        try hop.conn.processIntents();
+    }
+    try hop.conn.runPendingInline();
+
+    try expectBudget(&hop.conn, 0, 300);
+    var got = HopChunks.take(hop);
+    try std.testing.expectEqual(@as(usize, 300), got.credit);
+    // Fewer chunks than frames: they were packed.
+    try std.testing.expect(got.n < 6);
+    try std.testing.expect(got.wire_bytes > 300 + 6 * frame.FRAME_HEADER_LEN);
+    got.ackAll(hop);
+    try expectBudget(&hop.conn, 0, 0);
+    try hop.conn.drainPendingCompleteReceipts(false);
+}
+
+test "budget: an inline job waits for room and runs when it comes back, with no reset" {
+    // The actor never waits, so `runPendingInline` holds a complete job back
+    // until one stream's cap is free, and the job then runs. A full budget
+    // used to refuse its write and reset the stream.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    try hop.preparePreface();
+    const conn = &hop.conn;
+
+    // Fill the budget but for 1,000 bytes: less than one stream's cap.
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    const filler = lim - 1000;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(filler, .pending));
+
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try conn.session.ingest(hopRequestFrame(&req, 1));
+        try conn.processIntents();
+    }
+    const gated_before = test_inline_budget_gated.load(.monotonic);
+    try conn.runPendingInline();
+    // Still queued, nothing reserved for it, nothing sent, nothing reset.
+    try std.testing.expectEqual(@as(usize, 1), conn.inline_n);
+    try expectBudget(conn, filler, 0);
+    try std.testing.expect(test_inline_budget_gated.load(.monotonic) > gated_before);
+    try std.testing.expectEqual(@as(usize, 0), io_queue.queued(wire_pump.WireChunk, &conn.write_ch, io));
+
+    // Room returns: the job runs and its 100 bytes are the whole charge.
+    conn.applyOutboundRelease(filler, .pending);
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 0), conn.inline_n);
+    try expectBudget(conn, 0, 100);
+    var got = HopChunks.take(hop);
+    try std.testing.expectEqual(@as(usize, 100), got.credit);
+    got.ackAll(hop);
+    try expectBudget(conn, 0, 0);
+    try conn.drainPendingCompleteReceipts(false);
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+}
+
+/// A handler slot that exists only to wait in the budget queue: no task, no
+/// stream, just the entry and its event.
+fn fakeBudgetWaiter(conn: *Connection, stream_id: u31) usize {
+    _ = conn.handlers.touchNext(.{ .stream_id = stream_id, .in_use = true }).?;
+    const i = conn.handlers.touched - 1;
+    // What `claimSlot` does for a real handler.
+    conn.space_events[i] = .init;
+    return i;
+}
+
+fn endFakeWaiters(conn: *Connection) void {
+    for (conn.handlers.slice()) |*slot| slot.in_use = false;
+}
+
+test "budget queue: waiters are served in arrival order, and room too small for the head wakes no one" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, std.testing.io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    defer endFakeWaiters(conn);
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+
+    const a = fakeBudgetWaiter(conn, 1);
+    const b = fakeBudgetWaiter(conn, 3);
+    const c = fakeBudgetWaiter(conn, 5);
+    const grants_before = test_budget_grants.load(.monotonic);
+    conn.queueForBudget(&conn.handlers.storage[a], a, 30, false);
+    conn.queueForBudget(&conn.handlers.storage[b], b, 10, false);
+    conn.queueForBudget(&conn.handlers.storage[c], c, 20, false);
+    try std.testing.expectEqual(@as(u32, 3), conn.budget_waiters.load(.acquire));
+
+    // 10 bytes come back. `b` would fit, `a` (the head) would not: `b` must
+    // wait behind it, and nothing is reserved.
+    conn.applyOutboundRelease(10, .pending);
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[a].budget.state);
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[b].budget.state);
+    try std.testing.expectEqual(lim - 10, conn.outbound_held.load(.acquire));
+    try std.testing.expectEqual(grants_before, test_budget_grants.load(.monotonic));
+
+    // 20 more: the head fits, and only the head is served (the room is gone).
+    conn.applyOutboundRelease(20, .pending);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[a].budget.state);
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[b].budget.state);
+    try std.testing.expectEqual(lim, conn.outbound_held.load(.acquire));
+
+    conn.applyOutboundRelease(10, .pending);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[b].budget.state);
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[c].budget.state);
+    conn.applyOutboundRelease(20, .pending);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[c].budget.state);
+    try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(budget_none, conn.budget_head);
+    try std.testing.expectEqual(budget_none, conn.budget_tail);
+
+    // The grant order is the arrival order.
+    try std.testing.expectEqual(grants_before + 3, test_budget_grants.load(.monotonic));
+    for ([_]u32{ 1, 3, 5 }, 0..) |sid, k| {
+        try std.testing.expectEqual(sid, test_budget_grant_log[(grants_before + k) % test_budget_grant_log.len].load(.monotonic));
+    }
+
+    // Each takes its grant, and the books balance: 60 granted, `lim - 60`
+    // still held by the filler.
+    for ([_]usize{ a, b, c }) |i| {
+        const ev = &conn.space_events[i];
+        try std.testing.expectEqual(BudgetWait.State.granted, conn.takeBudgetOutcome(&conn.handlers.storage[i], ev));
+    }
+    conn.applyOutboundRelease(lim, .pending);
+    try expectBudget(conn, 0, 0);
+}
+
+test "budget queue: a head refused by the SERVER cap is woken to fail, not left queued" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, std.testing.io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    defer endFakeWaiters(conn);
+    var acct: GlobalAccounting = .{ .max_streams = 8, .reaper_capacity = 8, .max_outbound_bytes = 160, .max_handshakes = 1 };
+    conn.config.accounting = &acct;
+    conn.config.limits.outbound_bytes_per_connection = 100;
+
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(100, .pending));
+    const w = fakeBudgetWaiter(conn, 1);
+    conn.queueForBudget(&conn.handlers.storage[w], w, 40, false);
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[w].budget.state);
+    // Other connections take the server's room while this one waits: 60 more
+    // bytes, then the cap is all used up.
+    try std.testing.expect(acct.tryReserveOutbound(60));
+    acct.max_outbound_bytes = 140;
+
+    // 50 bytes come back. The connection has room for the head (50 >= 40);
+    // the server has 140 - 110 = 30. No release on this connection will ever
+    // change that, so the head is woken with a refusal and the queue is empty.
+    conn.applyOutboundRelease(50, .pending);
+    try std.testing.expectEqual(BudgetWait.State.refused, conn.handlers.storage[w].budget.state);
+    try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(budget_none, conn.budget_head);
+    // Nothing was reserved for it.
+    try expectBudget(conn, 50, 0);
+    try std.testing.expectEqual(@as(usize, 110), acct.outbound_bytes.load(.acquire));
+    try std.testing.expectEqual(BudgetWait.State.refused, conn.takeBudgetOutcome(&conn.handlers.storage[w], &conn.space_events[w]));
+    conn.applyOutboundRelease(50, .pending);
+    acct.releaseOutbound(60);
+    try std.testing.expectEqual(@as(usize, 0), acct.outbound_bytes.load(.acquire));
+}
+
+test "budget queue: leaving the queue returns an unused grant exactly once" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, std.testing.io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    defer endFakeWaiters(conn);
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+
+    const a = fakeBudgetWaiter(conn, 1);
+    const b = fakeBudgetWaiter(conn, 3);
+    const c = fakeBudgetWaiter(conn, 5);
+    conn.queueForBudget(&conn.handlers.storage[a], a, 10, false);
+    conn.queueForBudget(&conn.handlers.storage[b], b, 10, false);
+    conn.queueForBudget(&conn.handlers.storage[c], c, 10, false);
+
+    // A queued waiter in the middle leaves: the others keep their order.
+    conn.abandonBudget(&conn.handlers.storage[b], b);
+    try std.testing.expectEqual(BudgetWait.State.idle, conn.handlers.storage[b].budget.state);
+    try std.testing.expectEqual(@as(u32, 2), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(@as(u32, @intCast(a)), conn.budget_head);
+    try std.testing.expectEqual(@as(u32, @intCast(c)), conn.budget_tail);
+    try std.testing.expectEqual(@as(u32, @intCast(c)), conn.handlers.storage[a].budget.next);
+
+    // The head is granted, then leaves without the bytes: they go back once,
+    // and the next waiter gets them.
+    conn.applyOutboundRelease(10, .pending);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[a].budget.state);
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[c].budget.state);
+    conn.abandonBudget(&conn.handlers.storage[a], a);
+    try std.testing.expectEqual(BudgetWait.State.idle, conn.handlers.storage[a].budget.state);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[c].budget.state);
+    try std.testing.expectEqual(lim, conn.outbound_held.load(.acquire));
+    // A second exit finds nothing to give back.
+    conn.abandonBudget(&conn.handlers.storage[a], a);
+    try std.testing.expectEqual(lim, conn.outbound_held.load(.acquire));
+
+    // The tail leaves queued, then the last grant is returned.
+    conn.abandonBudget(&conn.handlers.storage[c], c);
+    try std.testing.expectEqual(lim - 10, conn.outbound_held.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(budget_none, conn.budget_head);
+    try std.testing.expectEqual(budget_none, conn.budget_tail);
+    conn.applyOutboundRelease(lim - 10, .pending);
+    try expectBudget(conn, 0, 0);
+}
+
+test "budget queue: a waiter that leaves hands its room to a follower that fits" {
+    // The head needs 30 and 10 are free; the follower needs 10 and fits, but
+    // waits behind the head. When the head leaves, no release is coming: the
+    // follower must be served by the exit itself.
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, std.testing.io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    defer endFakeWaiters(conn);
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+
+    const head = fakeBudgetWaiter(conn, 1);
+    const follower = fakeBudgetWaiter(conn, 3);
+    conn.queueForBudget(&conn.handlers.storage[head], head, 30, false);
+    conn.queueForBudget(&conn.handlers.storage[follower], follower, 10, false);
+    conn.applyOutboundRelease(10, .pending);
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[follower].budget.state);
+    try std.testing.expectEqual(lim - 10, conn.outbound_held.load(.acquire));
+
+    conn.abandonBudget(&conn.handlers.storage[head], head);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[follower].budget.state);
+    try std.testing.expectEqual(lim, conn.outbound_held.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.takeBudgetOutcome(&conn.handlers.storage[follower], &conn.space_events[follower]));
+    conn.applyOutboundRelease(lim, .pending);
+    try expectBudget(conn, 0, 0);
+}
+
+test "budget: a grant that arrives with a reset or a failed writer goes back" {
+    // The granted branch of `parkForBudget`: the bytes are reserved for the
+    // handler, which finds its stream over (or the writer dead) when it runs.
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, std.testing.io);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    defer endFakeWaiters(conn);
+    const a = fakeBudgetWaiter(conn, 1);
+    const b = fakeBudgetWaiter(conn, 3);
+    const c = fakeBudgetWaiter(conn, 5);
+
+    // A terminal cause set after the grant.
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(50, .pending));
+    conn.handlers.storage[a].terminal.setCause(.server_shutdown);
+    try std.testing.expectError(response.causeToError(.server_shutdown), conn.acceptGrant(&conn.handlers.storage[a].terminal, 50));
+    try expectBudget(conn, 0, 0);
+
+    // The writer failed after the grant.
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(50, .pending));
+    conn.writer_failed.store(true, .release);
+    try std.testing.expectError(error.WriteFailed, conn.acceptGrant(&conn.handlers.storage[b].terminal, 50));
+    conn.writer_failed.store(false, .release);
+    try expectBudget(conn, 0, 0);
+
+    // Neither: the handler keeps its bytes.
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(50, .pending));
+    try conn.acceptGrant(&conn.handlers.storage[c].terminal, 50);
+    try expectBudget(conn, 50, 0);
+    conn.applyOutboundRelease(50, .pending);
+}
+
+fn parkedTaskMain(conn: *Connection, hctx: *HandlerCtx, out: *?anyerror) void {
+    conn.lockSessionUncancelable(conn.config.io);
+    defer conn.unlockSession(conn.config.io);
+    conn.parkForBudget(hctx, hctx.stream_id, 100) catch |err| {
+        out.* = err;
+    };
+}
+
+fn cancelParkedScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, rt.io());
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    defer endFakeWaiters(conn);
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+
+    const i = fakeBudgetWaiter(conn, 1);
+    const slot = &conn.handlers.storage[i];
+    var hctx: HandlerCtx = .{ .conn = conn, .terminal = &slot.terminal, .slot = slot, .stream_id = 1, .arena = gpa };
+    var out: ?anyerror = null;
+    var task = try rt.spawn(parkedTaskMain, .{ conn, &hctx, &out });
+    const deadline = nowNs(conn.config.io) + 5 * std.time.ns_per_s;
+    while (conn.budget_parks.load(.acquire) == 0) {
+        if (nowNs(conn.config.io) >= deadline) return error.NeverParked;
+        try zio.sleep(.fromMilliseconds(1));
+    }
+    try std.testing.expectEqual(@as(u32, 1), conn.budget_waiters.load(.acquire));
+
+    // The task is cancelled while it waits (the reaper's way of stopping a
+    // handler that does not come out by itself).
+    task.cancel();
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), out);
+    try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(budget_none, conn.budget_head);
+    try std.testing.expectEqual(BudgetWait.State.idle, slot.budget.state);
+    try std.testing.expectEqual(lim, conn.outbound_held.load(.acquire));
+    conn.applyOutboundRelease(lim, .pending);
+    try expectBudget(conn, 0, 0);
+}
+
+test "budget: a task handler cancelled while it waits leaves the queue and reserves nothing" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(1),
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(cancelParkedScenario, .{ rt, gpa });
+    try h.join();
+}
+
+test "budget queue: a gated inline job is served in arrival order behind task writers, then runs" {
+    // Task writers keep the queue non-empty. A complete job that arrives
+    // takes its place at the tail (it does not take room from outside the
+    // queue, and it is not left waiting for a moment when the room is a whole
+    // cap): it is granted third, after the two writers before it, and then runs.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    try hop.preparePreface();
+    const conn = &hop.conn;
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    const cap = conn.config.limits.outbound_bytes_per_stream;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try conn.session.ingest(hopRequestFrame(&req, 1));
+        try conn.processIntents();
+    }
+    const w1 = fakeBudgetWaiter(conn, 101);
+    const w2 = fakeBudgetWaiter(conn, 103);
+    defer {
+        conn.handlers.storage[w1].in_use = false;
+        conn.handlers.storage[w2].in_use = false;
+    }
+    conn.queueForBudget(&conn.handlers.storage[w1], w1, 100, false);
+    conn.queueForBudget(&conn.handlers.storage[w2], w2, 100, false);
+
+    const grants_before = test_budget_grants.load(.monotonic);
+    const gated_before = test_inline_budget_gated.load(.monotonic);
+    try conn.runPendingInline();
+    // Queued behind both, nothing reserved for it, the job not run.
+    try std.testing.expectEqual(@as(usize, 1), conn.inline_n);
+    try std.testing.expectEqual(@as(u32, 3), conn.budget_waiters.load(.acquire));
+    try std.testing.expect(test_inline_budget_gated.load(.monotonic) > gated_before);
+
+    conn.applyOutboundRelease(100, .pending);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[w1].budget.state);
+    conn.applyOutboundRelease(100, .pending);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[w2].budget.state);
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 1), conn.inline_n);
+
+    conn.applyOutboundRelease(cap, .pending);
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 0), conn.inline_n);
+
+    // The order of the grants: both writers, then the job (stream 1).
+    try std.testing.expectEqual(grants_before + 3, test_budget_grants.load(.monotonic));
+    for ([_]u32{ 101, 103, 1 }, 0..) |sid, k| {
+        try std.testing.expectEqual(sid, test_budget_grant_log[(grants_before + k) % test_budget_grant_log.len].load(.monotonic));
+    }
+
+    var got = HopChunks.take(hop);
+    try std.testing.expectEqual(@as(usize, 100), got.credit);
+    got.ackAll(hop);
+    try hop.conn.drainPendingCompleteReceipts(false);
+    for ([_]usize{ w1, w2 }) |i| {
+        try std.testing.expectEqual(BudgetWait.State.granted, conn.takeBudgetOutcome(&conn.handlers.storage[i], &conn.space_events[i]));
+    }
+    conn.applyOutboundRelease(conn.pending_outbound_held.load(.acquire), .pending);
+    try expectBudget(conn, 0, 0);
+}
+
+test "budget queue: a complete job whose stream is reset while it waits leaves the queue and a grant goes back" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    try hop.preparePreface();
+    const conn = &hop.conn;
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try conn.session.ingest(hopRequestFrame(&req, 1));
+        try conn.processIntents();
+    }
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(u32, 1), conn.budget_waiters.load(.acquire));
+
+    // Reset while queued: it leaves, nothing is owed.
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.handlers.storage[0].terminal.setCause(.server_shutdown);
+        conn.wakeHandlerWaiters(1);
+    }
+    try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(BudgetWait.State.idle, conn.handlers.storage[0].budget.state);
+    try std.testing.expectEqual(lim, conn.outbound_held.load(.acquire));
+
+    // The job still runs (to fail at its first check) and takes no budget.
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 0), conn.inline_n);
+    try std.testing.expectEqual(lim, conn.outbound_held.load(.acquire));
+    conn.applyOutboundRelease(lim, .pending);
+    // Whatever the failed job queued (an RST) is drained and acked.
+    hop.drainLocalWrites();
+    try expectBudget(conn, 0, 0);
+}
+
+/// A hop with one complete route, the budget full, and one request (stream 1)
+/// ingested: its job sits in `inline_sids`. For the tests of a complete job's
+/// budget entry.
+fn inlineEntryHop(trap: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: []const router_mod.Route) !void {
+    try openTrapHopRoutes(trap, gpa, io, routes);
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+    conn.lockSessionUncancelable(io);
+    defer conn.unlockSession(io);
+    conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+    var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+    try conn.session.ingest(hopRequestFrame(&req, 1));
+    try conn.processIntents();
+}
+
+test "budget queue: a GRANTED complete job whose stream is reset gives its cap back at once, and once" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try inlineEntryHop(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    const conn = &hop.conn;
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    const cap = conn.config.limits.outbound_bytes_per_stream;
+
+    try conn.runPendingInline();
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[0].budget.state);
+    // A release grants it: the cap is reserved for the job, which has not run.
+    conn.applyOutboundRelease(lim, .pending);
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[0].budget.state);
+    try expectBudget(conn, cap, 0);
+
+    // The stream is reset before the actor runs it: the cap goes back now.
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.handlers.storage[0].terminal.setCause(.server_shutdown);
+        conn.wakeHandlerWaiters(1);
+    }
+    try expectBudget(conn, 0, 0);
+    try std.testing.expectEqual(BudgetWait.State.idle, conn.handlers.storage[0].budget.state);
+
+    // The job then ends without a second return (an over-release would trap).
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 0), conn.inline_n);
+    hop.drainLocalWrites();
+    try expectBudget(conn, 0, 0);
+}
+
+test "budget queue: a writer failure grants a queued complete job and ends its stream; the batch ends it cleanly" {
+    // `handleWriterFailed` sets every slot's cause and releases the pending
+    // DATA of the scheduler, which grants the queued entry, and it never
+    // abandons the entry. The actor then runs the batch: the terminal job must
+    // give its entry up before it runs, or the slot is released with the entry
+    // granted. The budget here is held by scheduler-owned DATA, so the release
+    // that grants the entry is `handleWriterFailed`'s own: no release is made
+    // by the test.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try inlineEntryHop(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    const conn = &hop.conn;
+    const cap = conn.config.limits.outbound_bytes_per_stream;
+
+    // Swap the helper's direct reservation for two streams' worth of DATA that
+    // sits in the scheduler (the hop's slab pool holds only a few slabs, so the
+    // budget is lowered to what they can fill).
+    conn.applyOutboundRelease(conn.config.limits.outbound_bytes_per_connection, .pending);
+    conn.config.limits.outbound_bytes_per_connection = 2 * cap;
+    const chunk: [limits_mod.Limits.defaults.outbound_bytes_per_stream]u8 = @splat('d');
+    try std.testing.expectEqual(cap, chunk.len);
+    for ([_]u31{ 101, 103 }) |sid| {
+        try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(cap, .pending));
+        try conn.sched.enqueueDataBytes(sid, &chunk, false, 0, 0);
+    }
+    try expectBudget(conn, 2 * cap, 0);
+
+    try conn.runPendingInline();
+    try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[0].budget.state);
+    try expectBudget(conn, 2 * cap, 0);
+
+    conn.writer_failed.store(true, .release);
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.handleWriterFailed();
+    }
+    // `handleWriterFailed` released the scheduler's DATA and that granted the
+    // entry; the stream is terminal. Nothing else released anything.
+    try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[0].budget.state);
+    try std.testing.expect(conn.handlers.storage[0].terminal.getCause() != null);
+    try expectBudget(conn, cap, 0);
+
+    // The batch: the job is terminal, so its entry ends before it runs, the
+    // slot is released with an idle entry, and the books are zero.
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 0), conn.inline_n);
+    try expectBudget(conn, 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
+    try std.testing.expectEqual(budget_none, conn.budget_head);
+    hop.drainLocalWrites();
+    conn.writer_failed.store(false, .release);
+}
+
+test "budget queue: admitting a complete job to an empty queue rings no doorbell; a later grant does" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, io, &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    const conn = &hop.conn;
+    try hop.preparePreface();
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try conn.session.ingest(hopRequestFrame(&req, 1));
+        try conn.processIntents();
+    }
+    // Empty queue, room: granted in its own admission and taken there.
+    const rings_before = test_budget_doorbell_rings.load(.monotonic);
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 0), conn.inline_n);
+    try std.testing.expectEqual(rings_before, test_budget_doorbell_rings.load(.monotonic));
+    var got = HopChunks.take(hop);
+    got.ackAll(hop);
+    try conn.drainPendingCompleteReceipts(false);
+    try expectBudget(conn, 0, 0);
+
+    // A job that has to wait is granted by a release, and that rings.
+    const lim = conn.config.limits.outbound_bytes_per_connection;
+    try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try conn.session.ingest(hopRequestFrame(&req, 3));
+        try conn.processIntents();
+    }
+    try conn.runPendingInline();
+    try std.testing.expectEqual(@as(usize, 1), conn.inline_n);
+    try std.testing.expectEqual(rings_before, test_budget_doorbell_rings.load(.monotonic));
+    conn.applyOutboundRelease(lim, .pending);
+    try std.testing.expectEqual(rings_before + 1, test_budget_doorbell_rings.load(.monotonic));
+    try conn.runPendingInline();
+    var got2 = HopChunks.take(hop);
+    got2.ackAll(hop);
+    try conn.drainPendingCompleteReceipts(false);
+    try expectBudget(conn, 0, 0);
 }
 
 /// Give back the two preface frames the connection queued at boot, so a test

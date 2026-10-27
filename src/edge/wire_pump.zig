@@ -56,8 +56,16 @@ pub const WriteCompletion = struct {
     /// Number of ticket slots linked from `ticket_slot` for this one write.
     ticket_count: u32 = 0,
     ok: bool = true,
-    /// Connection-local outbound bytes to release (actor applies).
+    /// DATA payload bytes this write carried (the budget credit the actor
+    /// releases). Frame headers and control frames carry none, so it can be
+    /// zero for a chunk that did real work.
     outbound_release: usize = 0,
+    /// Bytes the finished chunk held on the wire. Together with the tickets
+    /// and the control entries it tells the actor that this completion is a
+    /// chunk's and not a terminal post (`countsChunk`). The credit above
+    /// cannot say that: an empty END_STREAM DATA frame and a control-only
+    /// chunk have no payload and still post one.
+    wire_len: u32 = 0,
     /// Successful socket-write completion time for trace attribution.
     written_ns: u64 = 0,
     /// Control-pool bytes and entry count to release (actor applies).
@@ -103,14 +111,20 @@ pub const terminal_posts: usize = 2;
 /// Whether the pump posts a completion when it finishes `chunk`. The same
 /// test as `WritePump.releaseChunk`, so the ledger counts what the channel
 /// receives.
+///
+/// Every chunk with bytes posts one, whatever it carries. The payload credit
+/// (`outbound_release`) is not the test: a chunk of headers and controls, or
+/// an empty END_STREAM DATA frame, has none. Its completion is what returns
+/// the write-pool chunk to the drain that waits for it, so a chunk that posted
+/// nothing could leave a held pop waiting for a wake that never comes.
 pub fn postsCompletion(chunk: WireChunk) bool {
-    return chunk.ticket_count != 0 or chunk.ticket != 0 or chunk.outbound_release != 0 or chunk.control_entries != 0;
+    return chunk.len != 0 or chunk.ticket_count != 0 or chunk.ticket != 0 or chunk.outbound_release != 0 or chunk.control_entries != 0;
 }
 
 /// Whether a received completion is a chunk's (counted in `AckLedger`)
 /// rather than a terminal post, which carries no ticket and no accounting.
 pub fn countsChunk(c: WriteCompletion) bool {
-    return c.ticket_count != 0 or c.ticket != 0 or c.outbound_release != 0 or c.control_entries != 0;
+    return c.wire_len != 0 or c.ticket_count != 0 or c.ticket != 0 or c.outbound_release != 0 or c.control_entries != 0;
 }
 
 pub const WireChunk = struct {
@@ -122,6 +136,8 @@ pub const WireChunk = struct {
     /// Number of ticket slots linked from `ticket_slot` for this one write.
     ticket_count: u32 = 0,
     /// Amounts echoed into WriteCompletion after write/free (no Connection callback).
+    /// `outbound_release` is the DATA payload bytes in this chunk, which the
+    /// connection's outbound budget counted once at the handler's write.
     outbound_release: usize = 0,
     control_release: usize = 0,
     control_entries: u32 = 0,
@@ -340,6 +356,7 @@ pub const WritePump = struct {
                 .ticket_count = if (chunk.ticket_count != 0) chunk.ticket_count else if (chunk.ticket != 0) 1 else 0,
                 .ok = ok,
                 .outbound_release = chunk.outbound_release,
+                .wire_len = @intCast(chunk.len),
                 .written_ns = written_ns,
                 .control_release = chunk.control_release,
                 .control_entries = chunk.control_entries,

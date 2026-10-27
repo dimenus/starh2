@@ -504,9 +504,9 @@ fn packSixOp(ctx: *PackCtx) !usize {
     var batch: emit_batch.EmitBatch = .{ .buf = &ctx.storage };
     var i: u32 = 0;
     while (i < 6) : (i += 1) {
-        batch.copyFrame(pack_headers, true, pack_headers.len, true);
+        batch.copyFrame(pack_headers, true, pack_headers.len, true, 0);
         batch.noteTicket(i + 1, i);
-        batch.copyFrame(pack_data, true, 0, false);
+        batch.copyFrame(pack_data, true, 0, false, 0);
     }
     const n = batch.len;
     std.mem.doNotOptimizeAway(batch.take().bytes);

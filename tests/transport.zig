@@ -49,9 +49,9 @@ test "emit batch packing is the production drain-turn rule" {
     try std.testing.expect(batch.frameJoinsInProgress(false, 0, batch.max_plaintext / 2 + 1, batch.max_plaintext, 0, true));
     var storage: [64]u8 = undefined;
     var emit: batch.EmitBatch = .{ .buf = &storage };
-    emit.copyFrame("H1", true, 8, true);
-    emit.copyFrame("D1", true, 0, false);
-    emit.copyFrame("H2", true, 8, true);
+    emit.copyFrame("H1", true, 8, true, 0);
+    emit.copyFrame("D1", true, 0, false, 0);
+    emit.copyFrame("H2", true, 8, true, 0);
     try std.testing.expectEqual(@as(u32, 2), emit.control_entries);
     try std.testing.expectEqualStrings("H1D1H2", emit.buf[0..emit.len]);
 }

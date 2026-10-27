@@ -173,7 +173,8 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
     limits.inbound_wire_chunks_per_connection = 512;
     limits.outbound_bytes_per_stream = 64 * 1024;
-    limits.outbound_bytes_per_connection = 8 * 1024 * 1024;
+    // The write pool (512 chunks) and one stream's cap must fit the budget.
+    limits.outbound_bytes_per_connection = 16 * 1024 * 1024;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -1756,8 +1757,9 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
         .cancellation_reaper_tasks = 1,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
-        .outbound_bytes_per_connection = 16 * 1024,
-        .outbound_bytes_per_server = 16 * 1024,
+        // The write pool (3 chunks) and one stream's cap must fit the budget.
+        .outbound_bytes_per_connection = 64 * 1024,
+        .outbound_bytes_per_server = 64 * 1024,
         .request_bytes_per_connection = 128 * 1024,
         .request_bytes_per_server = 256 * 1024,
         .request_arena_bytes = 256 * 1024,

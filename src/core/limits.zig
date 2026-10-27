@@ -130,8 +130,25 @@ pub const Limits = struct {
     /// refused.
     frame_slab_bytes: usize = 512,
     frame_slabs_per_connection: usize = 256,
+    /// DATA payload bytes one stream may have waiting in the scheduler. A
+    /// handler that writes more waits for the stream's slab to drain.
     outbound_bytes_per_stream: usize = 64 * 1024,
+    /// DATA payload bytes one connection holds, counted once, from a handler's
+    /// write until the write ack of the chunk that carried them. Frame
+    /// headers, HEADERS and control frames are not counted: the control pool,
+    /// the frame pool and the write pool bound them. A write that finds this
+    /// full WAITS (backpressure, first come first served) and resumes when an
+    /// ack returns room; it is not refused. A complete (inline) handler takes
+    /// its place in the same queue, for one stream's cap, and the actor runs it
+    /// when it is served. The budget must hold the
+    /// whole write pool and one stream's cap (checked at boot), so the bytes
+    /// on the wire alone can never fill it.
     outbound_bytes_per_connection: usize = 4 * 1024 * 1024,
+    /// The same bytes over every connection. Unlike the connection budget this
+    /// one REFUSES: when it is exhausted no release on the writer's own
+    /// connection makes room, so waiting could not end. The write fails and its
+    /// stream is reset (overload shedding). The server's slab pool, which holds
+    /// the bytes waiting in the scheduler, is refused the same way.
     outbound_bytes_per_server: usize = 256 * 1024 * 1024,
     /// The most CLASS bytes (see `request_pool`) one connection's requests
     /// hold at once, headers and bodies and what handlers allocate. One
@@ -391,6 +408,18 @@ pub const Limits = struct {
         // park forever on capacity that the outer limit already refused.
         if (self.outbound_bytes_per_stream > self.outbound_bytes_per_connection) return error.InvalidConfig;
         if (self.outbound_bytes_per_connection > self.outbound_bytes_per_server) return error.InvalidConfig;
+        // A handler whose write finds the connection budget full PARKS; it
+        // does not fail. That is only safe if a release can always come, and
+        // a release comes from a write ack or a slow-consumer kill. Wire bytes
+        // are acked, and they are bounded by the write pool: no more than
+        // `inbound_wire_chunks_per_connection` chunks of `WIRE_CHUNK_SIZE`
+        // exist, so the wire side cannot be the whole budget. The pending side
+        // has the slow-consumer deadline. The budget therefore has to hold the
+        // whole write pool AND one stream's cap that a parked writer needs,
+        // or "all of the budget is on the wire, and the wire is waiting for
+        // the writer" would be a state, and nothing would end it.
+        const write_pool_bytes = try checkedMul(self.inbound_wire_chunks_per_connection, WIRE_CHUNK_SIZE);
+        if (try checkedAdd(write_pool_bytes, self.outbound_bytes_per_stream) > self.outbound_bytes_per_connection) return error.InvalidConfig;
         if (self.request_bytes_per_connection > self.request_bytes_per_server) return error.InvalidConfig;
         // The request pool's own shape: the arena cap is a power of two of at
         // least one block, and the server cap holds at least one request.

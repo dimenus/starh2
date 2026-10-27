@@ -2462,7 +2462,8 @@ fn namedExpect100BodyAfterContinue(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
     // even though this server only speaks HTTP/1.1.
     lim.request_arena_bytes = try lim.bodyArenaBytes();
     lim.outbound_bytes_per_stream = 2 * 1024 * 1024;
-    lim.outbound_bytes_per_connection = 2 * 1024 * 1024;
+    // One stream's cap plus the write pool must fit the connection budget.
+    lim.outbound_bytes_per_connection = 4 * 1024 * 1024;
     lim.request_body_idle_timeout_ns = 5 * std.time.ns_per_s;
     var server = starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h1c = listen }},

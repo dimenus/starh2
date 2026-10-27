@@ -114,6 +114,11 @@ pub const EmitBatch = struct {
     needs_flush: bool = false,
     control_n: usize = 0,
     control_entries: u32 = 0,
+    /// DATA payload bytes of the frames in the batch, apart from `len`. A batch
+    /// packs small DATA frames with controls, so the frame bytes (headers and
+    /// controls included) are not the budget's bytes: the chunk carries this
+    /// number as its release, and the ack returns exactly that.
+    payload_credit: usize = 0,
 
     pub fn capacity(self: *const EmitBatch) usize {
         return self.buf.len;
@@ -139,16 +144,18 @@ pub const EmitBatch = struct {
     /// Copy one frame into the scratch. Several HEADERS are supposed to join;
     /// a flush-on-second-control here is how one-shot TLS paid one record per
     /// response. DATA is not a control and must not increment `control_entries`.
+    /// `credit` is the DATA payload bytes the frame carries (0 for a control).
     pub fn copyFrame(
         self: *EmitBatch,
         payload: []const u8,
         flush: bool,
         control_n: usize,
         control_entry: bool,
+        credit: usize,
     ) void {
         std.debug.assert(self.wouldFit(payload.len));
         @memcpy(self.buf[self.len..][0..payload.len], payload);
-        self.adopt(payload.len, flush, control_n, control_entry);
+        self.adopt(payload.len, flush, control_n, control_entry, credit);
     }
 
     /// The next free bytes of the scratch, for a frame that is built there
@@ -159,9 +166,12 @@ pub const EmitBatch = struct {
     }
 
     /// `copyFrame` for a frame already in the scratch at `len`: count it.
-    pub fn adopt(self: *EmitBatch, payload_len: usize, flush: bool, control_n: usize, control_entry: bool) void {
+    pub fn adopt(self: *EmitBatch, payload_len: usize, flush: bool, control_n: usize, control_entry: bool, credit: usize) void {
         std.debug.assert(self.wouldFit(payload_len));
+        std.debug.assert(credit <= payload_len);
+        std.debug.assert(!control_entry or credit == 0);
         self.len += payload_len;
+        self.payload_credit += credit;
         self.needs_flush = self.needs_flush or flush;
         if (control_entry) {
             self.control_n += control_n;
@@ -177,6 +187,7 @@ pub const EmitBatch = struct {
         ticket_count: u32,
         control_n: usize,
         control_entries: u32,
+        payload_credit: usize,
     };
 
     pub fn take(self: *EmitBatch) Taken {
@@ -191,6 +202,7 @@ pub const EmitBatch = struct {
             .ticket_count = self.ticket_count,
             .control_n = self.control_n,
             .control_entries = self.control_entries,
+            .payload_credit = self.payload_credit,
         };
         self.clear();
         return out;
@@ -205,6 +217,7 @@ pub const EmitBatch = struct {
         self.needs_flush = false;
         self.control_n = 0;
         self.control_entries = 0;
+        self.payload_credit = 0;
     }
 };
 
@@ -243,17 +256,17 @@ test "unticketed DATA joins a drain-turn already in progress" {
 test "unticketed DATA overflow can take before the receipt is attached" {
     var storage: [5]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    batch.copyFrame("aa", true, 2, true);
+    batch.copyFrame("aa", true, 2, true, 0);
     try std.testing.expect(!batch.wouldFit(4));
     const first = batch.take();
     try std.testing.expectEqualStrings("aa", first.bytes);
     try std.testing.expectEqual(@as(u32, 1), first.control_entries);
-    batch.copyFrame("bbb", true, 0, false);
+    batch.copyFrame("bbb", true, 0, false, 0);
     const mid = batch.take();
     try std.testing.expectEqualStrings("bbb", mid.bytes);
     try std.testing.expectEqual(@as(u32, 0), mid.ticket_count);
     try std.testing.expectEqual(@as(u32, 0), mid.control_entries);
-    batch.copyFrame("cc", true, 0, false);
+    batch.copyFrame("cc", true, 0, false, 0);
     batch.noteTicket(9, 1);
     const last = batch.take();
     try std.testing.expectEqualStrings("cc", last.bytes);
@@ -264,9 +277,9 @@ test "several HEADERS join one batch and sum control occupancy" {
     // Revert to flush-on-second-control and this is two takes, entries=1 each.
     var storage: [256]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    batch.copyFrame("AAA", true, 10, true);
-    batch.copyFrame("BB", true, 20, true);
-    batch.copyFrame("C", true, 30, true);
+    batch.copyFrame("AAA", true, 10, true, 0);
+    batch.copyFrame("BB", true, 20, true, 0);
+    batch.copyFrame("C", true, 30, true, 0);
     try std.testing.expectEqual(@as(u32, 3), batch.control_entries);
     try std.testing.expectEqual(@as(usize, 60), batch.control_n);
     try std.testing.expectEqualStrings("AAABBC", batch.buf[0..batch.len]);
@@ -280,12 +293,12 @@ test "several HEADERS join one batch and sum control occupancy" {
 test "ticketed DATA joins HEADERS without counting as a control" {
     var storage: [256]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    batch.copyFrame("HDR", true, 24, true);
+    batch.copyFrame("HDR", true, 24, true, 0);
     batch.noteTicket(1, 10);
-    batch.copyFrame("BODY", true, 0, false);
+    batch.copyFrame("BODY", true, 0, false, 0);
     batch.noteTicket(2, 11);
-    batch.copyFrame("HDR", true, 24, true);
-    batch.copyFrame("BODY", true, 0, false);
+    batch.copyFrame("HDR", true, 24, true, 0);
+    batch.copyFrame("BODY", true, 0, false, 0);
     batch.noteTicket(3, 12);
     try std.testing.expectEqual(@as(u32, 2), batch.control_entries);
     try std.testing.expectEqual(@as(usize, 48), batch.control_n);
@@ -298,7 +311,7 @@ test "ticketed DATA joins HEADERS without counting as a control" {
 test "a frame that does not fit leaves the batch untouched" {
     var storage: [5]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    batch.copyFrame("aa", true, 2, true);
+    batch.copyFrame("aa", true, 2, true, 0);
     try std.testing.expect(!batch.wouldFit(4));
     try std.testing.expect(batch.wouldFit(3));
     try std.testing.expectEqual(@as(usize, 2), batch.len);
@@ -308,13 +321,13 @@ test "a frame that does not fit leaves the batch untouched" {
 test "overflow is a flush then a new batch, not a concat past capacity" {
     var storage: [5]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    batch.copyFrame("aa", true, 2, true);
+    batch.copyFrame("aa", true, 2, true, 0);
     try std.testing.expect(!batch.wouldFit(4));
     const first = batch.take();
     try std.testing.expectEqualStrings("aa", first.bytes);
     try std.testing.expectEqual(@as(u32, 1), first.control_entries);
     try std.testing.expect(batch.wouldFit(4));
-    batch.copyFrame("bbbb", true, 4, true);
+    batch.copyFrame("bbbb", true, 4, true, 0);
     const second = batch.take();
     try std.testing.expectEqualStrings("bbbb", second.bytes);
     try std.testing.expectEqual(@as(u32, 1), second.control_entries);
@@ -346,10 +359,10 @@ test "receipts attach only to the last TLS record of one plaintext" {
 test "needs_flush stays set after a later non-flush frame" {
     var storage: [64]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    batch.copyFrame("aa", false, 2, true);
+    batch.copyFrame("aa", false, 2, true, 0);
     try std.testing.expect(!batch.needs_flush);
-    batch.copyFrame("bb", true, 2, true);
-    batch.copyFrame("cc", false, 2, true);
+    batch.copyFrame("bb", true, 2, true, 0);
+    batch.copyFrame("cc", false, 2, true, 0);
     try std.testing.expect(batch.needs_flush);
     const taken = batch.take();
     try std.testing.expect(taken.flush);
@@ -358,7 +371,7 @@ test "needs_flush stays set after a later non-flush frame" {
 test "ticketed DATA alone is a valid batch with no control occupancy" {
     var storage: [64]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
-    batch.copyFrame("BODY", true, 0, false);
+    batch.copyFrame("BODY", true, 0, false, 0);
     batch.noteTicket(7, 3);
     try std.testing.expectEqual(@as(u32, 0), batch.control_entries);
     try std.testing.expectEqual(@as(usize, 0), batch.control_n);
@@ -368,12 +381,32 @@ test "ticketed DATA alone is a valid batch with no control occupancy" {
     try std.testing.expectEqual(@as(u32, 0), taken.control_entries);
 }
 
+test "a packed batch carries exactly the DATA payload of its frames" {
+    // The frame bytes of a batch (headers, controls, 9-byte DATA headers) are
+    // not the budget's bytes. Only the payload of each DATA frame is.
+    var storage: [256]u8 = undefined;
+    var batch: EmitBatch = .{ .buf = &storage };
+    batch.copyFrame("HDR", true, 24, true, 0);
+    // A 9-byte frame header and 5 payload bytes.
+    batch.copyFrame("123456789abcde", false, 0, false, 5);
+    batch.copyFrame("CTL", true, 12, true, 0);
+    // An empty END_STREAM DATA frame: header only, no credit.
+    batch.copyFrame("123456789", false, 0, false, 0);
+    batch.copyFrame("123456789xyz", false, 0, false, 3);
+    try std.testing.expectEqual(@as(usize, 8), batch.payload_credit);
+    try std.testing.expect(batch.len > batch.payload_credit);
+    const taken = batch.take();
+    try std.testing.expectEqual(@as(usize, 8), taken.payload_credit);
+    try std.testing.expectEqual(@as(usize, 0), batch.payload_credit);
+    try std.testing.expect(batch.empty());
+}
+
 test "frames fill the TLS plaintext cap without overflowing" {
     var storage: [max_plaintext]u8 = undefined;
     var batch: EmitBatch = .{ .buf = &storage };
     const payload: [64]u8 = @splat('x');
     while (batch.wouldFit(payload.len)) {
-        batch.copyFrame(&payload, true, payload.len, true);
+        batch.copyFrame(&payload, true, payload.len, true, 0);
     }
     try std.testing.expect(batch.len + payload.len > max_plaintext);
     try std.testing.expect(batch.len <= max_plaintext);

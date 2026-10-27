@@ -11,7 +11,12 @@
 # the SERVER saw: how many connections it ended (`ended`, `by=server`
 # lines only: a failed write is how a peer close shows), the first such
 # site and error (`reason`), and how many handler writes it refused for
-# lack of outbound budget (`budget_refusals`, each one a failed stream).
+# lack of SERVER-wide memory (`budget_refusals`: the server byte cap or the
+# slab pool, each one a failed stream; a full CONNECTION budget parks the
+# handler and is not a refusal). `budget_hw` is the largest bytes any one
+# connection held at once, over its limit, and `budget_parks` is how many
+# handler writes waited for budget room: a cell whose runs never parked
+# (`parked_runs` 0) never filled the budget and proves nothing about it.
 # A server that is dead before the script stops it, or that printed a
 # panic, is a CRASH run (`panic` quotes the message). On h2c,
 # `ack_high_water` is the most write completions a connection owed room in
@@ -28,6 +33,19 @@
 #                                 must accept --close-reason
 #   OUTBOUND=8388608              --outbound-bytes-per-connection for the server
 #   SERVER_ARGS='...'             extra bench-server flags (splitting intended)
+#   REQUEST_ARGS='...'            the request-memory flags. The default raises
+#                                 the per-connection request cap from the
+#                                 server's 64 MiB to 256 MiB (and the server
+#                                 cap to 512 MiB). A task handler renders its
+#                                 body into the REQUEST arena, then waits for
+#                                 outbound budget while holding it, and 200
+#                                 streams of 128 KiB bodies hold more than
+#                                 64 MiB: the server then answers 5xx
+#                                 (request pool `connection_cap`, in `/mem`).
+#                                 That is the request-memory limit, not the
+#                                 outbound budget this script measures. Set
+#                                 REQUEST_ARGS= (empty) to run on the server's
+#                                 defaults.
 #
 # Exit: 0 no run failed a request, 1 some run failed, 2 harness error.
 set -eu
@@ -57,6 +75,8 @@ fi
 
 EXTRA=
 [ -n "${OUTBOUND:-}" ] && EXTRA="--outbound-bytes-per-connection $OUTBOUND"
+REQUEST_ARGS=${REQUEST_ARGS---request-bytes-per-connection 268435456 --request-bytes-per-server 536870912}
+EXTRA="$EXTRA $REQUEST_ARGS"
 
 S_PID=
 H_PID=
@@ -67,7 +87,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "t3538-rate: sha=$(git -C "$REPO" rev-parse --short HEAD) dirty=$(git -C "$REPO" status --porcelain --untracked-files=no | wc -l | tr -d ' ') modes=\"$MODES\" ms=\"$MS\" kbs=\"$KBS\" runs=$RUNS n=$REQUESTS executors=$EXECUTORS outbound=${OUTBOUND:-default} server=$STARH2"
+echo "t3538-rate: sha=$(git -C "$REPO" rev-parse --short HEAD) dirty=$(git -C "$REPO" status --porcelain --untracked-files=no | wc -l | tr -d ' ') modes=\"$MODES\" ms=\"$MS\" kbs=\"$KBS\" runs=$RUNS n=$REQUESTS executors=$EXECUTORS outbound=${OUTBOUND:-default} request_args=\"${REQUEST_ARGS:-defaults}\" server=$STARH2"
 
 any_failed=0
 for MODE in $MODES; do
@@ -81,6 +101,8 @@ for MODE in $MODES; do
       failed_runs=0
       ended_runs=0
       crash_runs=0
+      refusal_runs=0
+      parked_runs=0
       run=1
       while [ "$run" -le "$RUNS" ]; do
         tag="$MODE-m$M-kb$KB-$run"
@@ -152,6 +174,11 @@ for MODE in $MODES; do
         ended=$(grep -c '^\[[0-9]*\] CLOSE_REASON .* by=server ' "$SLOG" || true)
         reason=$(sed -n 's/^\[[0-9]*\] CLOSE_REASON .* by=server site=\([^ ]*\) err=\([^ ]*\) goaway=\([^ ]*\).*/\1:\2:goaway=\3/p' "$SLOG" | head -1)
         refused=$(sed -n 's/^\[[0-9]*\] STREAM_BUDGET .* stream_budget_refusals=\([0-9]*\).*/\1/p' "$SLOG" | awk '{ s += $1 } END { print s + 0 }')
+        # The budget's high-water mark and parks, from the teardown line every
+        # connection prints (STREAM_BUDGET ... lim=L high_water=H budget_parks=P).
+        budget_lim=$(sed -n 's/^\[[0-9]*\] STREAM_BUDGET .* lim=\([0-9]*\) .*/\1/p' "$SLOG" | head -1)
+        budget_hw=$(sed -n 's/^\[[0-9]*\] STREAM_BUDGET .* high_water=\([0-9]*\) .*/\1/p' "$SLOG" | sort -n | tail -1)
+        budget_parks=$(sed -n 's/^\[[0-9]*\] STREAM_BUDGET .* budget_parks=\([0-9]*\) .*/\1/p' "$SLOG" | awk '{ s += $1 } END { print s + 0 }')
         # h2c only: the largest count of completions owed room in the write
         # ack channel, over the run's connections, and the channel's size.
         ack_hw=$(sed -n 's/^\[[0-9]*\] ACK_LEDGER .* high_water=\([0-9]*\).*/\1/p' "$SLOG" | sort -n | tail -1)
@@ -165,11 +192,14 @@ for MODE in $MODES; do
         fi
         [ "$verdict" = PASS ] || failed_runs=$((failed_runs + 1))
         [ "$ended" -eq 0 ] || ended_runs=$((ended_runs + 1))
-        echo "run $tag $verdict started=$started succeeded=$succeeded failed=$failed errored=$errored ended=$ended reason=${reason:--} budget_refusals=$refused ack_high_water=${ack_hw:--}/${ack_cap:--} panic=\"${panic:--}\" secs=$waited"
+        [ "$refused" -eq 0 ] || refusal_runs=$((refusal_runs + 1))
+        [ "$budget_parks" -eq 0 ] || parked_runs=$((parked_runs + 1))
+        echo "run $tag $verdict started=$started succeeded=$succeeded failed=$failed errored=$errored ended=$ended reason=${reason:--} budget_refusals=$refused budget_hw=${budget_hw:--}/${budget_lim:--} budget_parks=$budget_parks ack_high_water=${ack_hw:--}/${ack_cap:--} panic=\"${panic:--}\" secs=$waited"
         run=$((run + 1))
       done
-      echo "cell mode=$MODE m=$M kb=$KB in_flight_kib=$((M * KB)) failing_runs=$failed_runs/$RUNS server_ended_runs=$ended_runs/$RUNS crashed_runs=$crash_runs/$RUNS"
+      echo "cell mode=$MODE m=$M kb=$KB in_flight_kib=$((M * KB)) failing_runs=$failed_runs/$RUNS server_ended_runs=$ended_runs/$RUNS crashed_runs=$crash_runs/$RUNS refusal_runs=$refusal_runs/$RUNS parked_runs=$parked_runs/$RUNS"
       [ "$failed_runs" -eq 0 ] || any_failed=1
+      [ "$refusal_runs" -eq 0 ] || any_failed=1
     done
   done
 done

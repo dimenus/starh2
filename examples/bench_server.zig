@@ -1136,7 +1136,7 @@ fn writeGpaCounters(w: *std.Io.Writer, c: *CountingGpa) !void {
         try w.print("[{d},{d}]", .{ i, gap });
     }
     const om = conn_mod.outbound_memory;
-    try w.print("],\"outbound\":{{\"frames_built\":{d},\"frames_from_slab\":{d},\"frames_from_chunk\":{d},\"frames_in_scratch\":{d},\"chunks_leased\":{d},\"chunks_to_pump\":{d},\"frames_refused\":{d},\"chunks_refused\":{d},\"drain_turns\":{d},\"drain_memory_pauses\":{d},\"control_frames\":{d},\"hpack_insertions\":{d},\"tls_leftovers\":{d},\"response_header_lists\":{d},\"body_idle_expiries\":{d}}}", .{
+    try w.print("],\"outbound\":{{\"frames_built\":{d},\"frames_from_slab\":{d},\"frames_from_chunk\":{d},\"frames_in_scratch\":{d},\"chunks_leased\":{d},\"chunks_to_pump\":{d},\"frames_refused\":{d},\"chunks_refused\":{d},\"drain_turns\":{d},\"drain_memory_pauses\":{d},\"server_cap_refusals\":{d},\"slab_pool_refusals\":{d},\"control_frames\":{d},\"hpack_insertions\":{d},\"tls_leftovers\":{d},\"response_header_lists\":{d},\"body_idle_expiries\":{d}}}", .{
         om.frames_built.load(.monotonic),
         om.frames_from_slab.load(.monotonic),
         om.frames_from_chunk.load(.monotonic),
@@ -1147,6 +1147,8 @@ fn writeGpaCounters(w: *std.Io.Writer, c: *CountingGpa) !void {
         om.chunks_refused.load(.monotonic),
         om.drain_turns.load(.monotonic),
         om.drain_memory_pauses.load(.monotonic),
+        om.server_cap_refusals.load(.monotonic),
+        om.slab_pool_refusals.load(.monotonic),
         starh2.core.session.control_frames_built.load(.monotonic),
         starh2.core.hpack.table_insertions.load(.monotonic),
         conn_mod.h2_work.tls_leftovers.load(.monotonic),

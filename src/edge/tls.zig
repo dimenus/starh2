@@ -1294,6 +1294,25 @@ pub const Pump = struct {
                 return false;
             };
         }
+        if (comptime observe) {
+            // The TLS counterpart of the WritePump hold (observe builds only):
+            // the batch is taken and nothing is written, as a socket that
+            // never accepts would leave it. A test that needs a full budget
+            // cannot depend on the size of the kernel's socket buffers. The
+            // driver runs on the actor, so the actor waits here; handlers
+            // still write (they need `session_mu`, not the actor).
+            if (wire_pump.test_hold_writes.load(.acquire)) {
+                _ = wire_pump.test_hold_entered.fetchAdd(1, .release);
+                while (wire_pump.test_hold_writes.load(.acquire)) {
+                    self.io.sleep(.fromMilliseconds(1), .awake) catch {
+                        self.failPending();
+                        self.failDrain();
+                        self.post(.{ .shutdown = true });
+                        return false;
+                    };
+                }
+            }
+        }
         const fail_next = wire_pump.test_fail_next_write.swap(false, .acq_rel);
         if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
             _ = tls_stage_failed.fetchAdd(1, .monotonic);
