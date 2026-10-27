@@ -1188,12 +1188,23 @@ pub const Pump = struct {
     pub fn push(self: *Pump, chunk_in: wire_pump.WireChunk) error{StashFull}!void {
         var chunk = chunk_in;
         self.stampPush(&chunk);
-        self.write_ch.trySend(chunk) catch return error.StashFull;
+        self.write_ch.trySend(chunk) catch {
+            // The chunk never entered the stash, so its position must not be
+            // used: the writer checks that positions come out without a gap.
+            // Every push holds the owner's push lock, so there is one producer
+            // and nothing was stamped since: giving the number back is exact.
+            self.unstampPush();
+            return error.StashFull;
+        };
     }
 
     /// True when the stash has room for `n` more chunks.
     pub fn hasRoomFor(self: *Pump, n: usize) bool {
-        return self.write_ch.impl.capacity - io_queue.chanLen(wire_pump.WireChunk, self.write_ch) >= n;
+        return self.freeSlots() >= n;
+    }
+
+    pub fn freeSlots(self: *Pump) usize {
+        return self.write_ch.impl.capacity - io_queue.chanLen(wire_pump.WireChunk, self.write_ch);
     }
 
     /// True when the scheduler must stop popping: one more pop and the
@@ -1339,6 +1350,12 @@ pub const Pump = struct {
         if (comptime !std.debug.runtime_safety) return;
         self.stash_pushed += 1;
         chunk.stash_seq = self.stash_pushed;
+    }
+
+    /// Give back the position `stampPush` just handed out. Safe builds only.
+    fn unstampPush(self: *Pump) void {
+        if (comptime !std.debug.runtime_safety) return;
+        self.stash_pushed -= 1;
     }
 
     fn popPending(self: *Pump) void {
@@ -1725,6 +1742,53 @@ test "writesDrained is false while anything pushed is not yet on the socket (t-3
     try std.testing.expect(!pump.writesDrained());
     _ = try ch.tryReceive();
     try std.testing.expect(pump.writesDrained());
+}
+
+test "a push that finds the stash full does not use up a position: the pops come out in order (t-3567)" {
+    // The writer checks that chunks come out of the stash with no gap in their
+    // positions. A failed push used to leave its number taken, so after one
+    // failure the next good chunk looked like it had skipped one, and a safe
+    // build panicked at the write.
+    var buf: [2]wire_pump.WireChunk = undefined;
+    var ch = zio.Channel(wire_pump.WireChunk).init(&buf);
+    var pump: Pump = undefined;
+    pump.write_ch = &ch;
+    pump.pending_n = 0;
+    pump.partial_off = 0;
+    pump.stash_pushed = wire_pump.stash_seq_none;
+    pump.stash_written = wire_pump.stash_seq_none;
+
+    const chunk = struct {
+        fn at(ticket: u64) wire_pump.WireChunk {
+            return .{ .bytes = &.{}, .len = 0, .flush_barrier = true, .ticket = ticket };
+        }
+    }.at;
+    try pump.push(chunk(1));
+    try pump.push(chunk(2));
+    try std.testing.expectError(error.StashFull, pump.push(chunk(99)));
+    try std.testing.expectError(error.StashFull, pump.push(chunk(98)));
+
+    // The writer takes one; the next push succeeds.
+    pump.pending_writes[0] = pump.tryTakeWrite().?;
+    pump.pending_n = 1;
+    try std.testing.expectEqual(@as(u64, 1), pump.pending_writes[0].ticket);
+    pump.popPending();
+    try pump.push(chunk(3));
+    try std.testing.expectError(error.StashFull, pump.push(chunk(97)));
+
+    // The rest come out in the order they went in, and every pop passes the
+    // position check (a gap would panic here).
+    for ([_]u64{ 2, 3 }) |want| {
+        pump.pending_writes[0] = pump.tryTakeWrite().?;
+        pump.pending_n = 1;
+        try std.testing.expectEqual(want, pump.pending_writes[0].ticket);
+        pump.popPending();
+    }
+    try std.testing.expect(pump.tryTakeWrite() == null);
+    if (comptime std.debug.runtime_safety) {
+        try std.testing.expectEqual(@as(u64, 3), pump.stash_pushed);
+        try std.testing.expectEqual(@as(u64, 3), pump.stash_written);
+    }
 }
 
 test "h2 ALPN matcher" {

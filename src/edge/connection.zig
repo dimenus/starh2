@@ -257,6 +257,9 @@ pub var test_ack_room_pauses: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): handler flush barriers that parked for
 /// `write_ack_ch` room (`waitForAckRoom`).
 pub var test_ack_room_waits: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): the fewest free stash slots a TLS bare flush
+/// barrier left after its push (`pushBareBarrier`). Starts at the maximum.
+pub var test_tls_barrier_min_room: std.atomic.Value(usize) = .init(std.math.maxInt(usize));
 /// Test-only (observe builds): handlers that parked for connection outbound
 /// budget (`parkForBudget`), and the budget grants made. `test_budget_grant_log`
 /// keeps the stream id of each grant, newest at `grants % len`, so a test can
@@ -396,6 +399,11 @@ pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
 /// stray or double `clear` asserts instead of corrupting the chain
 /// (`zig-pkg/zio-*/src/task.zig` `TaskLocal.set`/`clear`).
 var shutdown_sweep: zio.TaskLocal(void) = .{};
+
+/// Bound, for the whole of `runBody`, to the connection whose actor runs on this
+/// task. `get() == self` tells the actor from a handler's task (`pushWriteChunk`
+/// rings only for the latter). Same discipline as `shutdown_sweep`.
+var actor_marker: zio.TaskLocal(*Connection) = .{};
 /// Set on a task handler's task, from the start of `runHandlerJob` to its end
 /// (observe builds only). A request's blocks go back to the pool from the
 /// actor, after the join; `releaseLease` asserts it is not called from inside
@@ -1781,12 +1789,14 @@ pub const Connection = struct {
     /// h2c only: completions owed room in `write_ack_ch` (see `AckLedger`).
     /// Producers add under `session_mu`; the actor subtracts on receive.
     acks: wire_pump.AckLedger = .{},
-    /// Set when the h2c WritePump starts: from then on `h2cPause` holds a
-    /// pop back when `write_ack_ch` has no room for it. A harness without a
-    /// pump (`BenchHop`) leaves it false.
+    /// Set when the writer starts (the h2c WritePump, or the TLS driver): from
+    /// then on a handler's bare flush barrier waits for room in `waitForAckRoom`.
+    /// On h2c it also makes `h2cPause` hold a pop back when `write_ack_ch` has no
+    /// room for it. A harness without a pump (`BenchHop`) leaves it false.
     ack_room_armed: bool = false,
-    /// Handlers parked in `waitForAckRoom`. The actor wakes them when it
-    /// takes a completion; see that function for the ordering.
+    /// Handlers parked in `waitForAckRoom`. On h2c the actor wakes them when it
+    /// takes a completion, on TLS the driver when it takes chunks off the
+    /// stash; see that function for the ordering.
     ack_room_waiters: std.atomic.Value(u32) = .init(0),
     /// Set the first time a drain finds the h2c connection ending; then
     /// `h2cPause` also keeps the drain from parking on a full write queue.
@@ -3622,8 +3632,23 @@ pub const Connection = struct {
             const chunk = if (pump.carried) |c| blk: {
                 pump.carried = null;
                 break :blk c;
-            } else pump.tryTakeWrite() orelse break;
+            } else blk: {
+                const taken = pump.tryTakeWrite() orelse break;
+                // This take left room in the stash: wake the barriers that wait
+                // for it (the TLS actor gets no write-ack to do it). At once, not
+                // after the write: a handler that is ready to flush takes the
+                // slot while the chunk is being written, and a check after the
+                // write would find the stash full again and wake nobody.
+                self.wakeBarrierWaitersTls();
+                break :blk taken;
+            };
             if (!pump.writeChunks(chunk)) return true;
+            // Again after the write: `writeChunks` gathers more chunks off the
+            // stash for a batch. Inside the loop on purpose: a bare barrier makes
+            // no ciphertext, so its chunk leaves `pending_n` at zero and the loop
+            // goes on, and handlers that keep flushing can keep it going; a wake
+            // after the loop would wait for as long as they do.
+            self.wakeBarrierWaitersTls();
         }
 
         if (pump.pending_cipher != null and pump.pending_read == null) {
@@ -3941,6 +3966,9 @@ pub const Connection = struct {
     fn runBody(self: *Connection, torn_down: *bool) !void {
         const gpa = self.config.gpa;
         const io = self.config.io;
+        var actor_node: @TypeOf(actor_marker).Node = .unset;
+        actor_marker.set(&actor_node, self);
+        defer actor_marker.clear(&actor_node);
         if (diag_task_handle_fn) |f| self.actor_task_h.store(f(), .release);
         if (comptime placement_check) self.actor_thread = std.Thread.getCurrentId();
         probeNote(.actor_start);
@@ -4032,6 +4060,8 @@ pub const Connection = struct {
                 }
             }.f;
             self.sched.pause_ctx = self;
+            // After `tls_driver` is set: `barrierRoom` reads the stash through it.
+            self.ack_room_armed = true;
             if (diag_park) {
                 self.diag_registered = true;
                 diagRegister(self);
@@ -5232,11 +5262,14 @@ pub const Connection = struct {
         try self.processIntents();
     }
 
-    /// Block a handler until `write_ack_ch` has room for one more push AND
-    /// the write queue has a free slot for it, the gates a drain's pop gets
-    /// from `h2cPause`. A handler's bare flush barrier (`sendFlushTicket`
-    /// with nothing pending) is the one push made outside a drain, so it
-    /// waits here first. It parks the handler, not the barrier: the handler
+    /// Block a handler until the writer has room for one more push, the gate a
+    /// drain's pop gets from the pause hooks. A handler's bare flush barrier
+    /// (`sendFlushTicket` with nothing pending) is the one push made outside a
+    /// drain, so it waits here first, on both transports. The room is
+    /// `barrierRoom`: on h2c `write_ack_ch` has room for one more completion
+    /// AND the write queue a free slot (`h2cPause`'s gates); on TLS the stash is
+    /// not full (`Pump.stashFull`, `pause_control`'s test). The rest of this
+    /// text is written for h2c; the TLS waker and its argument follow it. It parks the handler, not the barrier: the handler
     /// then waits for the barrier's ticket anyway, and a parked handler leaves
     /// nothing behind if its stream is reset. A barrier takes a queue slot and
     /// no pool chunk, so the queue can be full while the pool is not; without
@@ -5280,6 +5313,36 @@ pub const Connection = struct {
     /// a failed write (`applyWriteAck`), `handleWriterFailed` and teardown
     /// (`publishTeardownWakes`, which also sets `dead`) all call
     /// `wakeAllSpace`.
+    ///
+    /// TLS. The actor posts no write acks, so `wakeAckRoomWaiters` never runs
+    /// there; the waker is the driver, which wakes after it has taken chunks off
+    /// the stash (`wakeBarrierWaitersTls`, from `driveTlsTurn`). The two sides:
+    ///   handler  W1: `ack_room_waiters.fetchAdd`, then R1: `stashFull()`
+    ///   driver   W2: `tryTakeWrite`, then R2: `ack_room_waiters.load`
+    /// R1 and W2 are critical sections of the SAME channel mutex (`stashFull`
+    /// counts the stash with `chanLen`, `tryTakeWrite` is a `tryReceive`), so
+    /// the mutex orders them. If R1 ran first and saw the stash full, its
+    /// release happens before the take's acquire, W1 is before R1 in the
+    /// handler's order and R2 is after W2 in the driver's, so W1 happens before
+    /// R2 and R2 sees the waiter (a load cannot miss a store that happens
+    /// before it): the driver finds a waiter and wakes it. If the take ran
+    /// first, R1 counts the stash after it and sees the room. So one side sees
+    /// the other, and no seq_cst is needed on this pair. R2 runs after every
+    /// take of the turn (the loop in `driveTlsTurn`), so a waiter that parks
+    /// behind a full stash is woken by the next take; if no take comes, the
+    /// writer is stuck for a reason the other wake sources already cover (a
+    /// failed send ends in `applyWriteAck`, `handleWriterFailed`, `dead`).
+    /// Progress. The loop in `driveTlsTurn` takes one chunk, runs R2, then
+    /// writes it, so every take the LOOP makes is followed by R2 before the next
+    /// take, and a loop that keeps going does not leave a waiter behind. The
+    /// takes that `writeChunks` makes itself (its batch gather, which runs only
+    /// behind a first chunk that is not a barrier) are not each followed by R2:
+    /// they share the one check after that call. A waiter needs the stash to be
+    /// below the full threshold. If the outer take crossed it, the check before
+    /// the write wakes the waiter; if only the gather did, the check after the
+    /// call does. Barriers never gather, so a run of barriers is the first case.
+    /// The check right after the take matters: the room is there only until a
+    /// handler that is ready to flush takes it.
     fn waitForAckRoom(self: *Connection, hctx: *HandlerCtx, stream_id: u31) response.ResponseError!void {
         if (!self.ack_room_armed) return;
         const terminal = hctx.terminal;
@@ -5295,7 +5358,7 @@ pub const Connection = struct {
             if (event) |e| e.reset();
             _ = self.ack_room_waiters.fetchAdd(1, .seq_cst); // W1
             defer _ = self.ack_room_waiters.fetchSub(1, .seq_cst);
-            if (self.acks.owed.load(.seq_cst) + ack_room_per_pop <= self.write_ack_buf.len and self.h2cQueueRoom(1)) return; // R1
+            if (self.barrierRoomSeqCst()) return; // R1
             self.unlockSession(self.config.io);
             const wait_res: anyerror!void = if (event) |e| blk: {
                 const winner = zio.select(.{
@@ -5324,10 +5387,34 @@ pub const Connection = struct {
         self.wakeAllSpace();
     }
 
-    /// Room for one bare flush barrier: its completion in `write_ack_ch`, and
-    /// its slot in the write queue.
+    /// Room for one bare flush barrier. h2c: its completion in `write_ack_ch`,
+    /// and its slot in the write queue. TLS: the stash is not full, the test a
+    /// drain asks before a pop, so a barrier pushed after a yes leaves the
+    /// drain's tail push its slot (`assertTailRoom`). Called under `session_mu`
+    /// before the push, and by the wakers.
     fn barrierRoom(self: *Connection) bool {
+        if (self.config.mode == .tls) {
+            const pump = self.tls_driver orelse return true;
+            return !pump.stashFull();
+        }
         return self.h2cAckRoom(0) and self.h2cQueueRoom(1);
+    }
+
+    /// `barrierRoom` for R1 in `waitForAckRoom`: the h2c ledger is read
+    /// seq_cst (it is half of the store-buffer handshake above). TLS needs no
+    /// stronger read; the channel mutex orders it.
+    fn barrierRoomSeqCst(self: *Connection) bool {
+        if (self.config.mode == .tls) return self.barrierRoom();
+        return self.acks.owed.load(.seq_cst) + ack_room_per_pop <= self.write_ack_buf.len and self.h2cQueueRoom(1);
+    }
+
+    /// TLS driver, after it took chunks off the stash: wake the handlers parked
+    /// for a barrier when the stash has room again. This load is R2 (see
+    /// `waitForAckRoom`).
+    fn wakeBarrierWaitersTls(self: *Connection) void {
+        if (self.ack_room_waiters.load(.seq_cst) == 0) return;
+        if (!self.barrierRoom()) return;
+        self.wakeAllSpace();
     }
 
     /// Block a handler until its stream's pending slab is below `cap`.
@@ -6394,6 +6481,17 @@ pub const Connection = struct {
     fn pushBareBarrier(self: *Connection, hctx: *HandlerCtx, stream_id: u31, ticket: u64, slot: u32) response.ResponseError!void {
         try self.waitForAckRoom(hctx, stream_id);
         self.sendFlushTicket(ticket, slot, false) catch return error.WriteFailed;
+        if (comptime test_observe) {
+            if (self.tls_driver) |pump| {
+                // Under `session_mu`, so nothing was pushed since: the room the
+                // barrier left. A drain's pop needs `pushes_per_pop` slots and
+                // its tail push `tail_pushes_per_drain`; a barrier is let in only
+                // while the stash is not full, so this never falls under the tail.
+                const left = pump.freeSlots();
+                var min = test_tls_barrier_min_room.load(.monotonic);
+                while (left < min) min = test_tls_barrier_min_room.cmpxchgWeak(min, left, .monotonic, .monotonic) orelse break;
+            }
+        }
     }
 
     fn sendFlushTicket(self: *Connection, ticket: u64, slot: u32, complete_batch_receipt: bool) anyerror!void {
@@ -6438,9 +6536,11 @@ pub const Connection = struct {
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{ WriteFailed, Canceled }!void {
         if (self.config.mode == .tls) {
             // Encrypt + stage + arm on this task. Acks apply in `post` via
-            // `ack_apply` (no write_ack_ch hop). `pause` (DATA) and
-            // `pause_control` (HEADERS/WINDOW_UPDATE) stop drain before this
-            // stash fills, so trySend is the last-resort fail-close.
+            // `ack_apply` (no write_ack_ch hop). Two things keep the stash from
+            // filling: `pause` (DATA) and `pause_control` (HEADERS/WINDOW_UPDATE)
+            // stop a drain before a pop, and a handler's bare flush barrier,
+            // which is a push outside any drain, waits in `waitForAckRoom` for
+            // the same room. So trySend is the last-resort fail-close.
             const pump = self.tls_driver orelse {
                 _ = tls_edge.tls_stage_failed.fetchAdd(1, .monotonic);
                 return error.WriteFailed;
@@ -6459,6 +6559,15 @@ pub const Connection = struct {
                 }
                 return error.WriteFailed;
             };
+            // The actor is the writer here and does not select on the stash. A
+            // chunk pushed from a handler's task (a drain run by `sendCb`,
+            // `flushCb`, `abortCb`, the error reset, a bare barrier) would leave
+            // an idle actor asleep until something else wakes it, and the handler
+            // is about to park on the chunk's ticket. This is the one place every
+            // such push passes through. The actor's own drains do not ring: it
+            // writes in the same turn (the hot path). On h2c the pump task waits
+            // on the queue.
+            if (actor_marker.get() != self) self.ring();
             return;
         }
         // Counted before the push: the pump may post its completion, and the

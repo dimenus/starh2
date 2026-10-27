@@ -770,6 +770,28 @@ pub fn build(b: *std.Build) void {
     const outbound_budget_step = b.step("test-outbound-budget", "Run the connection outbound budget gates (a full budget parks a writer in arrival order; the server cap refuses; an inline job waits)");
     outbound_budget_step.dependOn(&run_outbound_budget_tests.step);
 
+    // t-3567: TLS bare flush barriers against a held writer. Its own step so
+    // it can be run alone (also in a release-fast observe build); `test` runs it.
+    const t3567_tests = b.addTest(.{
+        .name = "t3567",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/t3567_tls_barriers.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_t3567_tests = b.addRunArtifact(t3567_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_t3567_tests.setCwd(b.path("."));
+    const t3567_step = b.step("test-t3567", "Run the t-3567 gate: bare flush barriers against a held writer wait for room on h2c and TLS");
+    t3567_step.dependOn(&run_t3567_tests.step);
+
     const request_memory_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/request_memory.zig"),
@@ -842,6 +864,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_request_memory_tests.step);
     test_step.dependOn(&run_outbound_memory_tests.step);
     test_step.dependOn(&run_outbound_budget_tests.step);
+    test_step.dependOn(&run_t3567_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");
