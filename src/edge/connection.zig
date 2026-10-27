@@ -297,6 +297,9 @@ pub var test_terminal_ring_high: std.atomic.Value(usize) = .init(0);
 /// them to prove its RSTs were queued during the stall, not after it.
 pub var test_rst_queued_paused: std.atomic.Value(usize) = .init(0);
 pub var test_control_pause_seen: std.atomic.Value(u64) = .init(0);
+/// Test-only (observe builds): server RST_STREAMs dropped from the terminal
+/// ring because the peer reset the same stream first (`retireTerminalRst`).
+pub var test_rst_retired: std.atomic.Value(usize) = .init(0);
 /// Test-only: ORDINARY control frames (HEADERS and the like) the scheduler
 /// refused, by the pool (`PoolFull`) and by the ring (`QueueFull`). A handler
 /// whose response is refused sees `WriteFailed`. Counted in Debug and
@@ -6472,6 +6475,7 @@ pub const Connection = struct {
                     if (diag_park) _ = diag_reset_after_ctrl_fail.fetchAdd(1, .monotonic);
                     self.applyStreamResetIntent(r);
                 },
+                .retire_rst => |sid| _ = self.sched.retireTerminalRst(sid),
                 else => self.session.releaseIntent(it),
             }
         }
@@ -6600,6 +6604,12 @@ pub const Connection = struct {
                 .dispatch_request => |d| try self.dispatch(d),
                 .early_reject => {},
                 .stream_reset => |r| self.applyStreamResetIntent(r),
+                .retire_rst => |sid| {
+                    const dropped = self.sched.retireTerminalRst(sid);
+                    if (comptime test_observe) {
+                        if (dropped) _ = test_rst_retired.fetchAdd(1, .monotonic);
+                    }
+                },
                 .connection_error => |ce| {
                     if (close_reason) {
                         var code_buf: [12]u8 = undefined;

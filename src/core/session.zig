@@ -66,6 +66,12 @@ pub const Intent = union(enum) {
     connection_closed,
     /// Exactly one early HTTP response (431/414/413); no handler dispatch.
     early_reject: struct { stream_id: u31, status: u16 },
+    /// The peer reset a stream this server had already reset, and the two
+    /// RST_STREAMs crossed. The peer counts the stream closed, so the server's
+    /// RST, if it still waits unwritten in the terminal ring, tells it nothing
+    /// and only holds one of the `Limits.terminalFrames` slots: the edge drops
+    /// it (`FairScheduler.retireTerminalRst`).
+    retire_rst: u31,
 };
 
 pub const OutboundFrame = struct {
@@ -121,6 +127,17 @@ pub const Terminal = union(enum) {
 const Tombstone = struct {
     id: u31,
     code: frame.ErrorCode,
+    ending: Ending,
+};
+
+/// How a stream ended, for what a later event on it still owes the peer.
+const Ending = enum(u8) {
+    /// The peer knows: both sides ended it, or the peer reset it.
+    closed,
+    /// This server queued an RST_STREAM for it. Until the peer resets the
+    /// stream too, that RST may still wait unwritten; a crossed peer RST
+    /// retires it (`Intent.retire_rst`).
+    server_rst,
 };
 
 fn encodeDataFrameInto(out: []u8, stream_id: u31, data: []const u8, end_stream: bool) usize {
@@ -769,7 +786,7 @@ pub const Session = struct {
         }
         if (end_stream) {
             s.localEndStream();
-            self.releaseConcurrency(stream_id, .no_error);
+            self.releaseConcurrency(stream_id, .no_error, .closed);
         }
         return out;
     }
@@ -956,7 +973,7 @@ pub const Session = struct {
     /// reach a closed stream — a peer RST, a local RST, END_STREAM in both
     /// directions — and a double release would corrupt the server-wide stream
     /// count.
-    fn releaseConcurrency(self: *Session, stream_id: u31, tombstone_code: frame.ErrorCode) void {
+    fn releaseConcurrency(self: *Session, stream_id: u31, tombstone_code: frame.ErrorCode, ending: Ending) void {
         const s = self.streams.getPtr(stream_id) orelse return;
         if (s.concurrency_released) return;
         if (s.state != .closed) return;
@@ -968,7 +985,7 @@ pub const Session = struct {
         // stream IDs cannot be reused, and every close removes the entry below.
         // Passing the terminal code here avoids a linear duplicate scan on
         // every normal response while preserving the peer/local RST code.
-        self.addTombstone(stream_id, tombstone_code) catch {};
+        self.addTombstone(stream_id, tombstone_code, ending) catch {};
         self.dropPendingRequest(stream_id);
         // A stream that ends mid-body (RST, early reject) leaves its idle
         // clock behind otherwise, and a peer that opens and resets streams
@@ -1024,6 +1041,7 @@ pub const Session = struct {
         // well-behaved peer can cause (`Limits.intentEntriesMin`), and a read
         // chunk stops before it fills it (`ingestSome`), so a queue this full
         // means a peer past the bound, answered like any other flood.
+        var queued = false;
         if (self.ordinaryIntentRoom() < limits_mod.RST_INTENT_ROOM) {
             if (self.rstOwed(stream_id)) try self.failConnection(.enhance_your_calm);
         } else if (self.rstOwed(stream_id)) {
@@ -1031,32 +1049,37 @@ pub const Session = struct {
             const n = try frame.Serializer.rstStream(&buf, stream_id, code);
             if (self.controlFrame(buf[0..n], .terminal)) |p| {
                 try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .rst_stream, .payload = p, .stream_id = stream_id } });
-                if (!self.streams.contains(stream_id)) try self.addTombstone(stream_id, code);
+                queued = true;
             } else |err| switch (err) {
                 error.OutOfMemory => try self.failConnection(.enhance_your_calm),
             }
         }
         try self.pushIntentOrFailClosed(.{ .stream_reset = .{ .stream_id = stream_id, .code = code, .from_peer = false } });
+        const ending: Ending = if (queued) .server_rst else .closed;
         if (self.streams.getPtr(stream_id)) |s| {
             s.onRst();
+            self.releaseConcurrency(stream_id, code, ending);
+        } else if (queued) {
+            // A refused stream never had a map entry: the tombstone is what
+            // makes a second refusal of the same id find it.
+            try self.addTombstone(stream_id, code, ending);
         }
-        self.releaseConcurrency(stream_id, code);
     }
 
     /// Oldest-first ring overwrite, because a peer decides how many streams it opens.
     /// An unbounded list would grow with the connection's lifetime, which is a
     /// memory target. Losing the oldest tombstone is safe: a frame for a stream
     /// that closed that long ago falls back to the generic closed-stream rules.
-    fn addTombstone(self: *Session, id: u31, code: frame.ErrorCode) !void {
+    fn addTombstone(self: *Session, id: u31, code: frame.ErrorCode, ending: Ending) !void {
         const capacity = self.limits.stream_tombstones;
         if (capacity == 0) return;
         if (self.tombstones.items.len < capacity) {
             // `init` sized the list to exactly `stream_tombstones`, so this
             // append cannot allocate: a table in the boot buffer never grows.
-            self.tombstones.appendAssumeCapacity(.{ .id = id, .code = code });
+            self.tombstones.appendAssumeCapacity(.{ .id = id, .code = code, .ending = ending });
             return;
         }
-        self.tombstones.items[self.tombstone_next] = .{ .id = id, .code = code };
+        self.tombstones.items[self.tombstone_next] = .{ .id = id, .code = code, .ending = ending };
         self.tombstone_next = (self.tombstone_next + 1) % capacity;
     }
 
@@ -1112,7 +1135,7 @@ pub const Session = struct {
                 const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
                 if (self.streams.getPtr(hdr.stream_id)) |s| {
                     s.onRst();
-                    self.releaseConcurrency(hdr.stream_id, code);
+                    self.releaseConcurrency(hdr.stream_id, code, .closed);
                     // Cancel handler; never RST in response to peer RST.
                     // A reset answered by a reset is an infinite exchange
                     // between two conforming peers (RFC 9113 section 5.4.2).
@@ -1130,9 +1153,18 @@ pub const Session = struct {
                     // connection here would kill every OTHER stream on it, which
                     // is how one canceled request became a dead connection.
                     //
-                    // There is nothing to do. The stream is already gone, its
-                    // concurrency credit already released, and the handler (if
-                    // any) already canceled when the stream closed.
+                    // The stream is already gone, its concurrency credit
+                    // already released, and the handler (if any) already
+                    // canceled when the stream closed. If it closed because
+                    // this server reset it, the two RSTs crossed: the peer
+                    // now counts the stream closed, and the server's RST, if
+                    // it still waits, is retired.
+                    if (self.tombstonePtr(hdr.stream_id)) |t| {
+                        if (t.ending == .server_rst) {
+                            t.ending = .closed;
+                            try self.pushIntentOrFailClosed(.{ .retire_rst = hdr.stream_id });
+                        }
+                    }
                 } else {
                     // IDLE: a stream id the peer has never opened has no state
                     // to reset, so this is a genuine protocol violation
@@ -1481,7 +1513,7 @@ pub const Session = struct {
                 try self.maybeDispatch(hdr.stream_id);
             }
         }
-        self.releaseConcurrency(hdr.stream_id, .no_error);
+        self.releaseConcurrency(hdr.stream_id, .no_error, .closed);
 
         // WINDOW_UPDATE at half
         if (s.window.needsWindowUpdate()) {
@@ -1731,7 +1763,7 @@ pub const Session = struct {
                 s.early_status = st;
                 s.onHeaders(true) catch {};
                 try self.emitEarlyReject(stream_id, st);
-                self.releaseConcurrency(stream_id, .no_error);
+                self.releaseConcurrency(stream_id, .no_error, .closed);
                 return;
             }
             for (decoded.fields) |f| {
@@ -1747,7 +1779,7 @@ pub const Session = struct {
                 // The early-reject state is already terminal and owns the response.
                 s.onHeaders(true) catch {};
                 try self.emitEarlyReject(stream_id, st);
-                self.releaseConcurrency(stream_id, .no_error);
+                self.releaseConcurrency(stream_id, .no_error, .closed);
                 return;
             }
             s.onHeaders(true) catch |err| {
@@ -1757,7 +1789,7 @@ pub const Session = struct {
             };
             putBounded(&self.pending_trailers, stream_id, decoded.fields);
             try self.maybeDispatch(stream_id);
-            self.releaseConcurrency(stream_id, .no_error);
+            self.releaseConcurrency(stream_id, .no_error, .closed);
             return;
         }
 
@@ -1769,7 +1801,7 @@ pub const Session = struct {
             s.early_status = 431;
             s.onHeaders(self.header_end_stream) catch {};
             try self.emitEarlyReject(stream_id, 431);
-            self.releaseConcurrency(stream_id, .no_error);
+            self.releaseConcurrency(stream_id, .no_error, .closed);
             return;
         }
 
@@ -1781,7 +1813,7 @@ pub const Session = struct {
                 // The early-reject state is already terminal and owns the response.
                 s.onHeaders(self.header_end_stream) catch {};
                 try self.emitEarlyReject(stream_id, 414);
-                self.releaseConcurrency(stream_id, .no_error);
+                self.releaseConcurrency(stream_id, .no_error, .closed);
                 return;
             }
             try self.emitRst(stream_id, .protocol_error);
@@ -1819,7 +1851,7 @@ pub const Session = struct {
         if (early) |st| {
             self.dropDecoded(stream_id, decoded, scratch_status != null);
             try self.emitEarlyReject(stream_id, st);
-            self.releaseConcurrency(stream_id, .no_error);
+            self.releaseConcurrency(stream_id, .no_error, .closed);
         } else {
             if (self.header_end_stream) {
                 // The common one-shot path already has a complete request and
@@ -1829,7 +1861,7 @@ pub const Session = struct {
             } else {
                 putBounded(&self.pending_headers, stream_id, decoded.fields);
             }
-            self.releaseConcurrency(stream_id, .no_error);
+            self.releaseConcurrency(stream_id, .no_error, .closed);
         }
     }
 
@@ -2031,7 +2063,7 @@ pub const Session = struct {
         if (self.streams.getPtr(stream_id)) |s| {
             if (end_stream) {
                 s.localEndStream();
-                self.releaseConcurrency(stream_id, .no_error);
+                self.releaseConcurrency(stream_id, .no_error, .closed);
             }
         }
     }
@@ -2083,6 +2115,13 @@ pub const Session = struct {
         return out;
     }
 
+    fn tombstonePtr(self: *Session, id: u31) ?*Tombstone {
+        for (self.tombstones.items) |*t| {
+            if (t.id == id) return t;
+        }
+        return null;
+    }
+
     pub fn tombstoneCode(self: *const Session, id: u31) ?frame.ErrorCode {
         for (self.tombstones.items) |t| {
             if (t.id == id) return t.code;
@@ -2100,9 +2139,9 @@ test "tombstones overwrite oldest in place" {
     var session = try Session.init(std.testing.allocator, std.testing.allocator, .{ .stream_tombstones = 2 });
     defer session.deinit();
 
-    try session.addTombstone(1, .cancel);
-    try session.addTombstone(3, .stream_closed);
-    try session.addTombstone(5, .no_error);
+    try session.addTombstone(1, .cancel, .closed);
+    try session.addTombstone(3, .stream_closed, .closed);
+    try session.addTombstone(5, .no_error, .closed);
 
     try std.testing.expectEqual(@as(usize, 2), session.tombstones.items.len);
     try std.testing.expect(!session.isTombstoned(1));
@@ -2127,14 +2166,14 @@ test "makeDataFrame still frames DATA after the stream map entry is gone" {
     try std.testing.expectEqual(@as(usize, frame.FRAME_HEADER_LEN + body.len), live.len);
     try std.testing.expect(session.streams.get(1) == null);
 
-    try session.addTombstone(3, .no_error);
+    try session.addTombstone(3, .no_error, .closed);
     try std.testing.expect(session.streamSendAvailable(3) > 0);
     const orphan = try session.makeDataFrame(3, body, true);
     defer std.testing.allocator.free(orphan);
     try std.testing.expectEqual(@as(usize, frame.FRAME_HEADER_LEN + body.len), orphan.len);
     try std.testing.expectEqual(@as(u8, 1), orphan[4] & 1);
 
-    try session.addTombstone(5, .cancel);
+    try session.addTombstone(5, .cancel, .closed);
     try std.testing.expectEqual(@as(i32, 0), session.streamSendAvailable(5));
 }
 
@@ -2279,7 +2318,7 @@ test "respond_headers after RST is StreamClosed" {
 }
 
 /// Counts of what a drained batch holds, then frees it.
-const TerminalCounts = struct { rst: usize = 0, goaway: usize = 0, stream_reset: usize = 0, connection_error: usize = 0 };
+const TerminalCounts = struct { rst: usize = 0, goaway: usize = 0, stream_reset: usize = 0, connection_error: usize = 0, retire_rst: usize = 0 };
 
 fn countTerminalIntents(gpa: std.mem.Allocator, session: *Session) TerminalCounts {
     const intents = session.drainIntents();
@@ -2293,6 +2332,7 @@ fn countTerminalIntents(gpa: std.mem.Allocator, session: *Session) TerminalCount
         },
         .stream_reset => c.stream_reset += 1,
         .connection_error => c.connection_error += 1,
+        .retire_rst => c.retire_rst += 1,
         else => {},
     };
     return c;
@@ -2326,7 +2366,7 @@ test "a reset of a stream closed in both directions queues no frame, and its loc
     defer session.deinit();
     _ = countTerminalIntents(gpa, &session);
     // Stream 3 ended normally: it has a tombstone and no map entry.
-    try session.addTombstone(3, .no_error);
+    try session.addTombstone(3, .no_error, .closed);
     try session.applyCommand(.{ .reset_stream = .{ .stream_id = 3, .code = .cancel } });
     const c = countTerminalIntents(gpa, &session);
     try std.testing.expectEqual(@as(usize, 0), c.rst);
@@ -2841,6 +2881,31 @@ fn ingestPrefaceAndSettings(session: *Session, gpa: std.mem.Allocator) !void {
     try wire.appendSlice(gpa, sbuf[0..sn]);
     try session.ingest(wire.items);
     freeTestIntents(gpa, session.drainIntents());
+}
+
+test "a peer RST that crosses this server's RST retires it, once; one that crosses a normal end retires nothing (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    try openTestStream(&session, 1);
+    session.highest_peer_stream = 3;
+    try session.emitRst(1, .cancel);
+    // Stream 3 ended normally.
+    try session.addTombstone(3, .no_error, .closed);
+    _ = countTerminalIntents(gpa, &session);
+
+    var peer: [frame.rst_stream_frame_bytes]u8 = undefined;
+    _ = try frame.Serializer.rstStream(&peer, 1, .cancel);
+    try session.ingest(&peer);
+    try session.ingest(&peer);
+    _ = try frame.Serializer.rstStream(&peer, 3, .cancel);
+    try session.ingest(&peer);
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 1), c.retire_rst);
+    try std.testing.expectEqual(@as(usize, 0), c.rst);
+    try std.testing.expectEqual(@as(usize, 0), c.stream_reset);
+    try std.testing.expect(session.terminal == .none);
 }
 
 test "single-frame END_HEADERS does not copy into header_block" {

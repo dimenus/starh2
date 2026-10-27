@@ -26,6 +26,16 @@
 //! buffer), and the handlers' DATA backs up into the socket and then the write
 //! memory, on both transports, while the actor goes on reading.
 //!
+//! `crossed_resets` (h2c): every handler aborts during the stall (M server
+//! RSTs wait), then the client resets all M streams itself, so the RSTs cross,
+//! and opens M new streams whose handler spawn fails (`test_force_spawn_fail`:
+//! M more RSTs, REFUSED_STREAM; a handler cannot start a response during the
+//! stall, because `start` waits for its HEADERS to be written). The peer
+//! never has more than M streams open in its own view, but without retiring
+//! the crossed RSTs the ring would need 2M. Only h2c: on TLS half the handlers
+//! wait in a flush (see `bare_flush`) and cannot abort, so the scenario cannot
+//! pass T there. The retire is Session and scheduler code, the same on both.
+//!
 //! `flood`: the M streams stay open, and the client sends more than M HEADERS
 //! for new stream ids in one write. Each is refused with an RST. Past T the
 //! connection must queue its final GOAWAY (ENHANCE_YOUR_CALM), keep the ring at
@@ -160,6 +170,7 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
 // The client: one connection on its own thread.
 
 const max_sid = 4096;
+const alive_ping = [8]u8{ 't', '3', '5', '6', '2', 'l', 'i', 'v' };
 
 const Client = struct {
     gpa: std.mem.Allocator,
@@ -175,6 +186,11 @@ const Client = struct {
     read_gate: std.atomic.Value(bool) = .init(false),
     send_flood: std.atomic.Value(bool) = .init(false),
     flood_sent: std.atomic.Value(bool) = .init(false),
+    /// Reset the `streams` first streams and open as many new ones.
+    send_cross: std.atomic.Value(bool) = .init(false),
+    cross_sent: std.atomic.Value(bool) = .init(false),
+    /// Sent when reading starts; its ack proves the connection is alive.
+    ping_acked: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     err: ?anyerror = null,
     rst_per_sid: [max_sid]u8 = @splat(0),
@@ -219,9 +235,20 @@ fn clientRun(c: *Client) !void {
             try w.send(more.items);
             c.flood_sent.store(true, .release);
         }
+        if (!c.cross_sent.load(.acquire) and c.send_cross.load(.acquire)) {
+            var more: std.ArrayList(u8) = .empty;
+            defer more.deinit(c.gpa);
+            for (0..c.streams) |i| try h2c.appendRst(c.gpa, &more, @intCast(1 + 2 * i));
+            for (0..c.streams) |i| try h2c.appendHeaders(c.gpa, &more, @intCast(1 + 2 * (c.streams + i)), "/stall", true);
+            try w.send(more.items);
+            c.cross_sent.store(true, .release);
+        }
         if (!reading) {
             if (c.read_gate.load(.acquire)) {
                 reading = true;
+                var ping: [17]u8 = undefined;
+                _ = try frame.Serializer.ping(&ping, false, &alive_ping);
+                try w.send(&ping);
             } else {
                 if (nowNs() >= deadline) return error.Deadline;
                 const nap: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
@@ -255,7 +282,9 @@ fn clientRun(c: *Client) !void {
                 if (p.len >= 8) c.goaway_code = std.mem.readInt(u32, p[4..8], .big);
                 if (c.goaway_code == @backingInt(frame.ErrorCode.enhance_your_calm)) c.enhance_seen = true;
             },
-            6 => if (s.flags & 1 == 0) {
+            6 => if (s.flags & 1 != 0) {
+                if (std.mem.eql(u8, w.last_payload.items, &alive_ping)) c.ping_acked.store(true, .release);
+            } else {
                 // Acking the graceful PING moves the server to phase 2.
                 var ack: [17]u8 = undefined;
                 (frame.FrameHeader{ .length = 8, .type = .ping, .flags = .{ .end_stream = true }, .stream_id = 0 }).encode(ack[0..9]);
@@ -310,7 +339,7 @@ fn holdEntered(transport: Transport) u64 {
     };
 }
 
-const Scenario = enum { server_failures, flood };
+const Scenario = enum { server_failures, flood, crossed_resets };
 
 fn limitsFor() starh2.Limits {
     var limits = starh2.Limits.defaults;
@@ -413,6 +442,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         joinClient(&c, t);
     };
 
+    const retired_0 = conn_mod.test_rst_retired.load(.monotonic);
     // Every response has its HEADERS out before the stall.
     try waitStarted(&c, m);
 
@@ -481,6 +511,28 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             };
             bound_ns = nowNs();
         },
+        .crossed_resets => {
+            abort_gate.store(true, .release);
+            try waitFor("every handler to abort", atLeast(&aborted, m), reached);
+            try waitFor("the M aborts' RSTs to wait in the ring", atLeast(&conn_mod.test_rst_queued_paused, rst_paused_0 + m), reached);
+            conn_mod.test_force_spawn_fail = true;
+            defer conn_mod.test_force_spawn_fail = false;
+            c.send_cross.store(true, .release);
+            try waitFor("the client to reset and reopen", &c, struct {
+                fn f(x: *Client) bool {
+                    return x.cross_sent.load(.acquire);
+                }
+            }.f);
+            waitFor("the new streams' RSTs to wait in the ring", atLeast(&conn_mod.test_rst_queued_paused, rst_paused_0 + 2 * m), reached) catch |err| {
+                std.debug.print("T3562-cross-timeout retired={d} rst_paused={d} ring_high={d} terminal_full={d}\n", .{
+                    conn_mod.test_rst_retired.load(.monotonic) - retired_0,
+                    conn_mod.test_rst_queued_paused.load(.monotonic) - rst_paused_0,
+                    conn_mod.test_terminal_ring_high.load(.acquire),
+                    conn_mod.test_ctrl_terminal_full.load(.monotonic) - full_0,
+                });
+                return err;
+            };
+        },
     }
     const rst_paused = conn_mod.test_rst_queued_paused.load(.monotonic) - rst_paused_0;
     const high_held = conn_mod.test_terminal_ring_high.load(.acquire);
@@ -488,6 +540,16 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
 
     hold(transport, false);
     c.read_gate.store(true, .release);
+    if (scenario == .crossed_resets) {
+        // Every RST was queued before the client's PING was read, and
+        // terminal frames leave first, so they are all out by its ack.
+        try waitFor("the PING ack", &c, struct {
+            fn f(x: *Client) bool {
+                return x.ping_acked.load(.acquire);
+            }
+        }.f);
+        server.requestShutdown();
+    }
     joinClient(&c, t);
     joined = true;
 
@@ -536,6 +598,19 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             // the GOAWAY was queued, at or before `bound_ns`.
             try std.testing.expect(c.eof_ns - bound_ns <= limits.close_flush_timeout_ns);
         },
+        .crossed_resets => {
+            // All 2M RSTs were queued during the stall, and every crossed one
+            // was retired before it was written.
+            try std.testing.expectEqual(2 * m, rst_paused);
+            try std.testing.expectEqual(m, conn_mod.test_rst_retired.load(.monotonic) - retired_0);
+            try expectRsts(&c, 1, m, 0);
+            try expectRsts(&c, 1 + 2 * m, m, 1);
+            try std.testing.expectEqual(m, c.rst_total);
+            try std.testing.expect(c.ping_acked.load(.acquire));
+            try std.testing.expect(!c.enhance_seen);
+            try std.testing.expect(c.goaways >= 2);
+            try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.no_error)), c.goaway_code);
+        },
     }
 
     server.requestShutdown();
@@ -565,4 +640,8 @@ test "flood during a stall, h2c: past T the connection ends with GOAWAY(ENHANCE_
 
 test "flood during a stall, tls: past T the connection ends with GOAWAY(ENHANCE_YOUR_CALM)" {
     try runCaseTop(.tls, .flood);
+}
+
+test "crossed resets during a stall, h2c: the peer's RSTs retire the server's unwritten ones, and M new failures fit" {
+    try runCaseTop(.h2c, .crossed_resets);
 }

@@ -191,6 +191,11 @@ pub fn leavesBlockOpen(payload: []const u8) bool {
 }
 
 /// The stream of a CONTINUATION frame payload; null for any other frame.
+fn rstStream(payload: []const u8) ?u31 {
+    if (payload.len < frame.FRAME_HEADER_LEN or payload[3] != @backingInt(frame.FrameType.rst_stream)) return null;
+    return @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
+}
+
 fn continuationStream(payload: []const u8) ?u31 {
     if (payload.len < frame.FRAME_HEADER_LEN or payload[3] != @backingInt(frame.FrameType.continuation)) return null;
     return @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
@@ -648,6 +653,41 @@ pub const FairScheduler = struct {
         }
         self.ordinary_len = kept;
         self.ordinary_tail = (self.ordinary_head + kept) % cap;
+    }
+
+    /// Drop the RST_STREAM for `stream_id` if it still waits in the terminal
+    /// ring, with its pool share, its payload and its ticket. The peer reset
+    /// the stream itself, so it already counts the stream closed, and an
+    /// unwritten RST for it would only hold one of the T terminal slots a
+    /// well-behaved peer's own open streams need (`Limits.terminalFrames`).
+    /// An RST that already left the ring is in the write memory and goes out
+    /// as it is. Returns whether one was dropped. Order of everything kept is
+    /// unchanged. O(T), and a peer RST is rate limited.
+    pub fn retireTerminalRst(self: *FairScheduler, stream_id: u31) bool {
+        const n = self.terminal_len;
+        const cap = self.terminal_q.len;
+        var kept: usize = 0;
+        var k: usize = 0;
+        var dropped = false;
+        while (k < n) : (k += 1) {
+            const e = self.terminal_q[(self.terminal_head + k) % cap];
+            if (!dropped and rstStream(e.payload) == stream_id) {
+                dropped = true;
+                self.ctrl.releaseTerminal(e.control_n);
+                if (e.ticket != 0) {
+                    const fail = self.ticket_fail orelse
+                        std.debug.panic("retired RST_STREAM for stream {d} carries ticket {d} and no ticket_fail is set", .{ stream_id, e.ticket });
+                    fail(self.ticket_fail_ctx.?, e.ticket, e.ticket_slot);
+                }
+                self.freePayload(e.payload);
+                continue;
+            }
+            self.terminal_q[(self.terminal_head + kept) % cap] = e;
+            kept += 1;
+        }
+        self.terminal_len = kept;
+        self.terminal_tail = (self.terminal_head + kept) % cap;
+        return dropped;
     }
 
     fn slotIndex(self: *const FairScheduler, pw: *const DataPending) u32 {
@@ -1296,6 +1336,31 @@ fn nowNs(io: std.Io) u64 {
 
 fn testPool(gpa: std.mem.Allocator, slab_bytes: usize, capacity: usize) !slab_pool.SlabPool {
     return slab_pool.SlabPool.init(gpa, std.testing.io, slab_bytes, capacity);
+}
+
+test "retireTerminalRst drops the stream's waiting RST with its share and payload, and keeps the order of the rest (t-3562)" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 16, 13 * 4, 4, 8, &pool);
+    defer sched.deinit();
+    var rst: [13]u8 = undefined;
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        _ = try frame.Serializer.rstStream(&rst, sid, .cancel);
+        try sched.enqueueControl(try gpa.dupe(u8, &rst), .terminal, 0, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 3), sched.ctrl.terminal_entries_held.load(.acquire));
+    try std.testing.expect(sched.retireTerminalRst(3));
+    try std.testing.expect(!sched.retireTerminalRst(3));
+    try std.testing.expect(!sched.retireTerminalRst(7));
+    try std.testing.expectEqual(@as(usize, 2), sched.terminal_len);
+    try std.testing.expectEqual(@as(usize, 2), sched.ctrl.terminal_entries_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2 * 13), sched.ctrl.terminal_bytes_held.load(.acquire));
+    for ([_]u31{ 1, 5 }) |want| {
+        const e = sched.popTerminal().?;
+        try std.testing.expectEqual(@as(?u31, want), rstStream(e.payload));
+        sched.freePayload(e.payload);
+    }
 }
 
 test "terminal frames fit their whole share with the ordinary share pinned, and not one more (t-3562)" {
