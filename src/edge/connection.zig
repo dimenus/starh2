@@ -6614,40 +6614,73 @@ pub const Connection = struct {
                         self.next_wire_ticket = 0;
                     }
                     const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
+                    // The payload is freed by a refusal; what a refused
+                    // WINDOW_UPDATE gave is read first.
+                    const wu_increment: u31 = if (f.typ == .window_update and f.payload.len >= frame.FRAME_HEADER_LEN + 4)
+                        @intCast(std.mem.readInt(u32, f.payload[frame.FRAME_HEADER_LEN..][0..4], .big) & 0x7fff_ffff)
+                    else
+                        0;
                     self.sched.enqueueControl(f.payload, class, t, s) catch |err| switch (err) {
                         error.PoolFull, error.QueueFull => {
-                            // Payload already freed by enqueueControl. Do not
-                            // drop the rest of the batch: the next intent is
-                            // often `stream_reset` for this same RST.
+                            // Payload already freed by enqueueControl.
                             if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
                             if (comptime test_observe) {
                                 if (class != .terminal) {
                                     if (err == error.PoolFull) _ = test_ctrl_ordinary_pool_full.fetchAdd(1, .monotonic) else _ = test_ctrl_ordinary_queue_full.fetchAdd(1, .monotonic);
                                 }
                             }
-                            self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
-                            consumed = n;
-                            // A fragment refused after its block began leaves
-                            // the peer waiting for it and the scheduler
-                            // holding the connection to that block
-                            // (`FairScheduler.block_open`): there is no way
-                            // to go on. The first fragment is an ordinary
-                            // per-stream refusal, and the rest of the batch,
-                            // its other fragments, is released above.
-                            // A refused HEADERS with END_STREAM had already
-                            // ended the stream in Session; the peer must still
-                            // learn it ended. The RST is queued for this
-                            // drain's caller, like a dispatch refusal.
-                            if (f.typ == .headers and f.flags.end_stream) self.session.resetRefusedEnd(f.stream_id) catch {};
-                            if (class == .terminal) {
-                                if (comptime test_observe) _ = test_ctrl_terminal_full.fetchAdd(1, .monotonic);
-                                self.noteServerClose("ctrl_terminal_full", err);
+                            // A terminal frame that cannot be queued, or a
+                            // fragment refused after its block began (the peer
+                            // waits for the rest of the block, and the
+                            // scheduler holds the connection to it,
+                            // `FairScheduler.block_open`): there is no way to
+                            // go on. The rest of the batch runs its local
+                            // resets and is released.
+                            if (class == .terminal or block_queued_open) {
+                                self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
+                                consumed = n;
+                                if (class == .terminal) {
+                                    if (comptime test_observe) _ = test_ctrl_terminal_full.fetchAdd(1, .monotonic);
+                                    self.noteServerClose("ctrl_terminal_full", err);
+                                } else {
+                                    self.noteServerClose("ctrl_fragment_full", err);
+                                }
                                 self.writer_failed.store(true, .release);
-                            } else if (block_queued_open) {
-                                self.noteServerClose("ctrl_fragment_full", err);
-                                self.writer_failed.store(true, .release);
+                                return error.OutOfMemory;
                             }
-                            return error.OutOfMemory;
+                            // An ordinary frame: only it, and the CONTINUATIONs
+                            // of its own block (queued right behind it by
+                            // `cmdHeaders`), are dropped. The rest of the batch
+                            // is other streams' work, and the connection goes
+                            // on: an ordinary refusal is never a connection
+                            // error.
+                            if (opens_block) {
+                                while (consumed < n) {
+                                    const next = &self.intent_batch[consumed];
+                                    const frag = switch (next.*) {
+                                        .outbound_frame => |nf| nf.typ == .continuation and nf.stream_id == f.stream_id,
+                                        else => false,
+                                    };
+                                    if (!frag) break;
+                                    consumed += 1;
+                                    self.session.releaseIntent(next);
+                                }
+                            }
+                            // The waiter whose ticket rode on it hears now.
+                            if (t != 0) self.tickets.wake(s, t, false);
+                            switch (f.typ) {
+                                // The peer never gets the response's start:
+                                // the stream is reset (a handler waiting on
+                                // it is woken by the reset). The RST is
+                                // queued, and this call's next round sends it.
+                                .headers => self.session.resetRefusedHeaders(f.stream_id) catch {},
+                                .window_update => self.session.refusedWindowUpdate(f.stream_id, wu_increment),
+                                // A SETTINGS or PING ack, a graceful PING:
+                                // dropped. The peer may time out waiting for
+                                // it; that is a slow end, not a wrong one.
+                                else => {},
+                            }
+                            continue;
                         },
                     };
                     block_queued_open = opens_block;

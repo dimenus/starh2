@@ -53,6 +53,13 @@
 //! live connection count must reach zero by that deadline, measured from the
 //! moment the ring reached T, which is after the GOAWAY was queued.
 //!
+//! `refused_batch` (h2c): the ordinary share is pinned by responses held in
+//! the writer, and the peer sends one chunk of a PING, an early-413 request
+//! and new requests. The PING ack, the 413 and the new responses are all
+//! refused. Only those frames may be lost: the connection must stay, and every
+//! stream must end for the peer (its HEADERS or one RST). TLS is not run: its
+//! hold parks the actor, so nothing is read during it.
+//!
 //! Run it with `./zb build test-t3562` (it is also part of `./zb build test`).
 const std = @import("std");
 const zio = @import("zio");
@@ -214,6 +221,7 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
 
 const max_sid = 4096;
 const alive_ping = [8]u8{ 't', '3', '5', '6', '2', 'l', 'i', 'v' };
+const batch_ping = [8]u8{ 't', '3', '5', '6', '2', 'b', 'a', 't' };
 
 const Client = struct {
     gpa: std.mem.Allocator,
@@ -235,6 +243,13 @@ const Client = struct {
     cross_sent: std.atomic.Value(bool) = .init(false),
     /// Sent when reading starts; its ack proves the connection is alive.
     ping_acked: std.atomic.Value(bool) = .init(false),
+    /// `refused_batch`: one write of a PING, an early-413 request and
+    /// `batch_streams` new requests; then, on `send_alive`, a PING.
+    send_batch: std.atomic.Value(bool) = .init(false),
+    batch_sent: std.atomic.Value(bool) = .init(false),
+    batch_streams: usize = 0,
+    send_alive: std.atomic.Value(bool) = .init(false),
+    alive_sent: bool = false,
     /// Streams that ended for the client: a HEADERS with END_STREAM or an
     /// RST_STREAM, whichever came first.
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -282,6 +297,25 @@ fn clientRun(c: *Client) !void {
             for (0..c.flood) |i| try h2c.appendHeaders(c.gpa, &more, @intCast(1 + 2 * (c.streams + i)), "/stall", true);
             try w.send(more.items);
             c.flood_sent.store(true, .release);
+        }
+        if (!c.batch_sent.load(.acquire) and c.send_batch.load(.acquire)) {
+            var more: std.ArrayList(u8) = .empty;
+            defer more.deinit(c.gpa);
+            var ping: [17]u8 = undefined;
+            _ = try frame.Serializer.ping(&ping, false, &batch_ping);
+            try more.appendSlice(c.gpa, &ping);
+            // A body far over the cap: the session answers 413 at once, with
+            // the peer's side still open, and no handler runs.
+            try h2c.appendHeadersExtra(c.gpa, &more, @intCast(1 + 2 * c.streams), "POST", "/empty", false, &.{.{ .name = "content-length", .value = "999999999" }});
+            for (0..c.batch_streams) |i| try h2c.appendHeaders(c.gpa, &more, @intCast(1 + 2 * (c.streams + 1 + i)), c.path, true);
+            try w.send(more.items);
+            c.batch_sent.store(true, .release);
+        }
+        if (!c.alive_sent and c.send_alive.load(.acquire)) {
+            var ping: [17]u8 = undefined;
+            _ = try frame.Serializer.ping(&ping, false, &alive_ping);
+            try w.send(&ping);
+            c.alive_sent = true;
         }
         if (!c.cross_sent.load(.acquire) and c.send_cross.load(.acquire)) {
             var more: std.ArrayList(u8) = .empty;
@@ -806,6 +840,100 @@ fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport)
     serving = false;
 }
 
+/// `refused_batch`: the share's frames held, plus two refused to prove it.
+const batch_held = refused_end_share + 2;
+const batch_new = 4;
+
+fn runRefusedBatch(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    var limits = starh2.Limits.defaults;
+    limits.control_entries_per_connection = refused_end_share;
+    var server = try serverFor(rt, gpa, .h2c, limits, &cert, &key);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    defer hold(.h2c, false);
+    defer empty_gate.store(true, .release);
+
+    const ordinary_full_0 = conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .h2c,
+        .port = server.localAddress(0).getPort(),
+        .streams = batch_held,
+        .path = "/empty",
+        .flood = 0,
+        .rcvbuf = null,
+        .batch_streams = batch_new,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) {
+        hold(.h2c, false);
+        empty_gate.store(true, .release);
+        joinClient(&c, t);
+    };
+
+    try waitFor("every handler to run", atLeast(&empty_entered, batch_held), reached);
+    // Pin the ordinary share: the writer holds the first responses' HEADERS,
+    // and two more are refused, which proves the share is full.
+    hold(.h2c, true);
+    empty_gate.store(true, .release);
+    try waitFor("the share to be pinned", atLeast(&empty_failed, batch_held - refused_end_share), reached);
+    const failed_0 = empty_failed.load(.acquire);
+
+    c.send_batch.store(true, .release);
+    // Every new request reaches its handler and is refused too. The read
+    // path refused the PING ack and the 413 before that and went on.
+    try waitFor("the new handlers to fail", atLeast(&empty_failed, failed_0 + batch_new), reached);
+    const refused = conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic) - ordinary_full_0;
+    std.debug.print("T3562-held transport=h2c scenario=refused_batch held={d} failed={d} ordinary_pool_full={d}\n", .{ batch_held, empty_failed.load(.acquire), refused });
+    // The two pinning refusals, the PING ack, the 413, the new responses.
+    try std.testing.expect(refused >= 2 + 1 + 1 + batch_new);
+
+    hold(.h2c, false);
+    const total = batch_held + 1 + batch_new;
+    const Want = struct { c: *Client, n: usize };
+    waitFor("every stream to end for the client", Want{ .c = &c, .n = total }, struct {
+        fn f(x: Want) bool {
+            return x.c.ended.load(.acquire) >= x.n;
+        }
+    }.f) catch |err| {
+        std.debug.print("T3562-refused-batch-timeout ended={d} of {d} rst_total={d} goaways={d} eof={} client_err={s}\n", .{ c.ended.load(.acquire), total, c.rst_total, c.goaways, c.eof, if (c.err) |e| @errorName(e) else "-" });
+        return err;
+    };
+    c.send_alive.store(true, .release);
+    try waitFor("the PING ack", &c, struct {
+        fn f(x: *Client) bool {
+            return x.ping_acked.load(.acquire);
+        }
+    }.f);
+    try std.testing.expect(!c.eof);
+    try std.testing.expectEqual(@as(usize, 0), c.goaways);
+    server.requestShutdown();
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    try expectEnded(&c, total);
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runRefusedBatchTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runRefusedBatch, .{ rt, gpa });
+    try h.join();
+}
+
 fn expectEnded(c: *const Client, n: usize) !void {
     for (0..n) |i| {
         const sid = 1 + 2 * i;
@@ -866,4 +994,8 @@ test "refused final HEADERS, h2c: the stream still ends for the peer, with an RS
 
 test "refused final HEADERS, tls: the stream still ends for the peer, with an RST" {
     try runRefusedEndTop(.tls);
+}
+
+test "ordinary refusals in one read chunk, h2c: only the refused frames are lost, and every stream still ends" {
+    try runRefusedBatchTop();
 }

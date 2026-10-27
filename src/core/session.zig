@@ -1050,6 +1050,29 @@ pub const Session = struct {
         try self.emitRst(stream_id, .internal_error);
     }
 
+    /// The edge refused a HEADERS frame for `stream_id` (and dropped the rest
+    /// of its block): the peer never got the response's start, so the stream
+    /// is reset. A stream still in the map is reset the usual way (a response
+    /// with a body, or a final HEADERS while the peer's side is still open,
+    /// which an early 413 is); one that left it ended with that HEADERS
+    /// (`resetRefusedEnd`).
+    pub fn resetRefusedHeaders(self: *Session, stream_id: u31) !void {
+        if (self.streams.contains(stream_id)) return self.emitRst(stream_id, .internal_error);
+        return self.resetRefusedEnd(stream_id);
+    }
+
+    /// The edge refused a WINDOW_UPDATE this session queued: take back the
+    /// credit it gave when it queued it, so the window stays what the peer
+    /// knows. The next DATA past the threshold queues a new one.
+    pub fn refusedWindowUpdate(self: *Session, stream_id: u31, increment: u31) void {
+        const inc: i32 = @intCast(increment);
+        if (stream_id == 0) {
+            self.windows.conn_recv -= inc;
+        } else if (self.streams.getPtr(stream_id)) |s| {
+            s.window.recv -= inc;
+        }
+    }
+
     /// Queue an RST_STREAM at most once per stream (`rstOwed`), and always run
     /// the local half: the `stream_reset` intent (scheduler cleanup, waking the
     /// handler) and the concurrency release happen whether or not a frame was
