@@ -293,10 +293,25 @@ pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
 pub var test_terminal_ring_high: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): RST_STREAM frames the scheduler took while its
 /// control pause (`pause_control`) was on, so they waited in the terminal
-/// ring; and the times the control pause answered true. A stall test reads
-/// them to prove its RSTs were queued during the stall, not after it.
+/// ring. A stall test reads it to prove its RSTs were queued during the
+/// stall, not after it.
 pub var test_rst_queued_paused: std.atomic.Value(usize) = .init(0);
-pub var test_control_pause_seen: std.atomic.Value(u64) = .init(0);
+/// Test-only (observe builds), refreshed at every drain: the writer is blocked
+/// on the socket and the control pause is on. h2c: a WritePump is inside a
+/// socket write (`wire_pump.test_writing`) and the write queue, the ack ring
+/// or the write memory has no room for a pop. TLS: a send is in flight
+/// (`pending_n`) and the stash is full or the write memory is out. With a
+/// small socket send buffer (`test_sndbuf_bytes`), a client that never reads
+/// and far more queued output than the two socket buffers hold, this cannot
+/// turn false again: nothing ever drains.
+pub var test_stalled: std.atomic.Value(bool) = .init(false);
+/// Test-only (observe builds): `SO_SNDBUF` set on each connection's socket
+/// when nonzero, so a stall forms after a few KiB on every OS (Linux
+/// otherwise takes hundreds of KiB from a client that does not read).
+pub var test_sndbuf_bytes: std.atomic.Value(u32) = .init(0);
+/// Test-only (observe builds): handlers parked in `waitForAckRoom` right now,
+/// waiting for room in the stash (TLS) or the write queue (h2c).
+pub var test_room_waiting: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): server RST_STREAMs dropped from the terminal
 /// ring because the peer reset the same stream first (`retireTerminalRst`).
 pub var test_rst_retired: std.atomic.Value(usize) = .init(0);
@@ -4097,6 +4112,10 @@ pub const Connection = struct {
         if (diag_task_handle_fn) |f| self.actor_task_h.store(f(), .release);
         if (comptime placement_check) self.actor_thread = std.Thread.getCurrentId();
         probeNote(.actor_start);
+        if (comptime test_observe) {
+            const sndbuf: c_int = @intCast(test_sndbuf_bytes.load(.acquire));
+            if (sndbuf != 0) _ = std.c.setsockopt(self.stream.socket.handle, std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&sndbuf), @sizeOf(c_int));
+        }
 
         var read_pump: wire_pump.ReadPump = undefined;
         var write_pump: wire_pump.WritePump = undefined;
@@ -4181,11 +4200,7 @@ pub const Connection = struct {
                 fn f(ctx: *anyopaque) bool {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     const p = c.tls_driver orelse return false;
-                    const paused = p.stashFull() or c.outboundMemoryPaused();
-                    if (comptime test_observe) {
-                        if (paused) _ = test_control_pause_seen.fetchAdd(1, .monotonic);
-                    }
-                    return paused;
+                    return p.stashFull() or c.outboundMemoryPaused();
                 }
             }.f;
             self.sched.pause_ctx = self;
@@ -5028,11 +5043,7 @@ pub const Connection = struct {
     /// condition cannot hold with nothing in flight to release a chunk.
     fn h2cPause(ctx: *anyopaque) bool {
         const self: *Connection = @ptrCast(@alignCast(ctx));
-        const paused = self.h2cPauseFor(0);
-        if (comptime test_observe) {
-            if (paused) _ = test_control_pause_seen.fetchAdd(1, .monotonic);
-        }
-        return paused;
+        return self.h2cPauseFor(0);
     }
 
     fn h2cPauseData(ctx: *anyopaque) bool {
@@ -5512,6 +5523,10 @@ pub const Connection = struct {
             _ = self.ack_room_waiters.fetchAdd(1, .seq_cst); // W1
             defer _ = self.ack_room_waiters.fetchSub(1, .seq_cst);
             if (self.barrierRoomSeqCst()) return; // R1
+            if (comptime test_observe) _ = test_room_waiting.fetchAdd(1, .acq_rel);
+            defer if (comptime test_observe) {
+                _ = test_room_waiting.fetchSub(1, .acq_rel);
+            };
             self.unlockSession(self.config.io);
             const wait_res: anyerror!void = if (event) |e| blk: {
                 const winner = zio.select(.{
@@ -5997,12 +6012,7 @@ pub const Connection = struct {
             self.sched.pause_control = h2cPause;
             self.sched.pause_ctx = self;
         }
-        if (comptime test_observe) {
-            // The scheduler asks the control pause only when it has a control
-            // frame to pop. Asked here too, at every drain, it tells a stall
-            // test the stall has formed before the test queues anything.
-            if (self.sched.pause_control) |pc| _ = pc(self.sched.pause_ctx);
-        }
+        if (comptime test_observe) test_stalled.store(self.stalledNow(), .release);
         if (diag_park) {
             const now = nowNs(self.config.io);
             if (diag_last_drain_ns != 0) diag_prev_drain_gap_ns = now -% diag_last_drain_ns;
@@ -6204,6 +6214,9 @@ pub const Connection = struct {
             self.handleWriterFailed();
             return err;
         };
+        // Again after the drain: the pushes it made may be what filled the
+        // queue, and no later drain may come once the writer is blocked.
+        if (comptime test_observe) test_stalled.store(self.stalledNow(), .release);
         if (trace.enabled) {
             if (sink_ctx.tickets_emitted > 0) {
                 _ = trace.emit_turns.fetchAdd(1, .monotonic);
@@ -6934,9 +6947,22 @@ pub const Connection = struct {
     /// stash (TLS), and either wakes the actor's select, which drains again.
     /// Nothing waits here and no lock is held across a wait.
     fn outboundMemoryPaused(self: *Connection) bool {
-        if (self.write_pool.freeCount() >= wire_const.POP_PUSHES) return false;
+        if (!self.outboundMemoryLow()) return false;
         _ = outbound_memory.drain_memory_pauses.fetchAdd(1, .monotonic);
         return true;
+    }
+
+    /// `outboundMemoryPaused` without counting a pause.
+    fn outboundMemoryLow(self: *const Connection) bool {
+        return self.write_pool.freeCount() < wire_const.POP_PUSHES;
+    }
+
+    /// See `test_stalled`. Reads only; counts nothing.
+    fn stalledNow(self: *Connection) bool {
+        if (self.tls_driver) |p| return p.pending_n > 0 and (p.stashFull() or self.outboundMemoryLow());
+        if (self.config.mode != .h2c or !self.ack_room_armed) return false;
+        if (wire_pump.test_writing.load(.acquire) == 0) return false;
+        return self.outboundMemoryLow() or !self.h2cAckRoom(0) or !self.h2cQueueRoom(h2c_queue_room_per_pop);
     }
 
     fn payloadInScratch(self: *const Connection, buf: []const u8) bool {

@@ -76,6 +76,8 @@ const dummy: u8 = 0;
 const ordinary_slack = 16;
 /// The client's receive buffer when it stalls the server by not reading.
 const stall_rcvbuf: c_int = 4096;
+/// The server socket's send buffer in those scenarios (`test_sndbuf_bytes`).
+const stall_sndbuf: u32 = 4096;
 /// DATA each handler writes when the data gate opens. With the writer held,
 /// 2 KiB per stream fills the write memory. With a client that does not read,
 /// it must also fill the two socket buffers, so it is larger there, and still
@@ -94,8 +96,6 @@ var data_bytes: std.atomic.Value(usize) = .init(held_data_bytes);
 /// slot. The bare flush barriers fill the stash (as in t3567_tls_barriers.zig),
 /// and the barrier of a handler that waits for room is not taken.
 var bare_flush: std.atomic.Value(bool) = .init(false);
-/// `bare_flush` handlers inside a flush right now.
-var flushing: std.atomic.Value(usize) = .init(0);
 /// `refused_end`: the handlers wait for this, then send an empty response.
 var empty_gate: std.atomic.Value(bool) = .init(false);
 var empty_entered: std.atomic.Value(usize) = .init(0);
@@ -115,7 +115,6 @@ fn resetGlobals() void {
     data_gate.store(false, .release);
     data_bytes.store(held_data_bytes, .release);
     bare_flush.store(false, .release);
-    flushing.store(0, .release);
     empty_gate.store(false, .release);
     empty_entered.store(0, .release);
     empty_sent.store(0, .release);
@@ -143,10 +142,9 @@ fn stall(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerr
         // A barrier pushed before the socket stops moving is written at once,
         // and its flush returns; flush again until one waits. Once the stall
         // holds, a flush waits for good (it returns with an error when the
-        // connection ends), and its barrier keeps its stash slot.
+        // connection ends): for its barrier's write, or for stash room
+        // (`test_room_waiting`).
         while (true) {
-            _ = flushing.fetchAdd(1, .acq_rel);
-            defer _ = flushing.fetchSub(1, .acq_rel);
             try body.flush();
             try zio.sleep(.fromMilliseconds(2));
         }
@@ -492,6 +490,9 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     conn_mod.test_terminal_ring_high.store(0, .release);
 
     const stalls_by_reading = scenario != .server_failures;
+    conn_mod.test_stalled.store(false, .release);
+    conn_mod.test_sndbuf_bytes.store(if (stalls_by_reading) stall_sndbuf else 0, .release);
+    defer conn_mod.test_sndbuf_bytes.store(0, .release);
     var c: Client = .{
         .gpa = gpa,
         .transport = transport,
@@ -515,19 +516,21 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     try waitStarted(&c, m);
 
     if (stalls_by_reading) {
-        // The client reads nothing: the DATA fills the socket buffers, then
-        // the write memory, and the control pause turns on.
+        // The client reads nothing, and the server's socket send buffer is
+        // small (`test_sndbuf_bytes`), so the writer blocks after a few KiB
+        // and the DATA fills the write memory. The test waits for that state,
+        // which cannot end while the client does not read: the writer
+        // blocked on the socket with no room left for a pop
+        // (`test_stalled`), and on TLS a flush parked for stash room.
         data_bytes.store(stalled_data_bytes, .release);
         if (transport == .tls) bare_flush.store(true, .release);
-        const pauses_0 = conn_mod.test_control_pause_seen.load(.monotonic);
         data_gate.store(true, .release);
         const writers = if (transport == .tls) m / 2 else m;
         try waitFor("every writer to write its DATA", atLeast(&wrote, writers), reached);
-        // On TLS the stash is full for good only once every flusher waits.
-        if (transport == .tls) try waitFor("every flusher to wait", atLeast(&flushing, m - writers), reached);
-        try waitFor("the control pause", pauses_0, struct {
-            fn f(p0: u64) bool {
-                return conn_mod.test_control_pause_seen.load(.monotonic) > p0;
+        if (transport == .tls) try waitFor("a flush parked for stash room", atLeast(&conn_mod.test_room_waiting, 1), reached);
+        try waitFor("the writer blocked with no room", {}, struct {
+            fn f(_: void) bool {
+                return conn_mod.test_stalled.load(.acquire);
             }
         }.f);
     } else {
