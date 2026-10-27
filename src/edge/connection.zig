@@ -2049,7 +2049,10 @@ pub const Connection = struct {
         // `init` narrows both counts to `u32`. The plan refuses a larger one
         // where the count is used: `SlabPool.planBoot` for the chunks and
         // `Plan.hashMap` for the streams.
-        const ticket_n = try boot_plan.add(try limits.controlPoolEntries(), max_streams);
+        // Ticket owners are handlers and ordinary controls. A terminal frame
+        // never reserves a ticket; it can only carry a handler's, which that
+        // handler already counts.
+        const ticket_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
         const ack_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
         const read_ch_n = try boot_plan.add(n_chunks, 1);
         const leases_n = try boot_plan.add(try boot_plan.mul(max_streams, 2), 1);
@@ -2198,7 +2201,7 @@ pub const Connection = struct {
         errdefer boot.free(completion_ch_buf);
         const write_ack_buf = try boot.alloc(wire_pump.WriteCompletion, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
         errdefer boot.free(write_ack_buf);
-        const ticket_slots = try boot.alloc(ticket_table.TicketWait, try config.limits.controlPoolEntries() + config.limits.max_streams_per_connection);
+        const ticket_slots = try boot.alloc(ticket_table.TicketWait, config.limits.control_entries_per_connection + config.limits.max_streams_per_connection);
         errdefer boot.free(ticket_slots);
         const plaintext_scratch = try boot.alloc(u8, emit_batch.max_plaintext);
         errdefer boot.free(plaintext_scratch);
