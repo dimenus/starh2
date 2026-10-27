@@ -41,6 +41,12 @@
 //! connection must queue its final GOAWAY (ENHANCE_YOUR_CALM), keep the ring at
 //! T, and close by its closing deadline once the client reads again.
 //!
+//! `refused_end` (both transports): the writer is held with a small ordinary
+//! share, and handlers send empty responses (HEADERS with END_STREAM). The
+//! HEADERS past the share are refused, and a stream whose final HEADERS was
+//! refused must still end for the peer: the client must read, for every
+//! stream, either its HEADERS or an RST_STREAM, before a deadline.
+//!
 //! Run it with `./zb build test-t3562` (it is also part of `./zb build test`).
 const std = @import("std");
 const zio = @import("zio");
@@ -82,6 +88,11 @@ var data_bytes: std.atomic.Value(usize) = .init(held_data_bytes);
 /// slot. The bare flush barriers fill the stash (as in t3567_tls_barriers.zig),
 /// and the barrier of a handler that waits for room is not taken.
 var bare_flush: std.atomic.Value(bool) = .init(false);
+/// `refused_end`: the handlers wait for this, then send an empty response.
+var empty_gate: std.atomic.Value(bool) = .init(false);
+var empty_entered: std.atomic.Value(usize) = .init(0);
+var empty_sent: std.atomic.Value(usize) = .init(0);
+var empty_failed: std.atomic.Value(usize) = .init(0);
 var abort_gate: std.atomic.Value(bool) = .init(false);
 var aborted: std.atomic.Value(usize) = .init(0);
 /// Handlers whose `resp.start` returned an error, and the first such error.
@@ -96,6 +107,10 @@ fn resetGlobals() void {
     data_gate.store(false, .release);
     data_bytes.store(held_data_bytes, .release);
     bare_flush.store(false, .release);
+    empty_gate.store(false, .release);
+    empty_entered.store(0, .release);
+    empty_sent.store(0, .release);
+    empty_failed.store(0, .release);
     abort_gate.store(false, .release);
     aborted.store(0, .release);
     start_failed.store(0, .release);
@@ -134,7 +149,21 @@ fn stall(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerr
     _ = aborted.fetchAdd(1, .acq_rel);
 }
 
+/// Sends a response with no body: one HEADERS frame with END_STREAM. A send
+/// the connection refuses returns its error, which is the path that resets the
+/// stream (`runHandlerJobBody`).
+fn empty(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = empty_entered.fetchAdd(1, .acq_rel);
+    while (!empty_gate.load(.acquire)) try zio.sleep(.fromMilliseconds(2));
+    resp.send(204, &.{}, "") catch |err| {
+        _ = empty_failed.fetchAdd(1, .acq_rel);
+        return err;
+    };
+    _ = empty_sent.fetchAdd(1, .acq_rel);
+}
+
 const routes = [_]starh2.Route{
+    .{ .method = .GET, .path = "/empty", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = empty } } },
     .{ .method = .GET, .path = "/stall", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = stall } } },
 };
 
@@ -179,6 +208,7 @@ const Client = struct {
     /// Streams opened at the start, and extra HEADERS (new ids past the
     /// advertised limit) sent when `send_flood` is set.
     streams: usize,
+    path: []const u8 = "/stall",
     flood: usize,
     /// Null: read from the start. Otherwise connect with this receive buffer
     /// and read nothing until `read_gate` is set, which stalls the server.
@@ -191,6 +221,10 @@ const Client = struct {
     cross_sent: std.atomic.Value(bool) = .init(false),
     /// Sent when reading starts; its ack proves the connection is alive.
     ping_acked: std.atomic.Value(bool) = .init(false),
+    /// Streams that ended for the client: a HEADERS with END_STREAM or an
+    /// RST_STREAM, whichever came first.
+    ended_per_sid: [max_sid]u8 = @splat(0),
+    ended: std.atomic.Value(usize) = .init(0),
     done: std.atomic.Value(bool) = .init(false),
     err: ?anyerror = null,
     rst_per_sid: [max_sid]u8 = @splat(0),
@@ -221,7 +255,7 @@ fn clientRun(c: *Client) !void {
     var req = try h2c.buildClientPrefaceAndSettings(c.gpa);
     defer req.deinit(c.gpa);
     try h2c.appendWindowUpdate(c.gpa, &req, 0, 1 << 30);
-    for (0..c.streams) |i| try h2c.appendHeaders(c.gpa, &req, @intCast(1 + 2 * i), "/stall", true);
+    for (0..c.streams) |i| try h2c.appendHeaders(c.gpa, &req, @intCast(1 + 2 * i), c.path, true);
     try w.send(req.items);
 
     const deadline = nowNs() + 40 * std.time.ns_per_s;
@@ -271,6 +305,10 @@ fn clientRun(c: *Client) !void {
             return;
         };
         if (s.ftype < c.frames.len) c.frames[s.ftype] += 1;
+        if (s.sid != 0 and s.sid < max_sid and (s.ftype == 3 or (s.ftype == 1 and s.flags & 1 != 0))) {
+            if (c.ended_per_sid[s.sid] == 0) _ = c.ended.fetchAdd(1, .acq_rel);
+            c.ended_per_sid[s.sid] +|= 1;
+        }
         switch (s.ftype) {
             3 => {
                 c.rst_total += 1;
@@ -340,6 +378,10 @@ fn holdEntered(transport: Transport) u64 {
 }
 
 const Scenario = enum { server_failures, flood, crossed_resets };
+
+/// `refused_end`: streams, and the ordinary share their final HEADERS meet.
+const refused_end_streams = 32;
+const refused_end_share = 8;
 
 fn limitsFor() starh2.Limits {
     var limits = starh2.Limits.defaults;
@@ -618,6 +660,112 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     serving = false;
 }
 
+fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    var limits = starh2.Limits.defaults;
+    // The preface, the SETTINGS ack and the WINDOW_UPDATE are written before
+    // the hold, so the whole share is free for the responses' HEADERS.
+    limits.control_entries_per_connection = refused_end_share;
+    const n = refused_end_streams;
+
+    var server = try serverFor(rt, gpa, transport, limits, &cert, &key);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    defer hold(transport, false);
+    defer empty_gate.store(true, .release);
+
+    const ordinary_full_0 = conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = transport,
+        .port = server.localAddress(0).getPort(),
+        .streams = n,
+        .path = "/empty",
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) {
+        hold(transport, false);
+        empty_gate.store(true, .release);
+        joinClient(&c, t);
+    };
+
+    try waitFor("every handler to run", atLeast(&empty_entered, n), reached);
+    // Hold the writer, then let every handler send: the first HEADERS take
+    // the ordinary share until their write completes, and the rest are
+    // refused. A send waits for its HEADERS to be written, so the handlers
+    // whose HEADERS were taken wait out the hold; at most the share's worth.
+    hold(transport, true);
+    empty_gate.store(true, .release);
+    try waitFor("the refused handlers to fail", atLeast(&empty_failed, n - refused_end_share), reached);
+    const failed = empty_failed.load(.acquire);
+    const refused = conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic) - ordinary_full_0;
+    std.debug.print("T3562-held transport={s} scenario=refused_end n={d} sent={d} failed={d} ordinary_pool_full={d}\n", .{ @tagName(transport), n, empty_sent.load(.acquire), failed, refused });
+    // The instrument fired: some final HEADERS were refused.
+    try std.testing.expect(failed > 0);
+    try std.testing.expect(refused > 0);
+
+    hold(transport, false);
+    // The oracle: every stream ends for the peer. A stream whose final
+    // HEADERS was refused and that gets no RST leaves the client waiting, and
+    // this deadline fails.
+    waitFor("every stream to end for the client", &c, struct {
+        fn f(x: *Client) bool {
+            return x.ended.load(.acquire) >= refused_end_streams;
+        }
+    }.f) catch |err| {
+        var missing: usize = 0;
+        for (0..n) |i| {
+            if (c.ended_per_sid[1 + 2 * i] == 0) missing += 1;
+        }
+        std.debug.print("T3562-refused-end-timeout transport={s} ended={d} of {d} missing={d} rst_total={d} frames={any} ring_high={d} terminal_full={d} client_err={s} done={}\n", .{ @tagName(transport), c.ended.load(.acquire), n, missing, c.rst_total, c.frames, conn_mod.test_terminal_ring_high.load(.acquire), conn_mod.test_ctrl_terminal_full.load(.monotonic), if (c.err) |e| @errorName(e) else "-", c.done.load(.acquire) });
+        return err;
+    };
+    server.requestShutdown();
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    // Each stream ended once: a refused one by its RST, the rest by HEADERS.
+    try expectEnded(&c, n);
+    try std.testing.expectEqual(failed, c.rst_total);
+    try std.testing.expect(c.eof);
+
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn expectEnded(c: *const Client, n: usize) !void {
+    for (0..n) |i| {
+        const sid = 1 + 2 * i;
+        if (c.ended_per_sid[sid] != 1) {
+            std.debug.print("t3562: stream {d} ended {d} times, want 1\n", .{ sid, c.ended_per_sid[sid] });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn runRefusedEndTop(transport: Transport) !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runRefusedEnd, .{ rt, gpa, transport });
+    try h.join();
+}
+
 fn runCaseTop(transport: Transport, scenario: Scenario) !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
@@ -644,4 +792,12 @@ test "flood during a stall, tls: past T the connection ends with GOAWAY(ENHANCE_
 
 test "crossed resets during a stall, h2c: the peer's RSTs retire the server's unwritten ones, and M new failures fit" {
     try runCaseTop(.h2c, .crossed_resets);
+}
+
+test "refused final HEADERS, h2c: the stream still ends for the peer, with an RST" {
+    try runRefusedEndTop(.h2c);
+}
+
+test "refused final HEADERS, tls: the stream still ends for the peer, with an RST" {
+    try runRefusedEndTop(.tls);
 }

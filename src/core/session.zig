@@ -138,6 +138,10 @@ const Ending = enum(u8) {
     /// stream too, that RST may still wait unwritten; a crossed peer RST
     /// retires it (`Intent.retire_rst`).
     server_rst,
+    /// The server's last frame for it carried END_STREAM, and the edge
+    /// refused that frame, so it was never written: the peer still counts the
+    /// stream open, and an RST is owed (`Session.resetRefusedEnd`).
+    end_refused,
 };
 
 fn encodeDataFrameInto(out: []u8, stream_id: u31, data: []const u8, end_stream: bool) usize {
@@ -1016,10 +1020,26 @@ pub const Session = struct {
     /// pass this test. Only a server-side reset of a stream that long gone
     /// reaches it (the peer cannot name such an id: HEADERS on it is a
     /// connection error), and the flood limit still bounds the result.
-    fn rstOwed(self: *const Session, stream_id: u31) bool {
+    fn rstOwed(self: *Session, stream_id: u31) bool {
         if (self.terminal != .none) return false;
         if (self.streams.getPtr(stream_id)) |s| return s.state != .closed;
-        return !self.isTombstoned(stream_id);
+        if (self.tombstonePtr(stream_id)) |t| return t.ending == .end_refused;
+        return true;
+    }
+
+    /// The edge refused a HEADERS with END_STREAM for `stream_id`. Queuing it
+    /// ended the stream here (`cmdHeaders`: `localEndStream`, then the
+    /// tombstone), but the peer never got it and still counts the stream
+    /// open, so the stream is reset instead. Without this, the handler's or
+    /// the early response's recovery found a closed stream, `rstOwed` said
+    /// no, and the peer waited for the stream forever. A stream still in the
+    /// map (the peer's side still open) is not closed, and its handler's
+    /// reset reaches it the usual way.
+    pub fn resetRefusedEnd(self: *Session, stream_id: u31) !void {
+        const t = self.tombstonePtr(stream_id) orelse return;
+        if (t.ending != .closed or t.code != .no_error) return;
+        t.ending = .end_refused;
+        try self.emitRst(stream_id, .internal_error);
     }
 
     /// Queue an RST_STREAM at most once per stream (`rstOwed`), and always run
@@ -1060,9 +1080,14 @@ pub const Session = struct {
             s.onRst();
             self.releaseConcurrency(stream_id, code, ending);
         } else if (queued) {
-            // A refused stream never had a map entry: the tombstone is what
-            // makes a second refusal of the same id find it.
-            try self.addTombstone(stream_id, code, ending);
+            if (self.tombstonePtr(stream_id)) |t| {
+                // A refused final HEADERS: the RST now ends the stream.
+                t.* = .{ .id = stream_id, .code = code, .ending = ending };
+            } else {
+                // A refused stream never had a map entry: the tombstone is
+                // what makes a second refusal of the same id find it.
+                try self.addTombstone(stream_id, code, ending);
+            }
         }
     }
 
@@ -2905,6 +2930,29 @@ test "a peer RST that crosses this server's RST retires it, once; one that cross
     try std.testing.expectEqual(@as(usize, 1), c.retire_rst);
     try std.testing.expectEqual(@as(usize, 0), c.rst);
     try std.testing.expectEqual(@as(usize, 0), c.stream_reset);
+    try std.testing.expect(session.terminal == .none);
+}
+
+test "a refused final HEADERS is reset once: the tombstone of its END_STREAM does not stop the RST (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    _ = countTerminalIntents(gpa, &session);
+    try openTestStream(&session, 1);
+    // An empty response: HEADERS with END_STREAM closes the stream here.
+    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 204, .headers = &.{}, .end_stream = true } });
+    try std.testing.expect(!session.streams.contains(1));
+    _ = countTerminalIntents(gpa, &session);
+    // The handler's reset of a stream that ended normally queues no frame.
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+
+    // The edge refused that HEADERS: the stream is reset, once.
+    try session.resetRefusedEnd(1);
+    try session.resetRefusedEnd(1);
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 1), c.rst);
     try std.testing.expect(session.terminal == .none);
 }
 

@@ -6508,16 +6508,33 @@ pub const Connection = struct {
     /// A batch can queue intents of its own: a dispatch that is refused (a
     /// failed handler spawn, a refused reaper reservation, no request memory)
     /// resets or answers its stream. They are drained here, in further rounds,
-    /// before this returns, so the session queue is empty whenever a lock
-    /// section ends, and the next section starts its batch from an empty
-    /// queue (`Limits.intentEntriesMin`). Nothing in a round may materialize
-    /// the queue itself: the batch it would drain into is the one being read.
+    /// before this returns, also after a round fails (the first error is
+    /// returned at the end), so the session queue is empty whenever a lock
+    /// section ends. Two things rest on that: the next section starts its
+    /// batch from an empty queue (`Limits.intentEntriesMin`), and a handler's
+    /// ticket parked in `next_wire_ticket` reaches that handler's own frame,
+    /// the first one it materializes, not a leftover RST of another stream
+    /// (that handler's refused HEADERS then released the ticket while the RST
+    /// still carried it, and the drain failed the connection in
+    /// `linkCompletion`). Nothing in a round may materialize the queue itself:
+    /// the batch it would drain into is the one being read.
     fn materializeIntents(self: *Connection) anyerror!void {
         self.assertSessionHeld("materializeIntents");
+        var first_err: ?anyerror = null;
         while (true) {
             const n = self.session.drainIntentsInto(self.intent_batch);
-            if (n == 0) return;
-            try self.materializeBatch(n);
+            if (n == 0) break;
+            self.materializeBatch(n) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| {
+            // The frame the ticket was parked for may have been dropped with
+            // the rest of the failed batch. Its caller fails and releases the
+            // reservation, so no later frame may take it.
+            self.next_wire_ticket = 0;
+            self.next_wire_slot = 0;
+            return err;
         }
     }
 
@@ -6577,6 +6594,11 @@ pub const Connection = struct {
                             // to go on. The first fragment is an ordinary
                             // per-stream refusal, and the rest of the batch,
                             // its other fragments, is released above.
+                            // A refused HEADERS with END_STREAM had already
+                            // ended the stream in Session; the peer must still
+                            // learn it ended. The RST is queued for this
+                            // drain's caller, like a dispatch refusal.
+                            if (f.typ == .headers and f.flags.end_stream) self.session.resetRefusedEnd(f.stream_id) catch {};
                             if (class == .terminal) {
                                 if (comptime test_observe) _ = test_ctrl_terminal_full.fetchAdd(1, .monotonic);
                                 self.noteServerClose("ctrl_terminal_full", err);
