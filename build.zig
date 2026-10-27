@@ -443,15 +443,15 @@ pub fn build(b: *std.Build) void {
     run_double_finalize_trap.has_side_effects = true;
     const run_sweep_lock_trap = b.addRunArtifact(teardown_traps);
     run_sweep_lock_trap.addArg("sweep-lock");
-    run_sweep_lock_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
+    run_sweep_lock_trap.addCheck(.{ .expect_stderr_match = "session lock acquired during shutdownHandlers" });
     run_sweep_lock_trap.has_side_effects = true;
     const run_sweep_lock_session_trap = b.addRunArtifact(teardown_traps);
     run_sweep_lock_session_trap.addArg("sweep-lock-session");
-    run_sweep_lock_session_trap.addCheck(.{ .expect_stderr_match = "session_mu acquired during shutdownHandlers" });
+    run_sweep_lock_session_trap.addCheck(.{ .expect_stderr_match = "session lock acquired during shutdownHandlers" });
     run_sweep_lock_session_trap.has_side_effects = true;
     const run_unlocked_sweep_trap = b.addRunArtifact(teardown_traps);
     run_unlocked_sweep_trap.addArg("unlocked-sweep");
-    run_unlocked_sweep_trap.addCheck(.{ .expect_stderr_match = "session_mu not held at wakeHandlerWaiters" });
+    run_unlocked_sweep_trap.addCheck(.{ .expect_stderr_match = "session lock not held at wakeHandlerWaiters" });
     run_unlocked_sweep_trap.has_side_effects = true;
     const run_watchdog_stall_trap = b.addRunArtifact(teardown_traps);
     run_watchdog_stall_trap.addArg("watchdog-stall");
@@ -1155,8 +1155,20 @@ pub fn build(b: *std.Build) void {
     const std_io_gate_step = b.step("std-io-gate", "Fail on any new std.Io concurrency abstraction; zio owns concurrency here");
     std_io_gate_step.dependOn(&std_io_gate_run.step);
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + every release target + every artifact a named step or the install step compiles");
+    // The session_mu gate. A handler's release of `session_mu` is what wakes
+    // the actor (`unlockSession` rings), so the mutex and the doorbell may be
+    // touched only inside their wrappers. t-3594 has the reasoning.
+    const session_mu_gate_run = b.addSystemCommand(&.{ "bash", "tools/session-mu-gate/gate.sh" });
+    session_mu_gate_run.addArg(".");
+    session_mu_gate_run.setCwd(b.path("."));
+    session_mu_gate_run.has_side_effects = true;
+    session_mu_gate_run.stdio = .inherit;
+    const session_mu_gate_step = b.step("session-mu-gate", "Fail on any use of the session mutex outside lockSession/unlockSession, or a send on the actor bell outside ring");
+    session_mu_gate_step.dependOn(&session_mu_gate_run.step);
+
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + every release target + every artifact a named step or the install step compiles");
     ci_step.dependOn(&std_io_gate_run.step);
+    ci_step.dependOn(&session_mu_gate_run.step);
     ci_step.dependOn(test_step);
     // Placement and balancer gates; each test says what it checks under the
     // scheduling this `ci` was built with.

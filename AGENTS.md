@@ -89,6 +89,7 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ./zb build h1-smoke  # HTTP/1.1 edge: curl --http1.1 against tls, curl against h1c, SSE, SIGTERM
 ./zb build h1-go-smoke  # HTTP/1.1 Go net/http oracle: keep-alive reuse and Expect 100-continue; ABORTS if go is missing
 ./zb build std-io-gate  # fails on any NEW std.Io concurrency abstraction; prints files and lines scanned
+./zb build session-mu-gate  # fails on session_mu used outside lockSession/unlockSession, or a doorbell send outside ring; runs in ci
 ```
 
 **`zig build test` reaches only part of the TLS edge.** `tests/h1_battery.zig`
@@ -131,6 +132,10 @@ see `tools/README.md`.
   set, not a budget, and it ratchets in both directions.
 - `Session` is the deterministic protocol authority. `Connection` serializes
   Session access with `session_mu`; handlers communicate through commands.
+  Take and release it only through `lockSession`, `lockSessionUncancelable` and
+  `unlockSession`: a task that is not the actor rings the actor's doorbell in
+  `unlockSession`, and that ring is how a handler's change reaches a parked
+  actor. `./zb build session-mu-gate` enforces it and runs inside `ci`.
 - ReadPump and WritePump are the sole owners of their socket directions on h2c.
   On TLS there is no pump task: the actor drives the TLS `Pump` and is the
   sole encrypt/decrypt owner and the sole socket reader and writer; never

@@ -15,6 +15,24 @@
 //! of both transports: no overflow, no failed flush, no RST_STREAM, no server
 //! close, every response ended, and the barriers WAITED while held.
 //!
+//! t-3594 adds two groups to this file, because they ask the same question
+//! (does a handler's change wake an idle actor?) of the same server:
+//!
+//! - An idle table: each `Response` operation on an otherwise idle connection
+//!   (send with an empty body, send with a body, start + write + end, a bare
+//!   flush, abort), on both transports, each with a deadline. A GET arms no
+//!   actor timer, and before each operation every handler waits 150 ms and then
+//!   until the actor is observed inside its park select (a deadline that fails
+//!   the row), so only a wake can move it.
+//!   After the operation the handler stays alive until the client has SEEN its
+//!   effect (the next frame, or the reset), within a bound: a handler that
+//!   exited would post its completion and wake the actor by that, and hide the
+//!   missing wake.
+//! - The failure regression: a response refused while it is materialized (the
+//!   CONTINUATION of a large header block meets a full control pool) fails the
+//!   connection from the handler's task. The handler catches the error and
+//!   stays alive. The ACTOR must still reach its teardown by a deadline.
+//!
 //! Every case prints one `T3567 ...` line with its counters before it
 //! asserts, so a rate can be read from repeated runs. Run it with
 //! `./zb build test-t3567` (it is also part of `./zb build test`). Every wait
@@ -28,6 +46,7 @@ const wire_client = @import("wire_client.zig");
 
 const conn_mod = starh2.edge.connection;
 const wire_pump = starh2.edge.wire_pump;
+const hpack = starh2.core.hpack;
 const tls_edge = starh2.edge.tls_edge;
 
 const Transport = wire_client.Transport;
@@ -55,6 +74,18 @@ fn resetGlobals() void {
     flush_ok.store(0, .release);
     flush_err.store(0, .release);
     first_flush_err.store(0, .release);
+    obs_headers.store(false, .release);
+    obs_data.store(false, .release);
+    obs_end.store(false, .release);
+    obs_rst.store(false, .release);
+    obs_missed.store(0, .release);
+    ops_done.store(0, .release);
+    obs_status.store(0, .release);
+    obs_body_len.store(0, .release);
+    park_missed.store(0, .release);
+    fail_gate.store(false, .release);
+    fail_alive.store(false, .release);
+    fail_caught.store(0, .release);
 }
 
 /// Starts its response, waits for the gate, flushes once with nothing
@@ -101,8 +132,186 @@ fn spinner(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anye
 /// gone quiet: by then the actor has finished its turn and is parked, so the
 /// handler's push is the only thing that can wake it.
 fn empty204(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    try zio.sleep(.fromMilliseconds(150));
+    try idleSleep();
     try resp.send(204, &.{}, "");
+    opDone();
+}
+
+/// How long a handler of the idle table waits before each operation. The actor
+/// has finished its turn and is parked long before this ends.
+const idle_ms = 150;
+
+/// What the client has seen on stream 1. A handler waits on these after an
+/// operation so that it does not exit (its exit posts a completion and wakes
+/// the actor, which would hide a missing wake).
+var obs_headers: std.atomic.Value(bool) = .init(false);
+var obs_data: std.atomic.Value(bool) = .init(false);
+var obs_end: std.atomic.Value(bool) = .init(false);
+var obs_rst: std.atomic.Value(bool) = .init(false);
+/// Observations that did not arrive in time.
+var obs_missed: std.atomic.Value(usize) = .init(0);
+/// Operations the handler was asked to do that returned success. A handler that
+/// takes an error path ends in `runHandlerJobBody`'s fallback 500, which the client
+/// would read as an END_STREAM; the row compares this count with the one it expects.
+var ops_done: std.atomic.Value(usize) = .init(0);
+/// The first status the client decoded on stream 1 (0 if none), and the DATA bytes
+/// it read there. Written by the client thread, read after it is joined.
+var obs_status: std.atomic.Value(u16) = .init(0);
+var obs_body: [64]u8 = undefined;
+var obs_body_len: std.atomic.Value(usize) = .init(0);
+
+fn opDone() void {
+    _ = ops_done.fetchAdd(1, .acq_rel);
+}
+
+/// Decode the `:status` of a HEADERS payload on stream 1 (the first header block
+/// of the connection, so the dynamic table is empty). Any failure leaves 0.
+fn noteStatus(gpa: std.mem.Allocator, block: []const u8) void {
+    if (obs_status.load(.acquire) != 0) return;
+    var dec = hpack.Decoder.init(gpa) catch return;
+    defer dec.deinit();
+    const res = dec.decode(block, 100, 64 * 1024, 256, 16 * 1024) catch return;
+    defer dec.freeResult(res);
+    for (res.fields) |hf| {
+        if (std.mem.eql(u8, hf.name, ":status")) {
+            const v = std.fmt.parseInt(u16, hf.value, 10) catch return;
+            obs_status.store(v, .release);
+            return;
+        }
+    }
+}
+
+fn noteBody(bytes: []const u8) void {
+    var n = obs_body_len.load(.acquire);
+    for (bytes) |b| {
+        if (n >= obs_body.len) break;
+        obs_body[n] = b;
+        n += 1;
+    }
+    obs_body_len.store(n, .release);
+}
+
+fn awaitObs(flag: *std.atomic.Value(bool)) void {
+    const deadline = nowNs() + 4 * std.time.ns_per_s;
+    while (!flag.load(.acquire)) {
+        if (nowNs() >= deadline) {
+            _ = obs_missed.fetchAdd(1, .acq_rel);
+            return;
+        }
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+}
+
+/// Park waits that ran out of time. A row with one is a failure: its operation
+/// was not made while the actor was asleep, so it proves nothing.
+var park_missed: std.atomic.Value(usize) = .init(0);
+
+/// Wait before an operation: a fixed sleep, then until the actor is observed
+/// inside its park select (`test_actors_in_select`, raised just before the
+/// select and lowered right after it). A sleep alone is no happens-before with
+/// the park: an actor still in its turn would read the handler's change at its
+/// next snapshot and the row would pass with the ring removed.
+///
+/// What this does NOT prove, in plain words. The wait SAMPLES the actor; it does
+/// not hold it. The gap is narrow. An unrelated wake could end the select after
+/// the sample, and the handler's release could start before the actor reads
+/// `releases_at_turn_top` at the top of its next turn. The actor reads that
+/// snapshot BEFORE it takes the lock, so the next turn sees the handler's change
+/// under the lock anyway. That is a legal schedule and not a lost wake, so a row
+/// can pass without the ring and no audit fires. A release that starts AFTER that
+/// snapshot and skips its ring is not in the gap: it trips the park check on the
+/// same turn. An idle GET has no other wake source, so the gap does not open in
+/// practice, and with the ring removed every row failed. The evidence is
+/// statistical: do not read a passing row as a proof that the ring is there. The
+/// proof is the park audit and the unit tests.
+fn idleSleep() !void {
+    try zio.sleep(.fromMilliseconds(idle_ms));
+    const deadline = nowNs() + 4 * std.time.ns_per_s;
+    while (conn_mod.test_actors_in_select.load(.acquire) == 0) {
+        if (nowNs() >= deadline) {
+            _ = park_missed.fetchAdd(1, .acq_rel);
+            return;
+        }
+        zio.sleep(.fromMilliseconds(1)) catch {};
+    }
+}
+
+fn idleSendBody(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try idleSleep();
+    try resp.send(200, &.{}, "hello");
+    opDone();
+    awaitObs(&obs_end);
+}
+
+fn idleStartWriteEnd(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try idleSleep();
+    var body = try resp.start(200, &.{});
+    opDone();
+    awaitObs(&obs_headers);
+    try idleSleep();
+    try body.writeAll("x");
+    opDone();
+    awaitObs(&obs_data);
+    try idleSleep();
+    try body.finish();
+    opDone();
+    awaitObs(&obs_end);
+}
+
+fn idleBareFlush(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try idleSleep();
+    var body = try resp.start(200, &.{});
+    opDone();
+    awaitObs(&obs_headers);
+    try idleSleep();
+    try body.flush();
+    opDone();
+    try idleSleep();
+    try body.finish();
+    opDone();
+    awaitObs(&obs_end);
+}
+
+fn idleAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try idleSleep();
+    var body = try resp.start(200, &.{});
+    opDone();
+    awaitObs(&obs_headers);
+    try idleSleep();
+    try body.abort();
+    opDone();
+    awaitObs(&obs_rst);
+}
+
+const wide_value_len = 7000;
+const wide_a: [wide_value_len]u8 = @splat('a');
+const wide_b: [wide_value_len]u8 = @splat('b');
+const wide_c: [wide_value_len]u8 = @splat('c');
+
+/// The control pool the failure regression sets (`fail_control_bytes`) takes
+/// the first fragment of this block (a 16 KiB HEADERS frame) and refuses the
+/// CONTINUATION.
+var fail_gate: std.atomic.Value(bool) = .init(false);
+var fail_alive: std.atomic.Value(bool) = .init(false);
+var fail_caught: std.atomic.Value(u16) = .init(0);
+
+/// Sends a response whose header block needs a CONTINUATION, catches the
+/// refusal and STAYS alive until the test opens the gate. It swallows the
+/// cancel that the actor's teardown delivers, so the connection can only end
+/// by the actor getting there on its own.
+fn refusedAndAlive(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    fail_alive.store(true, .release);
+    defer fail_alive.store(false, .release);
+    idleSleep() catch {};
+    resp.send(200, &.{
+        .{ .name = "x-wide-a", .value = &wide_a },
+        .{ .name = "x-wide-b", .value = &wide_b },
+        .{ .name = "x-wide-c", .value = &wide_c },
+    }, "") catch |err| {
+        fail_caught.store(@intFromError(err), .release);
+    };
+    const cap = nowNs() + 20 * std.time.ns_per_s;
+    while (!fail_gate.load(.acquire) and nowNs() < cap) zio.sleep(.fromMilliseconds(2)) catch {};
 }
 
 /// The request that puts a chunk in front of the hold.
@@ -114,6 +323,11 @@ const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/flusher", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = flusher } } },
     .{ .method = .GET, .path = "/spinner", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = spinner } } },
     .{ .method = .GET, .path = "/empty204", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = empty204 } } },
+    .{ .method = .GET, .path = "/idle-send-body", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = idleSendBody } } },
+    .{ .method = .GET, .path = "/idle-swe", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = idleStartWriteEnd } } },
+    .{ .method = .GET, .path = "/idle-flush", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = idleBareFlush } } },
+    .{ .method = .GET, .path = "/idle-abort", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = idleAbort } } },
+    .{ .method = .GET, .path = "/refused", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = refusedAndAlive } } },
     .{ .method = .GET, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
 };
 
@@ -125,6 +339,10 @@ fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
 }
 
 fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, cert: *[]u8, key: *[]u8) !starh2.Server {
+    return serverForLimits(rt, gpa, transport, starh2.Limits.defaults, cert, key);
+}
+
+fn serverForLimits(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, limits: starh2.Limits, cert: *[]u8, key: *[]u8) !starh2.Server {
     const io = rt.io();
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
@@ -141,7 +359,7 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, cer
         .endpoints = &.{endpoint},
         .routes = &routes,
         .tls = tls_cfg,
-        .limits = starh2.Limits.defaults,
+        .limits = limits,
     });
 }
 
@@ -223,6 +441,23 @@ fn clientRun(c: *Client) !void {
             c.closed_early = true;
             return;
         };
+        if (s.sid == 1) {
+            const end = s.flags & 1 != 0;
+            switch (s.ftype) {
+                1 => {
+                    noteStatus(c.gpa, w.last_payload.items);
+                    obs_headers.store(true, .release);
+                    if (end) obs_end.store(true, .release);
+                },
+                0 => {
+                    noteBody(w.last_payload.items);
+                    obs_data.store(true, .release);
+                    if (end) obs_end.store(true, .release);
+                },
+                3 => obs_rst.store(true, .release),
+                else => {},
+            }
+        }
         if (s.sid == c.triggerSid()) {
             // A reset is a reset, whichever stream it is on; only END_STREAM on
             // HEADERS or DATA ends the trigger's response.
@@ -517,12 +752,28 @@ test "tls: a parked barrier is woken while other handlers keep flushing (the wak
     try runSpinCaseTop(40, 4);
 }
 
-/// A task handler answers with an empty body on an otherwise idle connection.
-/// `sendCb` drains on the handler's task and pushes the HEADERS, then the
-/// handler parks on the ticket. On TLS the actor is the writer and sleeps
-/// unless something rings it; nothing else is going on to wake it (a GET arms
-/// no timer). The response must arrive, by a deadline.
-fn runIdleSend(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
+const Outcome = enum { ends, reset };
+
+/// What a row must see. The client checks the status and the body the handler's
+/// own operations produce, not any END_STREAM: when `resp.start` is refused,
+/// `runHandlerJobBody` sends a fallback 500 ("internal error") and the client sees
+/// an END_STREAM too. `ops` is how many operations the handler completed.
+const Want = struct { outcome: Outcome, status: u16, body: []const u8, ops: usize };
+const want_empty204: Want = .{ .outcome = .ends, .status = 204, .body = "", .ops = 1 };
+const want_send_body: Want = .{ .outcome = .ends, .status = 200, .body = "hello", .ops = 1 };
+const want_swe: Want = .{ .outcome = .ends, .status = 200, .body = "x", .ops = 3 };
+const want_flush: Want = .{ .outcome = .ends, .status = 200, .body = "", .ops = 3 };
+const want_abort: Want = .{ .outcome = .reset, .status = 200, .body = "", .ops = 2 };
+
+/// One operation on an otherwise idle connection (see the header). The
+/// response must reach the client by the client's deadline, and the handler
+/// must have seen what the client saw (`obs_missed`), so the wake came from the
+/// operation and not from the handler's exit.
+///
+/// The empty-body `send` is the member t-3567 found: `sendCb` drains on the
+/// handler's task and pushes the HEADERS, then the handler parks on the ticket.
+/// On TLS the actor is the writer and sleeps unless something rings it.
+fn runIdleOp(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, path: []const u8, want: Want) !void {
     resetGlobals();
     var cert: []u8 = &.{};
     var key: []u8 = &.{};
@@ -545,35 +796,188 @@ fn runIdleSend(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !
         .transport = transport,
         .port = server.localAddress(0).getPort(),
         .n = 1,
-        .path = "/empty204",
+        .path = path,
         .deadline_ns = 5 * std.time.ns_per_s,
     };
     const t = try std.Thread.spawn(.{}, clientMain, .{&c});
     joinClient(&c, t);
-    std.debug.print("T3567-idle transport={s} ended={} client_err={s}\n", .{ @tagName(transport), c.ended[0], if (c.err) |e| @errorName(e) else "-" });
+    const got_body = obs_body[0..obs_body_len.load(.acquire)];
+    std.debug.print("T3594-idle transport={s} path={s} ended={} reset={} status={d} body={s} ops={d} missed={d} client_err={s}\n", .{
+        @tagName(transport), path, c.ended[0], c.reset[0], obs_status.load(.acquire), got_body, ops_done.load(.acquire), obs_missed.load(.acquire), if (c.err) |e| @errorName(e) else "-",
+    });
     if (c.err) |e| return e;
-    try std.testing.expect(c.ended[0]);
-    try std.testing.expectEqual(@as(usize, 0), c.resets);
+    try std.testing.expectEqual(want.ops, ops_done.load(.acquire));
+    try std.testing.expectEqual(want.status, obs_status.load(.acquire));
+    try std.testing.expectEqualStrings(want.body, got_body);
+    switch (want.outcome) {
+        .ends => {
+            try std.testing.expect(c.ended[0]);
+            try std.testing.expectEqual(@as(usize, 0), c.resets);
+        },
+        .reset => {
+            try std.testing.expect(c.reset[0]);
+            try std.testing.expect(!c.ended[0]);
+        },
+    }
+    try std.testing.expectEqual(@as(usize, 0), obs_missed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), park_missed.load(.acquire));
 
     server.requestShutdown();
     serve_handle.join() catch {};
     serving = false;
 }
 
-fn runIdleSendTop(transport: Transport) !void {
+fn runIdleOpTop(transport: Transport, path: []const u8, want: Want) !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
     defer rt.deinit();
-    var h = try rt.spawn(runIdleSend, .{ rt, gpa, transport });
+    var h = try rt.spawn(runIdleOp, .{ rt, gpa, transport, path, want });
     try h.join();
 }
 
-test "tls: a task handler's empty-body send on an idle connection gets its response" {
-    try runIdleSendTop(.tls);
+test "idle table, tls: a task handler's empty-body send gets its response" {
+    try runIdleOpTop(.tls, "/empty204", want_empty204);
 }
 
-test "h2c control: a task handler's empty-body send on an idle connection gets its response" {
-    try runIdleSendTop(.h2c);
+test "idle table, h2c: a task handler's empty-body send gets its response" {
+    try runIdleOpTop(.h2c, "/empty204", want_empty204);
+}
+
+test "idle table, tls: a task handler's send with a body gets its response" {
+    try runIdleOpTop(.tls, "/idle-send-body", want_send_body);
+}
+
+test "idle table, h2c: a task handler's send with a body gets its response" {
+    try runIdleOpTop(.h2c, "/idle-send-body", want_send_body);
+}
+
+test "idle table, tls: start, write and end each reach the client" {
+    try runIdleOpTop(.tls, "/idle-swe", want_swe);
+}
+
+test "idle table, h2c: start, write and end each reach the client" {
+    try runIdleOpTop(.h2c, "/idle-swe", want_swe);
+}
+
+test "idle table, tls: a bare flush on an idle connection completes" {
+    try runIdleOpTop(.tls, "/idle-flush", want_flush);
+}
+
+test "idle table, h2c: a bare flush on an idle connection completes" {
+    try runIdleOpTop(.h2c, "/idle-flush", want_flush);
+}
+
+test "idle table, tls: an abort reaches the client as a reset" {
+    try runIdleOpTop(.tls, "/idle-abort", want_abort);
+}
+
+test "idle table, h2c: an abort reaches the client as a reset" {
+    try runIdleOpTop(.h2c, "/idle-abort", want_abort);
+}
+
+/// The control pool for the failure regression. The ordinary share is this
+/// minus the reserve for terminal frames (4 KiB): 18 KiB, which holds the
+/// 16 KiB HEADERS fragment of the wide block and not the CONTINUATION after it.
+const fail_control_bytes = 22 * 1024;
+
+/// The third member of the class (t-3594). A response that is refused while it
+/// is materialized, for lack of room for a CONTINUATION, fails the connection:
+/// `handleWriterFailed` runs on the HANDLER's task, under `session_mu`, and sets
+/// every stream's cause. The handler catches the error and stays alive, so
+/// nothing posts a completion. The actor has to learn of the failure from the
+/// handler's release of the lock, and reach its teardown while the handler is
+/// still alive. `test_observed_writer_fail_handled` cannot be the oracle: the
+/// handler's own task sets it.
+fn runFailedAndAlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    var limits = starh2.Limits.defaults;
+    limits.control_bytes_per_connection = fail_control_bytes;
+    var server = try serverForLimits(rt, gpa, transport, limits, &cert, &key);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        fail_gate.store(true, .release);
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const teardowns_0 = conn_mod.test_actor_teardowns.load(.acquire);
+    const term_full_0 = conn_mod.test_ctrl_terminal_full.load(.monotonic);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = transport,
+        .port = server.localAddress(0).getPort(),
+        .n = 1,
+        .path = "/refused",
+        .deadline_ns = 15 * std.time.ns_per_s,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+
+    // The handler has caught the refusal and is waiting on the gate.
+    const caught_ok = blk: {
+        const deadline = nowNs() + client_deadline_ns;
+        while (fail_caught.load(.acquire) == 0) {
+            if (nowNs() >= deadline) break :blk false;
+            zio.sleep(.fromMilliseconds(2)) catch {};
+        }
+        break :blk true;
+    };
+    // The actor reaches its teardown by a deadline, with the handler alive.
+    const reached = blk: {
+        const deadline = nowNs() + 5 * std.time.ns_per_s;
+        while (conn_mod.test_actor_teardowns.load(.acquire) == teardowns_0) {
+            if (nowNs() >= deadline) break :blk false;
+            zio.sleep(.fromMilliseconds(2)) catch {};
+        }
+        break :blk true;
+    };
+    const alive = fail_alive.load(.acquire);
+    const caught = fail_caught.load(.acquire);
+    // Now let the handler go, so the connection can finish and the client end.
+    fail_gate.store(true, .release);
+    joinClient(&c, t);
+    std.debug.print("T3594-fail transport={s} handler_caught={} err={d} actor_teardown={} handler_alive_then={} terminal_full={d} closed_early={}\n", .{
+        @tagName(transport),                                             caught_ok,      caught, reached, alive,
+        conn_mod.test_ctrl_terminal_full.load(.monotonic) - term_full_0, c.closed_early,
+    });
+    try std.testing.expect(caught_ok);
+    // The instrument ran: the refusal was the fragment kind, not the terminal kind.
+    try std.testing.expect(caught != 0);
+    try std.testing.expectEqual(term_full_0, conn_mod.test_ctrl_terminal_full.load(.monotonic));
+    try std.testing.expect(reached);
+    try std.testing.expect(alive);
+    try std.testing.expectEqual(@as(usize, 0), park_missed.load(.acquire));
+
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runFailedAndAliveTop(transport: Transport) !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runFailedAndAlive, .{ rt, gpa, transport });
+    try h.join();
+}
+
+test "failure regression, tls: a refused CONTINUATION fails the connection and the actor tears down while the handler is alive" {
+    try runFailedAndAliveTop(.tls);
+}
+
+// A CONTROL, not a guard of the class. On h2c `handleWriterFailed` closes
+// `write_ch`; the write pump posts `fail_all` and the actor wakes by `.acks`,
+// ring or not. This case passes at 58b88c9 too. Do not count it as a guard.
+test "failure regression CONTROL, h2c (does not guard the class): a refused CONTINUATION fails the connection and the actor tears down while the handler is alive" {
+    try runFailedAndAliveTop(.h2c);
 }
 
 fn runCaseTop(transport: Transport, hold: Hold, n: usize) !void {

@@ -48,11 +48,12 @@
 //! encryption happens on the actor without taking a second mutex. The
 //! cipher state has one owner (the actor task).
 //!
-//! There is exactly one place that releases the lock inside an operation:
-//! `waitForStreamSpace`. It must, because the capacity it waits for can only be
-//! freed by the actor, which needs the same lock. It always reacquires
-//! UNCANCELABLE before it returns, so the caller's `defer unlock` stays
-//! balanced on every path, including cancellation.
+//! There are three places that release the lock inside an operation:
+//! `waitForStreamSpace`, `parkForBudget` and `waitForAckRoom`. They must,
+//! because the capacity they wait for can only be freed by the actor, which
+//! needs the same lock. Each always reacquires UNCANCELABLE before it returns,
+//! so the caller's `defer unlock` stays balanced on every path, including
+//! cancellation.
 //!
 //! Handler code never holds the lock. `Response` callbacks take it and do
 //! their work. A non-end `wait` parks inside `waitForStreamSpace` (the lock is
@@ -70,10 +71,16 @@
 //!    buffered item survives until the actor takes it, and the select's fast
 //!    path observes it before parking.
 //! 2. Every other producer sets its flag and then RINGS the doorbell (`ring`,
-//!    a capacity-1 channel; a full doorbell means a ring is already pending).
+//!    a capacity-1 channel; a full doorbell already means a ring is pending).
 //!    The ring is the producer's LAST act, and `ring` is the only writer of
 //!    that channel. A producer that neither sends on a selected channel nor
 //!    rings is a hang — which is why no such producer may exist.
+//!
+//!    A handler's task does not ring by site. It changes shared state only
+//!    under `session_mu`, and `unlockSession` rings when the releasing task is
+//!    not the actor, as its last act. Only two producers ring by hand: the
+//!    actor for work it made after its turn's check (`tryDispatch`, the inline
+//!    grant in `grantBudgetLocked`), because the unlock does not ring for it.
 //!
 //! # Byte accounting: two kinds, released at different moments
 //!
@@ -278,6 +285,17 @@ pub var test_budget_doorbell_rings: std.atomic.Value(usize) = .init(0);
 /// queue (`ctrl_terminal_full`, the reset burst that ends a connection). A test
 /// that relies on the terminal queue not overflowing asserts it did not move.
 pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): actors that are inside their park select right
+/// now. Raised immediately before `zio.select` in `waitForActivity` and lowered
+/// right after it returns. A test whose handler must act while the actor is
+/// asleep waits for this to be above zero (a sleep proves nothing about the
+/// actor's turn), with a deadline that fails the test. One connection per test.
+pub var test_actors_in_select: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): where in `unlockSession` a hook runs, between its
+/// two counters and around its ring, so a unit test can put the actor's
+/// snapshot at either side of the ring without a second thread.
+pub const ReleasePoint = enum { before_ring, after_ring, park_after_check };
+pub var test_release_hook: ?*const fn (*Connection, ReleasePoint) void = null;
 /// Test-only (observe builds): while true, the TLS driver holds the chunks that
 /// sit in the stash (pushed by a drain, not yet taken for writing). Beside
 /// `wire_pump.test_hold_writes`, which holds a batch the driver already took,
@@ -363,6 +381,10 @@ pub var test_tls_leftover_connections: std.atomic.Value(usize) = .init(0);
 /// tell a cancel that left as `Canceled` from one a `catch` turned into
 /// something else. The connection task's result is not visible to a test.
 pub var test_run_canceled: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): actor teardowns begun (`teardownExhaustive`). A
+/// test whose handler stays alive after the connection failed reads this to
+/// prove the ACTOR got to its teardown, which a handler's own task cannot fake.
+pub var test_actor_teardowns: std.atomic.Value(usize) = .init(0);
 /// Counts the times `runPendingInline` saw `error.Canceled` from its drain. With
 /// `test_run_canceled` it lets a test tell WHICH path carried a cancel: a cancel
 /// parked elsewhere (the main-loop drain, a select) reaches `run` without
@@ -1743,10 +1765,19 @@ pub const Connection = struct {
     shutting_down: bool = false,
     /// Set by a handler after it refills scheduler slab space; cleared by the
     /// actor at the top of each iteration. Emission happens only in the
-    /// actor's drainEmit. The handler rings the doorbell after the store, and
-    /// the ring persists until the actor takes it, so the refill cannot be a
-    /// lost wakeup.
+    /// actor's drainEmit. The handler's release of `session_mu` (which rings,
+    /// `unlockSession`) comes after the store, and the ring persists until the
+    /// actor takes it, so the refill cannot be a lost wakeup.
     sched_refilled: std.atomic.Value(bool) = .init(false),
+    /// Observe builds. Releases of `session_mu` by a task that is not the
+    /// actor, counted twice by `unlockSession` (see `lostWakeSince`):
+    /// `releases_started` after the unlock and BEFORE the ring (each release
+    /// takes its own number from it), `releases_rung_max` AFTER the ring (the
+    /// highest number that has finished its ring). Both `seq_cst`.
+    releases_started: std.atomic.Value(usize) = .init(0),
+    releases_rung_max: std.atomic.Value(usize) = .init(0),
+    /// Actor only. `releases_started` at the top of the current turn.
+    releases_at_turn_top: usize = 0,
     grace_deadline: ?std.Io.Timestamp = null,
     /// Set when the connection has decided to close and is delivering the
     /// frames it already queued: the time after which it stops waiting for the
@@ -2717,6 +2748,12 @@ pub const Connection = struct {
             if (!slot.budget.is_inline) {
                 self.space_events[i].set();
             } else if (i != admitting) {
+                // KEEP. A release of wire bytes runs on the actor with no
+                // `session_mu` (h2c `drainWriteAcks`, TLS `ack_apply`), so no
+                // unlock follows it and nothing else tells the actor that an
+                // inline entry was granted. A grant made by a handler's release
+                // of pending bytes is also followed by that handler's unlock;
+                // the ring here covers both, and a second token coalesces.
                 if (comptime test_observe) _ = test_budget_doorbell_rings.fetchAdd(1, .monotonic);
                 self.ring();
             }
@@ -3775,16 +3812,27 @@ pub const Connection = struct {
             // stashed cipher suffix sit. The recv is unarmed in the last case.
             if (pump.pending_read != null or pump.pending_cipher != null or pump.conn.pendingInbound()) return null;
             std.debug.assert(pump.recv_armed or pump.send_armed);
+            self.assertNoLostWake("the TLS select");
             diagActor(self, .select);
             defer diagActor(self, .tls_turn);
-            const winner = try zio.select(.{
-                .io = &pump.cq,
-                .comps = comps_ch.asyncReceive(),
-                .bell = self.doorbell.asyncReceive(),
-                .ack_hold = ack_hold_ev,
-                .shutdown = shutdown_ev,
-                .timer = timeout,
-            });
+            const winner = blk: {
+                if (comptime test_observe) _ = test_actors_in_select.fetchAdd(1, .acq_rel);
+                defer if (comptime test_observe) {
+                    _ = test_actors_in_select.fetchSub(1, .acq_rel);
+                };
+                break :blk try zio.select(.{
+                    .io = &pump.cq,
+                    .comps = comps_ch.asyncReceive(),
+                    .bell = self.doorbell.asyncReceive(),
+                    .ack_hold = ack_hold_ev,
+                    .shutdown = shutdown_ev,
+                    .timer = timeout,
+                });
+            };
+            switch (winner) {
+                .bell => {},
+                else => self.auditWake("the TLS select"),
+            }
             switch (winner) {
                 .io => |r| {
                     const c = r catch |err| {
@@ -3830,15 +3878,26 @@ pub const Connection = struct {
             }
             return null;
         }
-        const winner = try zio.select(.{
-            .reads = self.read_ch.asyncReceive(),
-            .acks = self.ackReceiveCh().asyncReceive(),
-            .comps = comps_ch.asyncReceive(),
-            .bell = self.doorbell.asyncReceive(),
-            .ack_hold = ack_hold_ev,
-            .shutdown = shutdown_ev,
-            .timer = timeout,
-        });
+        self.assertNoLostWake("the h2c select");
+        const winner = blk: {
+            if (comptime test_observe) _ = test_actors_in_select.fetchAdd(1, .acq_rel);
+            defer if (comptime test_observe) {
+                _ = test_actors_in_select.fetchSub(1, .acq_rel);
+            };
+            break :blk try zio.select(.{
+                .reads = self.read_ch.asyncReceive(),
+                .acks = self.ackReceiveCh().asyncReceive(),
+                .comps = comps_ch.asyncReceive(),
+                .bell = self.doorbell.asyncReceive(),
+                .ack_hold = ack_hold_ev,
+                .shutdown = shutdown_ev,
+                .timer = timeout,
+            });
+        };
+        switch (winner) {
+            .bell => {},
+            else => self.auditWake("the h2c select"),
+        }
         switch (winner) {
             .reads => |r| {
                 const chunk = r catch return null;
@@ -4140,6 +4199,7 @@ pub const Connection = struct {
         var leaving = false;
         while (true) {
             probeNote(.actor_turn);
+            if (comptime test_observe) self.releases_at_turn_top = self.releases_started.load(.seq_cst);
             _ = self.sched_refilled.swap(false, .acq_rel);
             self.drainWriteAcks();
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
@@ -4345,6 +4405,7 @@ pub const Connection = struct {
     /// while holding `session_mu`.
     fn teardownExhaustive(self: *Connection) void {
         std.debug.assert(shutdown_sweep.get() == null);
+        if (comptime test_observe) _ = test_actor_teardowns.fetchAdd(1, .release);
         self.closeWriterQueues();
         {
             self.lockSessionUncancelable(self.config.io);
@@ -5428,9 +5489,10 @@ pub const Connection = struct {
     /// is what keeps a single stream inside `outbound_bytes_per_stream` and the
     /// connection inside `resourceUpperBound`.
     ///
-    /// This is the ONLY place that releases `session_mu` mid-operation, and it
-    /// must, because only the actor can free this capacity and the actor needs
-    /// the same lock. The sequence per attempt:
+    /// This is one of three places that release `session_mu` mid-operation
+    /// (the others are `parkForBudget` and `waitForAckRoom`), and it must,
+    /// because only the actor can free this capacity and the actor needs the
+    /// same lock. The sequence per attempt:
     /// 1. Check the terminal cause and the writer state FIRST, so a dead stream
     ///    returns an exact error instead of parking.
     /// 2. Re-read the pending length; return if there is room.
@@ -5494,10 +5556,11 @@ pub const Connection = struct {
     /// large response never needs an arbitrarily large buffer. Per piece:
     /// wait for room in the stream's slab, then for room in the connection's
     /// budget (`reserveBudget`; a full budget parks the handler, it does not
-    /// fail the write), copy into the slab, then set `sched_refilled` and
-    /// wake the actor. The flag is set BEFORE the wake for the reason given
-    /// in the module header — an event edge can be erased by the actor's
-    /// reset, a flag cannot.
+    /// fail the write), copy into the slab, then set `sched_refilled`. The
+    /// actor learns of it from the release of `session_mu` (`unlockSession`
+    /// rings), which comes after the flag is set, for the reason given in the
+    /// module header — an event edge can be erased by the actor's reset, a flag
+    /// cannot.
     ///
     /// Slab room comes first, and `take` is what that room allows, so a
     /// waiter never asks the budget for more than one stream's cap. The
@@ -5542,8 +5605,9 @@ pub const Connection = struct {
                 return error.OutOfMemory;
             };
             off += take;
+            // The wake for this piece is the release of `session_mu`: the next
+            // `waitForStreamSpace` (or the caller's unlock) rings.
             self.sched_refilled.store(true, .release);
-            self.ring();
         }
         if (bytes.len == 0 or end or flush_ticket != 0) {
             self.sched.enqueueDataBytes(stream_id, &.{}, end, flush_ticket, flush_slot) catch {
@@ -5551,7 +5615,6 @@ pub const Connection = struct {
                 return error.OutOfMemory;
             };
             self.sched_refilled.store(true, .release);
-            self.ring();
         }
     }
 
@@ -6562,12 +6625,11 @@ pub const Connection = struct {
             // The actor is the writer here and does not select on the stash. A
             // chunk pushed from a handler's task (a drain run by `sendCb`,
             // `flushCb`, `abortCb`, the error reset, a bare barrier) would leave
-            // an idle actor asleep until something else wakes it, and the handler
-            // is about to park on the chunk's ticket. This is the one place every
-            // such push passes through. The actor's own drains do not ring: it
-            // writes in the same turn (the hot path). On h2c the pump task waits
-            // on the queue.
-            if (actor_marker.get() != self) self.ring();
+            // an idle actor asleep until something else wakes it. Every such
+            // push is made under `session_mu`, and that task's release of it
+            // rings (`unlockSession`), so this site rings nothing. The actor's
+            // own drains write in the same turn (the hot path). On h2c the pump
+            // task waits on the queue.
             return;
         }
         // Counted before the push: the pump may post its completion, and the
@@ -7187,6 +7249,13 @@ pub const Connection = struct {
             // A task handler's processIntents can queue a complete job while
             // the actor is parked. Flag-before-ring: inline_n is the state,
             // the ring is the persistent wake.
+            //
+            // KEEP, and do not suppress it for the actor. This is the actor
+            // ringing ITSELF for work it made after this turn's check:
+            // `dispatch` also runs on the actor, inside `runPendingInline`, and
+            // the release of `session_mu` does not ring for the actor
+            // (`unlockSession`). That release ring covers the handler-side
+            // callers only.
             self.ring();
             return true;
         }
@@ -7231,10 +7300,12 @@ pub const Connection = struct {
     /// 1. CAS `live` -> `reported`. The winner posts the completion. If a
     ///    reaper already claimed the slot, this handler stays silent and the
     ///    reaper reports after its `cancel` returns.
-    /// 2. Post the completion, then wake the actor. Without the wake the slot
+    /// 2. Post the completion. The send IS the wake: the actor selects on the
+    ///    completion channel, so no ring follows it. Without the post the slot
     ///    sits until an unrelated event arrives.
-    /// 3. Decrement the live counter, then release the decoded request, arena,
-    ///    and job.
+    /// 3. Decrement the live counter. This frees nothing: the request's blocks
+    ///    (headers, body, arena) go back to the pool from the actor, in
+    ///    `releaseSlot` after it has joined this task.
     ///
     /// The counters are published at the MUTATION sites, not once per actor
     /// iteration. A parked actor republishes nothing, so a per-iteration value
@@ -7660,9 +7731,10 @@ pub const Connection = struct {
         self.session_held = true;
     }
 
-    /// Every acquisition and release of `session_mu` goes through these two, so
-    /// `session_held` cannot drift from the mutex. Do not call the mutex
-    /// directly.
+    /// Every acquisition and release of `session_mu` goes through `lockSession`,
+    /// this and `unlockSession`, so `session_held` cannot drift from the mutex
+    /// and every release by a task that is not the actor rings it. Do not call
+    /// the mutex directly: `./zb build session-mu-gate` fails the build.
     fn lockSessionUncancelable(self: *Connection, io: std.Io) void {
         assertNotInShutdownSweep();
         if (diag_park) {
@@ -7681,7 +7753,7 @@ pub const Connection = struct {
         if (!std.debug.runtime_safety) return;
         const bound = shutdown_sweep.get();
         if (bound != null) {
-            std.debug.panic("session_mu acquired during shutdownHandlers", .{});
+            std.debug.panic("session lock acquired during shutdownHandlers", .{});
         }
         std.debug.assert(bound == null);
     }
@@ -7696,17 +7768,164 @@ pub const Connection = struct {
         std.debug.assert(slot.finalize_count.load(.acquire) == 1);
     }
 
+    /// The release of `session_mu` is how a handler's task tells the actor that
+    /// shared state changed. Every handler-side change to what the actor acts on
+    /// (a queued frame, a pushed stash chunk, a failure published by
+    /// `handleWriterFailed`, a flag) is made under this lock, so a task that is
+    /// not the actor rings the doorbell as the LAST act of its release. A new
+    /// handler path cannot forget the wake: it cannot change that state without
+    /// releasing the lock.
+    ///
+    /// - AFTER the unlock. A ring before it could wake the actor into a park on
+    ///   the mutex that the handler still holds.
+    /// - Not for the actor itself. It drains every input in the same turn, and a
+    ///   ring would only cost it a spare turn.
+    /// - Also on the unlocks inside the wait loops (`waitForStreamSpace`,
+    ///   `parkForBudget`, `waitForAckRoom`). That is by design: `enqueuePending`
+    ///   copies piece k, then parks in `waitForStreamSpace` for piece k + 1, and
+    ///   only that unlock can tell the actor about piece k.
+    /// - The ring coalesces. A full doorbell already means a wake is pending,
+    ///   so a burst of releases costs one token.
+    ///
+    /// Not covered by this ring, so those sites keep their own: the actor
+    /// ringing itself for work it made after its turn's check (`tryDispatch`'s
+    /// `inline_n`, the inline entry in `grantBudgetLocked`), and changes made
+    /// with no `session_mu` at all (wire releases on the actor).
     fn unlockSession(self: *Connection, io: std.Io) void {
         // Cleared while the mutex is still held, or the next holder would see a
         // stale false.
         self.session_held = false;
         self.session_mu.unlock(io);
+        if (actor_marker.get() != self) {
+            // Two counters, because one cannot be right (`lostWakeSince`).
+            const seq = if (comptime test_observe) self.releaseStarted() else 0;
+            if (comptime test_observe) {
+                if (test_release_hook) |h| h(self, .before_ring);
+            }
+            self.ring();
+            if (comptime test_observe) {
+                if (test_release_hook) |h| h(self, .after_ring);
+                self.releaseRung(seq);
+            }
+        }
+    }
+
+    /// Observe builds. A release by a task that is not the actor takes its own
+    /// number here, after its unlock and before its ring.
+    fn releaseStarted(self: *Connection) usize {
+        return self.releases_started.fetchAdd(1, .seq_cst) + 1;
+    }
+
+    /// Observe builds. The same release, after its ring: publish its number. The
+    /// maximum, not a count, so a release that is slow to get here cannot hide
+    /// another one that did not ring (`lostWakeSince`).
+    fn releaseRung(self: *Connection, seq: usize) void {
+        _ = self.releases_rung_max.fetchMax(seq, .seq_cst);
+    }
+
+    /// Observe builds. True when a release by a task that is not the actor
+    /// STARTED after `snapshot` (a value of `releases_started` that the actor
+    /// read), has finished its ring, and the doorbell is empty. That is a lost
+    /// wake.
+    ///
+    /// Why it is sound. On the paths this is called from, the actor takes a
+    /// token only in a `.bell` arm, and that is before the top of its turn,
+    /// where it reads `releases_started` as `snapshot`. (`waitTicketDraining`
+    /// also has a `.bell` arm and takes tokens, but it cannot reach a checked
+    /// park: it runs its select only for a ticket that is still dark. The
+    /// ordinary path calls it for a ticket that is already signaled, so the loop
+    /// body does not run. A dark ticket gets there only through `finalize_all`,
+    /// which is teardown, or `complete_receipts_fail_all`, which is set together
+    /// with `writer_failed`; the turn that sees `writer_failed` leaves the loop
+    /// for teardown in its lock block, before either check.)
+    ///
+    /// Each release takes its own number from `releases_started` (a `fetchAdd`
+    /// after its unlock), and after its ring it publishes that number with
+    /// `fetchMax` into `releases_rung_max`. Numbers 1 to `snapshot` were taken
+    /// before the actor read the snapshot, so those releases unlocked before it.
+    /// `releases_rung_max > snapshot` means a release whose number is above the
+    /// snapshot, so one that started AFTER it, has finished its ring. Its ring
+    /// came after the actor's last take, so its token is still there, and the
+    /// doorbell is empty only if some ring never happened. A release that started
+    /// before the snapshot did its unlock before it, so the turn that follows
+    /// reads its state under the lock, with or without a token.
+    ///
+    /// Why a maximum and not a count. Release A (number 1) rings and is slow to
+    /// publish; the actor takes A's token and snapshots 1; release B (number 2)
+    /// skips its ring and publishes. A count of published releases is 1, not
+    /// above the snapshot, and A's late publish would only make it 2 after the
+    /// fact. The maximum is 2 at once.
+    ///
+    /// Why two counters. `trySend` can hand the token straight to the parked
+    /// actor before the handler's next instruction. With one counter bumped
+    /// AFTER the ring, the actor takes `.bell`, snapshots the old count, the
+    /// bump lands, and the check sees "count moved, doorbell empty" on a legal
+    /// schedule. With one counter bumped BEFORE the ring, the actor can look
+    /// between the bump and the ring. `releases_started` is read by the actor
+    /// and moves before the ring; `releases_rung_max` is compared and moves
+    /// after.
+    fn lostWakeSince(self: *Connection, snapshot: usize) bool {
+        if (comptime !test_observe) return false;
+        if (self.releases_rung_max.load(.seq_cst) <= snapshot) return false;
+        const empty = io_queue.chanLen(u8, &self.doorbell) == 0;
+        return empty;
+    }
+
+    /// Observe builds. Called just before the actor parks in `waitForActivity`.
+    /// The actor may sleep only if every release of `session_mu` by another task
+    /// since the top of its turn has left a token (`lostWakeSince`). It panics at
+    /// the park, which names the bug, and a hang would not.
+    ///
+    /// Not checked: whether a queued complete job (`inline_n`) has a token. The
+    /// states that hold one back on purpose have their own wakes, and the check
+    /// panicked on a legal TLS schedule (`runPendingInline` runs before
+    /// `driveTlsTurn`, and the send completion that frees a control entry is the
+    /// next wake). The two rings that guard that case have their own unit tests.
+    fn assertNoLostWake(self: *Connection, comptime where: []const u8) void {
+        if (comptime !test_observe) return;
+        if (self.parkCheckFailed()) {
+            std.debug.panic("actor parks in {s} with no wake token waiting after a handler released the session lock since its turn began (a lost wake)", .{where});
+        }
+    }
+
+    /// The check, as a value. The hook runs after it and before the select: a
+    /// release there is the schedule that a snapshot taken at the park would have
+    /// absorbed (round 2 loaded `releases_at_park` here), so the wake audit
+    /// compares against the turn-top snapshot instead.
+    fn parkCheckFailed(self: *Connection) bool {
+        if (comptime !test_observe) return false;
+        if (self.lostWakeSince(self.releases_at_turn_top)) return true;
+        if (test_release_hook) |h| h(self, .park_after_check);
+        return false;
+    }
+
+    /// The wake audit, as a value. The turn-top snapshot, not one taken at the
+    /// park: no token is taken between the top of the turn and the select on
+    /// the audited path, so every release that started after the top and rang
+    /// leaves a token, whenever in the turn it started.
+    fn wakeAuditFailed(self: *Connection) bool {
+        return self.lostWakeSince(self.releases_at_turn_top);
+    }
+
+    /// Observe builds. Called when the actor wakes from a park by anything but
+    /// the doorbell. `assertNoLostWake` cannot catch a wake that was lost while
+    /// the actor was already asleep: it runs before the park, and the release
+    /// came after. This runs at the first wake that does come (a timer, a
+    /// completion, the shutdown event at the end of a test), and names the
+    /// cause instead of leaving a deadline to fail. Same argument as
+    /// `lostWakeSince`, with the turn-top snapshot (`wakeAuditFailed`): the
+    /// doorbell has one consumer, this task, and the wake was not a `.bell` arm.
+    fn auditWake(self: *Connection, comptime where: []const u8) void {
+        if (comptime !test_observe) return;
+        if (self.wakeAuditFailed()) {
+            std.debug.panic("actor woke in {s} by something other than the bell after a handler released the session lock while it slept, and no wake token is waiting (a lost wake)", .{where});
+        }
     }
 
     /// Called where Session or the scheduler is about to be read or mutated.
     fn assertSessionHeld(self: *const Connection, comptime site: []const u8) void {
         if (std.debug.runtime_safety and !self.session_held) {
-            std.debug.panic("session_mu not held at {s}", .{site});
+            std.debug.panic("session lock not held at {s}", .{site});
         }
     }
 
@@ -8171,7 +8390,8 @@ pub const Connection = struct {
                 self.failClosedOnIntentError();
                 return error.WriteFailed;
             };
-            self.ring();
+            // The actor is woken by the release of `session_mu` at the end of
+            // this block (`unlockSession`).
         }
         hctx.slot.awaiting_receipt.store(true, .release);
         defer hctx.slot.awaiting_receipt.store(false, .release);
@@ -9638,7 +9858,7 @@ test "budget queue: a writer failure grants a queued complete job and ends its s
     conn.writer_failed.store(false, .release);
 }
 
-test "budget queue: admitting a complete job to an empty queue rings no doorbell; a later grant does" {
+test "budget queue: admitting a complete job to an empty queue rings no bell; a later grant does" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const routes = [_]router_mod.Route{.{
@@ -9683,8 +9903,13 @@ test "budget queue: admitting a complete job to an empty queue rings no doorbell
     try conn.runPendingInline();
     try std.testing.expectEqual(@as(usize, 1), conn.inline_n);
     try std.testing.expectEqual(rings_before, test_budget_doorbell_rings.load(.monotonic));
+    // The release is a wire release's kind: no `session_mu`, so no unlock rings
+    // after it, and the token below can only be the grant's own (the ring in
+    // `grantBudgetLocked` is kept for this, `unlockSession` does not replace it).
+    drainDoorbell(conn);
     conn.applyOutboundRelease(lim, .pending);
     try std.testing.expectEqual(rings_before + 1, test_budget_doorbell_rings.load(.monotonic));
+    try std.testing.expect(io_queue.tryRecv(u8, &conn.doorbell) != null);
     try conn.runPendingInline();
     var got2 = HopChunks.take(hop);
     got2.ackAll(hop);
@@ -10389,4 +10614,386 @@ test "slot boot buffer: slotBootBytes is an exact fit for every mode and limits"
             try std.testing.expectError(error.OutOfMemory, bootIntoBuffer(io, lim, mode, need - 1));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// t-3594: a task that is not the actor wakes it by releasing `session_mu`.
+//
+// These tests are about the boundary, not about any named path. The task below
+// changes a value that no ring site writes and calls no `ring`, and the parked
+// stand-in for the actor must still wake. A handler path written next year
+// passes or fails here exactly as the paths of today do.
+
+/// What the "handler" changes under the lock.
+var release_probe: std.atomic.Value(usize) = .init(0);
+var stand_in_parked: std.atomic.Value(bool) = .init(false);
+
+const ReleaseWay = enum { cancelable, uncancelable, error_return };
+
+fn releaseThenFail(conn: *Connection) !void {
+    try conn.lockSession();
+    defer conn.unlockSession(conn.config.io);
+    release_probe.store(42, .release);
+    return error.Boom;
+}
+
+/// The only thing it does to tell the actor is to release the lock.
+fn releasingTask(conn: *Connection, way: ReleaseWay) void {
+    switch (way) {
+        .cancelable => {
+            conn.lockSession() catch return;
+            defer conn.unlockSession(conn.config.io);
+            release_probe.store(42, .release);
+        },
+        .uncancelable => {
+            conn.lockSessionUncancelable(conn.config.io);
+            defer conn.unlockSession(conn.config.io);
+            release_probe.store(42, .release);
+        },
+        .error_return => releaseThenFail(conn) catch {},
+    }
+}
+
+/// A select on the doorbell and a timeout. The timeout is a failure.
+fn parkedStandIn(conn: *Connection) !void {
+    const limit: zio.Timeout = .{ .duration = .fromMilliseconds(5000) };
+    stand_in_parked.store(true, .release);
+    const winner = try zio.select(.{
+        .bell = conn.doorbell.asyncReceive(),
+        .timer = limit,
+    });
+    switch (winner) {
+        .bell => |r| _ = try r,
+        .timer => return error.LostWake,
+    }
+    try std.testing.expectEqual(@as(usize, 42), release_probe.load(.acquire));
+}
+
+fn drainDoorbell(conn: *Connection) void {
+    while (io_queue.tryRecv(u8, &conn.doorbell)) |_| {}
+}
+
+fn releaseWakesScenario(rt: *zio.Runtime, gpa: std.mem.Allocator, way: ReleaseWay) !void {
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, rt.io());
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    drainDoorbell(conn);
+    release_probe.store(0, .release);
+    stand_in_parked.store(false, .release);
+
+    var actor = try rt.spawn(parkedStandIn, .{conn});
+    while (!stand_in_parked.load(.acquire)) try zio.sleep(.fromMilliseconds(1));
+    // The stand-in is on its way into the select; give it time to be in it, so
+    // that the wake has to reach a parked task. (A ring that came before the
+    // park would pass too: the doorbell keeps its token. That is the point of
+    // it, and not what this waits for.)
+    try zio.sleep(.fromMilliseconds(20));
+    var handler = try rt.spawn(releasingTask, .{ conn, way });
+    handler.join();
+    try actor.join();
+}
+
+fn releaseWakesCase(way: ReleaseWay) !void {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(2),
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(releaseWakesScenario, .{ rt, gpa, way });
+    try h.join();
+}
+
+test "release wake: a release by a task that is not the actor leaves a wake that a parked or parking actor receives (lockSession)" {
+    try releaseWakesCase(.cancelable);
+}
+
+test "release wake: a release by a task that is not the actor leaves a wake that a parked or parking actor receives (lockSessionUncancelable)" {
+    try releaseWakesCase(.uncancelable);
+}
+
+test "release wake: a deferred unlock on an error return leaves a wake that a parked or parking actor receives" {
+    try releaseWakesCase(.error_return);
+}
+
+fn markerScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var trap_a: TrapHop = undefined;
+    try openTrapHop(&trap_a, gpa, rt.io());
+    defer trap_a.close();
+    var trap_b: TrapHop = undefined;
+    try openTrapHop(&trap_b, gpa, rt.io());
+    defer trap_b.close();
+    const a = &trap_a.hop.conn;
+    const b = &trap_b.hop.conn;
+    const io = rt.io();
+    drainDoorbell(a);
+    drainDoorbell(b);
+    const count_0 = a.releases_rung_max.load(.seq_cst);
+
+    var node: @TypeOf(actor_marker).Node = .unset;
+
+    // Bound to this connection: the task is its actor, and an unlock rings
+    // nothing.
+    actor_marker.set(&node, a);
+    a.lockSessionUncancelable(io);
+    a.unlockSession(io);
+    actor_marker.clear(&node);
+    try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(u8, &a.doorbell));
+    try std.testing.expectEqual(count_0, a.releases_rung_max.load(.seq_cst));
+
+    // Bound to ANOTHER connection: still not this one's actor, so it rings.
+    actor_marker.set(&node, b);
+    a.lockSessionUncancelable(io);
+    a.unlockSession(io);
+    actor_marker.clear(&node);
+    try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &a.doorbell));
+    try std.testing.expectEqual(count_0 + 1, a.releases_rung_max.load(.seq_cst));
+    // And it rang only a: b was neither locked nor rung.
+    try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(u8, &b.doorbell));
+}
+
+test "release wake: an unlock by the actor's own task rings nothing; bound to another connection it rings" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(1),
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(markerScenario, .{ rt, gpa });
+    try h.join();
+}
+
+fn coalesceScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, rt.io());
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    const io = rt.io();
+    drainDoorbell(conn);
+
+    // Repeated releases with the doorbell full return (a ring that blocked
+    // would hang this test) and leave one token.
+    for (0..5) |_| {
+        conn.lockSessionUncancelable(io);
+        conn.unlockSession(io);
+    }
+    try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &conn.doorbell));
+    // After the token is consumed, the next release makes a fresh one.
+    try std.testing.expect(io_queue.tryRecv(u8, &conn.doorbell) != null);
+    try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(u8, &conn.doorbell));
+    conn.lockSessionUncancelable(io);
+    conn.unlockSession(io);
+    try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &conn.doorbell));
+}
+
+test "release wake: releases coalesce on a full bell and make a fresh token once it is consumed" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(1),
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(coalesceScenario, .{ rt, gpa });
+    try h.join();
+}
+
+fn selfDispatchScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, rt.io(), &routes);
+    defer trap.close();
+    const hop = &trap.hop;
+    const conn = &hop.conn;
+    const io = rt.io();
+    try hop.preparePreface();
+
+    // This task is the actor, as far as `unlockSession` can tell, so its unlock
+    // rings nothing. The token below can only be the ring in `tryDispatch`,
+    // which is kept for exactly this case: the actor queues a complete job
+    // after its turn's check, and nothing else tells it.
+    var node: @TypeOf(actor_marker).Node = .unset;
+    actor_marker.set(&node, conn);
+    defer actor_marker.clear(&node);
+    drainDoorbell(conn);
+    {
+        conn.lockSessionUncancelable(io);
+        defer conn.unlockSession(io);
+        conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try conn.session.ingest(hopRequestFrame(&req, 1));
+        try conn.processIntents();
+    }
+    try std.testing.expectEqual(@as(usize, 1), conn.inline_n);
+    try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &conn.doorbell));
+
+    try conn.runPendingInline();
+    var got = HopChunks.take(hop);
+    got.ackAll(hop);
+    try conn.drainPendingCompleteReceipts(false);
+    try expectBudget(conn, 0, 0);
+}
+
+test "release wake: the actor's own dispatch of a complete job rings its bell (the ring unlockSession does not replace)" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(1),
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(selfDispatchScenario, .{ rt, gpa });
+    try h.join();
+}
+
+// The park audit and the ring/count race (t-3594, round 2). One thread, and the
+// two interleavings that matter are made by the hook `unlockSession` calls on
+// each side of its ring.
+
+var hook_target: ?*Connection = null;
+var hook_false_alarm = false;
+/// How many times each hook point ran for the target. The cases assert them:
+/// a case that passes with its hook never called proves nothing.
+var hook_entries: [3]usize = @splat(0);
+
+/// The actor was parked. The ring has handed it the token: it takes it (only a
+/// `.bell` arm takes one) and starts a new turn, reading the count. The
+/// handler's last counter lands AFTER this.
+fn actorTakesTokenAfterRing(conn: *Connection, point: ReleasePoint) void {
+    if (conn != hook_target or point != .after_ring) return;
+    hook_entries[@intFromEnum(point)] += 1;
+    std.debug.assert(io_queue.tryRecv(u8, &conn.doorbell) != null);
+    conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
+}
+
+/// The actor looks for a lost wake after the release started and before its
+/// ring.
+fn actorLooksBeforeRing(conn: *Connection, point: ReleasePoint) void {
+    if (conn != hook_target or point != .before_ring) return;
+    hook_entries[@intFromEnum(point)] += 1;
+    if (conn.lostWakeSince(conn.releases_at_turn_top)) hook_false_alarm = true;
+}
+
+/// Between the pre-park check and the select, a release starts and never rings.
+fn releaseWithoutRingAfterCheck(conn: *Connection, point: ReleasePoint) void {
+    if (conn != hook_target or point != .park_after_check) return;
+    hook_entries[@intFromEnum(point)] += 1;
+    conn.releaseRung(conn.releaseStarted());
+}
+
+/// Release A rings and is slow to publish. The actor takes A's token and
+/// snapshots. Release B starts, skips its ring and publishes. The check runs now,
+/// before A's publish.
+var overlap_caught = false;
+fn overlapHook(conn: *Connection, point: ReleasePoint) void {
+    if (conn != hook_target or point != .after_ring) return;
+    hook_entries[@intFromEnum(point)] += 1;
+    std.debug.assert(io_queue.tryRecv(u8, &conn.doorbell) != null);
+    conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
+    conn.releaseRung(conn.releaseStarted());
+    overlap_caught = conn.lostWakeSince(conn.releases_at_turn_top);
+}
+
+fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var trap: TrapHop = undefined;
+    try openTrapHop(&trap, gpa, rt.io());
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    const io = rt.io();
+    hook_target = conn;
+    defer {
+        test_release_hook = null;
+        hook_target = null;
+    }
+
+    // 1. The ring hands the token to the actor, which snapshots; then the
+    //    handler's counter lands. Legal, and must not look like a lost wake.
+    hook_entries = @splat(0);
+    drainDoorbell(conn);
+    conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
+    test_release_hook = actorTakesTokenAfterRing;
+    conn.lockSessionUncancelable(io);
+    conn.unlockSession(io);
+    test_release_hook = null;
+    // The forced schedule ran: the hook was entered once, the actor took the
+    // token (the doorbell is empty), and the release still counted.
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.after_ring)]);
+    try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(u8, &conn.doorbell));
+    try std.testing.expectEqual(conn.releases_started.load(.seq_cst), conn.releases_rung_max.load(.seq_cst));
+    try std.testing.expect(!conn.wakeAuditFailed());
+    try std.testing.expect(!conn.parkCheckFailed());
+
+    // 2. The actor looks between the release's start and its ring. Legal.
+    drainDoorbell(conn);
+    hook_false_alarm = false;
+    conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
+    test_release_hook = actorLooksBeforeRing;
+    conn.lockSessionUncancelable(io);
+    conn.unlockSession(io);
+    test_release_hook = null;
+    // The hook ran once, between the start and the ring, and the ring then made
+    // the token (the doorbell holds one).
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.before_ring)]);
+    try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &conn.doorbell));
+    try std.testing.expect(!hook_false_alarm);
+    try std.testing.expect(!conn.wakeAuditFailed());
+
+    // 3. The converse. A release after the snapshot whose ring never happens
+    //    (counted without the ring, through the same counters the unlock uses)
+    //    is a lost wake, and the audit returns it instead of crashing.
+    drainDoorbell(conn);
+    const snapshot = conn.releases_started.load(.seq_cst);
+    conn.releaseRung(conn.releaseStarted());
+    try std.testing.expect(conn.lostWakeSince(snapshot));
+    // The same release with its ring is not.
+    conn.ring();
+    try std.testing.expect(!conn.lostWakeSince(snapshot));
+    // A release that started BEFORE the snapshot is never one, ring or no ring.
+    drainDoorbell(conn);
+    try std.testing.expect(!conn.lostWakeSince(conn.releases_started.load(.seq_cst)));
+
+    // 4. The schedule a snapshot taken at the park absorbs. The pre-park check
+    //    passes; THEN a release starts and never rings; then the actor wakes by
+    //    something that is not the doorbell. The wake audit must see it. (With
+    //    the park snapshot loaded after the check, as in round 2, it is inside
+    //    the snapshot and this fails.)
+    hook_entries = @splat(0);
+    drainDoorbell(conn);
+    conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
+    test_release_hook = releaseWithoutRingAfterCheck;
+    const check_failed = conn.parkCheckFailed();
+    test_release_hook = null;
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.park_after_check)]);
+    try std.testing.expect(!check_failed);
+    try std.testing.expect(conn.wakeAuditFailed());
+
+    // 5. Two releases overlap. A rings and is slow to publish; the actor takes
+    //    A's token and snapshots; B skips its ring and publishes; the check runs
+    //    BEFORE A's publish lands. B must be seen then, and after A's publish.
+    //    (An anonymous count of published releases is 1 here, not above the
+    //    snapshot, and misses it.)
+    hook_entries = @splat(0);
+    overlap_caught = false;
+    drainDoorbell(conn);
+    test_release_hook = overlapHook;
+    conn.lockSessionUncancelable(io);
+    conn.unlockSession(io);
+    test_release_hook = null;
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.after_ring)]);
+    try std.testing.expect(overlap_caught);
+    try std.testing.expect(conn.wakeAuditFailed());
+}
+
+test "park audit: the ring and the count race both ways without a false alarm, and a skipped ring is returned" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .executors = .exact(1),
+    });
+    defer rt.deinit();
+    var h = try rt.spawn(interleaveScenario, .{ rt, gpa });
+    try h.join();
 }
