@@ -94,6 +94,8 @@ var data_bytes: std.atomic.Value(usize) = .init(held_data_bytes);
 /// slot. The bare flush barriers fill the stash (as in t3567_tls_barriers.zig),
 /// and the barrier of a handler that waits for room is not taken.
 var bare_flush: std.atomic.Value(bool) = .init(false);
+/// `bare_flush` handlers inside a flush right now.
+var flushing: std.atomic.Value(usize) = .init(0);
 /// `refused_end`: the handlers wait for this, then send an empty response.
 var empty_gate: std.atomic.Value(bool) = .init(false);
 var empty_entered: std.atomic.Value(usize) = .init(0);
@@ -113,6 +115,7 @@ fn resetGlobals() void {
     data_gate.store(false, .release);
     data_bytes.store(held_data_bytes, .release);
     bare_flush.store(false, .release);
+    flushing.store(0, .release);
     empty_gate.store(false, .release);
     empty_entered.store(0, .release);
     empty_sent.store(0, .release);
@@ -137,9 +140,16 @@ fn stall(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerr
     _ = started.fetchAdd(1, .acq_rel);
     while (!data_gate.load(.acquire)) try zio.sleep(.fromMilliseconds(2));
     if (bare_flush.load(.acquire) and index % 2 == 0) {
-        // Waits for its barrier to be written, which the stall never does: it
-        // returns with an error when the connection ends.
-        try body.flush();
+        // A barrier pushed before the socket stops moving is written at once,
+        // and its flush returns; flush again until one waits. Once the stall
+        // holds, a flush waits for good (it returns with an error when the
+        // connection ends), and its barrier keeps its stash slot.
+        while (true) {
+            _ = flushing.fetchAdd(1, .acq_rel);
+            defer _ = flushing.fetchSub(1, .acq_rel);
+            try body.flush();
+            try zio.sleep(.fromMilliseconds(2));
+        }
     } else {
         const chunk: [stalled_data_bytes]u8 = @splat('x');
         try body.writeAll(chunk[0..data_bytes.load(.acquire)]);
@@ -509,6 +519,8 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         data_gate.store(true, .release);
         const writers = if (transport == .tls) m / 2 else m;
         try waitFor("every writer to write its DATA", atLeast(&wrote, writers), reached);
+        // On TLS the stash is full for good only once every flusher waits.
+        if (transport == .tls) try waitFor("every flusher to wait", atLeast(&flushing, m - writers), reached);
         try waitFor("the control pause", pauses_0, struct {
             fn f(p0: u64) bool {
                 return conn_mod.test_control_pause_seen.load(.monotonic) > p0;
