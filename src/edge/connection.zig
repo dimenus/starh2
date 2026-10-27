@@ -10251,9 +10251,11 @@ test "the terminal ring, the pool's terminal share and the frame store all hold 
 }
 
 /// Limits for M streams per connection, with the server-wide caps and the
-/// intent queue raised to what boot asks for M.
+/// intent queue raised to what boot asks for M. At the default M they are the
+/// defaults, untouched, so the tests check the default intent queue too.
 fn limitsForStreams(m: usize) !limits_mod.Limits {
     var lim = limits_mod.Limits.defaults;
+    if (m == lim.max_streams_per_connection) return lim;
     lim.max_streams_per_connection = m;
     lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
     lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
