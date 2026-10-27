@@ -1298,6 +1298,39 @@ fn testPool(gpa: std.mem.Allocator, slab_bytes: usize, capacity: usize) !slab_po
     return slab_pool.SlabPool.init(gpa, std.testing.io, slab_bytes, capacity);
 }
 
+test "terminal frames fit their whole share with the ordinary share pinned, and not one more (t-3562)" {
+    // The pool half of the bound, with no timing: frames already in flight pin
+    // the ordinary share (a `forgetStream` cannot give them back), and the
+    // terminal share must still take T frames. The terminal ring and the pool
+    // are one argument, so the first refusal past T is whichever fills first.
+    const gpa = std.testing.allocator;
+    const terminal = 7;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 16, 13 * terminal, terminal, 8, &pool);
+    defer sched.deinit();
+    var i: usize = 0;
+    while (i < 16) : (i += 1) try std.testing.expect(sched.ctrl.tryReserveOrdinary(10));
+    try std.testing.expect(!sched.ctrl.tryReserveOrdinary(10));
+
+    var rst: [13]u8 = undefined;
+    _ = try frame.Serializer.rstStream(&rst, 1, .cancel);
+    i = 0;
+    while (i < terminal) : (i += 1) {
+        try sched.enqueueControl(try gpa.dupe(u8, &rst), .terminal, 0, 0);
+    }
+    try std.testing.expectEqual(terminal, sched.terminal_len);
+    // One more is refused, by the pool share and the ring alike.
+    const extra = try gpa.dupe(u8, &rst);
+    try std.testing.expectError(error.PoolFull, sched.enqueueControl(extra, .terminal, 0, 0));
+    // The ordinary share is untouched by terminal frames.
+    try std.testing.expectEqual(@as(usize, 16), sched.ctrl.entries_held.load(.acquire));
+    // A pop gives its share back, so the next terminal frame fits.
+    const popped = sched.popTerminal().?;
+    sched.freePayload(popped.payload);
+    try sched.enqueueControl(try gpa.dupe(u8, &rst), .terminal, 0, 0);
+}
+
 test "scheduler queues own payloads and hold control until complete" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
