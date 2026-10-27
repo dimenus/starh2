@@ -47,6 +47,12 @@
 //! refused must still end for the peer: the client must read, for every
 //! stream, either its HEADERS or an RST_STREAM, before a deadline.
 //!
+//! `flood_unread`: the same flood, but the client never reads again, so the
+//! GOAWAY can never be written and only the closing deadline
+//! (`close_flush_timeout_ns`, 1 s here) can end the connection. The server's
+//! live connection count must reach zero by that deadline, measured from the
+//! moment the ring reached T, which is after the GOAWAY was queued.
+//!
 //! Run it with `./zb build test-t3562` (it is also part of `./zb build test`).
 const std = @import("std");
 const zio = @import("zio");
@@ -377,17 +383,23 @@ fn holdEntered(transport: Transport) u64 {
     };
 }
 
-const Scenario = enum { server_failures, flood, crossed_resets };
+const Scenario = enum { server_failures, flood, flood_unread, crossed_resets };
+
+/// `flood_unread`'s closing deadline, and the slack the measurement allows
+/// above it: the actor checks the deadline on its own turn.
+const unread_close_ns = std.time.ns_per_s;
+const unread_close_slack_ns = std.time.ns_per_s;
 
 /// `refused_end`: streams, and the ordinary share their final HEADERS meet.
 const refused_end_streams = 32;
 const refused_end_share = 8;
 
-fn limitsFor() starh2.Limits {
+fn limitsFor(scenario: Scenario) starh2.Limits {
     var limits = starh2.Limits.defaults;
     // The flood's final GOAWAY is written after the stall; the closing
-    // deadline must outlast the test's own waits.
-    limits.close_flush_timeout_ns = 6 * std.time.ns_per_s;
+    // deadline must outlast the test's own waits, except where it is what
+    // the scenario measures.
+    limits.close_flush_timeout_ns = if (scenario == .flood_unread) unread_close_ns else 6 * std.time.ns_per_s;
     // The ordinary share holds a frame until its write completes, so M HEADERS
     // in flight plus the server preface, the SETTINGS ack and a WINDOW_UPDATE
     // fill a share of exactly M: with `control_entries_per_connection` = M, one
@@ -442,7 +454,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         gpa.free(cert);
         gpa.free(key);
     }
-    const limits = limitsFor();
+    const limits = limitsFor(scenario);
     const m = limits.max_streams_per_connection;
     const t_frames = try limits.terminalFrames();
     try std.testing.expectEqual(m + 3, t_frames);
@@ -471,7 +483,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         .transport = transport,
         .port = server.localAddress(0).getPort(),
         .streams = m,
-        .flood = if (scenario == .flood) m + 40 else 0,
+        .flood = if (scenario == .flood or scenario == .flood_unread) m + 40 else 0,
         .rcvbuf = if (stalls_by_reading) stall_rcvbuf else null,
     };
     const t = try std.Thread.spawn(.{}, clientMain, .{&c});
@@ -518,6 +530,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     }
 
     var bound_ns: u64 = 0;
+    var closed_ns: u64 = 0;
     switch (scenario) {
         .server_failures => {
             // M server RSTs, then the graceful GOAWAY.
@@ -535,7 +548,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             // shutdown, so the GOAWAY is queued when the hold ends.
             if (transport == .h2c) try waitFor("the graceful GOAWAY in the ring", m + 1, ringAtLeast);
         },
-        .flood => {
+        .flood, .flood_unread => {
             c.send_flood.store(true, .release);
             try waitFor("the client to send the flood", &c, struct {
                 fn f(x: *Client) bool {
@@ -552,6 +565,22 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
                 return err;
             };
             bound_ns = nowNs();
+            if (scenario == .flood_unread) {
+                // Nothing can be written: only the closing deadline ends it.
+                // (h2c ends sooner: its writer is torn down about 100 ms after
+                // the GOAWAY is queued, close reason write_failed/ack_fail_all.
+                // This bound is an upper one.)
+                const Live = struct { server: *starh2.Server };
+                waitFor("the connection to close", Live{ .server = &server }, struct {
+                    fn f(x: Live) bool {
+                        return x.server.active_connections.load(.acquire) == 0;
+                    }
+                }.f) catch |err| {
+                    std.debug.print("T3562-unread-timeout live={d} after {d} ms\n", .{ server.active_connections.load(.acquire), (nowNs() - bound_ns) / std.time.ns_per_ms });
+                    return err;
+                };
+                closed_ns = nowNs();
+            }
         },
         .crossed_resets => {
             abort_gate.store(true, .release);
@@ -578,7 +607,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     }
     const rst_paused = conn_mod.test_rst_queued_paused.load(.monotonic) - rst_paused_0;
     const high_held = conn_mod.test_terminal_ring_high.load(.acquire);
-    std.debug.print("T3562-held transport={s} scenario={s} m={d} t={d} ring_high={d} rst_paused={d} terminal_full={d}\n", .{ @tagName(transport), @tagName(scenario), m, t_frames, high_held, rst_paused, conn_mod.test_ctrl_terminal_full.load(.monotonic) - full_0 });
+    std.debug.print("T3562-held transport={s} scenario={s} m={d} t={d} ring_high={d} rst_paused={d} terminal_full={d} unread_close_ms={d}\n", .{ @tagName(transport), @tagName(scenario), m, t_frames, high_held, rst_paused, conn_mod.test_ctrl_terminal_full.load(.monotonic) - full_0, if (closed_ns != 0) (closed_ns - bound_ns) / std.time.ns_per_ms else 0 });
 
     hold(transport, false);
     c.read_gate.store(true, .release);
@@ -603,6 +632,18 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         if (c.err) |e| @errorName(e) else "-",          c.frames[0],        c.frames[1],
     });
 
+    if (scenario == .flood_unread) {
+        // The server closed with bytes the client never read. What the client
+        // reads now, if anything, is not the claim here.
+        try std.testing.expectEqual(t_frames, high_held);
+        try std.testing.expectEqual(t_frames - 1, rst_paused);
+        try std.testing.expectEqual(@as(usize, 0), full);
+        try std.testing.expect(closed_ns - bound_ns <= unread_close_ns + unread_close_slack_ns);
+        server.requestShutdown();
+        serve_handle.join() catch {};
+        serving = false;
+        return;
+    }
     if (c.err) |e| return e;
     // The slack was enough: no ordinary frame was refused by the pool.
     try std.testing.expectEqual(ordinary_full_0, conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic));
@@ -640,6 +681,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             // the GOAWAY was queued, at or before `bound_ns`.
             try std.testing.expect(c.eof_ns - bound_ns <= limits.close_flush_timeout_ns);
         },
+        .flood_unread => unreachable,
         .crossed_resets => {
             // All 2M RSTs were queued during the stall, and every crossed one
             // was retired before it was written.
@@ -788,6 +830,14 @@ test "flood during a stall, h2c: past T the connection ends with GOAWAY(ENHANCE_
 
 test "flood during a stall, tls: past T the connection ends with GOAWAY(ENHANCE_YOUR_CALM)" {
     try runCaseTop(.tls, .flood);
+}
+
+test "flood during a stall that never ends, h2c: the closing deadline ends the connection" {
+    try runCaseTop(.h2c, .flood_unread);
+}
+
+test "flood during a stall that never ends, tls: the closing deadline ends the connection" {
+    try runCaseTop(.tls, .flood_unread);
 }
 
 test "crossed resets during a stall, h2c: the peer's RSTs retire the server's unwritten ones, and M new failures fit" {
