@@ -1007,25 +1007,33 @@ pub const Session = struct {
     /// unwritten is for a DISTINCT stream the peer cannot have closed, because
     /// the RST is what closes it, so a well-behaved peer (at most
     /// `max_streams_per_connection` streams open in its view) never has more
-    /// than M of them. The three cases:
+    /// than M of them. The cases:
     /// - A stream in the map is open for the peer unless it is `.closed`.
-    /// - A stream not in the map was either closed (it has a tombstone: a
-    ///   normal end, a peer RST, or an RST this server queued) or was refused
-    ///   before it was admitted. A refused stream has no map entry, so
-    ///   `emitRst` tombstones it when it queues the RST, and a second refusal
-    ///   of the same id finds the tombstone.
+    /// - A stream with a tombstone ended (`Ending`): only one whose final
+    ///   HEADERS the edge refused is still open for the peer.
+    /// - A stream with neither is either a NEW id the caller is refusing before
+    ///   it was admitted (`target` = `.new`: the peer just opened it), or one
+    ///   whose tombstone was evicted from the bounded ring (a delayed reset of
+    ///   a stream that ended long ago). Absence alone cannot tell the two
+    ///   apart, so only the refusal paths, which know, may queue an RST for an
+    ///   absent id. The RST then tombstones it, and a second refusal of the
+    ///   same id finds that.
     /// - Once `terminal` is set the GOAWAY already covers every stream, and
     ///   more RSTs would only use the room the final GOAWAY was kept.
-    /// A tombstone evicted from the bounded ring can let a very old closed id
-    /// pass this test. Only a server-side reset of a stream that long gone
-    /// reaches it (the peer cannot name such an id: HEADERS on it is a
-    /// connection error), and the flood limit still bounds the result.
-    fn rstOwed(self: *Session, stream_id: u31) bool {
+    fn rstOwed(self: *Session, stream_id: u31, target: RstTarget) bool {
         if (self.terminal != .none) return false;
         if (self.streams.getPtr(stream_id)) |s| return s.state != .closed;
         if (self.tombstonePtr(stream_id)) |t| return t.ending == .end_refused;
-        return true;
+        return target == .new;
     }
+
+    /// What the caller of `queueRst` knows about the stream it resets.
+    const RstTarget = enum {
+        /// A stream this connection admitted: in the map, or ended.
+        known,
+        /// A new id the peer just opened, refused before it was admitted.
+        new,
+    };
 
     /// The edge refused a HEADERS with END_STREAM for `stream_id`. Queuing it
     /// ended the stream here (`cmdHeaders`: `localEndStream`, then the
@@ -1052,6 +1060,16 @@ pub const Session = struct {
     /// holds more unwritten terminal frames than a well-behaved peer can
     /// (`Limits.terminalFrames`): the connection ends with ENHANCE_YOUR_CALM.
     fn emitRst(self: *Session, stream_id: u31, code: frame.ErrorCode) !void {
+        return self.queueRst(stream_id, code, .known);
+    }
+
+    /// Refuse a stream the peer just opened, before it is admitted: there is
+    /// no map entry and no tombstone, and the RST is owed (`rstOwed`).
+    fn refuseStream(self: *Session, stream_id: u31) !void {
+        return self.queueRst(stream_id, .refused_stream, .new);
+    }
+
+    fn queueRst(self: *Session, stream_id: u31, code: frame.ErrorCode, target: RstTarget) !void {
         // An RST takes two intents (the frame and the local reset). The
         // connection error that ends a flood takes the two terminal intents
         // (GOAWAY and connection_error, which sit in the reserve and move the
@@ -1063,8 +1081,8 @@ pub const Session = struct {
         // means a peer past the bound, answered like any other flood.
         var queued = false;
         if (self.ordinaryIntentRoom() < limits_mod.RST_INTENT_ROOM) {
-            if (self.rstOwed(stream_id)) try self.failConnection(.enhance_your_calm);
-        } else if (self.rstOwed(stream_id)) {
+            if (self.rstOwed(stream_id, target)) try self.failConnection(.enhance_your_calm);
+        } else if (self.rstOwed(stream_id, target)) {
             var buf: [13]u8 = undefined;
             const n = try frame.Serializer.rstStream(&buf, stream_id, code);
             if (self.controlFrame(buf[0..n], .terminal)) |p| {
@@ -1622,7 +1640,7 @@ pub const Session = struct {
         } else {
             if (self.goaway_ceiling) |ceil| {
                 if (hdr.stream_id > ceil) {
-                    try self.emitRst(hdr.stream_id, .refused_stream);
+                    try self.refuseStream(hdr.stream_id);
                     return;
                 }
             }
@@ -1744,13 +1762,13 @@ pub const Session = struct {
         if (s_ptr == null) {
             if (self.active_streams >= self.limits.max_streams_per_connection) {
                 self.dropDecoded(stream_id, decoded, scratch_status != null);
-                try self.emitRst(stream_id, .refused_stream);
+                try self.refuseStream(stream_id);
                 return;
             }
             if (self.stream_hooks) |h| {
                 if (!h.tryAdmit(h.ctx)) {
                     self.dropDecoded(stream_id, decoded, scratch_status != null);
-                    try self.emitRst(stream_id, .refused_stream);
+                    try self.refuseStream(stream_id);
                     return;
                 }
             }
@@ -2410,12 +2428,34 @@ test "a refused stream has no map entry, and is reset once because the RST tombs
     var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     _ = countTerminalIntents(gpa, &session);
-    try session.emitRst(7, .refused_stream);
-    try session.emitRst(7, .refused_stream);
+    try session.refuseStream(7);
+    try session.refuseStream(7);
     const c = countTerminalIntents(gpa, &session);
     try std.testing.expectEqual(@as(usize, 1), c.rst);
     try std.testing.expectEqual(@as(usize, 2), c.stream_reset);
     try std.testing.expect(session.isTombstoned(7));
+}
+
+test "a delayed reset of a stream whose tombstone was evicted queues no RST, and its local half still runs (t-3562)" {
+    const gpa = std.testing.allocator;
+    var limits = limits_mod.Limits.defaults;
+    limits.stream_tombstones = 2;
+    var session = try Session.init(gpa, gpa, limits);
+    defer session.deinit();
+    _ = countTerminalIntents(gpa, &session);
+    // Three streams end normally; the ring keeps the last two.
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        try openTestStream(&session, sid);
+        try session.applyCommand(.{ .respond_headers = .{ .stream_id = sid, .status = 204, .headers = &.{}, .end_stream = true } });
+    }
+    try std.testing.expect(!session.isTombstoned(1));
+    _ = countTerminalIntents(gpa, &session);
+    // A handler's reset that arrives late, for the evicted stream 1: the peer
+    // counts it closed, and absence is not a refusal.
+    try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 0), c.rst);
+    try std.testing.expectEqual(@as(usize, 1), c.stream_reset);
 }
 
 test "each GOAWAY role is queued at most once (t-3562)" {

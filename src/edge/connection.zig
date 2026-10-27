@@ -7573,15 +7573,16 @@ pub const Connection = struct {
                         job.resp.send(status, &.{}, "internal error") catch {};
                     } else if (!job.resp.finished) {
                         self.withSession(struct {
-                            fn go(c: *Connection, sid: u31) void {
+                            fn go(c: *Connection, at: DelayedReset) void {
                                 if (diag_park) _ = diag_rst_handler.fetchAdd(1, .monotonic);
                                 // A concurrently terminal stream needs no second reset.
-                                c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
+                                if (!at.stillOwed()) return;
+                                c.session.applyCommand(.{ .reset_stream = .{ .stream_id = at.stream_id, .code = .internal_error } }) catch {};
                                 // Swallowing OOM here left RST-tombstoned DATA in
                                 // the scheduler and the connection up — the TLS stall.
                                 c.processIntents() catch c.failClosedOnIntentError();
                             }
-                        }.go, job.stream_id);
+                        }.go, DelayedReset{ .stream_id = job.stream_id, .terminal = &job.slot.terminal });
                     }
                 };
                 if (job.slot.terminal.getCause() == null and !job.resp.committed) {
@@ -7891,6 +7892,22 @@ pub const Connection = struct {
         }
         if (canceled) return error.Canceled;
     }
+
+    /// A handler's reset of its own stream after a failure, which reaches
+    /// `session_mu` late: the stream may have ended meanwhile (the peer reset
+    /// it, the slow-consumer sweep did, the connection is closing), and its
+    /// tombstone may since have been evicted, so Session's state alone cannot
+    /// say whether the peer still counts it open (`Session.rstOwed` refuses an
+    /// absent id). The slot's terminal cause, read under the lock, can: any
+    /// cause means the stream already ended or is ending.
+    const DelayedReset = struct {
+        stream_id: u31,
+        terminal: *const response.SlotTerminal,
+
+        fn stillOwed(self: DelayedReset) bool {
+            return self.terminal.getCause() == null;
+        }
+    };
 
     fn withSession(self: *Connection, comptime f: anytype, arg: anytype) void {
         self.lockSession() catch return;
@@ -8281,12 +8298,13 @@ pub const Connection = struct {
                 hctx.compressing = false;
             }
             self.withSession(struct {
-                fn go(c: *Connection, sid: u31) void {
+                fn go(c: *Connection, at: DelayedReset) void {
                     if (diag_park) _ = diag_rst_compress.fetchAdd(1, .monotonic);
-                    c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
+                    if (!at.stillOwed()) return;
+                    c.session.applyCommand(.{ .reset_stream = .{ .stream_id = at.stream_id, .code = .internal_error } }) catch {};
                     c.processIntents() catch c.failClosedOnIntentError();
                 }
-            }.go, stream_id);
+            }.go, DelayedReset{ .stream_id = stream_id, .terminal = hctx.terminal });
             return error.WriteFailed;
         };
     }
