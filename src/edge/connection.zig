@@ -325,6 +325,12 @@ pub var test_closing_ended_peer_eof: std.atomic.Value(usize) = .init(0);
 /// and whose send side was then shut, to wait for the peer (the lingering
 /// close in `closeFlushed`).
 pub var test_closing_write_shut: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): HTTP/2 connections whose socket was closed,
+/// and when the last one was (`zio.Timestamp` monotonic ns, the clock the
+/// tests read). Written at the close itself, so a test can tell when the
+/// server let go of the peer, whatever the closing phase decided.
+pub var test_socket_closes: std.atomic.Value(usize) = .init(0);
+pub var test_socket_close_ns: std.atomic.Value(u64) = .init(0);
 /// Test-only (observe builds): server RST_STREAMs dropped from the terminal
 /// ring because the peer reset the same stream first (`retireTerminalRst`).
 pub var test_rst_retired: std.atomic.Value(usize) = .init(0);
@@ -713,6 +719,11 @@ var diag_last_empty_park_ns: u64 = 0;
 /// the probe, so a plain var is enough.
 var diag_last_drain_ns: u64 = 0;
 var diag_prev_drain_gap_ns: u64 = 0;
+
+fn noteTestSocketClose() void {
+    test_socket_close_ns.store(zio.Timestamp.now(.monotonic).toNanoseconds(), .release);
+    _ = test_socket_closes.fetchAdd(1, .acq_rel);
+}
 
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
@@ -2591,6 +2602,7 @@ pub const Connection = struct {
         if (!self.socket_closed.load(.acquire)) {
             self.stream.close(io);
             self.socket_closed.store(true, .release);
+            if (comptime test_observe) noteTestSocketClose();
         }
     }
 
@@ -4194,6 +4206,7 @@ pub const Connection = struct {
             self.drainWriteAcksForced();
             if (!self.socket_closed.swap(true, .acq_rel)) {
                 self.stream.close(io);
+                if (comptime test_observe) noteTestSocketClose();
             }
         }
 
@@ -10928,6 +10941,45 @@ test "an error exit from ingest materializes what the read queued before the unl
     try std.testing.expectError(error.OutOfMemory, trapIngest(conn, &wire));
     try std.testing.expectEqual(@as(usize, 0), conn.session.intentLen());
     try std.testing.expectEqual(ordinary_0 + 1, conn.sched.ordinary_len);
+}
+
+test "a failed round does not stop the next: intents a refusal queued are materialized before the unlock (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // Both shares held. The terminal one is forced: the terminal store, ring
+    // and share hold the same T, so a terminal frame the store built always
+    // finds a share entry; holding the share alone stands for any round that
+    // fails while the session queue has more to give.
+    const caps = conn.sched.ctrl.ordinaryCaps();
+    const pinned = caps.entries - conn.sched.ctrl.entries_held.load(.acquire);
+    for (0..pinned) |_| try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(1));
+    var t_pinned: usize = 0;
+    while (conn.sched.ctrl.tryReserveTerminal(1)) t_pinned += 1;
+    defer {
+        conn.sched.ctrl.release(pinned, pinned);
+        for (0..t_pinned) |_| conn.sched.ctrl.releaseTerminal(1);
+    }
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        // The unlock panics in a safe build if a round was skipped.
+        defer conn.unlockSession(conn.config.io);
+        for ([_]u31{ 1, 3 }) |sid| {
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        // Round 1: stream 1's final HEADERS is refused (its RST goes to the
+        // session queue, for round 2), then stream 3's RST fails the round.
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 204, .headers = &.{}, .end_stream = true, .ticket = .none } });
+        try conn.session.applyCommand(.{ .reset_stream = .{ .stream_id = 3, .code = .cancel } });
+        try std.testing.expectError(error.OutOfMemory, conn.materializeIntents());
+        try std.testing.expectEqual(@as(usize, 0), conn.session.intentLen());
+    }
+    try std.testing.expect(conn.writer_failed.load(.acquire));
 }
 
 /// M server RSTs wait in the terminal ring (the drain is held), then one

@@ -15,13 +15,12 @@
 //!   ids the scenario expects, one each, the GOAWAY(s), then EOF.
 //!
 //! `server_failures`: M streams start their responses, the writer is held
-//! (`wire_pump.test_hold_writes` on h2c, `test_hold_stash` on TLS) and the
-//! handlers' DATA fills the write memory, every handler aborts (M server
-//! RSTs), and a graceful shutdown queues its GOAWAYs. Before t-3562 the 33rd
-//! abort overflowed the 32-entry ring. On h2c all M RSTs and the graceful
-//! GOAWAY wait in the ring together. The TLS hold parks the actor: the RSTs
-//! (from handlers) still wait, but the first ones reach the stash before it
-//! is full, and the GOAWAY (from the actor) is queued after the hold.
+//! (`wire_pump.test_hold_writes` on h2c; on TLS `test_hold_tls_take`, so the
+//! actor goes on running) and the handlers' DATA fills the write memory or
+//! the stash, which the test waits for (`test_stalled`). Then every handler
+//! aborts (M server RSTs), and a graceful shutdown queues its GOAWAYs. Before
+//! t-3562 the 33rd abort overflowed the 32-entry ring. All M RSTs and the
+//! graceful GOAWAY wait in the ring together, on both transports.
 //!
 //! The other scenarios need the actor to READ during the stall. On TLS they
 //! use the stall a real peer makes: the client stops reading (with a small
@@ -30,7 +29,9 @@
 //! reading. The writer is also held: on macOS the socket alone let a batch
 //! through every few hundred ms. h2c holds the write pump
 //! (`test_hold_writes`); TLS stops the driver taking from the stash
-//! (`test_hold_tls_take`). The actor reads during both.
+//! (`test_hold_tls_take`). The actor reads during both. What each hold proves
+//! and what it does not is at `WriterHold`; one h2c flood runs with the
+//! socket stall alone, on Linux.
 //!
 //! `crossed_resets` (h2c): every handler aborts during the stall (M server
 //! RSTs wait), then the client resets all M streams itself, so the RSTs cross,
@@ -305,6 +306,8 @@ const Client = struct {
     /// and when the client saw it.
     eof: bool = false,
     eof_ns: u64 = 0,
+    /// When the client had closed its own socket (its EOF to the server).
+    closed_ns: u64 = 0,
     /// Frames of each type the client read.
     frames: [16]usize = @splat(0),
 };
@@ -331,6 +334,8 @@ fn clientMain(c: *Client) void {
     clientRun(c) catch |err| {
         c.err = err;
     };
+    // `clientRun` closed the socket on its way out.
+    c.closed_ns = nowNs();
     c.done.store(true, .release);
 }
 
@@ -581,7 +586,24 @@ fn ringAtLeast(n: usize) bool {
     return conn_mod.test_terminal_ring_high.load(.acquire) >= n;
 }
 
-fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scenario: Scenario) !void {
+/// How a scenario that stalls by not reading holds the writer.
+///
+/// `.held` (both transports, the default): the client stops reading AND the
+/// writer is held (h2c `test_hold_writes`, TLS `test_hold_tls_take`). That
+/// proves the bounds and the ring under a stall that cannot end early,
+/// whatever the kernel does: on macOS the socket alone let a batch through
+/// every few hundred ms. It does not prove the closing path against a real
+/// kernel queue: the writer is released only when the client reads again,
+/// so the GOAWAY reaches a socket that is being read.
+///
+/// `.socket` (h2c, Linux only): no hold; only the socket stalls the writer.
+/// The GOAWAY then sits in the kernel send queue while the client sends its
+/// late PING, which is the path round 3's item 1 fixed (Linux answered data
+/// that reached a closed socket with a TCP RST and the client lost the
+/// unread GOAWAY). macOS does not hold that stall, so it is not run there.
+const WriterHold = enum { held, socket };
+
+fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scenario: Scenario, writer_hold: WriterHold) !void {
     resetGlobals();
     var cert: []u8 = &.{};
     var key: []u8 = &.{};
@@ -642,6 +664,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     const ended_failed_0 = conn_mod.test_closing_ended_writer_failed.load(.monotonic);
     const ended_eof_0 = conn_mod.test_closing_ended_peer_eof.load(.monotonic);
     const write_shut_0 = conn_mod.test_closing_write_shut.load(.monotonic);
+    const socket_closes_0 = conn_mod.test_socket_closes.load(.monotonic);
     // Every response has its HEADERS out before the stall.
     try waitStarted(&c, m);
 
@@ -654,17 +677,15 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         // (`test_stalled`), and on TLS a flush parked for stash room.
         data_bytes.store(stalled_data_bytes, .release);
         if (transport == .tls) bare_flush.store(true, .release);
-        // The writer is held as well. The socket alone did not hold the
-        // stall on macOS: after the gauge was seen, the h2c pump still
-        // completed a batch or two every 300 ms (TLS: once in 30 runs under
-        // load), and the control pause came and went. The actor still reads
-        // during both holds, which is what these scenarios need; the holds
-        // end before the client reads, so the closing path still meets the
-        // kernel queue.
-        switch (transport) {
+        // The writer is held as well (`WriterHold.held`). The socket alone
+        // did not hold the stall on macOS: after the gauge was seen, the h2c
+        // pump still completed a batch or two every 300 ms (TLS: once in 30
+        // runs under load), and the control pause came and went. The actor
+        // still reads during both holds, which is what these scenarios need.
+        if (writer_hold == .held) switch (transport) {
             .h2c => hold(.h2c, true),
             .tls => conn_mod.test_hold_tls_take.store(true, .release),
-        }
+        };
         data_gate.store(true, .release);
         const writers = if (transport == .tls) m / 2 else m;
         try waitFor("every writer to write its DATA", atLeast(&wrote, writers), reached);
@@ -676,17 +697,30 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         try waitStalled(&c);
     } else {
         // Hold the writer, then let the handlers write: the DATA fills the
-        // write memory, which pauses the terminal loop.
-        const entered_0 = holdEntered(transport);
-        hold(transport, true);
-        data_gate.store(true, .release);
-        const Entered = struct { transport: Transport, at: u64 };
-        try waitFor("the writer to enter the hold", Entered{ .transport = transport, .at = entered_0 }, struct {
-            fn f(x: Entered) bool {
-                return holdEntered(x.transport) != x.at;
-            }
-        }.f);
+        // write memory (h2c) or the stash (TLS), which pauses the terminal
+        // loop. TLS uses the take hold: the stash hold would park the actor,
+        // which then computes no stall gauge and queues nothing.
+        switch (transport) {
+            .h2c => {
+                const entered_0 = holdEntered(transport);
+                hold(transport, true);
+                data_gate.store(true, .release);
+                const Entered = struct { transport: Transport, at: u64 };
+                try waitFor("the writer to enter the hold", Entered{ .transport = transport, .at = entered_0 }, struct {
+                    fn f(x: Entered) bool {
+                        return holdEntered(x.transport) != x.at;
+                    }
+                }.f);
+            },
+            .tls => {
+                conn_mod.test_hold_tls_take.store(true, .release);
+                data_gate.store(true, .release);
+            },
+        }
         try waitFor("every handler to write its DATA", atLeast(&wrote, m), reached);
+        // And the DATA has filled the write memory, so the terminal loop is
+        // paused: the state the aborts must meet, as in the other scenarios.
+        try waitStalled(&c);
     }
 
     var bound_ns: u64 = 0;
@@ -703,10 +737,9 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
                 return err;
             };
             server.requestShutdown();
-            // On h2c phase 1's GOAWAY is queued in the same stall. On TLS the
-            // stash hold parks the actor, which is what starts the graceful
-            // shutdown, so the GOAWAY is queued when the hold ends.
-            if (transport == .h2c) try waitFor("the graceful GOAWAY in the ring", m + 1, ringAtLeast);
+            // Phase 1's GOAWAY is queued in the same stall: the actor runs
+            // during both holds.
+            try waitFor("the graceful GOAWAY in the ring", m + 1, ringAtLeast);
         },
         .flood, .flood_unread => {
             c.send_flood.store(true, .release);
@@ -828,20 +861,10 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     try std.testing.expect(c.eof);
     switch (scenario) {
         .server_failures => {
-            if (transport == .h2c) {
-                // All M RSTs and the graceful GOAWAY waited in the ring
-                // together, during the hold.
-                try std.testing.expectEqual(m, rst_paused);
-                try std.testing.expectEqual(m + 1, high_held);
-            } else {
-                // TLS proves less, and its name says so: the drain that
-                // filled the stash took the first RSTs into it before the
-                // pause (one in every run so far), and the hold parks the
-                // actor, which is what queues the graceful GOAWAY, so that
-                // GOAWAY is queued after the hold.
-                try std.testing.expect(rst_paused + 16 >= m);
-                try std.testing.expect(high_held + 16 >= m);
-            }
+            // All M RSTs and the graceful GOAWAY waited in the ring together,
+            // during the hold.
+            try std.testing.expectEqual(m, rst_paused);
+            try std.testing.expectEqual(m + 1, high_held);
             try expectRsts(&c, 1, m, 1);
             try std.testing.expectEqual(m, c.rst_total);
             try std.testing.expect(c.goaways >= 2);
@@ -870,6 +893,10 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             // the flush is what let Linux reset the late PING's connection
             // and drop the unread GOAWAY (item 1).
             try std.testing.expectEqual(write_shut_0 + 1, conn_mod.test_closing_write_shut.load(.monotonic));
+            // And the server closed its socket because the client closed
+            // (its EOF ends the lingering close), not at the closing
+            // deadline: the close counter is written at the close itself.
+            try expectClosedAfterPeer(&c, socket_closes_0, limits.close_flush_timeout_ns);
         },
         .flood_unread => unreachable,
         .crossed_resets => {
@@ -1326,18 +1353,37 @@ fn runRefusedEndTop(transport: Transport, tombstones: usize) !void {
 }
 
 fn runCaseTop(transport: Transport, scenario: Scenario) !void {
+    return runCaseHoldTop(transport, scenario, .held);
+}
+
+fn runCaseHoldTop(transport: Transport, scenario: Scenario, writer_hold: WriterHold) !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
     defer rt.deinit();
-    var h = try rt.spawn(runCase, .{ rt, gpa, transport, scenario });
+    var h = try rt.spawn(runCase, .{ rt, gpa, transport, scenario, writer_hold });
     try h.join();
+}
+
+/// The server's socket closed once, after the client closed its own, and
+/// long before the closing deadline (`deadline_ns`) would have closed it.
+fn expectClosedAfterPeer(c: *const Client, closes_0: usize, deadline_ns: u64) !void {
+    // The client is done once it closed; the server's close follows its EOF.
+    const limit = c.closed_ns + deadline_ns / 4;
+    while (conn_mod.test_socket_closes.load(.acquire) == closes_0 and nowNs() < limit) zio.sleep(.fromMilliseconds(1)) catch {};
+    try std.testing.expectEqual(closes_0 + 1, conn_mod.test_socket_closes.load(.acquire));
+    const closed = conn_mod.test_socket_close_ns.load(.acquire);
+    std.debug.print("T3562-closed raw_server={d} raw_client={d} server_close_after_client_close_ms={d} deadline_ms={d}\n", .{ closed, c.closed_ns, @divTrunc(@as(i64, @intCast(closed)) - @as(i64, @intCast(c.closed_ns)), std.time.ns_per_ms), deadline_ns / std.time.ns_per_ms });
+    // The client's timestamp is taken just after its close, so the server
+    // may close a moment before it; never a deadline's worth after.
+    try std.testing.expect(closed + 100 * std.time.ns_per_ms >= c.closed_ns);
+    try std.testing.expect(closed < c.closed_ns + deadline_ns / 4);
 }
 
 test "server failures in one stall, h2c: M aborts and the graceful GOAWAY all fit, one RST per stream" {
     try runCaseTop(.h2c, .server_failures);
 }
 
-test "server failures in one stall, tls: the M aborts' RSTs wait in the ring and the stash, one RST per stream, the graceful GOAWAY after the hold" {
+test "server failures in one stall, tls: M aborts and the graceful GOAWAY all fit, one RST per stream" {
     try runCaseTop(.tls, .server_failures);
 }
 
@@ -1347,6 +1393,13 @@ test "flood during a stall, h2c: past T the connection ends with GOAWAY(ENHANCE_
 
 test "flood during a stall, tls: past T the connection ends with GOAWAY(ENHANCE_YOUR_CALM)" {
     try runCaseTop(.tls, .flood);
+}
+
+test "flood during a real socket stall, h2c (Linux only): the GOAWAY waits in the kernel queue, the late PING does not reset it away, and the server closes when the client does" {
+    // macOS lets an h2c batch through a socket the client does not read
+    // (`WriterHold`), so the stall would not hold there.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try runCaseHoldTop(.h2c, .flood, .socket);
 }
 
 test "flood during a stall that never ends, h2c: the closing deadline ends the connection" {
