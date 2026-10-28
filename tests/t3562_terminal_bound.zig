@@ -814,7 +814,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     serving = false;
 }
 
-fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
+fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, tombstones: usize) !void {
     resetGlobals();
     var cert: []u8 = &.{};
     var key: []u8 = &.{};
@@ -826,6 +826,9 @@ fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport)
     // The preface, the SETTINGS ack and the WINDOW_UPDATE are written before
     // the hold, so the whole share is free for the responses' HEADERS.
     limits.control_entries_per_connection = refused_end_share;
+    // Zero is a valid config: the RST a refused final HEADERS owes must not
+    // depend on the tombstone ring.
+    limits.stream_tombstones = tombstones;
     const n = refused_end_streams;
 
     var server = try serverFor(rt, gpa, transport, limits, &cert, &key);
@@ -894,8 +897,10 @@ fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport)
     joined = true;
     if (c.err) |e| return e;
     // Each stream ended once: a refused one by its RST, the rest by HEADERS.
+    // The count of refusals is read now that every handler is done: under
+    // load one more HEADERS can be refused after the wait above.
     try expectEnded(&c, n);
-    try std.testing.expectEqual(failed, c.rst_total);
+    try std.testing.expectEqual(empty_failed.load(.acquire), c.rst_total);
     try std.testing.expect(c.eof);
 
     serve_handle.join() catch {};
@@ -1006,11 +1011,11 @@ fn expectEnded(c: *const Client, n: usize) !void {
     }
 }
 
-fn runRefusedEndTop(transport: Transport) !void {
+fn runRefusedEndTop(transport: Transport, tombstones: usize) !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
     defer rt.deinit();
-    var h = try rt.spawn(runRefusedEnd, .{ rt, gpa, transport });
+    var h = try rt.spawn(runRefusedEnd, .{ rt, gpa, transport, tombstones });
     try h.join();
 }
 
@@ -1051,11 +1056,15 @@ test "crossed resets during a stall, h2c: the peer's RSTs retire the server's un
 }
 
 test "refused final HEADERS, h2c: the stream still ends for the peer, with an RST" {
-    try runRefusedEndTop(.h2c);
+    try runRefusedEndTop(.h2c, starh2.Limits.defaults.stream_tombstones);
 }
 
 test "refused final HEADERS, tls: the stream still ends for the peer, with an RST" {
-    try runRefusedEndTop(.tls);
+    try runRefusedEndTop(.tls, starh2.Limits.defaults.stream_tombstones);
+}
+
+test "refused final HEADERS with no tombstones kept, h2c: the stream still ends for the peer, with an RST" {
+    try runRefusedEndTop(.h2c, 0);
 }
 
 test "ordinary refusals in one read chunk, h2c: only the refused frames are lost, and every stream still ends" {
