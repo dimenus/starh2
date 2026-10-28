@@ -23,10 +23,13 @@
 //! (from handlers) still wait, but the first ones reach the stash before it
 //! is full, and the GOAWAY (from the actor) is queued after the hold.
 //!
-//! The other scenarios need the actor to READ during the stall, so they use
-//! the stall a real peer makes: the client stops reading (with a small receive
-//! buffer), and the handlers' DATA backs up into the socket and then the write
-//! memory, on both transports, while the actor goes on reading.
+//! The other scenarios need the actor to READ during the stall. On TLS they
+//! use the stall a real peer makes: the client stops reading (with a small
+//! receive buffer, and a 4 KiB server send buffer), and the handlers' DATA
+//! backs up into the socket and then the write memory while the actor goes on
+//! reading. On h2c the writer is also held (`test_hold_writes`): on macOS the
+//! socket alone let a batch through every few hundred ms. The h2c actor reads
+//! during the hold.
 //!
 //! `crossed_resets` (h2c): every handler aborts during the stall (M server
 //! RSTs wait), then the client resets all M streams itself, so the RSTs cross,
@@ -594,6 +597,13 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         // (`test_stalled`), and on TLS a flush parked for stash room.
         data_bytes.store(stalled_data_bytes, .release);
         if (transport == .tls) bare_flush.store(true, .release);
+        // On h2c the writer is held as well. The socket alone did not hold
+        // the stall on macOS: after the gauge was seen, the pump still
+        // completed a batch or two every 300 ms, and the control pause came
+        // and went. The h2c actor still reads during the hold, which is what
+        // these scenarios need; the hold ends before the client reads, so
+        // the closing path still meets the kernel queue.
+        if (transport == .h2c) hold(.h2c, true);
         data_gate.store(true, .release);
         const writers = if (transport == .tls) m / 2 else m;
         try waitFor("every writer to write its DATA", atLeast(&wrote, writers), reached);

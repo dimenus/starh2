@@ -254,9 +254,10 @@ pub var test_fail_next_write: std.atomic.Value(bool) = .init(false);
 /// writing them, as a socket write that never completes would. Unlike
 /// `test_write_delay_ms`, it can be set after a connection is running.
 pub var test_hold_writes: std.atomic.Value(bool) = .init(false);
-/// Test-only (observe builds): WritePumps inside a socket write right now. A
-/// stall test reads it (through `Connection.test_stalled`) to know the h2c
-/// writer is blocked on the socket, not between writes.
+/// Test-only (observe builds): WritePumps inside a socket write and its flush,
+/// or holding a batch in `test_hold_writes`, right now. A stall test reads it
+/// (through `Connection.test_stalled`) to know the h2c writer is blocked, not
+/// between writes.
 pub var test_writing: std.atomic.Value(u32) = .init(0);
 const observe = @import("build_options").observe;
 /// Test-only: how many times a WritePump has entered the hold above. A test
@@ -454,6 +455,11 @@ pub const WritePump = struct {
                 // none written: the flag being set is not that, because the
                 // pump may read it later than the test wrote it.
                 _ = test_hold_entered.fetchAdd(1, .release);
+                // A held batch blocks like a socket that never takes it.
+                if (comptime observe) _ = test_writing.fetchAdd(1, .acq_rel);
+                defer if (comptime observe) {
+                    _ = test_writing.fetchSub(1, .acq_rel);
+                };
                 while (test_hold_writes.load(.acquire)) {
                     self.io.sleep(.fromMilliseconds(1), .awake) catch {
                         for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
