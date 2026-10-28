@@ -310,7 +310,7 @@ const SessionCtx = struct {
         // Each isolated operation is flow-control-ready. A real client
         // replenishes this connection window between responses.
         self.session.windows.conn_send = starh2.core.flow.INITIAL_WINDOW;
-        try self.session.applyCommand(.{ .respond_headers = .{
+        try self.session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
             .stream_id = stream_id,
             .status = 200,
             .headers = &response_extra_fields,

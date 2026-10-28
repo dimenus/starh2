@@ -8095,7 +8095,7 @@ pub const Connection = struct {
         // (From the first materialization on: until then the preface that
         // `Session.init` queued waits for the boot flush.)
         if (std.debug.runtime_safety and self.intents_materialized and self.session.intentLen() != 0) {
-            std.debug.panic("session_mu released with {d} intents queued", .{self.session.intentLen()});
+            std.debug.panic("the session lock was released with {d} intents queued", .{self.session.intentLen()});
         }
         // Cleared while the mutex is still held, or the next holder would see a
         // stale false.
