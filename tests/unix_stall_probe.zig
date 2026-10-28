@@ -77,6 +77,9 @@ const Client = struct {
     send_tick: std.atomic.Value(bool) = .init(false),
     pinging: std.atomic.Value(bool) = .init(false),
     resume_reading: std.atomic.Value(bool) = .init(false),
+    /// Reset `/big` once recovery is proven: its handler writes forever, and
+    /// a graceful shutdown would wait out its drain timeout (30 s) for it.
+    cancel_big: std.atomic.Value(bool) = .init(false),
     /// After reading resumed: DATA bytes read, and whether the server's
     /// /tick response and EOF came.
     read_after: std.atomic.Value(usize) = .init(0),
@@ -136,8 +139,16 @@ fn clientRun(c: *Client) !void {
         _ = std.c.nanosleep(&nap, null);
     }
     // Read until the server closes.
+    var cancelled = false;
     while (true) {
         if (nowNs() >= deadline) return error.Deadline;
+        if (!cancelled and c.cancel_big.load(.acquire)) {
+            var rst: std.ArrayList(u8) = .empty;
+            defer rst.deinit(c.gpa);
+            try h2c.appendRst(c.gpa, &rst, 1);
+            try w.send(rst.items);
+            cancelled = true;
+        }
         const s = w.next(nowNs() + 25 * std.time.ns_per_ms) catch |err| switch (err) {
             error.Deadline => continue,
             else => return err,
@@ -258,6 +269,9 @@ fn runProbe(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, vari
     const recover_deadline = nowNs() + 10 * std.time.ns_per_s;
     while (c.read_after.load(.acquire) < plateau.big and nowNs() < recover_deadline) try zio.sleep(.fromMilliseconds(5));
     const recovered = c.read_after.load(.acquire);
+    c.cancel_big.store(true, .release);
+    const end_deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (!big_done.load(.acquire) and nowNs() < end_deadline) try zio.sleep(.fromMilliseconds(2));
     server.requestShutdown();
     while (!c.done.load(.acquire)) try zio.sleep(.fromMilliseconds(5));
     t.join();
