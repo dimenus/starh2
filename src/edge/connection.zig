@@ -348,6 +348,17 @@ pub var test_release_hook: ?*const fn (*Connection, ReleasePoint) void = null;
 /// the times the driver stopped there.
 pub var test_hold_stash: std.atomic.Value(bool) = .init(false);
 pub var test_hold_stash_entered: std.atomic.Value(u64) = .init(0);
+/// Test-only (observe builds): while true, the TLS driver takes no chunk off
+/// the stash, as if every send were in flight forever, and the actor goes on
+/// with everything else, reading included (unlike `test_hold_stash` and the
+/// TLS side of `wire_pump.test_hold_writes`, which park it). The stash fills
+/// and the control pause holds for as long as the flag does.
+pub var test_hold_tls_take: std.atomic.Value(bool) = .init(false);
+
+fn tlsTakeHeld() bool {
+    if (comptime !test_observe) return false;
+    return test_hold_tls_take.load(.acquire);
+}
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
 pub var test_allow_full_queue_push: std.atomic.Value(bool) = .init(false);
@@ -3764,6 +3775,7 @@ pub const Connection = struct {
             }
         }
         while (pump.pending_n == 0) {
+            if (tlsTakeHeld()) break;
             const chunk = if (pump.carried) |c| blk: {
                 pump.carried = null;
                 break :blk c;
@@ -3848,7 +3860,7 @@ pub const Connection = struct {
         // completion was never delivered and every task on that executor
         // stopped for good (t-2655: 10M turns with no park, pending_n=6,
         // carried set).
-        if (pump.pending_n == 0 and (pump.carried != null or !pump.write_ch.isEmpty())) {
+        if (pump.pending_n == 0 and (pump.carried != null or !pump.write_ch.isEmpty()) and !tlsTakeHeld()) {
             self.diagNoPark(pump, 2);
             return false;
         }
@@ -7012,7 +7024,7 @@ pub const Connection = struct {
 
     /// See `test_stalled`. Reads only; counts nothing.
     fn stalledNow(self: *Connection) bool {
-        if (self.tls_driver) |p| return p.pending_n > 0 and (p.stashFull() or self.outboundMemoryLow());
+        if (self.tls_driver) |p| return (p.pending_n > 0 or tlsTakeHeld()) and (p.stashFull() or self.outboundMemoryLow());
         if (self.config.mode != .h2c or !self.ack_room_armed) return false;
         if (wire_pump.test_writing.load(.acquire) == 0) return false;
         return self.outboundMemoryLow() or !self.h2cAckRoom(0) or !self.h2cQueueRoom(h2c_queue_room_per_pop);

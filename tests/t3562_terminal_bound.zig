@@ -27,9 +27,10 @@
 //! use the stall a real peer makes: the client stops reading (with a small
 //! receive buffer, and a 4 KiB server send buffer), and the handlers' DATA
 //! backs up into the socket and then the write memory while the actor goes on
-//! reading. On h2c the writer is also held (`test_hold_writes`): on macOS the
-//! socket alone let a batch through every few hundred ms. The h2c actor reads
-//! during the hold.
+//! reading. The writer is also held: on macOS the socket alone let a batch
+//! through every few hundred ms. h2c holds the write pump
+//! (`test_hold_writes`); TLS stops the driver taking from the stash
+//! (`test_hold_tls_take`). The actor reads during both.
 //!
 //! `crossed_resets` (h2c): every handler aborts during the stall (M server
 //! RSTs wait), then the client resets all M streams itself, so the RSTs cross,
@@ -550,6 +551,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer hold(transport, false);
+    defer conn_mod.test_hold_tls_take.store(false, .release);
     defer data_gate.store(true, .release);
     defer abort_gate.store(true, .release);
 
@@ -574,6 +576,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     var joined = false;
     defer if (!joined) {
         hold(transport, false);
+        conn_mod.test_hold_tls_take.store(false, .release);
         c.read_gate.store(true, .release);
         data_gate.store(true, .release);
         abort_gate.store(true, .release);
@@ -597,13 +600,17 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         // (`test_stalled`), and on TLS a flush parked for stash room.
         data_bytes.store(stalled_data_bytes, .release);
         if (transport == .tls) bare_flush.store(true, .release);
-        // On h2c the writer is held as well. The socket alone did not hold
-        // the stall on macOS: after the gauge was seen, the pump still
-        // completed a batch or two every 300 ms, and the control pause came
-        // and went. The h2c actor still reads during the hold, which is what
-        // these scenarios need; the hold ends before the client reads, so
-        // the closing path still meets the kernel queue.
-        if (transport == .h2c) hold(.h2c, true);
+        // The writer is held as well. The socket alone did not hold the
+        // stall on macOS: after the gauge was seen, the h2c pump still
+        // completed a batch or two every 300 ms (TLS: once in 30 runs under
+        // load), and the control pause came and went. The actor still reads
+        // during both holds, which is what these scenarios need; the holds
+        // end before the client reads, so the closing path still meets the
+        // kernel queue.
+        switch (transport) {
+            .h2c => hold(.h2c, true),
+            .tls => conn_mod.test_hold_tls_take.store(true, .release),
+        }
         data_gate.store(true, .release);
         const writers = if (transport == .tls) m / 2 else m;
         try waitFor("every writer to write its DATA", atLeast(&wrote, writers), reached);
@@ -706,6 +713,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     std.debug.print("T3562-held transport={s} scenario={s} m={d} t={d} ring_high={d} rst_paused={d} terminal_full={d} unread_close_ms={d}\n", .{ @tagName(transport), @tagName(scenario), m, t_frames, high_held, rst_paused, conn_mod.test_ctrl_terminal_full.load(.monotonic) - full_0, if (closed_ns != 0) (closed_ns - bound_ns) / std.time.ns_per_ms else 0 });
 
     hold(transport, false);
+    conn_mod.test_hold_tls_take.store(false, .release);
     c.read_gate.store(true, .release);
     if (scenario == .crossed_resets) {
         // Every RST was queued before the client's PING was read, and
