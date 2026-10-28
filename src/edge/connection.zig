@@ -1860,6 +1860,8 @@ pub const Connection = struct {
     /// Closing phase, actor only: everything queued has reached the kernel and
     /// the send side is shut (`closeFlushed`), and the peer's EOF has arrived.
     closing_write_shut: bool = false,
+    /// TLS: close_notify was staged in the closing phase (`closeFlushed`).
+    closing_notify_staged: bool = false,
     /// Set by the first `materializeIntents`; see `unlockSession`.
     intents_materialized: bool = false,
     closing_peer_eof: bool = false,
@@ -5065,6 +5067,16 @@ pub const Connection = struct {
             return true;
         }
         if (!self.outboundFlushed()) return false;
+        // TLS: close_notify is the last record, staged once everything else
+        // is written, and it drains under the same deadline before the send
+        // side is shut.
+        if (self.tls_driver) |pump| {
+            if (!self.closing_notify_staged) {
+                self.closing_notify_staged = true;
+                if (!pump.stageCloseNotify()) return true;
+                if (!self.outboundFlushed()) return false;
+            }
+        }
         if (!self.closing_write_shut) {
             self.closing_write_shut = true;
             self.stream.shutdown(self.config.io, .send) catch {};

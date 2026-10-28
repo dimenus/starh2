@@ -1225,6 +1225,26 @@ pub const Pump = struct {
             !self.send_armed and self.send_head == self.send_fill;
     }
 
+    /// Stage TLS close_notify behind everything written, and send it. RFC
+    /// 8446 section 6.1: each party sends close_notify before it closes its
+    /// write side, so the peer can tell the end of the data from a cut
+    /// connection. The actor calls it once its output is flushed
+    /// (`writesDrained`), so the alert is the last record, and waits for this
+    /// send to drain like any other before it shuts the socket's send side
+    /// (`Connection.closeFlushed`). tls.zig's state makes it once only: a
+    /// second call stages nothing. False when the CQ is closed (teardown).
+    pub fn stageCloseNotify(self: *Pump) bool {
+        std.debug.assert(self.writesDrained());
+        const record = self.conn.cipher.close(self.send_buf[self.send_fill..]) catch |err| {
+            // The buffer is empty here and holds many records, so this is a
+            // cipher that already failed: nothing to send.
+            if (diag_wait) rawPrint("TLSERR close_notify {s}\n", .{@errorName(err)});
+            return true;
+        };
+        self.send_fill += record.len;
+        return self.armSend();
+    }
+
     const WriteSome = enum { done, full, exit };
 
     /// Encrypt `bytes` from `self.partial_off` on, one full-size record at a
