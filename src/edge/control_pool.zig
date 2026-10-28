@@ -73,6 +73,11 @@ pub const ControlPool = struct {
         return reserve(&self.entries_held, &self.bytes_held, self.max_entries, self.max_bytes, n, entries);
     }
 
+    /// Ordinary entries free now.
+    pub fn ordinaryFree(self: *const ControlPool) usize {
+        return self.max_entries -| self.entries_held.load(.acquire);
+    }
+
     /// True when one more ordinary entry fits. Bytes are not checked: the
     /// caller does not know its frame's size yet.
     pub fn hasOrdinaryEntry(self: *const ControlPool) bool {

@@ -64,10 +64,17 @@
 //! and new requests. The 413's POST also ends its own side in that chunk (its
 //! body with END_STREAM, or its body and trailers), so the stream has left
 //! the map before the edge takes the 413's HEADERS. The PING ack, the 413 and
-//! the new responses are all refused. Only those frames may be lost: the
-//! connection must stay, and every stream must end for the peer (its HEADERS
-//! or one RST). TLS is not run: its hold parks the actor, so nothing is read
-//! during it.
+//! the new responses are all refused. The PING ack is owed and sent later
+//! (`owed_acks` proves that part); the rest may be lost: the connection must
+//! stay, and every stream must end for the peer (its HEADERS or one RST). TLS
+//! is not run: its hold parks the actor, so nothing is read during it.
+//!
+//! `owed_acks` (h2c): the share is pinned the same way, and the peer sends
+//! SETTINGS, a PING and 65 uploads in one write, until its connection window
+//! is 0. Every ack and WINDOW_UPDATE the server queues meanwhile is refused.
+//! After the stall the peer must get the SETTINGS ack, the PING ack with its
+//! payload, and enough credit to finish every upload, which no new DATA can
+//! cause: the peer has none it may send.
 //!
 //! Run it with `./zb build test-t3562` (it is also part of `./zb build test`).
 const std = @import("std");
@@ -141,6 +148,7 @@ fn resetGlobals() void {
     start_failed.store(0, .release);
     first_start_err.store(0, .release);
     entered.store(0, .release);
+    uploads_ok.store(0, .release);
 }
 
 /// Starts its response (the HEADERS are written before the stall), writes
@@ -193,9 +201,22 @@ fn empty(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerr
     _ = empty_sent.fetchAdd(1, .acq_rel);
 }
 
+/// `owed_acks`: the body each upload carries, and the uploads whose handler
+/// saw all of it.
+const upload_body_len = flow_initial_window + 1000;
+const flow_initial_window = 65_535;
+var uploads_ok: std.atomic.Value(usize) = .init(0);
+
+fn upload(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    if (req.body.len != upload_body_len) return error.ShortUpload;
+    _ = uploads_ok.fetchAdd(1, .acq_rel);
+    try resp.send(204, &.{}, "");
+}
+
 const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/empty", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = empty } } },
     .{ .method = .GET, .path = "/stall", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = stall } } },
+    .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = upload } } },
 };
 
 fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
@@ -1060,6 +1081,232 @@ fn runRefusedBatchTop(post_end: PostEnd) !void {
     try h.join();
 }
 
+/// `owed_acks`: upload streams. With the server's 4 MiB connection window
+/// and 64 KiB stream windows, 64 streams take all but 64 bytes of the
+/// connection window and the 65th takes the rest, so the peer's connection
+/// window reaches 0.
+const upload_streams = 65;
+const owed_ping = [8]u8{ 'o', 'w', 'e', 'd', 'p', 'i', 'n', 'g' };
+
+/// A client that pins the ordinary share with `batch_held` empty responses
+/// (the test holds the writer), then, on `go`, sends SETTINGS, a PING and
+/// `upload_streams` uploads in one write, as far as its windows allow. It
+/// sends the rest of each body as WINDOW_UPDATE credit arrives, and stops
+/// when every stream has ended.
+const UploadClient = struct {
+    gpa: std.mem.Allocator,
+    port: u16,
+    go: std.atomic.Value(bool) = .init(false),
+    /// Set once the windows stopped the upload: every byte it may send is out.
+    blocked: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+    conn_window: i64 = flow_initial_window,
+    stream_window: [upload_streams]i64 = @splat(flow_initial_window),
+    sent: [upload_streams]usize = @splat(0),
+    /// SETTINGS acks and the owed PING's ack, read after `go`.
+    settings_acks: usize = 0,
+    ping_acked: bool = false,
+    ended_per_sid: [max_sid]u8 = @splat(0),
+    ended: usize = 0,
+    rst_total: usize = 0,
+    goaways: usize = 0,
+    conn_credit_after_go: u64 = 0,
+
+    fn sid(i: usize) u31 {
+        return @intCast(1 + 2 * (batch_held + i));
+    }
+
+    /// DATA for every stream, as far as both windows allow.
+    fn pushData(self: *UploadClient, w: *Wire) !void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        const body: [16 * 1024]u8 = @splat('u');
+        for (0..upload_streams) |i| {
+            while (self.sent[i] < upload_body_len) {
+                const room = @min(self.conn_window, self.stream_window[i]);
+                if (room <= 0) break;
+                const take: usize = @min(@as(usize, @intCast(room)), body.len, upload_body_len - self.sent[i]);
+                self.sent[i] += take;
+                self.conn_window -= @intCast(take);
+                self.stream_window[i] -= @intCast(take);
+                try h2c.appendData(self.gpa, &out, sid(i), body[0..take], self.sent[i] == upload_body_len);
+            }
+        }
+        if (out.items.len != 0) try w.send(out.items);
+    }
+
+    fn run(self: *UploadClient) !void {
+        const w = try Wire.connectRecvBuf(self.gpa, .h2c, self.port, null);
+        defer w.close();
+        try w.handshake();
+        var req = try h2c.buildClientPrefaceAndSettings(self.gpa);
+        defer req.deinit(self.gpa);
+        for (0..batch_held) |i| try h2c.appendHeaders(self.gpa, &req, @intCast(1 + 2 * i), "/empty", true);
+        try w.send(req.items);
+        const deadline = nowNs() + 40 * std.time.ns_per_s;
+        var went = false;
+        while (true) {
+            if (!went and self.go.load(.acquire)) {
+                went = true;
+                var more: std.ArrayList(u8) = .empty;
+                defer more.deinit(self.gpa);
+                var settings: [9]u8 = undefined;
+                _ = try frame.Serializer.settingsFrame(&settings, false, &.{});
+                try more.appendSlice(self.gpa, &settings);
+                var ping: [17]u8 = undefined;
+                _ = try frame.Serializer.ping(&ping, false, &owed_ping);
+                try more.appendSlice(self.gpa, &ping);
+                for (0..upload_streams) |i| try h2c.appendHeadersExtra(self.gpa, &more, sid(i), "POST", "/upload", false, &.{});
+                try w.send(more.items);
+                try self.pushData(w);
+                if (self.conn_window != 0) return error.UploadNotBlocked;
+                self.blocked.store(true, .release);
+            }
+            if (nowNs() >= deadline) return error.Deadline;
+            const s = w.next(nowNs() + 25 * std.time.ns_per_ms) catch |err| switch (err) {
+                error.Deadline => continue,
+                else => return err,
+            } orelse return error.ServerClosed;
+            const p = w.last_payload.items;
+            switch (s.ftype) {
+                1 => if (s.flags & 1 != 0) self.noteEnded(s.sid),
+                3 => {
+                    self.rst_total += 1;
+                    self.noteEnded(s.sid);
+                },
+                4 => if (went and s.flags & 1 != 0) {
+                    self.settings_acks += 1;
+                },
+                6 => if (s.flags & 1 != 0 and std.mem.eql(u8, p, &owed_ping)) {
+                    self.ping_acked = true;
+                },
+                7 => self.goaways += 1,
+                8 => {
+                    const inc = std.mem.readInt(u32, p[0..4], .big) & 0x7fff_ffff;
+                    if (s.sid == 0) {
+                        self.conn_window += inc;
+                        if (went) self.conn_credit_after_go += inc;
+                    } else if (s.sid >= sid(0) and s.sid <= sid(upload_streams - 1)) {
+                        self.stream_window[(s.sid - sid(0)) / 2] += inc;
+                    }
+                    if (went) try self.pushData(w);
+                },
+                else => {},
+            }
+            if (went and self.ended >= batch_held + upload_streams and self.settings_acks >= 1 and self.ping_acked) return;
+        }
+    }
+
+    fn noteEnded(self: *UploadClient, stream: u32) void {
+        if (stream >= max_sid) return;
+        if (self.ended_per_sid[stream] == 0) self.ended += 1;
+        self.ended_per_sid[stream] +|= 1;
+    }
+
+    fn main(self: *UploadClient) void {
+        self.run() catch |err| {
+            self.err = err;
+        };
+        self.done.store(true, .release);
+    }
+};
+
+fn runOwedAcks(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    var limits = starh2.Limits.defaults;
+    limits.control_entries_per_connection = refused_end_share;
+    var server = try serverFor(rt, gpa, .h2c, limits, &cert, &key);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    defer hold(.h2c, false);
+    defer empty_gate.store(true, .release);
+
+    var c: UploadClient = .{ .gpa = gpa, .port = server.localAddress(0).getPort() };
+    const t = try std.Thread.spawn(.{}, UploadClient.main, .{&c});
+    var joined = false;
+    defer if (!joined) {
+        hold(.h2c, false);
+        empty_gate.store(true, .release);
+        const deadline = nowNs() + 45 * std.time.ns_per_s;
+        while (!c.done.load(.acquire) and nowNs() < deadline) zio.sleep(.fromMilliseconds(5)) catch {};
+        t.join();
+    };
+
+    // Pin the ordinary share, as `refused_batch` does: the writer holds the
+    // first responses' HEADERS, and two more are refused.
+    try waitFor("every handler to run", atLeast(&empty_entered, batch_held), reached);
+    hold(.h2c, true);
+    empty_gate.store(true, .release);
+    try waitFor("the share to be pinned", atLeast(&empty_failed, batch_held - refused_end_share), reached);
+
+    const refused_0 = conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic);
+    c.go.store(true, .release);
+    const Blocked = struct {
+        fn f(x: *UploadClient) bool {
+            return x.blocked.load(.acquire) or x.done.load(.acquire);
+        }
+    };
+    try waitFor("the upload to fill the connection window", &c, Blocked.f);
+    // Every ack and every WINDOW_UPDATE the server queued during the pin was
+    // refused: the SETTINGS ack, the PING ack, one per stream that crossed
+    // half its window (64 of them; the 65th got only 64 bytes), and at least
+    // one for the connection.
+    const want_refused = 2 + (upload_streams - 1) + 1;
+    waitFor("the acks and WINDOW_UPDATEs to be refused", atLeast(&conn_mod.test_ctrl_ordinary_pool_full, refused_0 + want_refused), reached) catch |err| {
+        std.debug.print("T3562-owed-timeout refused={d} want={d} client_err={s}\n", .{ conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic) - refused_0, want_refused, if (c.err) |e| @errorName(e) else "-" });
+        return err;
+    };
+    const refused = conn_mod.test_ctrl_ordinary_pool_full.load(.monotonic) - refused_0;
+    std.debug.print("T3562-held transport=h2c scenario=owed_acks refused={d} client_conn_window={d}\n", .{ refused, c.conn_window });
+
+    // The stall ends: what was owed must now reach the peer, and the upload
+    // must finish with the credit it brings.
+    hold(.h2c, false);
+    const Done = struct {
+        fn f(x: *UploadClient) bool {
+            return x.done.load(.acquire);
+        }
+    };
+    try waitFor("the client to finish", &c, Done.f);
+    t.join();
+    joined = true;
+    std.debug.print("T3562 transport=h2c scenario=owed_acks settings_acks={d} ping_acked={} ended={d} rst_total={d} goaways={d} uploads_ok={d} conn_credit_after_go={d} client_err={s}\n", .{ c.settings_acks, c.ping_acked, c.ended, c.rst_total, c.goaways, uploads_ok.load(.acquire), c.conn_credit_after_go, if (c.err) |e| @errorName(e) else "-" });
+    if (c.err) |e| return e;
+    try std.testing.expectEqual(@as(usize, 1), c.settings_acks);
+    try std.testing.expect(c.ping_acked);
+    try std.testing.expectEqual(@as(usize, 0), c.goaways);
+    // Every upload reached its handler whole, and every stream ended once
+    // for the peer. Some responses end with an RST, not their HEADERS: the
+    // share is 8 entries, and the owed frames and the responses compete for
+    // it after the stall (an ordinary refusal); that is not what this tests.
+    try std.testing.expectEqual(@as(usize, upload_streams), uploads_ok.load(.acquire));
+    for (0..batch_held + upload_streams) |i| try std.testing.expectEqual(@as(u8, 1), c.ended_per_sid[1 + 2 * i]);
+    // The peer's connection window was 0, and the credit it got after `go`
+    // covers what it still had to send.
+    try std.testing.expect(c.conn_credit_after_go >= upload_streams * upload_body_len - (4 * 1024 * 1024 - flow_initial_window) - flow_initial_window);
+
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runOwedAcksTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runOwedAcks, .{ rt, gpa });
+    try h.join();
+}
+
 fn expectEnded(c: *const Client, n: usize) !void {
     for (0..n) |i| {
         const sid = 1 + 2 * i;
@@ -1132,4 +1379,8 @@ test "ordinary refusals in one read chunk, h2c: only the refused frames are lost
 
 test "ordinary refusals in one read chunk, the 413's peer ending with trailers, h2c: every stream still ends" {
     try runRefusedBatchTop(.trailers);
+}
+
+test "owed acks during a stall, h2c: the SETTINGS ack, the PING ack and the WINDOW_UPDATE credit arrive after it, and the upload finishes" {
+    try runOwedAcksTop();
 }

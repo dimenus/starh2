@@ -134,7 +134,6 @@ pub const AppCommand = union(enum) {
         end_stream: bool,
     },
     reset_stream: struct { stream_id: u31, code: frame.ErrorCode },
-    ping: [8]u8,
     goaway: struct { last_stream_id: u31, code: frame.ErrorCode },
     /// Start graceful shutdown phase 1: GOAWAY(max) + PING (edge waits for ACK/timeout).
     graceful_phase1,
@@ -222,6 +221,47 @@ pub const HeaderListMem = union(enum) {
     scratch: struct { alloc: std.mem.Allocator, status: u16 },
 };
 
+/// What the connection owes the peer and could not queue yet: the frame
+/// buffer was not there (`controlFrame`), or the edge refused the frame
+/// because the ordinary control share was full (a peer that does not read).
+/// RFC 9113 requires each of these: a SETTINGS ack (a peer may end the
+/// connection with SETTINGS_TIMEOUT), a PING ack with the PING's payload (Go
+/// and gRPC close a connection that misses one), and WINDOW_UPDATE credit (a
+/// peer whose window is at zero sends no DATA, so nothing else would ever
+/// make a new one). They are kept here, coalesced, and queued again by
+/// `Session.requeueOwed`, which the edge calls once per materialization,
+/// with the room its ordinary share has.
+///
+/// While anything of a kind is owed, a new one of that kind joins it instead
+/// of going ahead, so the acks keep their order and the credit is one frame.
+/// A SETTINGS ack is owed only after its SETTINGS was applied (`onSettings`
+/// applies before it acks), so a later ack never runs ahead of its settings.
+///
+/// Bounded: past `rates.SETTINGS_BURST` SETTINGS acks or `rates.PING_BURST`
+/// PING acks owed at once, the peer goes on sending past the burst its rate
+/// limit allows while it reads nothing, and the connection ends with
+/// ENHANCE_YOUR_CALM. The window credit needs no bound: it is a sum, and the
+/// peer can only send what it was granted.
+///
+/// The graceful shutdown's PING is not here: it may be dropped, because its
+/// one-second deadline moves the shutdown on without its ack.
+pub const Owed = struct {
+    settings_acks: usize = 0,
+    /// PING ack payloads, oldest first, in a ring.
+    pings: [rates_mod.PING_BURST][8]u8 = undefined,
+    ping_head: usize = 0,
+    ping_len: usize = 0,
+    /// Connection credit granted (`Windows.conn_recv` holds it) and not yet
+    /// sent. Each stream's is `Stream.window_owed`; `streams` says whether
+    /// any stream may have some.
+    conn_window: u31 = 0,
+    streams: bool = false,
+
+    pub fn any(self: *const Owed) bool {
+        return self.settings_acks != 0 or self.ping_len != 0 or self.conn_window != 0 or self.streams;
+    }
+};
+
 pub const Session = struct {
     /// Heap that outlives any one ingest or command.
     gpa: std.mem.Allocator,
@@ -294,6 +334,9 @@ pub const Session = struct {
     grace_phase: enum { none, phase1, phase2 } = .none,
     grace_ping: [8]u8 = .{ 0x73, 0x68, 0x32, 0x67, 0x72, 0x61, 0x63, 0x65 }, // "sh2grace"
     grace_ping_acked: bool = false,
+    /// Connection-level frames RFC 9113 requires and the edge could not queue
+    /// yet (`Owed`).
+    owed: Owed = .{},
     control_frames_since_data: usize = 0,
     /// Optional server-wide stream admission (global max_streams_per_server).
     /// A per-connection limit alone does not bound a server: N connections at
@@ -900,12 +943,6 @@ pub const Session = struct {
             .respond_headers => |r| try self.cmdHeaders(r.stream_id, r.status, r.headers, r.end_stream, r.ticket),
             .respond_data => |r| try self.cmdData(r.stream_id, r.data, r.end_stream),
             .reset_stream => |r| try self.emitRst(r.stream_id, r.code),
-            .ping => |opaque_data| {
-                var buf: [17]u8 = undefined;
-                const n = try frame.Serializer.ping(&buf, false, &opaque_data);
-                const p = try self.controlFrame(buf[0..n], .ordinary);
-                try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
-            },
             .goaway => |g| try self.failConnectionWith(g.code, g.last_stream_id),
             .graceful_phase1 => try self.beginGracefulPhase1(),
             .graceful_phase2 => try self.beginGracefulPhase2(),
@@ -935,8 +972,13 @@ pub const Session = struct {
         if (self.terminal != .none) return;
         var buf: [17]u8 = undefined;
         const n = try frame.Serializer.ping(&buf, false, &self.grace_ping);
-        const p = try self.controlFrame(buf[0..n], .ordinary);
-        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
+        // The PING may be dropped (no frame buffer here, or the edge refuses
+        // it): phase 1 still ends at its deadline, without the ack.
+        if (self.controlFrame(buf[0..n], .ordinary)) |p| {
+            try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p } });
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+        }
         self.grace_phase = .phase1;
         self.grace_ping_acked = false;
     }
@@ -1064,18 +1106,6 @@ pub const Session = struct {
     pub fn resetRefusedHeaders(self: *Session, stream_id: u31, owes_rst: bool) !void {
         if (self.streams.contains(stream_id)) return self.emitRst(stream_id, .internal_error);
         if (owes_rst) return self.queueRst(stream_id, .internal_error, .refused_end);
-    }
-
-    /// The edge refused a WINDOW_UPDATE this session queued: take back the
-    /// credit it gave when it queued it, so the window stays what the peer
-    /// knows. The next DATA past the threshold queues a new one.
-    pub fn refusedWindowUpdate(self: *Session, stream_id: u31, increment: u31) void {
-        const inc: i32 = @intCast(increment);
-        if (stream_id == 0) {
-            self.windows.conn_recv -= inc;
-        } else if (self.streams.getPtr(stream_id)) |s| {
-            s.window.recv -= inc;
-        }
     }
 
     /// Queue an RST_STREAM at most once per stream (`rstOwed`), and always run
@@ -1398,11 +1428,8 @@ pub const Session = struct {
                 else => {},
             }
         }
-        // ACK
-        var buf: [9]u8 = undefined;
-        const n = try frame.Serializer.settingsFrame(&buf, true, &.{});
-        const p = try self.controlFrame(buf[0..n], .ordinary);
-        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } });
+        // Applied above; now the ack.
+        try self.queueSettingsAck();
     }
 
     fn onPing(self: *Session, hdr: frame.FrameHeader, payload: []const u8) !void {
@@ -1416,12 +1443,7 @@ pub const Session = struct {
             }
             return;
         }
-        var opaque_data: [8]u8 = undefined;
-        @memcpy(&opaque_data, payload[0..8]);
-        var buf: [17]u8 = undefined;
-        const n = try frame.Serializer.ping(&buf, true, &opaque_data);
-        const p = try self.controlFrame(buf[0..n], .ordinary);
-        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } });
+        try self.queuePingAck(payload[0..8].*);
     }
 
     fn onWindowUpdate(self: *Session, hdr: frame.FrameHeader, payload: []const u8) !void {
@@ -1482,10 +1504,13 @@ pub const Session = struct {
         // unpadded slice reaches the request body. A peer that pays for padding
         // must not gain free window by hiding bytes in it.
         const total: i32 = @intCast(payload.len);
-        self.windows.debitConnRecv(total) catch {
+        // Checked against what the peer was told: the window less the credit
+        // still owed (`grantWindow`).
+        if (self.windows.conn_recv - @as(i32, self.owed.conn_window) < total) {
             try self.failConnection(.flow_control_error);
             return;
-        };
+        }
+        self.windows.debitConnRecv(total) catch unreachable;
         const s = self.streams.getPtr(hdr.stream_id) orelse {
             if (hdr.stream_id <= self.highest_peer_stream) {
                 // CLOSED, not idle: the client is still uploading a body for a
@@ -1502,18 +1527,7 @@ pub const Session = struct {
                 // connection. Replenish at the usual threshold so a large body
                 // sent into a dead stream cannot strand the whole window.
                 if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .data_on_closed_ignored, .code = .no_error, .stream_id = hdr.stream_id });
-                if (self.windows.needsConnWindowUpdate()) {
-                    const inc = self.windows.connWindowUpdateIncrement();
-                    if (inc > 0) {
-                        var buf: [13]u8 = undefined;
-                        const n = try frame.Serializer.windowUpdate(&buf, 0, inc);
-                        // The frame first, the credit after: a refusal then
-                        // leaves the window as the peer knows it.
-                        const p = try self.controlFrame(buf[0..n], .ordinary);
-                        self.windows.creditConnRecv(inc);
-                        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p } });
-                    }
-                }
+                try self.replenishConnWindow();
                 return;
             }
             // IDLE: DATA for a stream never opened (RFC 9113 section 5.1).
@@ -1524,10 +1538,11 @@ pub const Session = struct {
             try self.failConnection(.protocol_error);
             return;
         }
-        s.window.debitRecv(total) catch {
+        if (s.window.recv - @as(i32, s.window_owed) < total) {
             try self.emitRst(hdr.stream_id, .flow_control_error);
             return;
-        };
+        }
+        s.window.debitRecv(total) catch unreachable;
 
         // An early-rejected stream (413/414/431) keeps consuming and discarding
         // its DATA until the peer sends END_STREAM. The server cannot stop the
@@ -1585,23 +1600,165 @@ pub const Session = struct {
         if (s.window.needsWindowUpdate()) {
             const inc = s.window.windowUpdateIncrement();
             if (inc > 0) {
-                var buf: [13]u8 = undefined;
-                const n = try frame.Serializer.windowUpdate(&buf, hdr.stream_id, inc);
-                const p = try self.controlFrame(buf[0..n], .ordinary);
                 s.window.creditRecv(inc);
-                try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p, .stream_id = hdr.stream_id } });
+                try self.grantWindow(hdr.stream_id, inc);
             }
         }
-        if (self.windows.needsConnWindowUpdate()) {
-            const inc = self.windows.connWindowUpdateIncrement();
-            if (inc > 0) {
-                var buf: [13]u8 = undefined;
-                const n = try frame.Serializer.windowUpdate(&buf, 0, inc);
-                const p = try self.controlFrame(buf[0..n], .ordinary);
-                self.windows.creditConnRecv(inc);
-                try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p } });
+        try self.replenishConnWindow();
+    }
+
+    fn replenishConnWindow(self: *Session) !void {
+        if (!self.windows.needsConnWindowUpdate()) return;
+        const inc = self.windows.connWindowUpdateIncrement();
+        if (inc == 0) return;
+        self.windows.creditConnRecv(inc);
+        try self.grantWindow(0, inc);
+    }
+
+    /// Tell the peer about `inc` of window credit already added to the
+    /// window (`stream_id` 0: the connection's). The window holds what this
+    /// server granted; the owed sum (`Owed`) is the part the peer has not been
+    /// told yet. DATA is checked against the difference, which is what the
+    /// peer knows (`onData`), so the owed sum never exceeds the window.
+    fn grantWindow(self: *Session, stream_id: u31, inc: u31) !void {
+        // Credit already owed for this target: join it, one frame later.
+        if (self.windowOwedPtr(stream_id)) |owed| {
+            if (owed.* != 0) {
+                self.oweWindowUpdate(stream_id, inc);
+                return;
             }
         }
+        var buf: [13]u8 = undefined;
+        const n = try frame.Serializer.windowUpdate(&buf, stream_id, inc);
+        const p = self.controlFrame(buf[0..n], .ordinary) catch |err| switch (err) {
+            error.OutOfMemory => {
+                self.oweWindowUpdate(stream_id, inc);
+                return;
+            },
+        };
+        try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p, .stream_id = stream_id } });
+    }
+
+    /// The owed credit for `stream_id` (0: the connection), or null for a
+    /// stream that is gone: its window went with it, and nothing is owed.
+    fn windowOwedPtr(self: *Session, stream_id: u31) ?*u31 {
+        if (stream_id == 0) return &self.owed.conn_window;
+        const s = self.streams.getPtr(stream_id) orelse return null;
+        return &s.window_owed;
+    }
+
+    /// `inc` of credit, granted and not sent: kept until `requeueOwed`.
+    /// Called by the edge for a WINDOW_UPDATE it refused, too.
+    pub fn oweWindowUpdate(self: *Session, stream_id: u31, inc: u31) void {
+        const owed = self.windowOwedPtr(stream_id) orelse return;
+        // It stays within the window, which a u31 holds: the credit was just
+        // added to the window, and DATA past what the peer was told is a
+        // flow-control error (`onData`).
+        owed.* += inc;
+        if (stream_id != 0) self.owed.streams = true;
+    }
+
+    fn queueSettingsAck(self: *Session) !void {
+        if (self.owed.settings_acks == 0) {
+            if (self.settingsAckFrame()) |p| {
+                return self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } });
+            } else |err| switch (err) {
+                error.OutOfMemory => {},
+            }
+        }
+        try self.oweSettingsAck();
+    }
+
+    fn settingsAckFrame(self: *Session) error{OutOfMemory}![]u8 {
+        var buf: [9]u8 = undefined;
+        const n = frame.Serializer.settingsFrame(&buf, true, &.{}) catch unreachable;
+        return self.controlFrame(buf[0..n], .ordinary);
+    }
+
+    /// One more SETTINGS ack owed: by `queueSettingsAck`, or by the edge for
+    /// one it refused. Past the bound, ENHANCE_YOUR_CALM (`Owed`).
+    pub fn oweSettingsAck(self: *Session) !void {
+        if (self.owed.settings_acks == rates_mod.SETTINGS_BURST) return self.failConnection(.enhance_your_calm);
+        self.owed.settings_acks += 1;
+    }
+
+    fn queuePingAck(self: *Session, payload: [8]u8) !void {
+        if (self.owed.ping_len == 0) {
+            if (self.pingAckFrame(payload)) |p| {
+                return self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } });
+            } else |err| switch (err) {
+                error.OutOfMemory => {},
+            }
+        }
+        try self.owePingAck(payload);
+    }
+
+    fn pingAckFrame(self: *Session, payload: [8]u8) error{OutOfMemory}![]u8 {
+        var buf: [17]u8 = undefined;
+        const n = frame.Serializer.ping(&buf, true, &payload) catch unreachable;
+        return self.controlFrame(buf[0..n], .ordinary);
+    }
+
+    /// One more PING ack owed, with the PING's payload: by `queuePingAck`, or
+    /// by the edge for one it refused. Past the bound, ENHANCE_YOUR_CALM.
+    pub fn owePingAck(self: *Session, payload: [8]u8) !void {
+        const o = &self.owed;
+        if (o.ping_len == o.pings.len) return self.failConnection(.enhance_your_calm);
+        o.pings[(o.ping_head + o.ping_len) % o.pings.len] = payload;
+        o.ping_len += 1;
+    }
+
+    /// Queue what is owed (`Owed`), at most `room` frames: the room the
+    /// edge's ordinary control share has now. SETTINGS acks first, then the
+    /// PING acks in the order their PINGs came, then the connection's credit,
+    /// then each stream's. A frame buffer that is not there stops it, and the
+    /// rest stays owed. Nothing once the connection is ending: its GOAWAY
+    /// already ends every stream, and the peer reads no further acks.
+    pub fn requeueOwed(self: *Session, room: usize) void {
+        if (self.terminal != .none) return;
+        var left = room;
+        const o = &self.owed;
+        while (o.settings_acks != 0 and self.owedRoom(left)) {
+            const p = self.settingsAckFrame() catch return;
+            self.pushIntent(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
+            o.settings_acks -= 1;
+            left -= 1;
+        }
+        while (o.ping_len != 0 and self.owedRoom(left)) {
+            const p = self.pingAckFrame(o.pings[o.ping_head]) catch return;
+            self.pushIntent(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
+            o.ping_head = (o.ping_head + 1) % o.pings.len;
+            o.ping_len -= 1;
+            left -= 1;
+        }
+        if (o.conn_window != 0 and self.owedRoom(left)) {
+            if (!self.requeueWindow(0, &o.conn_window)) return;
+            left -= 1;
+        }
+        if (!o.streams) return;
+        var it = self.streams.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.window_owed == 0) continue;
+            if (!self.owedRoom(left)) return;
+            if (!self.requeueWindow(e.key_ptr.*, &e.value_ptr.window_owed)) return;
+            left -= 1;
+        }
+        o.streams = false;
+    }
+
+    /// Room for one more owed frame: the edge's share has a free entry, and
+    /// the intent queue keeps the room an RST needs.
+    fn owedRoom(self: *const Session, left: usize) bool {
+        return left != 0 and self.ordinaryIntentRoom() > limits_mod.RST_INTENT_ROOM;
+    }
+
+    fn requeueWindow(self: *Session, stream_id: u31, owed: *u31) bool {
+        var buf: [13]u8 = undefined;
+        const n = frame.Serializer.windowUpdate(&buf, stream_id, owed.*) catch unreachable;
+        const p = self.controlFrame(buf[0..n], .ordinary) catch return false;
+        self.pushIntent(.{ .outbound_frame = .{ .typ = .window_update, .payload = p, .stream_id = stream_id } }) catch unreachable;
+        owed.* = 0;
+        return true;
     }
 
     /// Emit exactly one HTTP response for a request that never reaches a
@@ -3200,6 +3357,183 @@ test "a server RST queued after a final HEADERS clears its obligation: one RST, 
     // The refusal of the HEADERS adds nothing to the RST already queued.
     try session.resetRefusedHeaders(1, owes);
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+}
+
+/// The frames a drained batch holds, in order, as (type, ack, stream,
+/// payload) — then frees it.
+const SeenFrame = struct { typ: frame.FrameType, ack: bool, sid: u31, body: [8]u8 = @splat(0), inc: u31 = 0 };
+
+fn drainFrames(gpa: std.mem.Allocator, session: *Session, out: []SeenFrame) usize {
+    const intents = session.drainIntents();
+    defer freeTestIntents(gpa, intents);
+    var n: usize = 0;
+    for (intents) |it| switch (it) {
+        .outbound_frame => |f| {
+            var seen: SeenFrame = .{ .typ = f.typ, .ack = f.flags.end_stream, .sid = f.stream_id };
+            const body = f.payload[frame.FRAME_HEADER_LEN..];
+            if (f.typ == .ping) seen.body = body[0..8].*;
+            if (f.typ == .window_update) seen.inc = @intCast(std.mem.readInt(u32, body[0..4], .big) & 0x7fff_ffff);
+            out[n] = seen;
+            n += 1;
+        },
+        else => {},
+    };
+    return n;
+}
+
+/// `len` bytes of DATA on `stream_id`, cut into frames of at most 16 KiB.
+fn appendTestData(gpa: std.mem.Allocator, wire: *std.ArrayList(u8), stream_id: u31, len: usize) !void {
+    var left = len;
+    while (left > 0) {
+        const take = @min(left, frame.DEFAULT_MAX_FRAME_SIZE);
+        var hdr: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        (frame.FrameHeader{ .length = @intCast(take), .type = .data, .flags = .{}, .stream_id = stream_id }).encode(&hdr);
+        try wire.appendSlice(gpa, &hdr);
+        try wire.appendNTimes(gpa, 'd', take);
+        left -= take;
+    }
+}
+
+fn pingFrame(buf: *[17]u8, payload: *const [8]u8) []const u8 {
+    _ = frame.Serializer.ping(buf, false, payload) catch unreachable;
+    return buf;
+}
+
+test "owed acks and credit are queued again in order, coalesced, as room allows (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    // What the edge does with refused frames: two SETTINGS acks, two PING
+    // acks, connection credit in two parts.
+    try session.oweSettingsAck();
+    try session.oweSettingsAck();
+    try session.owePingAck("first-pg".*);
+    try session.owePingAck("second-p".*);
+    session.oweWindowUpdate(0, 1000);
+    session.oweWindowUpdate(0, 500);
+    // A PING that arrives now joins the owed ones, behind them.
+    var pb: [17]u8 = undefined;
+    try session.ingest(pingFrame(&pb, "third-pg"));
+    var seen: [16]SeenFrame = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainFrames(gpa, &session, &seen));
+    try std.testing.expectEqual(@as(usize, 3), session.owed.ping_len);
+
+    // Room for three: the SETTINGS acks first, then the oldest PING ack.
+    session.requeueOwed(3);
+    var n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expect(seen[0].typ == .settings and seen[0].ack);
+    try std.testing.expect(seen[1].typ == .settings and seen[1].ack);
+    try std.testing.expect(seen[2].typ == .ping and seen[2].ack);
+    try std.testing.expectEqualSlices(u8, "first-pg", &seen[2].body);
+    try std.testing.expect(session.owed.any());
+
+    // The rest: the PING acks in order, then the credit as one frame.
+    session.requeueOwed(16);
+    n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualSlices(u8, "second-p", &seen[0].body);
+    try std.testing.expectEqualSlices(u8, "third-pg", &seen[1].body);
+    try std.testing.expect(seen[2].typ == .window_update and seen[2].sid == 0);
+    try std.testing.expectEqual(@as(u31, 1500), seen[2].inc);
+    try std.testing.expect(!session.owed.any());
+}
+
+test "owed PING acks past the burst end the connection with ENHANCE_YOUR_CALM (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    for (0..rates_mod.PING_BURST) |_| try session.owePingAck("burst-pg".*);
+    try std.testing.expect(session.terminal == .none);
+    try session.owePingAck("one-more".*);
+    try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, session.terminal.goaway.code);
+    // Ending, nothing more is queued for the peer.
+    _ = countTerminalIntents(gpa, &session);
+    session.requeueOwed(16);
+    try std.testing.expectEqual(@as(usize, 0), session.intentLen());
+}
+
+test "owed SETTINGS acks past the burst end the connection with ENHANCE_YOUR_CALM (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    for (0..rates_mod.SETTINGS_BURST) |_| try session.oweSettingsAck();
+    try std.testing.expect(session.terminal == .none);
+    try session.oweSettingsAck();
+    try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, session.terminal.goaway.code);
+}
+
+test "owed window credit: DATA is held to what the peer was told, and a stream's owed credit goes with the stream (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try appendTestRequest(gpa, &wire, 3, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+
+    // Stream 1's half-window WINDOW_UPDATE is refused by the edge.
+    const half: usize = flow.INITIAL_WINDOW / 2 + 1;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, half);
+    try session.ingest(wire.items);
+    var n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(seen[0].typ == .window_update and seen[0].sid == 1);
+    session.oweWindowUpdate(1, seen[0].inc);
+    // The peer was told INITIAL_WINDOW - half: one byte more on stream 1 is
+    // a flow-control error for that stream, even though the server's own
+    // window has the credit.
+    const rest_len: usize = flow.INITIAL_WINDOW - half;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, rest_len + 1);
+    try session.ingest(wire.items);
+    const c = countTerminalIntents(gpa, &session);
+    try std.testing.expectEqual(@as(usize, 1), c.rst);
+    try std.testing.expect(session.terminal == .none);
+    // Stream 1 is gone, and its owed credit with it.
+    try std.testing.expect(!session.streams.contains(1));
+
+    // Stream 3: its credit is owed, and the peer sends all it was told. A
+    // stream cannot reach a second update while one is owed (that takes more
+    // than the peer was told), so nothing new is queued; the requeue sends
+    // the owed credit, which reopens the peer's window.
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 3, half);
+    try session.ingest(wire.items);
+    n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    const first_inc = seen[0].inc;
+    session.oweWindowUpdate(3, first_inc);
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 3, rest_len);
+    try session.ingest(wire.items);
+    n = drainFrames(gpa, &session, &seen);
+    for (seen[0..n]) |f| try std.testing.expect(!(f.typ == .window_update and f.sid == 3));
+    session.requeueOwed(16);
+    n = drainFrames(gpa, &session, &seen);
+    var stream3: u31 = 0;
+    for (seen[0..n]) |f| {
+        if (f.typ == .window_update and f.sid == 3) stream3 += f.inc;
+        try std.testing.expect(!(f.typ == .window_update and f.sid == 1));
+    }
+    try std.testing.expectEqual(first_inc, stream3);
+    try std.testing.expect(session.streams.contains(3));
+    try std.testing.expectEqual(@as(i32, flow.INITIAL_WINDOW) - @as(i32, @intCast(half + rest_len)) + first_inc, session.streams.get(3).?.window.recv);
+    try std.testing.expectEqual(@as(u31, 0), session.streams.get(3).?.window_owed);
 }
 
 test "single-frame END_HEADERS does not copy into header_block" {

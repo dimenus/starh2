@@ -6608,9 +6608,21 @@ pub const Connection = struct {
         self.assertSessionHeld("materializeIntents");
         var first_err: ?anyerror = null;
         self.intents_materialized = true;
+        var requeued = false;
         while (true) {
             const n = self.session.drainIntentsInto(self.intent_batch);
-            if (n == 0) break;
+            if (n == 0) {
+                // Once the queue is empty, what the session owes goes in, up
+                // to the room the ordinary share has now, and is materialized
+                // in the rounds that follow. Once per call: a frame refused
+                // again is owed again, for the next call. Every lock section
+                // calls this, the actor's turn after a write completion too,
+                // and a completion is what frees the share.
+                if (requeued or !self.session.owed.any()) break;
+                requeued = true;
+                self.session.requeueOwed(self.sched.ctrl.ordinaryFree());
+                continue;
+            }
             self.materializeBatch(n) catch |err| {
                 if (first_err == null) first_err = err;
             };
@@ -6649,11 +6661,15 @@ pub const Connection = struct {
                     if (f.typ == .continuation) std.debug.panic("a CONTINUATION for stream {d} reached the batch without its HEADERS", .{f.stream_id});
                     const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
                     // The payload is freed by a refusal; what a refused
-                    // WINDOW_UPDATE gave is read first.
+                    // WINDOW_UPDATE or PING ack carries is read first.
                     const wu_increment: u31 = if (f.typ == .window_update and f.payload.len >= frame.FRAME_HEADER_LEN + 4)
                         @intCast(std.mem.readInt(u32, f.payload[frame.FRAME_HEADER_LEN..][0..4], .big) & 0x7fff_ffff)
                     else
                         0;
+                    const ping_payload: [8]u8 = if (f.typ == .ping and f.payload.len >= frame.FRAME_HEADER_LEN + 8)
+                        f.payload[frame.FRAME_HEADER_LEN..][0..8].*
+                    else
+                        @splat(0);
                     const queued = if (opens_block)
                         self.enqueueHeaderBlock(n, &consumed)
                     else
@@ -6692,10 +6708,24 @@ pub const Connection = struct {
                                 // it is woken by the reset). The RST is
                                 // queued, and this call's next round sends it.
                                 .headers => self.session.resetRefusedHeaders(f.stream_id, f.owes_rst_if_refused) catch {},
-                                .window_update => self.session.refusedWindowUpdate(f.stream_id, wu_increment),
-                                // A SETTINGS or PING ack, a graceful PING:
-                                // dropped. The peer may time out waiting for
-                                // it; that is a slow end, not a wrong one.
+                                // What RFC 9113 requires is owed and queued
+                                // again when the share has room
+                                // (`Session.Owed`, `materializeIntents`). Past
+                                // its bound the peer gets ENHANCE_YOUR_CALM,
+                                // which this call's next round queues.
+                                .window_update => self.session.oweWindowUpdate(f.stream_id, wu_increment),
+                                .settings => {
+                                    // The server preface goes first, into an
+                                    // empty share (`finishBoot`).
+                                    if (!f.flags.end_stream) std.debug.panic("the server preface SETTINGS was refused", .{});
+                                    try self.session.oweSettingsAck();
+                                },
+                                .ping => if (f.flags.end_stream) {
+                                    try self.session.owePingAck(ping_payload);
+                                },
+                                // Nothing else is ordinary, but the graceful
+                                // PING (non-ack): dropped. Phase 1 ends at its
+                                // deadline without the ack.
                                 else => {},
                             }
                             continue;
@@ -10417,6 +10447,10 @@ const TrapWire = struct {
     rst: usize = 0,
     goaway_codes: [4]u32 = @splat(0),
     goaways: usize = 0,
+    settings_acks: usize = 0,
+    ping_acks: [4][8]u8 = undefined,
+    ping_ack_n: usize = 0,
+    conn_credit: u64 = 0,
 
     fn deinit(self: *TrapWire) void {
         self.rst_per_sid.deinit();
@@ -10449,6 +10483,16 @@ fn trapCollect(trap: *TrapHop, out: *TrapWire) !void {
                     .goaway => {
                         if (out.goaways < out.goaway_codes.len) out.goaway_codes[out.goaways] = std.mem.readInt(u32, body[4..8], .big);
                         out.goaways += 1;
+                    },
+                    .settings => if (h.flags.end_stream) {
+                        out.settings_acks += 1;
+                    },
+                    .ping => if (h.flags.end_stream) {
+                        if (out.ping_ack_n < out.ping_acks.len) out.ping_acks[out.ping_ack_n] = body[0..8].*;
+                        out.ping_ack_n += 1;
+                    },
+                    .window_update => if (h.stream_id == 0) {
+                        out.conn_credit += std.mem.readInt(u32, body[0..4], .big) & 0x7fff_ffff;
                     },
                     else => {},
                 }
@@ -10677,6 +10721,50 @@ test "a header block is admitted whole: one ordinary entry left and a two-fragme
     try trapCollect(&trap, &seen);
     try std.testing.expectEqual(@as(usize, 1), seen.rst);
     try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "acks the edge refuses are owed and sent once the share has room (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // The whole ordinary share is held, as by a peer that does not read.
+    const caps = conn.sched.ctrl.ordinaryCaps();
+    const pinned = caps.entries - conn.sched.ctrl.entries_held.load(.acquire);
+    for (0..pinned) |_| try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(1));
+    const refused_0 = test_ctrl_ordinary_pool_full.load(.monotonic);
+
+    var wire: [9 + 17 + 17]u8 = undefined;
+    (frame.FrameHeader{ .length = 0, .type = .settings, .flags = .{}, .stream_id = 0 }).encode(wire[0..9]);
+    _ = try frame.Serializer.ping(wire[9..26], false, "owed-p-1");
+    _ = try frame.Serializer.ping(wire[26..43], false, "owed-p-2");
+    try trapIngest(conn, &wire);
+    // All three acks were refused, and the connection goes on.
+    try std.testing.expectEqual(refused_0 + 3, test_ctrl_ordinary_pool_full.load(.monotonic));
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expectEqual(@as(usize, 1), conn.session.owed.settings_acks);
+    try std.testing.expectEqual(@as(usize, 2), conn.session.owed.ping_len);
+
+    // The share frees (a write completion), and the actor's next section
+    // queues what is owed.
+    conn.sched.ctrl.release(pinned, pinned);
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        try conn.materializeIntents();
+    }
+    try std.testing.expect(!conn.session.owed.any());
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen.settings_acks);
+    try std.testing.expectEqual(@as(usize, 2), seen.ping_ack_n);
+    try std.testing.expectEqualSlices(u8, "owed-p-1", &seen.ping_acks[0]);
+    try std.testing.expectEqualSlices(u8, "owed-p-2", &seen.ping_acks[1]);
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
 }
 
