@@ -61,10 +61,13 @@
 //!
 //! `refused_batch` (h2c): the ordinary share is pinned by responses held in
 //! the writer, and the peer sends one chunk of a PING, an early-413 request
-//! and new requests. The PING ack, the 413 and the new responses are all
-//! refused. Only those frames may be lost: the connection must stay, and every
-//! stream must end for the peer (its HEADERS or one RST). TLS is not run: its
-//! hold parks the actor, so nothing is read during it.
+//! and new requests. The 413's POST also ends its own side in that chunk (its
+//! body with END_STREAM, or its body and trailers), so the stream has left
+//! the map before the edge takes the 413's HEADERS. The PING ack, the 413 and
+//! the new responses are all refused. Only those frames may be lost: the
+//! connection must stay, and every stream must end for the peer (its HEADERS
+//! or one RST). TLS is not run: its hold parks the actor, so nothing is read
+//! during it.
 //!
 //! Run it with `./zb build test-t3562` (it is also part of `./zb build test`).
 const std = @import("std");
@@ -77,6 +80,7 @@ const wire_client = @import("wire_client.zig");
 const conn_mod = starh2.edge.connection;
 const wire_pump = starh2.edge.wire_pump;
 const frame = starh2.core.frame;
+const hpack = starh2.core.hpack;
 
 const Transport = wire_client.Transport;
 const Wire = wire_client.Wire;
@@ -255,6 +259,9 @@ const Client = struct {
     send_batch: std.atomic.Value(bool) = .init(false),
     batch_sent: std.atomic.Value(bool) = .init(false),
     batch_streams: usize = 0,
+    /// How the early-413 POST in the batch ends its own side, in the same
+    /// write: its body with END_STREAM, or its body and then trailers.
+    batch_post_end: PostEnd = .body,
     send_alive: std.atomic.Value(bool) = .init(false),
     alive_sent: bool = false,
     /// PINGs the test asked for, and sent: each wakes the server's actor,
@@ -280,6 +287,24 @@ const Client = struct {
     /// Frames of each type the client read.
     frames: [16]usize = @splat(0),
 };
+
+/// `refused_batch`: the POST's declared body, over the cap the test sets
+/// (`batch_body_cap`).
+const batch_post_len = 2048;
+const batch_post_len_str = "2048";
+const batch_body_cap = 1024;
+
+const PostEnd = enum { body, trailers };
+
+/// A trailer block (no pseudo-header) with END_STREAM.
+fn appendTrailers(gpa: std.mem.Allocator, wire: *std.ArrayList(u8), stream_id: u31) !void {
+    const block = try hpack.Encoder.encode(gpa, &.{.{ .name = "x-trailer", .value = "1" }});
+    defer gpa.free(block);
+    var hdr: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    (frame.FrameHeader{ .length = @intCast(block.len), .type = .headers, .flags = .{ .end_headers = true, .end_stream = true }, .stream_id = stream_id }).encode(&hdr);
+    try wire.appendSlice(gpa, &hdr);
+    try wire.appendSlice(gpa, block);
+}
 
 fn clientMain(c: *Client) void {
     clientRun(c) catch |err| {
@@ -315,9 +340,16 @@ fn clientRun(c: *Client) !void {
             var ping: [17]u8 = undefined;
             _ = try frame.Serializer.ping(&ping, false, &batch_ping);
             try more.appendSlice(c.gpa, &ping);
-            // A body far over the cap: the session answers 413 at once, with
-            // the peer's side still open, and no handler runs.
-            try h2c.appendHeadersExtra(c.gpa, &more, @intCast(1 + 2 * c.streams), "POST", "/empty", false, &.{.{ .name = "content-length", .value = "999999999" }});
+            // A declared body over the cap: the session answers 413 at once,
+            // with the peer's side still open, and no handler runs. The body
+            // (as long as declared, so its end is no error) and the end of
+            // the peer's side follow in the same write, so the stream is
+            // closed and gone from the map before the edge takes the 413.
+            const post_sid: u31 = @intCast(1 + 2 * c.streams);
+            try h2c.appendHeadersExtra(c.gpa, &more, post_sid, "POST", "/empty", false, &.{.{ .name = "content-length", .value = batch_post_len_str }});
+            const body: [batch_post_len]u8 = @splat('b');
+            try h2c.appendData(c.gpa, &more, post_sid, &body, c.batch_post_end == .body);
+            if (c.batch_post_end == .trailers) try appendTrailers(c.gpa, &more, post_sid);
             for (0..c.batch_streams) |i| try h2c.appendHeaders(c.gpa, &more, @intCast(1 + 2 * (c.streams + 1 + i)), c.path, true);
             try w.send(more.items);
             c.batch_sent.store(true, .release);
@@ -936,12 +968,13 @@ fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport,
 const batch_held = refused_end_share + 2;
 const batch_new = 4;
 
-fn runRefusedBatch(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+fn runRefusedBatch(rt: *zio.Runtime, gpa: std.mem.Allocator, post_end: PostEnd) !void {
     resetGlobals();
     var cert: []u8 = &.{};
     var key: []u8 = &.{};
     var limits = starh2.Limits.defaults;
     limits.control_entries_per_connection = refused_end_share;
+    limits.request_body_bytes = batch_body_cap;
     var server = try serverFor(rt, gpa, .h2c, limits, &cert, &key);
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
@@ -964,6 +997,7 @@ fn runRefusedBatch(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .flood = 0,
         .rcvbuf = null,
         .batch_streams = batch_new,
+        .batch_post_end = post_end,
     };
     const t = try std.Thread.spawn(.{}, clientMain, .{&c});
     var joined = false;
@@ -1018,11 +1052,11 @@ fn runRefusedBatch(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     serving = false;
 }
 
-fn runRefusedBatchTop() !void {
+fn runRefusedBatchTop(post_end: PostEnd) !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
     defer rt.deinit();
-    var h = try rt.spawn(runRefusedBatch, .{ rt, gpa });
+    var h = try rt.spawn(runRefusedBatch, .{ rt, gpa, post_end });
     try h.join();
 }
 
@@ -1093,5 +1127,9 @@ test "refused final HEADERS with no tombstones kept, h2c: the stream still ends 
 }
 
 test "ordinary refusals in one read chunk, h2c: only the refused frames are lost, and every stream still ends" {
-    try runRefusedBatchTop();
+    try runRefusedBatchTop(.body);
+}
+
+test "ordinary refusals in one read chunk, the 413's peer ending with trailers, h2c: every stream still ends" {
+    try runRefusedBatchTop(.trailers);
 }
