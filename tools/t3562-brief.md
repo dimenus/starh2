@@ -388,3 +388,132 @@ Copy the committed tree; do not reuse an old directory:
 Then run the built `t3562` binary (`.zig-cache/o/*/t3562`) 30 times alone
 and 10 rounds of 3 at once, by exit code and by "All 9 tests passed" (or
 the new count). Report the counts and quote one line of any failure.
+
+## Round 4 (review of b18951a; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at b18951a: Mac gates pass on a clean cache (ci: only
+the libcxx probes fail). Linux: the full suite passed twice (the second on a
+clean cache); the `t3562` binary passed 30/30 alone and 30/30 three at a time
+on BOTH systems. The item 1 failure is gone. Perf A/B on nachos (c30c99b vs
+b18951a, n = 6 per arm, alternating): every shape within noise; h2c
+complete4 median -3.8% with wide overlap (z -1.12), to be re-measured on
+the final tree. Memory: +15,832 bytes per connection, matched by both
+reviewers from the code.
+
+**My mutation survived:** `closeFlushed` returning `false` instead of
+`self.closing_peer_eof` (the server ignores the peer's EOF and every closing
+connection waits for the deadline) passes the whole suite. The flood client
+still sees `eof=true close_ms=1`, from the server's FIN, and
+`test_closing_ended_peer_eof` is counted BEFORE the mutated return. Nothing
+checks when the SERVER closes its socket.
+
+Ryan decided two points in this round: the owed-state shape in item 3, and
+fixing all four pre-existing defects in item 6. Fix everything as new
+commits on top of b18951a. The round 1 to 3 rules still apply, and Linux
+remains a required gate.
+
+1. **The END_STREAM obligation misses a final HEADERS the PEER's END_STREAM
+   closes (high; both reviewers).** `cmdHeaders` sets
+   `owes_rst_if_refused` only if the stream already left the map. An early
+   413 (`emitEarlyReject`) is queued while the peer's side is open, then the
+   peer's DATA(END_STREAM) in the same chunk closes and removes the stream
+   (`onData`, `releaseConcurrency`). If that HEADERS is refused,
+   `resetRefusedHeaders` finds neither a map entry nor an obligation: no
+   response and no RST, forever. The trailers path (`onHeaders` ~1821) has
+   the same gap. **Fix:** every final HEADERS carries the obligation
+   (`owes_rst_if_refused = end_stream`), cleared on acceptance, on a peer
+   RST, and when a server RST for that stream is queued after it (no second
+   RST). Test: `refused_batch` with the POST's body and END_STREAM in the
+   same write; and a trailers case.
+2. **A refused CONTINUATION still ends the connection (high; both).**
+   `materializeBatch` treats `block_queued_open` (a fragment ENQUEUED, not
+   written) like a terminal refusal: it drops the rest of the batch, sets
+   `writer_failed`, and every stream dies. A two-fragment block is possible
+   at defaults (32 KiB `response_header_bytes`, 16 KiB frames). **Fix:**
+   admit a header block as one unit: ask the control pool for the block's
+   total entries and bytes before the first fragment; if it does not fit,
+   refuse the whole block as an ordinary refusal (item 1's RST rule then
+   applies). Test: one ordinary entry left, a two-fragment response; the
+   connection stays and that stream gets one RST.
+3. **Connection-level obligations survive a refusal (Ryan's decision:
+   owed state, retry).** Today a refused SETTINGS ack, PING ack or
+   WINDOW_UPDATE is dropped for good. RFC 9113 requires the acks (a peer may
+   end with SETTINGS_TIMEOUT; Go and gRPC close on a missed PING ack), and a
+   dropped WINDOW_UPDATE strands credit when the window is at zero (no DATA
+   comes to trigger a new one; `session.zig` ~1063-1074 relies on one).
+   **Fix:** Session keeps what it owes: a count of SETTINGS acks; the PING
+   ack payloads, bounded (past the bound the peer is flooding:
+   ENHANCE_YOUR_CALM, derived and boot-checked like the other bounds); the
+   unsent WINDOW_UPDATE credit as a sum per stream and for the connection.
+   Re-queue them at the next drain that has room, in the order RFC 9113
+   needs (each SETTINGS ack after its SETTINGS was applied). Coalesce, so
+   the memory is a few bytes; report it. The graceful PING may stay
+   droppable (its deadline still runs): say so in the code. Tests: during a
+   stall that pins the ordinary share, the peer sends SETTINGS and PING and
+   uploads until its connection window is 0; after the stall it receives
+   the SETTINGS ack, the PING ack with its payload, and enough
+   WINDOW_UPDATE credit to finish the upload.
+4. **Error exits leave intents queued (high; astra, confirmed by reading).**
+   `controlFrame(.ordinary)` returns `OutOfMemory` when `rentFrame` finds no
+   frame slab or write chunk, and the handlers pass it up with `try`
+   (`session.zig` ~903 PING ack; `beginGracefulPhase1` ~930: GOAWAY queued,
+   then the PING allocation fails). The lock section then ends with intents
+   queued, which hits round 3's `unlockSession` panic in safe builds, and in
+   release builds leaves them for the next section. astra's reachable case:
+   `frame_slabs_per_connection = 2` and nine PINGs in one read. **Fix:**
+   every error exit materializes or releases what it queued before the
+   unlock, and keeps any terminal output. With item 3, a failed ordinary
+   allocation for an ack should become owed state, not an error. Keep the
+   panic. Test: astra's case, and graceful phase 1 with no ordinary frame
+   left.
+5. **Tests.** (a) My surviving mutation above: assert when the SERVER
+   closes the socket after the peer's EOF (well before the closing
+   deadline), from a counter written at the actual close, not in
+   `closeFlushed`. (b) Mutation 13 (stop at the first failed round)
+   survives; Fable shows the later rounds are still reachable: a batch with
+   the terminal store full, a refused final HEADERS, then an RST. Add that
+   Connection test (with the mutation the unlock panic fires). (c)
+   `server_failures` opens the abort gate without waiting for
+   `test_stalled` (astra): wait for it, as the flood and crossed cases do.
+   (d) Fable: with the h2c writer held by construction, the round 3 item 1
+   path (GOAWAY in the kernel queue, a late PING, a TCP RST) no longer runs
+   end to end on h2c. Keep one case with the real socket stall (it may run
+   on Linux only, where the kernel queue takes the GOAWAY), and say in the
+   test comments what each hold proves and what it does not.
+6. **Pre-existing, fixed here (Ryan: "why not fix all 4?").**
+   (a) TLS never writes close_notify, on any close (`grep -i close_notify
+   src` finds only the inbound event; c30c99b too). Before the send-side
+   shutdown in the lingering close, stage close_notify through the TLS
+   cipher and drain it under the same deadline. Test: a TLS client reads
+   the GOAWAY, then close_notify, then EOF.
+   (b) The h2c ReadPump shuts the send side on a read EOF or error
+   (`wire_pump.zig` ~217-225); TLS calls `failDrain` on EOF/close_notify
+   (`tls.zig` ~1431-1442, 1527-1534). A peer that half-closes loses queued
+   GOAWAY/RSTs, and a peer EOF before the closing phase skips it (the
+   `leaving` branch, `connection.zig` ~4337). Only the actor shuts the send
+   side (`closeFlushed`); an EOF is an event, an I/O error is a failure.
+   Test: a peer half-closes during a stall; it still receives the GOAWAY.
+   (c) A cancellation-shielded handler holds the task, slot and fd past the
+   closing deadline, because exhaustive handler teardown runs before the fd
+   close (`connection.zig` ~4513). A handler that shields itself cannot be
+   stopped from inside the process (zio's cancel waits), so the fix is the
+   order: close the socket at the deadline BEFORE joining the handlers;
+   the slot and task stay until the handler returns, under the existing
+   watchdog. Say that in the code. Test: a shielded handler that sleeps past
+   the deadline; the peer sees the close at the deadline.
+   (d) `test_hold_writes` (`wire_pump.zig` ~453-463) is not compiled out of
+   non-test builds. Gate it like the other hooks (`comptime`), and check
+   the rest of the hooks the same way.
+7. **Small.** Fable: `waitStalled`'s nudge PINGs add PING acks during the
+   stall; with item 3 they become owed, so check the tests still prove what
+   they claim.
+
+Rerun mutations 1 to 21, plus: (22) every final HEADERS carries no
+obligation unless it left the map (item 1); (23) a block admitted one frame
+at a time again (item 2); (24) owed acks dropped instead of retried (item
+3); (25) an error exit returns without releasing its intents (item 4);
+(26) `closeFlushed` ignores the peer's EOF (my survivor); (27) no
+close_notify (6a); (28) the ReadPump shuts the send side on EOF again (6b);
+(29) handlers joined before the socket closes (6c). Full `./zb build test`
+each, on the Mac. Run the Linux gate as in round 3. Report `slotBootBytes`
+at defaults by running it.
