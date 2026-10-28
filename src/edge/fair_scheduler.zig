@@ -921,6 +921,40 @@ pub const FairScheduler = struct {
         }
     }
 
+    /// A header block of more than one frame (HEADERS, then CONTINUATIONs),
+    /// admitted as one unit: the share's room for all its entries and bytes
+    /// is taken before the first fragment is queued, or none is, and every
+    /// payload is freed (`PoolFull`). A block admitted fragment by fragment
+    /// could be refused after its HEADERS went in, and the peer would then
+    /// wait for the rest of a block that never comes (the scheduler holds the
+    /// connection to it, `block_open`). The ticket rides on the first frame.
+    pub fn enqueueControlBlock(
+        self: *FairScheduler,
+        payloads: []const []u8,
+        ticket: u64,
+        ticket_slot: u32,
+    ) error{PoolFull}!void {
+        std.debug.assert(payloads.len >= 2);
+        var total: usize = 0;
+        for (payloads) |p| total += frame.encodedOnWireLen(p);
+        if (!self.ctrl.tryReserveOrdinaryBlock(total, payloads.len)) {
+            for (payloads) |p| self.freePayload(p);
+            return error.PoolFull;
+        }
+        for (payloads, 0..) |p, k| {
+            // The ring holds as many entries as the share, and a popped entry
+            // gives its ring slot back before its share, so a reserved entry
+            // always has a slot.
+            pushRing(ControlEntry, self.ordinary_q, &self.ordinary_head, &self.ordinary_tail, &self.ordinary_len, .{
+                .payload = p,
+                .class = .ordinary,
+                .ticket = if (k == 0) ticket else 0,
+                .ticket_slot = if (k == 0) ticket_slot else 0,
+                .control_n = frame.encodedOnWireLen(p),
+            }) catch unreachable;
+        }
+    }
+
     pub fn enqueueFramedData(
         self: *FairScheduler,
         payload: []u8,

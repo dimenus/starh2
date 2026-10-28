@@ -63,7 +63,14 @@ pub const ControlPool = struct {
     }
 
     pub fn tryReserveOrdinary(self: *ControlPool, n: usize) bool {
-        return reserve(&self.entries_held, &self.bytes_held, self.max_entries, self.max_bytes, n);
+        return reserve(&self.entries_held, &self.bytes_held, self.max_entries, self.max_bytes, n, 1);
+    }
+
+    /// A whole header block: `entries` frames of `n` wire bytes in all, all
+    /// or none. The peer waits for every fragment once the first is out, so
+    /// a block is admitted as one unit (`FairScheduler.enqueueControlBlock`).
+    pub fn tryReserveOrdinaryBlock(self: *ControlPool, n: usize, entries: usize) bool {
+        return reserve(&self.entries_held, &self.bytes_held, self.max_entries, self.max_bytes, n, entries);
     }
 
     /// True when one more ordinary entry fits. Bytes are not checked: the
@@ -74,18 +81,18 @@ pub const ControlPool = struct {
 
     /// A GOAWAY or RST_STREAM of `n` wire bytes, from the terminal share.
     pub fn tryReserveTerminal(self: *ControlPool, n: usize) bool {
-        return reserve(&self.terminal_entries_held, &self.terminal_bytes_held, self.terminal_entries, self.terminal_bytes, n);
+        return reserve(&self.terminal_entries_held, &self.terminal_bytes_held, self.terminal_entries, self.terminal_bytes, n, 1);
     }
 
-    fn reserve(entries_held: *std.atomic.Value(usize), bytes_held: *std.atomic.Value(usize), max_entries: usize, max_bytes: usize, n: usize) bool {
+    fn reserve(entries_held: *std.atomic.Value(usize), bytes_held: *std.atomic.Value(usize), max_entries: usize, max_bytes: usize, n: usize, k: usize) bool {
         while (true) {
             const cur_e = entries_held.load(.acquire);
             const cur_b = bytes_held.load(.acquire);
-            if (cur_e >= max_entries) return false;
+            if (cur_e > max_entries or max_entries - cur_e < k) return false;
             if (cur_b > max_bytes or max_bytes - cur_b < n) return false;
-            if (entries_held.cmpxchgWeak(cur_e, cur_e + 1, .acq_rel, .acquire) != null) continue;
+            if (entries_held.cmpxchgWeak(cur_e, cur_e + k, .acq_rel, .acquire) != null) continue;
             if (bytes_held.cmpxchgWeak(cur_b, cur_b + n, .acq_rel, .acquire) == null) return true;
-            _ = entries_held.fetchSub(1, .acq_rel);
+            _ = entries_held.fetchSub(k, .acq_rel);
         }
     }
 
@@ -175,6 +182,21 @@ test "10k nonterminal controls force DATA at <=64 gaps" {
     }
     try std.testing.expect(data_quanta >= 10_000 / CONTROL_BEFORE_DATA);
     try std.testing.expect(max_gap <= CONTROL_BEFORE_DATA);
+}
+
+test "a header block is reserved whole or not at all" {
+    var pool = ControlPool.init(1024, 4, test_terminal_bytes, test_terminal_entries);
+    try std.testing.expect(pool.tryReserveOrdinary(10));
+    try std.testing.expect(pool.tryReserveOrdinary(10));
+    // Two entries left: a three-fragment block takes none of them.
+    try std.testing.expect(!pool.tryReserveOrdinaryBlock(30, 3));
+    try std.testing.expectEqual(@as(usize, 2), pool.entries_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 20), pool.bytes_held.load(.acquire));
+    // Bytes too: two entries, but not the bytes.
+    try std.testing.expect(!pool.tryReserveOrdinaryBlock(1024, 2));
+    try std.testing.expect(pool.tryReserveOrdinaryBlock(40, 2));
+    try std.testing.expectEqual(@as(usize, 4), pool.entries_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 60), pool.bytes_held.load(.acquire));
 }
 
 test "exact occupancy release asserts once" {

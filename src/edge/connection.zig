@@ -6623,9 +6623,6 @@ pub const Connection = struct {
         errdefer while (consumed < n) : (consumed += 1) {
             self.session.releaseIntent(&self.intent_batch[consumed]);
         };
-        // The last control queued was a HEADERS or CONTINUATION without
-        // END_HEADERS, so the next one is the rest of its block.
-        var block_queued_open = false;
         while (consumed < n) {
             const it = &self.intent_batch[consumed];
             // Every processing branch consumes its current intent, including
@@ -6648,6 +6645,8 @@ pub const Connection = struct {
                     // The frame's own ticket, if a handler waits on it.
                     const t = f.ticket.id;
                     const s = f.ticket.slot;
+                    // A CONTINUATION is always taken with its HEADERS below.
+                    if (f.typ == .continuation) std.debug.panic("a CONTINUATION for stream {d} reached the batch without its HEADERS", .{f.stream_id});
                     const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
                     // The payload is freed by a refusal; what a refused
                     // WINDOW_UPDATE gave is read first.
@@ -6655,7 +6654,11 @@ pub const Connection = struct {
                         @intCast(std.mem.readInt(u32, f.payload[frame.FRAME_HEADER_LEN..][0..4], .big) & 0x7fff_ffff)
                     else
                         0;
-                    self.sched.enqueueControl(f.payload, class, t, s) catch |err| switch (err) {
+                    const queued = if (opens_block)
+                        self.enqueueHeaderBlock(n, &consumed)
+                    else
+                        self.sched.enqueueControl(f.payload, class, t, s);
+                    queued catch |err| switch (err) {
                         error.PoolFull, error.QueueFull => {
                             // Payload already freed by enqueueControl.
                             if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
@@ -6664,43 +6667,23 @@ pub const Connection = struct {
                                     if (err == error.PoolFull) _ = test_ctrl_ordinary_pool_full.fetchAdd(1, .monotonic) else _ = test_ctrl_ordinary_queue_full.fetchAdd(1, .monotonic);
                                 }
                             }
-                            // A terminal frame that cannot be queued, or a
-                            // fragment refused after its block began (the peer
-                            // waits for the rest of the block, and the
-                            // scheduler holds the connection to it,
-                            // `FairScheduler.block_open`): there is no way to
-                            // go on. The rest of the batch runs its local
-                            // resets and is released.
-                            if (class == .terminal or block_queued_open) {
+                            // A terminal frame that cannot be queued: there
+                            // is no way to go on. The rest of the batch runs
+                            // its local resets and is released.
+                            if (class == .terminal) {
                                 self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
                                 consumed = n;
-                                if (class == .terminal) {
-                                    if (comptime test_observe) _ = test_ctrl_terminal_full.fetchAdd(1, .monotonic);
-                                    self.noteServerClose("ctrl_terminal_full", err);
-                                } else {
-                                    self.noteServerClose("ctrl_fragment_full", err);
-                                }
+                                if (comptime test_observe) _ = test_ctrl_terminal_full.fetchAdd(1, .monotonic);
+                                self.noteServerClose("ctrl_terminal_full", err);
                                 self.writer_failed.store(true, .release);
                                 return error.OutOfMemory;
                             }
-                            // An ordinary frame: only it, and the CONTINUATIONs
-                            // of its own block (queued right behind it by
-                            // `cmdHeaders`), are dropped. The rest of the batch
-                            // is other streams' work, and the connection goes
-                            // on: an ordinary refusal is never a connection
-                            // error.
-                            if (opens_block) {
-                                while (consumed < n) {
-                                    const next = &self.intent_batch[consumed];
-                                    const frag = switch (next.*) {
-                                        .outbound_frame => |nf| nf.typ == .continuation and nf.stream_id == f.stream_id,
-                                        else => false,
-                                    };
-                                    if (!frag) break;
-                                    consumed += 1;
-                                    self.session.releaseIntent(next);
-                                }
-                            }
+                            // An ordinary frame, or a whole header block
+                            // (`enqueueHeaderBlock` took its fragments and
+                            // freed them): only it is dropped. The rest of the
+                            // batch is other streams' work, and the
+                            // connection goes on: an ordinary refusal is never
+                            // a connection error.
                             // The waiter whose ticket rode on it hears now.
                             if (t != 0) self.tickets.wake(s, t, false);
                             switch (f.typ) {
@@ -6718,7 +6701,6 @@ pub const Connection = struct {
                             continue;
                         },
                     };
-                    block_queued_open = opens_block;
                     if (comptime test_observe) {
                         if (f.typ == .rst_stream and self.controlPausedNow()) _ = test_rst_queued_paused.fetchAdd(1, .monotonic);
                         if (class == .terminal) {
@@ -6753,6 +6735,33 @@ pub const Connection = struct {
                 },
             }
         }
+    }
+
+    /// The header block whose HEADERS is `intent_batch[consumed.* - 1]`,
+    /// with its CONTINUATIONs right behind it (`Session.cmdHeaders` queues a
+    /// block whole, and a drain takes the whole queue), admitted as one unit
+    /// (`FairScheduler.enqueueControlBlock`). Advances `consumed` past the
+    /// fragments: on success the scheduler owns every payload, on `PoolFull`
+    /// every payload is freed, and either way the fragments' intents hold
+    /// nothing more to release.
+    fn enqueueHeaderBlock(self: *Connection, n: usize, consumed: *usize) error{ PoolFull, QueueFull }!void {
+        const first = self.intent_batch[consumed.* - 1].outbound_frame;
+        var payloads: [limits_mod.MAX_HEADER_FRAGMENTS][]u8 = undefined;
+        payloads[0] = first.payload;
+        var k: usize = 1;
+        var open = true;
+        while (open) : (k += 1) {
+            if (consumed.* >= n) std.debug.panic("the header block of stream {d} ends without END_HEADERS in the batch", .{first.stream_id});
+            const frag = switch (self.intent_batch[consumed.*]) {
+                .outbound_frame => |nf| nf,
+                else => std.debug.panic("the header block of stream {d} is broken by another intent", .{first.stream_id}),
+            };
+            if (frag.typ != .continuation or frag.stream_id != first.stream_id) std.debug.panic("the header block of stream {d} is broken by another frame", .{first.stream_id});
+            payloads[k] = frag.payload;
+            open = fair_scheduler.leavesBlockOpen(frag.payload);
+            consumed.* += 1;
+        }
+        return self.sched.enqueueControlBlock(payloads[0..k], first.ticket.id, first.ticket.slot);
     }
 
     /// Materialize every Session intent and emit all scheduler work now.
@@ -10628,6 +10637,47 @@ test "a ticket travels with its own frame: a leftover HEADERS does not take the 
     try std.testing.expect(conn.tickets.isSignaled(a[1]));
     try std.testing.expect(conn.tickets.isSignaled(b[1]));
     try conn.drainPendingCompleteReceipts(false);
+}
+
+test "a header block is admitted whole: one ordinary entry left and a two-fragment response refuse the block, reset its stream once, and keep the connection (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // Pin the ordinary share to one free entry.
+    const caps = conn.sched.ctrl.ordinaryCaps();
+    var pinned: usize = 0;
+    while (conn.sched.ctrl.entries_held.load(.acquire) + 1 < caps.entries) : (pinned += 1) {
+        try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(1));
+    }
+    // A response header block over one frame: HEADERS plus a CONTINUATION.
+    const wide: [20 * 1024]u8 = @splat('w');
+    const fields_wide = [_]hpack.HeaderField{.{ .name = "x-wide", .value = &wide }};
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        try conn.session.streams.put(1, .{ .id = 1, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+        conn.session.active_streams += 1;
+        conn.session.highest_peer_stream = 1;
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &fields_wide, .end_stream = false, .ticket = .none } });
+        try std.testing.expectEqual(@as(usize, 2), conn.session.intentLen());
+        try conn.materializeIntents();
+        // No fragment went in: the one free entry is still free.
+        try std.testing.expectEqual(@as(usize, 0), conn.sched.ordinary_len);
+        try std.testing.expectEqual(caps.entries - 1, conn.sched.ctrl.entries_held.load(.acquire));
+        try std.testing.expect(!conn.sched.block_open);
+    }
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    try std.testing.expect(conn.session.terminal == .none);
+    conn.sched.ctrl.release(pinned, pinned);
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen.rst);
+    try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
 }
 
 /// M server RSTs wait in the terminal ring (the drain is held), then one
