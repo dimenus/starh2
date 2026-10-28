@@ -297,22 +297,6 @@ pub var test_terminal_ring_high: test_hook.Hook(std.atomic.Value(usize)) = if (t
 /// ring. A stall test reads it to prove its RSTs were queued during the
 /// stall, not after it.
 pub var test_rst_queued_paused: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
-/// Test-only (observe builds), refreshed at every drain: the writer is blocked
-/// on the socket and the control pause is on. h2c: a WritePump is inside a
-/// socket write (`wire_pump.test_writing`) and the write queue, the ack ring
-/// or the write memory has no room for a pop. TLS: a send is in flight
-/// (`pending_n`) and the stash is full or the write memory is out. With a
-/// small socket send buffer (`test_sndbuf_bytes`), a client that never reads
-/// and far more queued output than the two socket buffers hold, this cannot
-/// turn false again: nothing ever drains.
-pub var test_stalled: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
-/// Test-only (observe builds): `SO_SNDBUF` set on each connection's socket
-/// when nonzero, so a stall forms after a few KiB on every OS (Linux
-/// otherwise takes hundreds of KiB from a client that does not read).
-pub var test_sndbuf_bytes: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
-/// Test-only (observe builds): handlers parked in `waitForAckRoom` right now,
-/// waiting for room in the stash (TLS) or the write queue (h2c).
-pub var test_room_waiting: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): how closing phases ended in `closeFlushed`:
 /// the writer failed; the deadline passed with output still not written
 /// (`blocked`) or with all of it in the kernel and the peer not closing
@@ -359,17 +343,6 @@ pub var test_release_hook: test_hook.Hook(?*const fn (*Connection, ReleasePoint)
 /// the times the driver stopped there.
 pub var test_hold_stash: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 pub var test_hold_stash_entered: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
-/// Test-only (observe builds): while true, the TLS driver takes no chunk off
-/// the stash, as if every send were in flight forever, and the actor goes on
-/// with everything else, reading included (unlike `test_hold_stash` and the
-/// TLS side of `wire_pump.test_hold_writes`, which park it). The stash fills
-/// and the control pause holds for as long as the flag does.
-pub var test_hold_tls_take: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
-
-fn tlsTakeHeld() bool {
-    if (comptime !test_observe) return false;
-    return test_hold_tls_take.load(.acquire);
-}
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
 pub var test_allow_full_queue_push: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
@@ -3814,7 +3787,6 @@ pub const Connection = struct {
             }
         }
         while (pump.pending_n == 0) {
-            if (tlsTakeHeld()) break;
             const chunk = if (pump.carried) |c| blk: {
                 pump.carried = null;
                 break :blk c;
@@ -3899,7 +3871,7 @@ pub const Connection = struct {
         // completion was never delivered and every task on that executor
         // stopped for good (t-2655: 10M turns with no park, pending_n=6,
         // carried set).
-        if (pump.pending_n == 0 and (pump.carried != null or !pump.write_ch.isEmpty()) and !tlsTakeHeld()) {
+        if (pump.pending_n == 0 and (pump.carried != null or !pump.write_ch.isEmpty())) {
             self.diagNoPark(pump, 2);
             return false;
         }
@@ -4182,10 +4154,6 @@ pub const Connection = struct {
         if (diag_task_handle_fn) |f| self.actor_task_h.store(f(), .release);
         if (comptime placement_check) self.actor_thread = std.Thread.getCurrentId();
         probeNote(.actor_start);
-        if (comptime test_observe) {
-            const sndbuf: c_int = @intCast(test_sndbuf_bytes.load(.acquire));
-            if (sndbuf != 0) _ = std.c.setsockopt(self.stream.socket.handle, std.c.SOL.SOCKET, std.c.SO.SNDBUF, std.mem.asBytes(&sndbuf), @sizeOf(c_int));
-        }
 
         var read_pump: wire_pump.ReadPump = undefined;
         var write_pump: wire_pump.WritePump = undefined;
@@ -5622,10 +5590,6 @@ pub const Connection = struct {
             _ = self.ack_room_waiters.fetchAdd(1, .seq_cst); // W1
             defer _ = self.ack_room_waiters.fetchSub(1, .seq_cst);
             if (self.barrierRoomSeqCst()) return; // R1
-            if (comptime test_observe) _ = test_room_waiting.fetchAdd(1, .acq_rel);
-            defer if (comptime test_observe) {
-                _ = test_room_waiting.fetchSub(1, .acq_rel);
-            };
             self.unlockSession(self.config.io);
             const wait_res: anyerror!void = if (event) |e| blk: {
                 const winner = zio.select(.{
@@ -6111,7 +6075,6 @@ pub const Connection = struct {
             self.sched.pause_control = h2cPause;
             self.sched.pause_ctx = self;
         }
-        if (comptime test_observe) test_stalled.store(self.stalledNow(), .release);
         if (diag_park) {
             const now = nowNs(self.config.io);
             if (diag_last_drain_ns != 0) diag_prev_drain_gap_ns = now -% diag_last_drain_ns;
@@ -6315,9 +6278,6 @@ pub const Connection = struct {
             self.handleWriterFailed();
             return err;
         };
-        // Again after the drain: the pushes it made may be what filled the
-        // queue, and no later drain may come once the writer is blocked.
-        if (comptime test_observe) test_stalled.store(self.stalledNow(), .release);
         if (trace.enabled) {
             if (sink_ctx.tickets_emitted > 0) {
                 _ = trace.emit_turns.fetchAdd(1, .monotonic);
@@ -7122,14 +7082,6 @@ pub const Connection = struct {
         if (self.outboundMemoryLow()) return true;
         if (self.ack_room_armed and !self.h2cAckRoom(0)) return true;
         return !self.h2cQueueRoom(h2c_queue_room_per_pop);
-    }
-
-    /// See `test_stalled`. Reads only; counts nothing.
-    fn stalledNow(self: *Connection) bool {
-        if (self.tls_driver) |p| return (p.pending_n > 0 or tlsTakeHeld()) and (p.stashFull() or self.outboundMemoryLow());
-        if (self.config.mode != .h2c or !self.ack_room_armed) return false;
-        if (wire_pump.test_writing.load(.acquire) == 0) return false;
-        return self.outboundMemoryLow() or !self.h2cAckRoom(0) or !self.h2cQueueRoom(h2c_queue_room_per_pop);
     }
 
     fn payloadInScratch(self: *const Connection, buf: []const u8) bool {
