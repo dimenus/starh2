@@ -11,6 +11,12 @@ const h2_oracle = @import("h2_oracle.zig");
 
 pub const client_deadline_ns = 10 * std.time.ns_per_s;
 
+/// FIONREAD: std.c has no macOS entry for it. `_IOR('f', 127, int)` there.
+const fionread = switch (@import("builtin").os.tag) {
+    .linux => std.os.linux.T.FIONREAD,
+    else => 0x4004667f,
+};
+
 pub const Transport = enum { h2c, tls };
 
 pub fn nowNs() u64 {
@@ -75,6 +81,34 @@ pub const Wire = struct {
         const self = try gpa.create(Wire);
         self.* = .{ .gpa = gpa, .transport = transport, .fd = fd, .oracle = .init(gpa, transport == .tls) };
         return self;
+    }
+
+    /// `connectRecvBuf` over a Unix stream socket at `path` (a server's
+    /// `h2c_unix` / `tls_unix` endpoint). The receive buffer is set before
+    /// the connection; on Linux a Unix stream is limited by the SENDER's
+    /// buffer, not this one, so a test must not count on it there.
+    pub fn connectUnix(gpa: std.mem.Allocator, transport: Transport, path: []const u8, rcvbuf: ?c_int) !*Wire {
+        const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        errdefer _ = std.c.close(fd);
+        if (rcvbuf) |n| _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&n), @sizeOf(c_int));
+        var addr: std.c.sockaddr.un = .{ .path = @splat(0) };
+        if (path.len >= addr.path.len) return error.NameTooLong;
+        @memcpy(addr.path[0..path.len], path);
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) != 0) return error.Connect;
+        const tv: std.c.timeval = .{ .sec = 1, .usec = 0 };
+        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(std.c.timeval));
+        const self = try gpa.create(Wire);
+        self.* = .{ .gpa = gpa, .transport = transport, .fd = fd, .oracle = .init(gpa, transport == .tls) };
+        return self;
+    }
+
+    /// Bytes the kernel holds for this client that it has not read yet
+    /// (FIONREAD), read without consuming them.
+    pub fn unreadBytes(self: *const Wire) usize {
+        var n: c_int = 0;
+        if (std.c.ioctl(self.fd, fionread, &n) != 0) return 0;
+        return @intCast(n);
     }
 
     pub fn open(gpa: std.mem.Allocator, transport: Transport, port: u16) !*Wire {

@@ -41,6 +41,29 @@ pub const EndpointConfig = union(enum) {
     tls: EndpointAddress,
     h2c_prior_knowledge: EndpointAddress,
     h1c: EndpointAddress,
+    /// TLS or h2c on a Unix stream socket at this path: for a proxy on the
+    /// same host, and the transport the tests drive, whose fixed kernel
+    /// buffers hold a stall (TCP loopback's do not on macOS). The server
+    /// copies the path, binds it, and deletes the file when its listeners
+    /// close. A file already there is not removed: the bind fails. At most
+    /// `std.Io.net.UnixAddress.max_len` bytes (104 on macOS).
+    tls_unix: []const u8,
+    h2c_unix: []const u8,
+
+    pub fn mode(ep: EndpointConfig) connection.Mode {
+        return switch (ep) {
+            .tls, .tls_unix => .tls,
+            .h2c_prior_knowledge, .h2c_unix => .h2c,
+            .h1c => .h1c,
+        };
+    }
+
+    fn unixPath(ep: EndpointConfig) ?[]const u8 {
+        return switch (ep) {
+            .tls_unix, .h2c_unix => |p| p,
+            else => null,
+        };
+    }
 };
 
 pub const TlsConfig = struct {
@@ -155,8 +178,9 @@ pub const Server = struct {
         var need_tls = false;
         var need_h2c = false;
         for (config.endpoints) |ep| {
-            if (ep == .tls) need_tls = true;
-            if (ep == .h2c_prior_knowledge) need_h2c = true;
+            if (ep.mode() == .tls) need_tls = true;
+            if (ep.mode() == .h2c) need_h2c = true;
+            if (ep.unixPath()) |path| _ = std.Io.net.UnixAddress.init(path) catch return error.InvalidConfig;
         }
         if (need_h2c) try config.limits.checkH2cWriteQueue();
         if (need_tls and config.tls == null) return error.InvalidConfig;
@@ -184,7 +208,17 @@ pub const Server = struct {
         }
 
         const endpoints = try gpa.dupe(EndpointConfig, config.endpoints);
-        errdefer gpa.free(endpoints);
+        for (endpoints) |*ep| switch (ep.*) {
+            .tls_unix, .h2c_unix => |*p| p.* = &.{},
+            else => {},
+        };
+        errdefer freeEndpoints(gpa, endpoints);
+        // The paths are the caller's: own a copy.
+        for (config.endpoints, endpoints) |src, *dst| switch (src) {
+            .tls_unix => |p| dst.* = .{ .tls_unix = try gpa.dupe(u8, p) },
+            .h2c_unix => |p| dst.* = .{ .h2c_unix = try gpa.dupe(u8, p) },
+            else => {},
+        };
 
         var tls_acceptor: ?tls_edge.Acceptor = null;
         errdefer if (tls_acceptor) |*auth| auth.deinit();
@@ -238,12 +272,7 @@ pub const Server = struct {
         // A server with only h1c endpoints makes no slots.
         var slot_boot_bytes: usize = 0;
         for (config.endpoints) |ep| {
-            const mode: connection.Mode = switch (ep) {
-                .tls => .tls,
-                .h2c_prior_knowledge => .h2c,
-                .h1c => .h1c,
-            };
-            slot_boot_bytes = @max(slot_boot_bytes, config.limits.slotBootBytes(mode) catch return error.InvalidConfig);
+            slot_boot_bytes = @max(slot_boot_bytes, config.limits.slotBootBytes(ep.mode()) catch return error.InvalidConfig);
         }
         var slots = conn_slot.SlotPool.init(gpa, config.limits.max_connections, slot_boot_bytes) catch return error.OutOfMemory;
         errdefer slots.deinit();
@@ -276,7 +305,11 @@ pub const Server = struct {
 
     fn closeListeners(self: *Server) void {
         var i: usize = 0;
-        while (i < self.listeners_bound) : (i += 1) self.listeners[i].socket.close(self.io);
+        while (i < self.listeners_bound) : (i += 1) {
+            self.listeners[i].socket.close(self.io);
+            // The socket file this server bound.
+            if (self.endpoints[i].unixPath()) |path| std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        }
         self.listeners_bound = 0;
     }
 
@@ -298,12 +331,10 @@ pub const Server = struct {
         }
 
         for (self.endpoints, 0..) |endpoint, i| {
-            const address = switch (endpoint) {
-                .tls => |value| value,
-                .h2c_prior_knowledge => |value| value,
-                .h1c => |value| value,
-            };
-            self.listeners[i] = listenEndpoint(self.io, address, self.limits.listen_backlog) catch return error.ListenFailed;
+            self.listeners[i] = switch (endpoint) {
+                .tls, .h2c_prior_knowledge, .h1c => |address| listenEndpoint(self.io, address, self.limits.listen_backlog),
+                .tls_unix, .h2c_unix => |path| listenUnix(self.io, path, self.limits.listen_backlog),
+            } catch return error.ListenFailed;
             self.local_addrs[i] = self.listeners[i].socket.address;
             self.listeners_bound = i + 1;
         }
@@ -328,12 +359,7 @@ pub const Server = struct {
         errdefer if (reapers_live) self.stopReapers(&reaper_group);
 
         for (self.endpoints, 0..) |endpoint, i| {
-            const mode: connection.Mode = switch (endpoint) {
-                .tls => .tls,
-                .h2c_prior_knowledge => .h2c,
-                .h1c => .h1c,
-            };
-            accept_group.concurrent(self.io, acceptLoop, .{ self, i, mode, &connection_group }) catch {
+            accept_group.concurrent(self.io, acceptLoop, .{ self, i, endpoint.mode(), &connection_group }) catch {
                 accept_group.cancel(self.io);
                 connection_group.cancel(self.io);
                 return error.TransportSetupFailed;
@@ -715,7 +741,7 @@ pub const Server = struct {
         }
         for (self.routes) |route| gpa.free(route.path);
         gpa.free(self.routes);
-        gpa.free(self.endpoints);
+        freeEndpoints(gpa, self.endpoints);
         gpa.free(self.listeners);
         gpa.free(self.local_addrs);
         if (self.reaper) |*pool| pool.deinit();
@@ -742,6 +768,21 @@ pub const Server = struct {
 /// from `Limits.listen_backlog`; the kernel caps it at somaxconn.
 fn listenEndpoint(io: std.Io, address: EndpointAddress, backlog: u31) std.Io.net.IpAddress.ListenError!std.Io.net.Server {
     return address.listen(io, .{ .reuse_address = true, .kernel_backlog = backlog });
+}
+
+/// A Unix stream listener at `path`. Init checked the path's length.
+fn listenUnix(io: std.Io, path: []const u8, backlog: u31) std.Io.net.UnixAddress.ListenError!std.Io.net.Server {
+    const ua = std.Io.net.UnixAddress.init(path) catch unreachable;
+    return ua.listen(io, .{ .kernel_backlog = backlog });
+}
+
+fn freeEndpoints(gpa: std.mem.Allocator, endpoints: []EndpointConfig) void {
+    for (endpoints) |ep| {
+        if (ep.unixPath()) |p| {
+            if (p.len != 0) gpa.free(p);
+        }
+    }
+    gpa.free(endpoints);
 }
 
 /// Turn off Nagle on an accepted TCP socket.
