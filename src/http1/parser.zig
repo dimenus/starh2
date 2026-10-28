@@ -7,6 +7,7 @@
 //! Status codes on the reject paths are the cut table in `tools/h1-channel-brief.md`.
 //! Do not weaken a rejection into an accept.
 const std = @import("std");
+const test_hook = @import("../edge/test_hook.zig");
 const request = @import("../http/request.zig");
 const fields_mod = @import("../core/fields.zig");
 const hpack = @import("../core/hpack.zig");
@@ -23,7 +24,7 @@ pub const Mutation = enum {
     m8_lenient_cl,
 };
 
-pub var test_mutation: Mutation = .none;
+pub var test_mutation: test_hook.Hook(Mutation) = if (test_hook.on) .none else {};
 
 pub const Version = enum { http10, http11 };
 
@@ -107,7 +108,7 @@ pub const Accumulator = struct {
                 self.matched += 1;
                 if (self.matched == 4) {
                     var consumed = i + 1;
-                    if (test_mutation == .m1_short_consume and consumed > 0) {
+                    if ((comptime test_hook.on) and test_mutation == .m1_short_consume and consumed > 0) {
                         consumed -= 1;
                     }
                     return .{ .head = .{ .consumed = consumed, .len = self.filled } };
@@ -554,7 +555,7 @@ fn isChunkedOnly(value: []const u8) bool {
 
 fn parseContentLength(value: []const u8) ?u64 {
     if (value.len == 0) return null;
-    if (test_mutation == .m8_lenient_cl) {
+    if ((comptime test_hook.on) and test_mutation == .m8_lenient_cl) {
         return std.fmt.parseInt(u64, trimOws(value), 10) catch null;
     }
     for (value) |c| {

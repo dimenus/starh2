@@ -34,6 +34,7 @@
 //! `wait` checks `ok` BEFORE the terminal cause, and that order is the whole
 //! point of `wait`'s doc comment below.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const zio = @import("zio");
 const response = @import("../http/response.zig");
 
@@ -78,7 +79,7 @@ pub const TestReserveBarrier = struct {
     go_finish: std.Io.Event = .unset,
 };
 
-pub var test_reserve_barrier: ?*TestReserveBarrier = null;
+pub var test_reserve_barrier: test_hook.Hook(?*TestReserveBarrier) = if (test_hook.on) null else {};
 
 pub var diag_reserved: std.atomic.Value(u64) = .init(0);
 pub var diag_completed: std.atomic.Value(u64) = .init(0);
@@ -105,9 +106,11 @@ pub const TicketTable = struct {
     /// Returns ticket + slot index. Caller must waitTicket or releaseReserved on error before wait.
     pub fn reserve(self: *TicketTable) error{ OutOfMemory, WriteFailed }!struct { u64, u32 } {
         if (self.write_failed.load(.acquire)) return error.WriteFailed;
-        if (test_reserve_barrier) |b| {
-            b.after_precheck.set(self.io);
-            b.go_claim.wait(self.io) catch return error.WriteFailed;
+        if (comptime test_hook.on) {
+            if (test_reserve_barrier) |b| {
+                b.after_precheck.set(self.io);
+                b.go_claim.wait(self.io) catch return error.WriteFailed;
+            }
         }
         if (self.write_failed.load(.acquire)) return error.WriteFailed;
         bump(&diag_reserved);
@@ -115,9 +118,11 @@ pub const TicketTable = struct {
         if (ticket == 0) return error.OutOfMemory;
         for (self.slots, 0..) |*slot, i| {
             if (slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
-                if (test_reserve_barrier) |b| {
-                    b.after_claim.set(self.io);
-                    b.go_finish.wait(self.io) catch return error.WriteFailed;
+                if (comptime test_hook.on) {
+                    if (test_reserve_barrier) |b| {
+                        b.after_claim.set(self.io);
+                        b.go_finish.wait(self.io) catch return error.WriteFailed;
+                    }
                 }
                 // Claim won — recheck failure. failAll may have scanned past this free slot
                 // before our claim; without this check we wait forever.

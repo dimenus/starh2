@@ -23,6 +23,7 @@
 //! observes it race-free). Both are set together, because a connection actor
 //! may be parked in a select where a flag alone would never be observed.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const limits_mod = @import("../core/limits.zig");
@@ -49,11 +50,11 @@ pub const TlsConfig = struct {
 
 /// Test-only: TLS handshakes that ended at their own timeout, as opposed to
 /// a peer that broke the handshake. Counted in Debug and `-Dobserve=true`.
-pub var test_handshake_timeouts: std.atomic.Value(usize) = .init(0);
+pub var test_handshake_timeouts: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 /// Test-only: times an accept loop parked because the connection or TLS
 /// handshake limit was full. Counted in Debug and `-Dobserve=true`.
-pub var test_admission_waits: std.atomic.Value(usize) = .init(0);
+pub var test_admission_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 pub const InitError = error{
     OutOfMemory,

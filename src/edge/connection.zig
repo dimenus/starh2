@@ -106,6 +106,7 @@
 //! draw lasts for the connection's life. With migration there is no fixed
 //! home to choose, and zio refuses any placement but `.auto`.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 // Direct zio dependency: the actor parks in one `zio.select`; TLS adds
 // the CompletionQueue. The h2c pumps stay std.Io-pure.
 const zio = @import("zio");
@@ -159,7 +160,7 @@ pub const placement_check = test_observe and zio_scheduling != .work_stealing;
 /// Per-connection task starts that compared their thread with the actor's.
 /// Counted so a zero mismatch count can be told apart from a check that
 /// never ran.
-pub var test_placement_checks: std.atomic.Value(usize) = .init(0);
+pub var test_placement_checks: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Diagnosis counters (always on, one atomic add per task handler): task
 /// handlers that reached the spawn, and spawns zio accepted. Compared with a
 /// handler's own entry count they tell "never spawned" from "spawned, never
@@ -167,7 +168,7 @@ pub var test_placement_checks: std.atomic.Value(usize) = .init(0);
 pub var diag_task_spawn_attempts: std.atomic.Value(u64) = .init(0);
 pub var diag_task_spawned: std.atomic.Value(u64) = .init(0);
 /// Per-connection task starts that ran on a thread other than the actor's.
-pub var test_placement_mismatches: std.atomic.Value(usize) = .init(0);
+pub var test_placement_mismatches: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 /// Called first by every per-connection task. `actor_thread` is the thread
 /// the connection's actor recorded when it started.
@@ -248,54 +249,54 @@ fn probeHandlerPlacement() zio.Placement {
 /// Test-only: when true, task-handler spawn fails closed with REFUSED_STREAM.
 /// Complete handlers never spawn, so this flag does not touch them. Do not
 /// run the task handler on the actor as a fallback — that parks ingest.
-pub var test_force_spawn_fail: bool = false;
+pub var test_force_spawn_fail: test_hook.Hook(bool) = if (test_hook.on) false else {};
 /// Test-only: when true, actor skips draining completion_ch (sticky until cleared).
-pub var test_hold_completion_drain: std.atomic.Value(bool) = .init(false);
+pub var test_hold_completion_drain: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: when true, the actor takes no write completion off
 /// `write_ack_ch` (sticky until cleared), so a test can make the one receiver
 /// slower than the drains that feed the pump. A real actor is that slow when
 /// one drain turn pushes many chunks. After clearing it, wake the actor the
 /// way a peer would (any inbound frame). Observe builds only.
-pub var test_hold_ack_receive: std.atomic.Value(bool) = .init(false);
+pub var test_hold_ack_receive: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 var hold_dummy_ack_buf: [1]wire_pump.WriteCompletion = undefined;
 var hold_dummy_ack_ch: zio.Channel(wire_pump.WriteCompletion) = .init(&hold_dummy_ack_buf);
 /// Test-only (observe builds): h2c drains held back because `write_ack_ch`
 /// had no room for another pop.
-pub var test_ack_room_pauses: std.atomic.Value(usize) = .init(0);
+pub var test_ack_room_pauses: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): handler flush barriers that parked for
 /// `write_ack_ch` room (`waitForAckRoom`).
-pub var test_ack_room_waits: std.atomic.Value(usize) = .init(0);
+pub var test_ack_room_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): the fewest free stash slots a TLS bare flush
 /// barrier left after its push (`pushBareBarrier`). Starts at the maximum.
-pub var test_tls_barrier_min_room: std.atomic.Value(usize) = .init(std.math.maxInt(usize));
+pub var test_tls_barrier_min_room: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(std.math.maxInt(usize)) else {};
 /// Test-only (observe builds): handlers that parked for connection outbound
 /// budget (`parkForBudget`), and the budget grants made. `test_budget_grant_log`
 /// keeps the stream id of each grant, newest at `grants % len`, so a test can
 /// read the order the queue served its waiters in.
-pub var test_budget_waits: std.atomic.Value(usize) = .init(0);
-pub var test_budget_grants: std.atomic.Value(usize) = .init(0);
-pub var test_budget_grant_log: [64]std.atomic.Value(u32) = @splat(.init(0));
+pub var test_budget_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_budget_grants: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_budget_grant_log: test_hook.Hook([64]std.atomic.Value(u32)) = if (test_hook.on) @splat(.init(0)) else {};
 /// Test-only (observe builds): times `runPendingInline` held a complete job
 /// back for lack of connection budget.
-pub var test_inline_budget_gated: std.atomic.Value(usize) = .init(0);
+pub var test_inline_budget_gated: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): doorbell rings made by a budget grant to an
 /// inline entry. The grant of the entry being admitted in the same call rings
 /// nothing.
-pub var test_budget_doorbell_rings: std.atomic.Value(usize) = .init(0);
+pub var test_budget_doorbell_rings: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): terminal control frames the scheduler could not
 /// queue (`ctrl_terminal_full`, the reset burst that ends a connection). A test
 /// that relies on the terminal queue not overflowing asserts it did not move.
-pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
+pub var test_ctrl_terminal_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: the most frames the terminal ring has held at once, over every
 /// connection since the test last stored 0. A bound test reads it to prove the
 /// stall really queued the frames it means to, and that none went past T.
 /// Counted in Debug and `-Dobserve=true`.
-pub var test_terminal_ring_high: std.atomic.Value(usize) = .init(0);
+pub var test_terminal_ring_high: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): RST_STREAM frames the scheduler took while its
 /// control pause (`pause_control`) was on, so they waited in the terminal
 /// ring. A stall test reads it to prove its RSTs were queued during the
 /// stall, not after it.
-pub var test_rst_queued_paused: std.atomic.Value(usize) = .init(0);
+pub var test_rst_queued_paused: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds), refreshed at every drain: the writer is blocked
 /// on the socket and the control pause is on. h2c: a WritePump is inside a
 /// socket write (`wire_pump.test_writing`) and the write queue, the ack ring
@@ -304,66 +305,66 @@ pub var test_rst_queued_paused: std.atomic.Value(usize) = .init(0);
 /// small socket send buffer (`test_sndbuf_bytes`), a client that never reads
 /// and far more queued output than the two socket buffers hold, this cannot
 /// turn false again: nothing ever drains.
-pub var test_stalled: std.atomic.Value(bool) = .init(false);
+pub var test_stalled: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only (observe builds): `SO_SNDBUF` set on each connection's socket
 /// when nonzero, so a stall forms after a few KiB on every OS (Linux
 /// otherwise takes hundreds of KiB from a client that does not read).
-pub var test_sndbuf_bytes: std.atomic.Value(u32) = .init(0);
+pub var test_sndbuf_bytes: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): handlers parked in `waitForAckRoom` right now,
 /// waiting for room in the stash (TLS) or the write queue (h2c).
-pub var test_room_waiting: std.atomic.Value(usize) = .init(0);
+pub var test_room_waiting: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): how closing phases ended in `closeFlushed`:
 /// the writer failed; the deadline passed with output still not written
 /// (`blocked`) or with all of it in the kernel and the peer not closing
 /// (`flushed`); the peer closed after a lingering close (h2c: on TLS a peer
 /// EOF ends the turn before `closeFlushed` runs).
-pub var test_closing_ended_writer_failed: std.atomic.Value(usize) = .init(0);
-pub var test_closing_ended_deadline_blocked: std.atomic.Value(usize) = .init(0);
-pub var test_closing_ended_deadline_flushed: std.atomic.Value(usize) = .init(0);
-pub var test_closing_ended_peer_eof: std.atomic.Value(usize) = .init(0);
+pub var test_closing_ended_writer_failed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_closing_ended_deadline_blocked: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_closing_ended_deadline_flushed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_closing_ended_peer_eof: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): closing phases whose output was all flushed
 /// and whose send side was then shut, to wait for the peer (the lingering
 /// close in `closeFlushed`).
-pub var test_closing_write_shut: std.atomic.Value(usize) = .init(0);
+pub var test_closing_write_shut: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): HTTP/2 connections whose socket was closed,
 /// and when the last one was (`zio.Timestamp` monotonic ns, the clock the
 /// tests read). Written at the close itself, so a test can tell when the
 /// server let go of the peer, whatever the closing phase decided.
-pub var test_socket_closes: std.atomic.Value(usize) = .init(0);
-pub var test_socket_close_ns: std.atomic.Value(u64) = .init(0);
+pub var test_socket_closes: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_socket_close_ns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): server RST_STREAMs dropped from the terminal
 /// ring because the peer reset the same stream first (`retireTerminalRst`).
-pub var test_rst_retired: std.atomic.Value(usize) = .init(0);
+pub var test_rst_retired: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: ORDINARY control frames (HEADERS and the like) the scheduler
 /// refused, by the pool (`PoolFull`) and by the ring (`QueueFull`). A handler
 /// whose response is refused sees `WriteFailed`. Counted in Debug and
 /// `-Dobserve=true`.
-pub var test_ctrl_ordinary_pool_full: std.atomic.Value(usize) = .init(0);
-pub var test_ctrl_ordinary_queue_full: std.atomic.Value(usize) = .init(0);
+pub var test_ctrl_ordinary_pool_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_ctrl_ordinary_queue_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): actors that are inside their park select right
 /// now. Raised immediately before `zio.select` in `waitForActivity` and lowered
 /// right after it returns. A test whose handler must act while the actor is
 /// asleep waits for this to be above zero (a sleep proves nothing about the
 /// actor's turn), with a deadline that fails the test. One connection per test.
-pub var test_actors_in_select: std.atomic.Value(usize) = .init(0);
+pub var test_actors_in_select: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): where in `unlockSession` a hook runs, between its
 /// two counters and around its ring, so a unit test can put the actor's
 /// snapshot at either side of the ring without a second thread.
 pub const ReleasePoint = enum { before_ring, after_ring, park_after_check };
-pub var test_release_hook: ?*const fn (*Connection, ReleasePoint) void = null;
+pub var test_release_hook: test_hook.Hook(?*const fn (*Connection, ReleasePoint) void) = if (test_hook.on) null else {};
 /// Test-only (observe builds): while true, the TLS driver holds the chunks that
 /// sit in the stash (pushed by a drain, not yet taken for writing). Beside
 /// `wire_pump.test_hold_writes`, which holds a batch the driver already took,
 /// it lets a test see a chunk in each place. `test_hold_stash_entered` counts
 /// the times the driver stopped there.
-pub var test_hold_stash: std.atomic.Value(bool) = .init(false);
-pub var test_hold_stash_entered: std.atomic.Value(u64) = .init(0);
+pub var test_hold_stash: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_hold_stash_entered: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): while true, the TLS driver takes no chunk off
 /// the stash, as if every send were in flight forever, and the actor goes on
 /// with everything else, reading included (unlike `test_hold_stash` and the
 /// TLS side of `wire_pump.test_hold_writes`, which park it). The stash fills
 /// and the control pause holds for as long as the flag does.
-pub var test_hold_tls_take: std.atomic.Value(bool) = .init(false);
+pub var test_hold_tls_take: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 
 fn tlsTakeHeld() bool {
     if (comptime !test_observe) return false;
@@ -371,29 +372,29 @@ fn tlsTakeHeld() bool {
 }
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
-pub var test_allow_full_queue_push: std.atomic.Value(bool) = .init(false);
+pub var test_allow_full_queue_push: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only (observe builds): h2c pushes refused because the write queue was
 /// full. Zero in a correct build (`pushWriteChunk`).
-pub var test_queue_push_refusals: std.atomic.Value(usize) = .init(0);
+pub var test_queue_push_refusals: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): pushes `pushWriteChunk` refused because the
 /// channel had no room, each one a connection failed closed. Zero in a
 /// correct build.
-pub var test_ack_bound_refusals: std.atomic.Value(usize) = .init(0);
+pub var test_ack_bound_refusals: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: while true, `drainEmit` emits nothing, so frames a handler
 /// queued stay in the scheduler (a reset can then arrive before them).
 /// Compiled out unless `test_observe`.
-pub var test_hold_emit: std.atomic.Value(bool) = .init(false);
+pub var test_hold_emit: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: stash a complete-batch write ack on the actor instead of
 /// applying it. Separate from `test_hold_completion_drain`, which parks
 /// `completion_ch`. Must not park the actor on the release event — that
 /// would block ingest of the next HEADERS, which is the property the
 /// lifecycle hold test checks.
-pub var test_hold_complete_receipt_ack: std.atomic.Value(bool) = .init(false);
+pub var test_hold_complete_receipt_ack: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: true while a complete-batch write ack is stashed unapplied.
-pub var test_complete_receipt_ack_held: std.atomic.Value(bool) = .init(false);
+pub var test_complete_receipt_ack_held: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: wakes a parked actor that has a live complete-batch stash.
 /// A zio.Event so the actor's select can wait on it directly.
-pub var test_release_complete_receipt_ack: zio.Event = .init;
+pub var test_release_complete_receipt_ack: test_hook.Hook(zio.Event) = if (test_hook.on) .init else {};
 /// Never set / never sent-to: the select branches point here when their
 /// real source is absent or gated, so the select keeps one comptime shape.
 var no_shutdown_event: zio.Event = .init;
@@ -402,14 +403,14 @@ var hold_dummy_completion_buf: [1]u31 = undefined;
 var hold_dummy_completion_ch: zio.Channel(u31) = .init(&hold_dummy_completion_buf);
 /// Test-only: when true, `borrowHeaderListMem` finds no free lease, so the
 /// next HEADERS takes Session's refuse-without-memory path.
-pub var test_no_request_lease: std.atomic.Value(bool) = .init(false);
+pub var test_no_request_lease: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: when true, the allocations that build a handler job fail as if
 /// the request's memory had run out, so dispatch takes its refusal path.
-pub var test_fail_dispatch_alloc: std.atomic.Value(bool) = .init(false);
+pub var test_fail_dispatch_alloc: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: delay write pump by N ms.
-pub var test_write_delay_ms: u64 = 0;
+pub var test_write_delay_ms: test_hook.Hook(u64) = if (test_hook.on) 0 else {};
 /// Test-only: fail write pump after N successful writes (0 = never).
-pub var test_write_fail_after: u64 = 0;
+pub var test_write_fail_after: test_hook.Hook(u64) = if (test_hook.on) 0 else {};
 /// Hot test counters. On in Debug (the gate builds) and when `-Dobserve=true`.
 /// Off in ReleaseFast examples so the oneshot bench does not pay process-global
 /// RMWs. Mutation canaries stay in gate builds; they are not the price of the
@@ -420,61 +421,61 @@ pub const test_observe = @import("build_options").observe;
 /// itself, not by the actor loop: an idle actor parks until the next wakeup, so a
 /// value refreshed only per iteration stays stale for as long as the connection is
 /// quiet and reports handlers that have already exited.
-pub var test_observed_live_handlers: std.atomic.Value(usize) = .init(0);
+pub var test_observed_live_handlers: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: handler slots held across all connections. Released strictly later
 /// than `test_observed_live_handlers` (the actor releases the slot after joining
 /// the handler), so a drain gate must require both to reach zero.
-pub var test_observed_slots_in_use: std.atomic.Value(usize) = .init(0);
+pub var test_observed_slots_in_use: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: FairScheduler emits observed by actor (mutation canary).
-pub var test_observed_sched_emits: std.atomic.Value(usize) = .init(0);
+pub var test_observed_sched_emits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: true once actor handled writer_failed terminal teardown.
-pub var test_observed_writer_fail_handled: std.atomic.Value(bool) = .init(false);
+pub var test_observed_writer_fail_handled: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: complete handlers run on the actor (no spawn).
-pub var test_observed_inline_jobs: std.atomic.Value(usize) = .init(0);
+pub var test_observed_inline_jobs: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Times `runPendingInline` stopped a batch because no ordinary control entry was free.
-pub var test_observed_inline_ctrl_full: std.atomic.Value(usize) = .init(0);
+pub var test_observed_inline_ctrl_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: queueWire calls not from FairScheduler sink (must stay 0).
-pub var test_queue_wire_bypass: std.atomic.Value(usize) = .init(0);
+pub var test_queue_wire_bypass: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the first-frame checks `queueWire` ran: one per connection that
 /// wrote. A test that expects N connections to be checked proves the check
 /// is wired in; deleting the call leaves every other test green.
-pub var test_preface_checks: std.atomic.Value(usize) = .init(0);
+pub var test_preface_checks: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts connections that started with a non-empty `tls_leftover`. The TLS
 /// preface tests assert every tested connection took that path, because a
 /// server read that returned only the Finished record would skip it.
-pub var test_tls_leftover_connections: std.atomic.Value(usize) = .init(0);
+pub var test_tls_leftover_connections: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the times `error.Canceled` reached `Connection.run`, so a test can
 /// tell a cancel that left as `Canceled` from one a `catch` turned into
 /// something else. The connection task's result is not visible to a test.
-pub var test_run_canceled: std.atomic.Value(usize) = .init(0);
+pub var test_run_canceled: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): actor teardowns begun (`teardownExhaustive`). A
 /// test whose handler stays alive after the connection failed reads this to
 /// prove the ACTOR got to its teardown, which a handler's own task cannot fake.
-pub var test_actor_teardowns: std.atomic.Value(usize) = .init(0);
+pub var test_actor_teardowns: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the times `runPendingInline` saw `error.Canceled` from its drain. With
 /// `test_run_canceled` it lets a test tell WHICH path carried a cancel: a cancel
 /// parked elsewhere (the main-loop drain, a select) reaches `run` without
 /// moving this one.
-pub var test_inline_drain_canceled: std.atomic.Value(usize) = .init(0);
+pub var test_inline_drain_canceled: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the pops an ending h2c connection held back because the write pool
 /// or the write queue had no room (see `h2cPauseFor`). A test that expects the
 /// hold-back proves it ran; removing the hooks leaves the other tests green.
-pub var test_closing_emit_deferred: std.atomic.Value(usize) = .init(0);
+pub var test_closing_emit_deferred: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: true while FairScheduler sink is executing queueWire.
-threadlocal var test_in_sched_sink: bool = false;
+threadlocal var test_in_sched_sink: test_hook.Hook(bool) = if (test_hook.on) false else {};
 /// Test-only: force queueWire/send fail after N successful accounted sends (0=never).
-pub var test_force_wire_fail_after: std.atomic.Value(usize) = .init(0);
-pub var test_wire_sends: std.atomic.Value(usize) = .init(0);
+pub var test_force_wire_fail_after: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_wire_sends: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: last handler ResponseError taxonomy (0=none/success, 1=WriteFailed, 2=ConnectionClosed,
 /// 3=PeerReset, 4=SlowConsumer, 5=other).
-pub var test_last_handler_err: std.atomic.Value(u8) = .init(0);
-pub var test_last_peer_reset_code: std.atomic.Value(u32) = .init(0);
+pub var test_last_handler_err: test_hook.Hook(std.atomic.Value(u8)) = if (test_hook.on) .init(0) else {};
+pub var test_last_peer_reset_code: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
 /// Test-only: stream_id currently blocked in waitForStreamSpace (0 = none).
-pub var test_waiting_for_space: std.atomic.Value(u32) = .init(0);
+pub var test_waiting_for_space: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
 /// Test-only: actor-owned handler-deadline heap occupancy (one connection at a time).
-pub var test_deadline_waits: std.atomic.Value(usize) = .init(0);
+pub var test_deadline_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: Connection finished boot allocations (pools, sched slabs, session maps).
-pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
+pub var test_boot_ready: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 
 
 
@@ -499,11 +500,11 @@ var actor_marker: zio.TaskLocal(*Connection) = .{};
 /// can resume on another thread.
 var handler_job_marker: zio.TaskLocal(void) = .{};
 /// Test-only gate that parks the actor immediately before its event-driven wait.
-pub var test_hold_before_actor_wait: std.atomic.Value(bool) = .init(false);
-pub var test_actor_waiting: std.Io.Event = .unset;
-pub var test_release_actor_wait: std.Io.Event = .unset;
+pub var test_hold_before_actor_wait: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_actor_waiting: test_hook.Hook(std.Io.Event) = if (test_hook.on) .unset else {};
+pub var test_release_actor_wait: test_hook.Hook(std.Io.Event) = if (test_hook.on) .unset else {};
 /// Test-only fallback timer raced against actor events by the wakeup canary.
-pub var test_polling_canary_tick_ns: std.atomic.Value(u64) = .init(0);
+pub var test_polling_canary_tick_ns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Bench `--diag`: print one line when the actor parks with scheduler or TLS
 /// work still sitting in userspace. Off unless the benchmark server sets it.
 pub var diag_park: bool = false;
@@ -1367,7 +1368,7 @@ const SendTrace = struct {
 
 /// Probes `LeaseIndex.find` made (observe builds only): every lease it looked
 /// at. A test reads the count to show a lookup does not scan.
-pub var test_lease_probes: std.atomic.Value(u64) = .init(0);
+pub var test_lease_probes: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 
 /// How a stream id finds its `RequestLease` in O(1), and how a new request
 /// finds a free one. Both are tables sized at boot (`Connection.planBoot`),
@@ -1698,8 +1699,8 @@ pub const DirtyKind = enum {
 
 /// Test-only: how many of the next connections to end in a slot are dirtied,
 /// and how. Counted in Debug and `-Dobserve=true`.
-pub var test_dirty_remaining: std.atomic.Value(usize) = .init(0);
-pub var test_dirty_kind: DirtyKind = .write_chunk_rented;
+pub var test_dirty_remaining: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_dirty_kind: test_hook.Hook(DirtyKind) = if (test_hook.on) .write_chunk_rented else {};
 
 fn testTakeDirtyTicket() bool {
     var n = test_dirty_remaining.load(.acquire);
@@ -1713,7 +1714,7 @@ fn testTakeDirtyTicket() bool {
 /// connection. The boot path never yields, so a counting allocator can read
 /// this to tell a general-allocator call made by boot from one made by a
 /// request. Counted in Debug and `-Dobserve=true`.
-pub threadlocal var test_in_boot: bool = false;
+pub threadlocal var test_in_boot: test_hook.Hook(bool) = if (test_hook.on) false else {};
 
 /// Entry point for one accepted socket. Boots the `Connection` into `slot`
 /// and runs it. The slot owns the connection's memory; this function ends the
@@ -1757,7 +1758,7 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig, slot: *conn_
         if (close_probe) diagRawPrint("t1002 finish_boot_fail {s}\n", .{@errorName(err)});
         return;
     };
-    test_boot_ready.store(true, .release);
+    if (comptime test_observe) test_boot_ready.store(true, .release);
     conn.run() catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {
@@ -2999,10 +3000,11 @@ pub const Connection = struct {
         std.debug.assert(self.held_ack_n < complete_receipt_capacity);
         self.held_acks[self.held_ack_n] = ack;
         self.held_ack_n += 1;
-        test_complete_receipt_ack_held.store(true, .release);
+        if (comptime test_observe) test_complete_receipt_ack_held.store(true, .release);
     }
 
     fn shouldHoldCompleteAck(ack: wire_pump.WriteCompletion) bool {
+        if (comptime !test_observe) return false;
         return ack.ticket != 0 and ack.complete_batch_receipt and
             test_hold_complete_receipt_ack.load(.acquire);
     }
@@ -3022,9 +3024,11 @@ pub const Connection = struct {
     }
 
     fn flushHeldWriteAcks(self: *Connection) void {
-        if (test_hold_complete_receipt_ack.load(.acquire) and self.held_ack_n > 0) {
-            test_complete_receipt_ack_held.store(true, .release);
-            return;
+        if (comptime test_observe) {
+            if (test_hold_complete_receipt_ack.load(.acquire) and self.held_ack_n > 0) {
+                test_complete_receipt_ack_held.store(true, .release);
+                return;
+            }
         }
         var i: usize = 0;
         while (i < self.held_ack_n) : (i += 1) {
@@ -3032,7 +3036,7 @@ pub const Connection = struct {
         }
         if (self.held_ack_n != 0) {
             self.held_ack_n = 0;
-            test_complete_receipt_ack_held.store(false, .release);
+            if (comptime test_observe) test_complete_receipt_ack_held.store(false, .release);
         }
     }
 
@@ -3097,7 +3101,7 @@ pub const Connection = struct {
             _ = self.applyWriteAck(self.held_acks[i]);
         }
         self.held_ack_n = 0;
-        test_complete_receipt_ack_held.store(false, .release);
+        if (comptime test_observe) test_complete_receipt_ack_held.store(false, .release);
         while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
             if (wire_pump.countsChunk(ack)) {
                 self.acks.sub();
@@ -3404,7 +3408,9 @@ pub const Connection = struct {
     }
 
     fn drainCompletions(self: *Connection) usize {
-        if (test_hold_completion_drain.load(.acquire)) return 0;
+        if (comptime test_observe) {
+            if (test_hold_completion_drain.load(.acquire)) return 0;
+        }
         var n: usize = 0;
         while (io_queue.tryRecv(u31, &self.completion_ch)) |sid| {
             if (self.releaseSlot(sid)) n += 1;
@@ -3616,7 +3622,7 @@ pub const Connection = struct {
             const ns: u64 = @intCast(deadline.nanoseconds);
             if (next == null or ns < next.?) next = ns;
         }
-        const canary_tick = test_polling_canary_tick_ns.load(.acquire);
+        const canary_tick: u64 = if (comptime test_observe) test_polling_canary_tick_ns.load(.acquire) else 0;
         if (canary_tick != 0) {
             const deadline = nowNs(self.config.io) +% canary_tick;
             if (next == null or deadline < next.?) next = deadline;
@@ -3910,9 +3916,11 @@ pub const Connection = struct {
         self.actor_site.store(2, .release);
         defer self.actor_site.store(1, .release);
         if (diag_park) self.traceParkSnapshot();
-        if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
-            test_actor_waiting.set(io);
-            try test_release_actor_wait.wait(io);
+        if (comptime test_observe) {
+            if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
+                test_actor_waiting.set(io);
+                try test_release_actor_wait.wait(io);
+            }
         }
         const timeout: zio.Timeout = if (self.nextDeadlineNs()) |deadline_ns| blk: {
             const now = nowNs(io);
@@ -3939,11 +3947,11 @@ pub const Connection = struct {
             self.config.shutdown_event orelse &no_shutdown_event;
         // The hold leaves completions buffered in the channel, exactly as the
         // gated drain leaves them queued.
-        const comps_ch = if (test_hold_completion_drain.load(.acquire))
+        const comps_ch = if ((comptime test_observe) and test_hold_completion_drain.load(.acquire))
             &hold_dummy_completion_ch
         else
             &self.completion_ch;
-        const ack_hold_ev = if (self.held_ack_n > 0)
+        const ack_hold_ev = if ((comptime test_observe) and self.held_ack_n > 0)
             &test_release_complete_receipt_ack
         else
             &no_ack_hold_event;
@@ -4243,8 +4251,8 @@ pub const Connection = struct {
                 .read_free = &self.read_free_ch,
                 .write_free = &self.write_pool,
                 .live_task_handlers = &self.live_task_handlers,
-                .test_delay_ms = test_write_delay_ms,
-                .test_fail_after = test_write_fail_after,
+                .test_delay_ms = if (comptime test_observe) test_write_delay_ms else 0,
+                .test_fail_after = if (comptime test_observe) test_write_fail_after else 0,
             };
             if (!tls_pump.start()) return;
             self.tls_driver = &tls_pump;
@@ -4289,8 +4297,8 @@ pub const Connection = struct {
                 .ledger = &self.acks,
                 .gpa = gpa,
                 .free_indices = &self.write_pool,
-                .test_delay_ms = test_write_delay_ms,
-                .test_fail_after = test_write_fail_after,
+                .test_delay_ms = if (comptime test_observe) test_write_delay_ms else 0,
+                .test_fail_after = if (comptime test_observe) test_write_fail_after else 0,
             };
             read_handle = try zio.spawnInto(connPlacement(), runReadPump, .{ self, &read_pump });
             write_handle = try zio.spawnInto(connPlacement(), runWritePump, .{ self, &write_pump });
@@ -4739,7 +4747,9 @@ pub const Connection = struct {
                 return self.scratchMem((l.arena.refusal orelse request_pool.Reason.server_cap).status());
             }
         }
-        if (test_no_request_lease.load(.acquire)) return self.scratchMem(503);
+        if (comptime test_observe) {
+            if (test_no_request_lease.load(.acquire)) return self.scratchMem(503);
+        }
         const lease = self.newLease(stream_id) orelse return self.scratchMem(503);
         if (lease.arena.reserve(need)) |_| {
             return self.requestMem(lease);
@@ -6114,8 +6124,10 @@ pub const Connection = struct {
             ) anyerror!void {
                 // A completed batch is still scheduler-originated output even
                 // when it is handed off after `sched.drain` returns.
-                test_in_sched_sink = true;
-                defer test_in_sched_sink = false;
+                if (comptime test_observe) test_in_sched_sink = true;
+                defer if (comptime test_observe) {
+                    test_in_sched_sink = false;
+                };
                 if (trace.enabled) batch.tickets_emitted += ticket_count;
                 try batch.c.queueWire(
                     payload,
@@ -6334,8 +6346,10 @@ pub const Connection = struct {
             ) anyerror!void {
                 // A completed batch is still scheduler-originated output even
                 // when it is handed off after `sched.drain` returns.
-                test_in_sched_sink = true;
-                defer test_in_sched_sink = false;
+                if (comptime test_observe) test_in_sched_sink = true;
+                defer if (comptime test_observe) {
+                    test_in_sched_sink = false;
+                };
                 if (trace.enabled) batch.tickets_emitted += ticket_count;
                 batch.queued_any = true;
                 try batch.c.queueWire(
@@ -6964,7 +6978,7 @@ pub const Connection = struct {
         // connection ending, not a gate that failed: no trap, no refusal.
         if (self.write_queue_ending.load(.seq_cst)) return error.WriteFailed;
         if (comptime test_observe) _ = test_queue_push_refusals.fetchAdd(1, .monotonic);
-        if (std.debug.runtime_safety and !self.writeGoingAway() and !test_allow_full_queue_push.load(.acquire)) {
+        if (std.debug.runtime_safety and !self.writeGoingAway() and !((comptime test_observe) and test_allow_full_queue_push.load(.acquire))) {
             std.debug.panic("h2c write queue is full at a push: a pause hook or the barrier gate let it through", .{});
         }
         self.noteServerClose("queue_full", null);
@@ -7531,7 +7545,9 @@ pub const Connection = struct {
         // arrays are built here. Running out of memory is an answer to the
         // stream, never a connection error: the request is refused (500 when
         // it hit its own cap, 503 for the others) and its memory goes back.
-        if (test_fail_dispatch_alloc.load(.acquire)) return self.refuseDispatchForMemory(d, lease);
+        if (comptime test_observe) {
+            if (test_fail_dispatch_alloc.load(.acquire)) return self.refuseDispatchForMemory(d, lease);
+        }
         const headers = a.alloc(request.Header, d.headers.len) catch return self.refuseDispatchForMemory(d, lease);
         for (d.headers, 0..) |h, i| headers[i] = .{ .name = h.name, .value = h.value };
         const trailers = a.alloc(request.Header, d.trailers.len) catch return self.refuseDispatchForMemory(d, lease);
@@ -7639,7 +7655,7 @@ pub const Connection = struct {
         _ = diag_task_spawn_attempts.fetchAdd(1, .monotonic);
         const where_before = self.diag_actor_where.load(.monotonic);
         diagActor(self, .lk_spawn);
-        const handle = if (test_force_spawn_fail)
+        const handle = if ((comptime test_observe) and test_force_spawn_fail)
             error.OutOfMemory
         else
             zio.spawnInto(probeHandlerPlacement(), runHandlerJob, .{job});
@@ -8836,8 +8852,10 @@ pub const Connection = struct {
         const io = self.config.io;
         const deadline_ns: u64 = @intCast(deadline.nanoseconds);
 
-        _ = test_deadline_waits.fetchAdd(1, .acq_rel);
-        defer _ = test_deadline_waits.fetchSub(1, .acq_rel);
+        if (comptime test_observe) _ = test_deadline_waits.fetchAdd(1, .acq_rel);
+        defer if (comptime test_observe) {
+            _ = test_deadline_waits.fetchSub(1, .acq_rel);
+        };
 
         while (true) {
             const slot_i = self.slotIndex(stream_id) orelse return error.Canceled;

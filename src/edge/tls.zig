@@ -34,6 +34,7 @@
 //! be two implementations of one contract. The std.Io purity of src/edge
 //! ends here; the h2c pumps remain std.Io-pure.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const slab_pool = @import("slab_pool.zig");
 const tls = @import("tls");
 const zio = @import("zio");
@@ -129,7 +130,7 @@ pub var tls_stage_failed: std.atomic.Value(u64) = .init(0);
 
 /// Test-only: alerts the server sent for a failed handshake. Counted in
 /// Debug and `-Dobserve=true`.
-pub var test_handshake_alerts: std.atomic.Value(u64) = .init(0);
+pub var test_handshake_alerts: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 
 pub fn writeFailJson(w: *std.Io.Writer) !void {
     try w.print(
@@ -1003,8 +1004,10 @@ pub const Pump = struct {
             var written_ns: u64 = 0;
             if (ok and chunk.ticket != 0) {
                 written_ns = nowNs(self.io);
-                wire_pump.test_last_ticket_ok_ns.store(written_ns, .release);
-                wire_pump.test_last_ticket_ok_id.store(chunk.ticket, .release);
+                if (comptime observe) {
+                    wire_pump.test_last_ticket_ok_ns.store(written_ns, .release);
+                    wire_pump.test_last_ticket_ok_id.store(chunk.ticket, .release);
+                }
             }
             self.post(.{
                 .ticket = chunk.ticket,
@@ -1324,7 +1327,7 @@ pub const Pump = struct {
                 }
             }
         }
-        const fail_next = wire_pump.test_fail_next_write.swap(false, .acq_rel);
+        const fail_next = if (comptime observe) wire_pump.test_fail_next_write.swap(false, .acq_rel) else false;
         if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
             _ = tls_stage_failed.fetchAdd(1, .monotonic);
             self.failPending();

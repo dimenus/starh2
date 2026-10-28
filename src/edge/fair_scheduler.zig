@@ -73,6 +73,7 @@
 //! `Connection.waitForStreamSpace`. That is the mechanism behind the promise
 //! that a connection stays inside `Limits.resourceUpperBound` under any load.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const control_pool = @import("control_pool.zig");
 const slab_pool = @import("slab_pool.zig");
 const Touched = @import("touched.zig").Touched;
@@ -83,7 +84,7 @@ const observe = @import("build_options").observe;
 
 /// Test-only (`observe` builds): HEADERS dropped by `forgetStream` that
 /// carried a ticket, so an integration test can prove that path ran.
-pub var test_dropped_ticketed_headers: std.atomic.Value(usize) = .init(0);
+pub var test_dropped_ticketed_headers: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 /// One round-robin turn. It matches the HTTP/2 default max frame size, so a
 /// quantum is exactly one DATA frame and the scheduler never has to split a
