@@ -588,6 +588,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     const ended_flushed_0 = conn_mod.test_closing_ended_deadline_flushed.load(.monotonic);
     const ended_failed_0 = conn_mod.test_closing_ended_writer_failed.load(.monotonic);
     const ended_eof_0 = conn_mod.test_closing_ended_peer_eof.load(.monotonic);
+    const write_shut_0 = conn_mod.test_closing_write_shut.load(.monotonic);
     // Every response has its HEADERS out before the stall.
     try waitStarted(&c, m);
 
@@ -810,6 +811,12 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             // The connection closed by its closing deadline, which began when
             // the GOAWAY was queued, at or before `bound_ns`.
             try std.testing.expect(c.eof_ns - bound_ns <= limits.close_flush_timeout_ns);
+            // And it closed lingering: once its output was flushed it shut
+            // only its send side and waited for the client (which reads
+            // until that FIN, so the shut must have come first). A close at
+            // the flush is what let Linux reset the late PING's connection
+            // and drop the unread GOAWAY (item 1).
+            try std.testing.expectEqual(write_shut_0 + 1, conn_mod.test_closing_write_shut.load(.monotonic));
         },
         .flood_unread => unreachable,
         .crossed_resets => {

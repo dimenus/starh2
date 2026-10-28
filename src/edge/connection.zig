@@ -321,6 +321,10 @@ pub var test_closing_ended_writer_failed: std.atomic.Value(usize) = .init(0);
 pub var test_closing_ended_deadline_blocked: std.atomic.Value(usize) = .init(0);
 pub var test_closing_ended_deadline_flushed: std.atomic.Value(usize) = .init(0);
 pub var test_closing_ended_peer_eof: std.atomic.Value(usize) = .init(0);
+/// Test-only (observe builds): closing phases whose output was all flushed
+/// and whose send side was then shut, to wait for the peer (the lingering
+/// close in `closeFlushed`).
+pub var test_closing_write_shut: std.atomic.Value(usize) = .init(0);
 /// Test-only (observe builds): server RST_STREAMs dropped from the terminal
 /// ring because the peer reset the same stream first (`retireTerminalRst`).
 pub var test_rst_retired: std.atomic.Value(usize) = .init(0);
@@ -5022,6 +5026,7 @@ pub const Connection = struct {
         if (!self.closing_write_shut) {
             self.closing_write_shut = true;
             self.stream.shutdown(self.config.io, .send) catch {};
+            if (comptime test_observe) _ = test_closing_write_shut.fetchAdd(1, .monotonic);
         }
         if (comptime test_observe) {
             if (self.closing_peer_eof) _ = test_closing_ended_peer_eof.fetchAdd(1, .monotonic);
