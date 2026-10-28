@@ -648,7 +648,7 @@ fn readSomeTls(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
         }
         if (pump.pending_read == null and pump.conn.pendingInbound()) {
             switch (pump.readOne()) {
-                .eof => return @as(usize, 0),
+                .eof, .closed => return @as(usize, 0),
                 .ok, .want, .stuck => {},
             }
         }
@@ -993,7 +993,7 @@ fn ingestTlsPeer(self: *H1Conn) bool {
     if (pump.inbound_eof) return true;
     if (pump.pending_read == null and pump.conn.pendingInbound()) {
         switch (pump.readOne()) {
-            .eof => return true,
+            .eof, .closed => return true,
             .ok, .want, .stuck => {},
         }
     }

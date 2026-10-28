@@ -998,6 +998,29 @@ pub const Session = struct {
         return self.grace_ping_acked;
     }
 
+    /// The peer closed its side of the transport (a TCP EOF, or TLS
+    /// close_notify): it will send nothing more, so no request can finish and
+    /// no WINDOW_UPDATE can come. What is already queued still goes out (the
+    /// peer may still be reading), then every stream still open ends with
+    /// RST_STREAM(CANCEL), then the connection with GOAWAY(NO_ERROR) naming
+    /// the last stream processed. A NO_ERROR GOAWAY tells the peer the streams
+    /// at or below it were handled, so none may be left open behind it; the
+    /// graceful finish ends its streams the same way. At most one RST per
+    /// open stream: M, which the terminal bound and the intent queue hold
+    /// (`Limits.terminalFrames`, `intentEntriesMin`).
+    pub fn peerClosed(self: *Session) !void {
+        // The ids first: a reset takes its stream out of the map.
+        var n: usize = 0;
+        var it = self.streams.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.state == .closed or e.value_ptr.state == .idle) continue;
+            self.stale_ids[n] = e.key_ptr.*;
+            n += 1;
+        }
+        for (self.stale_ids[0..n]) |sid| try self.emitRst(sid, .cancel);
+        try self.failConnectionWith(.no_error, self.last_processed_stream);
+    }
+
     fn failConnection(self: *Session, code: frame.ErrorCode) !void {
         try self.failConnectionWith(code, self.last_processed_stream);
     }

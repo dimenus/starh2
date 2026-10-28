@@ -315,6 +315,11 @@ pub var test_closing_write_shut: test_hook.Hook(std.atomic.Value(usize)) = if (t
 /// tests read). Written at the close itself, so a test can tell when the
 /// server let go of the peer, whatever the closing phase decided.
 pub var test_socket_closes: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): TLS closing phases that staged close_notify.
+pub var test_close_notify_staged: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): peer EOFs the actor took as an event
+/// (`onPeerEof`), before or during the closing phase.
+pub var test_peer_eofs: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 pub var test_socket_close_ns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): server RST_STREAMs dropped from the terminal
 /// ring because the peer reset the same stream first (`retireTerminalRst`).
@@ -3763,7 +3768,6 @@ pub const Connection = struct {
         diagActor(self, .tls_turn);
         defer diagActor(self, .running);
         const pump = self.tls_driver.?;
-        if (pump.inbound_eof) return true;
 
         // Closing phase: a completion taken here can be the last send, which
         // is what ends the phase. Only the lock block decides that, so a turn
@@ -3826,7 +3830,7 @@ pub const Connection = struct {
                 switch (pump.readOne()) {
                     .eof => return true,
                     .ok => {},
-                    .want, .stuck => break,
+                    .closed, .want, .stuck => break,
                 }
             }
             const chunk = pump.pending_read orelse break;
@@ -3853,7 +3857,6 @@ pub const Connection = struct {
             return false;
         }
 
-        if (pump.inbound_eof) return true;
         // t-866: never wait while pendingInbound(). Also don't park on a
         // stashed cipher suffix (recv is unarmed until it is fed), or while
         // outbound is only stashed (carried / write_ch) and not yet encrypted.
@@ -3934,7 +3937,9 @@ pub const Connection = struct {
             // t-866: never park while inbound plaintext, unread records, or a
             // stashed cipher suffix sit. The recv is unarmed in the last case.
             if (pump.pending_read != null or pump.pending_cipher != null or pump.conn.pendingInbound()) return null;
-            std.debug.assert(pump.recv_armed or pump.send_armed);
+            // After the peer's EOF nothing is read, and with no send in flight
+            // only a timer or the doorbell can wake the actor.
+            std.debug.assert(pump.recv_armed or pump.send_armed or pump.inbound_eof);
             self.assertNoLostWake("the TLS select");
             diagActor(self, .select);
             defer diagActor(self, .tls_turn);
@@ -4315,8 +4320,9 @@ pub const Connection = struct {
             try self.runPendingInline();
         }
 
+        // An end of stream met among the extra chunks of a read batch.
         var inbound_eof = false;
-        // Out-of-lock exits (TLS pump gone, empty-chunk EOF) set this and
+        // Out-of-lock exits (TLS pump gone, a failed read) set this and
         // continue. In-lock terminal branches freeze and sweep under the
         // hold they already have; they must not drop and reacquire.
         var leaving = false;
@@ -4424,9 +4430,6 @@ pub const Connection = struct {
                     {
                         try self.finishGraceful();
                         self.beginClosing();
-                    } else if (inbound_eof) {
-                        self.freezeAndSweepLocked();
-                        break;
                     }
                 }
                 // Checked in the turn that began the phase too. If nothing was
@@ -4445,10 +4448,10 @@ pub const Connection = struct {
             try self.runPendingInline();
 
             if (self.config.mode == .tls) {
-                if (try self.driveTlsTurn()) {
-                    self.beginLeave(&leaving);
-                    continue;
-                }
+                const leave = try self.driveTlsTurn();
+                // An EOF or close_notify the pump saw this turn.
+                if (!leave and self.tls_driver.?.inbound_eof) try self.onPeerEof();
+                if (leave) self.beginLeave(&leaving);
                 continue;
             }
 
@@ -4466,13 +4469,20 @@ pub const Connection = struct {
             // still be open, and the GOAWAY is for a peer that half-closed).
             // The EOF is noted: once the output is flushed it ends the
             // lingering close (`closeFlushed`).
-            if (self.closing_deadline_ns != null) {
-                if (chunk.len == 0 and chunk.bytes.len == 0) self.closing_peer_eof = true;
-                self.recycleReadChunk(chunk);
+            if (chunk.len == 0 and chunk.bytes.len == 0) {
+                // A failed read fails the connection; the peer's EOF is an
+                // event (`onPeerEof`), in the closing phase or before it.
+                if (read_pump.read_failed.load(.acquire)) {
+                    self.noteServerClose("read_failed", null);
+                    self.writer_failed.store(true, .release);
+                    self.beginLeave(&leaving);
+                } else {
+                    try self.onPeerEof();
+                }
                 continue;
             }
-            if (chunk.len == 0 and chunk.bytes.len == 0) {
-                self.beginLeave(&leaving);
+            if (self.closing_deadline_ns != null) {
+                self.recycleReadChunk(chunk);
                 continue;
             }
             if (trace.enabled) self.noteReadBacklog();
@@ -4492,7 +4502,7 @@ pub const Connection = struct {
                 while (extra_i < inbound_chunk_batch) : (extra_i += 1) {
                     const extra = io_queue.tryRecv(wire_pump.WireChunk, &self.read_ch) orelse break;
                     if (extra.len == 0 and extra.bytes.len == 0) {
-                        self.recycleReadChunk(extra);
+                        // Handled after the batch, like the first chunk's.
                         inbound_eof = true;
                         break;
                     }
@@ -4510,6 +4520,16 @@ pub const Connection = struct {
                 }
             }
             if (trace.enabled) noteInboundBatch(held_n);
+            // An end of stream behind the batch, after its frames.
+            if (inbound_eof) {
+                inbound_eof = false;
+                if (read_pump.read_failed.load(.acquire)) {
+                    self.noteServerClose("read_failed", null);
+                    self.writer_failed.store(true, .release);
+                } else {
+                    try self.onPeerEof();
+                }
+            }
             // Session went terminal. If that began the closing phase, the lock
             // block above drives it; otherwise the writer failed: leave.
             if (self.writer_failed.load(.acquire) or (leave and self.closing_deadline_ns == null)) {
@@ -5008,6 +5028,28 @@ pub const Connection = struct {
         self.beginClosing();
     }
 
+    /// The peer closed its side: a socket EOF, or TLS close_notify. An event,
+    /// not a failure (a failed read is one, and the caller leaves instead).
+    /// The peer may still read, so what is queued for it is delivered: a
+    /// connection that is not ending yet ends now, with GOAWAY(NO_ERROR)
+    /// (`Session.peerClosed`), and the closing phase writes everything
+    /// queued. Its lingering close then ends as soon as the output is
+    /// flushed, because the peer's EOF is already here (`closeFlushed`).
+    fn onPeerEof(self: *Connection) !void {
+        if (self.closing_peer_eof) return;
+        self.closing_peer_eof = true;
+        if (comptime test_observe) _ = test_peer_eofs.fetchAdd(1, .monotonic);
+        const io = self.config.io;
+        self.lockSessionUncancelable(io);
+        defer self.unlockSession(io);
+        if (self.closing_deadline_ns != null) return;
+        if (self.session.terminal == .none) {
+            self.session.peerClosed() catch |err| try self.sessionErrorExit(err, "peer_eof_error");
+        }
+        self.materializeIntents() catch self.failClosedOnIntentError();
+        self.beginClosingIfTerminal();
+    }
+
     /// The ONE place that decides the closing phase is over: everything queued
     /// was written and the peer closed, or the deadline passed, or the writer
     /// failed.
@@ -5042,6 +5084,7 @@ pub const Connection = struct {
             if (!self.closing_notify_staged) {
                 self.closing_notify_staged = true;
                 if (!pump.stageCloseNotify()) return true;
+                if (comptime test_observe) _ = test_close_notify_staged.fetchAdd(1, .monotonic);
                 if (!self.outboundFlushed()) return false;
             }
         }

@@ -979,6 +979,8 @@ pub const Pump = struct {
         self.read_free.putOneUncancelable(self.io, idx) catch {};
     }
 
+    /// The peer will send nothing more (socket EOF, close_notify, or a read
+    /// that failed). The actor reads it after each turn (`onPeerEof`).
     fn postEof(self: *Pump) void {
         self.inbound_eof = true;
     }
@@ -1145,6 +1147,8 @@ pub const Pump = struct {
             if (self.pending_read != null) return .blocked;
             switch (self.readOne()) {
                 .eof => return .eof,
+                // Nothing after close_notify is read.
+                .closed => return .done,
                 .ok => {
                     if (self.pending_read != null) return .blocked;
                 },
@@ -1434,7 +1438,9 @@ pub const Pump = struct {
         return self.armSend();
     }
 
-    pub const ReadOutcome = enum { ok, eof, want, stuck };
+    /// `eof`: the read failed (the drain is failed). `closed`: the peer's
+    /// close_notify, an event (`inbound_eof`).
+    pub const ReadOutcome = enum { ok, eof, closed, want, stuck };
 
     pub fn readOne(self: *Pump) ReadOutcome {
         pump_trace.bump(&pump_trace.read_one);
@@ -1445,7 +1451,6 @@ pub const Pump = struct {
             return .stuck;
         }
         const n = self.conn.decryptInto(buf) catch |err| {
-            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
             if (diag_wait) rawPrint("TLSERR recv2 {s}\n", .{@errorName(err)});
             self.failDrain();
             self.postEof();
@@ -1456,13 +1461,13 @@ pub const Pump = struct {
                 pump_trace.bump(&pump_trace.want_read);
                 return .want;
             }
-            // close_notify: the same end of stream as a socket EOF.
-            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            // close_notify: the same end of stream as a socket EOF, an event
+            // and not a failure. The actor goes on writing (its closing
+            // phase); only it shuts the send side (`closeFlushed`).
             if (diag_wait) rawPrint("TLSERR recv2_eof\n", .{});
-            self.conn.ringPeerClosed(null, "close_notify");
-            self.failDrain();
+            if (!self.inbound_eof) self.conn.ringPeerClosed(null, "close_notify");
             self.postEof();
-            return .eof;
+            return .closed;
         }
         self.pending_read = .{ .bytes = buf, .len = n };
         return .ok;
@@ -1485,11 +1490,12 @@ pub const Pump = struct {
             },
             .done => {},
         }
+        if (self.inbound_eof) return true;
         if (!self.rearmRecv()) return false;
         if (self.pending_read != null) return true;
         switch (self.readOne()) {
             .eof => return false,
-            .ok, .want, .stuck => return true,
+            .ok, .closed, .want, .stuck => return true,
         }
     }
 
@@ -1538,7 +1544,6 @@ pub const Pump = struct {
             // Only shutdownCq cancels the op; teardown owns the exit.
             error.Canceled => return .exit,
             else => {
-                self.conn.tcp_stream.shutdown(self.io, .send) catch {};
                 if (diag_wait) rawPrint("TLSERR cqrecv {s}\n", .{@errorName(err)});
                 self.conn.ringPeerClosed(.socket_error, @errorName(err));
                 self.failDrain();
@@ -1548,14 +1553,16 @@ pub const Pump = struct {
             },
         };
         if (n == 0) {
-            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            // The peer closed its side: an event, not a failure. The recv is
+            // not armed again; sends go on, and the actor's closing phase ends
+            // the connection (`Connection.onPeerEof`).
             if (diag_wait) rawPrint("TLSERR cqrecv_eof\n", .{});
-            self.conn.ringPeerClosed(.socket_eof, "socket_eof");
-            self.failDrain();
+            if (!self.inbound_eof) self.conn.ringPeerClosed(.socket_eof, "socket_eof");
             self.postEof();
-            self.post(.{ .shutdown = true });
-            return .exit;
+            return .ok;
         }
+        // After close_notify nothing more is read.
+        if (self.inbound_eof) return .ok;
         if (!self.ingestCipher(self.recv_buf[0..n])) return .exit;
         return .ok;
     }

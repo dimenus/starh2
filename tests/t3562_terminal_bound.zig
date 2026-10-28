@@ -287,6 +287,10 @@ const Client = struct {
     /// fills what the writer's last take left free.
     send_settle: std.atomic.Value(bool) = .init(false),
     settle_sent: std.atomic.Value(bool) = .init(false),
+    /// Shut the client's write side (a half-close), and whether it was. A
+    /// half-closed client sends nothing more.
+    half_close: std.atomic.Value(bool) = .init(false),
+    half_closed: bool = false,
     /// Streams that ended for the client: a HEADERS with END_STREAM or an
     /// RST_STREAM, whichever came first.
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -389,6 +393,10 @@ fn clientRun(c: *Client) !void {
             try w.send(more.items);
             c.batch_sent.store(true, .release);
         }
+        if (!c.half_closed and c.half_close.load(.acquire)) {
+            if (std.c.shutdown(w.fd, std.c.SHUT.WR) != 0) return error.HalfClose;
+            c.half_closed = true;
+        }
         if (!c.settle_sent.load(.acquire) and c.send_settle.load(.acquire)) {
             var ping: [17]u8 = undefined;
             _ = try frame.Serializer.ping(&ping, false, &settle_ping);
@@ -416,9 +424,12 @@ fn clientRun(c: *Client) !void {
                 // may already be closing: on Linux, data that reaches a closed
                 // socket is answered with a reset, which drops what the client
                 // has not read yet, the GOAWAY included (`closeFlushed`).
-                var ping: [17]u8 = undefined;
-                _ = try frame.Serializer.ping(&ping, false, &alive_ping);
-                try w.send(&ping);
+                // Not after a half-close: the client sends nothing then.
+                if (!c.half_closed) {
+                    var ping: [17]u8 = undefined;
+                    _ = try frame.Serializer.ping(&ping, false, &alive_ping);
+                    try w.send(&ping);
+                }
             } else {
                 if (nowNs() >= deadline) return error.Deadline;
                 const nap: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
@@ -513,7 +524,7 @@ fn holdEntered(transport: Transport) u64 {
     };
 }
 
-const Scenario = enum { server_failures, flood, flood_unread, crossed_resets };
+const Scenario = enum { server_failures, flood, flood_unread, crossed_resets, half_close, flood_half_close };
 
 /// `flood_unread`'s closing deadline, and the slack the measurement allows
 /// above it: the actor checks the deadline on its own turn.
@@ -658,7 +669,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         .port = server.localAddress(0).getPort(),
         .unix_path = unix_path,
         .streams = m,
-        .flood = if (scenario == .flood or scenario == .flood_unread) m + 40 else 0,
+        .flood = if (scenario == .flood or scenario == .flood_unread or scenario == .flood_half_close) m + 40 else 0,
         .rcvbuf = stall_rcvbuf,
         .oracle_waiver = if (scenario == .flood_unread) "flood_unread: the client reads nothing until the closing deadline has closed the connection" else null,
     };
@@ -678,6 +689,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     const ended_eof_0 = conn_mod.test_closing_ended_peer_eof.load(.monotonic);
     const write_shut_0 = conn_mod.test_closing_write_shut.load(.monotonic);
     const socket_closes_0 = conn_mod.test_socket_closes.load(.monotonic);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.monotonic);
     // Every response has its HEADERS out before the stall.
     try waitStarted(&c, m);
 
@@ -735,7 +747,15 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
                 return err;
             };
         },
-        .flood, .flood_unread => {
+        .half_close => {
+            // The client shuts its write side during the stall. The server
+            // must take it as an event: it still sends what it queues (its
+            // own GOAWAY(NO_ERROR) here) before it closes. The oracle checks
+            // the GOAWAY, and close_notify on TLS, before the EOF.
+            try halfCloseAndWait(&c, peer_eofs_0);
+            try waitFor("the RSTs and the GOAWAY in the ring", m + 1, ringAtLeast);
+        },
+        .flood, .flood_unread, .flood_half_close => {
             c.send_flood.store(true, .release);
             try waitFor("the client to send the flood", &c, struct {
                 fn f(x: *Client) bool {
@@ -752,6 +772,8 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
                 return err;
             };
             bound_ns = nowNs();
+            // The GOAWAY is queued; then the client half-closes.
+            if (scenario == .flood_half_close) try halfCloseAndWait(&c, peer_eofs_0);
             if (scenario == .flood_unread) {
                 // Nothing can be delivered: only the closing deadline ends it.
                 const Live = struct { server: *starh2.Server };
@@ -865,7 +887,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             try std.testing.expect(!c.enhance_seen);
             try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.no_error)), c.goaway_code);
         },
-        .flood => {
+        .flood, .flood_half_close => {
             // The ring filled to the bound (T - 1 RSTs, then the GOAWAY) and
             // no further, all of it during the stall.
             try std.testing.expectEqual(t_frames, high_held);
@@ -887,12 +909,28 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             // the flush is what let Linux reset the late PING's connection
             // and drop the unread GOAWAY (item 1).
             try std.testing.expectEqual(write_shut_0 + 1, conn_mod.test_closing_write_shut.load(.monotonic));
-            // And the server closed its socket because the client closed
-            // (its EOF ends the lingering close), not at the closing
-            // deadline: the close counter is written at the close itself.
-            try expectClosedAfterPeer(&c, socket_closes_0, limits.close_flush_timeout_ns);
+            if (scenario == .flood) {
+                // And the server closed its socket because the client closed
+                // (its EOF ends the lingering close), not at the closing
+                // deadline: the close counter is written at the close itself.
+                try expectClosedAfterPeer(&c, socket_closes_0, limits.close_flush_timeout_ns);
+            } else {
+                // The half-close was taken as an event, once.
+                try std.testing.expectEqual(peer_eofs_0 + 1, conn_mod.test_peer_eofs.load(.monotonic));
+            }
         },
         .flood_unread => unreachable,
+        .half_close => {
+            // Every open stream ended with one RST(CANCEL), then the server's
+            // own GOAWAY(NO_ERROR), once. (A NO_ERROR GOAWAY with the streams
+            // left open is what the protocol oracle caught here first.)
+            try expectRsts(&c, 1, m, 1);
+            try std.testing.expectEqual(m, c.rst_total);
+            try std.testing.expectEqual(@as(usize, 1), c.goaways);
+            try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.no_error)), c.goaway_code);
+            try std.testing.expectEqual(peer_eofs_0 + 1, conn_mod.test_peer_eofs.load(.monotonic));
+            try std.testing.expectEqual(write_shut_0 + 1, conn_mod.test_closing_write_shut.load(.monotonic));
+        },
         .crossed_resets => {
             // All 2M RSTs were queued during the stall, and every crossed one
             // was retired before it was written.
@@ -1364,6 +1402,13 @@ fn runCaseHoldTop(transport: Transport, scenario: Scenario, socket: StallSocket)
     try h.join();
 }
 
+/// Ask the client to half-close, and wait until the server's actor took the
+/// EOF as an event (`test_peer_eofs`).
+fn halfCloseAndWait(c: *Client, peer_eofs_0: usize) !void {
+    c.half_close.store(true, .release);
+    try waitFor("the server to take the half-close", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+}
+
 /// The server's socket closed once, after the client closed its own, and
 /// long before the closing deadline (`deadline_ns`) would have closed it.
 fn expectClosedAfterPeer(c: *const Client, closes_0: usize, deadline_ns: u64) !void {
@@ -1400,6 +1445,22 @@ test "flood during a real socket stall, h2c (Linux only): the GOAWAY waits in th
     // (`StallSocket`), so the stall would not hold there.
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     try runCaseHoldTop(.h2c, .flood, .tcp);
+}
+
+test "a peer that half-closes during a stall, h2c: the server takes it as an event and still sends its GOAWAY" {
+    try runCaseTop(.h2c, .half_close);
+}
+
+test "a peer that half-closes during a stall, tls: the server still sends its GOAWAY, then close_notify" {
+    try runCaseTop(.tls, .half_close);
+}
+
+test "a flood, then a half-close, h2c: the queued RSTs and GOAWAY still reach the peer" {
+    try runCaseTop(.h2c, .flood_half_close);
+}
+
+test "a flood, then a half-close, tls: the queued RSTs and GOAWAY still reach the peer, then close_notify" {
+    try runCaseTop(.tls, .flood_half_close);
 }
 
 test "flood during a stall that never ends, h2c: the closing deadline ends the connection" {

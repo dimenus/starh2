@@ -187,6 +187,10 @@ pub const ReadPump = struct {
     /// is non-zero — oneshot-only must not donate on every read.
     live_task_handlers: *std.atomic.Value(usize),
     stopped: std.atomic.Value(bool) = .init(false),
+    /// Set before the end-of-stream post when the read FAILED (an I/O error),
+    /// not when the peer closed: the actor treats the first as a failed
+    /// connection and the second as an event (`Connection.onPeerEof`).
+    read_failed: std.atomic.Value(bool) = .init(false),
 
     fn returnIndex(self: *ReadPump, idx: u32) void {
         self.free_indices.putOneUncancelable(self.io, idx) catch {
@@ -210,18 +214,20 @@ pub const ReadPump = struct {
             const off = @as(usize, idx) * chunk_size;
             const buf = self.chunk_storage[off..][0..chunk_size];
             var dest: [1][]u8 = .{buf};
-            const n = reader.interface.readVec(&dest) catch {
+            // The pump never shuts the socket's send side: a peer that closed
+            // only its own side still reads, and what is queued for it (the
+            // GOAWAY, its RSTs) must reach it. The actor shuts it once the
+            // output is flushed (`Connection.closeFlushed`), and a failed
+            // read fails the connection, whose teardown shuts both sides.
+            const n = reader.interface.readVec(&dest) catch |err| {
                 self.returnIndex(idx);
-                // Unblock a write parked on a peer that already closed, so the
-                // pump gives its queue slots and chunks back and the completions
-                // that wake a held drain arrive.
-                self.stream.shutdown(self.io, .send) catch {};
+                // The peer's FIN comes back as `EndOfStream`, not as 0 bytes.
+                if (err != error.EndOfStream) self.read_failed.store(true, .release);
                 self.postEof();
                 return;
             };
             if (n == 0) {
                 self.returnIndex(idx);
-                self.stream.shutdown(self.io, .send) catch {};
                 self.postEof();
                 return;
             }
