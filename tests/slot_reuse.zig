@@ -1411,3 +1411,7 @@ test "http/2 path: h2c makes no general-allocator call of any size after warm-up
 test "http/2 path: tls makes no general-allocator call of any size after warm-up" {
     try runHttp2PathCallsCase(.tls);
 }
+
+test "zz h2 oracle: no protocol violation on any connection in this binary" {
+    try @import("h2_oracle.zig").expectNoViolations();
+}

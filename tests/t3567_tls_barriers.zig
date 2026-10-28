@@ -1011,3 +1011,7 @@ test "tls: 20 bare flush barriers against a held stash (test_hold_stash) do not 
 test "h2c control: 20 bare flush barriers against a held writer wait for room and every response ends" {
     try runCaseTop(.h2c, .writes, 20);
 }
+
+test "zz h2 oracle: no protocol violation on any connection in this binary" {
+    try @import("h2_oracle.zig").expectNoViolations();
+}

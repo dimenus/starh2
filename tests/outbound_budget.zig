@@ -957,3 +957,7 @@ test "empty DATA: 120 streams that end with a payload-less END_STREAM frame comp
 test "empty DATA: 120 streams that end with a payload-less END_STREAM frame complete through a write pool of three chunks (tls)" {
     try runEmptiesCase(.tls);
 }
+
+test "zz h2 oracle: no protocol violation on any connection in this binary" {
+    try @import("h2_oracle.zig").expectNoViolations();
+}

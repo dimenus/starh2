@@ -310,6 +310,8 @@ const Client = struct {
     closed_ns: u64 = 0,
     /// Frames of each type the client read.
     frames: [16]usize = @splat(0),
+    /// Why the protocol oracle's end checks do not apply (`Oracle.waive`).
+    oracle_waiver: ?[]const u8 = null,
 };
 
 /// `refused_batch`: the POST's declared body, over the cap the test sets
@@ -342,6 +344,7 @@ fn clientMain(c: *Client) void {
 fn clientRun(c: *Client) !void {
     const w = try Wire.connectRecvBuf(c.gpa, c.transport, c.port, c.rcvbuf);
     defer w.close();
+    if (c.oracle_waiver) |why| w.oracle.waive(why);
     try w.handshake();
     var req = try h2c.buildClientPrefaceAndSettings(c.gpa);
     defer req.deinit(c.gpa);
@@ -646,6 +649,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         .streams = m,
         .flood = if (scenario == .flood or scenario == .flood_unread) m + 40 else 0,
         .rcvbuf = if (stalls_by_reading) stall_rcvbuf else null,
+        .oracle_waiver = if (scenario == .flood_unread) "flood_unread: the client reads nothing until the closing deadline has closed the connection" else null,
     };
     const t = try std.Thread.spawn(.{}, clientMain, .{&c});
     var joined = false;
@@ -1436,4 +1440,8 @@ test "ordinary refusals in one read chunk, the 413's peer ending with trailers, 
 
 test "owed acks during a stall, h2c: the SETTINGS ack, the PING ack and the WINDOW_UPDATE credit arrive after it, and the upload finishes" {
     try runOwedAcksTop();
+}
+
+test "zz h2 oracle: no protocol violation on any connection in this binary" {
+    try @import("h2_oracle.zig").expectNoViolations();
 }
