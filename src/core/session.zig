@@ -1776,7 +1776,13 @@ pub const Session = struct {
         s.early_status = status;
         try self.pushIntentOrFailClosed(.{ .early_reject = .{ .stream_id = stream_id, .status = status } });
         // Also emit the HTTP response frames now so core stays self-contained for tests.
-        try self.cmdHeaders(stream_id, status, &.{}, true, .none);
+        self.cmdHeaders(stream_id, status, &.{}, true, .none) catch |err| switch (err) {
+            // No frame buffer for the response: the stream is reset instead,
+            // as when the edge refuses it (`resetRefusedHeaders`). An RST
+            // always has room (`Limits.terminalFrames`).
+            error.OutOfMemory => try self.emitRst(stream_id, .internal_error),
+            else => return err,
+        };
     }
 
     fn isTombstoned(self: *const Session, id: u31) bool {

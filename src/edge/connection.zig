@@ -3453,7 +3453,7 @@ pub const Connection = struct {
         var rest = bytes;
         while (true) {
             const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
-            const taken = try self.session.ingestSome(rest);
+            const taken = self.session.ingestSome(rest) catch |err| return self.sessionErrorExit(err, "ingest_error");
             if (trace.enabled) {
                 _ = trace.ingest_ns.fetchAdd(nowNs(io) -% ingest_t0, .monotonic);
                 _ = trace.ingest_n.fetchAdd(1, .monotonic);
@@ -3471,6 +3471,21 @@ pub const Connection = struct {
             }
             if (rest.len == 0) return;
         }
+    }
+
+    /// The exit for an error from `Session` in a lock section. The section
+    /// may have queued intents before the error, and the queue must be empty
+    /// when the lock is released (`unlockSession`), so they are materialized
+    /// first. If the session went terminal, its GOAWAY is now in the
+    /// scheduler and the error does not end the connection here: the caller
+    /// goes on, and the closing phase writes it. Otherwise the error is the
+    /// connection's end, returned to `run`, whose teardown releases the
+    /// scheduler.
+    fn sessionErrorExit(self: *Connection, err: anyerror, comptime site: []const u8) anyerror!void {
+        self.assertSessionHeld("sessionErrorExit");
+        self.materializeIntents() catch self.failClosedOnIntentError();
+        if (self.session.terminal != .goaway) return err;
+        self.noteServerClose(site, err);
     }
 
     /// Ingest one already-taken inbound chunk. Caller recycles the chunk.
@@ -4346,12 +4361,16 @@ pub const Connection = struct {
                 if (self.closing_deadline_ns == null) {
                     const now = nowNs(io);
                     self.session.edge_now_ns = now;
-                    try self.session.checkIdleDeadlines(now);
-                    if (try self.maybeBeginGraceful()) {
+                    self.session.checkIdleDeadlines(now) catch |err| try self.sessionErrorExit(err, "idle_deadline_error");
+                    const graceful_done = self.maybeBeginGraceful() catch |err| blk: {
+                        try self.sessionErrorExit(err, "graceful_error");
+                        break :blk false;
+                    };
+                    if (graceful_done) {
                         // The drain is over; its RST_STREAMs are queued.
                         self.beginClosing();
                     } else {
-                        try self.checkSlowConsumers();
+                        self.checkSlowConsumers() catch |err| try self.sessionErrorExit(err, "slow_consumer_error");
                         // Deadlines and slow-consumer kills push Session intents
                         // (RST_STREAM, stream_reset). drainEmit only walks the
                         // scheduler, so those intents have to be materialized first or
@@ -4360,7 +4379,7 @@ pub const Connection = struct {
                         // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
                         // Slots freed since the last turn go to parked requests before
                         // any new one, so a waiting request is not overtaken.
-                        try self.dispatchParked();
+                        self.dispatchParked() catch |err| try self.sessionErrorExit(err, "dispatch_parked_error");
                     }
                 }
                 diagActor(self, .lk_materialize);
@@ -10766,6 +10785,149 @@ test "acks the edge refuses are owed and sent once the share has room (t-3562)" 
     try std.testing.expectEqualSlices(u8, "owed-p-1", &seen.ping_acks[0]);
     try std.testing.expectEqualSlices(u8, "owed-p-2", &seen.ping_acks[1]);
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+/// Frame hooks for the error-exit tests: refuse every ordinary frame, or
+/// only the final GOAWAY (a broken invariant, forced), and build the rest
+/// the usual way.
+fn rentNoOrdinary(ctx: *anyopaque, n: usize, class: session_mod.FrameClass) ?[]u8 {
+    if (class == .ordinary) return null;
+    const c: *Connection = @ptrCast(@alignCast(ctx));
+    return c.rentFrame(n, class);
+}
+
+fn rentNoFinalGoaway(ctx: *anyopaque, n: usize, class: session_mod.FrameClass) ?[]u8 {
+    if (class == .final_goaway) return null;
+    const c: *Connection = @ptrCast(@alignCast(ctx));
+    return c.rentFrame(n, class);
+}
+
+/// Materialize and collect until nothing is owed: the actor's turns after
+/// write completions.
+fn trapSettle(trap: *TrapHop, out: *TrapWire) !void {
+    const conn = &trap.hop.conn;
+    var turns: usize = 0;
+    while (true) : (turns += 1) {
+        if (turns > 64) return error.NeverSettled;
+        {
+            conn.lockSessionUncancelable(conn.config.io);
+            defer conn.unlockSession(conn.config.io);
+            try conn.materializeIntents();
+        }
+        try trapCollect(trap, out);
+        if (!conn.session.owed.any()) return;
+    }
+}
+
+test "nine PINGs in one read with two frame slabs: the acks that find no frame are owed, not an error, and all nine arrive in order (t-3562)" {
+    const gpa = std.testing.allocator;
+    var lim = limits_mod.Limits.defaults;
+    lim.frame_slabs_per_connection = 2;
+    lim.inbound_wire_chunks_per_connection = wire_const.POP_PUSHES + 2;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    const refused_0 = outbound_memory.frames_refused.load(.monotonic);
+    var wire: [9 * 17]u8 = undefined;
+    for (0..9) |i| {
+        var payload: [8]u8 = "ping-0-x".*;
+        payload[5] = '0' + @as(u8, @intCast(i));
+        _ = try frame.Serializer.ping(wire[i * 17 ..][0..17], false, &payload);
+    }
+    try trapIngest(conn, &wire);
+    // The instrument fired: some acks found no frame buffer.
+    try std.testing.expect(outbound_memory.frames_refused.load(.monotonic) > refused_0);
+    try std.testing.expect(conn.session.owed.ping_len > 0);
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapSettle(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 9), seen.ping_ack_n);
+    // TrapWire keeps the first four payloads: in the order the PINGs came.
+    for (0..4) |i| try std.testing.expectEqual('0' + @as(u8, @intCast(i)), seen.ping_acks[i][5]);
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "graceful phase 1 with no ordinary frame left: the GOAWAY goes, the PING is dropped, and nothing is left queued (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        try conn.session.applyCommand(.graceful_phase1);
+        try conn.processIntents();
+    }
+    try std.testing.expect(conn.session.grace_phase == .phase1);
+    try std.testing.expect(conn.session.terminal == .none);
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen.goaways);
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.no_error)), seen.goaway_codes[0]);
+}
+
+test "an early 413 with no frame for its response resets the stream instead of failing the read (t-3562)" {
+    const gpa = std.testing.allocator;
+    var lim = limits_mod.Limits.defaults;
+    lim.request_body_bytes = 1024;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
+    var block: [64]u8 = undefined;
+    const fields_post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-length", .value = "4096" },
+    };
+    const parts = [_][]const hpack.HeaderField{&fields_post};
+    const block_len = try hpack.Encoder.encodedLen(&fields_post);
+    std.debug.assert(block_len <= block.len);
+    _ = hpack.Encoder.encodeRange(block[0..block_len], &parts, 0);
+    var wire: [frame.FRAME_HEADER_LEN + 64]u8 = undefined;
+    (frame.FrameHeader{ .length = @intCast(block_len), .type = .headers, .flags = .{ .end_headers = true }, .stream_id = 1 }).encode(wire[0..frame.FRAME_HEADER_LEN]);
+    @memcpy(wire[frame.FRAME_HEADER_LEN..][0..block_len], block[0..block_len]);
+    try trapIngest(conn, wire[0 .. frame.FRAME_HEADER_LEN + block_len]);
+    try std.testing.expect(conn.session.terminal == .none);
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "an error exit from ingest materializes what the read queued before the unlock (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // A PING (its ack is queued), then DATA on stream 0, a connection error
+    // whose final GOAWAY is refused: `ingestSome` returns an error with the
+    // ack still in the session queue. Forced: the store keeps a slot for that
+    // GOAWAY, so this is the path of any error, not a reachable refusal.
+    conn.session.stream_hooks.?.rentFrame = rentNoFinalGoaway;
+    var wire: [17 + frame.FRAME_HEADER_LEN]u8 = undefined;
+    _ = try frame.Serializer.ping(wire[0..17], false, "err-exit");
+    (frame.FrameHeader{ .length = 0, .type = .data, .flags = .{}, .stream_id = 0 }).encode(wire[17..][0..frame.FRAME_HEADER_LEN]);
+    const ordinary_0 = conn.sched.ordinary_len;
+    // The unlock in `trapIngest` panics in a safe build if the ack is left.
+    try std.testing.expectError(error.OutOfMemory, trapIngest(conn, &wire));
+    try std.testing.expectEqual(@as(usize, 0), conn.session.intentLen());
+    try std.testing.expectEqual(ordinary_0 + 1, conn.sched.ordinary_len);
 }
 
 /// M server RSTs wait in the terminal ring (the drain is held), then one
