@@ -4,7 +4,10 @@
 // body, GET /sse is a long-lived event stream of `data: <unix-nanos>\n\n`
 // at a ticker interval (sleep to a deadline, not for a duration). GET
 // /sse-broadcast is the same stream fed by ONE ticker for every stream, as
-// starh2's bench server does it (examples/bench_server.zig). TLS +
+// starh2's bench server does it (examples/bench_server.zig). GET /sse-fed
+// takes its events from OUTSIDE: tools/sse_bench/feed.go sends UDP datagrams
+// (u64 slot, i64 unix nanos, little-endian) at random times, and one reader
+// task wakes only that slot's stream, so no server timer is involved. TLS +
 // HTTP/2 ALPN, same testdata cert as the other arms. Not the Datastar SDK:
 // the client subtracts the stamped nanos, and a patchElements payload would
 // be a different measurement.
@@ -17,6 +20,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,7 +33,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
@@ -37,6 +41,8 @@ use tokio_rustls::TlsAcceptor;
 struct Args {
     port: u16,
     interval_ms: u64,
+    fed_port: u16,
+    fed_slots: usize,
     cert: String,
     key: String,
 }
@@ -45,6 +51,8 @@ fn parse_args() -> Args {
     let mut args = Args {
         port: 8444,
         interval_ms: 100,
+        fed_port: 0,
+        fed_slots: 200,
         cert: "testdata/cert.pem".to_string(),
         key: "testdata/key.pem".to_string(),
     };
@@ -58,6 +66,8 @@ fn parse_args() -> Args {
         match flag {
             "port" => args.port = value.parse().expect("port"),
             "sse-interval-ms" => args.interval_ms = value.parse().expect("sse-interval-ms"),
+            "fed-port" => args.fed_port = value.parse().expect("fed-port"),
+            "fed-slots" => args.fed_slots = value.parse().expect("fed-slots"),
             "cert" => args.cert = value.clone(),
             "key" => args.key = value.clone(),
             _ => panic!("unknown flag {}", argv[i]),
@@ -148,13 +158,35 @@ impl Body for BroadcastBody {
 
 type ArmBody = Either<Full<Bytes>, Either<TickerBody, BroadcastBody>>;
 
+// One watch channel per fed slot; streams take slots in arrival order. A slot
+// keeps the newest stamp, so a stream that falls behind sends it once, the
+// rule the broadcast arms follow.
+struct Fed {
+    slots: Vec<watch::Sender<u128>>,
+    next: AtomicU64,
+}
+
 fn handle(
     req: Request<hyper::body::Incoming>,
     interval: Duration,
     ticks: watch::Receiver<u128>,
+    fed: Arc<Fed>,
 ) -> impl Future<Output = Result<Response<ArmBody>, hyper::Error>> {
     let path = req.uri().path().to_string();
     async move {
+        if path == "/sse-fed" {
+            let slot = fed.next.fetch_add(1, Ordering::Relaxed) as usize % fed.slots.len();
+            let mut rx = fed.slots[slot].subscribe();
+            // A stamp from an earlier stream on this slot is not this stream's.
+            rx.borrow_and_update();
+            let resp = Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .body(Either::Right(Either::Right(BroadcastBody { changed: wait_changed(rx) })))
+                .expect("static response");
+            return Ok(resp);
+        }
         if path == "/sse-broadcast" {
             let mut rx = ticks;
             // Wait for the next tick, not the one already stamped.
@@ -232,6 +264,28 @@ async fn main() {
     // (TOKIO_WORKER_THREADS).
     let width = tokio::runtime::Handle::current().metrics().num_workers();
     let (tick_tx, tick_rx) = watch::channel(0u128);
+    let fed = Arc::new(Fed {
+        slots: (0..args.fed_slots).map(|_| watch::channel(0u128).0).collect(),
+        next: AtomicU64::new(0),
+    });
+    if args.fed_port != 0 {
+        let fed = fed.clone();
+        let sock = UdpSocket::bind(("127.0.0.1", args.fed_port))
+            .await
+            .unwrap_or_else(|e| panic!("bind udp {}: {e}", args.fed_port));
+        tokio::spawn(async move {
+            let mut dgram = [0u8; 16];
+            loop {
+                let n = sock.recv(&mut dgram).await.expect("udp recv");
+                if n != dgram.len() {
+                    continue;
+                }
+                let slot = u64::from_le_bytes(dgram[0..8].try_into().unwrap()) as usize % fed.slots.len();
+                let ts = i64::from_le_bytes(dgram[8..16].try_into().unwrap()) as u128;
+                fed.slots[slot].send_replace(ts);
+            }
+        });
+    }
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -260,6 +314,7 @@ async fn main() {
         }
         let tls = tls.clone();
         let tick_rx = tick_rx.clone();
+        let fed = fed.clone();
         tokio::spawn(async move {
             let stream = match tls.accept(tcp).await {
                 Ok(s) => s,
@@ -273,7 +328,7 @@ async fn main() {
             // run.sh opens 200 streams and then probes on the same socket.
             builder.max_concurrent_streams(1024);
             let ticks = tick_rx.clone();
-            let svc = service_fn(move |req| handle(req, interval, ticks.clone()));
+            let svc = service_fn(move |req| handle(req, interval, ticks.clone(), fed.clone()));
             if let Err(e) = builder.serve_connection(TokioIo::new(stream), svc).await {
                 // A client that closes mid-stream is the normal end of a round.
                 let _ = e;

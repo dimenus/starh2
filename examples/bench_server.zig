@@ -717,12 +717,63 @@ fn sseBroadcastHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Re
     try body.finish();
 }
 
+// The fed arm. Events come from OUTSIDE the server: tools/sse_bench/feed.go
+// sends UDP datagrams at random (Poisson) times, each naming a stream slot and
+// carrying the feeder's send time. One task reads the socket and wakes only
+// that slot's stream, so no server timer decides when an event fires. This is
+// the shape of a message bus or a database notification feeding many viewers.
+//
+// Datagram: u64 slot, then i64 unix nanoseconds at send, both little-endian.
+// Streams take slots in arrival order, modulo `--fed-slots`. A slot's channel
+// holds one stamp, so a stream that falls behind sends the newest once, the
+// rule the broadcast arms follow.
+const fed_max_slots = 1024;
+var g_fed_slots: u64 = 200;
+var g_fed_next: std.atomic.Value(u64) = .init(0);
+var g_fed_dropped: std.atomic.Value(u64) = .init(0);
+var g_fed_buf: [fed_max_slots][1]i64 = undefined;
+var g_fed_ch: [fed_max_slots]zio.Channel(i64) = undefined;
+
+fn fedReaderTask(port: u16) !void {
+    if (port == 0) return;
+    const addr = zio.net.IpAddress.initIp4(.{ 127, 0, 0, 1 }, port);
+    const sock = try addr.bind(.{});
+    defer sock.close();
+    var dgram: [16]u8 = undefined;
+    while (true) {
+        const n = try sock.receive(&dgram, .none);
+        if (n != dgram.len) continue;
+        const slot = std.mem.readInt(u64, dgram[0..8], .little) % g_fed_slots;
+        const ts = std.mem.readInt(i64, dgram[8..16], .little);
+        g_fed_ch[slot].trySend(ts) catch {
+            _ = g_fed_dropped.fetchAdd(1, .monotonic);
+        };
+    }
+}
+
+fn sseFedHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    const ch = &g_fed_ch[g_fed_next.fetchAdd(1, .monotonic) % g_fed_slots];
+    // A stamp left by the last stream on this slot is from an earlier round.
+    while (true) _ = ch.tryReceive() catch break;
+    var body = try resp.startSse(&.{});
+    var buf: [64]u8 = undefined;
+    while (true) {
+        const ts = try ch.receive();
+        const ev = try std.fmt.bufPrint(&buf, "data: {d}\n\n", .{ts});
+        body.writeAll(ev) catch break;
+    }
+    try body.finish();
+}
+
 const Args = struct {
     port: u16 = 0,
     tls: bool = true,
     cert: []const u8 = "testdata/cert.pem",
     key: []const u8 = "testdata/key.pem",
     sse_interval_ms: u64 = 100,
+    /// UDP port for the fed arm's datagrams; 0 leaves /sse-fed without events.
+    fed_port: u16 = 0,
+    fed_slots: u64 = 200,
     trace: bool = false,
     trace_every: u64 = 1024,
     executors: ?u8 = null,
@@ -793,6 +844,11 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.cert = try gpa.dupe(u8, args.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, a, "--key")) {
             out.key = try gpa.dupe(u8, args.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, a, "--fed-port")) {
+            out.fed_port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--fed-slots")) {
+            out.fed_slots = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
+            if (out.fed_slots == 0 or out.fed_slots > fed_max_slots) return error.InvalidFedSlots;
         } else if (std.mem.eql(u8, a, "--sse-interval-ms")) {
             out.sse_interval_ms = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--trace")) {
@@ -1464,12 +1520,17 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     g_io = rt.io();
     var ticker_handle = try rt.spawn(tickerTask, .{});
     defer ticker_handle.cancel();
+    g_fed_slots = args.fed_slots;
+    for (&g_fed_ch, &g_fed_buf) |*ch, *buf| ch.* = .init(buf);
+    var fed_handle = try rt.spawn(fedReaderTask, .{args.fed_port});
+    defer fed_handle.cancel();
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", args.port);
 
     const routes = [_]starh2.Route{
         .{ .method = .GET, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = helloHandler } } },
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseHandler } } },
         .{ .method = .GET, .path = "/sse-broadcast", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseBroadcastHandler } } },
+        .{ .method = .GET, .path = "/sse-fed", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseFedHandler } } },
         .{ .method = .GET, .path = "/trace", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = traceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceHandler } } },
         .{ .method = .GET, .path = "/sse-cadence-reset", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceResetHandler } } },
