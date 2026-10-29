@@ -1260,6 +1260,9 @@ pub const Session = struct {
                 }
                 const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
                 if (self.streams.getPtr(hdr.stream_id)) |s| {
+                    // A final HEADERS still queued owes nothing now: the peer
+                    // has reset the stream, whichever branch it takes here.
+                    self.clearRefusalObligation(hdr.stream_id);
                     s.onRst();
                     self.releaseConcurrency(hdr.stream_id, code);
                     // Cancel handler; never RST in response to peer RST.
@@ -3298,6 +3301,30 @@ test "a peer RST while the final HEADERS is still queued clears its obligation (
     var peer: [frame.rst_stream_frame_bytes]u8 = undefined;
     _ = try frame.Serializer.rstStream(&peer, 1, .cancel);
     try session.ingest(&peer);
+    const owes = try finalHeadersOwes(gpa, &session, 1);
+    try std.testing.expect(!owes);
+    // A refusal of it now queues no RST: the peer counts the stream closed.
+    try session.resetRefusedHeaders(1, owes);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+}
+
+test "a peer RST for a stream still in the map clears its final HEADERS' obligation (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    // The peer's side is still open, so the server's final HEADERS leaves
+    // the stream half-closed (local) and in the map.
+    try session.streams.put(1, .{ .id = 1, .state = .open, .window = .{ .send = flow.INITIAL_WINDOW } });
+    session.active_streams += 1;
+    session.highest_peer_stream = 1;
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 204, .headers = &.{}, .end_stream = true } });
+    try std.testing.expect(session.streams.contains(1));
+    // The peer cancels the stream before the edge takes the HEADERS.
+    var peer: [frame.rst_stream_frame_bytes]u8 = undefined;
+    _ = try frame.Serializer.rstStream(&peer, 1, .cancel);
+    try session.ingest(&peer);
+    try std.testing.expect(!session.streams.contains(1));
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(!owes);
     // A refusal of it now queues no RST: the peer counts the stream closed.
