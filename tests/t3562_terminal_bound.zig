@@ -1724,6 +1724,88 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     serving = false;
 }
 
+/// A TLS peer that sends close_notify and then one more record, and does
+/// not read. The record after the close_notify must count for nothing (RFC
+/// 8446 section 6.1): with the server's output blocked by the unread socket,
+/// the closing phase waits for its deadline, and the actor must park meanwhile,
+/// not go round on that record. The connection still ends, at the deadline.
+fn runNotifyThenRecord(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    var limits = starh2.Limits.defaults;
+    limits.close_flush_timeout_ns = std.time.ns_per_s;
+    var path_buf: [104]u8 = undefined;
+    const path = try unixPath(&path_buf, .tls, "notify-record");
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, path);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    defer abort_gate.store(true, .release);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = 0,
+        .unix_path = path,
+        .streams = 1,
+        .flood = 0,
+        .rcvbuf = stall_rcvbuf,
+        .notify_record_after = true,
+        .oracle_waiver = "the client stops reading, so the server's output cannot be delivered",
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) {
+        c.read_gate.store(true, .release);
+        joinClient(&c, t);
+    };
+
+    // The handler's DATA fills what the unread socket holds.
+    try waitStarted(&c, 1);
+    data_bytes.store(stalled_data_bytes, .release);
+    data_gate.store(true, .release);
+    try waitFor("the handler to write its DATA", atLeast(&wrote, 1), reached);
+    try waitTransportStall(&c);
+
+    c.send_notify.store(true, .release);
+    try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    // The closing phase now waits for its deadline. A parked actor takes a
+    // few turns in that time; one that goes round takes thousands.
+    const turns_0 = conn_mod.test_tls_turns.load(.acquire);
+    zio.sleep(.fromMilliseconds(300)) catch {};
+    const turns = conn_mod.test_tls_turns.load(.acquire) - turns_0;
+    std.debug.print("T3562-notify-record turns_in_300ms={d}\n", .{turns});
+    try std.testing.expect(turns < 50);
+    // And the connection ends, at its closing deadline.
+    try waitFor("the server to close", atLeast(&conn_mod.test_socket_closes, closes_0 + 1), reached);
+    c.read_gate.store(true, .release);
+    joinClient(&c, t);
+    joined = true;
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runNotifyThenRecordTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runNotifyThenRecord, .{ rt, gpa });
+    try h.join();
+}
+
 fn runFrameThenNotifyTop() !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
@@ -1889,6 +1971,10 @@ test "a handler's lock section after the loop ends never overlaps the TLS pump's
 
 test "a TLS frame and close_notify in one write, the socket left open: the server ingests the frame, takes the close, and closes" {
     try runFrameThenNotifyTop();
+}
+
+test "a TLS record after close_notify counts for nothing: the actor parks while the closing phase waits, and the connection ends" {
+    try runNotifyThenRecordTop();
 }
 
 test "zz h2 oracle: no protocol violation on any connection in this binary" {

@@ -352,6 +352,9 @@ pub var test_hold_stash: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.
 /// `pollRecv`, until released. A completion that lands meanwhile is then
 /// reaped by that `pollRecv`, not by the select. Armed once.
 pub var test_hold_idle_tls_turn: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+/// Test-only: TLS turns taken (`driveTlsTurn` calls), so a test can tell an
+/// actor that parks from one that goes round without parking.
+pub var test_tls_turns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 pub var test_idle_tls_turn_held: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 pub var test_release_idle_tls_turn: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only, the TLS pump's lifetime at teardown. `test_hold_abort` stops the
@@ -3824,6 +3827,7 @@ pub const Connection = struct {
         // is what ends the phase. Only the lock block decides that, so a turn
         // that took one goes round again instead of parking on the timer.
         var polled_progress = false;
+        if (comptime test_observe) _ = test_tls_turns.fetchAdd(1, .monotonic);
         if (comptime test_observe) {
             if (test_hold_idle_tls_turn.load(.acquire) and pump.pending_cipher == null and pump.pending_read == null and
                 !pump.conn.pendingInbound() and pump.pending_n == 0 and !pump.send_armed and pump.carried == null and

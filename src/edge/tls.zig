@@ -773,7 +773,12 @@ pub const Conn = struct {
     /// is not work: the pump must park until the socket brings the rest.
     /// One implementation for every pump gate site, so they cannot drift;
     /// the in-process record test pins this exact function.
+    ///
+    /// After the peer's close_notify nothing is work: what follows it is
+    /// ignored (RFC 8446 section 6.1). Records already buffered behind it
+    /// stay, unread, and later bytes are dropped (`acceptCipher`).
     pub fn pendingInbound(self: *const Conn) bool {
+        if (self.peer_closed) return false;
         return completeRecordLen(self.in_buf[self.in_head..self.in_fill]) != null;
     }
 
@@ -814,6 +819,10 @@ pub const Conn = struct {
     /// Copy up to `bytes.len` of received ciphertext into `in_buf`. Returns
     /// how much fit; 0 when `in_buf` is full.
     fn acceptCipher(self: *Conn, bytes: []const u8) usize {
+        // After the peer's close_notify, bytes are taken and dropped: they
+        // are ignored (RFC 8446 section 6.1), and keeping them would only
+        // fill `in_buf`.
+        if (self.peer_closed) return bytes.len;
         if (self.in_buf.len - self.in_fill < bytes.len) self.compactIn();
         const n = @min(bytes.len, self.in_buf.len - self.in_fill);
         @memcpy(self.in_buf[self.in_fill..][0..n], bytes[0..n]);
