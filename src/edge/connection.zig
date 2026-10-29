@@ -7565,7 +7565,14 @@ pub const Connection = struct {
             .headers = &.{},
             .end_stream = true,
             .ticket = .none,
-        } }) catch {};
+        } }) catch {
+            // No frame for the refusal (the ordinary share or the frame
+            // slabs are spent): reset the stream instead, so the peer is not
+            // left waiting for an answer, as `Session.emitEarlyReject` does.
+            // An RST takes its frame from the terminal store, which always
+            // has room for one per stream (`Limits.terminalFrames`).
+            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .internal_error } }) catch {};
+        };
         std.debug.assert(self.releaseSlot(d.stream_id));
         return true;
     }
@@ -11043,6 +11050,35 @@ test "an early 413 with no frame for its response resets the stream instead of f
     var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
     defer seen.deinit();
     try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "a request refused for want of job memory, with no frame for its response, is reset instead of left open (t-3562)" {
+    const gpa = std.testing.allocator;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopBigBody } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, std.testing.io, &routes);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // The job cannot be built, and the refusal's HEADERS finds no frame.
+    test_fail_dispatch_alloc.store(true, .release);
+    defer test_fail_dispatch_alloc.store(false, .release);
+    conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
+    var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+    try trapIngest(conn, hopRequestFrame(&req, 1));
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expectEqual(@as(usize, 0), conn.countInUseSlots());
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    // The stream still ends for the peer: one RST, as an early reject's
+    // does when its response finds no frame (`emitEarlyReject`).
     try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
 }
