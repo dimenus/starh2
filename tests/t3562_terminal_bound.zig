@@ -143,6 +143,8 @@ fn resetGlobals() void {
     first_start_err.store(0, .release);
     entered.store(0, .release);
     uploads_ok.store(0, .release);
+    shielded_entered.store(0, .release);
+    shielded_done_ns.store(0, .release);
 }
 
 /// Starts its response (the HEADERS are written before the stall), writes
@@ -208,10 +210,31 @@ fn upload(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) any
     try resp.send(204, &.{}, "");
 }
 
+/// `shielded`: how long the handler sleeps under its shield. Far longer than
+/// the test allows for the server's close, so a close that waits for the
+/// handler fails. The client's read can block up to its 1 s receive timeout
+/// before it half-closes, and the teardown watchdog panics after 5 s with no
+/// handler returning: 3 s is clear of both.
+const shielded_sleep_ns = 3 * std.time.ns_per_s;
+var shielded_entered: std.atomic.Value(usize) = .init(0);
+var shielded_done_ns: std.atomic.Value(u64) = .init(0);
+
+/// Shields itself from cancellation, sleeps, and returns without a response.
+/// Nothing in the process can stop it early: zio's cancel waits for the
+/// shield to end.
+fn shielded(_: *anyopaque, _: *const starh2.Request, _: *starh2.Response) anyerror!void {
+    zio.beginShield();
+    defer zio.endShield();
+    _ = shielded_entered.fetchAdd(1, .acq_rel);
+    zio.sleep(.fromNanoseconds(shielded_sleep_ns)) catch {};
+    shielded_done_ns.store(nowNs(), .release);
+}
+
 const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/empty", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = empty } } },
     .{ .method = .GET, .path = "/stall", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = stall } } },
     .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = upload } } },
+    .{ .method = .GET, .path = "/shielded", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = shielded } } },
 };
 
 fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
@@ -713,6 +736,10 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     // takes one chunk from the stash when a send completes, then blocks
     // again), which leaves a slot free and the pause off. One PING runs one
     // more drain, after the writer blocked, and the stall settles again.
+    // Its ack is ordinary output during the stall. If the share refused it,
+    // it would be owed and sent later, and that could hide a refusal; the
+    // assert below that no ordinary frame was refused rules that out, and
+    // the oracle checks that the ack arrives.
     c.send_settle.store(true, .release);
     try waitFor("the client to send its settle PING", &c, struct {
         fn f(x: *Client) bool {
@@ -1376,6 +1403,81 @@ fn expectEnded(c: *const Client, n: usize) !void {
     }
 }
 
+/// A handler that shields itself cannot be stopped, so the connection must
+/// not wait for it to close its socket: the peer half-closes while the
+/// handler sleeps under its shield, and the server's socket closes once the
+/// closing phase is done, long before the handler returns. The handler keeps
+/// its slot and task until it returns.
+fn runShielded(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, transport, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = transport,
+        .port = server.localAddress(0).getPort(),
+        .streams = 1,
+        .path = "/shielded",
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    try waitFor("the shielded handler to run", atLeast(&shielded_entered, 1), reached);
+    try halfCloseAndWait(&c, peer_eofs_0);
+    // The client closes its socket once it reads the server's EOF.
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
+    const closed = conn_mod.test_socket_close_ns.load(.acquire);
+    // The handler was still asleep when the socket closed.
+    try std.testing.expect(shielded_done_ns.load(.acquire) == 0 or shielded_done_ns.load(.acquire) > closed);
+    try std.testing.expect(c.eof);
+    try std.testing.expect(c.eof_ns < closed + shielded_sleep_ns / 2);
+    try expectEnded(&c, 1);
+    try std.testing.expect(c.goaways >= 1);
+
+    // The slot and task stay until the handler returns.
+    try waitFor("the shielded handler to return", &shielded_done_ns, struct {
+        fn f(x: *const std.atomic.Value(u64)) bool {
+            return x.load(.acquire) != 0;
+        }
+    }.f);
+    try std.testing.expect(shielded_done_ns.load(.acquire) > closed);
+    std.debug.print("T3562-shielded transport={s} close_before_handler_ms={d}\n", .{ @tagName(transport), (shielded_done_ns.load(.acquire) - closed) / std.time.ns_per_ms });
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runShieldedTop(transport: Transport) !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runShielded, .{ rt, gpa, transport });
+    try h.join();
+}
+
 fn runRefusedEndTop(transport: Transport, tombstones: usize) !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
@@ -1497,6 +1599,14 @@ test "ordinary refusals in one read chunk, the 413's peer ending with trailers, 
 
 test "owed acks during a stall, h2c: the SETTINGS ack, the PING ack and the WINDOW_UPDATE credit arrive after it, and the upload finishes" {
     try runOwedAcksTop();
+}
+
+test "a shielded handler past the close, h2c: the socket closes when the closing phase ends, not when the handler returns" {
+    try runShieldedTop(.h2c);
+}
+
+test "a shielded handler past the close, tls: the socket closes when the closing phase ends, not when the handler returns" {
+    try runShieldedTop(.tls);
 }
 
 test "zz h2 oracle: no protocol violation on any connection in this binary" {

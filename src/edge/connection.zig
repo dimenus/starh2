@@ -4119,7 +4119,7 @@ pub const Connection = struct {
     /// any other, and `run` re-raises it. After the phase, the teardown below
     /// runs unchanged and releases whatever the phase did not write.
     ///
-    /// ## Teardown sequence (the `defer` block, then the tail)
+    /// ## Teardown sequence (`runBody`'s `defer` block, then `run`)
     /// 1. Tell the live pump(s) to stop. h2c: push a sentinel so a writer
     ///    parked on an empty queue wakes. TLS: close the unused overflow
     ///    channel, then `shutdownCq` on this task (no pump task).
@@ -4129,28 +4129,33 @@ pub const Connection = struct {
     /// 3. Cancel h2c pumps if they were spawned, then `drainWriteAcksForced`
     ///    applies leftover channel completions. TLS acks already applied
     ///    locally; the drain is a no-op. `deinit` asserts the channel empty.
-    /// 4. `shutdownHandlers` runs after the loop and returns only when every
+    /// 4. Close the socket exactly once, guarded by `socket_closed`.
+    /// 5. `teardownExhaustive` (`shutdownHandlers`) returns only when every
     ///    slot has passed through `releaseSlot`.
-    /// 5. Close the socket exactly once, guarded by `socket_closed`.
+    ///
+    /// The socket closes BEFORE the handlers are joined, on every exit. A
+    /// handler that shields itself from cancellation cannot be stopped from
+    /// inside the process (zio's cancel waits for the shield to end), so
+    /// joining first would keep the peer's connection and the fd open until
+    /// that handler chose to return. Its slot and task still stay until it
+    /// returns, under the teardown watchdog (`takeTeardownCompletion`).
     fn run(self: *Connection) !void {
-        var torn_down = false;
-        // The error path runs after `runBody`'s own `defer`, the order an
-        // `errdefer` at the top of the body gave before Zig 0.17 removed
-        // error capture from `errdefer`.
-        self.runBody(&torn_down) catch |err| {
+        self.runBody() catch |err| {
             if (comptime test_observe) {
                 if (err == error.Canceled) _ = test_run_canceled.fetchAdd(1, .acq_rel);
             }
-            if (!torn_down) {
-                torn_down = true;
-                self.teardownExhaustive();
-                if (err == error.Canceled) zio.recancel();
-            }
+            self.teardownExhaustive();
+            if (err == error.Canceled) zio.recancel();
             return err;
         };
+        self.teardownExhaustive();
+        // endShield only drops shield_count. A cancel that arrived during
+        // the shield is still pending; consume and return it.
+        try zio.checkCancel();
+        if (close_probe) diagRawPrint("t1002 conn={x} shutdown_done parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
     }
 
-    fn runBody(self: *Connection, torn_down: *bool) !void {
+    fn runBody(self: *Connection) !void {
         const gpa = self.config.gpa;
         const io = self.config.io;
         var actor_node: @TypeOf(actor_marker).Node = .unset;
@@ -4539,13 +4544,6 @@ pub const Connection = struct {
             if (leave) continue;
             try self.runPendingInline();
         }
-
-        self.teardownExhaustive();
-        torn_down.* = true;
-        // endShield only drops shield_count. A cancel that arrived during
-        // the shield is still pending; consume and return it.
-        try zio.checkCancel();
-        if (close_probe) diagRawPrint("t1002 conn={x} shutdown_done parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
     }
 
     /// Last owned turn, then lock-free wait. Every `run` exit uses this,
