@@ -131,6 +131,11 @@ pub var tls_stage_failed: std.atomic.Value(u64) = .init(0);
 /// Test-only: alerts the server sent for a failed handshake. Counted in
 /// Debug and `-Dobserve=true`.
 pub var test_handshake_alerts: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
+/// Test-only: pumps that started with the peer's close_notify already
+/// decrypted (in the handshake leftover). Counted apart from the report in
+/// `Pump.start`, so a test can check its precondition whatever the report
+/// does.
+pub var test_close_at_pump_start: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 pub fn writeFailJson(w: *std.Io.Writer) !void {
     try w.print(
@@ -1625,6 +1630,9 @@ pub const Pump = struct {
         // before this pump exists). Nothing after it is read, so nothing
         // would report it: report it now. The actor ingests the leftover
         // before its loop, and takes the EOF only after that (`eofReady`).
+        if (comptime test_hook.on) {
+            if (self.conn.peer_closed) _ = test_close_at_pump_start.fetchAdd(1, .acq_rel);
+        }
         if (self.conn.peer_closed) {
             self.conn.ringPeerClosed(null, "close_notify");
             self.postEof();

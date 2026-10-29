@@ -1887,6 +1887,7 @@ fn runPipelinedNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const closes_0 = conn_mod.test_socket_closes.load(.acquire);
     const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
     const leftovers_0 = conn_mod.test_tls_leftover_connections.load(.acquire);
+    const close_at_start_0 = starh2.edge.tls_edge.test_close_at_pump_start.load(.acquire);
     var c: Client = .{
         .gpa = gpa,
         .transport = .tls,
@@ -1906,6 +1907,15 @@ fn runPipelinedNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     if (c.err) |e| return e;
     // The frames came as handshake leftover, which is what this is about.
     try std.testing.expectEqual(leftovers_0 + 1, conn_mod.test_tls_leftover_connections.load(.acquire));
+    // And the close_notify itself was in that leftover: the pump found it
+    // already decrypted when it started. A TCP split can deliver the frames
+    // with the handshake and the close_notify on the pump's first recv; the
+    // close is then taken the ordinary way, and this run did not test what
+    // it is about. That must fail, not pass.
+    if (starh2.edge.tls_edge.test_close_at_pump_start.load(.acquire) != close_at_start_0 + 1) {
+        std.debug.print("t3562: PRECONDITION NOT MET: the close_notify was not in the handshake leftover (the pump did not find it at start), so this run did not test the leftover close\n", .{});
+        return error.LeftoverClosePreconditionNotMet;
+    }
     // The PING in the leftover was ingested and answered before the close.
     try std.testing.expect(c.ping_acked.load(.acquire));
     try std.testing.expect(c.goaways >= 1);
