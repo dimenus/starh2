@@ -45,6 +45,10 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 . "$REPO/tools/sse_bench/hyper_build.sh"
 . "$REPO/tools/sse_bench/arm_width.sh"
 STREAMS=${STREAMS:-200}
+# /sse gives every stream its own timer. /sse-broadcast feeds every stream from
+# one ticker, the shape of one update pushed to many viewers; its events carry
+# the tick time, so its latency includes the fan-out to every stream.
+SSE_PATH=${SSE_PATH:-/sse}
 SECONDS_RUN=${SECONDS_RUN:-10}
 INTERVAL=${INTERVAL:-10}
 ROUNDS=${ROUNDS:-4}
@@ -118,7 +122,7 @@ check_widths "$WIDTH" "$OUT/go.log" "$OUT/kestrel.log" "$OUT/hyper.log" || exit 
 
 # An arm that never answered must not be reported as a slow arm.
 for port in 19446 19447 19449 19453; do
-  if ! "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams 1 -seconds 2 -warmup "$WARMUP" -label probe >/dev/null 2>&1; then
+  if ! "$OUT/sse-client" -url "https://127.0.0.1:$port$SSE_PATH" -streams 1 -seconds 2 -warmup "$WARMUP" -label probe >/dev/null 2>&1; then
     echo "the server on port $port did not deliver an event — refusing to report" >&2
     kill $S_PID $G_PID $K_PID $H_PID 2>/dev/null
     exit 1
@@ -145,7 +149,7 @@ sample_rss "$H_PID" "$OUT/hyper-rss.txt" &
 H_RSS_PID=$!
 
 target=$(( SECONDS_RUN * 1000 / INTERVAL * STREAMS ))
-echo "== $STREAMS streams, $CONNS conns, ${SECONDS_RUN}s + ${WARMUP}s warmup, one event per ${INTERVAL}ms, $ROUNDS rounds"
+echo "== $SSE_PATH: $STREAMS streams, $CONNS conns, ${SECONDS_RUN}s + ${WARMUP}s warmup, one event per ${INTERVAL}ms, $ROUNDS rounds"
 echo "== runtime: starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH)  opponents width=$WIDTH  kestrel :19449  hyper :19453"
 echo "== target $target events per arm per round ($(( STREAMS * 1000 / INTERVAL )) events/s)"
 
@@ -168,7 +172,7 @@ while [ "$i" -le "$ROUNDS" ]; do
       hyper) pid=$H_PID ;;
     esac
     cpu_before=$(cpu_seconds "$pid")
-    "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams "$STREAMS" \
+    "$OUT/sse-client" -url "https://127.0.0.1:$port$SSE_PATH" -streams "$STREAMS" \
       -conns "$CONNS" \
       -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$name" | sed 's/^/  /'
     cpu_after=$(cpu_seconds "$pid")
@@ -204,19 +208,21 @@ echo "  retained: starh2=${starh2_retained}KB  go=${go_retained}KB  kestrel=${ke
 #                  run on another; the row is marked BG-INCOMPLETE when that
 #                  background client did not deliver on every stream, because
 #                  then the box was not loaded the way the label says.
-SPLIT_ROUNDS=${SPLIT_ROUNDS:-2}
+# The split is a question about per-stream timers on one connection, so the
+# broadcast run skips it unless asked.
+if [ "$SSE_PATH" = /sse ]; then SPLIT_ROUNDS=${SPLIT_ROUNDS:-2}; else SPLIT_ROUNDS=${SPLIT_ROUNDS:-0}; fi
 if [ "$SPLIT_ROUNDS" -gt 0 ] && [ "$STREAMS" -gt 1 ]; then
   echo "== latency split: 1 stream quiet vs beside $((STREAMS - 1)) streams on another connection, $SPLIT_ROUNDS rounds"
   split_quiet() {
-    "$OUT/sse-client" -url "https://127.0.0.1:$2/sse" -streams 1 -seconds "$SECONDS_RUN" -warmup "$WARMUP" \
+    "$OUT/sse-client" -url "https://127.0.0.1:$2$SSE_PATH" -streams 1 -seconds "$SECONDS_RUN" -warmup "$WARMUP" \
       -label "$1 1-quiet" | grep "sse latency" | sed 's/^/  /'
   }
   split_loaded() {
-    "$OUT/sse-client" -url "https://127.0.0.1:$2/sse" -streams $((STREAMS - 1)) \
+    "$OUT/sse-client" -url "https://127.0.0.1:$2$SSE_PATH" -streams $((STREAMS - 1)) \
       -seconds $((SECONDS_RUN + WARMUP + 3)) -warmup 0 -label bg > "$OUT/split-bg.txt" 2>&1 &
     bg_pid=$!
     sleep 2
-    row=$("$OUT/sse-client" -url "https://127.0.0.1:$2/sse" -streams 1 -seconds "$SECONDS_RUN" -warmup "$WARMUP" \
+    row=$("$OUT/sse-client" -url "https://127.0.0.1:$2$SSE_PATH" -streams 1 -seconds "$SECONDS_RUN" -warmup "$WARMUP" \
       -label "$1 1-beside-load" | grep "sse latency")
     wait $bg_pid
     want=$((STREAMS - 1))

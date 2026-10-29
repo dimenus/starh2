@@ -6,6 +6,10 @@
 // HTTP/2 ALPN, same testdata cert as the other arms. Not the Datastar SDK
 // — the client subtracts the stamped nanos, and a patchElements payload
 // would be a different measurement.
+//
+// GET /sse-broadcast is the same stream fed by ONE ticker for every stream,
+// the shape of an app that pushes one update to many viewers. It stamps the
+// tick time, so its latency includes the fan-out to every stream.
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.AspNetCore.Http.Features;
@@ -94,6 +98,34 @@ app.MapGet("/sse", async ctx =>
     }
 });
 
+var tick_hub = new TickHub();
+_ = Task.Run(async () =>
+{
+    using var hub_ticker = new PeriodicTimer(interval);
+    while (await hub_ticker.WaitForNextTickAsync())
+    {
+        tick_hub.Publish((DateTime.UtcNow.Ticks - DateTime.UnixEpoch.Ticks) * 100);
+    }
+});
+
+app.MapGet("/sse-broadcast", async ctx =>
+{
+    ctx.Response.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    ctx.Features.Get<IHttpResponseBodyFeature>()?.DisableBuffering();
+    await ctx.Response.StartAsync(ctx.RequestAborted);
+
+    var ct = ctx.RequestAborted;
+    var seen = tick_hub.Current();
+    while (!ct.IsCancellationRequested)
+    {
+        var (seq, unix_ns) = await tick_hub.After(seen, ct);
+        seen = seq;
+        await ctx.Response.WriteAsync($"data: {unix_ns}\n\n", ct);
+        await ctx.Response.Body.FlushAsync(ct);
+    }
+});
+
 // width is the scheduler width this arm actually runs with, so the harness
 // can check that every arm is pinned the same. DOTNET_PROCESSOR_COUNT sets it
 // and sizes the thread pool, the GC heaps, and Kestrel's IO queues from it.
@@ -110,4 +142,53 @@ static X509Certificate2 LoadPem(string certPath, string keyPath)
     return X509CertificateLoader.LoadPkcs12(
         loaded.Export(X509ContentType.Pfx),
         password: null);
+}
+
+// The one ticker behind /sse-broadcast. A stream that missed ticks sends the
+// latest stamp once, as the starh2 arm's condition variable does.
+sealed class TickHub
+{
+    private readonly object _lock = new();
+    private long _seq;
+    private long _ts;
+    private TaskCompletionSource _tick = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void Publish(long ts)
+    {
+        TaskCompletionSource fired;
+        lock (_lock)
+        {
+            _seq++;
+            _ts = ts;
+            fired = _tick;
+            _tick = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        fired.SetResult();
+    }
+
+    public long Current()
+    {
+        lock (_lock)
+        {
+            return _seq;
+        }
+    }
+
+    // The newest tick past `seen`, waiting for one if there is none.
+    public async Task<(long Seq, long Ts)> After(long seen, CancellationToken ct)
+    {
+        while (true)
+        {
+            Task tick;
+            lock (_lock)
+            {
+                if (_seq != seen)
+                {
+                    return (_seq, _ts);
+                }
+                tick = _tick.Task;
+            }
+            await tick.WaitAsync(ct);
+        }
+    }
 }

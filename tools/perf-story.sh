@@ -275,15 +275,30 @@ elif [ -z "$BASE_SHA" ]; then
   emit_row "mixed" "55835a4" "GAP" "no base tree" "$log" "absent"
 fi
 
+# sse-200 gives every stream its own timer; sse-200-broadcast feeds all 200
+# from one ticker, the fan-out shape. Read the CPU columns of both: starh2
+# wakes for every per-stream deadline and sends at once, which buys latency
+# with CPU, and the broadcast row shows its cost when events arrive together.
 sse_row() {
   arm=$1
   root=$2
   sum=$3
+  path=${4:-/sse}
   name="sse-200"
+  dir="sse-$arm"
+  if [ "$path" != /sse ]; then
+    name="sse-200-broadcast"
+    dir="sse-bc-$arm"
+  fi
   log="$OUT/logs/${name}-${arm}.log"
-  cmd="cd $root && STREAMS=200 SECONDS_RUN=10 INTERVAL=10 ROUNDS=4 WARMUP=1 STARH2_EXECUTORS=2 OUT=$OUT/sse-$arm tools/sse_bench/run.sh"
+  if [ "$path" != /sse ] && ! grep -q sse-broadcast "$root/tools/sse_bench/server.go"; then
+    write_log_header "$log" "$sum" "skipped: $root has no /sse-broadcast on every arm"
+    emit_row "$name" "$arm" "EXCLUDED" "route not in this tree" "$log" "$sum"
+    return 0
+  fi
+  cmd="cd $root && SSE_PATH=$path STREAMS=200 SECONDS_RUN=10 INTERVAL=10 ROUNDS=4 WARMUP=1 STARH2_EXECUTORS=2 OUT=$OUT/$dir tools/sse_bench/run.sh"
   if skip_or_run "$name" "$arm" "$sum" "$cmd" "$log"; then
-    if run_logged "$log" env STREAMS=200 SECONDS_RUN=10 INTERVAL=10 ROUNDS=4 WARMUP=1 STARH2_EXECUTORS=2 OUT="$OUT/sse-$arm" "$root/tools/sse_bench/run.sh"; then
+    if run_logged "$log" env SSE_PATH="$path" STREAMS=200 SECONDS_RUN=10 INTERVAL=10 ROUNDS=4 WARMUP=1 STARH2_EXECUTORS=2 OUT="$OUT/$dir" "$root/tools/sse_bench/run.sh"; then
       emit_row "$name" "$arm" "ok" "see log" "$log" "$sum"
     else
       emit_row "$name" "$arm" "FAIL" "run.sh exit non-zero" "$log" "$sum"
@@ -292,8 +307,10 @@ sse_row() {
 }
 
 sse_row "$NEW_SHA" "$NEW_ROOT" "$NEW_SUM"
+sse_row "$NEW_SHA" "$NEW_ROOT" "$NEW_SUM" /sse-broadcast
 if [ -n "$BASE_SHA" ]; then
   sse_row "$BASE_SHA" "$BASE_ROOT" "$BASE_SUM"
+  sse_row "$BASE_SHA" "$BASE_ROOT" "$BASE_SUM" /sse-broadcast
 else
   log="$OUT/logs/sse-200-base-missing.log"
   write_log_header "$log" "absent" "PERF_STORY_BASE missing"
