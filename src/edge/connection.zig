@@ -5078,9 +5078,6 @@ pub const Connection = struct {
         };
     }
 
-    /// Close write queues and mark the loop to sweep on the next existing
-    /// lock. Do not split these: a leave without close waits behind putOne.
-    /// This helper does not lock.
     /// After this no handler reaches the TLS pump: handlers read `tls_driver`
     /// only under `session_mu`, so taking the lock waits for any section that
     /// already holds the pump, and every later section finds null. The actor
@@ -5095,6 +5092,9 @@ pub const Connection = struct {
         self.tls_driver = null;
     }
 
+    /// Close write queues and mark the loop to sweep on the next existing
+    /// lock. Do not split these: a leave without close waits behind putOne.
+    /// This helper does not lock.
     fn beginLeave(self: *Connection, leaving: *bool) void {
         std.debug.assert(shutdown_sweep.get() == null);
         self.closeWriterQueues();
@@ -5624,9 +5624,12 @@ pub const Connection = struct {
     fn finishGraceful(self: *Connection) !void {
         // Reset any remaining streams with CANCEL. The ids first: a reset
         // takes its stream out of the map.
-        for (self.session.openStreamIds()) |sid| {
-            // A stream may become terminal while the graceful sweep advances.
-            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .cancel } }) catch {};
+        {
+            defer self.session.returnOpenStreamIds();
+            for (self.session.openStreamIds()) |sid| {
+                // A stream may become terminal while the graceful sweep advances.
+                self.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .cancel } }) catch {};
+            }
         }
         try self.processIntents();
     }

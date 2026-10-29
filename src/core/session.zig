@@ -295,10 +295,16 @@ pub const Session = struct {
     /// A connection WINDOW_UPDATE is not recorded: connection credit never
     /// blocks a single stream in the scheduler.
     credit_ids: []u31 = &.{},
-    /// Scratch for `checkIdleDeadlines`: the streams whose body went idle, one
-    /// sweep at a time. `body_idle_ns` never holds more entries than there are
-    /// streams (`putBounded`), so `max_streams_per_connection` ids always fit.
+    /// Scratch for stream ids copied out of a map before the streams are
+    /// reset: `checkIdleDeadlines` (bodies gone idle) and `openStreamIds`
+    /// (every open stream). `max_streams_per_connection` ids always fit:
+    /// `body_idle_ns` never holds more entries than there are streams
+    /// (`putBounded`). One user at a time: `stale_ids_lent` makes a second
+    /// one loud in safe builds.
     stale_ids: []u31 = &.{},
+    /// Safe builds only: `openStreamIds` lent `stale_ids` to its caller,
+    /// which has not called `returnOpenStreamIds` yet.
+    stale_ids_lent: if (std.debug.runtime_safety) bool else void = if (std.debug.runtime_safety) false else {},
     credit_len: usize = 0,
     credit_all: bool = false,
     tombstones: std.ArrayList(Tombstone),
@@ -1021,7 +1027,10 @@ pub const Session = struct {
     /// streams run on would hold the connection to that deadline for a
     /// result the peer may never be able to receive.
     pub fn peerClosed(self: *Session) !void {
-        for (self.openStreamIds()) |sid| try self.emitRst(sid, .cancel);
+        {
+            defer self.returnOpenStreamIds();
+            for (self.openStreamIds()) |sid| try self.emitRst(sid, .cancel);
+        }
         try self.failConnectionWith(.no_error, self.last_processed_stream);
     }
 
@@ -1029,8 +1038,11 @@ pub const Session = struct {
     /// caller that resets them: a reset takes its stream out of the map, and
     /// any change to a map invalidates its live iterators (std.HashMap's
     /// contract, whatever its tombstones do today). The slice is
-    /// `stale_ids`, valid until the next call.
+    /// `stale_ids`, lent until the caller calls `returnOpenStreamIds`.
+    /// `checkIdleDeadlines` writes the same buffer, so nothing may run it in
+    /// between; in safe builds every writer asserts the buffer is not lent.
     pub fn openStreamIds(self: *Session) []const u31 {
+        self.lendStaleIds();
         var n: usize = 0;
         var it = self.streams.iterator();
         while (it.next()) |e| {
@@ -1039,6 +1051,21 @@ pub const Session = struct {
             n += 1;
         }
         return self.stale_ids[0..n];
+    }
+
+    /// The caller of `openStreamIds` is done with its slice.
+    pub fn returnOpenStreamIds(self: *Session) void {
+        if (std.debug.runtime_safety) {
+            std.debug.assert(self.stale_ids_lent);
+            self.stale_ids_lent = false;
+        }
+    }
+
+    fn lendStaleIds(self: *Session) void {
+        if (std.debug.runtime_safety) {
+            std.debug.assert(!self.stale_ids_lent);
+            self.stale_ids_lent = true;
+        }
     }
 
     fn failConnection(self: *Session, code: frame.ErrorCode) !void {
@@ -1373,6 +1400,8 @@ pub const Session = struct {
         // Collect first, act second. `emitRst` removes map entries, and a
         // mutation during iteration invalidates the iterator. The ids go in
         // `stale_ids`, which holds one per stream the connection may have.
+        // Not while `openStreamIds` has lent it.
+        if (std.debug.runtime_safety) std.debug.assert(!self.stale_ids_lent);
         var n_stale: usize = 0;
         var it = self.body_idle_ns.iterator();
         while (it.next()) |e| {
