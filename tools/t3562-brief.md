@@ -517,3 +517,116 @@ close_notify (6a); (28) the ReadPump shuts the send side on EOF again (6b);
 (29) handlers joined before the socket closes (6c). Full `./zb build test`
 each, on the Mac. Run the Linux gate as in round 3. Report `slotBootBytes`
 at defaults by running it.
+
+## Round 5 (review of 33caeac; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at 33caeac: Mac gates pass on a clean cache (682 of 685,
+3 skipped, none cached; ci: only the libcxx probes fail; smoke, ReleaseFast,
+observe ReleaseFast and session-mu-gate pass). Linux on nachos (a fresh
+`git archive` tree with the pinned zio): the full suite passed 685 of 685
+twice, the second on a clean cache. The `t3562` binary passed 30/30 alone and
+30/30 three at a time on BOTH systems. Every one of the 29 mutations in the
+report is caught, my round 3 survivor included.
+
+**My mutation survived:** in `Session.onData`, checking the connection window
+without the owed credit (`if (self.windows.conn_recv < total) {`) passes the
+whole suite (682 of 685). The stream-window twin is caught by one unit test
+only. Two other mutations of mine were caught: dropping a PING ack silently
+past the owed bound (crash), and the stream-window twin.
+
+Ryan decided this round: a NARROW round. Fix only the items below, each as a
+new commit on top of 33caeac. Each fix needs a test that fails on 33caeac
+first; say in the commit which test and how it failed. Do not reopen the
+T = M + 3 design or the cancel-all rule (item 7). The earlier rules still
+apply, and Linux remains a required gate.
+
+1. **TLS: a peer EOF reaped at the top of a turn parks the actor (high; both
+   reviewers; from 6b, ea7b6e1).** `driveTlsTurn` calls `pump.pollRecv()`
+   first. On `n == 0`, `onRecvComplete` sets `inbound_eof` and returns `.ok`,
+   so `pollRecv` returns `.progress`. Outside the closing phase the same turn
+   falls through to `waitForActivity`, and the main loop calls `onPeerEof`
+   only after `driveTlsTurn` returns. An idle connection has no deadline in
+   `nextDeadlineNs`, so it parks until server shutdown and holds its slot and
+   fd. Scenario: the peer sends a frame that produces no output (a
+   WINDOW_UPDATE, a SETTINGS ack) and closes in the same instant, so the EOF
+   completion lands while the actor is busy. Fix so that no turn can park
+   with an unhandled `inbound_eof`. The test: TLS, no handler alive, the peer
+   writes a frame and then closes or half-closes; `onPeerEof` runs and the
+   server's socket closes well before any deadline. It must fail on 33caeac
+   (force the timing if needed, for example by delivering the EOF while the
+   actor is in a turn), on Mac and Linux.
+2. **TLS pump lifetime at teardown (high if real; both reviewers; widened by
+   6c, 33caeac).** `tls_pump`, `read_pump` and `write_pump` are locals of
+   `runBody`. Its `defer` sets `self.tls_driver = null` and shuts the CQ
+   WITHOUT `session_mu`, and since 33caeac it runs before
+   `teardownExhaustive` on every exit. `abortCb` has no terminal-cause check,
+   and `drainEmit` reaches `pushWriteChunk`, which reads `self.tls_driver`
+   under `session_mu`. A shielded handler that calls `abort()` between the
+   loop's exit and the defer can hold a pointer into a dead stack frame.
+   First prove or disprove the race. Then fix it structurally, so the wrong
+   access cannot be written: the pumps become Connection fields (or another
+   owner that outlives every handler), detached under `session_mu` before
+   the loop is left, and no handler path can reach a pump after detach. Also
+   say whether `JoinHandle.cancel` joins (read zio's source). The test: a
+   shielded handler that calls `abort()` in a loop after the peer half-closes,
+   on TLS, in a safe build.
+3. **A peer RST for a stream still in the map leaves the RST obligation set
+   (medium; Fable; from item 1, b3cf629).** The in-map branch of the peer
+   RST_STREAM handler in `Session` removes the stream but does not call
+   `clearRefusalObligation`; only the not-in-map branch does. A refusal later
+   in the same section then finds no map entry, and `rstOwed(.refused_end)`
+   returns true, so the server resets a stream the peer already reset and uses
+   a terminal slot for it. Fix, and add the in-map variant of the existing
+   session test (stream `.open`, final HEADERS queued, peer RST, refusal
+   queues no RST).
+4. **The owed PING/SETTINGS bound is reachable inside the rate limit (low;
+   both reviewers; item 3).** The PING bucket holds 100 and refills 10 per
+   second, so a peer may send PING 101 within its limit 100 ms after a burst
+   of 100. With the share full for those 100 ms the 101st owed ack ends the
+   connection. The doc comment's claim ("past the burst its rate limit
+   allows") is false. Make the two bounds one, so an owed ack can never exist
+   that the rate limit allowed and the bound refuses. Fable's suggestion: an
+   owed ack keeps its token until it is sent. Same for SETTINGS. Test it
+   with a peer that stays inside the limit.
+5. **Tests for my survivor:** a test that fails when `onData` ignores the
+   owed CONNECTION credit, and a second test (not the same unit test) for the
+   stream twin.
+6. **Negative handler deadlines panic (low; astra; from e47b7ad).** Both
+   `waitUntilCb` (h1 and h2) do `@intCast(deadline.nanoseconds)` to `u64`.
+   A past deadline below zero, or one above `u64`, traps in a safe build,
+   where zio's `Timeout` used to clamp it. Compare before narrowing, and
+   saturate as zio does. Unit test with `.fromNanoseconds(-1)`.
+7. **Cancel-all on peer EOF stays (Ryan's decision).** `peerClosed` resets
+   every open stream, `half_closed_remote` included. Say so in its doc
+   comment, and why: a closing connection is bounded in time, and a request
+   whose response would still need a peer frame cannot finish. Do not change
+   the behaviour.
+8. **Small items.**
+   - Rename the TLS `server_failures` case to what it proves (M/2 aborts and
+     the GOAWAY under the pause; M RSTs in all).
+   - `h2_oracle`: track the open header block. HEADERS(END_STREAM) without
+     END_HEADERS must not end a stream until its last CONTINUATION, a
+     CONTINUATION must follow on the same stream with nothing between, and EOF
+     inside a block is a violation. Check the stricter oracle passes on 33caeac
+     plus your fixes; if it finds something, report it.
+   - astra's dispatch-memory refusal (`connection.zig` near the
+     `respond_headers ... catch {}` before `releaseSlot`): when building the
+     refusal response fails for want of a frame buffer, the stream is released
+     with no response and no RST. Prove or disprove it by reading or by a test.
+     If real, fall back to a terminal-store RST as `emitEarlyReject` does.
+   - `finishGraceful` removes map entries while it iterates the map
+     (pre-existing). Collect the ids first, as `peerClosed` does.
+
+Not in this round (file each with `task` if not already filed): Fable's note
+that the h1 `waitUntilCb` sleeps with no wake arm; astra's note that PING
+acks owed after a refusal can leave out of order (RFC 9113 does not require
+order); astra's note that WINDOW_UPDATE credit queued but unwritten counts as
+told in `onData` (pre-existing, and the server has room for that credit).
+
+Mutations for this round (add to the report's table): 30, item 1's check
+removed; 31, item 3's `clearRefusalObligation` removed from the in-map
+branch; 32, item 4's token kept by an owed ack released at once; 33, the
+connection-credit subtraction removed (my survivor); 34, item 6's
+comparison done after the narrowing. For item 2, mutate the detach ordering
+if the structure still allows it; if the new shape makes the wrong order
+impossible to write, say so instead.
