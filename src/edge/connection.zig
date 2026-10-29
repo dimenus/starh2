@@ -9485,6 +9485,15 @@ fn bigBodyByte(i: usize) u8 {
     return @intCast('a' + (i / 1000) % 26);
 }
 
+/// A handler that answers 503 itself, with END_STREAM and no body, and
+/// counts that it ran (`expectHandler503Reset`).
+var hop_503_runs: usize = 0;
+
+fn hopHandler503(_: *anyopaque, _: *const request.Request, resp: *response.CompleteResponse) anyerror!void {
+    hop_503_runs += 1;
+    try resp.send(503, &.{}, "");
+}
+
 fn hopBigBody(_: *anyopaque, _: *const request.Request, resp: *response.CompleteResponse) anyerror!void {
     var body: [48 * 1024]u8 = undefined;
     for (&body, 0..) |*b, i| b.* = bigBodyByte(i);
@@ -11133,6 +11142,51 @@ test "a request refused for want of job memory, with no frame for its response, 
 
 test "a request refused for want of job memory, with no frame for its response, is reset instead of left open: a 500 (its own cap) with INTERNAL_ERROR (t-3562)" {
     try expectDispatchRefusalReset(true, .no_frame, .internal_error);
+}
+
+test "a handler's own 503, refused by the ordinary share (its bytes spent), is reset with INTERNAL_ERROR: its retry safety is not the server's to claim (t-3562)" {
+    const gpa = std.testing.allocator;
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHandler503 } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopRoutes(&trap, gpa, std.testing.io, &routes);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    hop_503_runs = 0;
+    // The share's entries are free but its bytes are not: a complete handler
+    // runs only while an entry is free (`runPendingInline`), so a share pinned
+    // by entries, as `.share_full` pins it, would stop the handler before it
+    // ran. One entry takes all but 4 of the share's bytes, too few for any
+    // HEADERS frame (9 bytes of frame header alone): the handler runs, its
+    // HEADERS is built, and the edge's share refuses it.
+    const caps = conn.sched.ctrl.ordinaryCaps();
+    const held_bytes = conn.sched.ctrl.bytes_held.load(.acquire);
+    const pin_bytes = caps.bytes - held_bytes - 4;
+    try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(pin_bytes));
+    try std.testing.expect(conn.sched.ctrl.hasOrdinaryEntry());
+    var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        conn.session.windows.conn_send = flow.INITIAL_WINDOW;
+        try conn.session.ingest(hopRequestFrame(&req, 1));
+        try conn.processIntents();
+    }
+    try conn.runPendingInline();
+    conn.sched.ctrl.release(pin_bytes, 1);
+    // The handler ran: this is its 503, not the server's refusal.
+    try std.testing.expectEqual(@as(usize, 1), hop_503_runs);
+    try std.testing.expect(conn.session.terminal == .none);
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.internal_error)), seen.rst_code);
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
 }
 
 test "a request refused for want of job memory, its response refused by a full ordinary share, is reset: a 503 with REFUSED_STREAM (t-3562)" {
