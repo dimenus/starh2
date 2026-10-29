@@ -732,6 +732,24 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 
+/// A handler's `waitUntil` deadline as the awake clock's u64 nanoseconds,
+/// saturated the way zio's `Timeout` saturates: before zero is already past
+/// (0), past u64 is never. Compared before it is narrowed: `@intCast` alone
+/// traps in a safe build on either.
+pub fn handlerDeadlineNs(deadline: std.Io.Timestamp) u64 {
+    const ns = deadline.nanoseconds;
+    if (ns <= 0) return 0;
+    if (ns > std.math.maxInt(u64)) return std.math.maxInt(u64);
+    return @intCast(ns);
+}
+
+test "handlerDeadlineNs saturates below zero and past u64 instead of trapping" {
+    try std.testing.expectEqual(@as(u64, 0), handlerDeadlineNs(.fromNanoseconds(-1)));
+    try std.testing.expectEqual(@as(u64, 0), handlerDeadlineNs(.fromNanoseconds(0)));
+    try std.testing.expectEqual(@as(u64, 42), handlerDeadlineNs(.fromNanoseconds(42)));
+    try std.testing.expectEqual(std.math.maxInt(u64), handlerDeadlineNs(.fromNanoseconds(@as(i96, std.math.maxInt(u64)) + 1)));
+}
+
 /// std.Io socket handle to zio's ev handle (same fd; Windows would need the
 /// pointer cast). Mirrors zio's private `stdIoHandleToZio`.
 fn tlsNetHandle(h: std.Io.net.Socket.Handle) zio.ev.Backend.NetHandle {
@@ -8927,7 +8945,7 @@ pub const Connection = struct {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
         const io = self.config.io;
-        const deadline_ns: u64 = @intCast(deadline.nanoseconds);
+        const deadline_ns = handlerDeadlineNs(deadline);
         const armed_ns = self.config.limits.handlerDeadlineNs(deadline_ns);
 
         if (comptime test_observe) _ = test_deadline_waits.fetchAdd(1, .acq_rel);

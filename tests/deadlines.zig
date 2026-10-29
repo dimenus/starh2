@@ -435,3 +435,89 @@ test "T4: deadline slack rounds the wait up, and never holds back a late handler
     }.f, .{ rt, gpa });
     try handle.join();
 }
+
+// T5: a deadline before zero is a deadline already past. `waitUntil` returns
+// at once, on both wait paths, instead of trapping on the narrowing to the
+// awake clock's u64 (zio's `Timeout` saturates the same way).
+const t5_token = "data: t5-done\n\n";
+var t5_wait_ns: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+
+fn ssePastZero(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.startSse(&.{});
+    const before = t4NowNs(resp.io);
+    try body.waitUntil(.fromNanoseconds(-1));
+    t5_wait_ns.store(t4NowNs(resp.io) - before, .release);
+    try body.writeAll(t5_token);
+    try body.finish();
+}
+
+fn t5ReadUntilToken(stream: zio.net.Stream) !void {
+    var seen: [64 * 1024]u8 = undefined;
+    var len: usize = 0;
+    const t0 = zio.Timestamp.now(.monotonic).toNanoseconds();
+    while (zio.Timestamp.now(.monotonic).toNanoseconds() -% t0 < 3 * std.time.ns_per_s) {
+        if (len == seen.len) return error.ResponseTooLarge;
+        const n = stream.read(seen[len..], .{ .duration = .fromMilliseconds(20) }) catch |err| switch (err) {
+            error.Timeout => 0,
+            else => return err,
+        };
+        len += n;
+        if (std.mem.indexOf(u8, seen[0..len], "t5-done") != null) return;
+    }
+    return error.TokenMissing;
+}
+
+test "T5: a deadline before zero returns at once on both wait paths (h2c and h1c)" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .executors = .exact(2),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(struct {
+        fn f(runtime: *zio.Runtime, a: std.mem.Allocator) !void {
+            const routes = [_]starh2.Route{
+                .{ .method = .GET, .path = "/past", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = ssePastZero } } },
+            };
+            const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+            var limits = starh2.Limits.defaults;
+            limits.max_connections = 8;
+            limits.max_streams_per_connection = 128;
+            limits.max_streams_per_server = 256;
+            limits.cancellation_reaper_jobs = 256;
+            var server = try starh2.Server.init(a, runtime.io(), .{
+                .endpoints = &.{ .{ .h2c_prior_knowledge = addr }, .{ .h1c = addr } },
+                .routes = &routes,
+                .tls = null,
+                .limits = limits,
+            });
+            defer server.deinit(a);
+            var serve_handle = try runtime.spawn(starh2.Server.serve, .{ &server, a });
+            defer {
+                server.requestShutdown();
+                serve_handle.join() catch {};
+            }
+            try server.waitUntilListening(5 * std.time.ns_per_s);
+            {
+                t5_wait_ns.store(std.math.maxInt(u64), .release);
+                const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
+                var stream = try peer.connect(.{});
+                defer stream.close();
+                const hello = try h2c.buildClientHello(a, "/past");
+                defer a.free(hello);
+                try writeAllStream(stream, hello);
+                try t5ReadUntilToken(stream);
+                try std.testing.expect(t5_wait_ns.load(.acquire) < 100 * std.time.ns_per_ms);
+            }
+            {
+                t5_wait_ns.store(std.math.maxInt(u64), .release);
+                const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(1).getPort());
+                var stream = try peer.connect(.{});
+                defer stream.close();
+                try writeAllStream(stream, "GET /past HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+                try t5ReadUntilToken(stream);
+                try std.testing.expect(t5_wait_ns.load(.acquire) < 100 * std.time.ns_per_ms);
+            }
+        }
+    }.f, .{ rt, gpa });
+    try handle.join();
+}
