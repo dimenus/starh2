@@ -1727,7 +1727,7 @@ test "server failures in one stall, h2c: M aborts and the graceful GOAWAY all fi
     try runCaseTop(.h2c, .server_failures);
 }
 
-test "server failures in one stall, tls: M aborts and the graceful GOAWAY all fit, one RST per stream" {
+test "server failures in one stall, tls: M/2 aborts and the graceful GOAWAY wait under the pause, and the peer gets M RSTs in all" {
     try runCaseTop(.tls, .server_failures);
 }
 
