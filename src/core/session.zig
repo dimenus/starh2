@@ -1011,6 +1011,15 @@ pub const Session = struct {
     /// graceful finish ends its streams the same way. At most one RST per
     /// open stream: M, which the terminal bound and the intent queue hold
     /// (`Limits.terminalFrames`, `intentEntriesMin`).
+    ///
+    /// Every stream means every one: `half_closed_remote` too, a request the
+    /// peer sent in full whose response is still being written. That is a
+    /// rule, not an oversight. The closing phase this begins is bounded in
+    /// time (`Limits.close_flush_timeout_ns`), and a response still in
+    /// progress can need a frame from the peer to finish (a WINDOW_UPDATE
+    /// once its window is spent), which will never come. Letting such
+    /// streams run on would hold the connection to that deadline for a
+    /// result the peer may never be able to receive.
     pub fn peerClosed(self: *Session) !void {
         // The ids first: a reset takes its stream out of the map.
         var n: usize = 0;
