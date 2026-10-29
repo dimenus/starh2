@@ -563,9 +563,8 @@ fn sseHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
         const deadline = next;
         if (deadline > now_ns) {
             _ = g_cadence.sleeps.fetchAdd(1, .monotonic);
-            // Cadence is a heap entry, not a handler timer. waitUntil parks
-            // on the actor-owned deadline heap; waitForActivity is the idle
-            // arm of the same heap.
+            // waitUntil is a zio timed wait owned by this handler: each stream
+            // has its own timer, and the actor's park timer never sees it.
             const ts = std.Io.Timestamp.fromNanoseconds(@intCast(deadline));
             const first_wait = prev_write == null;
             if (first_wait) _ = g_cadence.first_wait_in_n.fetchAdd(1, .monotonic);
