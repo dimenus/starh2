@@ -230,11 +230,26 @@ fn shielded(_: *anyopaque, _: *const starh2.Request, _: *starh2.Response) anyerr
     shielded_done_ns.store(nowNs(), .release);
 }
 
+/// `aborter`: starts its response, then aborts it once, and records when it
+/// returned. Shielded, as a handler that must not be stopped would be.
+var aborter_started: std.atomic.Value(usize) = .init(0);
+var aborter_done: std.atomic.Value(bool) = .init(false);
+
+fn aborter(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    zio.beginShield();
+    defer zio.endShield();
+    defer aborter_done.store(true, .release);
+    var body = try resp.start(200, &.{});
+    _ = aborter_started.fetchAdd(1, .acq_rel);
+    body.abort() catch {};
+}
+
 const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/empty", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = empty } } },
     .{ .method = .GET, .path = "/stall", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = stall } } },
     .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = upload } } },
     .{ .method = .GET, .path = "/shielded", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = shielded } } },
+    .{ .method = .GET, .path = "/aborter", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = aborter } } },
 };
 
 fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
@@ -1559,6 +1574,91 @@ fn runIdleEof(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     serving = false;
 }
 
+/// The TLS pump at teardown. A handler's lock section that begins after the
+/// actor left its loop must not overlap the actor shutting the pump down:
+/// the handler reaches the pump through `tls_driver` (`pushWriteChunk`), and
+/// the pump must still be attached and alive for the whole section, or
+/// already detached when it begins. The holds force the interleaving: the
+/// handler's `abort()` waits before taking `session_mu` while the client
+/// half-closes and the connection ends; it takes the lock once the actor has
+/// left the loop and waits after it, and it stays in its section for longer
+/// than that wait.
+fn runAbortAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    aborter_started.store(0, .release);
+    aborter_done.store(false, .release);
+    conn_mod.test_release_abort.store(false, .release);
+    conn_mod.test_hold_abort.store(true, .release);
+    conn_mod.test_abort_dwell_ms.store(300, .release);
+    conn_mod.test_detach_dwell_ms.store(150, .release);
+    defer {
+        conn_mod.test_hold_abort.store(false, .release);
+        conn_mod.test_release_abort.store(true, .release);
+        conn_mod.test_abort_dwell_ms.store(0, .release);
+        conn_mod.test_detach_dwell_ms.store(0, .release);
+    }
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const held_0 = conn_mod.test_abort_held.load(.acquire);
+    const dwelling_0 = conn_mod.test_detach_dwelling.load(.acquire);
+    const saw_0 = conn_mod.test_abort_saw_pump_shut.load(.acquire);
+    const shuts_0 = conn_mod.test_tls_pump_shuts.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 1,
+        .path = "/aborter",
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    try waitFor("the handler's abort to wait before the lock", atLeast(&conn_mod.test_abort_held, held_0 + 1), reached);
+    c.half_close.store(true, .release);
+    try waitFor("the actor to leave its loop", atLeast(&conn_mod.test_detach_dwelling, dwelling_0 + 1), reached);
+    conn_mod.test_release_abort.store(true, .release);
+    try waitFor("the handler to return", &aborter_done, struct {
+        fn f(x: *const std.atomic.Value(bool)) bool {
+            return x.load(.acquire);
+        }
+    }.f);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    // The instrument fired: the actor shut the pump while the test ran.
+    try std.testing.expect(conn_mod.test_tls_pump_shuts.load(.acquire) > shuts_0);
+    try std.testing.expectEqual(saw_0, conn_mod.test_abort_saw_pump_shut.load(.acquire));
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runAbortAtTeardownTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runAbortAtTeardown, .{ rt, gpa });
+    try h.join();
+}
+
 fn runIdleEofTop() !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
@@ -1708,6 +1808,10 @@ test "a shielded handler past the close, tls: the socket closes when the closing
 
 test "a TLS peer EOF reaped at the top of an idle turn is still taken, and the server closes long before any deadline" {
     try runIdleEofTop();
+}
+
+test "a handler's lock section after the loop ends never overlaps the TLS pump's shutdown (tls)" {
+    try runAbortAtTeardownTop();
 }
 
 test "zz h2 oracle: no protocol violation on any connection in this binary" {

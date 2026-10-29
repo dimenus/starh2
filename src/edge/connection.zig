@@ -354,6 +354,23 @@ pub var test_hold_stash: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.
 pub var test_hold_idle_tls_turn: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 pub var test_idle_tls_turn_held: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 pub var test_release_idle_tls_turn: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+/// Test-only, the TLS pump's lifetime at teardown. `test_hold_abort` stops the
+/// next `abortCb` before it takes `session_mu`, until `test_release_abort`
+/// (armed once; `test_abort_held` counts). `test_abort_dwell_ms` keeps
+/// `abortCb` inside its lock section that long, and counts in
+/// `test_abort_saw_pump_shut` a section that began with the TLS pump attached
+/// and saw the actor shut that pump down (`test_tls_pump_shuts`) before it
+/// ended. `test_detach_dwell_ms` makes the actor wait that long, after it
+/// left the loop, before it detaches and shuts the pump
+/// (`test_detach_dwelling` counts the waits).
+pub var test_hold_abort: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_abort_held: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_release_abort: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_abort_dwell_ms: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
+pub var test_abort_saw_pump_shut: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_tls_pump_shuts: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_detach_dwell_ms: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
+pub var test_detach_dwelling: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 pub var test_hold_stash_entered: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
@@ -1983,6 +2000,15 @@ pub const Connection = struct {
     /// `waitForActivity` and `pushWriteChunk` can reach the CQ. Null on h2c
     /// and before `Pump.start`.
     tls_driver: ?*tls_edge.Pump = null,
+    /// The pumps. They live in the Connection, not on `runBody`'s stack, so no
+    /// pointer to one can outlive its storage: the Connection outlives every
+    /// handler (`teardownExhaustive` joins them) and every pump task
+    /// (`JoinHandle.cancel` joins). Handlers reach the TLS pump only through
+    /// `tls_driver`, under `session_mu`, and `detachTlsPump` clears it under
+    /// the same lock before the actor shuts the pump down.
+    tls_pump: tls_edge.Pump = undefined,
+    read_pump: wire_pump.ReadPump = undefined,
+    write_pump: wire_pump.WritePump = undefined,
     /// Diag: the pump's current blocking site (see `tls_edge.Pump.site`).
     tls_pump_site: std.atomic.Value(u8) = .init(0),
     /// Diag: where the ACTOR currently is. 1 loop, 2 waitForActivity,
@@ -4188,9 +4214,6 @@ pub const Connection = struct {
         if (comptime placement_check) self.actor_thread = std.Thread.getCurrentId();
         probeNote(.actor_start);
 
-        var read_pump: wire_pump.ReadPump = undefined;
-        var write_pump: wire_pump.WritePump = undefined;
-        var tls_pump: tls_edge.Pump = undefined;
         var read_handle: ?zio.JoinHandle(void) = null;
         var write_handle: ?zio.JoinHandle(void) = null;
         var tls_started = false;
@@ -4198,19 +4221,27 @@ pub const Connection = struct {
 
         defer {
             if (self.diag_registered) diagDeregister(self);
-            if (h2c_started) read_pump.stop();
+            if (h2c_started) self.read_pump.stop();
             if (self.config.mode == .tls) {
                 self.tls_write_ch.close(.graceful);
             } else {
-                self.stopWritePump(if (h2c_started) &write_pump else null);
+                self.stopWritePump(if (h2c_started) &self.write_pump else null);
             }
             self.stream.shutdown(io, .both) catch {
                 // Shutdown is best-effort; task cancellation is the authoritative unblock.
             };
             if (tls_started) {
-                tls_pump.failDrain();
-                self.tls_driver = null;
-                tls_pump.shutdownCq();
+                if (comptime test_observe) {
+                    const dwell = test_detach_dwell_ms.load(.acquire);
+                    if (dwell != 0) {
+                        _ = test_detach_dwelling.fetchAdd(1, .acq_rel);
+                        io.sleep(.fromMilliseconds(dwell), .awake) catch {};
+                    }
+                }
+                self.detachTlsPump();
+                self.tls_pump.failDrain();
+                self.tls_pump.shutdownCq();
+                if (comptime test_observe) _ = test_tls_pump_shuts.fetchAdd(1, .acq_rel);
             }
             if (write_handle) |*h| h.cancel();
             if (read_handle) |*h| h.cancel();
@@ -4230,7 +4261,7 @@ pub const Connection = struct {
                 if (self.config.accounting) |a| a.releaseHandshake();
                 self.handshake_held = false;
             }
-            tls_pump = .{
+            self.tls_pump = .{
                 .io = io,
                 .conn = self.tls.?,
                 .to_actor = &self.read_ch,
@@ -4257,8 +4288,8 @@ pub const Connection = struct {
                 .test_delay_ms = if (comptime test_observe) test_write_delay_ms else 0,
                 .test_fail_after = if (comptime test_observe) test_write_fail_after else 0,
             };
-            if (!tls_pump.start()) return;
-            self.tls_driver = &tls_pump;
+            if (!self.tls_pump.start()) return;
+            self.tls_driver = &self.tls_pump;
             tls_started = true;
             self.sched.pause = struct {
                 fn f(ctx: *anyopaque) bool {
@@ -4283,7 +4314,7 @@ pub const Connection = struct {
                 diagRegister(self);
             }
         } else {
-            read_pump = .{
+            self.read_pump = .{
                 .io = io,
                 .stream = self.stream,
                 .to_actor = &self.read_ch,
@@ -4292,7 +4323,7 @@ pub const Connection = struct {
                 .free_indices = &self.read_free_ch,
                 .live_task_handlers = &self.live_task_handlers,
             };
-            write_pump = .{
+            self.write_pump = .{
                 .io = io,
                 .stream = self.stream,
                 .from_actor = &self.write_ch,
@@ -4303,8 +4334,8 @@ pub const Connection = struct {
                 .test_delay_ms = if (comptime test_observe) test_write_delay_ms else 0,
                 .test_fail_after = if (comptime test_observe) test_write_fail_after else 0,
             };
-            read_handle = try zio.spawnInto(connPlacement(), runReadPump, .{ self, &read_pump });
-            write_handle = try zio.spawnInto(connPlacement(), runWritePump, .{ self, &write_pump });
+            read_handle = try zio.spawnInto(connPlacement(), runReadPump, .{ self, &self.read_pump });
+            write_handle = try zio.spawnInto(connPlacement(), runWritePump, .{ self, &self.write_pump });
             h2c_started = true;
             self.ack_room_armed = true;
             self.sched.pause = h2cPauseData;
@@ -4500,7 +4531,7 @@ pub const Connection = struct {
             if (chunk.len == 0 and chunk.bytes.len == 0) {
                 // A failed read fails the connection; the peer's EOF is an
                 // event (`onPeerEof`), in the closing phase or before it.
-                if (read_pump.read_failed.load(.acquire)) {
+                if (self.read_pump.read_failed.load(.acquire)) {
                     self.noteServerClose("read_failed", null);
                     self.writer_failed.store(true, .release);
                     self.beginLeave(&leaving);
@@ -4551,7 +4582,7 @@ pub const Connection = struct {
             // An end of stream behind the batch, after its frames.
             if (inbound_eof) {
                 inbound_eof = false;
-                if (read_pump.read_failed.load(.acquire)) {
+                if (self.read_pump.read_failed.load(.acquire)) {
                     self.noteServerClose("read_failed", null);
                     self.writer_failed.store(true, .release);
                 } else {
@@ -5019,6 +5050,20 @@ pub const Connection = struct {
     /// Close write queues and mark the loop to sweep on the next existing
     /// lock. Do not split these: a leave without close waits behind putOne.
     /// This helper does not lock.
+    /// After this no handler reaches the TLS pump: handlers read `tls_driver`
+    /// only under `session_mu`, so taking the lock waits for any section that
+    /// already holds the pump, and every later section finds null. The actor
+    /// shuts the pump down only after this, so a handler never uses a pump
+    /// that is being shut down. The write queues are closed first, as in
+    /// `teardownExhaustive`: a handler can park on a full queue while it
+    /// holds `session_mu`.
+    fn detachTlsPump(self: *Connection) void {
+        self.closeWriterQueues();
+        self.lockSessionUncancelable(self.config.io);
+        defer self.unlockSession(self.config.io);
+        self.tls_driver = null;
+    }
+
     fn beginLeave(self: *Connection, leaving: *bool) void {
         std.debug.assert(shutdown_sweep.get() == null);
         self.closeWriterQueues();
@@ -9179,8 +9224,26 @@ pub const Connection = struct {
     fn abortCb(ctx: *anyopaque, stream_id: u31) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
+        if (comptime test_observe) {
+            if (test_hold_abort.swap(false, .acq_rel)) {
+                _ = test_abort_held.fetchAdd(1, .acq_rel);
+                while (!test_release_abort.load(.acquire)) self.config.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+        }
         try self.lockSession();
         defer self.unlockSession(self.config.io);
+        if (comptime test_observe) {
+            const dwell = test_abort_dwell_ms.load(.acquire);
+            if (dwell != 0) {
+                const attached = self.tls_driver != null;
+                const shuts_0 = test_tls_pump_shuts.load(.acquire);
+                self.config.io.sleep(.fromMilliseconds(dwell), .awake) catch {};
+                if (attached and test_tls_pump_shuts.load(.acquire) != shuts_0) _ = test_abort_saw_pump_shut.fetchAdd(1, .acq_rel);
+            }
+        }
+        // `abortBody` checked the cause before this task waited for the lock;
+        // the loop's last sweep can set one meanwhile, under this lock.
+        if (hctx.terminal.getCause()) |c| return response.causeToError(c);
         self.session.applyCommand(.{ .reset_stream = .{ .stream_id = stream_id, .code = .cancel } }) catch return error.WriteFailed;
         self.processIntents() catch return error.WriteFailed;
     }
