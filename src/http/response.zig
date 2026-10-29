@@ -214,9 +214,12 @@ pub const Response = struct {
         return .{ .response = self, .stream_id = self.stream_id, .generation = self.terminal.currentGeneration() };
     }
 
-    /// Sleep to a deadline on the actor's heap, never for a duration. The
-    /// deadline is on `Clock.awake` (same clock `io` uses). A complete oneshot
-    /// must not call this.
+    /// Sleep to a deadline, never for a duration. The deadline is on
+    /// `Clock.awake` (same clock `io` uses). It never returns before the
+    /// deadline. `Limits.handler_deadline_slack_ns` (0 by default) moves the
+    /// timer up to that much later; the usual wake delay comes on top. When
+    /// the stream ends first it returns an error that says why. A complete
+    /// oneshot must not call this.
     pub fn waitUntil(self: *Response, deadline: std.Io.Timestamp) ResponseError!void {
         if (self.slotTerminal()) |c| return causeToError(c);
         try self.waitUntilFn(self.ctx, self.stream_id, deadline);

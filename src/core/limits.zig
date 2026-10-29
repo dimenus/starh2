@@ -321,8 +321,33 @@ pub const Limits = struct {
     /// to hold a connection slot. Holds no memory: the frames were already
     /// counted when they were queued. Must be non-zero.
     close_flush_timeout_ns: u64 = 500 * std.time.ns_per_ms,
+    /// How late a handler's `waitUntil` may return. 0, the default, wakes
+    /// each handler at its own deadline. A non-zero value rounds every
+    /// handler deadline UP to the next multiple of it on the awake clock, so
+    /// handlers whose deadlines fall in the same window wake on one timer
+    /// pass instead of one wake each. That is the trade for many streams
+    /// that each tick on their own timer (SSE): fewer wakes per event, for up
+    /// to this much added latency on each timed wait, plus the time the
+    /// handlers woken together spend waiting for each other.
+    ///
+    /// Only the timed wait moves. A handler woken by I/O or by another task
+    /// is not affected, and a handler already past its own deadline returns
+    /// at once instead of waiting for the next multiple.
+    handler_deadline_slack_ns: u64 = 0,
 
     pub const defaults: Limits = .{};
+
+    /// The deadline a handler's timed wait arms: `deadline_ns` rounded up to
+    /// the next multiple of `handler_deadline_slack_ns`. Saturates instead of
+    /// wrapping, so a deadline near the end of the clock never wraps to an
+    /// early one.
+    pub fn handlerDeadlineNs(self: Limits, deadline_ns: u64) u64 {
+        const slack = self.handler_deadline_slack_ns;
+        if (slack == 0) return deadline_ns;
+        const over = deadline_ns % slack;
+        if (over == 0) return deadline_ns;
+        return deadline_ns +| (slack - over);
+    }
 
     fn checkedMul(a: usize, b: usize) error{InvalidConfig}!usize {
         const r = @mulWithOverflow(a, b);
@@ -680,6 +705,19 @@ test "the intent queue holds a reset of every live stream, and boot refuses less
     lim = Limits.defaults;
     lim.max_streams_per_connection = 1;
     try std.testing.expectEqual(INGEST_FRAME_ROOM + TERMINAL_INTENT_RESERVE, try lim.intentEntriesMin());
+}
+
+test "handler deadline slack rounds up to its multiple and never wraps" {
+    var lim = Limits.defaults;
+    try std.testing.expectEqual(@as(u64, 1_234_567), lim.handlerDeadlineNs(1_234_567));
+
+    lim.handler_deadline_slack_ns = 1_000_000;
+    try std.testing.expectEqual(@as(u64, 2_000_000), lim.handlerDeadlineNs(1_000_001));
+    try std.testing.expectEqual(@as(u64, 2_000_000), lim.handlerDeadlineNs(1_999_999));
+    try std.testing.expectEqual(@as(u64, 2_000_000), lim.handlerDeadlineNs(2_000_000));
+    try std.testing.expectEqual(@as(u64, 0), lim.handlerDeadlineNs(0));
+    const max = std.math.maxInt(u64);
+    try std.testing.expectEqual(max, lim.handlerDeadlineNs(max - 1));
 }
 
 test "defaults resource bound" {

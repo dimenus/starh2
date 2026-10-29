@@ -8818,14 +8818,10 @@ pub const Connection = struct {
         try self.waitTicket(stream_id, slot_i, hctx.terminal);
     }
 
-    /// Streaming body write.
-    ///
-    /// Register `{stream_id, deadline}` on the actor heap and park on the
-    /// per-slot deadline Event. Not `space_events`, and not `Io.sleep`.
     /// Streaming body cadence wait (`Body.waitUntil`), handler-owned.
     ///
-    /// One per-slot Event with a timed wait: `error.Timeout` IS the deadline.
-    /// zio arms it on the waiter's home executor, so it fires when that
+    /// One per-slot Event raced against a timer: the timer winning IS the
+    /// deadline. zio arms it on the waiter's home executor, so it fires when that
     /// executor next polls. This is a cooperative scheduler: the actor must
     /// reach a suspension point for the timer to fire, and it does, because
     /// every turn parks in `zio.select`. `T1` in `tests/deadlines.zig` is the
@@ -8833,16 +8829,24 @@ pub const Connection = struct {
     /// executor with migration off.
     ///
     /// Do NOT move timers to a thread of their own to make a non-yielding
-    /// actor work. That was tried, upstream refused it twice, and it costs
-    /// 750 us of p50 on 500 concurrent SSE streams (21 us against 775 us) at
-    /// the SAME delivered count and the same CPU per event. The mechanism:
+    /// actor work. That was tried, upstream refused it twice, and it adds
+    /// latency on hundreds of concurrent SSE streams at the same delivered
+    /// count and the same CPU per event. The mechanism:
     /// such a patch does not only ARM the timer elsewhere, it runs the woken
     /// waiter there too (`wakeFromTimer` marks the wake, and `scheduleTask`
     /// then forces local scheduling on the timer executor). Every expired
     /// deadline therefore runs on ONE thread and then contends for
-    /// `session_mu` in `writeCb`. One thread absorbs 200 wakes per
-    /// millisecond and saturates before 500, which is why the penalty is a
-    /// knee rather than a slope: 200 streams cost nothing and 500 cost 35x.
+    /// `session_mu` in `writeCb`. That one thread saturates at some stream
+    /// count, so the penalty is a knee rather than a slope.
+    ///
+    /// The timer is armed at an absolute deadline on the awake clock, the
+    /// clock `deadline` is on, never as a duration: a duration is added to
+    /// the loop's cached `now`, which can be older than ours. With
+    /// `Limits.handler_deadline_slack_ns` the armed deadline is rounded up
+    /// to a multiple of the slack, so streams that tick on their own timers
+    /// share timer passes. The early return below compares against the
+    /// caller's own deadline, so a handler that is already late is never
+    /// held back to the next multiple.
     ///
     /// A normal return is an early wake from
     /// `wakeHandlerDeadline` (RST, terminal, writer failure, teardown); the
@@ -8858,6 +8862,7 @@ pub const Connection = struct {
         const self = hctx.conn;
         const io = self.config.io;
         const deadline_ns: u64 = @intCast(deadline.nanoseconds);
+        const armed_ns = self.config.limits.handlerDeadlineNs(deadline_ns);
 
         if (comptime test_observe) _ = test_deadline_waits.fetchAdd(1, .acq_rel);
         defer if (comptime test_observe) {
@@ -8871,19 +8876,13 @@ pub const Connection = struct {
             if (hctx.terminal.getCause()) |c| return response.causeToError(c);
             if (hctx.terminal.cancel_flag.load(.acquire)) return error.Canceled;
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
-            // One clock read: with two, the deadline can pass between the
-            // check and the subtraction, and the u64 wraps to a ~584-year
-            // timer that parks the handler for good (its stream goes silent
-            // while the connection lives; Debug panics instead).
-            const now = nowNs(io);
-            if (now >= deadline_ns) return;
-            const remain = deadline_ns - now;
+            if (nowNs(io) >= deadline_ns) return;
             diagWait(hctx, .deadline_wait);
             defer diagWait(hctx, .running);
             const winner = zio.select(.{
                 .ev = event,
                 .dead = &self.dead,
-                .timer = zio.Timeout.fromNanoseconds(remain),
+                .timer = zio.Timeout{ .deadline = .fromNanoseconds(armed_ns) },
             }) catch |err| switch (err) {
                 error.Canceled => {
                     if (hctx.terminal.getCause()) |c| return response.causeToError(c);
