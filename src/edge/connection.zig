@@ -4526,8 +4526,9 @@ pub const Connection = struct {
 
             if (self.config.mode == .tls) {
                 const leave = try self.driveTlsTurn();
-                // An EOF or close_notify the pump saw this turn.
-                if (!leave and self.tls_driver.?.inbound_eof) try self.onPeerEof();
+                // An EOF or close_notify the pump saw, once what came before
+                // it is ingested.
+                if (!leave and self.tls_driver.?.eofReady()) try self.onPeerEof();
                 if (leave) self.beginLeave(&leaving);
                 continue;
             }

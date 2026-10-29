@@ -224,6 +224,30 @@ pub const Wire = struct {
         }
     }
 
+    /// TLS only: send `frames`, then this client's close_notify, in ONE
+    /// write, without closing the socket. `record_after`: one more complete
+    /// record after the close_notify (its payload is not valid ciphertext; a
+    /// peer must ignore anything after close_notify, RFC 8446 section 6.1).
+    pub fn sendThenCloseNotify(self: *Wire, frames: []const u8, record_after: bool) !void {
+        std.debug.assert(self.transport == .tls);
+        self.oracle.onSend(frames);
+        var flight: std.ArrayList(u8) = .empty;
+        defer flight.deinit(self.gpa);
+        var off: usize = 0;
+        while (off < frames.len) {
+            const r = try self.conn.encrypt(frames[off..][0..@min(frames.len - off, 16 * 1024)], &self.out);
+            try flight.appendSlice(self.gpa, r.ciphertext);
+            off += r.cleartext_pos;
+        }
+        try flight.appendSlice(self.gpa, try self.conn.close(&self.out));
+        if (record_after) {
+            const junk_len = 20;
+            try flight.appendSlice(self.gpa, &.{ 0x17, 0x03, 0x03, 0x00, junk_len });
+            try flight.appendNTimes(self.gpa, 0xa5, junk_len);
+        }
+        try self.sendRaw(flight.items);
+    }
+
     pub fn recordLen(bytes: []const u8) ?usize {
         if (bytes.len < 5) return null;
         const len = 5 + @as(usize, std.mem.readInt(u16, bytes[3..5], .big));

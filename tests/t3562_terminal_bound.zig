@@ -333,6 +333,12 @@ const Client = struct {
     /// nothing.
     send_wu: std.atomic.Value(bool) = .init(false),
     wu_sent: std.atomic.Value(bool) = .init(false),
+    /// TLS: one write of a PING (`alive_ping`) and this client's
+    /// close_notify, the socket left open (`Wire.sendThenCloseNotify`).
+    /// `notify_record_after`: one more record after the close_notify.
+    send_notify: std.atomic.Value(bool) = .init(false),
+    notify_sent: std.atomic.Value(bool) = .init(false),
+    notify_record_after: bool = false,
     /// Streams that ended for the client: a HEADERS with END_STREAM or an
     /// RST_STREAM, whichever came first.
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -434,6 +440,12 @@ fn clientRun(c: *Client) !void {
             for (0..c.batch_streams) |i| try h2c.appendHeaders(c.gpa, &more, @intCast(1 + 2 * (c.streams + 1 + i)), c.path, true);
             try w.send(more.items);
             c.batch_sent.store(true, .release);
+        }
+        if (!c.notify_sent.load(.acquire) and c.send_notify.load(.acquire)) {
+            var ping: [17]u8 = undefined;
+            _ = try frame.Serializer.ping(&ping, false, &alive_ping);
+            try w.sendThenCloseNotify(&ping, c.notify_record_after);
+            c.notify_sent.store(true, .release);
         }
         if (!c.wu_sent.load(.acquire) and c.send_wu.load(.acquire)) {
             var more: std.ArrayList(u8) = .empty;
@@ -1659,6 +1671,67 @@ fn runAbortAtTeardownTop() !void {
     try h.join();
 }
 
+/// A TLS peer that sends a frame and its close_notify in one write, and
+/// leaves the socket open: the server must take the close_notify (it
+/// decrypts both records in one call), ingest the frame before it, then send
+/// its GOAWAY and close_notify and close. The client reads all the while.
+fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 0,
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    c.send_notify.store(true, .release);
+    try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    // The PING before the close_notify was ingested: its ack came.
+    try std.testing.expect(c.ping_acked.load(.acquire));
+    try std.testing.expect(c.goaways >= 1);
+    try std.testing.expect(c.eof);
+    // The client never closed its socket while reading: the server closed.
+    try std.testing.expectEqual(closes_0 + 1, conn_mod.test_socket_closes.load(.acquire));
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runFrameThenNotifyTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runFrameThenNotify, .{ rt, gpa });
+    try h.join();
+}
+
 fn runIdleEofTop() !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
@@ -1812,6 +1885,10 @@ test "a TLS peer EOF reaped at the top of an idle turn is still taken, and the s
 
 test "a handler's lock section after the loop ends never overlaps the TLS pump's shutdown (tls)" {
     try runAbortAtTeardownTop();
+}
+
+test "a TLS frame and close_notify in one write, the socket left open: the server ingests the frame, takes the close, and closes" {
+    try runFrameThenNotifyTop();
 }
 
 test "zz h2 oracle: no protocol violation on any connection in this binary" {

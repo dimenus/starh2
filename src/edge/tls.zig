@@ -1470,7 +1470,27 @@ pub const Pump = struct {
             return .closed;
         }
         self.pending_read = .{ .bytes = buf, .len = n };
+        // One decrypt can return a record's plaintext AND reach the
+        // close_notify behind it (`decryptInto` stops there). Nothing calls
+        // this again for the close: no complete record is left before it.
+        // So it is reported now, behind the plaintext: the actor ingests
+        // `pending_read` first (`eofReady`).
+        if (self.conn.peer_closed and !self.inbound_eof) {
+            self.conn.ringPeerClosed(null, "close_notify");
+            self.postEof();
+        }
         return .ok;
+    }
+
+    /// The peer's end of stream is posted and nothing it sent before it is
+    /// left to ingest: no plaintext waiting, and either the close_notify was
+    /// reached (nothing after it is read) or no complete record is buffered.
+    /// The actor takes the EOF (`Connection.onPeerEof`) only then, so the
+    /// frames before a close are never dropped by the closing phase.
+    pub fn eofReady(self: *const Pump) bool {
+        if (!self.inbound_eof or self.pending_read != null) return false;
+        if (self.conn.peer_closed) return true;
+        return self.pending_cipher == null and !self.conn.pendingInbound();
     }
 
     pub fn ingestCipher(self: *Pump, bytes: []const u8) bool {
