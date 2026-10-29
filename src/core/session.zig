@@ -3621,6 +3621,83 @@ test "an owed SETTINGS ack keeps its rate-limit token, so the limit and the owed
     try std.testing.expect(rl.admit(.settings, now + 300 * std.time.ns_per_ms));
 }
 
+test "owed connection credit: DATA past what the peer was told ends the connection, though the window has the credit (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    // The state a refused connection WINDOW_UPDATE leaves: the peer has used
+    // the window down to `told`, the server granted `credit` more
+    // (`grantWindow` adds it to the window), and the edge refused the frame,
+    // so the credit is owed. Driving it through ingest would take the
+    // connection window's whole replenish threshold of DATA.
+    const told: i32 = 1000;
+    const credit: u31 = 20_000;
+    session.windows.conn_recv = told + credit;
+    session.oweWindowUpdate(0, credit);
+    // One byte past what the peer was told: a connection flow-control error,
+    // even though the server's own window holds the credit.
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, @intCast(told + 1));
+    try session.ingest(wire.items);
+    try std.testing.expect(session.terminal == .goaway);
+    try std.testing.expectEqual(frame.ErrorCode.flow_control_error, session.terminal.goaway.code);
+}
+
+test "owed stream credit: DATA up to what the peer was told is taken, one byte more resets the stream (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    // Half the stream window and one byte: the stream's WINDOW_UPDATE is
+    // queued, and the edge refuses it, so its credit is owed.
+    const half: usize = flow.INITIAL_WINDOW / 2 + 1;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, half);
+    try session.ingest(wire.items);
+    const n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(seen[0].typ == .window_update and seen[0].sid == 1);
+    session.oweWindowUpdate(1, seen[0].inc);
+    // Exactly what the peer was told is still taken.
+    const told: usize = flow.INITIAL_WINDOW - half;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, told);
+    try session.ingest(wire.items);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+    try std.testing.expect(session.streams.contains(1));
+    // One byte more is a flow-control error for the stream.
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, 1);
+    try session.ingest(wire.items);
+    try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
+    try std.testing.expect(session.terminal == .none);
+}
+
 test "owed window credit: DATA is held to what the peer was told, and a stream's owed credit goes with the stream (t-3562)" {
     const gpa = std.testing.allocator;
     var session = try Session.init(gpa, gpa, .defaults);
