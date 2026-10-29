@@ -1630,6 +1630,7 @@ fn runAbortAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const dwelling_0 = conn_mod.test_detach_dwelling.load(.acquire);
     const saw_0 = conn_mod.test_abort_saw_pump_shut.load(.acquire);
     const shuts_0 = conn_mod.test_tls_pump_shuts.load(.acquire);
+    const in_window_0 = conn_mod.test_abort_began_in_window.load(.acquire);
     var c: Client = .{
         .gpa = gpa,
         .transport = .tls,
@@ -1655,8 +1656,12 @@ fn runAbortAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     joinClient(&c, t);
     joined = true;
     if (c.err) |e| return e;
-    // The instrument fired: the actor shut the pump while the test ran.
+    // The instrument fired: the actor shut the pump while the test ran, and
+    // the handler's lock section began in the window this is about (the
+    // actor out of its loop, the pump still attached). A run that took the
+    // lock only after the detach proves nothing, and fails here.
     try std.testing.expect(conn_mod.test_tls_pump_shuts.load(.acquire) > shuts_0);
+    try std.testing.expectEqual(in_window_0 + 1, conn_mod.test_abort_began_in_window.load(.acquire));
     try std.testing.expectEqual(saw_0, conn_mod.test_abort_saw_pump_shut.load(.acquire));
     server.requestShutdown();
     serve_handle.join() catch {};

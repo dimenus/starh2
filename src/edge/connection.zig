@@ -374,6 +374,12 @@ pub var test_abort_saw_pump_shut: test_hook.Hook(std.atomic.Value(usize)) = if (
 pub var test_tls_pump_shuts: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 pub var test_detach_dwell_ms: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
 pub var test_detach_dwelling: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Set while the actor waits out `test_detach_dwell_ms`, and counts (in
+/// `test_abort_began_in_window`) an `abortCb` lock section that began with
+/// the TLS pump attached while it was set: the proof that the test entered
+/// the window it is about, and did not take the lock only after the detach.
+pub var test_detach_in_dwell: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_abort_began_in_window: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 pub var test_hold_stash_entered: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
@@ -4256,8 +4262,10 @@ pub const Connection = struct {
                 if (comptime test_observe) {
                     const dwell = test_detach_dwell_ms.load(.acquire);
                     if (dwell != 0) {
+                        test_detach_in_dwell.store(true, .release);
                         _ = test_detach_dwelling.fetchAdd(1, .acq_rel);
                         io.sleep(.fromMilliseconds(dwell), .awake) catch {};
+                        test_detach_in_dwell.store(false, .release);
                     }
                 }
                 self.detachTlsPump();
@@ -9264,6 +9272,7 @@ pub const Connection = struct {
             const dwell = test_abort_dwell_ms.load(.acquire);
             if (dwell != 0) {
                 const attached = self.tls_driver != null;
+                if (attached and test_detach_in_dwell.load(.acquire)) _ = test_abort_began_in_window.fetchAdd(1, .acq_rel);
                 const shuts_0 = test_tls_pump_shuts.load(.acquire);
                 self.config.io.sleep(.fromMilliseconds(dwell), .awake) catch {};
                 if (attached and test_tls_pump_shuts.load(.acquire) != shuts_0) _ = test_abort_saw_pump_shut.fetchAdd(1, .acq_rel);
