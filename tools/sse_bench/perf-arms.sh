@@ -1,5 +1,5 @@
 #!/bin/sh
-# Where the CPU goes, per arm, on the conns50 oneshot shape (Linux + perf).
+# Where the CPU goes, per arm, on a oneshot or an SSE shape (Linux + perf).
 #
 # The harness rows say starh2 spends about 1.8x the CPU of hyper for the
 # same rps on the h2load shape (tools/sse_bench/mixed.sh CONNS=50). This
@@ -9,6 +9,14 @@
 # thread of the process, and the top symbols by self time. Kernel samples
 # need perf_event_paranoid <= 1 or root; the script uses sudo for perf
 # only, and refuses to run when sudo needs a password.
+#
+# SHAPE=oneshot (default) is the conns50 oneshot shape above. SHAPE=sse
+# opens STREAMS (default 200) SSE streams over CONNS (default 1) and the
+# servers send one event per INTERVAL ms (default 10) on each; the per-unit
+# lines then divide by delivered events instead of requests. The perf
+# window also covers stream opening and warmup, and the client counts only
+# the measurement window, so per-unit numbers read a little high; the bias
+# is the same for every arm.
 #
 # ARMS="starh2 hyper" (default) picks the servers. OPPONENT_WIDTH applies
 # as in run.sh/mixed.sh: the opponent is pinned to starh2's executor
@@ -20,7 +28,14 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 . "$REPO/tools/bench_lock.sh"
 . "$REPO/tools/sse_bench/hyper_build.sh"
 . "$REPO/tools/sse_bench/arm_width.sh"
-CONNS=${CONNS:-50}
+SHAPE=${SHAPE:-oneshot}
+case $SHAPE in
+  oneshot) CONNS=${CONNS:-50} ;;
+  sse) CONNS=${CONNS:-1} ;;
+  *) echo "SHAPE must be oneshot or sse, not $SHAPE" >&2; exit 2 ;;
+esac
+STREAMS=${STREAMS:-200}
+INTERVAL=${INTERVAL:-10}
 ONESHOT_WORKERS=${ONESHOT_WORKERS:-500}
 SECONDS_RUN=${SECONDS_RUN:-5}
 WARMUP=${WARMUP:-1}
@@ -96,8 +111,14 @@ measure() {
   sudo perf stat -x, -e "$SYSCALL_EVENTS" -p "$pid" -o "$OUT/$arm.stat.csv" >/dev/null 2>&1 &
   stat_pid=$!
   sleep 0.5
-  "$OUT/sse-client" -streams 0 -conns "$CONNS" -oneshot-url "https://127.0.0.1:$port/" \
-    -oneshot-workers "$ONESHOT_WORKERS" -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$arm" | tee "$OUT/$arm.client.txt" | sed 's/^/  /'
+  case $SHAPE in
+    oneshot)
+      "$OUT/sse-client" -streams 0 -conns "$CONNS" -oneshot-url "https://127.0.0.1:$port/" \
+        -oneshot-workers "$ONESHOT_WORKERS" -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$arm" | tee "$OUT/$arm.client.txt" | sed 's/^/  /' ;;
+    sse)
+      "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams "$STREAMS" -conns "$CONNS" \
+        -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$arm" | tee "$OUT/$arm.client.txt" | sed 's/^/  /' ;;
+  esac
   sudo kill -INT "$perf_pid" 2>/dev/null
   sudo kill -INT "$stat_pid" 2>/dev/null
   wait "$perf_pid" 2>/dev/null
@@ -119,13 +140,23 @@ measure() {
   echo "  $arm by dso:"; sed 's/^/    /' "$OUT/$arm.dso.txt"
   echo "  $arm top symbols (self):"; head -30 "$OUT/$arm.report.txt" | cut -c1-160 | sed 's/^/    /'
   echo "  $arm top kernel symbols:"; head -15 "$OUT/$arm.kernel.txt" | cut -c1-120 | sed 's/^/    /'
-  # perf stat -x, rows: count,unit,event,...; requests = the client's ok count.
-  reqs=$(grep -m1 'oneshot ok=' "$OUT/$arm.client.txt" 2>/dev/null | sed 's/.*ok=\([0-9]*\).*/\1/')
-  echo "  $arm syscalls per request (window, ok=$reqs):"
+  # perf stat -x, rows: count,unit,event,...; units = the client's ok count
+  # (oneshot) or delivered events (sse).
+  case $SHAPE in
+    oneshot) unit=req; units=$(grep -m1 'oneshot ok=' "$OUT/$arm.client.txt" 2>/dev/null | sed 's/.*ok=\([0-9]*\).*/\1/') ;;
+    sse) unit=event; units=$(grep -m1 ' streams=.* events=' "$OUT/$arm.client.txt" 2>/dev/null | sed 's/.*events=\([0-9]*\).*/\1/') ;;
+  esac
+  if [ -z "$units" ] || [ "$units" -eq 0 ]; then
+    echo "$arm: the client reported no $unit count — refusing to report per-$unit numbers" >&2
+    return 1
+  fi
+  awk -v hz="$hz" -v n="$units" -v unit="$unit" '{
+    printf "    per %s: CPU=%.2fus voluntary ctxt=%.3f\n", unit, (($3 - $1) + ($4 - $2)) / hz * 1e6 / n, ($7 - $5) / n }' "$OUT/$arm.raw.txt"
+  echo "  $arm syscalls per $unit (window, $unit count=$units):"
   sudo chown "$(id -u)" "$OUT/$arm.stat.csv" 2>/dev/null
-  awk -F, -v reqs="${reqs:-0}" '$1 ~ /^[0-9]+$/ && reqs > 0 {
+  awk -F, -v n="$units" -v unit="$unit" '$1 ~ /^[0-9]+$/ {
     name = $3; sub(/^syscalls:sys_enter_/, "", name)
-    printf "    %-16s %10d  %6.3f/req\n", name, $1, $1 / reqs }' "$OUT/$arm.stat.csv"
+    printf "    %-16s %10d  %6.3f/%s\n", name, $1, $1 / n, unit }' "$OUT/$arm.stat.csv"
 }
 
 bench_lock
@@ -134,12 +165,15 @@ cleanup() { kill $PIDS 2>/dev/null; wait 2>/dev/null; bench_unlock; }
 trap cleanup EXIT INT TERM
 
 # STARH2_EXTRA_ARGS passes any further bench-server flags (A/B knobs).
-"$STARH2" --mode tls --port 19460 --sse-interval-ms 10 $EXECUTOR_ARGS ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
+"$STARH2" --mode tls --port 19460 --sse-interval-ms "$INTERVAL" $EXECUTOR_ARGS ${STARH2_EXTRA_ARGS:-} > "$OUT/starh2.log" 2>&1 &
 S_PID=$!; PIDS="$S_PID"
 STARH2_WIDTH=$(starh2_width "$OUT/starh2.log") || exit 1
 WIDTH=$(opponent_width "$STARH2_WIDTH")
 PIN=$(width_env "$WIDTH")
-echo "== perf-arms: $CONNS conns, $ONESHOT_WORKERS workers, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g"
+case $SHAPE in
+  oneshot) echo "== perf-arms: oneshot, $CONNS conns, $ONESHOT_WORKERS workers, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g" ;;
+  sse) echo "== perf-arms: sse, $STREAMS streams over $CONNS conns, one event per ${INTERVAL}ms per stream, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g" ;;
+esac
 echo "== starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH) zio-scheduling=$STARH2_ZIO_SCHEDULING extra=[${STARH2_EXTRA_ARGS:-}]  opponents width=$WIDTH  arms: $ARMS"
 echo "== starh2 ready: $(grep -m1 ready "$OUT/starh2.log")"
 
@@ -148,7 +182,7 @@ for arm in $ARMS; do
   case $arm in
     starh2) measure starh2 "$S_PID" 19460 || exit 1 ;;
     hyper)
-      $PIN "$HYPER" -port 19461 -sse-interval-ms 10 -cert testdata/cert.pem -key testdata/key.pem > "$OUT/hyper.log" 2>&1 &
+      $PIN "$HYPER" -port 19461 -sse-interval-ms "$INTERVAL" -cert testdata/cert.pem -key testdata/key.pem > "$OUT/hyper.log" 2>&1 &
       H_PID=$!; PIDS="$PIDS $H_PID"
       check_widths_one=$(json_int "$(wait_ready "$OUT/hyper.log")" width)
       if [ "$WIDTH" != default ] && [ "$check_widths_one" != "$WIDTH" ]; then
