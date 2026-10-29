@@ -781,3 +781,66 @@ single read (it must still pass when the timing is kind, so say how you
 showed the wait matters); 41, item 3's code carried as INTERNAL_ERROR again
 (if item 3 is real); 42, my survivor (the `pending_read` guard in
 `eofReady` removed).
+
+## Round 8 (review of 64a3527; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at 64a3527: Linux on nachos (a fresh `git archive`
+tree): the full suite passed 722 of 722 twice, the second on a clean cache;
+`t3562` 30/30 alone and 30/30 three at a time. Mac, on a clean cache: the
+full suite passed (719 of 722, 3 skipped); ci fails only on the libcxx
+probes; smoke, ReleaseFast, observe ReleaseFast and session-mu-gate pass;
+`t3562` 30/30 alone and 30/30 three at a time.
+
+Mutation 42 (my round 6 survivor) is now caught on both systems: on Linux the
+full suite fails the frame-then-close_notify test and the h2 oracle, and the
+mutated `t3562` binary failed 10 of 10; the Mac full suite fails the same two
+tests.
+
+**My new mutation survived on both systems:** in `Session.applyCommand`,
+`.respond_headers` passing `.refused_stream` instead of `.internal_error` to
+`cmdHeaders` (so a status a handler sends resets with REFUSED_STREAM when the
+edge refuses it) passes the whole suite: Mac 719 of 722 (3 skipped), Linux 722
+of 722, nothing cached. Both reviewers found the same gap by reading.
+
+Neither reviewer found a production defect in round 7. Ryan decided this
+round: three test-only items, each a new commit on top of 64a3527. **No
+production code changes**, except a test-only counter or hook if an item
+needs one (compiled out of release builds, like the existing `test_*`
+counters). The earlier rules still apply, and Linux remains a required gate.
+
+1. **A handler's own 503 refused at the edge must reset with INTERNAL_ERROR
+   (the survivor; both reviewers).** Add a case beside the four
+   `expectDispatchRefusalReset` cases in `src/edge/connection.zig`: a route
+   whose handler runs (prove it ran, for example a counter it bumps) and
+   answers 503 with END_STREAM and no body, while the ordinary share is
+   pinned the same way as `.share_full`. Assert exactly one RST on that
+   stream, code INTERNAL_ERROR, and no GOAWAY. It must fail under mutation 43
+   below.
+2. **The item 4 test reaches the guarded path by a 50 ms sleep (both
+   reviewers).** In the frame-then-close_notify test
+   (`tests/t3562_terminal_bound.zig`, the `zio.sleep(.fromMilliseconds(50))`
+   before `c.send_notify`), wait instead on `conn_mod.test_actors_in_select`
+   reaching at least 1 (as `tests/t3567_tls_barriers.zig` does), then send.
+   Say in the commit what that counter proves and what it does not (for
+   example, whether the actor can leave the select before the client's write
+   lands). Mutation 42 must still fail it: run the mutated `t3562` binary 10
+   times on Linux and 3 times on the Mac and report the counts.
+3. **The item 1 test does not prove the close_notify came in the leftover
+   (astra).** `test_tls_leftover_connections` counts a connection with any
+   leftover, so a TCP split that delivers the PING in the handshake read and
+   the close_notify on the pump's first recv passes the test with the
+   `Pump.start` fix removed. Make the test assert that the close itself was
+   found at pump start (for example a test counter bumped in `Pump.start`'s
+   `peer_closed` branch). If that precondition is not met, the test must
+   FAIL with a message that says so, never pass silently. Report how often
+   the precondition held in the 30-run gates.
+
+Mutations for this round (add to the report's table): 43, `.respond_headers`
+passing `.refused_stream` (mine, above); 44, item 2's wait replaced by the old
+50 ms sleep (a test edit: say what shows the wait matters); 45, the
+`Pump.start` `peer_closed` branch removed (mutation 39 again, against item 3's
+stronger test).
+
+Do not tell me the tests pass; I recompute. Report as before in
+`tools/t3562-report.md` (replace the round 7 report), then print exactly one
+line: `STATUS: done t62i /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.
