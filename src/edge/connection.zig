@@ -418,6 +418,9 @@ pub var test_no_request_lease: test_hook.Hook(std.atomic.Value(bool)) = if (test
 /// Test-only: when true, the allocations that build a handler job fail as if
 /// the request's memory had run out, so dispatch takes its refusal path.
 pub var test_fail_dispatch_alloc: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+/// Test-only, with `test_fail_dispatch_alloc`: the request ran out of its own
+/// memory (`request_pool.Reason.request_cap`, a 500), not the server's (a 503).
+pub var test_fail_dispatch_request_cap: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: delay write pump by N ms.
 pub var test_write_delay_ms: test_hook.Hook(u64) = if (test_hook.on) 0 else {};
 /// Test-only: fail write pump after N successful writes (0 = never).
@@ -7584,8 +7587,13 @@ pub const Connection = struct {
             // slabs are spent): reset the stream instead, so the peer is not
             // left waiting for an answer, as `Session.emitEarlyReject` does.
             // An RST takes its frame from the terminal store, which always
-            // has room for one per stream (`Limits.terminalFrames`).
-            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .internal_error } }) catch {};
+            // has room for one per stream (`Limits.terminalFrames`). The code
+            // says what the status would have: a 503 (the server's or the
+            // connection's memory) is safe to retry, which REFUSED_STREAM
+            // tells the client (RFC 9113 section 8.7); a 500 (the request's
+            // own cap) is not.
+            const code: frame.ErrorCode = if (status == 503) .refused_stream else .internal_error;
+            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = code } }) catch {};
         };
         std.debug.assert(self.releaseSlot(d.stream_id));
         return true;
@@ -7658,7 +7666,10 @@ pub const Connection = struct {
         // stream, never a connection error: the request is refused (500 when
         // it hit its own cap, 503 for the others) and its memory goes back.
         if (comptime test_observe) {
-            if (test_fail_dispatch_alloc.load(.acquire)) return self.refuseDispatchForMemory(d, lease);
+            if (test_fail_dispatch_alloc.load(.acquire)) {
+                if (test_fail_dispatch_request_cap.load(.acquire)) lease.arena.refusal = .request_cap;
+                return self.refuseDispatchForMemory(d, lease);
+            }
         }
         const headers = a.alloc(request.Header, d.headers.len) catch return self.refuseDispatchForMemory(d, lease);
         for (d.headers, 0..) |h, i| headers[i] = .{ .name = h.name, .value = h.value };
@@ -10625,6 +10636,8 @@ fn trapIngest(conn: *Connection, bytes: []const u8) !void {
 const TrapWire = struct {
     rst_per_sid: std.AutoHashMap(u31, usize),
     rst: usize = 0,
+    /// The error code of the last RST_STREAM read.
+    rst_code: u32 = 0,
     goaway_codes: [4]u32 = @splat(0),
     goaways: usize = 0,
     settings_acks: usize = 0,
@@ -10657,6 +10670,7 @@ fn trapCollect(trap: *TrapHop, out: *TrapWire) !void {
                 switch (h.type) {
                     .rst_stream => {
                         out.rst += 1;
+                        out.rst_code = std.mem.readInt(u32, body[0..4], .big);
                         const e = try out.rst_per_sid.getOrPutValue(h.stream_id, 0);
                         e.value_ptr.* += 1;
                     },
@@ -11069,7 +11083,7 @@ test "an early 413 with no frame for its response resets the stream instead of f
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
 }
 
-test "a request refused for want of job memory, with no frame for its response, is reset instead of left open (t-3562)" {
+fn expectDispatchRefusalReset(request_cap: bool, want: frame.ErrorCode) !void {
     const gpa = std.testing.allocator;
     const routes = [_]router_mod.Route{.{
         .method = .GET,
@@ -11084,6 +11098,8 @@ test "a request refused for want of job memory, with no frame for its response, 
     // The job cannot be built, and the refusal's HEADERS finds no frame.
     test_fail_dispatch_alloc.store(true, .release);
     defer test_fail_dispatch_alloc.store(false, .release);
+    test_fail_dispatch_request_cap.store(request_cap, .release);
+    defer test_fail_dispatch_request_cap.store(false, .release);
     conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
     var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
     try trapIngest(conn, hopRequestFrame(&req, 1));
@@ -11093,9 +11109,19 @@ test "a request refused for want of job memory, with no frame for its response, 
     defer seen.deinit();
     try trapCollect(&trap, &seen);
     // The stream still ends for the peer: one RST, as an early reject's
-    // does when its response finds no frame (`emitEarlyReject`).
+    // does when its response finds no frame (`emitEarlyReject`), with the
+    // code its refusal would have meant.
     try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(u32, @backingInt(want)), seen.rst_code);
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "a request refused for want of job memory, with no frame for its response, is reset instead of left open: a 503 (server's memory) with REFUSED_STREAM (t-3562)" {
+    try expectDispatchRefusalReset(false, .refused_stream);
+}
+
+test "a request refused for want of job memory, with no frame for its response, is reset instead of left open: a 500 (its own cap) with INTERNAL_ERROR (t-3562)" {
+    try expectDispatchRefusalReset(true, .internal_error);
 }
 
 test "an error exit from ingest materializes what the read queued before the unlock (t-3562)" {
