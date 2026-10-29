@@ -14,9 +14,13 @@
 //!   server ended it (END_STREAM or RST_STREAM);
 //! - at most one RST_STREAM per stream, and none for a stream the client
 //!   never opened;
+//! - a header block is whole: a HEADERS without END_HEADERS is followed by
+//!   CONTINUATIONs on the same stream with no other frame between, up to
+//!   one with END_HEADERS, and its END_STREAM ends the stream only then;
 //! - a PING ack carries a payload the client sent, a SETTINGS ack answers a
 //!   SETTINGS the client sent.
 //! Checked when the server closes (the client read its EOF):
+//! - no header block was left open;
 //! - a GOAWAY came first, and the server did not reset the connection;
 //! - on TLS, close_notify came first;
 //! - after a final GOAWAY with NO_ERROR (a graceful end): every stream the
@@ -55,6 +59,13 @@ const StreamView = struct {
     server_rsts: u8 = 0,
 };
 
+/// A header block the server began and has not ended (no END_HEADERS yet).
+const OpenBlock = struct {
+    sid: u31,
+    /// The HEADERS carried END_STREAM: the stream ends with the block.
+    end_stream: bool,
+};
+
 const Pending = struct {
     payload: [8]u8 = @splat(0),
     /// Sent before the client read any GOAWAY: then it is owed.
@@ -84,6 +95,12 @@ pub const Oracle = struct {
     /// Set by a test whose client stops reading on purpose, so delivery at
     /// the end cannot be owed (`waive`); the reason is printed.
     waived: ?[]const u8 = null,
+    block: ?OpenBlock = null,
+    /// Violations this connection found. The oracle's own tests read it;
+    /// they set `global` false, so the violations they cause on purpose do
+    /// not fail the binary (`expectNoViolations`).
+    found: usize = 0,
+    global: bool = true,
 
     pub fn init(gpa: std.mem.Allocator, tls: bool) Oracle {
         return .{ .gpa = gpa, .tls = tls };
@@ -97,7 +114,8 @@ pub const Oracle = struct {
     }
 
     fn violation(self: *Oracle, comptime fmt: []const u8, args: anytype) void {
-        _ = self;
+        self.found += 1;
+        if (!self.global) return;
         _ = violations.fetchAdd(1, .acq_rel);
         std.debug.print("H2ORACLE: " ++ fmt ++ "\n", args);
     }
@@ -147,6 +165,17 @@ pub const Oracle = struct {
     pub fn onFrame(self: *Oracle, ftype: u8, flags: u8, sid: u32, payload: []const u8) void {
         self.any_frame = true;
         const id: u31 = @intCast(sid & 0x7fff_ffff);
+        if (self.block) |b| {
+            // Inside a header block only its CONTINUATIONs may come.
+            if (ftype != 9 or id != b.sid) {
+                self.violation("frame type {d} on stream {d} inside the open header block of stream {d}", .{ ftype, id, b.sid });
+                self.block = null;
+                if (ftype == 9) return;
+            }
+        } else if (ftype == 9) {
+            self.violation("a CONTINUATION on stream {d} with no header block open", .{id});
+            return;
+        }
         switch (ftype) {
             0, 1 => {
                 const s = self.streams.getPtr(id) orelse {
@@ -154,7 +183,20 @@ pub const Oracle = struct {
                     return;
                 };
                 if (s.server_end or s.server_rsts != 0) self.violation("{s} on stream {d} after the server ended it", .{ if (ftype == 0) "DATA" else "HEADERS", id });
-                if (flags & 1 != 0) s.server_end = true;
+                // END_HEADERS (0x4) missing: the block goes on in
+                // CONTINUATIONs, and END_STREAM takes effect at its end.
+                if (ftype == 1 and flags & 0x4 == 0) {
+                    self.block = .{ .sid = id, .end_stream = flags & 1 != 0 };
+                } else if (flags & 1 != 0) {
+                    s.server_end = true;
+                }
+            },
+            9 => if (flags & 0x4 != 0) {
+                const b = self.block.?;
+                self.block = null;
+                if (b.end_stream) {
+                    if (self.streams.getPtr(b.sid)) |s| s.server_end = true;
+                }
             },
             3 => {
                 const s = self.streams.getPtr(id) orelse {
@@ -204,6 +246,7 @@ pub const Oracle = struct {
             return;
         }
         if (!self.any_frame) return;
+        if (self.block) |b| self.violation("the connection ended inside the header block of stream {d}", .{b.sid});
         if (how == .reset) self.violation("the server reset the connection (the client may have lost unread frames)", .{});
         if (!self.goaway_seen) {
             self.violation("the server closed without a GOAWAY", .{});
@@ -226,3 +269,55 @@ pub const Oracle = struct {
         }
     }
 };
+
+fn testOracle() Oracle {
+    var o = Oracle.init(std.testing.allocator, false);
+    o.global = false;
+    // The client opened streams 1 and 3.
+    var hdr: [frame_header_len]u8 = .{ 0, 0, 0, 1, 0x5, 0, 0, 0, 1 };
+    o.onSend("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    o.onSend(&hdr);
+    hdr[8] = 3;
+    o.onSend(&hdr);
+    return o;
+}
+
+test "oracle: a HEADERS with END_STREAM but no END_HEADERS ends its stream at the last CONTINUATION" {
+    var o = testOracle();
+    defer o.deinit();
+    o.onFrame(1, 0x1, 1, "");
+    try std.testing.expect(!o.streams.get(1).?.server_end);
+    o.onFrame(9, 0x0, 1, "");
+    o.onFrame(9, 0x4, 1, "");
+    try std.testing.expect(o.streams.get(1).?.server_end);
+    try std.testing.expectEqual(@as(usize, 0), o.found);
+}
+
+test "oracle: a frame between a header block's fragments is a violation" {
+    var o = testOracle();
+    defer o.deinit();
+    o.onFrame(1, 0x0, 1, "");
+    o.onFrame(0, 0x0, 3, "x");
+    try std.testing.expectEqual(@as(usize, 1), o.found);
+}
+
+test "oracle: a CONTINUATION on another stream, or with no block open, is a violation" {
+    var o = testOracle();
+    defer o.deinit();
+    o.onFrame(1, 0x0, 1, "");
+    o.onFrame(9, 0x4, 3, "");
+    try std.testing.expectEqual(@as(usize, 1), o.found);
+    o.onFrame(9, 0x4, 1, "");
+    try std.testing.expectEqual(@as(usize, 2), o.found);
+}
+
+test "oracle: the connection ending inside a header block is a violation" {
+    var o = testOracle();
+    defer o.deinit();
+    // A graceful GOAWAY naming no stream: no stream is owed an end, so the
+    // open block is the only thing that can be wrong.
+    o.onFrame(7, 0x0, 0, &(.{ 0, 0, 0, 0 } ++ .{ 0, 0, 0, 0 }));
+    o.onFrame(1, 0x0, 1, "");
+    o.onEnd(.eof);
+    try std.testing.expectEqual(@as(usize, 1), o.found);
+}
