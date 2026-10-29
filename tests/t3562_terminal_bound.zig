@@ -1737,20 +1737,28 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     defer if (!joined) joinClient(&c, t);
 
     // The exchange first (the server answered a PING sent after its
-    // SETTINGS), then a moment for the actor to park. The PING and the
+    // SETTINGS), then the actor parked in its select. The PING and the
     // close_notify then arrive through the recv completion the parked actor
-    // takes in its select: the pump decrypts both there (`ingestCipher`,
+    // takes in that select: the pump decrypts both there (`ingestCipher`,
     // `readOne`), and the PING's plaintext is still pending when the EOF is
     // posted. Sent while the actor was still busy with the preface, they
     // were taken at the top of a turn instead, which reads the plaintext
     // first, and that path could not show the EOF taken too early.
+    //
+    // `test_actors_in_select` is raised just before the actor calls
+    // `zio.select` and lowered when it returns, and this test has one
+    // connection: above zero means the actor reached its select with
+    // nothing left to do. It does not prove the actor stays there until the
+    // client's write lands; a timer, a doorbell or a send completion would
+    // take it out first. This connection has none of those once its PING is
+    // answered (no handler, no deadline, nothing being written).
     c.send_alive.store(true, .release);
     try waitFor("the PING ack", &c, struct {
         fn f(x: *Client) bool {
             return x.ping_acked.load(.acquire);
         }
     }.f);
-    zio.sleep(.fromMilliseconds(50)) catch {};
+    try waitFor("the actor to park in its select", atLeast(&conn_mod.test_actors_in_select, 1), reached);
     c.send_notify.store(true, .release);
     try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
     joinClient(&c, t);
