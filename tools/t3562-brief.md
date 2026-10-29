@@ -713,3 +713,71 @@ of an unreported `peer_closed` removed; 36, item 2's ordering reverted
 (release lowers `held` before the refill); 37, item 5's drop of bytes after
 close_notify removed; 38, item 6 always INTERNAL_ERROR; and 2d again,
 against item 3's stronger test.
+
+## Round 7 (review of 2b9a2c2; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at 2b9a2c2: Linux on nachos (a fresh `git archive`
+tree): the full suite passed 719 of 719 twice, the second on a clean cache;
+`t3562` 30/30 alone and **29/30 three at a time**. Mac, on a clean cache:
+the full suite **failed 1 test** (715 of 719); ci fails only on the libcxx
+probes; smoke, ReleaseFast, observe ReleaseFast and session-mu-gate pass;
+`t3562` 30/30 alone and 30/30 three at a time. Both failures were the same
+test, `a handler's lock section after the loop ends never overlaps the TLS
+pump's shutdown (tls)`, with `TestUnexpectedResult` from
+`runAbortAtTeardown` and no timeout message (item 2 below).
+
+**My mutation survived:** in `Pump.eofReady`, dropping the pending-plaintext
+guard (`if (!self.inbound_eof) return false;` instead of
+`if (!self.inbound_eof or self.pending_read != null) return false;`) passes
+the whole suite (716 of 719, nothing cached). Your round 6 report says the
+rule is needed (the closing phase drops frames read after the EOF is taken),
+but no test shows it.
+
+Ryan decided this round: fix items 1 to 4, each as a new commit on top of
+2b9a2c2, each with a test that fails on 2b9a2c2 first (say in the commit how
+it failed). The earlier rules still apply, and Linux remains a required gate.
+
+1. **A close_notify consumed in the post-handshake drain is never posted
+   (medium; both reviewers, independently).** `Server` calls
+   `tls_conn.drainLeftoverPlain(&leftover_buf)` (src/edge/server.zig), which
+   runs `decryptInto` and can set `peer_closed` from a close_notify pipelined
+   behind the client's Finished and first frames. `Pump.start` then sets
+   `inbound_eof = false` and never reads `conn.peer_closed`;
+   `pendingInbound()` is false, so `readOne` never reports it. A client that
+   pipelines [Finished][preface][frames][close_notify] and leaves TCP open
+   holds the connection with no deadline. This is round 6 item 1's class at
+   `decryptInto`'s second caller. Fix so a `peer_closed` already set when the
+   pump starts is reported, after the leftover is ingested. Test: a TLS
+   client whose Finished flight carries its preface, a PING and its
+   close_notify, TCP left open; the server takes the EOF, answers the PING,
+   sends its GOAWAY and close_notify, and closes well before any deadline.
+2. **The teardown test reads the pump-shutdown counter once (flake; astra;
+   seen failing 2 times in my runs).** `runAbortAtTeardown` waits for
+   `aborter_done`, joins the client, then checks
+   `test_tls_pump_shuts > shuts_0` once. The actor increments that counter
+   only after it takes `session_mu`, which the handler holds until just
+   before `aborter_done` is set, and the client can already be done (the
+   server shut its send side before the dwell). Wait for the counter (with
+   the usual waitFor) instead of sampling it, and check the test still
+   catches mutation 2d and still fails when the window is missed. Then run
+   the `t3562` binary 30 times three at a time on both systems and report it.
+3. **A 503 refused later at admission still resets with INTERNAL_ERROR
+   (low; astra; not checked by me).** The claim: job construction hits the
+   server or connection cap, a frame buffer is available so the 503 HEADERS
+   is built, then the edge's ordinary share refuses it, and
+   `resetRefusedHeaders` queues `.internal_error`. Prove or disprove it by
+   reading and a test. If real, carry the refusal's reset code with that
+   response so a pre-dispatch 503 resets with REFUSED_STREAM on this path
+   too. Do not infer retry safety from a 503 a handler produced.
+4. **My survivor.** Make a test fail when `eofReady` ignores pending
+   plaintext: round 6 item 1's test sends a WINDOW_UPDATE ahead of the
+   close_notify, which the client cannot see dropped. Send a frame the
+   server must answer (a PING) ahead of it, so the oracle requires the ack.
+   Run my mutation against it and report.
+
+Mutations for this round (add to the report's table): 39, item 1's report of
+an already-closed peer at pump start removed; 40, item 2's wait reverted to a
+single read (it must still pass when the timing is kind, so say how you
+showed the wait matters); 41, item 3's code carried as INTERNAL_ERROR again
+(if item 3 is real); 42, my survivor (the `pending_read` guard in
+`eofReady` removed).
