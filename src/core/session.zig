@@ -1021,7 +1021,16 @@ pub const Session = struct {
     /// streams run on would hold the connection to that deadline for a
     /// result the peer may never be able to receive.
     pub fn peerClosed(self: *Session) !void {
-        // The ids first: a reset takes its stream out of the map.
+        for (self.openStreamIds()) |sid| try self.emitRst(sid, .cancel);
+        try self.failConnectionWith(.no_error, self.last_processed_stream);
+    }
+
+    /// The ids of the streams still open, copied out of the map, for a
+    /// caller that resets them: a reset takes its stream out of the map, and
+    /// any change to a map invalidates its live iterators (std.HashMap's
+    /// contract, whatever its tombstones do today). The slice is
+    /// `stale_ids`, valid until the next call.
+    pub fn openStreamIds(self: *Session) []const u31 {
         var n: usize = 0;
         var it = self.streams.iterator();
         while (it.next()) |e| {
@@ -1029,8 +1038,7 @@ pub const Session = struct {
             self.stale_ids[n] = e.key_ptr.*;
             n += 1;
         }
-        for (self.stale_ids[0..n]) |sid| try self.emitRst(sid, .cancel);
-        try self.failConnectionWith(.no_error, self.last_processed_stream);
+        return self.stale_ids[0..n];
     }
 
     fn failConnection(self: *Session, code: frame.ErrorCode) !void {

@@ -5609,13 +5609,11 @@ pub const Connection = struct {
     }
 
     fn finishGraceful(self: *Connection) !void {
-        // Reset any remaining streams with CANCEL.
-        var it = self.session.streams.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.state != .closed and e.value_ptr.state != .idle) {
-                // A stream may become terminal while the graceful sweep advances.
-                self.session.applyCommand(.{ .reset_stream = .{ .stream_id = e.key_ptr.*, .code = .cancel } }) catch {};
-            }
+        // Reset any remaining streams with CANCEL. The ids first: a reset
+        // takes its stream out of the map.
+        for (self.session.openStreamIds()) |sid| {
+            // A stream may become terminal while the graceful sweep advances.
+            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .cancel } }) catch {};
         }
         try self.processIntents();
     }
