@@ -1770,7 +1770,7 @@ pub const Session = struct {
             const p = self.settingsAckFrame() catch return;
             self.pushIntent(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
             o.settings_acks -= 1;
-            if (self.rate_limiter) |rl| rl.releaseAck(.settings);
+            if (self.rate_limiter) |rl| rl.releaseAck(.settings, self.edge_now_ns);
             left -= 1;
         }
         while (o.ping_len != 0 and self.owedRoom(left)) {
@@ -1778,7 +1778,7 @@ pub const Session = struct {
             self.pushIntent(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
             o.ping_head = (o.ping_head + 1) % o.pings.len;
             o.ping_len -= 1;
-            if (self.rate_limiter) |rl| rl.releaseAck(.ping);
+            if (self.rate_limiter) |rl| rl.releaseAck(.ping, self.edge_now_ns);
             left -= 1;
         }
         if (o.conn_window != 0 and self.owedRoom(left)) {
@@ -3713,6 +3713,50 @@ test "owed stream credit: DATA up to what the peer was told is taken, one byte m
     try session.ingest(wire.items);
     try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
     try std.testing.expect(session.terminal == .none);
+}
+
+test "an owed ack whose retry the edge refuses again keeps the limit: no token is refilled twice (t-3562)" {
+    const gpa = std.testing.allocator;
+    inline for (.{ frame.FrameType.ping, frame.FrameType.settings }) |typ| {
+        var session = try Session.init(gpa, gpa, .defaults);
+        defer session.deinit();
+        var rl: rates_mod.RateLimiter = .{};
+        session.rate_limiter = &rl;
+        session.edge_now_ns = 1;
+        try ingestPrefaceAndSettings(&session, gpa);
+        const burst = if (typ == .ping) rates_mod.PING_BURST else rates_mod.SETTINGS_BURST;
+        // Every token taken, every ack owed: the bucket is at its limit.
+        if (typ == .ping) {
+            try ingestPingsOwingAcks(&session, gpa, burst, 1);
+        } else {
+            // The preface's SETTINGS took one token and its ack was sent; owe
+            // the rest of the burst, then one more 100 ms later (the sent
+            // ack's token has refilled).
+            var now: u64 = 1;
+            for (0..burst) |i| {
+                if (i == burst - 1) now += 100 * std.time.ns_per_ms;
+                session.edge_now_ns = now;
+                var settings: [9]u8 = undefined;
+                const n = try frame.Serializer.settingsFrame(&settings, false, &.{});
+                try session.ingest(settings[0..n]);
+                try std.testing.expect(session.terminal == .none);
+                for (0..refuseQueuedAcks(gpa, &session, .settings)) |_| try session.oweSettingsAck();
+            }
+        }
+        try std.testing.expect(session.terminal == .none);
+        const owed = if (typ == .ping) session.owed.ping_len else session.owed.settings_acks;
+        try std.testing.expectEqual(burst, owed);
+        // 100 ms on, one owed ack is queued again and the edge refuses it
+        // again, so it is owed again.
+        const later = session.edge_now_ns + 100 * std.time.ns_per_ms;
+        session.edge_now_ns = later;
+        session.requeueOwed(1);
+        const retried = refuseQueuedAcks(gpa, &session, typ);
+        try std.testing.expectEqual(@as(usize, 1), retried);
+        if (typ == .ping) try session.owePingAck("in-limit".*) else try session.oweSettingsAck();
+        // Still `burst` owed, so the limit must not admit another.
+        try std.testing.expect(!rl.admit(typ, later));
+    }
 }
 
 test "owed window credit: DATA is held to what the peer was told, and a stream's owed credit goes with the stream (t-3562)" {

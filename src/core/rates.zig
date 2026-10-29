@@ -61,9 +61,15 @@ pub const TokenBucket = struct {
         self.held += 1.0;
     }
 
-    /// The owed work is done: its token refills again.
-    pub fn release(self: *TokenBucket) void {
+    /// The owed work is done: its token refills again. It refills up to
+    /// `now_ns` first, with the old `held`, the same rule as `hold`: the
+    /// work can be owed again at once (the edge refuses a retried ack), and
+    /// a hold at the same `now_ns` must then find no refill to pay twice.
+    /// Without it, the refill after a release and re-hold saw the lowered
+    /// count and gave one token too many.
+    pub fn release(self: *TokenBucket, now_ns: u64) void {
         std.debug.assert(self.held >= 1.0);
+        self.refill(now_ns);
         self.held -= 1.0;
     }
 };
@@ -151,10 +157,10 @@ pub const RateLimiter = struct {
     }
 
     /// An owed ack of `typ` was queued: its token refills again.
-    pub fn releaseAck(self: *RateLimiter, typ: frame.FrameType) void {
+    pub fn releaseAck(self: *RateLimiter, typ: frame.FrameType, now_ns: u64) void {
         switch (typ) {
-            .settings => self.settings.release(),
-            .ping => self.ping.release(),
+            .settings => self.settings.release(now_ns),
+            .ping => self.ping.release(now_ns),
             else => unreachable,
         }
     }
