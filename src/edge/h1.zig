@@ -1327,10 +1327,16 @@ fn abortCb(ctx: *anyopaque, _: u31) response.ResponseError!void {
     h.conn.want_close = true;
 }
 
+/// Sleeps to the deadline rounded up by `Limits.handler_deadline_slack_ns`,
+/// the same rule as the HTTP/2 path. A handler already past its own deadline
+/// returns at once.
 fn waitUntilCb(ctx: *anyopaque, _: u31, deadline: std.Io.Timestamp) response.ResponseError!void {
     const h: *Hctx = @ptrCast(@alignCast(ctx));
     if (h.terminal.getCause()) |c| return response.causeToError(c);
-    const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = deadline, .clock = .awake } };
+    const deadline_ns: u64 = @intCast(deadline.nanoseconds);
+    if (nowNs(h.conn.io) >= deadline_ns) return;
+    const armed: std.Io.Timestamp = .fromNanoseconds(h.conn.config.limits.handlerDeadlineNs(deadline_ns));
+    const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = armed, .clock = .awake } };
     timeout.sleep(h.conn.io) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
     };

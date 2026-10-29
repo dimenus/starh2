@@ -812,6 +812,9 @@ const Args = struct {
     /// `Limits.control_entries_per_connection`. The terminal control queue
     /// (GOAWAY, RST_STREAM) is an eighth of it, at least 16.
     control_entries_per_connection: ?usize = null,
+    /// `Limits.handler_deadline_slack_ns`, in microseconds. Null keeps exact
+    /// deadlines. Reported back in the ready line.
+    deadline_slack_us: ?u64 = null,
     /// `--close-reason`: see `connection.close_reason`.
     close_reason: bool = false,
 };
@@ -873,6 +876,8 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
             out.outbound_bytes_per_connection = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--control-entries-per-connection")) {
             out.control_entries_per_connection = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, a, "--deadline-slack-us")) {
+            out.deadline_slack_us = try std.fmt.parseInt(u64, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--self-drive-oneshots")) {
             const n = try std.fmt.parseInt(usize, args.next() orelse return error.MissingValue, 10);
             if (n == 0) return error.InvalidSelfDriveCount;
@@ -1563,6 +1568,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     if (args.request_pool_retain_bytes) |v| limits.request_pool_retain_bytes = v;
     if (args.outbound_bytes_per_connection) |v| limits.outbound_bytes_per_connection = v;
     if (args.control_entries_per_connection) |v| limits.control_entries_per_connection = v;
+    if (args.deadline_slack_us) |v| limits.handler_deadline_slack_ns = try std.math.mul(u64, v, std.time.ns_per_us);
 
     var server = try starh2.Server.init(server_gpa, rt.io(), .{
         .endpoints = &.{ep},
@@ -1586,7 +1592,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     const exec_n = rt.executors.items.len;
     const ready = try std.fmt.allocPrint(
         gpa,
-        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\",\"count_gpa\":{d},\"thp_disabled\":{d}}}\n",
+        "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\",\"count_gpa\":{d},\"thp_disabled\":{d},\"deadline_slack_ns\":{d}}}\n",
         .{
             if (args.tls) "tls" else "h2c",
             port,
@@ -1607,6 +1613,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
             @tagName(g_gpa_choice),
             @as(u8, @intFromBool(g_counting != null)),
             @as(u8, @intFromBool(g_thp_disabled)),
+            limits.handler_deadline_slack_ns,
         },
     );
     defer gpa.free(ready);

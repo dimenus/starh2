@@ -314,3 +314,124 @@ test "T3: terminal during waitUntil returns exact error and frees the heap" {
     }.f, .{ rt, gpa });
     try handle.join();
 }
+
+// T4: `Limits.handler_deadline_slack_ns`, through a real server on both the
+// HTTP/2 and the HTTP/1.1 wait paths. The grid math is written out here
+// again rather than calling `Limits.handlerDeadlineNs`, so the test does not
+// share the code it checks.
+const t4_slack_ns: u64 = 200 * std.time.ns_per_ms;
+const t4_token = "data: t4-done\n\n";
+
+/// 1: the first wait returned at or after the rounded deadline. 2: before it.
+var t4_woke: std.atomic.Value(u8) = .init(0);
+/// How long a wait on a deadline already past took.
+var t4_late_wait_ns: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+
+fn t4GridUp(ns: u64) u64 {
+    return ns + (t4_slack_ns - ns % t4_slack_ns) % t4_slack_ns;
+}
+
+fn t4NowNs(io: std.Io) u64 {
+    return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
+
+fn sseSlack(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.startSse(&.{});
+    const io = resp.io;
+    // 1 ms past a multiple, so an exact wait returns about 199 ms before the
+    // rounded one: the two cannot be confused.
+    const deadline = t4GridUp(t4NowNs(io) + 1) + std.time.ns_per_ms;
+    try body.waitUntil(.fromNanoseconds(@intCast(deadline)));
+    const woke = t4NowNs(io);
+    t4_woke.store(if (woke >= t4GridUp(deadline)) 1 else 2, .release);
+
+    // `woke` is just past a multiple, so a deadline 1 ns in the past rounds
+    // up to the NEXT multiple, nearly a whole slack away. Waiting for it
+    // would be the bug.
+    const before = t4NowNs(io);
+    try body.waitUntil(.fromNanoseconds(@intCast(before - 1)));
+    t4_late_wait_ns.store(t4NowNs(io) - before, .release);
+
+    try body.writeAll(t4_token);
+    try body.finish();
+}
+
+fn t4ReadUntilToken(stream: zio.net.Stream) !void {
+    var seen: [64 * 1024]u8 = undefined;
+    var len: usize = 0;
+    const t0 = zio.Timestamp.now(.monotonic).toNanoseconds();
+    while (zio.Timestamp.now(.monotonic).toNanoseconds() -% t0 < 3 * std.time.ns_per_s) {
+        if (len == seen.len) return error.ResponseTooLarge;
+        const n = stream.read(seen[len..], .{ .duration = .fromMilliseconds(20) }) catch |err| switch (err) {
+            error.Timeout => 0,
+            else => return err,
+        };
+        len += n;
+        if (std.mem.indexOf(u8, seen[0..len], "t4-done") != null) return;
+    }
+    return error.TokenMissing;
+}
+
+fn t4Check() !void {
+    try std.testing.expectEqual(@as(u8, 1), t4_woke.load(.acquire));
+    try std.testing.expect(t4_late_wait_ns.load(.acquire) < t4_slack_ns / 2);
+}
+
+test "T4: deadline slack rounds the wait up, and never holds back a late handler (h2c and h1c)" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .executors = .exact(2),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(struct {
+        fn f(runtime: *zio.Runtime, a: std.mem.Allocator) !void {
+            const routes = [_]starh2.Route{
+                .{ .method = .GET, .path = "/slack", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseSlack } } },
+            };
+            const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+            var limits = starh2.Limits.defaults;
+            limits.max_connections = 8;
+            limits.max_streams_per_connection = 128;
+            limits.max_streams_per_server = 256;
+            limits.cancellation_reaper_jobs = 256;
+            limits.handler_deadline_slack_ns = t4_slack_ns;
+            var server = try starh2.Server.init(a, runtime.io(), .{
+                .endpoints = &.{ .{ .h2c_prior_knowledge = addr }, .{ .h1c = addr } },
+                .routes = &routes,
+                .tls = null,
+                .limits = limits,
+            });
+            defer server.deinit(a);
+            var serve_handle = try runtime.spawn(starh2.Server.serve, .{ &server, a });
+            defer {
+                server.requestShutdown();
+                serve_handle.join() catch {};
+            }
+            try server.waitUntilListening(5 * std.time.ns_per_s);
+
+            {
+                t4_woke.store(0, .release);
+                t4_late_wait_ns.store(std.math.maxInt(u64), .release);
+                const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
+                var stream = try peer.connect(.{});
+                defer stream.close();
+                const hello = try h2c.buildClientHello(a, "/slack");
+                defer a.free(hello);
+                try writeAllStream(stream, hello);
+                try t4ReadUntilToken(stream);
+                try t4Check();
+            }
+            {
+                t4_woke.store(0, .release);
+                t4_late_wait_ns.store(std.math.maxInt(u64), .release);
+                const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(1).getPort());
+                var stream = try peer.connect(.{});
+                defer stream.close();
+                try writeAllStream(stream, "GET /slack HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+                try t4ReadUntilToken(stream);
+                try t4Check();
+            }
+        }
+    }.f, .{ rt, gpa });
+    try handle.join();
+}
