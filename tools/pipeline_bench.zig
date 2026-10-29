@@ -368,6 +368,7 @@ const ConnHopCtx = struct {
     gpa: std.mem.Allocator,
     peer: std.Io.net.Stream,
     slabs: starh2.edge.slab_pool.SlabPool,
+    requests: starh2.edge.request_pool.RequestPool,
     hop: starh2.edge.connection.BenchHop,
     wire: [frame.FRAME_HEADER_LEN + seed_request_block.len]u8 = undefined,
     next_stream_id: u31,
@@ -382,6 +383,10 @@ const ConnHopCtx = struct {
             8,
         );
         errdefer self.slabs.deinit(gpa);
+        // A connection takes every request's memory from this pool, as one
+        // built by `Server.init` does.
+        self.requests = try starh2.edge.request_pool.RequestPool.init(starh2.Limits.defaults.requestPoolConfig());
+        errdefer self.requests.deinit();
 
         const pair = try openLoopbackPair(io);
         errdefer pair.peer.close(io);
@@ -393,6 +398,7 @@ const ConnHopCtx = struct {
             .router = .{ .routes = &hop_routes },
             .gpa = gpa,
             .slab_pool = &self.slabs,
+            .request_pool = &self.requests,
         });
         errdefer self.hop.deinit();
 
@@ -404,6 +410,7 @@ const ConnHopCtx = struct {
     fn deinit(self: *ConnHopCtx) void {
         self.hop.deinit();
         self.peer.close(self.io);
+        self.requests.deinit();
         self.slabs.deinit(self.gpa);
     }
 

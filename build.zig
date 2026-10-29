@@ -1155,7 +1155,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&bench_run.step);
 
     // Local pipeline costs without sockets, contention, or a client.
-    // Deliberately ReleaseFast-only and not a CI gate.
+    // Its numbers are ReleaseFast-only and not a CI gate.
     const pipeline_bench_exe = b.addExecutable(.{
         .name = "pipeline-bench",
         .root_module = b.createModule(.{
@@ -1177,6 +1177,18 @@ pub fn build(b: *std.Build) void {
     pipeline_bench_run.stdio = .inherit;
     const pipeline_bench_step = b.step("bench-pipeline", "Isolated HPACK, frame parsing, and task lifecycle costs");
     pipeline_bench_step.dependOn(&pipeline_bench_run.step);
+    // `ci` compiles the bench, but a bench that compiles can still fail at
+    // setup. This run checks only that it exits 0; it reads no timing.
+    const pipeline_bench_smoke = b.addRunArtifact(pipeline_bench_exe);
+    pipeline_bench_smoke.addArgs(&.{ "-n", "1000", "--rounds", "3" });
+    pipeline_bench_smoke.setCwd(b.path("."));
+    pipeline_bench_smoke.has_side_effects = true;
+    pipeline_bench_smoke.expectExitCode(0);
+    // The report goes to stderr, and the build runner shows a checked run's
+    // stderr under "failed command" even when the run passed.
+    _ = pipeline_bench_smoke.captureStdErr(.{});
+    const pipeline_bench_smoke_step = b.step("bench-pipeline-smoke", "Run pipeline-bench once at a tiny size and fail if it does not exit 0");
+    pipeline_bench_smoke_step.dependOn(&pipeline_bench_smoke.step);
 
     // The std.Io gate. zio is the runtime; `std.Io` is the vtable it
     // implements, so `io: std.Io` is correct and is NOT what this bans. The
@@ -1221,6 +1233,7 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(&h1_smoke_run.step);
     ci_step.dependOn(&h1_go_smoke_run.step);
     ci_step.dependOn(&readme_doctest_run.step);
+    ci_step.dependOn(pipeline_bench_smoke_step);
     ci_step.dependOn(release_step);
 
     // Every artifact that `zig build <step>` or a plain `zig build` can
