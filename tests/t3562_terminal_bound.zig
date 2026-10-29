@@ -1676,7 +1676,10 @@ fn runAbortAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // the handler's lock section began in the window this is about (the
     // actor out of its loop, the pump still attached). A run that took the
     // lock only after the detach proves nothing, and fails here.
-    try std.testing.expect(conn_mod.test_tls_pump_shuts.load(.acquire) > shuts_0);
+    // The actor shuts the pump only once it has `session_mu`, which the
+    // handler holds until just before it returns: wait for it, do not read it
+    // once.
+    try waitFor("the actor to shut the TLS pump", atLeast(&conn_mod.test_tls_pump_shuts, shuts_0 + 1), reached);
     try std.testing.expectEqual(in_window_0 + 1, conn_mod.test_abort_began_in_window.load(.acquire));
     try std.testing.expectEqual(saw_0, conn_mod.test_abort_saw_pump_shut.load(.acquire));
     server.requestShutdown();
