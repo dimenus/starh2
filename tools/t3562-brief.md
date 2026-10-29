@@ -630,3 +630,86 @@ connection-credit subtraction removed (my survivor); 34, item 6's
 comparison done after the narrowing. For item 2, mutate the detach ordering
 if the structure still allows it; if the new shape makes the wrong order
 impossible to write, say so instead.
+
+## Round 6 (review of e676294; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at e676294: Mac gates pass on a clean cache (712 of 715,
+3 skipped, none cached; ci: only the libcxx probes fail; smoke, ReleaseFast,
+observe ReleaseFast and session-mu-gate pass). Linux on nachos (a fresh
+`git archive` tree): the full suite passed 715 of 715 twice, the second on a
+clean cache. The `t3562` binary passed 30/30 alone and 30/30 three at a time
+on BOTH systems. Every mutation in the report is caught, and so are mine: an
+owed PING ack that never releases its token (the PING owed-ack test), and a
+refill that ignores held tokens (both owed-ack tests).
+
+Ryan decided this round: fix the items below, including the pre-existing hot
+loop (item 5), each as a new commit on top of e676294, each with a test that
+fails on e676294 first (say in the commit how it failed), except the doc
+items. Do not reopen T = M + 3 or cancel-all on peer EOF. The earlier rules
+still apply, and Linux remains a required gate.
+
+1. **A close_notify decrypted with application data never posts EOF
+   (medium; astra; 6b's area).** `decryptInto` decrypts records until
+   `peer_closed`, so one call can return an application record's plaintext
+   AND set `peer_closed` from a close_notify behind it. `readOne` then
+   returns `.ok` with `n > 0` and does not call `postEof`. `pendingInbound()`
+   is only "a complete record is buffered", so nothing calls `readOne` again
+   to report the close. A peer that sends a frame and close_notify in one
+   flight, then waits for the server's close_notify without closing TCP,
+   holds the connection with no deadline. Fix so that a `peer_closed` the
+   pump has not reported is always reported, after the plaintext before it is
+   ingested. Test: TLS, the peer sends a frame and close_notify coalesced in
+   one write, and does NOT close TCP; the server must take the EOF, send its
+   GOAWAY and close_notify, and close.
+2. **A refused owed-ack retry over-refills the bucket (low; astra; item 4
+   of round 5).** `requeueOwed` releases a hold, the edge then refuses the
+   retried ack (entries free but bytes not, since `ordinaryFree()` counts
+   entries only), and the re-owe calls `hold(now)`, which refills with the
+   lowered `held` first. Example from the review: 100 owed, `tokens = 0`;
+   100 ms later one retry is refused and re-held; the refill with
+   `held = 99` makes one token, then `held` is 100 again, so
+   `tokens + held = 101` and a PING is admitted with the ring full. Fix so
+   `tokens + held <= capacity` holds across release and re-hold (for
+   example, refill to the release time before lowering `held`, or keep the
+   hold until the retry is accepted). Test the refused-retry path, for PING
+   and SETTINGS.
+3. **The item 2 test can pass without entering its race (medium, test
+   validity; both reviewers).** `runAbortAtTeardown` asserts only that the
+   pump shut and that no section saw it shut while attached. If the handler
+   takes `session_mu` only after the detach, both assertions pass and the
+   test proves nothing. Add positive evidence that a lock section BEGAN with
+   the pump attached during the dwell (a counter at the hook), assert it
+   rose, and make a run that missed the window fail, not pass. Re-run
+   mutation 2d against it.
+4. **Two doc comments (low; Fable).** `detachTlsPump` was inserted between
+   `beginLeave`'s doc comment and `beginLeave`, so "This helper does not
+   lock" now heads the function that locks. Move it back. `openStreamIds`
+   says its slice is "valid until the next call", but `checkIdleDeadlines`
+   also writes `stale_ids`: say so, or route that sweep through the same
+   helper, and if cheap make a misuse loud in safe builds.
+5. **After close_notify, a further complete record keeps the actor from
+   parking (low; Fable; pre-existing; Ryan: fix it here).** `decryptInto`
+   stops at `peer_closed`, but `pendingInbound()` stays true while a
+   complete record sits behind the close_notify, and `driveTlsTurn`'s "never
+   park while pendingInbound()" returns without parking on every turn, until
+   the closing deadline. Only a peer that violates TLS reaches it. Fix so
+   bytes after close_notify are dropped or no longer count as work (RFC 8446
+   section 6.1: data after close_notify is ignored). Test: a peer sends
+   close_notify then another record, does not read; the actor must park
+   (count turns, or check it is in the select) and the connection must end.
+6. **REFUSED_STREAM for a 503 dispatch refusal (low; Fable).** efbfefe
+   resets a stream refused for want of job memory with INTERNAL_ERROR. When
+   the refusal was a 503 (server cap, retriable), use REFUSED_STREAM (RFC
+   9113 section 8.7); keep INTERNAL_ERROR for the 500 (the request's own
+   cap). Extend efbfefe's test to cover both.
+7. **The t-3671 flake.** `owed_acks` counts every SETTINGS ack after `go`,
+   and the preface's ack can arrive after `go` under load (1 of 60 three at
+   a time on the Mac in round 5). Fix the test so it counts only the acks of
+   the SETTINGS it sends, then close t-3671 in the report (I will close the
+   task).
+
+Mutations for this round (add to the report's table): 35, item 1's report
+of an unreported `peer_closed` removed; 36, item 2's ordering reverted
+(release lowers `held` before the refill); 37, item 5's drop of bytes after
+close_notify removed; 38, item 6 always INTERNAL_ERROR; and 2d again,
+against item 3's stronger test.
