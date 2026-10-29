@@ -314,6 +314,10 @@ const Client = struct {
     /// half-closed client sends nothing more.
     half_close: std.atomic.Value(bool) = .init(false),
     half_closed: bool = false,
+    /// One connection-level WINDOW_UPDATE, a frame the server answers with
+    /// nothing.
+    send_wu: std.atomic.Value(bool) = .init(false),
+    wu_sent: std.atomic.Value(bool) = .init(false),
     /// Streams that ended for the client: a HEADERS with END_STREAM or an
     /// RST_STREAM, whichever came first.
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -416,9 +420,16 @@ fn clientRun(c: *Client) !void {
             try w.send(more.items);
             c.batch_sent.store(true, .release);
         }
+        if (!c.wu_sent.load(.acquire) and c.send_wu.load(.acquire)) {
+            var more: std.ArrayList(u8) = .empty;
+            defer more.deinit(c.gpa);
+            try h2c.appendWindowUpdate(c.gpa, &more, 0, 1000);
+            try w.send(more.items);
+            c.wu_sent.store(true, .release);
+        }
         if (!c.half_closed and c.half_close.load(.acquire)) {
             if (std.c.shutdown(w.fd, std.c.SHUT.WR) != 0) return error.HalfClose;
-            c.half_closed = true;
+            @atomicStore(bool, &c.half_closed, true, .release);
         }
         if (!c.settle_sent.load(.acquire) and c.send_settle.load(.acquire)) {
             var ping: [17]u8 = undefined;
@@ -1470,6 +1481,92 @@ fn runShielded(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !
     serving = false;
 }
 
+/// A TLS peer EOF that the top of a turn reaps (`pollRecv`), on a connection
+/// with nothing else to do, must still be taken (`onPeerEof`): the recv is
+/// not armed again after an EOF, and an idle connection has no deadline, so
+/// a turn that parks then waits until server shutdown. The hold makes the
+/// EOF land between two turns: it holds the turn that follows the client's
+/// WINDOW_UPDATE, and the client half-closes meanwhile.
+fn runIdleEof(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    conn_mod.test_hold_idle_tls_turn.store(false, .release);
+    conn_mod.test_release_idle_tls_turn.store(false, .release);
+    defer conn_mod.test_release_idle_tls_turn.store(true, .release);
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    const held_0 = conn_mod.test_idle_tls_turn_held.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 0,
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    // The exchange is over (the server answered a PING sent after its
+    // SETTINGS), and the actor goes idle.
+    c.send_alive.store(true, .release);
+    try waitFor("the PING ack", &c, struct {
+        fn f(x: *Client) bool {
+            return x.ping_acked.load(.acquire);
+        }
+    }.f);
+    zio.sleep(.fromMilliseconds(50)) catch {};
+    conn_mod.test_hold_idle_tls_turn.store(true, .release);
+    c.send_wu.store(true, .release);
+    try waitFor("an idle TLS turn to be held", atLeast(&conn_mod.test_idle_tls_turn_held, held_0 + 1), reached);
+    c.half_close.store(true, .release);
+    // The client sees the flag between reads, which can block up to its
+    // receive timeout; then the FIN needs a moment to reach the server's CQ.
+    try waitFor("the client to half-close", &c, struct {
+        fn f(x: *Client) bool {
+            return @atomicLoad(bool, &x.half_closed, .acquire);
+        }
+    }.f);
+    zio.sleep(.fromMilliseconds(100)) catch {};
+    conn_mod.test_release_idle_tls_turn.store(true, .release);
+
+    try waitFor("the server to take the peer's EOF", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    try std.testing.expect(c.eof);
+    try std.testing.expect(c.goaways >= 1);
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runIdleEofTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runIdleEof, .{ rt, gpa });
+    try h.join();
+}
+
 fn runShieldedTop(transport: Transport) !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
@@ -1607,6 +1704,10 @@ test "a shielded handler past the close, h2c: the socket closes when the closing
 
 test "a shielded handler past the close, tls: the socket closes when the closing phase ends, not when the handler returns" {
     try runShieldedTop(.tls);
+}
+
+test "a TLS peer EOF reaped at the top of an idle turn is still taken, and the server closes long before any deadline" {
+    try runIdleEofTop();
 }
 
 test "zz h2 oracle: no protocol violation on any connection in this binary" {

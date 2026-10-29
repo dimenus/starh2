@@ -347,6 +347,13 @@ pub var test_release_hook: test_hook.Hook(?*const fn (*Connection, ReleasePoint)
 /// it lets a test see a chunk in each place. `test_hold_stash_entered` counts
 /// the times the driver stopped there.
 pub var test_hold_stash: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+/// Test-only: hold the next TLS turn that starts with nothing to do (no
+/// plaintext, nothing to write, no send in flight) at its top, before its
+/// `pollRecv`, until released. A completion that lands meanwhile is then
+/// reaped by that `pollRecv`, not by the select. Armed once.
+pub var test_hold_idle_tls_turn: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_idle_tls_turn_held: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_release_idle_tls_turn: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 pub var test_hold_stash_entered: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
@@ -3773,6 +3780,16 @@ pub const Connection = struct {
         // is what ends the phase. Only the lock block decides that, so a turn
         // that took one goes round again instead of parking on the timer.
         var polled_progress = false;
+        if (comptime test_observe) {
+            if (test_hold_idle_tls_turn.load(.acquire) and pump.pending_cipher == null and pump.pending_read == null and
+                !pump.conn.pendingInbound() and pump.pending_n == 0 and !pump.send_armed and pump.carried == null and
+                pump.write_ch.isEmpty())
+            {
+                test_hold_idle_tls_turn.store(false, .release);
+                _ = test_idle_tls_turn_held.fetchAdd(1, .acq_rel);
+                while (!test_release_idle_tls_turn.load(.acquire)) try self.config.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
         if (pump.pending_cipher == null) {
             switch (pump.pollRecv()) {
                 .exit => return true,
@@ -3937,6 +3954,12 @@ pub const Connection = struct {
             // t-866: never park while inbound plaintext, unread records, or a
             // stashed cipher suffix sit. The recv is unarmed in the last case.
             if (pump.pending_read != null or pump.pending_cipher != null or pump.conn.pendingInbound()) return null;
+            // An EOF the pump saw and the actor has not taken yet: the main
+            // loop takes it (`onPeerEof`) after this turn. Parking first could
+            // be for good: the recv is not armed again after an EOF, and an
+            // idle connection has no deadline. `pollRecv` at the top of a turn
+            // reaps the EOF without parking, so this is reachable.
+            if (pump.inbound_eof and !self.closing_peer_eof) return null;
             // After the peer's EOF nothing is read, and with no send in flight
             // only a timer or the doorbell can wake the actor.
             std.debug.assert(pump.recv_armed or pump.send_armed or pump.inbound_eof);
