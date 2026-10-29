@@ -6869,7 +6869,7 @@ pub const Connection = struct {
                                 // the stream is reset (a handler waiting on
                                 // it is woken by the reset). The RST is
                                 // queued, and this call's next round sends it.
-                                .headers => self.session.resetRefusedHeaders(f.stream_id, f.owes_rst_if_refused) catch {},
+                                .headers => self.session.resetRefusedHeaders(f.stream_id, f.owes_rst_if_refused, f.refusal_code) catch {},
                                 // What RFC 9113 requires is owed and queued
                                 // again when the share has room
                                 // (`Session.Owed`, `materializeIntents`). Past
@@ -7576,23 +7576,22 @@ pub const Connection = struct {
     /// consumed.
     fn refuseDispatchForMemory(self: *Connection, d: session_mod.DispatchRequest, lease: *RequestLease) bool {
         const status = (lease.arena.refusal orelse request_pool.Reason.server_cap).status();
-        self.session.applyCommand(.{ .respond_headers = .{
+        // The code that says what the status says: a 503 (the server's or the
+        // connection's memory) is safe to retry, which REFUSED_STREAM tells
+        // the client (RFC 9113 section 8.7); a 500 (the request's own cap) is
+        // not. It replaces the response if the edge refuses it later.
+        const code: frame.ErrorCode = if (status == 503) .refused_stream else .internal_error;
+        self.session.applyCommand(.{ .refuse_request = .{
             .stream_id = d.stream_id,
             .status = status,
-            .headers = &.{},
-            .end_stream = true,
-            .ticket = .none,
+            .reset_code = code,
         } }) catch {
             // No frame for the refusal (the ordinary share or the frame
             // slabs are spent): reset the stream instead, so the peer is not
             // left waiting for an answer, as `Session.emitEarlyReject` does.
             // An RST takes its frame from the terminal store, which always
-            // has room for one per stream (`Limits.terminalFrames`). The code
-            // says what the status would have: a 503 (the server's or the
-            // connection's memory) is safe to retry, which REFUSED_STREAM
-            // tells the client (RFC 9113 section 8.7); a 500 (the request's
-            // own cap) is not.
-            const code: frame.ErrorCode = if (status == 503) .refused_stream else .internal_error;
+            // has room for one per stream (`Limits.terminalFrames`), with the
+            // same code.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = code } }) catch {};
         };
         std.debug.assert(self.releaseSlot(d.stream_id));
@@ -11083,7 +11082,12 @@ test "an early 413 with no frame for its response resets the stream instead of f
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
 }
 
-fn expectDispatchRefusalReset(request_cap: bool, want: frame.ErrorCode) !void {
+/// How the dispatch refusal's response is refused: it finds no frame buffer
+/// (`rentNoOrdinary`), or its HEADERS is built and the edge's full ordinary
+/// share refuses it (`resetRefusedHeaders`).
+const RefusalPath = enum { no_frame, share_full };
+
+fn expectDispatchRefusalReset(request_cap: bool, path: RefusalPath, want: frame.ErrorCode) !void {
     const gpa = std.testing.allocator;
     const routes = [_]router_mod.Route{.{
         .method = .GET,
@@ -11100,9 +11104,16 @@ fn expectDispatchRefusalReset(request_cap: bool, want: frame.ErrorCode) !void {
     defer test_fail_dispatch_alloc.store(false, .release);
     test_fail_dispatch_request_cap.store(request_cap, .release);
     defer test_fail_dispatch_request_cap.store(false, .release);
-    conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
+    var pinned: usize = 0;
+    switch (path) {
+        .no_frame => conn.session.stream_hooks.?.rentFrame = rentNoOrdinary,
+        .share_full => {
+            while (conn.sched.ctrl.tryReserveOrdinary(1)) pinned += 1;
+        },
+    }
     var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
     try trapIngest(conn, hopRequestFrame(&req, 1));
+    conn.sched.ctrl.release(pinned, pinned);
     try std.testing.expect(conn.session.terminal == .none);
     try std.testing.expectEqual(@as(usize, 0), conn.countInUseSlots());
     var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
@@ -11117,11 +11128,19 @@ fn expectDispatchRefusalReset(request_cap: bool, want: frame.ErrorCode) !void {
 }
 
 test "a request refused for want of job memory, with no frame for its response, is reset instead of left open: a 503 (server's memory) with REFUSED_STREAM (t-3562)" {
-    try expectDispatchRefusalReset(false, .refused_stream);
+    try expectDispatchRefusalReset(false, .no_frame, .refused_stream);
 }
 
 test "a request refused for want of job memory, with no frame for its response, is reset instead of left open: a 500 (its own cap) with INTERNAL_ERROR (t-3562)" {
-    try expectDispatchRefusalReset(true, .internal_error);
+    try expectDispatchRefusalReset(true, .no_frame, .internal_error);
+}
+
+test "a request refused for want of job memory, its response refused by a full ordinary share, is reset: a 503 with REFUSED_STREAM (t-3562)" {
+    try expectDispatchRefusalReset(false, .share_full, .refused_stream);
+}
+
+test "a request refused for want of job memory, its response refused by a full ordinary share, is reset: a 500 with INTERNAL_ERROR (t-3562)" {
+    try expectDispatchRefusalReset(true, .share_full, .internal_error);
 }
 
 test "an error exit from ingest materializes what the read queued before the unlock (t-3562)" {

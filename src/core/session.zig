@@ -90,6 +90,12 @@ pub const OutboundFrame = struct {
     /// The obligation lives on the frame, not in the tombstone ring, which a
     /// connection may keep empty and always overwrites.
     owes_rst_if_refused: bool = false,
+    /// The code of the RST that replaces this final HEADERS if the edge
+    /// refuses it (`resetRefusedHeaders`). INTERNAL_ERROR, except for a
+    /// request the server refused before any handler ran
+    /// (`AppCommand.refuse_request`), whose refusal says itself whether a
+    /// retry is safe.
+    refusal_code: frame.ErrorCode = .internal_error,
 };
 
 /// A handler's write ticket and its table slot (`Connection.tickets`). `id`
@@ -134,6 +140,14 @@ pub const AppCommand = union(enum) {
         end_stream: bool,
     },
     reset_stream: struct { stream_id: u31, code: frame.ErrorCode },
+    /// Answer a request the server refused before any handler ran, with a
+    /// status and no body. If the edge refuses that response, the stream is
+    /// reset with `reset_code` instead, the code that says the same thing as
+    /// the status: REFUSED_STREAM for a refusal that is safe to retry (RFC
+    /// 9113 section 8.7). A status a handler sends goes through
+    /// `respond_headers` and resets with INTERNAL_ERROR: its retry safety is
+    /// not the server's to claim.
+    refuse_request: struct { stream_id: u31, status: u16, reset_code: frame.ErrorCode },
     goaway: struct { last_stream_id: u31, code: frame.ErrorCode },
     /// Start graceful shutdown phase 1: GOAWAY(max) + PING (edge waits for ACK/timeout).
     graceful_phase1,
@@ -949,7 +963,8 @@ pub const Session = struct {
     pub fn applyCommand(self: *Session, cmd: AppCommand) !void {
         if (self.terminal != .none) return;
         switch (cmd) {
-            .respond_headers => |r| try self.cmdHeaders(r.stream_id, r.status, r.headers, r.end_stream, r.ticket),
+            .respond_headers => |r| try self.cmdHeaders(r.stream_id, r.status, r.headers, r.end_stream, r.ticket, .internal_error),
+            .refuse_request => |r| try self.cmdHeaders(r.stream_id, r.status, &.{}, true, .none, r.reset_code),
             .respond_data => |r| try self.cmdData(r.stream_id, r.data, r.end_stream),
             .reset_stream => |r| try self.emitRst(r.stream_id, r.code),
             .goaway => |g| try self.failConnectionWith(g.code, g.last_stream_id),
@@ -1173,9 +1188,9 @@ pub const Session = struct {
     /// still owed it (`OutboundFrame.owes_rst_if_refused`): not if the peer
     /// reset the stream, or the server queued an RST for it, while the frame
     /// was queued.
-    pub fn resetRefusedHeaders(self: *Session, stream_id: u31, owes_rst: bool) !void {
-        if (self.streams.contains(stream_id)) return self.emitRst(stream_id, .internal_error);
-        if (owes_rst) return self.queueRst(stream_id, .internal_error, .refused_end);
+    pub fn resetRefusedHeaders(self: *Session, stream_id: u31, owes_rst: bool, code: frame.ErrorCode) !void {
+        if (self.streams.contains(stream_id)) return self.emitRst(stream_id, code);
+        if (owes_rst) return self.queueRst(stream_id, code, .refused_end);
     }
 
     /// Queue an RST_STREAM at most once per stream (`rstOwed`), and always run
@@ -1855,7 +1870,7 @@ pub const Session = struct {
         s.early_status = status;
         try self.pushIntentOrFailClosed(.{ .early_reject = .{ .stream_id = stream_id, .status = status } });
         // Also emit the HTTP response frames now so core stays self-contained for tests.
-        self.cmdHeaders(stream_id, status, &.{}, true, .none) catch |err| switch (err) {
+        self.cmdHeaders(stream_id, status, &.{}, true, .none, .internal_error) catch |err| switch (err) {
             // No frame buffer for the response: the stream is reset instead,
             // as when the edge refuses it (`resetRefusedHeaders`). An RST
             // always has room (`Limits.terminalFrames`).
@@ -2311,7 +2326,7 @@ pub const Session = struct {
     /// `OutOfMemory`) leaves nothing queued and the caller may still answer
     /// the stream with something else. A half-queued block would be one the
     /// peer waits on forever.
-    fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool, ticket: WireTicket) !void {
+    fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool, ticket: WireTicket, refusal_code: frame.ErrorCode) !void {
         // A RST tombstone already released the map entry. Emitting HEADERS
         // after that is how a handler that took `session_mu` late queued a
         // body the scheduler can never emit (TLS stall: pending DATA, tomb_rst).
@@ -2368,6 +2383,7 @@ pub const Session = struct {
                 .ticket = if (k == 0) ticket else .none,
                 // A final HEADERS owes an RST if the edge refuses it.
                 .owes_rst_if_refused = k == 0 and end_stream,
+                .refusal_code = refusal_code,
             } }) catch unreachable;
         }
         built = 0;
@@ -3335,7 +3351,7 @@ test "a refused final HEADERS is reset from its own obligation, with no tombston
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
     // The edge refused that HEADERS: the stream is reset, once (the edge
     // calls this once, for the one frame that carried the obligation).
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
     const c = countTerminalIntents(gpa, &session);
     try std.testing.expectEqual(@as(usize, 1), c.rst);
@@ -3357,7 +3373,7 @@ test "a peer RST while the final HEADERS is still queued clears its obligation (
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(!owes);
     // A refusal of it now queues no RST: the peer counts the stream closed.
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
 }
 
@@ -3381,7 +3397,7 @@ test "a peer RST for a stream still in the map clears its final HEADERS' obligat
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(!owes);
     // A refusal of it now queues no RST: the peer counts the stream closed.
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
 }
 
@@ -3436,7 +3452,7 @@ fn expectEarly413OwesAfterPeerEnd(last: enum { data, trailers }) !void {
     try std.testing.expect(session.terminal == .none);
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(owes);
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
 }
 
@@ -3464,7 +3480,7 @@ test "a server RST queued after a final HEADERS clears its obligation: one RST, 
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(!owes);
     // The refusal of the HEADERS adds nothing to the RST already queued.
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
 }
 
