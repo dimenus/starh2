@@ -237,11 +237,14 @@ pub const HeaderListMem = union(enum) {
 /// A SETTINGS ack is owed only after its SETTINGS was applied (`onSettings`
 /// applies before it acks), so a later ack never runs ahead of its settings.
 ///
-/// Bounded: past `rates.SETTINGS_BURST` SETTINGS acks or `rates.PING_BURST`
-/// PING acks owed at once, the peer goes on sending past the burst its rate
-/// limit allows while it reads nothing, and the connection ends with
-/// ENHANCE_YOUR_CALM. The window credit needs no bound: it is a sum, and the
-/// peer can only send what it was granted.
+/// Bounded by the rate limit, not beside it: an owed ack keeps the token its
+/// SETTINGS or PING took (`RateLimiter.holdAck`) until it is queued again, so
+/// the limit admits one only while fewer than `rates.SETTINGS_BURST` /
+/// `rates.PING_BURST` acks are owed, and a peer that sends past that while
+/// it reads nothing ends with ENHANCE_YOUR_CALM from the limit. The rings'
+/// own check (past the burst: ENHANCE_YOUR_CALM) is then the bound only for a
+/// session with no rate limiter. The window credit needs no bound: it is a
+/// sum, and the peer can only send what it was granted.
 ///
 /// The graceful shutdown's PING is not here: it may be dropped, because its
 /// one-second deadline moves the shutdown on without its ack.
@@ -1706,6 +1709,7 @@ pub const Session = struct {
     pub fn oweSettingsAck(self: *Session) !void {
         if (self.owed.settings_acks == rates_mod.SETTINGS_BURST) return self.failConnection(.enhance_your_calm);
         self.owed.settings_acks += 1;
+        if (self.rate_limiter) |rl| rl.holdAck(.settings, self.edge_now_ns);
     }
 
     fn queuePingAck(self: *Session, payload: [8]u8) !void {
@@ -1732,6 +1736,7 @@ pub const Session = struct {
         if (o.ping_len == o.pings.len) return self.failConnection(.enhance_your_calm);
         o.pings[(o.ping_head + o.ping_len) % o.pings.len] = payload;
         o.ping_len += 1;
+        if (self.rate_limiter) |rl| rl.holdAck(.ping, self.edge_now_ns);
     }
 
     /// Queue what is owed (`Owed`), at most `room` frames: the room the
@@ -1748,6 +1753,7 @@ pub const Session = struct {
             const p = self.settingsAckFrame() catch return;
             self.pushIntent(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
             o.settings_acks -= 1;
+            if (self.rate_limiter) |rl| rl.releaseAck(.settings);
             left -= 1;
         }
         while (o.ping_len != 0 and self.owedRoom(left)) {
@@ -1755,6 +1761,7 @@ pub const Session = struct {
             self.pushIntent(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
             o.ping_head = (o.ping_head + 1) % o.pings.len;
             o.ping_len -= 1;
+            if (self.rate_limiter) |rl| rl.releaseAck(.ping);
             left -= 1;
         }
         if (o.conn_window != 0 and self.owedRoom(left)) {
@@ -3520,6 +3527,98 @@ test "owed SETTINGS acks past the burst end the connection with ENHANCE_YOUR_CAL
     try std.testing.expect(session.terminal == .none);
     try session.oweSettingsAck();
     try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, session.terminal.goaway.code);
+}
+
+/// Take the queued intents back and free them, and return how many were
+/// acks of `typ`: the edge's share refusing them (`materializeBatch`), whose
+/// caller then owes each one, as the edge does.
+fn refuseQueuedAcks(gpa: std.mem.Allocator, session: *Session, typ: frame.FrameType) usize {
+    const intents = session.drainIntents();
+    var acks: usize = 0;
+    for (intents) |it| switch (it) {
+        .outbound_frame => |f| if (f.typ == typ and f.flags.end_stream) {
+            acks += 1;
+        },
+        else => {},
+    };
+    freeTestIntents(gpa, intents);
+    return acks;
+}
+
+/// Ingest `n` PINGs at `now_ns`, every ack refused by the edge and owed.
+/// Once one ack is owed the session owes the later ones itself, to keep
+/// their order; only an ack it queued is refused here.
+fn ingestPingsOwingAcks(session: *Session, gpa: std.mem.Allocator, n: usize, now_ns: u64) !void {
+    session.edge_now_ns = now_ns;
+    for (0..n) |_| {
+        var ping: [17]u8 = undefined;
+        _ = try frame.Serializer.ping(&ping, false, "in-limit");
+        try session.ingest(&ping);
+        if (session.terminal != .none) return;
+        for (0..refuseQueuedAcks(gpa, session, .ping)) |_| try session.owePingAck("in-limit".*);
+    }
+}
+
+test "an owed PING ack keeps its rate-limit token, so the limit and the owed bound are one (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    // A full burst, every ack refused by the edge and owed.
+    try ingestPingsOwingAcks(&session, gpa, rates_mod.PING_BURST, 1);
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expectEqual(rates_mod.PING_BURST, session.owed.ping_len);
+    // 100 ms later the bucket has refilled one token at 10 per second. The
+    // limit must not admit a PING whose ack could not be owed: the acks
+    // still owed keep their tokens.
+    const later = 1 + 100 * std.time.ns_per_ms;
+    try std.testing.expect(!rl.admit(.ping, later));
+    // Once the owed acks are queued, their tokens come back as the bucket
+    // refills, and a PING is admitted again.
+    session.requeueOwed(rates_mod.PING_BURST);
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expectEqual(@as(usize, 0), session.owed.ping_len);
+    freeTestIntents(gpa, session.drainIntents());
+    try std.testing.expect(rl.admit(.ping, later + 200 * std.time.ns_per_ms));
+}
+
+test "an owed SETTINGS ack keeps its rate-limit token, so the limit and the owed bound are one (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    // The preface's SETTINGS took one token and its ack was sent. The rest
+    // of the burst, each ack refused by the edge and owed.
+    var now: u64 = 1;
+    var owed_target: usize = rates_mod.SETTINGS_BURST - 1;
+    while (true) {
+        while (session.owed.settings_acks < owed_target) {
+            var settings: [9]u8 = undefined;
+            const n = try frame.Serializer.settingsFrame(&settings, false, &.{});
+            session.edge_now_ns = now;
+            try session.ingest(settings[0..n]);
+            try std.testing.expect(session.terminal == .none);
+            for (0..refuseQueuedAcks(gpa, &session, .settings)) |_| try session.oweSettingsAck();
+        }
+        if (owed_target == rates_mod.SETTINGS_BURST) break;
+        // 100 ms later one token has refilled (the sent ack's), and the limit
+        // admits one more SETTINGS: the owed ring still has room for its ack.
+        now += 100 * std.time.ns_per_ms;
+        owed_target = rates_mod.SETTINGS_BURST;
+    }
+    try std.testing.expectEqual(rates_mod.SETTINGS_BURST, session.owed.settings_acks);
+    // The ring is full: 100 ms later the limit must not admit another.
+    try std.testing.expect(!rl.admit(.settings, now + 100 * std.time.ns_per_ms));
+    session.requeueOwed(rates_mod.SETTINGS_BURST);
+    try std.testing.expectEqual(@as(usize, 0), session.owed.settings_acks);
+    freeTestIntents(gpa, session.drainIntents());
+    try std.testing.expect(rl.admit(.settings, now + 300 * std.time.ns_per_ms));
 }
 
 test "owed window credit: DATA is held to what the peer was told, and a stream's owed credit goes with the stream (t-3562)" {
