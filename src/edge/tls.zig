@@ -1620,6 +1620,15 @@ pub const Pump = struct {
             .{},
         );
         self.recv_armed = false;
+        // The peer's close_notify was already decrypted, in the handshake's
+        // leftover (`Conn.drainLeftoverPlain`, which runs `decryptInto`
+        // before this pump exists). Nothing after it is read, so nothing
+        // would report it: report it now. The actor ingests the leftover
+        // before its loop, and takes the EOF only after that (`eofReady`).
+        if (self.conn.peer_closed) {
+            self.conn.ringPeerClosed(null, "close_notify");
+            self.postEof();
+        }
         return self.rearmRecv();
     }
 

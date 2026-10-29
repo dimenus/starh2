@@ -127,7 +127,7 @@ pub const Wire = struct {
     }
 
     pub fn handshake(self: *Wire) !void {
-        return self.handshakeImpl(null);
+        return self.handshakeImpl(null, false);
     }
 
     /// Open the connection with `flight` (plaintext HTTP/2) already sent. On
@@ -136,10 +136,18 @@ pub const Wire = struct {
     /// so the server reads the flight as handshake leftover. On h2c it is
     /// the first write.
     pub fn handshakeWith(self: *Wire, flight: []const u8) !void {
-        return self.handshakeImpl(flight);
+        return self.handshakeImpl(flight, false);
     }
 
-    fn handshakeImpl(self: *Wire, flight: ?[]const u8) !void {
+    /// TLS only: as `handshakeWith`, with this client's close_notify after
+    /// the flight in the same write, and the socket left open. The server
+    /// decrypts all of it as handshake leftover.
+    pub fn handshakeWithThenCloseNotify(self: *Wire, flight: []const u8) !void {
+        std.debug.assert(self.transport == .tls);
+        return self.handshakeImpl(flight, true);
+    }
+
+    fn handshakeImpl(self: *Wire, flight: ?[]const u8, close_after: bool) !void {
         if (flight) |f| self.oracle.onSend(f);
         if (self.transport == .h2c) {
             if (flight) |f| try self.sendRaw(f);
@@ -178,6 +186,7 @@ pub const Wire = struct {
                 try last.appendSlice(self.gpa, r.ciphertext);
                 off += r.cleartext_pos;
             }
+            if (close_after) try last.appendSlice(self.gpa, try self.conn.close(&self.out));
             try self.sendRaw(last.items);
         }
     }

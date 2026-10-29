@@ -337,6 +337,10 @@ const Client = struct {
     /// close_notify, the socket left open (`Wire.sendThenCloseNotify`).
     /// `notify_record_after`: one more record after the close_notify.
     send_notify: std.atomic.Value(bool) = .init(false),
+    /// TLS: the handshake's last flight carries the preface, a PING
+    /// (`alive_ping`) and this client's close_notify, all in one write, the
+    /// socket left open (`Wire.handshakeWithThenCloseNotify`).
+    pipeline_notify: bool = false,
     notify_sent: std.atomic.Value(bool) = .init(false),
     notify_record_after: bool = false,
     /// Streams that ended for the client: a HEADERS with END_STREAM or an
@@ -403,12 +407,19 @@ fn clientRun(c: *Client) !void {
     }
     c.wire.store(w, .release);
     if (c.oracle_waiver) |why| w.oracle.waive(why);
-    try w.handshake();
     var req = try h2c.buildClientPrefaceAndSettings(c.gpa);
     defer req.deinit(c.gpa);
     try h2c.appendWindowUpdate(c.gpa, &req, 0, 1 << 30);
     for (0..c.streams) |i| try h2c.appendHeaders(c.gpa, &req, @intCast(1 + 2 * i), c.path, true);
-    try w.send(req.items);
+    if (c.pipeline_notify) {
+        var ping: [17]u8 = undefined;
+        _ = try frame.Serializer.ping(&ping, false, &alive_ping);
+        try req.appendSlice(c.gpa, &ping);
+        try w.handshakeWithThenCloseNotify(req.items);
+    } else {
+        try w.handshake();
+        try w.send(req.items);
+    }
 
     const deadline = nowNs() + 40 * std.time.ns_per_s;
     var reading = c.rcvbuf == null;
@@ -1818,6 +1829,70 @@ fn runNotifyThenRecordTop() !void {
     try h.join();
 }
 
+/// A TLS client whose last handshake flight carries its preface, a PING and
+/// its close_notify, the socket left open. The server decrypts all of it as
+/// handshake leftover (`Conn.drainLeftoverPlain`), before its pump starts.
+/// It must still take the close: ingest the leftover, answer the PING, send
+/// its GOAWAY and close_notify, and close, long before any deadline.
+fn runPipelinedNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    const leftovers_0 = conn_mod.test_tls_leftover_connections.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 0,
+        .flood = 0,
+        .rcvbuf = null,
+        .pipeline_notify = true,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    // The frames came as handshake leftover, which is what this is about.
+    try std.testing.expectEqual(leftovers_0 + 1, conn_mod.test_tls_leftover_connections.load(.acquire));
+    // The PING in the leftover was ingested and answered before the close.
+    try std.testing.expect(c.ping_acked.load(.acquire));
+    try std.testing.expect(c.goaways >= 1);
+    try std.testing.expect(c.eof);
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runPipelinedNotifyTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runPipelinedNotify, .{ rt, gpa });
+    try h.join();
+}
+
 fn runFrameThenNotifyTop() !void {
     const gpa = std.testing.allocator;
     const rt = try newRuntime(gpa);
@@ -1987,6 +2062,10 @@ test "a TLS frame and close_notify in one write, the socket left open: the serve
 
 test "a TLS record after close_notify counts for nothing: the actor parks while the closing phase waits, and the connection ends" {
     try runNotifyThenRecordTop();
+}
+
+test "a TLS close_notify in the handshake's last flight, behind the preface and a PING, the socket left open: the server takes it and closes" {
+    try runPipelinedNotifyTop();
 }
 
 test "zz h2 oracle: no protocol violation on any connection in this binary" {
