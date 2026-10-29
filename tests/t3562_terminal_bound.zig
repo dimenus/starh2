@@ -287,6 +287,8 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
 
 const max_sid = 4096;
 const alive_ping = [8]u8{ 't', '3', '5', '6', '2', 'l', 'i', 'v' };
+/// The PING sent with the client's close_notify (`send_notify`).
+const notify_ping = [8]u8{ 't', '3', '5', '6', '2', 'n', 't', 'f' };
 const settle_ping = [8]u8{ 't', '3', '5', '6', '2', 's', 'e', 't' };
 const batch_ping = [8]u8{ 't', '3', '5', '6', '2', 'b', 'a', 't' };
 
@@ -333,10 +335,11 @@ const Client = struct {
     /// nothing.
     send_wu: std.atomic.Value(bool) = .init(false),
     wu_sent: std.atomic.Value(bool) = .init(false),
-    /// TLS: one write of a PING (`alive_ping`) and this client's
+    /// TLS: one write of a PING (`notify_ping`) and this client's
     /// close_notify, the socket left open (`Wire.sendThenCloseNotify`).
     /// `notify_record_after`: one more record after the close_notify.
     send_notify: std.atomic.Value(bool) = .init(false),
+    notify_ping_acked: std.atomic.Value(bool) = .init(false),
     /// TLS: the handshake's last flight carries the preface, a PING
     /// (`alive_ping`) and this client's close_notify, all in one write, the
     /// socket left open (`Wire.handshakeWithThenCloseNotify`).
@@ -454,7 +457,7 @@ fn clientRun(c: *Client) !void {
         }
         if (!c.notify_sent.load(.acquire) and c.send_notify.load(.acquire)) {
             var ping: [17]u8 = undefined;
-            _ = try frame.Serializer.ping(&ping, false, &alive_ping);
+            _ = try frame.Serializer.ping(&ping, false, &notify_ping);
             try w.sendThenCloseNotify(&ping, c.notify_record_after);
             c.notify_sent.store(true, .release);
         }
@@ -541,6 +544,7 @@ fn clientRun(c: *Client) !void {
             },
             6 => if (s.flags & 1 != 0) {
                 if (std.mem.eql(u8, w.last_payload.items, &alive_ping)) c.ping_acked.store(true, .release);
+                if (std.mem.eql(u8, w.last_payload.items, &notify_ping)) c.notify_ping_acked.store(true, .release);
             } else {
                 // Acking the graceful PING moves the server to phase 2.
                 var ack: [17]u8 = undefined;
@@ -1732,13 +1736,29 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var joined = false;
     defer if (!joined) joinClient(&c, t);
 
+    // The exchange first (the server answered a PING sent after its
+    // SETTINGS), then a moment for the actor to park. The PING and the
+    // close_notify then arrive through the recv completion the parked actor
+    // takes in its select: the pump decrypts both there (`ingestCipher`,
+    // `readOne`), and the PING's plaintext is still pending when the EOF is
+    // posted. Sent while the actor was still busy with the preface, they
+    // were taken at the top of a turn instead, which reads the plaintext
+    // first, and that path could not show the EOF taken too early.
+    c.send_alive.store(true, .release);
+    try waitFor("the PING ack", &c, struct {
+        fn f(x: *Client) bool {
+            return x.ping_acked.load(.acquire);
+        }
+    }.f);
+    zio.sleep(.fromMilliseconds(50)) catch {};
     c.send_notify.store(true, .release);
     try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
     joinClient(&c, t);
     joined = true;
     if (c.err) |e| return e;
-    // The PING before the close_notify was ingested: its ack came.
-    try std.testing.expect(c.ping_acked.load(.acquire));
+    // The PING before the close_notify was ingested before the close was
+    // taken: its ack came. The oracle requires it too.
+    try std.testing.expect(c.notify_ping_acked.load(.acquire));
     try std.testing.expect(c.goaways >= 1);
     try std.testing.expect(c.eof);
     // The server closed, once, long before its closing deadline. The
