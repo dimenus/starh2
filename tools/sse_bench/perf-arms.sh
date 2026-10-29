@@ -16,7 +16,8 @@
 # lines then divide by delivered events instead of requests. The perf
 # window also covers stream opening and warmup, and the client counts only
 # the measurement window, so per-unit numbers read a little high; the bias
-# is the same for every arm.
+# is the same for every arm. SSE_PATH=/sse-broadcast (default /sse) feeds
+# every stream from one ticker instead of one timer per stream.
 #
 # ARMS="starh2 hyper" (default) picks the servers. OPPONENT_WIDTH applies
 # as in run.sh/mixed.sh: the opponent is pinned to starh2's executor
@@ -36,6 +37,7 @@ case $SHAPE in
 esac
 STREAMS=${STREAMS:-200}
 INTERVAL=${INTERVAL:-10}
+SSE_PATH=${SSE_PATH:-/sse}
 ONESHOT_WORKERS=${ONESHOT_WORKERS:-500}
 SECONDS_RUN=${SECONDS_RUN:-5}
 WARMUP=${WARMUP:-1}
@@ -116,7 +118,7 @@ measure() {
       "$OUT/sse-client" -streams 0 -conns "$CONNS" -oneshot-url "https://127.0.0.1:$port/" \
         -oneshot-workers "$ONESHOT_WORKERS" -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$arm" | tee "$OUT/$arm.client.txt" | sed 's/^/  /' ;;
     sse)
-      "$OUT/sse-client" -url "https://127.0.0.1:$port/sse" -streams "$STREAMS" -conns "$CONNS" \
+      "$OUT/sse-client" -url "https://127.0.0.1:$port$SSE_PATH" -streams "$STREAMS" -conns "$CONNS" \
         -seconds "$SECONDS_RUN" -warmup "$WARMUP" -label "$arm" | tee "$OUT/$arm.client.txt" | sed 's/^/  /' ;;
   esac
   sudo kill -INT "$perf_pid" 2>/dev/null
@@ -172,7 +174,7 @@ WIDTH=$(opponent_width "$STARH2_WIDTH")
 PIN=$(width_env "$WIDTH")
 case $SHAPE in
   oneshot) echo "== perf-arms: oneshot, $CONNS conns, $ONESHOT_WORKERS workers, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g" ;;
-  sse) echo "== perf-arms: sse, $STREAMS streams over $CONNS conns, one event per ${INTERVAL}ms per stream, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g" ;;
+  sse) echo "== perf-arms: sse $SSE_PATH, $STREAMS streams over $CONNS conns, one event per ${INTERVAL}ms per stream, ${SECONDS_RUN}s + ${WARMUP}s warmup, perf ${PERF_HZ}Hz -g" ;;
 esac
 echo "== starh2 executors=$STARH2_EXECUTORS (=$STARH2_WIDTH) zio-scheduling=$STARH2_ZIO_SCHEDULING extra=[${STARH2_EXTRA_ARGS:-}]  opponents width=$WIDTH  arms: $ARMS"
 echo "== starh2 ready: $(grep -m1 ready "$OUT/starh2.log")"
