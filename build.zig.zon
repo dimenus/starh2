@@ -4,12 +4,12 @@
     .fingerprint = 0x813a04b419058cf5,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // lalinsky/zio main be65431 (2026-10-23), the upstream Zig 0.17 port
-        // (#792) plus everything after it. PR 788, the earlier pin, was
-        // closed unmerged.
+        // dimenus/zio fix/iouring-send-eagain: lalinsky/zio main c9cc793 plus
+        // the io_uring send -EAGAIN bridge, which is not merged upstream yet.
+        // Move back to lalinsky/zio once it is.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#be65431ba2f9aa91232cac89a3e76b4480d15689",
-            .hash = "zio-0.19.0-xHbVVOZILQDHwvSkKoyueGl29__yoF4DRzNDIEzjgprv",
+            .url = "git+https://github.com/dimenus/zio#dbf1beb79cdcfb0bbe57839823104d8bdc82343a",
+            .hash = "zio-0.19.0-xHbVVPYzLgBGEz8P__YtqSzJ0whhX8mw9hP3Zg2Gdg6S",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.
