@@ -21,6 +21,7 @@ set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd -P)
 . "$REPO/tools/bench_lock.sh"
 . "$REPO/tools/sse_bench/kestrel_publish.sh"
+. "$REPO/tools/sse_bench/cpu.sh"
 . "$REPO/tools/sse_bench/hyper_build.sh"
 . "$REPO/tools/sse_bench/arm_width.sh"
 STREAMS=${STREAMS:-32}
@@ -119,18 +120,6 @@ for port in 19450 19451 19452 19454; do
     exit 1
   fi
 done
-
-cpu_seconds() {
-  ps -o time= -p "$1" | awk '{
-    gsub(/[[:space:]]/, "", $0)
-    fraction_parts = split($0, fraction, ".")
-    clock_parts = split(fraction[1], clock, ":")
-    total = 0
-    for (i = 1; i <= clock_parts; i++) total = (total * 60) + clock[i]
-    if (fraction_parts > 1) total += ("0." fraction[2])
-    printf "%.2f", total
-  }'
-}
 
 sse_target=$(( SECONDS_RUN * 1000 / INTERVAL * STREAMS ))
 echo "== mixed SSE + oneshot, one TLS connection per arm"
