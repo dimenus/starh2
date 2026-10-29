@@ -1228,7 +1228,10 @@ const UploadClient = struct {
     conn_window: i64 = flow_initial_window,
     stream_window: [upload_streams]i64 = @splat(flow_initial_window),
     sent: [upload_streams]usize = @splat(0),
-    /// SETTINGS acks and the owed PING's ack, read after `go`.
+    /// Every SETTINGS ack read, from the start: the client sends two
+    /// SETTINGS (its preface's, and one on `go`), and when the preface's ack
+    /// is written depends on when the writer hold began, so it may come
+    /// after `go` too. The owed PING's ack, read after `go`.
     settings_acks: usize = 0,
     ping_acked: bool = false,
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -1299,7 +1302,7 @@ const UploadClient = struct {
                     self.rst_total += 1;
                     self.noteEnded(s.sid);
                 },
-                4 => if (went and s.flags & 1 != 0) {
+                4 => if (s.flags & 1 != 0) {
                     self.settings_acks += 1;
                 },
                 6 => if (s.flags & 1 != 0 and std.mem.eql(u8, p, &owed_ping)) {
@@ -1318,7 +1321,7 @@ const UploadClient = struct {
                 },
                 else => {},
             }
-            if (went and self.ended >= batch_held + upload_streams and self.settings_acks >= 1 and self.ping_acked) return;
+            if (went and self.ended >= batch_held + upload_streams and self.settings_acks >= 2 and self.ping_acked) return;
         }
     }
 
@@ -1405,7 +1408,9 @@ fn runOwedAcks(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     joined = true;
     std.debug.print("T3562 transport=h2c scenario=owed_acks settings_acks={d} ping_acked={} ended={d} rst_total={d} goaways={d} uploads_ok={d} conn_credit_after_go={d} client_err={s}\n", .{ c.settings_acks, c.ping_acked, c.ended, c.rst_total, c.goaways, uploads_ok.load(.acquire), c.conn_credit_after_go, if (c.err) |e| @errorName(e) else "-" });
     if (c.err) |e| return e;
-    try std.testing.expectEqual(@as(usize, 1), c.settings_acks);
+    // One ack for each SETTINGS the client sent: its preface's and the one
+    // owed during the stall.
+    try std.testing.expectEqual(@as(usize, 2), c.settings_acks);
     try std.testing.expect(c.ping_acked);
     try std.testing.expectEqual(@as(usize, 0), c.goaways);
     // Every upload reached its handler whole, and every stream ended once
