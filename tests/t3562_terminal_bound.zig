@@ -1727,8 +1727,10 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expect(c.ping_acked.load(.acquire));
     try std.testing.expect(c.goaways >= 1);
     try std.testing.expect(c.eof);
-    // The client never closed its socket while reading: the server closed.
-    try std.testing.expectEqual(closes_0 + 1, conn_mod.test_socket_closes.load(.acquire));
+    // The server closed, once, long before its closing deadline. The
+    // client's EOF is the server's FIN, which comes just before the server's
+    // close, so the close is waited for, not read at once.
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
     server.requestShutdown();
     serve_handle.join() catch {};
     serving = false;
