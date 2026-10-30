@@ -65,6 +65,9 @@ pub const pump_trace = struct {
     pub var tryget_write: std.atomic.Value(u64) = .init(0);
     /// Send completions the driver handled (one per armed send).
     pub var send_complete: std.atomic.Value(u64) = .init(0);
+    /// Sends armed (`armSend` submits one). Equal to `send_complete` when no
+    /// send is in flight.
+    pub var send_arms: std.atomic.Value(u64) = .init(0);
     pub var read_one: std.atomic.Value(u64) = .init(0);
     pub var want_read: std.atomic.Value(u64) = .init(0);
     pub var read_free_empty_yield: std.atomic.Value(u64) = .init(0);
@@ -131,6 +134,16 @@ pub var tls_stage_failed: std.atomic.Value(u64) = .init(0);
 /// Test-only: alerts the server sent for a failed handshake. Counted in
 /// Debug and `-Dobserve=true`.
 pub var test_handshake_alerts: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
+/// Test-only: pumps that started with the peer's close_notify already
+/// decrypted (in the handshake leftover). Counted apart from the report in
+/// `Pump.start`, so a test can check its precondition whatever the report
+/// does.
+pub var test_close_at_pump_start: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only: times `eofReady` found the EOF posted with plaintext still
+/// pending (`pending_read`), the case its first guard holds the EOF back for.
+/// Counted apart from the guard, so a test can require that its run reached
+/// that case whatever the guard does.
+pub var test_eof_held_for_plaintext: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 pub fn writeFailJson(w: *std.Io.Writer) !void {
     try w.print(
@@ -773,7 +786,12 @@ pub const Conn = struct {
     /// is not work: the pump must park until the socket brings the rest.
     /// One implementation for every pump gate site, so they cannot drift;
     /// the in-process record test pins this exact function.
+    ///
+    /// After the peer's close_notify nothing is work: what follows it is
+    /// ignored (RFC 8446 section 6.1). Records already buffered behind it
+    /// stay, unread, and later bytes are dropped (`acceptCipher`).
     pub fn pendingInbound(self: *const Conn) bool {
+        if (self.peer_closed) return false;
         return completeRecordLen(self.in_buf[self.in_head..self.in_fill]) != null;
     }
 
@@ -814,6 +832,10 @@ pub const Conn = struct {
     /// Copy up to `bytes.len` of received ciphertext into `in_buf`. Returns
     /// how much fit; 0 when `in_buf` is full.
     fn acceptCipher(self: *Conn, bytes: []const u8) usize {
+        // After the peer's close_notify, bytes are taken and dropped: they
+        // are ignored (RFC 8446 section 6.1), and keeping them would only
+        // fill `in_buf`.
+        if (self.peer_closed) return bytes.len;
         if (self.in_buf.len - self.in_fill < bytes.len) self.compactIn();
         const n = @min(bytes.len, self.in_buf.len - self.in_fill);
         @memcpy(self.in_buf[self.in_fill..][0..n], bytes[0..n]);
@@ -1081,6 +1103,7 @@ pub const Pump = struct {
             error.Closed => return false,
             error.InvalidCompletion => unreachable,
         };
+        pump_trace.bump(&pump_trace.send_arms);
         self.send_armed = true;
         return true;
     }
@@ -1470,7 +1493,30 @@ pub const Pump = struct {
             return .closed;
         }
         self.pending_read = .{ .bytes = buf, .len = n };
+        // One decrypt can return a record's plaintext AND reach the
+        // close_notify behind it (`decryptInto` stops there). Nothing calls
+        // this again for the close: no complete record is left before it.
+        // So it is reported now, behind the plaintext: the actor ingests
+        // `pending_read` first (`eofReady`).
+        if (self.conn.peer_closed and !self.inbound_eof) {
+            self.conn.ringPeerClosed(null, "close_notify");
+            self.postEof();
+        }
         return .ok;
+    }
+
+    /// The peer's end of stream is posted and nothing it sent before it is
+    /// left to ingest: no plaintext waiting, and either the close_notify was
+    /// reached (nothing after it is read) or no complete record is buffered.
+    /// The actor takes the EOF (`Connection.onPeerEof`) only then, so the
+    /// frames before a close are never dropped by the closing phase.
+    pub fn eofReady(self: *const Pump) bool {
+        if (comptime test_hook.on) {
+            if (self.inbound_eof and self.pending_read != null) _ = test_eof_held_for_plaintext.fetchAdd(1, .acq_rel);
+        }
+        if (!self.inbound_eof or self.pending_read != null) return false;
+        if (self.conn.peer_closed) return true;
+        return self.pending_cipher == null and !self.conn.pendingInbound();
     }
 
     pub fn ingestCipher(self: *Pump, bytes: []const u8) bool {
@@ -1591,6 +1637,18 @@ pub const Pump = struct {
             .{},
         );
         self.recv_armed = false;
+        // The peer's close_notify was already decrypted, in the handshake's
+        // leftover (`Conn.drainLeftoverPlain`, which runs `decryptInto`
+        // before this pump exists). Nothing after it is read, so nothing
+        // would report it: report it now. The actor ingests the leftover
+        // before its loop, and takes the EOF only after that (`eofReady`).
+        if (comptime test_hook.on) {
+            if (self.conn.peer_closed) _ = test_close_at_pump_start.fetchAdd(1, .acq_rel);
+        }
+        if (self.conn.peer_closed) {
+            self.conn.ringPeerClosed(null, "close_notify");
+            self.postEof();
+        }
         return self.rearmRecv();
     }
 

@@ -1333,7 +1333,7 @@ fn abortCb(ctx: *anyopaque, _: u31) response.ResponseError!void {
 fn waitUntilCb(ctx: *anyopaque, _: u31, deadline: std.Io.Timestamp) response.ResponseError!void {
     const h: *Hctx = @ptrCast(@alignCast(ctx));
     if (h.terminal.getCause()) |c| return response.causeToError(c);
-    const deadline_ns: u64 = @intCast(deadline.nanoseconds);
+    const deadline_ns = connection.handlerDeadlineNs(deadline);
     if (nowNs(h.conn.io) >= deadline_ns) return;
     const armed: std.Io.Timestamp = .fromNanoseconds(h.conn.config.limits.handlerDeadlineNs(deadline_ns));
     const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = armed, .clock = .awake } };

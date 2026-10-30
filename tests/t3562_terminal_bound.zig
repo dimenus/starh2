@@ -143,6 +143,8 @@ fn resetGlobals() void {
     first_start_err.store(0, .release);
     entered.store(0, .release);
     uploads_ok.store(0, .release);
+    shielded_entered.store(0, .release);
+    shielded_done_ns.store(0, .release);
 }
 
 /// Starts its response (the HEADERS are written before the stall), writes
@@ -208,10 +210,46 @@ fn upload(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) any
     try resp.send(204, &.{}, "");
 }
 
+/// `shielded`: how long the handler sleeps under its shield. Far longer than
+/// the test allows for the server's close, so a close that waits for the
+/// handler fails. The client's read can block up to its 1 s receive timeout
+/// before it half-closes, and the teardown watchdog panics after 5 s with no
+/// handler returning: 3 s is clear of both.
+const shielded_sleep_ns = 3 * std.time.ns_per_s;
+var shielded_entered: std.atomic.Value(usize) = .init(0);
+var shielded_done_ns: std.atomic.Value(u64) = .init(0);
+
+/// Shields itself from cancellation, sleeps, and returns without a response.
+/// Nothing in the process can stop it early: zio's cancel waits for the
+/// shield to end.
+fn shielded(_: *anyopaque, _: *const starh2.Request, _: *starh2.Response) anyerror!void {
+    zio.beginShield();
+    defer zio.endShield();
+    _ = shielded_entered.fetchAdd(1, .acq_rel);
+    zio.sleep(.fromNanoseconds(shielded_sleep_ns)) catch {};
+    shielded_done_ns.store(nowNs(), .release);
+}
+
+/// `aborter`: starts its response, then aborts it once, and records when it
+/// returned. Shielded, as a handler that must not be stopped would be.
+var aborter_started: std.atomic.Value(usize) = .init(0);
+var aborter_done: std.atomic.Value(bool) = .init(false);
+
+fn aborter(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    zio.beginShield();
+    defer zio.endShield();
+    defer aborter_done.store(true, .release);
+    var body = try resp.start(200, &.{});
+    _ = aborter_started.fetchAdd(1, .acq_rel);
+    body.abort() catch {};
+}
+
 const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/empty", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = empty } } },
     .{ .method = .GET, .path = "/stall", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = stall } } },
     .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = upload } } },
+    .{ .method = .GET, .path = "/shielded", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = shielded } } },
+    .{ .method = .GET, .path = "/aborter", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = aborter } } },
 };
 
 fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
@@ -249,6 +287,8 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
 
 const max_sid = 4096;
 const alive_ping = [8]u8{ 't', '3', '5', '6', '2', 'l', 'i', 'v' };
+/// The PING sent with the client's close_notify (`send_notify`).
+const notify_ping = [8]u8{ 't', '3', '5', '6', '2', 'n', 't', 'f' };
 const settle_ping = [8]u8{ 't', '3', '5', '6', '2', 's', 'e', 't' };
 const batch_ping = [8]u8{ 't', '3', '5', '6', '2', 'b', 'a', 't' };
 
@@ -291,6 +331,21 @@ const Client = struct {
     /// half-closed client sends nothing more.
     half_close: std.atomic.Value(bool) = .init(false),
     half_closed: bool = false,
+    /// One connection-level WINDOW_UPDATE, a frame the server answers with
+    /// nothing.
+    send_wu: std.atomic.Value(bool) = .init(false),
+    wu_sent: std.atomic.Value(bool) = .init(false),
+    /// TLS: one write of a PING (`notify_ping`) and this client's
+    /// close_notify, the socket left open (`Wire.sendThenCloseNotify`).
+    /// `notify_record_after`: one more record after the close_notify.
+    send_notify: std.atomic.Value(bool) = .init(false),
+    notify_ping_acked: std.atomic.Value(bool) = .init(false),
+    /// TLS: the handshake's last flight carries the preface, a PING
+    /// (`alive_ping`) and this client's close_notify, all in one write, the
+    /// socket left open (`Wire.handshakeWithThenCloseNotify`).
+    pipeline_notify: bool = false,
+    notify_sent: std.atomic.Value(bool) = .init(false),
+    notify_record_after: bool = false,
     /// Streams that ended for the client: a HEADERS with END_STREAM or an
     /// RST_STREAM, whichever came first.
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -355,12 +410,19 @@ fn clientRun(c: *Client) !void {
     }
     c.wire.store(w, .release);
     if (c.oracle_waiver) |why| w.oracle.waive(why);
-    try w.handshake();
     var req = try h2c.buildClientPrefaceAndSettings(c.gpa);
     defer req.deinit(c.gpa);
     try h2c.appendWindowUpdate(c.gpa, &req, 0, 1 << 30);
     for (0..c.streams) |i| try h2c.appendHeaders(c.gpa, &req, @intCast(1 + 2 * i), c.path, true);
-    try w.send(req.items);
+    if (c.pipeline_notify) {
+        var ping: [17]u8 = undefined;
+        _ = try frame.Serializer.ping(&ping, false, &alive_ping);
+        try req.appendSlice(c.gpa, &ping);
+        try w.handshakeWithThenCloseNotify(req.items);
+    } else {
+        try w.handshake();
+        try w.send(req.items);
+    }
 
     const deadline = nowNs() + 40 * std.time.ns_per_s;
     var reading = c.rcvbuf == null;
@@ -393,9 +455,22 @@ fn clientRun(c: *Client) !void {
             try w.send(more.items);
             c.batch_sent.store(true, .release);
         }
+        if (!c.notify_sent.load(.acquire) and c.send_notify.load(.acquire)) {
+            var ping: [17]u8 = undefined;
+            _ = try frame.Serializer.ping(&ping, false, &notify_ping);
+            try w.sendThenCloseNotify(&ping, c.notify_record_after);
+            c.notify_sent.store(true, .release);
+        }
+        if (!c.wu_sent.load(.acquire) and c.send_wu.load(.acquire)) {
+            var more: std.ArrayList(u8) = .empty;
+            defer more.deinit(c.gpa);
+            try h2c.appendWindowUpdate(c.gpa, &more, 0, 1000);
+            try w.send(more.items);
+            c.wu_sent.store(true, .release);
+        }
         if (!c.half_closed and c.half_close.load(.acquire)) {
             if (std.c.shutdown(w.fd, std.c.SHUT.WR) != 0) return error.HalfClose;
-            c.half_closed = true;
+            @atomicStore(bool, &c.half_closed, true, .release);
         }
         if (!c.settle_sent.load(.acquire) and c.send_settle.load(.acquire)) {
             var ping: [17]u8 = undefined;
@@ -469,6 +544,7 @@ fn clientRun(c: *Client) !void {
             },
             6 => if (s.flags & 1 != 0) {
                 if (std.mem.eql(u8, w.last_payload.items, &alive_ping)) c.ping_acked.store(true, .release);
+                if (std.mem.eql(u8, w.last_payload.items, &notify_ping)) c.notify_ping_acked.store(true, .release);
             } else {
                 // Acking the graceful PING moves the server to phase 2.
                 var ack: [17]u8 = undefined;
@@ -713,6 +789,10 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     // takes one chunk from the stash when a send completes, then blocks
     // again), which leaves a slot free and the pause off. One PING runs one
     // more drain, after the writer blocked, and the stall settles again.
+    // Its ack is ordinary output during the stall. If the share refused it,
+    // it would be owed and sent later, and that could hide a refusal; the
+    // assert below that no ordinary frame was refused rules that out, and
+    // the oracle checks that the ack arrives.
     c.send_settle.store(true, .release);
     try waitFor("the client to send its settle PING", &c, struct {
         fn f(x: *Client) bool {
@@ -1163,7 +1243,10 @@ const UploadClient = struct {
     conn_window: i64 = flow_initial_window,
     stream_window: [upload_streams]i64 = @splat(flow_initial_window),
     sent: [upload_streams]usize = @splat(0),
-    /// SETTINGS acks and the owed PING's ack, read after `go`.
+    /// Every SETTINGS ack read, from the start: the client sends two
+    /// SETTINGS (its preface's, and one on `go`), and when the preface's ack
+    /// is written depends on when the writer hold began, so it may come
+    /// after `go` too. The owed PING's ack, read after `go`.
     settings_acks: usize = 0,
     ping_acked: bool = false,
     ended_per_sid: [max_sid]u8 = @splat(0),
@@ -1234,7 +1317,7 @@ const UploadClient = struct {
                     self.rst_total += 1;
                     self.noteEnded(s.sid);
                 },
-                4 => if (went and s.flags & 1 != 0) {
+                4 => if (s.flags & 1 != 0) {
                     self.settings_acks += 1;
                 },
                 6 => if (s.flags & 1 != 0 and std.mem.eql(u8, p, &owed_ping)) {
@@ -1253,7 +1336,7 @@ const UploadClient = struct {
                 },
                 else => {},
             }
-            if (went and self.ended >= batch_held + upload_streams and self.settings_acks >= 1 and self.ping_acked) return;
+            if (went and self.ended >= batch_held + upload_streams and self.settings_acks >= 2 and self.ping_acked) return;
         }
     }
 
@@ -1340,7 +1423,9 @@ fn runOwedAcks(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     joined = true;
     std.debug.print("T3562 transport=h2c scenario=owed_acks settings_acks={d} ping_acked={} ended={d} rst_total={d} goaways={d} uploads_ok={d} conn_credit_after_go={d} client_err={s}\n", .{ c.settings_acks, c.ping_acked, c.ended, c.rst_total, c.goaways, uploads_ok.load(.acquire), c.conn_credit_after_go, if (c.err) |e| @errorName(e) else "-" });
     if (c.err) |e| return e;
-    try std.testing.expectEqual(@as(usize, 1), c.settings_acks);
+    // One ack for each SETTINGS the client sent: its preface's and the one
+    // owed during the stall.
+    try std.testing.expectEqual(@as(usize, 2), c.settings_acks);
     try std.testing.expect(c.ping_acked);
     try std.testing.expectEqual(@as(usize, 0), c.goaways);
     // Every upload reached its handler whole, and every stream ended once
@@ -1374,6 +1459,548 @@ fn expectEnded(c: *const Client, n: usize) !void {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+/// A handler that shields itself cannot be stopped, so the connection must
+/// not wait for it to close its socket: the peer half-closes while the
+/// handler sleeps under its shield, and the server's socket closes once the
+/// closing phase is done, long before the handler returns. The handler keeps
+/// its slot and task until it returns.
+fn runShielded(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, transport, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = transport,
+        .port = server.localAddress(0).getPort(),
+        .streams = 1,
+        .path = "/shielded",
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    try waitFor("the shielded handler to run", atLeast(&shielded_entered, 1), reached);
+    try halfCloseAndWait(&c, peer_eofs_0);
+    // The client closes its socket once it reads the server's EOF.
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
+    const closed = conn_mod.test_socket_close_ns.load(.acquire);
+    // The handler was still asleep when the socket closed.
+    try std.testing.expect(shielded_done_ns.load(.acquire) == 0 or shielded_done_ns.load(.acquire) > closed);
+    try std.testing.expect(c.eof);
+    try std.testing.expect(c.eof_ns < closed + shielded_sleep_ns / 2);
+    try expectEnded(&c, 1);
+    try std.testing.expect(c.goaways >= 1);
+
+    // The slot and task stay until the handler returns.
+    try waitFor("the shielded handler to return", &shielded_done_ns, struct {
+        fn f(x: *const std.atomic.Value(u64)) bool {
+            return x.load(.acquire) != 0;
+        }
+    }.f);
+    try std.testing.expect(shielded_done_ns.load(.acquire) > closed);
+    std.debug.print("T3562-shielded transport={s} close_before_handler_ms={d}\n", .{ @tagName(transport), (shielded_done_ns.load(.acquire) - closed) / std.time.ns_per_ms });
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+/// A TLS peer EOF that the top of a turn reaps (`pollRecv`), on a connection
+/// with nothing else to do, must still be taken (`onPeerEof`): the recv is
+/// not armed again after an EOF, and an idle connection has no deadline, so
+/// a turn that parks then waits until server shutdown. The hold makes the
+/// EOF land between two turns: it holds the turn that follows the client's
+/// WINDOW_UPDATE, and the client half-closes meanwhile.
+fn runIdleEof(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    conn_mod.test_hold_idle_tls_turn.store(false, .release);
+    conn_mod.test_release_idle_tls_turn.store(false, .release);
+    defer conn_mod.test_release_idle_tls_turn.store(true, .release);
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    const held_0 = conn_mod.test_idle_tls_turn_held.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 0,
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    // The exchange is over (the server answered a PING sent after its
+    // SETTINGS), and the actor goes idle.
+    c.send_alive.store(true, .release);
+    try waitFor("the PING ack", &c, struct {
+        fn f(x: *Client) bool {
+            return x.ping_acked.load(.acquire);
+        }
+    }.f);
+    zio.sleep(.fromMilliseconds(50)) catch {};
+    conn_mod.test_hold_idle_tls_turn.store(true, .release);
+    c.send_wu.store(true, .release);
+    try waitFor("an idle TLS turn to be held", atLeast(&conn_mod.test_idle_tls_turn_held, held_0 + 1), reached);
+    c.half_close.store(true, .release);
+    // The client sees the flag between reads, which can block up to its
+    // receive timeout; then the FIN needs a moment to reach the server's CQ.
+    try waitFor("the client to half-close", &c, struct {
+        fn f(x: *Client) bool {
+            return @atomicLoad(bool, &x.half_closed, .acquire);
+        }
+    }.f);
+    zio.sleep(.fromMilliseconds(100)) catch {};
+    conn_mod.test_release_idle_tls_turn.store(true, .release);
+
+    try waitFor("the server to take the peer's EOF", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    try std.testing.expect(c.eof);
+    try std.testing.expect(c.goaways >= 1);
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+/// The TLS pump at teardown. A handler's lock section that begins after the
+/// actor left its loop must not overlap the actor shutting the pump down:
+/// the handler reaches the pump through `tls_driver` (`pushWriteChunk`), and
+/// the pump must still be attached and alive for the whole section, or
+/// already detached when it begins. The holds force the interleaving: the
+/// handler's `abort()` waits before taking `session_mu` while the client
+/// half-closes and the connection ends; it takes the lock once the actor has
+/// left the loop and waits after it, and it stays in its section for longer
+/// than that wait.
+fn runAbortAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    aborter_started.store(0, .release);
+    aborter_done.store(false, .release);
+    conn_mod.test_release_abort.store(false, .release);
+    conn_mod.test_hold_abort.store(true, .release);
+    conn_mod.test_abort_dwell_ms.store(300, .release);
+    conn_mod.test_detach_dwell_ms.store(150, .release);
+    defer {
+        conn_mod.test_hold_abort.store(false, .release);
+        conn_mod.test_release_abort.store(true, .release);
+        conn_mod.test_abort_dwell_ms.store(0, .release);
+        conn_mod.test_detach_dwell_ms.store(0, .release);
+    }
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const held_0 = conn_mod.test_abort_held.load(.acquire);
+    const dwelling_0 = conn_mod.test_detach_dwelling.load(.acquire);
+    const saw_0 = conn_mod.test_abort_saw_pump_shut.load(.acquire);
+    const shuts_0 = conn_mod.test_tls_pump_shuts.load(.acquire);
+    const in_window_0 = conn_mod.test_abort_began_in_window.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 1,
+        .path = "/aborter",
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    try waitFor("the handler's abort to wait before the lock", atLeast(&conn_mod.test_abort_held, held_0 + 1), reached);
+    c.half_close.store(true, .release);
+    try waitFor("the actor to leave its loop", atLeast(&conn_mod.test_detach_dwelling, dwelling_0 + 1), reached);
+    conn_mod.test_release_abort.store(true, .release);
+    try waitFor("the handler to return", &aborter_done, struct {
+        fn f(x: *const std.atomic.Value(bool)) bool {
+            return x.load(.acquire);
+        }
+    }.f);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    // The instrument fired: the actor shut the pump while the test ran, and
+    // the handler's lock section began in the window this is about (the
+    // actor out of its loop, the pump still attached). A run that took the
+    // lock only after the detach proves nothing, and fails here.
+    // The actor shuts the pump only once it has `session_mu`, which the
+    // handler holds until just before it returns: wait for it, do not read it
+    // once.
+    try waitFor("the actor to shut the TLS pump", atLeast(&conn_mod.test_tls_pump_shuts, shuts_0 + 1), reached);
+    try std.testing.expectEqual(in_window_0 + 1, conn_mod.test_abort_began_in_window.load(.acquire));
+    try std.testing.expectEqual(saw_0, conn_mod.test_abort_saw_pump_shut.load(.acquire));
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runAbortAtTeardownTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runAbortAtTeardown, .{ rt, gpa });
+    try h.join();
+}
+
+/// The TLS send counters (`tls_edge.pump_trace`) at one moment.
+const SendCounts = struct { arms: u64, completes: u64 };
+
+/// Every TLS send armed since `at` has completed, and at least one did: no
+/// send is in flight on a connection that started after `at`.
+fn noSendInFlight(at: SendCounts) bool {
+    const trace = starh2.edge.tls_edge.pump_trace;
+    // Arms first: a send armed between the two reads then shows as in flight.
+    const arms = trace.send_arms.load(.acquire) - at.arms;
+    const completes = trace.send_complete.load(.acquire) - at.completes;
+    return completes > 0 and completes == arms;
+}
+
+/// A TLS peer that sends a frame and its close_notify in one write, and
+/// leaves the socket open: the server must take the close_notify (it
+/// decrypts both records in one call), ingest the frame before it, then send
+/// its GOAWAY and close_notify and close. The client reads all the while.
+fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 0,
+        .flood = 0,
+        .rcvbuf = null,
+    };
+    // The TLS send counters are global to the binary, and an earlier test's
+    // connection can end with a send canceled, never counted as completed:
+    // this connection's sends are the counts' rise from here, taken before it
+    // connects, when every earlier connection is gone.
+    const trace = starh2.edge.tls_edge.pump_trace;
+    const sends_0: SendCounts = .{ .arms = trace.send_arms.load(.acquire), .completes = trace.send_complete.load(.acquire) };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    // The exchange first (the server answered a PING sent after its
+    // SETTINGS), then the actor parked in its select. The PING and the
+    // close_notify then arrive through the recv completion the parked actor
+    // takes in that select: the pump decrypts both there (`ingestCipher`,
+    // `readOne`), and the PING's plaintext is still pending when the EOF is
+    // posted and the main loop asks `eofReady`. Taken at the top of a turn
+    // instead (`pollRecv`), the same turn reads the plaintext first, and
+    // that path cannot show the EOF taken too early.
+    //
+    // The park the test then samples must be one that only the client's
+    // next write can end. The PING ack's bytes can reach the client before
+    // the actor takes that send's completion, and a park on that completion
+    // ends without the client: the next turn's `pollRecv` then takes the
+    // PING and the close, on the path that reads the plaintext first. So the
+    // test first waits until the ack's send completion was taken: every TLS
+    // send this connection armed (`pump_trace.send_arms`) has completed
+    // (`send_complete`), at least one, so no send is in flight. The ack's
+    // send was armed before the client could read the ack, so it is among
+    // them. Then `test_actors_in_select`
+    // (raised just before the actor calls `zio.select`, lowered when it
+    // returns; one connection here) says the actor reached its select with
+    // nothing left to do. What can still end that park first: a send armed
+    // after the check (this connection writes nothing more until the
+    // client's close), a timer (it has no deadline armed), or the doorbell
+    // (it has no handler). The witness checked below
+    // (`test_eof_held_for_plaintext`) still says whether the guarded path
+    // ran.
+    c.send_alive.store(true, .release);
+    try waitFor("the PING ack", &c, struct {
+        fn f(x: *Client) bool {
+            return x.ping_acked.load(.acquire);
+        }
+    }.f);
+    try waitFor("the PING ack's send completion, with no send in flight", sends_0, noSendInFlight);
+    try waitFor("the actor to park in its select", atLeast(&conn_mod.test_actors_in_select, 1), reached);
+    const held_0 = starh2.edge.tls_edge.test_eof_held_for_plaintext.load(.acquire);
+    c.send_notify.store(true, .release);
+    try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    // The guarded path ran: the main loop found the EOF posted with the
+    // PING's plaintext still pending. A run that took the close at the top of
+    // a turn tested nothing here, and must fail, not pass.
+    const held = starh2.edge.tls_edge.test_eof_held_for_plaintext.load(.acquire);
+    if (held == held_0) {
+        std.debug.print("t3562: PRECONDITION NOT MET: the EOF was never posted with plaintext pending (test_eof_held_for_plaintext stayed at {d}), so this run did not reach the path eofReady's guard protects\n", .{held_0});
+        return error.GuardedPathNotReached;
+    }
+    // The PING before the close_notify was ingested before the close was
+    // taken: its ack came. The oracle requires it too.
+    try std.testing.expect(c.notify_ping_acked.load(.acquire));
+    try std.testing.expect(c.goaways >= 1);
+    try std.testing.expect(c.eof);
+    // The server closed, once, long before its closing deadline. The
+    // client's EOF is the server's FIN, which comes just before the server's
+    // close, so the close is waited for, not read at once.
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+/// A TLS peer that sends close_notify and then one more record, and does
+/// not read. The record after the close_notify must count for nothing (RFC
+/// 8446 section 6.1): with the server's output blocked by the unread socket,
+/// the closing phase waits for its deadline, and the actor must park meanwhile,
+/// not go round on that record. The connection still ends, at the deadline.
+fn runNotifyThenRecord(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    var limits = starh2.Limits.defaults;
+    limits.close_flush_timeout_ns = std.time.ns_per_s;
+    var path_buf: [104]u8 = undefined;
+    const path = try unixPath(&path_buf, .tls, "notify-record");
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, path);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    defer abort_gate.store(true, .release);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = 0,
+        .unix_path = path,
+        .streams = 1,
+        .flood = 0,
+        .rcvbuf = stall_rcvbuf,
+        .notify_record_after = true,
+        .oracle_waiver = "the client stops reading, so the server's output cannot be delivered",
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) {
+        c.read_gate.store(true, .release);
+        joinClient(&c, t);
+    };
+
+    // The handler's DATA fills what the unread socket holds.
+    try waitStarted(&c, 1);
+    data_bytes.store(stalled_data_bytes, .release);
+    data_gate.store(true, .release);
+    try waitFor("the handler to write its DATA", atLeast(&wrote, 1), reached);
+    try waitTransportStall(&c);
+
+    c.send_notify.store(true, .release);
+    try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    // The closing phase now waits for its deadline. A parked actor takes a
+    // few turns in that time; one that goes round takes thousands.
+    const turns_0 = conn_mod.test_tls_turns.load(.acquire);
+    zio.sleep(.fromMilliseconds(300)) catch {};
+    const turns = conn_mod.test_tls_turns.load(.acquire) - turns_0;
+    std.debug.print("T3562-notify-record turns_in_300ms={d}\n", .{turns});
+    try std.testing.expect(turns < 50);
+    // And the connection ends, at its closing deadline.
+    try waitFor("the server to close", atLeast(&conn_mod.test_socket_closes, closes_0 + 1), reached);
+    c.read_gate.store(true, .release);
+    joinClient(&c, t);
+    joined = true;
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runNotifyThenRecordTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runNotifyThenRecord, .{ rt, gpa });
+    try h.join();
+}
+
+/// A TLS client whose last handshake flight carries its preface, a PING and
+/// its close_notify, the socket left open. The server decrypts all of it as
+/// handshake leftover (`Conn.drainLeftoverPlain`), before its pump starts.
+/// It must still take the close: ingest the leftover, answer the PING, send
+/// its GOAWAY and close_notify, and close, long before any deadline.
+fn runPipelinedNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetGlobals();
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    defer {
+        gpa.free(cert);
+        gpa.free(key);
+    }
+    const limits = starh2.Limits.defaults;
+    var server = try serverFor(rt, gpa, .tls, limits, &cert, &key, null);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const closes_0 = conn_mod.test_socket_closes.load(.acquire);
+    const peer_eofs_0 = conn_mod.test_peer_eofs.load(.acquire);
+    const leftovers_0 = conn_mod.test_tls_leftover_connections.load(.acquire);
+    const close_at_start_0 = starh2.edge.tls_edge.test_close_at_pump_start.load(.acquire);
+    var c: Client = .{
+        .gpa = gpa,
+        .transport = .tls,
+        .port = server.localAddress(0).getPort(),
+        .streams = 0,
+        .flood = 0,
+        .rcvbuf = null,
+        .pipeline_notify = true,
+    };
+    const t = try std.Thread.spawn(.{}, clientMain, .{&c});
+    var joined = false;
+    defer if (!joined) joinClient(&c, t);
+
+    try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
+    joinClient(&c, t);
+    joined = true;
+    if (c.err) |e| return e;
+    // The frames came as handshake leftover, which is what this is about.
+    try std.testing.expectEqual(leftovers_0 + 1, conn_mod.test_tls_leftover_connections.load(.acquire));
+    // And the close_notify itself was in that leftover: the pump found it
+    // already decrypted when it started. A TCP split can deliver the frames
+    // with the handshake and the close_notify on the pump's first recv; the
+    // close is then taken the ordinary way, and this run did not test what
+    // it is about. That must fail, not pass.
+    const close_at_start = starh2.edge.tls_edge.test_close_at_pump_start.load(.acquire);
+    if (close_at_start != close_at_start_0 + 1) {
+        // One connection: exactly one pump start with the close already
+        // there. 0 more means the close came later (this run did not test
+        // the leftover close); 2 or more means more than this connection
+        // counted, which this test cannot explain either.
+        std.debug.print("t3562: PRECONDITION NOT MET: test_close_at_pump_start went from {d} to {d}, want exactly one more (0 more: the close_notify was not in the handshake leftover, so this run did not test the leftover close)\n", .{ close_at_start_0, close_at_start });
+        return error.LeftoverClosePreconditionNotMet;
+    }
+    // The PING in the leftover was ingested and answered before the close.
+    try std.testing.expect(c.ping_acked.load(.acquire));
+    try std.testing.expect(c.goaways >= 1);
+    try std.testing.expect(c.eof);
+    try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
+    server.requestShutdown();
+    serve_handle.join() catch {};
+    serving = false;
+}
+
+fn runPipelinedNotifyTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runPipelinedNotify, .{ rt, gpa });
+    try h.join();
+}
+
+fn runFrameThenNotifyTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runFrameThenNotify, .{ rt, gpa });
+    try h.join();
+}
+
+fn runIdleEofTop() !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runIdleEof, .{ rt, gpa });
+    try h.join();
+}
+
+fn runShieldedTop(transport: Transport) !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runShielded, .{ rt, gpa, transport });
+    try h.join();
 }
 
 fn runRefusedEndTop(transport: Transport, tombstones: usize) !void {
@@ -1428,7 +2055,7 @@ test "server failures in one stall, h2c: M aborts and the graceful GOAWAY all fi
     try runCaseTop(.h2c, .server_failures);
 }
 
-test "server failures in one stall, tls: M aborts and the graceful GOAWAY all fit, one RST per stream" {
+test "server failures in one stall, tls: M/2 aborts and the graceful GOAWAY wait under the pause, and the peer gets M RSTs in all" {
     try runCaseTop(.tls, .server_failures);
 }
 
@@ -1497,6 +2124,34 @@ test "ordinary refusals in one read chunk, the 413's peer ending with trailers, 
 
 test "owed acks during a stall, h2c: the SETTINGS ack, the PING ack and the WINDOW_UPDATE credit arrive after it, and the upload finishes" {
     try runOwedAcksTop();
+}
+
+test "a shielded handler past the close, h2c: the socket closes when the closing phase ends, not when the handler returns" {
+    try runShieldedTop(.h2c);
+}
+
+test "a shielded handler past the close, tls: the socket closes when the closing phase ends, not when the handler returns" {
+    try runShieldedTop(.tls);
+}
+
+test "a TLS peer EOF reaped at the top of an idle turn is still taken, and the server closes long before any deadline" {
+    try runIdleEofTop();
+}
+
+test "a handler's lock section after the loop ends never overlaps the TLS pump's shutdown (tls)" {
+    try runAbortAtTeardownTop();
+}
+
+test "a TLS frame and close_notify in one write, the socket left open: the server ingests the frame, takes the close, and closes" {
+    try runFrameThenNotifyTop();
+}
+
+test "a TLS record after close_notify counts for nothing: the actor parks while the closing phase waits, and the connection ends" {
+    try runNotifyThenRecordTop();
+}
+
+test "a TLS close_notify in the handshake's last flight, behind the preface and a PING, the socket left open: the server takes it and closes" {
+    try runPipelinedNotifyTop();
 }
 
 test "zz h2 oracle: no protocol violation on any connection in this binary" {

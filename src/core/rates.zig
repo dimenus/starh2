@@ -18,6 +18,11 @@ pub const TokenBucket = struct {
     tokens: f64,
     refill_per_ns: f64,
     last_ns: u64 = 0,
+    /// Tokens kept by work the frames left behind and the server has not
+    /// done yet (an owed ack, `Session.Owed`). The bucket refills only up to
+    /// `capacity - held`, so what is owed counts against the limit until it
+    /// is done: `tokens + held <= capacity` always.
+    held: f64 = 0,
 
     pub fn init(capacity: f64, refill_per_sec: f64) TokenBucket {
         return .{
@@ -27,24 +32,53 @@ pub const TokenBucket = struct {
         };
     }
 
-    pub fn tryTake(self: *TokenBucket, now_ns: u64) bool {
+    fn refill(self: *TokenBucket, now_ns: u64) void {
         if (self.last_ns == 0) {
             self.last_ns = now_ns;
         } else if (now_ns > self.last_ns) {
             const elapsed = @as(f64, @floatFromInt(now_ns - self.last_ns));
-            self.tokens = @min(self.capacity, self.tokens + elapsed * self.refill_per_ns);
+            self.tokens = @min(self.capacity - self.held, self.tokens + elapsed * self.refill_per_ns);
             self.last_ns = now_ns;
         }
+    }
+
+    pub fn tryTake(self: *TokenBucket, now_ns: u64) bool {
+        self.refill(now_ns);
         if (self.tokens < 1.0) return false;
         self.tokens -= 1.0;
         return true;
     }
+
+    /// Keep one token for work still owed: the token its frame takes (or
+    /// took) is not refilled while it is held. It takes nothing itself, and
+    /// it refills up to `now_ns` first, with the old `held`: a frame's ack
+    /// can be owed while the frame is handled, before the frame is charged
+    /// at the same `now_ns`, and the refill that pays for the frame must not
+    /// see its own hold. After the frame, `tokens + held <= capacity` again.
+    pub fn hold(self: *TokenBucket, now_ns: u64) void {
+        std.debug.assert(self.held < self.capacity);
+        self.refill(now_ns);
+        self.held += 1.0;
+    }
+
+    /// The owed work is done: its token refills again. It refills up to
+    /// `now_ns` first, with the old `held`, the same rule as `hold`: the
+    /// work can be owed again at once (the edge refuses a retried ack), and
+    /// a hold at the same `now_ns` must then find no refill to pay twice.
+    /// Without it, the refill after a release and re-hold saw the lowered
+    /// count and gave one token too many.
+    pub fn release(self: *TokenBucket, now_ns: u64) void {
+        std.debug.assert(self.held >= 1.0);
+        self.refill(now_ns);
+        self.held -= 1.0;
+    }
 };
 
 /// The burst of SETTINGS and of PING frames a peer may send at once. Each one
-/// forces an ack, so this is also how many acks `Session` keeps owed at most
-/// while it cannot queue them (`Session.Owed`): more owed at once is a peer
-/// that goes on sending past its burst while it reads nothing.
+/// forces an ack, and an ack `Session` cannot queue is owed (`Session.Owed`)
+/// and keeps its frame's token until it is queued (`TokenBucket.hold`). So
+/// the bucket admits a frame only while fewer than this many acks are owed,
+/// and the owed rings, which hold this many, are never the limit.
 pub const SETTINGS_BURST: usize = 100;
 pub const PING_BURST: usize = 100;
 
@@ -110,6 +144,24 @@ pub const RateLimiter = struct {
             // exempt nor charged against the shared budget.
             .window_update => return self.window_update.tryTake(now_ns),
             else => return self.non_data.tryTake(now_ns),
+        }
+    }
+
+    /// An ack of `typ` (SETTINGS or PING) is owed: it keeps its token.
+    pub fn holdAck(self: *RateLimiter, typ: frame.FrameType, now_ns: u64) void {
+        switch (typ) {
+            .settings => self.settings.hold(now_ns),
+            .ping => self.ping.hold(now_ns),
+            else => unreachable,
+        }
+    }
+
+    /// An owed ack of `typ` was queued: its token refills again.
+    pub fn releaseAck(self: *RateLimiter, typ: frame.FrameType, now_ns: u64) void {
+        switch (typ) {
+            .settings => self.settings.release(now_ns),
+            .ping => self.ping.release(now_ns),
+            else => unreachable,
         }
     }
 };

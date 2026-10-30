@@ -517,3 +517,392 @@ close_notify (6a); (28) the ReadPump shuts the send side on EOF again (6b);
 (29) handlers joined before the socket closes (6c). Full `./zb build test`
 each, on the Mac. Run the Linux gate as in round 3. Report `slotBootBytes`
 at defaults by running it.
+
+## Round 5 (review of 33caeac; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at 33caeac: Mac gates pass on a clean cache (682 of 685,
+3 skipped, none cached; ci: only the libcxx probes fail; smoke, ReleaseFast,
+observe ReleaseFast and session-mu-gate pass). Linux on nachos (a fresh
+`git archive` tree with the pinned zio): the full suite passed 685 of 685
+twice, the second on a clean cache. The `t3562` binary passed 30/30 alone and
+30/30 three at a time on BOTH systems. Every one of the 29 mutations in the
+report is caught, my round 3 survivor included.
+
+**My mutation survived:** in `Session.onData`, checking the connection window
+without the owed credit (`if (self.windows.conn_recv < total) {`) passes the
+whole suite (682 of 685). The stream-window twin is caught by one unit test
+only. Two other mutations of mine were caught: dropping a PING ack silently
+past the owed bound (crash), and the stream-window twin.
+
+Ryan decided this round: a NARROW round. Fix only the items below, each as a
+new commit on top of 33caeac. Each fix needs a test that fails on 33caeac
+first; say in the commit which test and how it failed. Do not reopen the
+T = M + 3 design or the cancel-all rule (item 7). The earlier rules still
+apply, and Linux remains a required gate.
+
+1. **TLS: a peer EOF reaped at the top of a turn parks the actor (high; both
+   reviewers; from 6b, ea7b6e1).** `driveTlsTurn` calls `pump.pollRecv()`
+   first. On `n == 0`, `onRecvComplete` sets `inbound_eof` and returns `.ok`,
+   so `pollRecv` returns `.progress`. Outside the closing phase the same turn
+   falls through to `waitForActivity`, and the main loop calls `onPeerEof`
+   only after `driveTlsTurn` returns. An idle connection has no deadline in
+   `nextDeadlineNs`, so it parks until server shutdown and holds its slot and
+   fd. Scenario: the peer sends a frame that produces no output (a
+   WINDOW_UPDATE, a SETTINGS ack) and closes in the same instant, so the EOF
+   completion lands while the actor is busy. Fix so that no turn can park
+   with an unhandled `inbound_eof`. The test: TLS, no handler alive, the peer
+   writes a frame and then closes or half-closes; `onPeerEof` runs and the
+   server's socket closes well before any deadline. It must fail on 33caeac
+   (force the timing if needed, for example by delivering the EOF while the
+   actor is in a turn), on Mac and Linux.
+2. **TLS pump lifetime at teardown (high if real; both reviewers; widened by
+   6c, 33caeac).** `tls_pump`, `read_pump` and `write_pump` are locals of
+   `runBody`. Its `defer` sets `self.tls_driver = null` and shuts the CQ
+   WITHOUT `session_mu`, and since 33caeac it runs before
+   `teardownExhaustive` on every exit. `abortCb` has no terminal-cause check,
+   and `drainEmit` reaches `pushWriteChunk`, which reads `self.tls_driver`
+   under `session_mu`. A shielded handler that calls `abort()` between the
+   loop's exit and the defer can hold a pointer into a dead stack frame.
+   First prove or disprove the race. Then fix it structurally, so the wrong
+   access cannot be written: the pumps become Connection fields (or another
+   owner that outlives every handler), detached under `session_mu` before
+   the loop is left, and no handler path can reach a pump after detach. Also
+   say whether `JoinHandle.cancel` joins (read zio's source). The test: a
+   shielded handler that calls `abort()` in a loop after the peer half-closes,
+   on TLS, in a safe build.
+3. **A peer RST for a stream still in the map leaves the RST obligation set
+   (medium; Fable; from item 1, b3cf629).** The in-map branch of the peer
+   RST_STREAM handler in `Session` removes the stream but does not call
+   `clearRefusalObligation`; only the not-in-map branch does. A refusal later
+   in the same section then finds no map entry, and `rstOwed(.refused_end)`
+   returns true, so the server resets a stream the peer already reset and uses
+   a terminal slot for it. Fix, and add the in-map variant of the existing
+   session test (stream `.open`, final HEADERS queued, peer RST, refusal
+   queues no RST).
+4. **The owed PING/SETTINGS bound is reachable inside the rate limit (low;
+   both reviewers; item 3).** The PING bucket holds 100 and refills 10 per
+   second, so a peer may send PING 101 within its limit 100 ms after a burst
+   of 100. With the share full for those 100 ms the 101st owed ack ends the
+   connection. The doc comment's claim ("past the burst its rate limit
+   allows") is false. Make the two bounds one, so an owed ack can never exist
+   that the rate limit allowed and the bound refuses. Fable's suggestion: an
+   owed ack keeps its token until it is sent. Same for SETTINGS. Test it
+   with a peer that stays inside the limit.
+5. **Tests for my survivor:** a test that fails when `onData` ignores the
+   owed CONNECTION credit, and a second test (not the same unit test) for the
+   stream twin.
+6. **Negative handler deadlines panic (low; astra; from e47b7ad).** Both
+   `waitUntilCb` (h1 and h2) do `@intCast(deadline.nanoseconds)` to `u64`.
+   A past deadline below zero, or one above `u64`, traps in a safe build,
+   where zio's `Timeout` used to clamp it. Compare before narrowing, and
+   saturate as zio does. Unit test with `.fromNanoseconds(-1)`.
+7. **Cancel-all on peer EOF stays (Ryan's decision).** `peerClosed` resets
+   every open stream, `half_closed_remote` included. Say so in its doc
+   comment, and why: a closing connection is bounded in time, and a request
+   whose response would still need a peer frame cannot finish. Do not change
+   the behaviour.
+8. **Small items.**
+   - Rename the TLS `server_failures` case to what it proves (M/2 aborts and
+     the GOAWAY under the pause; M RSTs in all).
+   - `h2_oracle`: track the open header block. HEADERS(END_STREAM) without
+     END_HEADERS must not end a stream until its last CONTINUATION, a
+     CONTINUATION must follow on the same stream with nothing between, and EOF
+     inside a block is a violation. Check the stricter oracle passes on 33caeac
+     plus your fixes; if it finds something, report it.
+   - astra's dispatch-memory refusal (`connection.zig` near the
+     `respond_headers ... catch {}` before `releaseSlot`): when building the
+     refusal response fails for want of a frame buffer, the stream is released
+     with no response and no RST. Prove or disprove it by reading or by a test.
+     If real, fall back to a terminal-store RST as `emitEarlyReject` does.
+   - `finishGraceful` removes map entries while it iterates the map
+     (pre-existing). Collect the ids first, as `peerClosed` does.
+
+Not in this round (file each with `task` if not already filed): Fable's note
+that the h1 `waitUntilCb` sleeps with no wake arm; astra's note that PING
+acks owed after a refusal can leave out of order (RFC 9113 does not require
+order); astra's note that WINDOW_UPDATE credit queued but unwritten counts as
+told in `onData` (pre-existing, and the server has room for that credit).
+
+Mutations for this round (add to the report's table): 30, item 1's check
+removed; 31, item 3's `clearRefusalObligation` removed from the in-map
+branch; 32, item 4's token kept by an owed ack released at once; 33, the
+connection-credit subtraction removed (my survivor); 34, item 6's
+comparison done after the narrowing. For item 2, mutate the detach ordering
+if the structure still allows it; if the new shape makes the wrong order
+impossible to write, say so instead.
+
+## Round 6 (review of e676294; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at e676294: Mac gates pass on a clean cache (712 of 715,
+3 skipped, none cached; ci: only the libcxx probes fail; smoke, ReleaseFast,
+observe ReleaseFast and session-mu-gate pass). Linux on nachos (a fresh
+`git archive` tree): the full suite passed 715 of 715 twice, the second on a
+clean cache. The `t3562` binary passed 30/30 alone and 30/30 three at a time
+on BOTH systems. Every mutation in the report is caught, and so are mine: an
+owed PING ack that never releases its token (the PING owed-ack test), and a
+refill that ignores held tokens (both owed-ack tests).
+
+Ryan decided this round: fix the items below, including the pre-existing hot
+loop (item 5), each as a new commit on top of e676294, each with a test that
+fails on e676294 first (say in the commit how it failed), except the doc
+items. Do not reopen T = M + 3 or cancel-all on peer EOF. The earlier rules
+still apply, and Linux remains a required gate.
+
+1. **A close_notify decrypted with application data never posts EOF
+   (medium; astra; 6b's area).** `decryptInto` decrypts records until
+   `peer_closed`, so one call can return an application record's plaintext
+   AND set `peer_closed` from a close_notify behind it. `readOne` then
+   returns `.ok` with `n > 0` and does not call `postEof`. `pendingInbound()`
+   is only "a complete record is buffered", so nothing calls `readOne` again
+   to report the close. A peer that sends a frame and close_notify in one
+   flight, then waits for the server's close_notify without closing TCP,
+   holds the connection with no deadline. Fix so that a `peer_closed` the
+   pump has not reported is always reported, after the plaintext before it is
+   ingested. Test: TLS, the peer sends a frame and close_notify coalesced in
+   one write, and does NOT close TCP; the server must take the EOF, send its
+   GOAWAY and close_notify, and close.
+2. **A refused owed-ack retry over-refills the bucket (low; astra; item 4
+   of round 5).** `requeueOwed` releases a hold, the edge then refuses the
+   retried ack (entries free but bytes not, since `ordinaryFree()` counts
+   entries only), and the re-owe calls `hold(now)`, which refills with the
+   lowered `held` first. Example from the review: 100 owed, `tokens = 0`;
+   100 ms later one retry is refused and re-held; the refill with
+   `held = 99` makes one token, then `held` is 100 again, so
+   `tokens + held = 101` and a PING is admitted with the ring full. Fix so
+   `tokens + held <= capacity` holds across release and re-hold (for
+   example, refill to the release time before lowering `held`, or keep the
+   hold until the retry is accepted). Test the refused-retry path, for PING
+   and SETTINGS.
+3. **The item 2 test can pass without entering its race (medium, test
+   validity; both reviewers).** `runAbortAtTeardown` asserts only that the
+   pump shut and that no section saw it shut while attached. If the handler
+   takes `session_mu` only after the detach, both assertions pass and the
+   test proves nothing. Add positive evidence that a lock section BEGAN with
+   the pump attached during the dwell (a counter at the hook), assert it
+   rose, and make a run that missed the window fail, not pass. Re-run
+   mutation 2d against it.
+4. **Two doc comments (low; Fable).** `detachTlsPump` was inserted between
+   `beginLeave`'s doc comment and `beginLeave`, so "This helper does not
+   lock" now heads the function that locks. Move it back. `openStreamIds`
+   says its slice is "valid until the next call", but `checkIdleDeadlines`
+   also writes `stale_ids`: say so, or route that sweep through the same
+   helper, and if cheap make a misuse loud in safe builds.
+5. **After close_notify, a further complete record keeps the actor from
+   parking (low; Fable; pre-existing; Ryan: fix it here).** `decryptInto`
+   stops at `peer_closed`, but `pendingInbound()` stays true while a
+   complete record sits behind the close_notify, and `driveTlsTurn`'s "never
+   park while pendingInbound()" returns without parking on every turn, until
+   the closing deadline. Only a peer that violates TLS reaches it. Fix so
+   bytes after close_notify are dropped or no longer count as work (RFC 8446
+   section 6.1: data after close_notify is ignored). Test: a peer sends
+   close_notify then another record, does not read; the actor must park
+   (count turns, or check it is in the select) and the connection must end.
+6. **REFUSED_STREAM for a 503 dispatch refusal (low; Fable).** efbfefe
+   resets a stream refused for want of job memory with INTERNAL_ERROR. When
+   the refusal was a 503 (server cap, retriable), use REFUSED_STREAM (RFC
+   9113 section 8.7); keep INTERNAL_ERROR for the 500 (the request's own
+   cap). Extend efbfefe's test to cover both.
+7. **The t-3671 flake.** `owed_acks` counts every SETTINGS ack after `go`,
+   and the preface's ack can arrive after `go` under load (1 of 60 three at
+   a time on the Mac in round 5). Fix the test so it counts only the acks of
+   the SETTINGS it sends, then close t-3671 in the report (I will close the
+   task).
+
+Mutations for this round (add to the report's table): 35, item 1's report
+of an unreported `peer_closed` removed; 36, item 2's ordering reverted
+(release lowers `held` before the refill); 37, item 5's drop of bytes after
+close_notify removed; 38, item 6 always INTERNAL_ERROR; and 2d again,
+against item 3's stronger test.
+
+## Round 7 (review of 2b9a2c2; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at 2b9a2c2: Linux on nachos (a fresh `git archive`
+tree): the full suite passed 719 of 719 twice, the second on a clean cache;
+`t3562` 30/30 alone and **29/30 three at a time**. Mac, on a clean cache:
+the full suite **failed 1 test** (715 of 719); ci fails only on the libcxx
+probes; smoke, ReleaseFast, observe ReleaseFast and session-mu-gate pass;
+`t3562` 30/30 alone and 30/30 three at a time. Both failures were the same
+test, `a handler's lock section after the loop ends never overlaps the TLS
+pump's shutdown (tls)`, with `TestUnexpectedResult` from
+`runAbortAtTeardown` and no timeout message (item 2 below).
+
+**My mutation survived:** in `Pump.eofReady`, dropping the pending-plaintext
+guard (`if (!self.inbound_eof) return false;` instead of
+`if (!self.inbound_eof or self.pending_read != null) return false;`) passes
+the whole suite (716 of 719, nothing cached). Your round 6 report says the
+rule is needed (the closing phase drops frames read after the EOF is taken),
+but no test shows it.
+
+Ryan decided this round: fix items 1 to 4, each as a new commit on top of
+2b9a2c2, each with a test that fails on 2b9a2c2 first (say in the commit how
+it failed). The earlier rules still apply, and Linux remains a required gate.
+
+1. **A close_notify consumed in the post-handshake drain is never posted
+   (medium; both reviewers, independently).** `Server` calls
+   `tls_conn.drainLeftoverPlain(&leftover_buf)` (src/edge/server.zig), which
+   runs `decryptInto` and can set `peer_closed` from a close_notify pipelined
+   behind the client's Finished and first frames. `Pump.start` then sets
+   `inbound_eof = false` and never reads `conn.peer_closed`;
+   `pendingInbound()` is false, so `readOne` never reports it. A client that
+   pipelines [Finished][preface][frames][close_notify] and leaves TCP open
+   holds the connection with no deadline. This is round 6 item 1's class at
+   `decryptInto`'s second caller. Fix so a `peer_closed` already set when the
+   pump starts is reported, after the leftover is ingested. Test: a TLS
+   client whose Finished flight carries its preface, a PING and its
+   close_notify, TCP left open; the server takes the EOF, answers the PING,
+   sends its GOAWAY and close_notify, and closes well before any deadline.
+2. **The teardown test reads the pump-shutdown counter once (flake; astra;
+   seen failing 2 times in my runs).** `runAbortAtTeardown` waits for
+   `aborter_done`, joins the client, then checks
+   `test_tls_pump_shuts > shuts_0` once. The actor increments that counter
+   only after it takes `session_mu`, which the handler holds until just
+   before `aborter_done` is set, and the client can already be done (the
+   server shut its send side before the dwell). Wait for the counter (with
+   the usual waitFor) instead of sampling it, and check the test still
+   catches mutation 2d and still fails when the window is missed. Then run
+   the `t3562` binary 30 times three at a time on both systems and report it.
+3. **A 503 refused later at admission still resets with INTERNAL_ERROR
+   (low; astra; not checked by me).** The claim: job construction hits the
+   server or connection cap, a frame buffer is available so the 503 HEADERS
+   is built, then the edge's ordinary share refuses it, and
+   `resetRefusedHeaders` queues `.internal_error`. Prove or disprove it by
+   reading and a test. If real, carry the refusal's reset code with that
+   response so a pre-dispatch 503 resets with REFUSED_STREAM on this path
+   too. Do not infer retry safety from a 503 a handler produced.
+4. **My survivor.** Make a test fail when `eofReady` ignores pending
+   plaintext: round 6 item 1's test sends a WINDOW_UPDATE ahead of the
+   close_notify, which the client cannot see dropped. Send a frame the
+   server must answer (a PING) ahead of it, so the oracle requires the ack.
+   Run my mutation against it and report.
+
+Mutations for this round (add to the report's table): 39, item 1's report of
+an already-closed peer at pump start removed; 40, item 2's wait reverted to a
+single read (it must still pass when the timing is kind, so say how you
+showed the wait matters); 41, item 3's code carried as INTERNAL_ERROR again
+(if item 3 is real); 42, my survivor (the `pending_read` guard in
+`eofReady` removed).
+
+## Round 8 (review of 64a3527; Fable, gpt-6-astra, and the orchestrator)
+
+Orchestrator's runs at 64a3527: Linux on nachos (a fresh `git archive`
+tree): the full suite passed 722 of 722 twice, the second on a clean cache;
+`t3562` 30/30 alone and 30/30 three at a time. Mac, on a clean cache: the
+full suite passed (719 of 722, 3 skipped); ci fails only on the libcxx
+probes; smoke, ReleaseFast, observe ReleaseFast and session-mu-gate pass;
+`t3562` 30/30 alone and 30/30 three at a time.
+
+Mutation 42 (my round 6 survivor) is now caught on both systems: on Linux the
+full suite fails the frame-then-close_notify test and the h2 oracle, and the
+mutated `t3562` binary failed 10 of 10; the Mac full suite fails the same two
+tests.
+
+**My new mutation survived on both systems:** in `Session.applyCommand`,
+`.respond_headers` passing `.refused_stream` instead of `.internal_error` to
+`cmdHeaders` (so a status a handler sends resets with REFUSED_STREAM when the
+edge refuses it) passes the whole suite: Mac 719 of 722 (3 skipped), Linux 722
+of 722, nothing cached. Both reviewers found the same gap by reading.
+
+Neither reviewer found a production defect in round 7. Ryan decided this
+round: three test-only items, each a new commit on top of 64a3527. **No
+production code changes**, except a test-only counter or hook if an item
+needs one (compiled out of release builds, like the existing `test_*`
+counters). The earlier rules still apply, and Linux remains a required gate.
+
+1. **A handler's own 503 refused at the edge must reset with INTERNAL_ERROR
+   (the survivor; both reviewers).** Add a case beside the four
+   `expectDispatchRefusalReset` cases in `src/edge/connection.zig`: a route
+   whose handler runs (prove it ran, for example a counter it bumps) and
+   answers 503 with END_STREAM and no body, while the ordinary share is
+   pinned the same way as `.share_full`. Assert exactly one RST on that
+   stream, code INTERNAL_ERROR, and no GOAWAY. It must fail under mutation 43
+   below.
+2. **The item 4 test reaches the guarded path by a 50 ms sleep (both
+   reviewers).** In the frame-then-close_notify test
+   (`tests/t3562_terminal_bound.zig`, the `zio.sleep(.fromMilliseconds(50))`
+   before `c.send_notify`), wait instead on `conn_mod.test_actors_in_select`
+   reaching at least 1 (as `tests/t3567_tls_barriers.zig` does), then send.
+   Say in the commit what that counter proves and what it does not (for
+   example, whether the actor can leave the select before the client's write
+   lands). Mutation 42 must still fail it: run the mutated `t3562` binary 10
+   times on Linux and 3 times on the Mac and report the counts.
+3. **The item 1 test does not prove the close_notify came in the leftover
+   (astra).** `test_tls_leftover_connections` counts a connection with any
+   leftover, so a TCP split that delivers the PING in the handshake read and
+   the close_notify on the pump's first recv passes the test with the
+   `Pump.start` fix removed. Make the test assert that the close itself was
+   found at pump start (for example a test counter bumped in `Pump.start`'s
+   `peer_closed` branch). If that precondition is not met, the test must
+   FAIL with a message that says so, never pass silently. Report how often
+   the precondition held in the 30-run gates.
+
+Mutations for this round (add to the report's table): 43, `.respond_headers`
+passing `.refused_stream` (mine, above); 44, item 2's wait replaced by the old
+50 ms sleep (a test edit: say what shows the wait matters); 45, the
+`Pump.start` `peer_closed` branch removed (mutation 39 again, against item 3's
+stronger test).
+
+Do not tell me the tests pass; I recompute. Report as before in
+`tools/t3562-report.md` (replace the round 7 report), then print exactly one
+line: `STATUS: done t62i /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.
+
+## Round 8b (review of df47a43; Fable and gpt-6-astra agree)
+
+Both reviewers, independently, found the same two gaps in round 8's tests;
+Fable added a wording nit. Still test-only, the same rules. One commit per
+item on top of this brief commit.
+
+1. **Item 1's test does not pin the path the brief asked for (both).** It
+   also passes if the handler's `resp.send(503, ...)` fails inside
+   `cmdHeaders` (intent room, frame rent, `HeadersTooLarge`): the handler
+   returns an error, `runHandlerJobBody`'s fallback sends a 500 through
+   `.respond_headers`, the pinned share refuses that HEADERS, and the stream
+   is reset with INTERNAL_ERROR. Every assertion holds and no 503 was built.
+   Mutation 43 cannot tell the two paths apart. Make the test require: the
+   handler's own `send` returned without error (record it in the handler);
+   `test_ctrl_ordinary_pool_full` rose by exactly 1 across the ingest; and no
+   HEADERS for stream 1 reached the wire (if `trapCollect` cannot count
+   HEADERS, say what it can count instead). Show the test fails when the
+   handler's send is forced to fail (a temporary edit), with the fix in place.
+2. **Item 2's wait can see the actor parked on the PING ack's send
+   completion (both).** `ping_acked` is set when the ack's bytes reach the
+   client, which can come before the actor takes its send completion
+   (`onSendComplete`), so the park the test samples can be the one waiting on
+   that completion; the next turn's `pollRecv` then takes the close on the
+   path the guard is not needed on. Add a test-only witness so the test knows
+   the guarded path ran, not just that it was likely: for example, wait until
+   no TLS send is in flight before sampling the park gauge, or count a recv
+   completion taken in the select that leaves plaintext pending and posts the
+   EOF in one call, and require it. Correct the comment's "nothing being
+   written". Run mutation 42 against it again: 10 times on Linux, 3 on the
+   Mac.
+3. **The precondition message (Fable, nit).** The check is `!= +1`, so a
+   delta of 2 fails with a message that says the close was not in the
+   leftover. Print the baseline and the value read.
+
+Report as before (replace the round 8 report), then print exactly one line:
+`STATUS: done t62j /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.
+
+## Round 8c (review of b78de27; Fable and gpt-6-astra agree)
+
+Both reviewers found one gap, the same one: round 8b's witness turns the
+send-completion race into a loud failure but does not remove it, so a
+correct server can now fail the frame-then-close_notify test with
+`error.GuardedPathNotReached`. The park the test samples can be the select
+that the PING ack's send completion ends; the next turn's `pollRecv` then
+takes the PING and the close and ingests the PING before `eofReady`. Test
+only, one commit on top of this brief commit.
+
+1. Before the test samples `test_actors_in_select`, wait until the PING
+   ack's send completion has been taken: sample
+   `tls_edge.pump_trace.send_complete` (bumped in `Pump.onSendComplete` in
+   observe builds) before the client sends its first PING, and after "the
+   PING ack" wait for it to rise (a `u64` sibling of `atLeast`/`reached` if
+   needed). Then wait on the park gauge, then send. Keep the witness check.
+   Say in the commit what this proves and what can still end the park (for
+   example a second send, if the server writes anything else after the ack).
+   Run the `t3562` binary 30 times alone and 30 three at a time on Linux and
+   report how many runs failed the witness; run mutation 42 against it again,
+   10 times on Linux and 3 on the Mac.
+
+Report as before (replace the round 8b report), then print exactly one line:
+`STATUS: done t62k /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.

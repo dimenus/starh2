@@ -127,7 +127,7 @@ pub const Wire = struct {
     }
 
     pub fn handshake(self: *Wire) !void {
-        return self.handshakeImpl(null);
+        return self.handshakeImpl(null, false);
     }
 
     /// Open the connection with `flight` (plaintext HTTP/2) already sent. On
@@ -136,10 +136,18 @@ pub const Wire = struct {
     /// so the server reads the flight as handshake leftover. On h2c it is
     /// the first write.
     pub fn handshakeWith(self: *Wire, flight: []const u8) !void {
-        return self.handshakeImpl(flight);
+        return self.handshakeImpl(flight, false);
     }
 
-    fn handshakeImpl(self: *Wire, flight: ?[]const u8) !void {
+    /// TLS only: as `handshakeWith`, with this client's close_notify after
+    /// the flight in the same write, and the socket left open. The server
+    /// decrypts all of it as handshake leftover.
+    pub fn handshakeWithThenCloseNotify(self: *Wire, flight: []const u8) !void {
+        std.debug.assert(self.transport == .tls);
+        return self.handshakeImpl(flight, true);
+    }
+
+    fn handshakeImpl(self: *Wire, flight: ?[]const u8, close_after: bool) !void {
         if (flight) |f| self.oracle.onSend(f);
         if (self.transport == .h2c) {
             if (flight) |f| try self.sendRaw(f);
@@ -178,6 +186,7 @@ pub const Wire = struct {
                 try last.appendSlice(self.gpa, r.ciphertext);
                 off += r.cleartext_pos;
             }
+            if (close_after) try last.appendSlice(self.gpa, try self.conn.close(&self.out));
             try self.sendRaw(last.items);
         }
     }
@@ -222,6 +231,30 @@ pub const Wire = struct {
             try self.sendRaw(r.ciphertext);
             off += r.cleartext_pos;
         }
+    }
+
+    /// TLS only: send `frames`, then this client's close_notify, in ONE
+    /// write, without closing the socket. `record_after`: one more complete
+    /// record after the close_notify (its payload is not valid ciphertext; a
+    /// peer must ignore anything after close_notify, RFC 8446 section 6.1).
+    pub fn sendThenCloseNotify(self: *Wire, frames: []const u8, record_after: bool) !void {
+        std.debug.assert(self.transport == .tls);
+        self.oracle.onSend(frames);
+        var flight: std.ArrayList(u8) = .empty;
+        defer flight.deinit(self.gpa);
+        var off: usize = 0;
+        while (off < frames.len) {
+            const r = try self.conn.encrypt(frames[off..][0..@min(frames.len - off, 16 * 1024)], &self.out);
+            try flight.appendSlice(self.gpa, r.ciphertext);
+            off += r.cleartext_pos;
+        }
+        try flight.appendSlice(self.gpa, try self.conn.close(&self.out));
+        if (record_after) {
+            const junk_len = 20;
+            try flight.appendSlice(self.gpa, &.{ 0x17, 0x03, 0x03, 0x00, junk_len });
+            try flight.appendNTimes(self.gpa, 0xa5, junk_len);
+        }
+        try self.sendRaw(flight.items);
     }
 
     pub fn recordLen(bytes: []const u8) ?usize {

@@ -90,6 +90,12 @@ pub const OutboundFrame = struct {
     /// The obligation lives on the frame, not in the tombstone ring, which a
     /// connection may keep empty and always overwrites.
     owes_rst_if_refused: bool = false,
+    /// The code of the RST that replaces this final HEADERS if the edge
+    /// refuses it (`resetRefusedHeaders`). INTERNAL_ERROR, except for a
+    /// request the server refused before any handler ran
+    /// (`AppCommand.refuse_request`), whose refusal says itself whether a
+    /// retry is safe.
+    refusal_code: frame.ErrorCode = .internal_error,
 };
 
 /// A handler's write ticket and its table slot (`Connection.tickets`). `id`
@@ -134,6 +140,14 @@ pub const AppCommand = union(enum) {
         end_stream: bool,
     },
     reset_stream: struct { stream_id: u31, code: frame.ErrorCode },
+    /// Answer a request the server refused before any handler ran, with a
+    /// status and no body. If the edge refuses that response, the stream is
+    /// reset with `reset_code` instead, the code that says the same thing as
+    /// the status: REFUSED_STREAM for a refusal that is safe to retry (RFC
+    /// 9113 section 8.7). A status a handler sends goes through
+    /// `respond_headers` and resets with INTERNAL_ERROR: its retry safety is
+    /// not the server's to claim.
+    refuse_request: struct { stream_id: u31, status: u16, reset_code: frame.ErrorCode },
     goaway: struct { last_stream_id: u31, code: frame.ErrorCode },
     /// Start graceful shutdown phase 1: GOAWAY(max) + PING (edge waits for ACK/timeout).
     graceful_phase1,
@@ -237,11 +251,14 @@ pub const HeaderListMem = union(enum) {
 /// A SETTINGS ack is owed only after its SETTINGS was applied (`onSettings`
 /// applies before it acks), so a later ack never runs ahead of its settings.
 ///
-/// Bounded: past `rates.SETTINGS_BURST` SETTINGS acks or `rates.PING_BURST`
-/// PING acks owed at once, the peer goes on sending past the burst its rate
-/// limit allows while it reads nothing, and the connection ends with
-/// ENHANCE_YOUR_CALM. The window credit needs no bound: it is a sum, and the
-/// peer can only send what it was granted.
+/// Bounded by the rate limit, not beside it: an owed ack keeps the token its
+/// SETTINGS or PING took (`RateLimiter.holdAck`) until it is queued again, so
+/// the limit admits one only while fewer than `rates.SETTINGS_BURST` /
+/// `rates.PING_BURST` acks are owed, and a peer that sends past that while
+/// it reads nothing ends with ENHANCE_YOUR_CALM from the limit. The rings'
+/// own check (past the burst: ENHANCE_YOUR_CALM) is then the bound only for a
+/// session with no rate limiter. The window credit needs no bound: it is a
+/// sum, and the peer can only send what it was granted.
 ///
 /// The graceful shutdown's PING is not here: it may be dropped, because its
 /// one-second deadline moves the shutdown on without its ack.
@@ -292,10 +309,16 @@ pub const Session = struct {
     /// A connection WINDOW_UPDATE is not recorded: connection credit never
     /// blocks a single stream in the scheduler.
     credit_ids: []u31 = &.{},
-    /// Scratch for `checkIdleDeadlines`: the streams whose body went idle, one
-    /// sweep at a time. `body_idle_ns` never holds more entries than there are
-    /// streams (`putBounded`), so `max_streams_per_connection` ids always fit.
+    /// Scratch for stream ids copied out of a map before the streams are
+    /// reset: `checkIdleDeadlines` (bodies gone idle) and `openStreamIds`
+    /// (every open stream). `max_streams_per_connection` ids always fit:
+    /// `body_idle_ns` never holds more entries than there are streams
+    /// (`putBounded`). One user at a time: `stale_ids_lent` makes a second
+    /// one loud in safe builds.
     stale_ids: []u31 = &.{},
+    /// Safe builds only: `openStreamIds` lent `stale_ids` to its caller,
+    /// which has not called `returnOpenStreamIds` yet.
+    stale_ids_lent: if (std.debug.runtime_safety) bool else void = if (std.debug.runtime_safety) false else {},
     credit_len: usize = 0,
     credit_all: bool = false,
     tombstones: std.ArrayList(Tombstone),
@@ -940,7 +963,8 @@ pub const Session = struct {
     pub fn applyCommand(self: *Session, cmd: AppCommand) !void {
         if (self.terminal != .none) return;
         switch (cmd) {
-            .respond_headers => |r| try self.cmdHeaders(r.stream_id, r.status, r.headers, r.end_stream, r.ticket),
+            .respond_headers => |r| try self.cmdHeaders(r.stream_id, r.status, r.headers, r.end_stream, r.ticket, .internal_error),
+            .refuse_request => |r| try self.cmdHeaders(r.stream_id, r.status, &.{}, true, .none, r.reset_code),
             .respond_data => |r| try self.cmdData(r.stream_id, r.data, r.end_stream),
             .reset_stream => |r| try self.emitRst(r.stream_id, r.code),
             .goaway => |g| try self.failConnectionWith(g.code, g.last_stream_id),
@@ -1008,8 +1032,32 @@ pub const Session = struct {
     /// graceful finish ends its streams the same way. At most one RST per
     /// open stream: M, which the terminal bound and the intent queue hold
     /// (`Limits.terminalFrames`, `intentEntriesMin`).
+    ///
+    /// Every stream means every one: `half_closed_remote` too, a request the
+    /// peer sent in full whose response is still being written. That is a
+    /// rule, not an oversight. The closing phase this begins is bounded in
+    /// time (`Limits.close_flush_timeout_ns`), and a response still in
+    /// progress can need a frame from the peer to finish (a WINDOW_UPDATE
+    /// once its window is spent), which will never come. Letting such
+    /// streams run on would hold the connection to that deadline for a
+    /// result the peer may never be able to receive.
     pub fn peerClosed(self: *Session) !void {
-        // The ids first: a reset takes its stream out of the map.
+        {
+            defer self.returnOpenStreamIds();
+            for (self.openStreamIds()) |sid| try self.emitRst(sid, .cancel);
+        }
+        try self.failConnectionWith(.no_error, self.last_processed_stream);
+    }
+
+    /// The ids of the streams still open, copied out of the map, for a
+    /// caller that resets them: a reset takes its stream out of the map, and
+    /// any change to a map invalidates its live iterators (std.HashMap's
+    /// contract, whatever its tombstones do today). The slice is
+    /// `stale_ids`, lent until the caller calls `returnOpenStreamIds`.
+    /// `checkIdleDeadlines` writes the same buffer, so nothing may run it in
+    /// between; in safe builds every writer asserts the buffer is not lent.
+    pub fn openStreamIds(self: *Session) []const u31 {
+        self.lendStaleIds();
         var n: usize = 0;
         var it = self.streams.iterator();
         while (it.next()) |e| {
@@ -1017,8 +1065,22 @@ pub const Session = struct {
             self.stale_ids[n] = e.key_ptr.*;
             n += 1;
         }
-        for (self.stale_ids[0..n]) |sid| try self.emitRst(sid, .cancel);
-        try self.failConnectionWith(.no_error, self.last_processed_stream);
+        return self.stale_ids[0..n];
+    }
+
+    /// The caller of `openStreamIds` is done with its slice.
+    pub fn returnOpenStreamIds(self: *Session) void {
+        if (std.debug.runtime_safety) {
+            std.debug.assert(self.stale_ids_lent);
+            self.stale_ids_lent = false;
+        }
+    }
+
+    fn lendStaleIds(self: *Session) void {
+        if (std.debug.runtime_safety) {
+            std.debug.assert(!self.stale_ids_lent);
+            self.stale_ids_lent = true;
+        }
     }
 
     fn failConnection(self: *Session, code: frame.ErrorCode) !void {
@@ -1126,9 +1188,9 @@ pub const Session = struct {
     /// still owed it (`OutboundFrame.owes_rst_if_refused`): not if the peer
     /// reset the stream, or the server queued an RST for it, while the frame
     /// was queued.
-    pub fn resetRefusedHeaders(self: *Session, stream_id: u31, owes_rst: bool) !void {
-        if (self.streams.contains(stream_id)) return self.emitRst(stream_id, .internal_error);
-        if (owes_rst) return self.queueRst(stream_id, .internal_error, .refused_end);
+    pub fn resetRefusedHeaders(self: *Session, stream_id: u31, owes_rst: bool, code: frame.ErrorCode) !void {
+        if (self.streams.contains(stream_id)) return self.emitRst(stream_id, code);
+        if (owes_rst) return self.queueRst(stream_id, code, .refused_end);
     }
 
     /// Queue an RST_STREAM at most once per stream (`rstOwed`), and always run
@@ -1260,6 +1322,9 @@ pub const Session = struct {
                 }
                 const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
                 if (self.streams.getPtr(hdr.stream_id)) |s| {
+                    // A final HEADERS still queued owes nothing now: the peer
+                    // has reset the stream, whichever branch it takes here.
+                    self.clearRefusalObligation(hdr.stream_id);
                     s.onRst();
                     self.releaseConcurrency(hdr.stream_id, code);
                     // Cancel handler; never RST in response to peer RST.
@@ -1350,6 +1415,8 @@ pub const Session = struct {
         // Collect first, act second. `emitRst` removes map entries, and a
         // mutation during iteration invalidates the iterator. The ids go in
         // `stale_ids`, which holds one per stream the connection may have.
+        // Not while `openStreamIds` has lent it.
+        if (std.debug.runtime_safety) std.debug.assert(!self.stale_ids_lent);
         var n_stale: usize = 0;
         var it = self.body_idle_ns.iterator();
         while (it.next()) |e| {
@@ -1703,6 +1770,7 @@ pub const Session = struct {
     pub fn oweSettingsAck(self: *Session) !void {
         if (self.owed.settings_acks == rates_mod.SETTINGS_BURST) return self.failConnection(.enhance_your_calm);
         self.owed.settings_acks += 1;
+        if (self.rate_limiter) |rl| rl.holdAck(.settings, self.edge_now_ns);
     }
 
     fn queuePingAck(self: *Session, payload: [8]u8) !void {
@@ -1729,6 +1797,7 @@ pub const Session = struct {
         if (o.ping_len == o.pings.len) return self.failConnection(.enhance_your_calm);
         o.pings[(o.ping_head + o.ping_len) % o.pings.len] = payload;
         o.ping_len += 1;
+        if (self.rate_limiter) |rl| rl.holdAck(.ping, self.edge_now_ns);
     }
 
     /// Queue what is owed (`Owed`), at most `room` frames: the room the
@@ -1745,6 +1814,7 @@ pub const Session = struct {
             const p = self.settingsAckFrame() catch return;
             self.pushIntent(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
             o.settings_acks -= 1;
+            if (self.rate_limiter) |rl| rl.releaseAck(.settings, self.edge_now_ns);
             left -= 1;
         }
         while (o.ping_len != 0 and self.owedRoom(left)) {
@@ -1752,6 +1822,7 @@ pub const Session = struct {
             self.pushIntent(.{ .outbound_frame = .{ .typ = .ping, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
             o.ping_head = (o.ping_head + 1) % o.pings.len;
             o.ping_len -= 1;
+            if (self.rate_limiter) |rl| rl.releaseAck(.ping, self.edge_now_ns);
             left -= 1;
         }
         if (o.conn_window != 0 and self.owedRoom(left)) {
@@ -1799,7 +1870,7 @@ pub const Session = struct {
         s.early_status = status;
         try self.pushIntentOrFailClosed(.{ .early_reject = .{ .stream_id = stream_id, .status = status } });
         // Also emit the HTTP response frames now so core stays self-contained for tests.
-        self.cmdHeaders(stream_id, status, &.{}, true, .none) catch |err| switch (err) {
+        self.cmdHeaders(stream_id, status, &.{}, true, .none, .internal_error) catch |err| switch (err) {
             // No frame buffer for the response: the stream is reset instead,
             // as when the edge refuses it (`resetRefusedHeaders`). An RST
             // always has room (`Limits.terminalFrames`).
@@ -2255,7 +2326,7 @@ pub const Session = struct {
     /// `OutOfMemory`) leaves nothing queued and the caller may still answer
     /// the stream with something else. A half-queued block would be one the
     /// peer waits on forever.
-    fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool, ticket: WireTicket) !void {
+    fn cmdHeaders(self: *Session, stream_id: u31, status: u16, headers: []const hpack.HeaderField, end_stream: bool, ticket: WireTicket, refusal_code: frame.ErrorCode) !void {
         // A RST tombstone already released the map entry. Emitting HEADERS
         // after that is how a handler that took `session_mu` late queued a
         // body the scheduler can never emit (TLS stall: pending DATA, tomb_rst).
@@ -2312,6 +2383,7 @@ pub const Session = struct {
                 .ticket = if (k == 0) ticket else .none,
                 // A final HEADERS owes an RST if the edge refuses it.
                 .owes_rst_if_refused = k == 0 and end_stream,
+                .refusal_code = refusal_code,
             } }) catch unreachable;
         }
         built = 0;
@@ -3279,7 +3351,7 @@ test "a refused final HEADERS is reset from its own obligation, with no tombston
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
     // The edge refused that HEADERS: the stream is reset, once (the edge
     // calls this once, for the one frame that carried the obligation).
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try session.applyCommand(.{ .reset_stream = .{ .stream_id = 1, .code = .internal_error } });
     const c = countTerminalIntents(gpa, &session);
     try std.testing.expectEqual(@as(usize, 1), c.rst);
@@ -3301,7 +3373,31 @@ test "a peer RST while the final HEADERS is still queued clears its obligation (
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(!owes);
     // A refusal of it now queues no RST: the peer counts the stream closed.
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+}
+
+test "a peer RST for a stream still in the map clears its final HEADERS' obligation (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    // The peer's side is still open, so the server's final HEADERS leaves
+    // the stream half-closed (local) and in the map.
+    try session.streams.put(1, .{ .id = 1, .state = .open, .window = .{ .send = flow.INITIAL_WINDOW } });
+    session.active_streams += 1;
+    session.highest_peer_stream = 1;
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 204, .headers = &.{}, .end_stream = true } });
+    try std.testing.expect(session.streams.contains(1));
+    // The peer cancels the stream before the edge takes the HEADERS.
+    var peer: [frame.rst_stream_frame_bytes]u8 = undefined;
+    _ = try frame.Serializer.rstStream(&peer, 1, .cancel);
+    try session.ingest(&peer);
+    try std.testing.expect(!session.streams.contains(1));
+    const owes = try finalHeadersOwes(gpa, &session, 1);
+    try std.testing.expect(!owes);
+    // A refusal of it now queues no RST: the peer counts the stream closed.
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
 }
 
@@ -3356,7 +3452,7 @@ fn expectEarly413OwesAfterPeerEnd(last: enum { data, trailers }) !void {
     try std.testing.expect(session.terminal == .none);
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(owes);
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
 }
 
@@ -3384,7 +3480,7 @@ test "a server RST queued after a final HEADERS clears its obligation: one RST, 
     const owes = try finalHeadersOwes(gpa, &session, 1);
     try std.testing.expect(!owes);
     // The refusal of the HEADERS adds nothing to the RST already queued.
-    try session.resetRefusedHeaders(1, owes);
+    try session.resetRefusedHeaders(1, owes, .internal_error);
     try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
 }
 
@@ -3493,6 +3589,219 @@ test "owed SETTINGS acks past the burst end the connection with ENHANCE_YOUR_CAL
     try std.testing.expect(session.terminal == .none);
     try session.oweSettingsAck();
     try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, session.terminal.goaway.code);
+}
+
+/// Take the queued intents back and free them, and return how many were
+/// acks of `typ`: the edge's share refusing them (`materializeBatch`), whose
+/// caller then owes each one, as the edge does.
+fn refuseQueuedAcks(gpa: std.mem.Allocator, session: *Session, typ: frame.FrameType) usize {
+    const intents = session.drainIntents();
+    var acks: usize = 0;
+    for (intents) |it| switch (it) {
+        .outbound_frame => |f| if (f.typ == typ and f.flags.end_stream) {
+            acks += 1;
+        },
+        else => {},
+    };
+    freeTestIntents(gpa, intents);
+    return acks;
+}
+
+/// Ingest `n` PINGs at `now_ns`, every ack refused by the edge and owed.
+/// Once one ack is owed the session owes the later ones itself, to keep
+/// their order; only an ack it queued is refused here.
+fn ingestPingsOwingAcks(session: *Session, gpa: std.mem.Allocator, n: usize, now_ns: u64) !void {
+    session.edge_now_ns = now_ns;
+    for (0..n) |_| {
+        var ping: [17]u8 = undefined;
+        _ = try frame.Serializer.ping(&ping, false, "in-limit");
+        try session.ingest(&ping);
+        if (session.terminal != .none) return;
+        for (0..refuseQueuedAcks(gpa, session, .ping)) |_| try session.owePingAck("in-limit".*);
+    }
+}
+
+test "an owed PING ack keeps its rate-limit token, so the limit and the owed bound are one (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    // A full burst, every ack refused by the edge and owed.
+    try ingestPingsOwingAcks(&session, gpa, rates_mod.PING_BURST, 1);
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expectEqual(rates_mod.PING_BURST, session.owed.ping_len);
+    // 100 ms later the bucket has refilled one token at 10 per second. The
+    // limit must not admit a PING whose ack could not be owed: the acks
+    // still owed keep their tokens.
+    const later = 1 + 100 * std.time.ns_per_ms;
+    try std.testing.expect(!rl.admit(.ping, later));
+    // Once the owed acks are queued, their tokens come back as the bucket
+    // refills, and a PING is admitted again.
+    session.requeueOwed(rates_mod.PING_BURST);
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expectEqual(@as(usize, 0), session.owed.ping_len);
+    freeTestIntents(gpa, session.drainIntents());
+    try std.testing.expect(rl.admit(.ping, later + 200 * std.time.ns_per_ms));
+}
+
+test "an owed SETTINGS ack keeps its rate-limit token, so the limit and the owed bound are one (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    // The preface's SETTINGS took one token and its ack was sent. The rest
+    // of the burst, each ack refused by the edge and owed.
+    var now: u64 = 1;
+    var owed_target: usize = rates_mod.SETTINGS_BURST - 1;
+    while (true) {
+        while (session.owed.settings_acks < owed_target) {
+            var settings: [9]u8 = undefined;
+            const n = try frame.Serializer.settingsFrame(&settings, false, &.{});
+            session.edge_now_ns = now;
+            try session.ingest(settings[0..n]);
+            try std.testing.expect(session.terminal == .none);
+            for (0..refuseQueuedAcks(gpa, &session, .settings)) |_| try session.oweSettingsAck();
+        }
+        if (owed_target == rates_mod.SETTINGS_BURST) break;
+        // 100 ms later one token has refilled (the sent ack's), and the limit
+        // admits one more SETTINGS: the owed ring still has room for its ack.
+        now += 100 * std.time.ns_per_ms;
+        owed_target = rates_mod.SETTINGS_BURST;
+    }
+    try std.testing.expectEqual(rates_mod.SETTINGS_BURST, session.owed.settings_acks);
+    // The ring is full: 100 ms later the limit must not admit another.
+    try std.testing.expect(!rl.admit(.settings, now + 100 * std.time.ns_per_ms));
+    session.requeueOwed(rates_mod.SETTINGS_BURST);
+    try std.testing.expectEqual(@as(usize, 0), session.owed.settings_acks);
+    freeTestIntents(gpa, session.drainIntents());
+    try std.testing.expect(rl.admit(.settings, now + 300 * std.time.ns_per_ms));
+}
+
+test "owed connection credit: DATA past what the peer was told ends the connection, though the window has the credit (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    // The state a refused connection WINDOW_UPDATE leaves: the peer has used
+    // the window down to `told`, the server granted `credit` more
+    // (`grantWindow` adds it to the window), and the edge refused the frame,
+    // so the credit is owed. Driving it through ingest would take the
+    // connection window's whole replenish threshold of DATA.
+    const told: i32 = 1000;
+    const credit: u31 = 20_000;
+    session.windows.conn_recv = told + credit;
+    session.oweWindowUpdate(0, credit);
+    // One byte past what the peer was told: a connection flow-control error,
+    // even though the server's own window holds the credit.
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, @intCast(told + 1));
+    try session.ingest(wire.items);
+    try std.testing.expect(session.terminal == .goaway);
+    try std.testing.expectEqual(frame.ErrorCode.flow_control_error, session.terminal.goaway.code);
+}
+
+test "owed stream credit: DATA up to what the peer was told is taken, one byte more resets the stream (t-3562)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    // Half the stream window and one byte: the stream's WINDOW_UPDATE is
+    // queued, and the edge refuses it, so its credit is owed.
+    const half: usize = flow.INITIAL_WINDOW / 2 + 1;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, half);
+    try session.ingest(wire.items);
+    const n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(seen[0].typ == .window_update and seen[0].sid == 1);
+    session.oweWindowUpdate(1, seen[0].inc);
+    // Exactly what the peer was told is still taken.
+    const told: usize = flow.INITIAL_WINDOW - half;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, told);
+    try session.ingest(wire.items);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+    try std.testing.expect(session.streams.contains(1));
+    // One byte more is a flow-control error for the stream.
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, 1);
+    try session.ingest(wire.items);
+    try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
+    try std.testing.expect(session.terminal == .none);
+}
+
+test "an owed ack whose retry the edge refuses again keeps the limit: no token is refilled twice (t-3562)" {
+    const gpa = std.testing.allocator;
+    inline for (.{ frame.FrameType.ping, frame.FrameType.settings }) |typ| {
+        var session = try Session.init(gpa, gpa, .defaults);
+        defer session.deinit();
+        var rl: rates_mod.RateLimiter = .{};
+        session.rate_limiter = &rl;
+        session.edge_now_ns = 1;
+        try ingestPrefaceAndSettings(&session, gpa);
+        const burst = if (typ == .ping) rates_mod.PING_BURST else rates_mod.SETTINGS_BURST;
+        // Every token taken, every ack owed: the bucket is at its limit.
+        if (typ == .ping) {
+            try ingestPingsOwingAcks(&session, gpa, burst, 1);
+        } else {
+            // The preface's SETTINGS took one token and its ack was sent; owe
+            // the rest of the burst, then one more 100 ms later (the sent
+            // ack's token has refilled).
+            var now: u64 = 1;
+            for (0..burst) |i| {
+                if (i == burst - 1) now += 100 * std.time.ns_per_ms;
+                session.edge_now_ns = now;
+                var settings: [9]u8 = undefined;
+                const n = try frame.Serializer.settingsFrame(&settings, false, &.{});
+                try session.ingest(settings[0..n]);
+                try std.testing.expect(session.terminal == .none);
+                for (0..refuseQueuedAcks(gpa, &session, .settings)) |_| try session.oweSettingsAck();
+            }
+        }
+        try std.testing.expect(session.terminal == .none);
+        const owed = if (typ == .ping) session.owed.ping_len else session.owed.settings_acks;
+        try std.testing.expectEqual(burst, owed);
+        // 100 ms on, one owed ack is queued again and the edge refuses it
+        // again, so it is owed again.
+        const later = session.edge_now_ns + 100 * std.time.ns_per_ms;
+        session.edge_now_ns = later;
+        session.requeueOwed(1);
+        const retried = refuseQueuedAcks(gpa, &session, typ);
+        try std.testing.expectEqual(@as(usize, 1), retried);
+        if (typ == .ping) try session.owePingAck("in-limit".*) else try session.oweSettingsAck();
+        // Still `burst` owed, so the limit must not admit another.
+        try std.testing.expect(!rl.admit(typ, later));
+    }
 }
 
 test "owed window credit: DATA is held to what the peer was told, and a stream's owed credit goes with the stream (t-3562)" {
