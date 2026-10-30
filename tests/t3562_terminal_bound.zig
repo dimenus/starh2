@@ -1699,10 +1699,6 @@ fn runAbortAtTeardownTop() !void {
     try h.join();
 }
 
-/// A TLS peer that sends a frame and its close_notify in one write, and
-/// leaves the socket open: the server must take the close_notify (it
-/// decrypts both records in one call), ingest the frame before it, then send
-/// its GOAWAY and close_notify and close. The client reads all the while.
 /// The TLS send counters (`tls_edge.pump_trace`) at one moment.
 const SendCounts = struct { arms: u64, completes: u64 };
 
@@ -1716,6 +1712,10 @@ fn noSendInFlight(at: SendCounts) bool {
     return completes > 0 and completes == arms;
 }
 
+/// A TLS peer that sends a frame and its close_notify in one write, and
+/// leaves the socket open: the server must take the close_notify (it
+/// decrypts both records in one call), ingest the frame before it, then send
+/// its GOAWAY and close_notify and close. The client reads all the while.
 fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     resetGlobals();
     var cert: []u8 = &.{};
