@@ -419,8 +419,7 @@ test "raised request_body_bytes: publish concurrent body memory cost" {
 test "h2c: a write queue smaller than one pop's reservation is rejected at boot (t-3520)" {
     // One pop pushes up to `pushes_per_pop` (2) chunks and the drain's tail one
     // more: 3. The h2c write queue is `inbound_wire_chunks_per_connection` slots
-    // with no extra, so a smaller queue lets one pop push more than is free and
-    // park the actor in `putOne` under `session_mu`.
+    // with no extra, so a smaller queue never has room for a pop.
     const min_slots = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS;
     try std.testing.expectEqual(@as(usize, 3), min_slots);
     const gpa = std.testing.allocator;

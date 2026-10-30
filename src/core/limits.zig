@@ -361,12 +361,10 @@ pub const Limits = struct {
         return r[0];
     }
 
-    /// Boot check for a server or connection that runs h2c. An ending h2c
-    /// connection holds a drain back before every pop that lacks the room one
-    /// pop is reserved (`H2C_MIN_WRITE_QUEUE_CHUNKS`). A queue smaller than that
-    /// never has the room, so the bound would not hold: one pop could push more
-    /// than is free and park the actor in `putOne` under `session_mu`, where
-    /// the closing deadline cannot fire. Not part of `resourceUpperBound`
+    /// Boot check for a server or connection that runs h2c. An h2c connection
+    /// holds a drain back before every pop that lacks the room one pop is
+    /// reserved (`H2C_MIN_WRITE_QUEUE_CHUNKS`). A queue smaller than that never
+    /// has the room, so no pop could ever run. Not part of `resourceUpperBound`
     /// because that is mode-blind and TLS legally uses a smaller value.
     pub fn checkH2cWriteQueue(self: Limits) error{InvalidConfig}!void {
         if (self.inbound_wire_chunks_per_connection < H2C_MIN_WRITE_QUEUE_CHUNKS) return error.InvalidConfig;

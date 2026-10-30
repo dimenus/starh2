@@ -577,10 +577,10 @@ test "goaway: h2c a bad preface delivers its GOAWAY (t-3520)" {
 /// How the test stops the server's output.
 const Stall = enum {
     /// A real client that asks for an endless stream and never reads. The
-    /// server's socket fills and its writes stop. Used on TLS only: on h2c the
-    /// actor can park in `write_ch.putOne` BEFORE it reads the connection
-    /// error, which holds the connection with no closing phase involved (see
-    /// the report for t-3520), so that shape cannot test the deadline.
+    /// server's socket fills and its writes stop, and the actor must stay live
+    /// to read what the client sends next. On h2c this needs the room checks
+    /// before every pop: when a full write queue parked the actor in `putOne`,
+    /// it never read the connection error.
     peer_never_reads,
     /// As `peer_never_reads`, but the handler outlives the sweep (it ignores the
     /// terminal cause until the task is canceled) and the client keeps sending
@@ -631,6 +631,14 @@ const fill_pings = 6;
 /// Bytes the /flood handler has written. It stops growing when the server's
 /// socket is full, which is how the test knows the peer has stalled the server.
 var flood_bytes: std.atomic.Value(usize) = .init(0);
+/// When the /flood handler last finished a write. The stall poll sees a byte
+/// change late on a loaded machine, so it cannot time the kill.
+var flood_last_write_ns: std.atomic.Value(u64) = .init(0);
+/// When the /flood handler's write returned `error.SlowConsumer`; 0 until then.
+var flood_killed_ns: std.atomic.Value(u64) = .init(0);
+/// The /flood handler returned. A handler that stopped writing for any reason
+/// looks like a stalled server to the byte count alone.
+var flood_exited: std.atomic.Value(bool) = .init(false);
 
 /// How long `stubborn` keeps running after the connection tells it to stop.
 /// Teardown waits for handlers to exit and does not force them, so this is
@@ -658,7 +666,12 @@ fn flood(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerr
     var body = try resp.startSse(&.{});
     var chunk: [4096]u8 = @splat('x');
     while (true) {
-        try body.writeAll(&chunk);
+        body.writeAll(&chunk) catch |err| {
+            if (err == error.SlowConsumer) flood_killed_ns.store(nowNs(), .release);
+            flood_exited.store(true, .release);
+            return err;
+        };
+        flood_last_write_ns.store(nowNs(), .release);
         _ = flood_bytes.fetchAdd(chunk.len, .monotonic);
     }
 }
@@ -671,6 +684,11 @@ const Stalled = struct {
     /// Client -> test body: the connection error is on the wire, at `sent_ns`.
     sent: std.atomic.Value(bool) = .init(false),
     sent_ns: std.atomic.Value(u64) = .init(0),
+    /// Test body -> client: the stream was killed, so read until its reset and
+    /// check the connection still answers (`expectResetThenPingAck`).
+    read_reset: std.atomic.Value(bool) = .init(false),
+    /// Client -> test body: the reset arrived and the PING was answered.
+    survived: std.atomic.Value(bool) = .init(false),
     /// Test body -> client: close and finish.
     release: std.atomic.Value(bool) = .init(false),
     err: ?anyerror = null,
@@ -687,6 +705,32 @@ fn stalledMain(port: u16, gpa: std.mem.Allocator, transport: Transport, stall: S
         st.err = err;
     };
     st.done.store(true, .release);
+}
+
+/// Reads past the DATA the server had already queued until stream 1's
+/// RST_STREAM, then sends a PING: a connection in its closing phase drops
+/// inbound frames, so an ACK proves the kill ended the stream and not the
+/// connection.
+fn expectResetThenPingAck(wire: *Wire) !void {
+    const deadline = nowNs() + client_deadline_ns;
+    while (true) {
+        const s = try wire.next(deadline) orelse return error.ClosedBeforeReset;
+        if (s.ftype == ftype_goaway) return error.GoawayBeforeReset;
+        if (s.ftype == ftype_rst_stream and s.sid == 1) {
+            if (s.code != @backingInt(frame.ErrorCode.cancel)) return error.WrongRstCode;
+            break;
+        }
+    }
+    var ping: [17]u8 = undefined;
+    (frame.FrameHeader{ .length = 8, .type = .ping, .flags = .{}, .stream_id = 0 }).encode(ping[0..9]);
+    @memcpy(ping[9..], "stillup?");
+    try wire.send(&ping);
+    while (true) {
+        const s = try wire.next(deadline) orelse return error.ClosedBeforePingAck;
+        if (s.ftype == ftype_goaway) return error.GoawayBeforePingAck;
+        if (s.sid == 1) return error.FrameAfterReset;
+        if (s.ftype == ftype_ping and s.flags & 0x1 != 0) return;
+    }
 }
 
 fn stalledClient(port: u16, gpa: std.mem.Allocator, transport: Transport, stall: Stall, st: *Stalled) !void {
@@ -767,8 +811,8 @@ fn stalledClient(port: u16, gpa: std.mem.Allocator, transport: Transport, stall:
             try h2c.appendWindowUpdate(gpa, &req, 0, 1 << 30);
             try h2c.appendHeaders(gpa, &req, 1, "/flood", true);
             try wire.send(req.items);
-            // Let the stream run, then hold the writer: the queue fills and the
-            // actor parks in its drain.
+            // Let the stream run, then hold the writer: the pool empties and
+            // the drain is held back.
             sleepMs(300);
             wire_pump.test_hold_writes.store(true, .release);
         },
@@ -795,7 +839,17 @@ fn stalledClient(port: u16, gpa: std.mem.Allocator, transport: Transport, stall:
         while (!st.release.load(.acquire)) sleepMs(5);
         return;
     }
-    while (!st.go.load(.acquire)) sleepMs(2);
+    // A check that sends nothing more ends with `release` and no `go`.
+    while (!st.go.load(.acquire)) {
+        if (st.release.load(.acquire)) return;
+        if (st.read_reset.load(.acquire)) {
+            try expectResetThenPingAck(wire);
+            st.survived.store(true, .release);
+            while (!st.release.load(.acquire)) sleepMs(5);
+            return;
+        }
+        sleepMs(2);
+    }
     var bad: std.ArrayList(u8) = .empty;
     defer bad.deinit(gpa);
     // For `drain_overflow` the window updates come first, in the same write,
@@ -804,8 +858,10 @@ fn stalledClient(port: u16, gpa: std.mem.Allocator, transport: Transport, stall:
         for (0..overflow_streams) |i| try h2c.appendWindowUpdate(gpa, &bad, @intCast(1 + 2 * i), 65535);
     }
     try appendDataOnStream0(gpa, &bad);
-    try wire.send(bad.items);
+    // Before the send: a client descheduled after it would start the clock late,
+    // and a close on time would read as early.
     st.sent_ns.store(nowNs(), .release);
+    try wire.send(bad.items);
     st.sent.store(true, .release);
     if (stall == .peer_floods_input) {
         // Keep the server's inbound side busy; it drops all of it.
@@ -822,6 +878,9 @@ const StalledCheck = enum {
     deadline,
     /// A cancel during the closing phase ends the connection at once.
     cancel,
+    /// The client sends nothing more, so the stream's own deadline is the only
+    /// thing that can stop the handler: its write must fail with SlowConsumer.
+    slow_consumer,
 };
 
 fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, stall: Stall, check_kind: StalledCheck, label: []const u8) !void {
@@ -838,9 +897,12 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     // cannot be mistaken for "ended at the deadline".
     const deadline_ns: u64 = switch (check_kind) {
         .deadline => 600 * std.time.ns_per_ms,
-        .cancel => 30 * std.time.ns_per_s,
+        .cancel, .slow_consumer => 30 * std.time.ns_per_s,
     };
     limits.close_flush_timeout_ns = deadline_ns;
+    // Above the 500 ms of no progress that says the server has stalled: the
+    // handler must still be parked when the stall is seen.
+    if (check_kind == .slow_consumer) limits.slow_consumer_timeout_ns = 1500 * std.time.ns_per_ms;
 
     // Read by the connection when its WritePump starts, so it must be set
     // before the client connects and cleared afterwards.
@@ -885,6 +947,9 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
     flood_bytes.store(0, .release);
+    flood_last_write_ns.store(0, .release);
+    flood_killed_ns.store(0, .release);
+    flood_exited.store(false, .release);
     const deferred_before = conn_mod.test_closing_emit_deferred.load(.acquire);
     var st: Stalled = .{};
     const t = try std.Thread.spawn(.{}, stalledMain, .{ server.localAddress(0).getPort(), gpa, transport, stall, &st });
@@ -894,6 +959,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     }
 
     const give_up = nowNs() + client_deadline_ns;
+    var last_write_ns: u64 = 0;
     while (!st.ready.load(.acquire)) {
         if (st.err) |err| return err;
         if (nowNs() >= give_up) return error.ClientNeverReady;
@@ -918,6 +984,10 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
                     still_since = nowNs();
                 } else if (now_bytes > 0 and nowNs() - still_since >= 500 * std.time.ns_per_ms) break;
             }
+            // Parked in its write, not gone: this is what makes the flat byte
+            // count a stalled server.
+            if (flood_exited.load(.acquire)) return error.HandlerExitedBeforeStall;
+            last_write_ns = flood_last_write_ns.load(.acquire);
             std.debug.print("{s}: server stalled after {d} flood bytes\n", .{ label, last_bytes });
         },
         // Let the server take the requests and queue its responses.
@@ -949,6 +1019,34 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
         return;
     }
 
+    if (check_kind == .slow_consumer) {
+        // The margin covers the actor's wake-up on a loaded machine. A deadline
+        // at twice the limit does not fit in it.
+        const stop = last_write_ns + limits.slow_consumer_timeout_ns + 1 * std.time.ns_per_s;
+        while (flood_killed_ns.load(.acquire) == 0) {
+            if (nowNs() >= stop) return error.NoSlowConsumerKill;
+            zio.sleep(.fromMilliseconds(5)) catch {};
+        }
+        const killed_ms = (flood_killed_ns.load(.acquire) - last_write_ns) / std.time.ns_per_ms;
+        std.debug.print("{s}: handler got SlowConsumer {d} ms after its last write (limit 1500 ms)\n", .{ label, killed_ms });
+        // The stream's deadline fired, not something earlier or much later. It
+        // runs from the last slab change, which is close to the handler's stamp,
+        // so the floor only allows for a stamp taken late.
+        try std.testing.expect(killed_ms >= limits.slow_consumer_timeout_ns / std.time.ns_per_ms - 100);
+        try std.testing.expect(killed_ms <= (stop - last_write_ns) / std.time.ns_per_ms);
+        // The peer learns of it, and only the stream ended.
+        st.read_reset.store(true, .release);
+        const read_stop = nowNs() + 2 * client_deadline_ns;
+        while (!st.survived.load(.acquire)) {
+            // `done` is what orders the read of `err`.
+            if (st.done.load(.acquire)) return st.err orelse error.ClientEndedWithoutAck;
+            if (nowNs() >= read_stop) return error.ClientNeverFinishedRead;
+            zio.sleep(.fromMilliseconds(5)) catch {};
+        }
+        try std.testing.expectEqual(@as(usize, 1), server.active_connections.load(.acquire));
+        return;
+    }
+
     st.go.store(true, .release);
     while (!st.sent.load(.acquire)) {
         if (st.err) |err| return err;
@@ -957,6 +1055,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     const t0 = st.sent_ns.load(.acquire);
 
     switch (check_kind) {
+        .slow_consumer => unreachable,
         .deadline => {
             const stop = t0 + deadline_ns + 3 * std.time.ns_per_s;
             while (server.active_connections.load(.acquire) != 0) {
@@ -985,12 +1084,14 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
             try std.testing.expect(cancel_ms <= 2000);
         },
     }
-    if ((stall == .queue_full or stall == .drain_overflow) and check_kind == .deadline) {
-        // The hold-back ran: without it the GOAWAY drain would have parked the
-        // actor in `putOne` and the deadline could not have fired.
+    if ((stall == .queue_full or stall == .drain_overflow or (transport == .h2c and stall == .peer_never_reads)) and check_kind == .deadline) {
         const deferred = conn_mod.test_closing_emit_deferred.load(.acquire) - deferred_before;
-        std.debug.print("{s}: closing drains held back for a full write queue: {d}\n", .{ label, deferred });
-        try std.testing.expect(deferred > 0);
+        std.debug.print("{s}: closing drains held back for no write room: {d}\n", .{ label, deferred });
+        // The hold-back ran: without it the GOAWAY drain would have pushed into
+        // a full queue and failed the connection before the deadline. Only the
+        // stalls that fill the queue on purpose can require it: with a real peer
+        // a macOS run can show none held back and still wait out the deadline.
+        if (stall != .peer_never_reads) try std.testing.expect(deferred > 0);
     }
 }
 
@@ -1004,6 +1105,18 @@ fn runStalledCase(transport: Transport, stall: Stall, check_kind: StalledCheck, 
 
 test "goaway: tls a peer that never reads holds the connection only until the deadline (t-3520)" {
     try runStalledCase(.tls, .peer_never_reads, .deadline, "tls peer never reads");
+}
+
+test "goaway: h2c a peer that never reads holds the connection only until the deadline (t-3523)" {
+    try runStalledCase(.h2c, .peer_never_reads, .deadline, "h2c peer never reads");
+}
+
+test "goaway: h2c a peer that never reads loses its stream at the slow-consumer deadline (t-3521)" {
+    try runStalledCase(.h2c, .peer_never_reads, .slow_consumer, "h2c slow consumer");
+}
+
+test "goaway: tls a peer that never reads loses its stream at the slow-consumer deadline (t-3521)" {
+    try runStalledCase(.tls, .peer_never_reads, .slow_consumer, "tls slow consumer");
 }
 
 test "goaway: h2c a writer that never completes holds the connection only until the deadline (t-3520)" {

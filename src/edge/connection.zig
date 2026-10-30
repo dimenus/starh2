@@ -785,8 +785,7 @@ fn tlsNetHandle(h: std.Io.net.Socket.Handle) zio.ev.Backend.NetHandle {
 /// - `block`   before `lockSession` -> after acquire. Dominant means a convoy on
 ///             the mutex: tasks queue for the lock itself.
 /// - `hold`    after acquire -> after unlock. Dominant means the serial section
-///             is genuinely expensive: framing, flow-control debit, or the
-///             blocking `write_ch.putOne` that runs while the lock is held.
+///             is genuinely expensive: framing or flow-control debit.
 /// - `ack`     unlock -> `tickets.complete` when the actor applies the write
 ///             ack. Dominant means the transport handoff, not the connection's
 ///             own work.
@@ -2042,8 +2041,7 @@ pub const Connection = struct {
     /// Diag: the pump's current blocking site (see `tls_edge.Pump.site`).
     tls_pump_site: std.atomic.Value(u8) = .init(0),
     /// Diag: where the ACTOR currently is. 1 loop, 2 waitForActivity,
-    /// 3 acquiring session_mu, 4 putOne(write_ch), 5 waitH2cPreface,
-    /// 6 shutdownHandlers.
+    /// 3 acquiring session_mu.
     actor_site: std.atomic.Value(u8) = .init(0),
     /// Diagnosis (t-2655): actor waits entered; read twice, it shows whether
     /// the actor still turns.
@@ -4186,11 +4184,10 @@ pub const Connection = struct {
     ///   TLS pump from stalling on a full inbound buffer; dropping means a peer
     ///   that keeps talking cannot restart the work the sweep just stopped.
     /// - Writes are driven the normal way: `driveTlsTurn` on TLS, the WritePump
-    ///   on h2c. On h2c, once the connection is ending, the scheduler pause
-    ///   hook (`h2cPause`) also stops each pop that lacks room in the write
-    ///   queue: a push would park the actor in `putOne`, and
-    ///   the deadline could not fire. The frames wait in the scheduler, and a
-    ///   write completion wakes the actor to try again.
+    ///   on h2c. On h2c the scheduler pause hook (`h2cPause`) stops each pop
+    ///   that lacks room in the write queue, as on every connection. The
+    ///   frames wait in the scheduler, and a write completion wakes the actor
+    ///   to try again.
     /// - `closeFlushed` ends the phase when `outboundFlushed` (every chunk acked,
     ///   and on TLS the socket has accepted all ciphertext), or the deadline
     ///   `Limits.close_flush_timeout_ns` passed, or the writer failed. It is
@@ -4637,8 +4634,8 @@ pub const Connection = struct {
     /// Last owned turn, then lock-free wait. Every `run` exit uses this,
     /// including errdefer: a complete job can sit in `inline_sids` with
     /// `teardown_inline_n == 0` if an intent error skipped the loop freeze.
-    /// Close write queues before the lock: a handler can park in `putOne`
-    /// while holding `session_mu`.
+    /// Close write queues before the lock, so a push made under it fails at
+    /// once (t-3696 asks whether this order is still needed).
     fn teardownExhaustive(self: *Connection) void {
         std.debug.assert(shutdown_sweep.get() == null);
         if (comptime test_observe) _ = test_actor_teardowns.fetchAdd(1, .release);
@@ -4999,8 +4996,8 @@ pub const Connection = struct {
     }
 
     /// Set terminal causes and release scheduler pending bytes. The actor
-    /// already holds `session_mu` on this turn. `shutdownHandlers` must not
-    /// take the mutex: a handler can park inside it on `write_ch.putOne`.
+    /// already holds `session_mu` on this turn. `shutdownHandlers` takes no
+    /// mutex (t-3696 asks whether it still must not).
     fn sweepHandlerWaitersLocked(self: *Connection) void {
         self.assertSessionHeld("sweepHandlerWaitersLocked");
         std.debug.assert(self.handlers.capacity() != 0);
@@ -5086,8 +5083,7 @@ pub const Connection = struct {
     /// already holds the pump, and every later section finds null. The actor
     /// shuts the pump down only after this, so a handler never uses a pump
     /// that is being shut down. The write queues are closed first, as in
-    /// `teardownExhaustive`: a handler can park on a full queue while it
-    /// holds `session_mu`.
+    /// `teardownExhaustive`.
     fn detachTlsPump(self: *Connection) void {
         self.closeWriterQueues();
         self.lockSessionUncancelable(self.config.io);
@@ -5096,8 +5092,7 @@ pub const Connection = struct {
     }
 
     /// Close write queues and mark the loop to sweep on the next existing
-    /// lock. Do not split these: a leave without close waits behind putOne.
-    /// This helper does not lock.
+    /// lock. Do not split these. This helper does not lock.
     fn beginLeave(self: *Connection, leaving: *bool) void {
         std.debug.assert(shutdown_sweep.get() == null);
         self.closeWriterQueues();
@@ -5233,7 +5228,7 @@ pub const Connection = struct {
     ///   (`waitForActivity` selects on the channel), and every actor turn
     ///   drains again, so a held pop is never stranded.
     /// - the write queue has no room for the pop's pushes and the tail
-    ///   (`h2cQueueRoom`), so no push waits in `putOne`. This was only the
+    ///   (`h2cQueueRoom`), so a push finds a free slot. This was only the
     ///   ending connection's rule; it is every connection's now, because a
     ///   bare flush barrier takes a queue slot and no pool chunk, so the
     ///   pool alone no longer bounds the queue.
@@ -5648,11 +5643,13 @@ pub const Connection = struct {
     /// then waits for the barrier's ticket anyway, and a parked handler leaves
     /// nothing behind if its stream is reset. A barrier takes a queue slot and
     /// no pool chunk, so the queue can be full while the pool is not; without
-    /// the queue gate the push itself would wait, in `putOne`, holding
-    /// `session_mu`, and the actor could not run a deadline or a graceful
-    /// shutdown. After the gate the push cannot wait: every push is made under
-    /// `session_mu`, which the caller holds from the check to the push, and
-    /// only the pump takes from the queue (`h2cQueueRoom`).
+    /// the queue gate the push would find a full queue, which on a connection
+    /// that is not ending panics in a safe build and otherwise fails the
+    /// connection closed (`pushWriteChunk`).
+    /// After the gate the push finds room: every push is made under
+    /// `session_mu`, which the caller holds from
+    /// the check to the push, and only the pump takes from the queue
+    /// (`h2cQueueRoom`).
     ///
     /// Caller holds `session_mu`; like `waitForStreamSpace`, this releases
     /// and reacquires it around the wait, on the same per-slot space event.
@@ -6202,11 +6199,9 @@ pub const Connection = struct {
         // The drain does not wait for memory. Pause hooks re-check room before
         // every pop: write-pool chunks on both transports
         // (`outboundMemoryPaused`), the stash on TLS, and on h2c the ack
-        // channel (always) and the write queue (once the connection is
-        // ending: a push would wait in `putOne` holding `session_mu`, and a
-        // writer that is not moving never makes room, so the closing deadline
-        // could not fire). The install below covers a connection whose pumps
-        // never started. The frames the hooks hold back stay in the
+        // channel and the write queue (`h2cPauseFor`). The install below
+        // covers a connection whose pumps never started. The frames the hooks
+        // hold back stay in the
         // scheduler; a write completion wakes the actor and the next drain
         // pops them. Terminal Session counts as ending here because the drain
         // inside `ingestWireChunk` runs before the closing phase has begun.
@@ -7024,9 +7019,10 @@ pub const Connection = struct {
         return sf.load(.acquire);
     }
 
-    /// Hand a chunk to WritePump. Never parks the actor once the connection is
-    /// going away: tryPut, shut the socket to unstick a blocked write, retry
-    /// once, then fail. A healthy connection still `putOne`s for backpressure.
+    /// Hand a chunk to WritePump. Never waits: on h2c the room checks made
+    /// before the push leave a free queue slot. On a connection that is not
+    /// ending, a full queue here means a check failed: a safe build panics, any
+    /// other build fails the connection closed (see below).
     fn pushWriteChunk(self: *Connection, chunk: wire_pump.WireChunk) error{ WriteFailed, Canceled }!void {
         if (self.config.mode == .tls) {
             // Encrypt + stage + arm on this task. Acks apply in `post` via
@@ -7314,7 +7310,7 @@ pub const Connection = struct {
     /// a lock.
     ///
     /// Both failure paths release the reservation AND return the write-chunk
-    /// lease before they return. After a successful `putOne` the pump owns the
+    /// lease before they return. After a successful push the pump owns the
     /// lease, and this function must not touch it again.
     fn sendAccountedWire(
         self: *Connection,
@@ -8031,8 +8027,7 @@ pub const Connection = struct {
     /// see `PendingCompleteReceipt` for why their slots free now (t-3491).
     /// SSE and any handler that can wait are still spawned (`connPlacement`).
     ///
-    /// The drain can park in `putOne` on a full h2c queue, a cancellation
-    /// point. `error.Canceled` leaves as itself, after the batch below is
+    /// `error.Canceled` from the drain leaves as itself, after the batch below is
     /// finished exactly as on any other drain failure: each job once, the
     /// receipt slot released, the inline queue shifted. Every other drain error
     /// still goes to `failClosedOnIntentError`.
