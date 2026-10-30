@@ -136,6 +136,11 @@ pub var test_handshake_alerts: test_hook.Hook(std.atomic.Value(u64)) = if (test_
 /// `Pump.start`, so a test can check its precondition whatever the report
 /// does.
 pub var test_close_at_pump_start: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only: times `eofReady` found the EOF posted with plaintext still
+/// pending (`pending_read`), the case its first guard holds the EOF back for.
+/// Counted apart from the guard, so a test can require that its run reached
+/// that case whatever the guard does.
+pub var test_eof_held_for_plaintext: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 pub fn writeFailJson(w: *std.Io.Writer) !void {
     try w.print(
@@ -1502,6 +1507,9 @@ pub const Pump = struct {
     /// The actor takes the EOF (`Connection.onPeerEof`) only then, so the
     /// frames before a close are never dropped by the closing phase.
     pub fn eofReady(self: *const Pump) bool {
+        if (comptime test_hook.on) {
+            if (self.inbound_eof and self.pending_read != null) _ = test_eof_held_for_plaintext.fetchAdd(1, .acq_rel);
+        }
         if (!self.inbound_eof or self.pending_read != null) return false;
         if (self.conn.peer_closed) return true;
         return self.pending_cipher == null and !self.conn.pendingInbound();

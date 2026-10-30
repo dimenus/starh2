@@ -1741,17 +1741,18 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // close_notify then arrive through the recv completion the parked actor
     // takes in that select: the pump decrypts both there (`ingestCipher`,
     // `readOne`), and the PING's plaintext is still pending when the EOF is
-    // posted. Sent while the actor was still busy with the preface, they
-    // were taken at the top of a turn instead, which reads the plaintext
-    // first, and that path could not show the EOF taken too early.
+    // posted and the main loop asks `eofReady`. Taken at the top of a turn
+    // instead (`pollRecv`), the same turn reads the plaintext first, and
+    // that path cannot show the EOF taken too early.
     //
-    // `test_actors_in_select` is raised just before the actor calls
-    // `zio.select` and lowered when it returns, and this test has one
-    // connection: above zero means the actor reached its select with
-    // nothing left to do. It does not prove the actor stays there until the
-    // client's write lands; a timer, a doorbell or a send completion would
-    // take it out first. This connection has none of those once its PING is
-    // answered (no handler, no deadline, nothing being written).
+    // `test_actors_in_select` (raised just before the actor calls
+    // `zio.select`, lowered when it returns; one connection here) says the
+    // actor reached its select with nothing left to do. It does not say the
+    // select will take the client's write: the actor can be parked on the
+    // PING ack's send completion, whose bytes the client may already have
+    // read, and the next turn's `pollRecv` would then take the close. So it
+    // is only a precondition; the witness that the guarded path ran is
+    // `test_eof_held_for_plaintext`, checked below.
     c.send_alive.store(true, .release);
     try waitFor("the PING ack", &c, struct {
         fn f(x: *Client) bool {
@@ -1759,11 +1760,20 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         }
     }.f);
     try waitFor("the actor to park in its select", atLeast(&conn_mod.test_actors_in_select, 1), reached);
+    const held_0 = starh2.edge.tls_edge.test_eof_held_for_plaintext.load(.acquire);
     c.send_notify.store(true, .release);
     try waitFor("the server to take the peer's close_notify", atLeast(&conn_mod.test_peer_eofs, peer_eofs_0 + 1), reached);
     joinClient(&c, t);
     joined = true;
     if (c.err) |e| return e;
+    // The guarded path ran: the main loop found the EOF posted with the
+    // PING's plaintext still pending. A run that took the close at the top of
+    // a turn tested nothing here, and must fail, not pass.
+    const held = starh2.edge.tls_edge.test_eof_held_for_plaintext.load(.acquire);
+    if (held == held_0) {
+        std.debug.print("t3562: PRECONDITION NOT MET: the EOF was never posted with plaintext pending (test_eof_held_for_plaintext stayed at {d}), so this run did not reach the path eofReady's guard protects\n", .{held_0});
+        return error.GuardedPathNotReached;
+    }
     // The PING before the close_notify was ingested before the close was
     // taken: its ack came. The oracle requires it too.
     try std.testing.expect(c.notify_ping_acked.load(.acquire));
