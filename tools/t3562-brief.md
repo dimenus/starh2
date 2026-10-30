@@ -881,3 +881,28 @@ item on top of this brief commit.
 
 Report as before (replace the round 8 report), then print exactly one line:
 `STATUS: done t62j /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.
+
+## Round 8c (review of b78de27; Fable and gpt-6-astra agree)
+
+Both reviewers found one gap, the same one: round 8b's witness turns the
+send-completion race into a loud failure but does not remove it, so a
+correct server can now fail the frame-then-close_notify test with
+`error.GuardedPathNotReached`. The park the test samples can be the select
+that the PING ack's send completion ends; the next turn's `pollRecv` then
+takes the PING and the close and ingests the PING before `eofReady`. Test
+only, one commit on top of this brief commit.
+
+1. Before the test samples `test_actors_in_select`, wait until the PING
+   ack's send completion has been taken: sample
+   `tls_edge.pump_trace.send_complete` (bumped in `Pump.onSendComplete` in
+   observe builds) before the client sends its first PING, and after "the
+   PING ack" wait for it to rise (a `u64` sibling of `atLeast`/`reached` if
+   needed). Then wait on the park gauge, then send. Keep the witness check.
+   Say in the commit what this proves and what can still end the park (for
+   example a second send, if the server writes anything else after the ack).
+   Run the `t3562` binary 30 times alone and 30 three at a time on Linux and
+   report how many runs failed the witness; run mutation 42 against it again,
+   10 times on Linux and 3 on the Mac.
+
+Report as before (replace the round 8b report), then print exactly one line:
+`STATUS: done t62k /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.
