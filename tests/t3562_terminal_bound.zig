@@ -1922,8 +1922,13 @@ fn runPipelinedNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // with the handshake and the close_notify on the pump's first recv; the
     // close is then taken the ordinary way, and this run did not test what
     // it is about. That must fail, not pass.
-    if (starh2.edge.tls_edge.test_close_at_pump_start.load(.acquire) != close_at_start_0 + 1) {
-        std.debug.print("t3562: PRECONDITION NOT MET: the close_notify was not in the handshake leftover (the pump did not find it at start), so this run did not test the leftover close\n", .{});
+    const close_at_start = starh2.edge.tls_edge.test_close_at_pump_start.load(.acquire);
+    if (close_at_start != close_at_start_0 + 1) {
+        // One connection: exactly one pump start with the close already
+        // there. 0 more means the close came later (this run did not test
+        // the leftover close); 2 or more means more than this connection
+        // counted, which this test cannot explain either.
+        std.debug.print("t3562: PRECONDITION NOT MET: test_close_at_pump_start went from {d} to {d}, want exactly one more (0 more: the close_notify was not in the handshake leftover, so this run did not test the leftover close)\n", .{ close_at_start_0, close_at_start });
         return error.LeftoverClosePreconditionNotMet;
     }
     // The PING in the leftover was ingested and answered before the close.
