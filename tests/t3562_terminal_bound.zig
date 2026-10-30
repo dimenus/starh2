@@ -1703,6 +1703,19 @@ fn runAbortAtTeardownTop() !void {
 /// leaves the socket open: the server must take the close_notify (it
 /// decrypts both records in one call), ingest the frame before it, then send
 /// its GOAWAY and close_notify and close. The client reads all the while.
+/// The TLS send counters (`tls_edge.pump_trace`) at one moment.
+const SendCounts = struct { arms: u64, completes: u64 };
+
+/// Every TLS send armed since `at` has completed, and at least one did: no
+/// send is in flight on a connection that started after `at`.
+fn noSendInFlight(at: SendCounts) bool {
+    const trace = starh2.edge.tls_edge.pump_trace;
+    // Arms first: a send armed between the two reads then shows as in flight.
+    const arms = trace.send_arms.load(.acquire) - at.arms;
+    const completes = trace.send_complete.load(.acquire) - at.completes;
+    return completes > 0 and completes == arms;
+}
+
 fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     resetGlobals();
     var cert: []u8 = &.{};
@@ -1732,6 +1745,12 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .flood = 0,
         .rcvbuf = null,
     };
+    // The TLS send counters are global to the binary, and an earlier test's
+    // connection can end with a send canceled, never counted as completed:
+    // this connection's sends are the counts' rise from here, taken before it
+    // connects, when every earlier connection is gone.
+    const trace = starh2.edge.tls_edge.pump_trace;
+    const sends_0: SendCounts = .{ .arms = trace.send_arms.load(.acquire), .completes = trace.send_complete.load(.acquire) };
     const t = try std.Thread.spawn(.{}, clientMain, .{&c});
     var joined = false;
     defer if (!joined) joinClient(&c, t);
@@ -1745,20 +1764,31 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // instead (`pollRecv`), the same turn reads the plaintext first, and
     // that path cannot show the EOF taken too early.
     //
-    // `test_actors_in_select` (raised just before the actor calls
-    // `zio.select`, lowered when it returns; one connection here) says the
-    // actor reached its select with nothing left to do. It does not say the
-    // select will take the client's write: the actor can be parked on the
-    // PING ack's send completion, whose bytes the client may already have
-    // read, and the next turn's `pollRecv` would then take the close. So it
-    // is only a precondition; the witness that the guarded path ran is
-    // `test_eof_held_for_plaintext`, checked below.
+    // The park the test then samples must be one that only the client's
+    // next write can end. The PING ack's bytes can reach the client before
+    // the actor takes that send's completion, and a park on that completion
+    // ends without the client: the next turn's `pollRecv` then takes the
+    // PING and the close, on the path that reads the plaintext first. So the
+    // test first waits until the ack's send completion was taken: every TLS
+    // send this connection armed (`pump_trace.send_arms`) has completed
+    // (`send_complete`), at least one, so no send is in flight. The ack's
+    // send was armed before the client could read the ack, so it is among
+    // them. Then `test_actors_in_select`
+    // (raised just before the actor calls `zio.select`, lowered when it
+    // returns; one connection here) says the actor reached its select with
+    // nothing left to do. What can still end that park first: a send armed
+    // after the check (this connection writes nothing more until the
+    // client's close), a timer (it has no deadline armed), or the doorbell
+    // (it has no handler). The witness checked below
+    // (`test_eof_held_for_plaintext`) still says whether the guarded path
+    // ran.
     c.send_alive.store(true, .release);
     try waitFor("the PING ack", &c, struct {
         fn f(x: *Client) bool {
             return x.ping_acked.load(.acquire);
         }
     }.f);
+    try waitFor("the PING ack's send completion, with no send in flight", sends_0, noSendInFlight);
     try waitFor("the actor to park in its select", atLeast(&conn_mod.test_actors_in_select, 1), reached);
     const held_0 = starh2.edge.tls_edge.test_eof_held_for_plaintext.load(.acquire);
     c.send_notify.store(true, .release);

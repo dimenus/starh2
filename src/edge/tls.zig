@@ -65,6 +65,9 @@ pub const pump_trace = struct {
     pub var tryget_write: std.atomic.Value(u64) = .init(0);
     /// Send completions the driver handled (one per armed send).
     pub var send_complete: std.atomic.Value(u64) = .init(0);
+    /// Sends armed (`armSend` submits one). Equal to `send_complete` when no
+    /// send is in flight.
+    pub var send_arms: std.atomic.Value(u64) = .init(0);
     pub var read_one: std.atomic.Value(u64) = .init(0);
     pub var want_read: std.atomic.Value(u64) = .init(0);
     pub var read_free_empty_yield: std.atomic.Value(u64) = .init(0);
@@ -1100,6 +1103,7 @@ pub const Pump = struct {
             error.Closed => return false,
             error.InvalidCompletion => unreachable,
         };
+        pump_trace.bump(&pump_trace.send_arms);
         self.send_armed = true;
         return true;
     }
