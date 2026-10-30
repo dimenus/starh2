@@ -34,6 +34,7 @@
 //! be two implementations of one contract. The std.Io purity of src/edge
 //! ends here; the h2c pumps remain std.Io-pure.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const slab_pool = @import("slab_pool.zig");
 const tls = @import("tls");
 const zio = @import("zio");
@@ -129,7 +130,7 @@ pub var tls_stage_failed: std.atomic.Value(u64) = .init(0);
 
 /// Test-only: alerts the server sent for a failed handshake. Counted in
 /// Debug and `-Dobserve=true`.
-pub var test_handshake_alerts: std.atomic.Value(u64) = .init(0);
+pub var test_handshake_alerts: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 
 pub fn writeFailJson(w: *std.Io.Writer) !void {
     try w.print(
@@ -978,6 +979,8 @@ pub const Pump = struct {
         self.read_free.putOneUncancelable(self.io, idx) catch {};
     }
 
+    /// The peer will send nothing more (socket EOF, close_notify, or a read
+    /// that failed). The actor reads it after each turn (`onPeerEof`).
     fn postEof(self: *Pump) void {
         self.inbound_eof = true;
     }
@@ -1003,8 +1006,10 @@ pub const Pump = struct {
             var written_ns: u64 = 0;
             if (ok and chunk.ticket != 0) {
                 written_ns = nowNs(self.io);
-                wire_pump.test_last_ticket_ok_ns.store(written_ns, .release);
-                wire_pump.test_last_ticket_ok_id.store(chunk.ticket, .release);
+                if (comptime observe) {
+                    wire_pump.test_last_ticket_ok_ns.store(written_ns, .release);
+                    wire_pump.test_last_ticket_ok_id.store(chunk.ticket, .release);
+                }
             }
             self.post(.{
                 .ticket = chunk.ticket,
@@ -1142,6 +1147,8 @@ pub const Pump = struct {
             if (self.pending_read != null) return .blocked;
             switch (self.readOne()) {
                 .eof => return .eof,
+                // Nothing after close_notify is read.
+                .closed => return .done,
                 .ok => {
                     if (self.pending_read != null) return .blocked;
                 },
@@ -1220,6 +1227,26 @@ pub const Pump = struct {
     pub fn writesDrained(self: *Pump) bool {
         return self.pending_n == 0 and self.carried == null and self.write_ch.isEmpty() and
             !self.send_armed and self.send_head == self.send_fill;
+    }
+
+    /// Stage TLS close_notify behind everything written, and send it. RFC
+    /// 8446 section 6.1: each party sends close_notify before it closes its
+    /// write side, so the peer can tell the end of the data from a cut
+    /// connection. The actor calls it once its output is flushed
+    /// (`writesDrained`), so the alert is the last record, and waits for this
+    /// send to drain like any other before it shuts the socket's send side
+    /// (`Connection.closeFlushed`). tls.zig's state makes it once only: a
+    /// second call stages nothing. False when the CQ is closed (teardown).
+    pub fn stageCloseNotify(self: *Pump) bool {
+        std.debug.assert(self.writesDrained());
+        const record = self.conn.cipher.close(self.send_buf[self.send_fill..]) catch |err| {
+            // The buffer is empty here and holds many records, so this is a
+            // cipher that already failed: nothing to send.
+            if (diag_wait) rawPrint("TLSERR close_notify {s}\n", .{@errorName(err)});
+            return true;
+        };
+        self.send_fill += record.len;
+        return self.armSend();
     }
 
     const WriteSome = enum { done, full, exit };
@@ -1324,7 +1351,7 @@ pub const Pump = struct {
                 }
             }
         }
-        const fail_next = wire_pump.test_fail_next_write.swap(false, .acq_rel);
+        const fail_next = if (comptime observe) wire_pump.test_fail_next_write.swap(false, .acq_rel) else false;
         if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
             _ = tls_stage_failed.fetchAdd(1, .monotonic);
             self.failPending();
@@ -1411,7 +1438,9 @@ pub const Pump = struct {
         return self.armSend();
     }
 
-    pub const ReadOutcome = enum { ok, eof, want, stuck };
+    /// `eof`: the read failed (the drain is failed). `closed`: the peer's
+    /// close_notify, an event (`inbound_eof`).
+    pub const ReadOutcome = enum { ok, eof, closed, want, stuck };
 
     pub fn readOne(self: *Pump) ReadOutcome {
         pump_trace.bump(&pump_trace.read_one);
@@ -1422,7 +1451,6 @@ pub const Pump = struct {
             return .stuck;
         }
         const n = self.conn.decryptInto(buf) catch |err| {
-            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
             if (diag_wait) rawPrint("TLSERR recv2 {s}\n", .{@errorName(err)});
             self.failDrain();
             self.postEof();
@@ -1433,13 +1461,13 @@ pub const Pump = struct {
                 pump_trace.bump(&pump_trace.want_read);
                 return .want;
             }
-            // close_notify: the same end of stream as a socket EOF.
-            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            // close_notify: the same end of stream as a socket EOF, an event
+            // and not a failure. The actor goes on writing (its closing
+            // phase); only it shuts the send side (`closeFlushed`).
             if (diag_wait) rawPrint("TLSERR recv2_eof\n", .{});
-            self.conn.ringPeerClosed(null, "close_notify");
-            self.failDrain();
+            if (!self.inbound_eof) self.conn.ringPeerClosed(null, "close_notify");
             self.postEof();
-            return .eof;
+            return .closed;
         }
         self.pending_read = .{ .bytes = buf, .len = n };
         return .ok;
@@ -1462,11 +1490,12 @@ pub const Pump = struct {
             },
             .done => {},
         }
+        if (self.inbound_eof) return true;
         if (!self.rearmRecv()) return false;
         if (self.pending_read != null) return true;
         switch (self.readOne()) {
             .eof => return false,
-            .ok, .want, .stuck => return true,
+            .ok, .closed, .want, .stuck => return true,
         }
     }
 
@@ -1515,7 +1544,6 @@ pub const Pump = struct {
             // Only shutdownCq cancels the op; teardown owns the exit.
             error.Canceled => return .exit,
             else => {
-                self.conn.tcp_stream.shutdown(self.io, .send) catch {};
                 if (diag_wait) rawPrint("TLSERR cqrecv {s}\n", .{@errorName(err)});
                 self.conn.ringPeerClosed(.socket_error, @errorName(err));
                 self.failDrain();
@@ -1525,14 +1553,16 @@ pub const Pump = struct {
             },
         };
         if (n == 0) {
-            self.conn.tcp_stream.shutdown(self.io, .send) catch {};
+            // The peer closed its side: an event, not a failure. The recv is
+            // not armed again; sends go on, and the actor's closing phase ends
+            // the connection (`Connection.onPeerEof`).
             if (diag_wait) rawPrint("TLSERR cqrecv_eof\n", .{});
-            self.conn.ringPeerClosed(.socket_eof, "socket_eof");
-            self.failDrain();
+            if (!self.inbound_eof) self.conn.ringPeerClosed(.socket_eof, "socket_eof");
             self.postEof();
-            self.post(.{ .shutdown = true });
-            return .exit;
+            return .ok;
         }
+        // After close_notify nothing more is read.
+        if (self.inbound_eof) return .ok;
         if (!self.ingestCipher(self.recv_buf[0..n])) return .exit;
         return .ok;
     }

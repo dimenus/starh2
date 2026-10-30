@@ -50,7 +50,7 @@ test "prefill max ordinary queue: emit gap <= 64 when DATA eligible" {
     // Ordinary capacity = 256 - 16 terminal reserve = 240
     var pool = try testPool(gpa, 1024 * 1024, 16);
     defer pool.deinit(gpa);
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
 
     // Eligible DATA before controls (prefilled into boot slab).
@@ -106,7 +106,7 @@ test "fair scheduler: 10k controls interleaved drain gaps <= 64" {
     // Boot slab holds enough to keep DATA eligible across 10k control drains.
     var pool = try testPool(gpa, 8 * 1024 * 1024, 16);
     defer pool.deinit(gpa);
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
 
     var big: [16 * 1024]u8 = undefined;
@@ -172,7 +172,7 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
     const fs = starh2.edge.fair_scheduler;
     var pool = try testPool(gpa, 64 * 1024, 16);
     defer pool.deinit(gpa);
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     const caps = sched.ctrl.ordinaryCaps();
     var i: usize = 0;
@@ -194,7 +194,7 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
 
     var pool2 = try testPool(gpa, 10_000, 16);
     defer pool2.deinit(gpa);
-    var s2 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool2);
+    var s2 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool2);
     defer s2.deinit();
     try headersOut(&s2, &.{ 1, 3 });
     try s2.enqueueDataBytes(1, &@as([100]u8, @splat(1)), false, 0, 0);
@@ -220,7 +220,7 @@ test "fair scheduler: terminal when ordinary full; zero windows" {
 
     var pool3 = try testPool(gpa, 10_000, 16);
     defer pool3.deinit(gpa);
-    var s3 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 4, &pool3);
+    var s3 = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 4, &pool3);
     defer s3.deinit();
     try headersOut(&s3, &.{1});
     try s3.enqueueDataBytes(1, &@as([100]u8, @splat(9)), true, 0, 0);
@@ -311,8 +311,8 @@ test "zero stream window does not block other stream or control (session)" {
             else => {},
         };
     }
-    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &.{}, .end_stream = false } });
-    try session.applyCommand(.{ .respond_headers = .{ .stream_id = 3, .status = 200, .headers = &.{}, .end_stream = false } });
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 1, .status = 200, .headers = &.{}, .end_stream = false } });
+    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none, .stream_id = 3, .status = 200, .headers = &.{}, .end_stream = false } });
     {
         const more = session.drainIntents();
         for (more) |*it| switch (it.*) {
@@ -395,7 +395,7 @@ test "drain emits pending DATA after Session dropped the stream" {
 
     var pool = try testPool(gpa, 1024, 4);
     defer pool.deinit(gpa);
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
     const body = "Hello, World!";
     try headersOut(&sched, &.{1});
@@ -485,7 +485,7 @@ test "drain does not emit pending DATA after a RST tombstone" {
 
     var pool = try testPool(gpa, 1024, 4);
     defer pool.deinit(gpa);
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
     // HEADERS out, so only the tombstone can be what holds the DATA back.
     try headersOut(&sched, &.{1});
@@ -544,7 +544,7 @@ test "pause_control leaves ordinary frames queued" {
     const fs = starh2.edge.fair_scheduler;
     var pool = try testPool(gpa, 1024, 4);
     defer pool.deinit(gpa);
-    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 4, &pool);
+    var sched = try fs.FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 4, &pool);
     defer sched.deinit();
 
     try sched.enqueueControl(try gpa.dupe(u8, "hdr1"), .ordinary, 0, 0);

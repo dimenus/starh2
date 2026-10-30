@@ -792,6 +792,47 @@ pub fn build(b: *std.Build) void {
     const t3567_step = b.step("test-t3567", "Run the t-3567 gate: bare flush barriers against a held writer wait for room on h2c and TLS");
     t3567_step.dependOn(&run_t3567_tests.step);
 
+    const t3562_tests = b.addTest(.{
+        .name = "t3562",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/t3562_terminal_bound.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_t3562_tests = b.addRunArtifact(t3562_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_t3562_tests.setCwd(b.path("."));
+    const t3562_step = b.step("test-t3562", "Run the t-3562 gate: terminal frames have one derived bound, and a flood past it ends with GOAWAY(ENHANCE_YOUR_CALM)");
+    t3562_step.dependOn(&run_t3562_tests.step);
+
+    // Not in `test` yet: it measures whether a Unix stream socket holds a
+    // server stall (the transport seam's step 1), on each system.
+    const unix_stall_tests = b.addTest(.{
+        .name = "unix_stall",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/unix_stall_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_unix_stall_tests = b.addRunArtifact(unix_stall_tests);
+    run_unix_stall_tests.setCwd(b.path("."));
+    const unix_stall_step = b.step("test-unix-stall", "Measure whether a Unix stream socket holds a server stall (h2c and TLS, quiet and with client writes)");
+    unix_stall_step.dependOn(&run_unix_stall_tests.step);
+
     const request_memory_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/request_memory.zig"),
@@ -865,6 +906,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_outbound_memory_tests.step);
     test_step.dependOn(&run_outbound_budget_tests.step);
     test_step.dependOn(&run_t3567_tests.step);
+    test_step.dependOn(&run_t3562_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_exact_step = b.step("test-exact", "Run live_exact gates only");

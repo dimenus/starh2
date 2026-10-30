@@ -23,6 +23,7 @@
 //! teardown may leave a waiting handler alone instead of canceling it. If a
 //! future change adds an exit path that skips `failDrain`, handlers will hang.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const slab_pool = @import("slab_pool.zig");
 const zio = @import("zio");
 const limits_mod = @import("../core/wire_const.zig");
@@ -186,6 +187,10 @@ pub const ReadPump = struct {
     /// is non-zero — oneshot-only must not donate on every read.
     live_task_handlers: *std.atomic.Value(usize),
     stopped: std.atomic.Value(bool) = .init(false),
+    /// Set before the end-of-stream post when the read FAILED (an I/O error),
+    /// not when the peer closed: the actor treats the first as a failed
+    /// connection and the second as an event (`Connection.onPeerEof`).
+    read_failed: std.atomic.Value(bool) = .init(false),
 
     fn returnIndex(self: *ReadPump, idx: u32) void {
         self.free_indices.putOneUncancelable(self.io, idx) catch {
@@ -209,18 +214,20 @@ pub const ReadPump = struct {
             const off = @as(usize, idx) * chunk_size;
             const buf = self.chunk_storage[off..][0..chunk_size];
             var dest: [1][]u8 = .{buf};
-            const n = reader.interface.readVec(&dest) catch {
+            // The pump never shuts the socket's send side: a peer that closed
+            // only its own side still reads, and what is queued for it (the
+            // GOAWAY, its RSTs) must reach it. The actor shuts it once the
+            // output is flushed (`Connection.closeFlushed`), and a failed
+            // read fails the connection, whose teardown shuts both sides.
+            const n = reader.interface.readVec(&dest) catch |err| {
                 self.returnIndex(idx);
-                // Unblock a write parked on a peer that already closed, so the
-                // pump gives its queue slots and chunks back and the completions
-                // that wake a held drain arrive.
-                self.stream.shutdown(self.io, .send) catch {};
+                // The peer's FIN comes back as `EndOfStream`, not as 0 bytes.
+                if (err != error.EndOfStream) self.read_failed.store(true, .release);
                 self.postEof();
                 return;
             };
             if (n == 0) {
                 self.returnIndex(idx);
-                self.stream.shutdown(self.io, .send) catch {};
                 self.postEof();
                 return;
             }
@@ -249,18 +256,19 @@ pub const ReadPump = struct {
 };
 
 /// Test-only: when true, the next WritePump write fails and the flag clears.
-pub var test_fail_next_write: std.atomic.Value(bool) = .init(false);
+pub var test_fail_next_write: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: while true, a WritePump holds the chunks it has taken instead of
 /// writing them, as a socket write that never completes would. Unlike
 /// `test_write_delay_ms`, it can be set after a connection is running.
-pub var test_hold_writes: std.atomic.Value(bool) = .init(false);
+pub var test_hold_writes: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+const observe = @import("build_options").observe;
 /// Test-only: how many times a WritePump has entered the hold above. A test
 /// that sets the flag waits for this to rise before it relies on a held pump.
-pub var test_hold_entered: std.atomic.Value(u64) = .init(0);
+pub var test_hold_entered: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only: monotonic ns of last successful WritePump completion that carried a ticket.
-pub var test_last_ticket_ok_ns: std.atomic.Value(u64) = .init(0);
+pub var test_last_ticket_ok_ns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only: ticket id of that completion (0 = none).
-pub var test_last_ticket_ok_id: std.atomic.Value(u64) = .init(0);
+pub var test_last_ticket_ok_id: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 
 /// t-866 ticket-ledger diagnostics (process-global, diag reads only).
 pub const diag_acks = struct {
@@ -347,8 +355,10 @@ pub const WritePump = struct {
             var written_ns: u64 = 0;
             if (ok and chunk.ticket != 0) {
                 written_ns = nowNs(self.io);
-                test_last_ticket_ok_ns.store(written_ns, .release);
-                test_last_ticket_ok_id.store(chunk.ticket, .release);
+                if (comptime observe) {
+                    test_last_ticket_ok_ns.store(written_ns, .release);
+                    test_last_ticket_ok_id.store(chunk.ticket, .release);
+                }
             }
             self.post(.{
                 .ticket = chunk.ticket,
@@ -444,7 +454,7 @@ pub const WritePump = struct {
                     count += 1;
                 }
             }
-            if (test_hold_writes.load(.acquire)) {
+            if ((comptime observe) and test_hold_writes.load(.acquire)) {
                 // Tells a test the pump is in the hold, with chunks taken and
                 // none written: the flag being set is not that, because the
                 // pump may read it later than the test wrote it.
@@ -467,7 +477,7 @@ pub const WritePump = struct {
                     return;
                 };
             }
-            const fail_next = test_fail_next_write.swap(false, .acq_rel);
+            const fail_next = if (comptime observe) test_fail_next_write.swap(false, .acq_rel) else false;
             if (fail_next or (self.test_fail_after > 0 and self.writes_done >= self.test_fail_after)) {
                 for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
                 self.failDrain();

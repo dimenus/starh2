@@ -41,12 +41,19 @@ pub const TokenBucket = struct {
     }
 };
 
+/// The burst of SETTINGS and of PING frames a peer may send at once. Each one
+/// forces an ack, so this is also how many acks `Session` keeps owed at most
+/// while it cannot queue them (`Session.Owed`): more owed at once is a peer
+/// that goes on sending past its burst while it reads nothing.
+pub const SETTINGS_BURST: usize = 100;
+pub const PING_BURST: usize = 100;
+
 /// Defaults: per 10-second windows for control-frame rate budgets.
 pub const RateLimiter = struct {
     non_data: TokenBucket = .init(10_000, 1_000), // 10000 / 10s
     rst: TokenBucket = .init(1_000, 100),
-    settings: TokenBucket = .init(100, 10),
-    ping: TokenBucket = .init(100, 10),
+    settings: TokenBucket = .init(SETTINGS_BURST, 10),
+    ping: TokenBucket = .init(PING_BURST, 10),
     /// WINDOW_UPDATE gets its OWN budget and does not charge `non_data`.
     ///
     /// It is the credit for DATA already delivered, so its rate scales with

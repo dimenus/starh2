@@ -106,6 +106,7 @@
 //! draw lasts for the connection's life. With migration there is no fixed
 //! home to choose, and zio refuses any placement but `.auto`.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 // Direct zio dependency: the actor parks in one `zio.select`; TLS adds
 // the CompletionQueue. The h2c pumps stay std.Io-pure.
 const zio = @import("zio");
@@ -115,6 +116,7 @@ const limits_mod = @import("../core/limits.zig");
 const wire_const = @import("../core/wire_const.zig");
 const boot_plan = @import("../core/boot_plan.zig");
 const conn_slot = @import("conn_slot.zig");
+const builtin = @import("builtin");
 const frame = @import("../core/frame.zig");
 const request = @import("../http/request.zig");
 const response = @import("../http/response.zig");
@@ -158,7 +160,7 @@ pub const placement_check = test_observe and zio_scheduling != .work_stealing;
 /// Per-connection task starts that compared their thread with the actor's.
 /// Counted so a zero mismatch count can be told apart from a check that
 /// never ran.
-pub var test_placement_checks: std.atomic.Value(usize) = .init(0);
+pub var test_placement_checks: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Diagnosis counters (always on, one atomic add per task handler): task
 /// handlers that reached the spawn, and spawns zio accepted. Compared with a
 /// handler's own entry count they tell "never spawned" from "spawned, never
@@ -166,7 +168,7 @@ pub var test_placement_checks: std.atomic.Value(usize) = .init(0);
 pub var diag_task_spawn_attempts: std.atomic.Value(u64) = .init(0);
 pub var diag_task_spawned: std.atomic.Value(u64) = .init(0);
 /// Per-connection task starts that ran on a thread other than the actor's.
-pub var test_placement_mismatches: std.atomic.Value(usize) = .init(0);
+pub var test_placement_mismatches: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 /// Called first by every per-connection task. `actor_thread` is the thread
 /// the connection's actor recorded when it started.
@@ -247,87 +249,130 @@ fn probeHandlerPlacement() zio.Placement {
 /// Test-only: when true, task-handler spawn fails closed with REFUSED_STREAM.
 /// Complete handlers never spawn, so this flag does not touch them. Do not
 /// run the task handler on the actor as a fallback — that parks ingest.
-pub var test_force_spawn_fail: bool = false;
+pub var test_force_spawn_fail: test_hook.Hook(bool) = if (test_hook.on) false else {};
 /// Test-only: when true, actor skips draining completion_ch (sticky until cleared).
-pub var test_hold_completion_drain: std.atomic.Value(bool) = .init(false);
+pub var test_hold_completion_drain: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: when true, the actor takes no write completion off
 /// `write_ack_ch` (sticky until cleared), so a test can make the one receiver
 /// slower than the drains that feed the pump. A real actor is that slow when
 /// one drain turn pushes many chunks. After clearing it, wake the actor the
 /// way a peer would (any inbound frame). Observe builds only.
-pub var test_hold_ack_receive: std.atomic.Value(bool) = .init(false);
+pub var test_hold_ack_receive: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 var hold_dummy_ack_buf: [1]wire_pump.WriteCompletion = undefined;
 var hold_dummy_ack_ch: zio.Channel(wire_pump.WriteCompletion) = .init(&hold_dummy_ack_buf);
 /// Test-only (observe builds): h2c drains held back because `write_ack_ch`
 /// had no room for another pop.
-pub var test_ack_room_pauses: std.atomic.Value(usize) = .init(0);
+pub var test_ack_room_pauses: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): handler flush barriers that parked for
 /// `write_ack_ch` room (`waitForAckRoom`).
-pub var test_ack_room_waits: std.atomic.Value(usize) = .init(0);
+pub var test_ack_room_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): the fewest free stash slots a TLS bare flush
 /// barrier left after its push (`pushBareBarrier`). Starts at the maximum.
-pub var test_tls_barrier_min_room: std.atomic.Value(usize) = .init(std.math.maxInt(usize));
+pub var test_tls_barrier_min_room: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(std.math.maxInt(usize)) else {};
 /// Test-only (observe builds): handlers that parked for connection outbound
 /// budget (`parkForBudget`), and the budget grants made. `test_budget_grant_log`
 /// keeps the stream id of each grant, newest at `grants % len`, so a test can
 /// read the order the queue served its waiters in.
-pub var test_budget_waits: std.atomic.Value(usize) = .init(0);
-pub var test_budget_grants: std.atomic.Value(usize) = .init(0);
-pub var test_budget_grant_log: [64]std.atomic.Value(u32) = @splat(.init(0));
+pub var test_budget_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_budget_grants: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_budget_grant_log: test_hook.Hook([64]std.atomic.Value(u32)) = if (test_hook.on) @splat(.init(0)) else {};
 /// Test-only (observe builds): times `runPendingInline` held a complete job
 /// back for lack of connection budget.
-pub var test_inline_budget_gated: std.atomic.Value(usize) = .init(0);
+pub var test_inline_budget_gated: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): doorbell rings made by a budget grant to an
 /// inline entry. The grant of the entry being admitted in the same call rings
 /// nothing.
-pub var test_budget_doorbell_rings: std.atomic.Value(usize) = .init(0);
+pub var test_budget_doorbell_rings: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): terminal control frames the scheduler could not
 /// queue (`ctrl_terminal_full`, the reset burst that ends a connection). A test
 /// that relies on the terminal queue not overflowing asserts it did not move.
-pub var test_ctrl_terminal_full: std.atomic.Value(usize) = .init(0);
+pub var test_ctrl_terminal_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only: the most frames the terminal ring has held at once, over every
+/// connection since the test last stored 0. A bound test reads it to prove the
+/// stall really queued the frames it means to, and that none went past T.
+/// Counted in Debug and `-Dobserve=true`.
+pub var test_terminal_ring_high: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): RST_STREAM frames the scheduler took while its
+/// control pause (`pause_control`) was on, so they waited in the terminal
+/// ring. A stall test reads it to prove its RSTs were queued during the
+/// stall, not after it.
+pub var test_rst_queued_paused: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): how closing phases ended in `closeFlushed`:
+/// the writer failed; the deadline passed with output still not written
+/// (`blocked`) or with all of it in the kernel and the peer not closing
+/// (`flushed`); the peer closed after a lingering close (h2c: on TLS a peer
+/// EOF ends the turn before `closeFlushed` runs).
+pub var test_closing_ended_writer_failed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_closing_ended_deadline_blocked: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_closing_ended_deadline_flushed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_closing_ended_peer_eof: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): closing phases whose output was all flushed
+/// and whose send side was then shut, to wait for the peer (the lingering
+/// close in `closeFlushed`).
+pub var test_closing_write_shut: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): HTTP/2 connections whose socket was closed,
+/// and when the last one was (`zio.Timestamp` monotonic ns, the clock the
+/// tests read). Written at the close itself, so a test can tell when the
+/// server let go of the peer, whatever the closing phase decided.
+pub var test_socket_closes: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): TLS closing phases that staged close_notify.
+pub var test_close_notify_staged: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): peer EOFs the actor took as an event
+/// (`onPeerEof`), before or during the closing phase.
+pub var test_peer_eofs: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_socket_close_ns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
+/// Test-only (observe builds): server RST_STREAMs dropped from the terminal
+/// ring because the peer reset the same stream first (`retireTerminalRst`).
+pub var test_rst_retired: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only: ORDINARY control frames (HEADERS and the like) the scheduler
+/// refused, by the pool (`PoolFull`) and by the ring (`QueueFull`). A handler
+/// whose response is refused sees `WriteFailed`. Counted in Debug and
+/// `-Dobserve=true`.
+pub var test_ctrl_ordinary_pool_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_ctrl_ordinary_queue_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): actors that are inside their park select right
 /// now. Raised immediately before `zio.select` in `waitForActivity` and lowered
 /// right after it returns. A test whose handler must act while the actor is
 /// asleep waits for this to be above zero (a sleep proves nothing about the
 /// actor's turn), with a deadline that fails the test. One connection per test.
-pub var test_actors_in_select: std.atomic.Value(usize) = .init(0);
+pub var test_actors_in_select: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): where in `unlockSession` a hook runs, between its
 /// two counters and around its ring, so a unit test can put the actor's
 /// snapshot at either side of the ring without a second thread.
 pub const ReleasePoint = enum { before_ring, after_ring, park_after_check };
-pub var test_release_hook: ?*const fn (*Connection, ReleasePoint) void = null;
+pub var test_release_hook: test_hook.Hook(?*const fn (*Connection, ReleasePoint) void) = if (test_hook.on) null else {};
 /// Test-only (observe builds): while true, the TLS driver holds the chunks that
 /// sit in the stash (pushed by a drain, not yet taken for writing). Beside
 /// `wire_pump.test_hold_writes`, which holds a batch the driver already took,
 /// it lets a test see a chunk in each place. `test_hold_stash_entered` counts
 /// the times the driver stopped there.
-pub var test_hold_stash: std.atomic.Value(bool) = .init(false);
-pub var test_hold_stash_entered: std.atomic.Value(u64) = .init(0);
+pub var test_hold_stash: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_hold_stash_entered: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Test-only: lets the full-queue push trap in `pushWriteChunk` be skipped, to
 /// test what every other build does there.
-pub var test_allow_full_queue_push: std.atomic.Value(bool) = .init(false);
+pub var test_allow_full_queue_push: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only (observe builds): h2c pushes refused because the write queue was
 /// full. Zero in a correct build (`pushWriteChunk`).
-pub var test_queue_push_refusals: std.atomic.Value(usize) = .init(0);
+pub var test_queue_push_refusals: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): pushes `pushWriteChunk` refused because the
 /// channel had no room, each one a connection failed closed. Zero in a
 /// correct build.
-pub var test_ack_bound_refusals: std.atomic.Value(usize) = .init(0);
+pub var test_ack_bound_refusals: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: while true, `drainEmit` emits nothing, so frames a handler
 /// queued stay in the scheduler (a reset can then arrive before them).
 /// Compiled out unless `test_observe`.
-pub var test_hold_emit: std.atomic.Value(bool) = .init(false);
+pub var test_hold_emit: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: stash a complete-batch write ack on the actor instead of
 /// applying it. Separate from `test_hold_completion_drain`, which parks
 /// `completion_ch`. Must not park the actor on the release event — that
 /// would block ingest of the next HEADERS, which is the property the
 /// lifecycle hold test checks.
-pub var test_hold_complete_receipt_ack: std.atomic.Value(bool) = .init(false);
+pub var test_hold_complete_receipt_ack: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: true while a complete-batch write ack is stashed unapplied.
-pub var test_complete_receipt_ack_held: std.atomic.Value(bool) = .init(false);
+pub var test_complete_receipt_ack_held: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: wakes a parked actor that has a live complete-batch stash.
 /// A zio.Event so the actor's select can wait on it directly.
-pub var test_release_complete_receipt_ack: zio.Event = .init;
+pub var test_release_complete_receipt_ack: test_hook.Hook(zio.Event) = if (test_hook.on) .init else {};
 /// Never set / never sent-to: the select branches point here when their
 /// real source is absent or gated, so the select keeps one comptime shape.
 var no_shutdown_event: zio.Event = .init;
@@ -336,14 +381,14 @@ var hold_dummy_completion_buf: [1]u31 = undefined;
 var hold_dummy_completion_ch: zio.Channel(u31) = .init(&hold_dummy_completion_buf);
 /// Test-only: when true, `borrowHeaderListMem` finds no free lease, so the
 /// next HEADERS takes Session's refuse-without-memory path.
-pub var test_no_request_lease: std.atomic.Value(bool) = .init(false);
+pub var test_no_request_lease: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: when true, the allocations that build a handler job fail as if
 /// the request's memory had run out, so dispatch takes its refusal path.
-pub var test_fail_dispatch_alloc: std.atomic.Value(bool) = .init(false);
+pub var test_fail_dispatch_alloc: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: delay write pump by N ms.
-pub var test_write_delay_ms: u64 = 0;
+pub var test_write_delay_ms: test_hook.Hook(u64) = if (test_hook.on) 0 else {};
 /// Test-only: fail write pump after N successful writes (0 = never).
-pub var test_write_fail_after: u64 = 0;
+pub var test_write_fail_after: test_hook.Hook(u64) = if (test_hook.on) 0 else {};
 /// Hot test counters. On in Debug (the gate builds) and when `-Dobserve=true`.
 /// Off in ReleaseFast examples so the oneshot bench does not pay process-global
 /// RMWs. Mutation canaries stay in gate builds; they are not the price of the
@@ -354,61 +399,61 @@ pub const test_observe = @import("build_options").observe;
 /// itself, not by the actor loop: an idle actor parks until the next wakeup, so a
 /// value refreshed only per iteration stays stale for as long as the connection is
 /// quiet and reports handlers that have already exited.
-pub var test_observed_live_handlers: std.atomic.Value(usize) = .init(0);
+pub var test_observed_live_handlers: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: handler slots held across all connections. Released strictly later
 /// than `test_observed_live_handlers` (the actor releases the slot after joining
 /// the handler), so a drain gate must require both to reach zero.
-pub var test_observed_slots_in_use: std.atomic.Value(usize) = .init(0);
+pub var test_observed_slots_in_use: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: FairScheduler emits observed by actor (mutation canary).
-pub var test_observed_sched_emits: std.atomic.Value(usize) = .init(0);
+pub var test_observed_sched_emits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: true once actor handled writer_failed terminal teardown.
-pub var test_observed_writer_fail_handled: std.atomic.Value(bool) = .init(false);
+pub var test_observed_writer_fail_handled: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 /// Test-only: complete handlers run on the actor (no spawn).
-pub var test_observed_inline_jobs: std.atomic.Value(usize) = .init(0);
+pub var test_observed_inline_jobs: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Times `runPendingInline` stopped a batch because no ordinary control entry was free.
-pub var test_observed_inline_ctrl_full: std.atomic.Value(usize) = .init(0);
+pub var test_observed_inline_ctrl_full: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: queueWire calls not from FairScheduler sink (must stay 0).
-pub var test_queue_wire_bypass: std.atomic.Value(usize) = .init(0);
+pub var test_queue_wire_bypass: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the first-frame checks `queueWire` ran: one per connection that
 /// wrote. A test that expects N connections to be checked proves the check
 /// is wired in; deleting the call leaves every other test green.
-pub var test_preface_checks: std.atomic.Value(usize) = .init(0);
+pub var test_preface_checks: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts connections that started with a non-empty `tls_leftover`. The TLS
 /// preface tests assert every tested connection took that path, because a
 /// server read that returned only the Finished record would skip it.
-pub var test_tls_leftover_connections: std.atomic.Value(usize) = .init(0);
+pub var test_tls_leftover_connections: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the times `error.Canceled` reached `Connection.run`, so a test can
 /// tell a cancel that left as `Canceled` from one a `catch` turned into
 /// something else. The connection task's result is not visible to a test.
-pub var test_run_canceled: std.atomic.Value(usize) = .init(0);
+pub var test_run_canceled: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only (observe builds): actor teardowns begun (`teardownExhaustive`). A
 /// test whose handler stays alive after the connection failed reads this to
 /// prove the ACTOR got to its teardown, which a handler's own task cannot fake.
-pub var test_actor_teardowns: std.atomic.Value(usize) = .init(0);
+pub var test_actor_teardowns: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the times `runPendingInline` saw `error.Canceled` from its drain. With
 /// `test_run_canceled` it lets a test tell WHICH path carried a cancel: a cancel
 /// parked elsewhere (the main-loop drain, a select) reaches `run` without
 /// moving this one.
-pub var test_inline_drain_canceled: std.atomic.Value(usize) = .init(0);
+pub var test_inline_drain_canceled: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Counts the pops an ending h2c connection held back because the write pool
 /// or the write queue had no room (see `h2cPauseFor`). A test that expects the
 /// hold-back proves it ran; removing the hooks leaves the other tests green.
-pub var test_closing_emit_deferred: std.atomic.Value(usize) = .init(0);
+pub var test_closing_emit_deferred: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: true while FairScheduler sink is executing queueWire.
-threadlocal var test_in_sched_sink: bool = false;
+threadlocal var test_in_sched_sink: test_hook.Hook(bool) = if (test_hook.on) false else {};
 /// Test-only: force queueWire/send fail after N successful accounted sends (0=never).
-pub var test_force_wire_fail_after: std.atomic.Value(usize) = .init(0);
-pub var test_wire_sends: std.atomic.Value(usize) = .init(0);
+pub var test_force_wire_fail_after: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_wire_sends: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: last handler ResponseError taxonomy (0=none/success, 1=WriteFailed, 2=ConnectionClosed,
 /// 3=PeerReset, 4=SlowConsumer, 5=other).
-pub var test_last_handler_err: std.atomic.Value(u8) = .init(0);
-pub var test_last_peer_reset_code: std.atomic.Value(u32) = .init(0);
+pub var test_last_handler_err: test_hook.Hook(std.atomic.Value(u8)) = if (test_hook.on) .init(0) else {};
+pub var test_last_peer_reset_code: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
 /// Test-only: stream_id currently blocked in waitForStreamSpace (0 = none).
-pub var test_waiting_for_space: std.atomic.Value(u32) = .init(0);
+pub var test_waiting_for_space: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
 /// Test-only: actor-owned handler-deadline heap occupancy (one connection at a time).
-pub var test_deadline_waits: std.atomic.Value(usize) = .init(0);
+pub var test_deadline_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: Connection finished boot allocations (pools, sched slabs, session maps).
-pub var test_boot_ready: std.atomic.Value(bool) = .init(false);
+pub var test_boot_ready: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 
 
 
@@ -433,11 +478,11 @@ var actor_marker: zio.TaskLocal(*Connection) = .{};
 /// can resume on another thread.
 var handler_job_marker: zio.TaskLocal(void) = .{};
 /// Test-only gate that parks the actor immediately before its event-driven wait.
-pub var test_hold_before_actor_wait: std.atomic.Value(bool) = .init(false);
-pub var test_actor_waiting: std.Io.Event = .unset;
-pub var test_release_actor_wait: std.Io.Event = .unset;
+pub var test_hold_before_actor_wait: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_actor_waiting: test_hook.Hook(std.Io.Event) = if (test_hook.on) .unset else {};
+pub var test_release_actor_wait: test_hook.Hook(std.Io.Event) = if (test_hook.on) .unset else {};
 /// Test-only fallback timer raced against actor events by the wakeup canary.
-pub var test_polling_canary_tick_ns: std.atomic.Value(u64) = .init(0);
+pub var test_polling_canary_tick_ns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Bench `--diag`: print one line when the actor parks with scheduler or TLS
 /// work still sitting in userspace. Off unless the benchmark server sets it.
 pub var diag_park: bool = false;
@@ -654,6 +699,11 @@ var diag_last_empty_park_ns: u64 = 0;
 var diag_last_drain_ns: u64 = 0;
 var diag_prev_drain_gap_ns: u64 = 0;
 
+fn noteTestSocketClose() void {
+    test_socket_close_ns.store(zio.Timestamp.now(.monotonic).toNanoseconds(), .release);
+    _ = test_socket_closes.fetchAdd(1, .acq_rel);
+}
+
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
@@ -718,6 +768,8 @@ pub const outbound_memory = struct {
     /// Frames `rentFrame` served, and which pool each came from.
     pub var frames_built: std.atomic.Value(u64) = .init(0);
     pub var frames_from_slab: std.atomic.Value(u64) = .init(0);
+    /// ... or from the terminal store (RST_STREAM and GOAWAY).
+    pub var frames_from_terminal_store: std.atomic.Value(u64) = .init(0);
     pub var frames_from_chunk: std.atomic.Value(u64) = .init(0);
     /// ... or written straight into the drain-turn scratch (small DATA).
     pub var frames_in_scratch: std.atomic.Value(u64) = .init(0);
@@ -1294,7 +1346,7 @@ const SendTrace = struct {
 
 /// Probes `LeaseIndex.find` made (observe builds only): every lease it looked
 /// at. A test reads the count to show a lookup does not scan.
-pub var test_lease_probes: std.atomic.Value(u64) = .init(0);
+pub var test_lease_probes: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 
 /// How a stream id finds its `RequestLease` in O(1), and how a new request
 /// finds a free one. Both are tables sized at boot (`Connection.planBoot`),
@@ -1625,8 +1677,8 @@ pub const DirtyKind = enum {
 
 /// Test-only: how many of the next connections to end in a slot are dirtied,
 /// and how. Counted in Debug and `-Dobserve=true`.
-pub var test_dirty_remaining: std.atomic.Value(usize) = .init(0);
-pub var test_dirty_kind: DirtyKind = .write_chunk_rented;
+pub var test_dirty_remaining: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_dirty_kind: test_hook.Hook(DirtyKind) = if (test_hook.on) .write_chunk_rented else {};
 
 fn testTakeDirtyTicket() bool {
     var n = test_dirty_remaining.load(.acquire);
@@ -1640,7 +1692,7 @@ fn testTakeDirtyTicket() bool {
 /// connection. The boot path never yields, so a counting allocator can read
 /// this to tell a general-allocator call made by boot from one made by a
 /// request. Counted in Debug and `-Dobserve=true`.
-pub threadlocal var test_in_boot: bool = false;
+pub threadlocal var test_in_boot: test_hook.Hook(bool) = if (test_hook.on) false else {};
 
 /// Entry point for one accepted socket. Boots the `Connection` into `slot`
 /// and runs it. The slot owns the connection's memory; this function ends the
@@ -1684,7 +1736,7 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig, slot: *conn_
         if (close_probe) diagRawPrint("t1002 finish_boot_fail {s}\n", .{@errorName(err)});
         return;
     };
-    test_boot_ready.store(true, .release);
+    if (comptime test_observe) test_boot_ready.store(true, .release);
     conn.run() catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {
@@ -1783,6 +1835,14 @@ pub const Connection = struct {
     /// frames it already queued: the time after which it stops waiting for the
     /// peer. Null while the connection is open. See `runBody` ("Closing phase").
     closing_deadline_ns: ?u64 = null,
+    /// Closing phase, actor only: everything queued has reached the kernel and
+    /// the send side is shut (`closeFlushed`), and the peer's EOF has arrived.
+    closing_write_shut: bool = false,
+    /// TLS: close_notify was staged in the closing phase (`closeFlushed`).
+    closing_notify_staged: bool = false,
+    /// Set by the first `materializeIntents`; see `unlockSession`.
+    intents_materialized: bool = false,
+    closing_peer_eof: bool = false,
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
     session_mu: std.Io.Mutex = .init,
@@ -1938,8 +1998,14 @@ pub const Connection = struct {
     /// it spawns read it without a race. Only `notePlacement` reads it.
     actor_thread: std.Thread.Id = 0,
     frame_pool: slab_pool.SlabPool = undefined,
-    /// Slabs of `frame_pool` that only terminal frames may take. Set in `init`.
-    frame_slab_reserve: usize = 0,
+    /// Where RST_STREAM and GOAWAY frames are built: `Limits.terminalFrames`
+    /// (T) fixed slots, each as big as the biggest terminal frame (a GOAWAY
+    /// with no debug data). They never take a frame slab or a write chunk, so
+    /// no other frame can leave a terminal frame without room. A slot is taken
+    /// when the frame is built (`rentTerminal`, which refuses past the bound)
+    /// and returned when the frame's bytes are copied out or written
+    /// (`releaseWireBytes`).
+    terminal_store: slab_pool.SlabPool = undefined,
     /// True while the scheduler's `buildData` callback makes a DATA frame, the
     /// one frame built inside a pop. See `rentFrame`. Written and read under
     /// `session_mu`.
@@ -1994,9 +2060,6 @@ pub const Connection = struct {
     receipt_ready_stamp: [complete_receipt_capacity]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0), .init(0) },
     receipt_ready_stamp_w: std.atomic.Value(usize) = .init(0),
     receipt_ready_stamp_r: usize = 0,
-    /// Next outbound wire frame (HEADERS/control/DATA) receives this ticket once.
-    next_wire_ticket: u64 = 0,
-    next_wire_slot: u32 = 0,
     pending_ticket: ?PendingTicketAttach = null,
     /// Quantum bytes to release from handler outbound after successful DATA sink.
     pending_data_outbound_release: usize = 0,
@@ -2020,7 +2083,11 @@ pub const Connection = struct {
         // `init` narrows both counts to `u32`. The plan refuses a larger one
         // where the count is used: `SlabPool.planBoot` for the chunks and
         // `Plan.hashMap` for the streams.
+        // Ticket owners are handlers and ordinary controls. A terminal frame
+        // never reserves a ticket; it can only carry a handler's, which that
+        // handler already counts.
         const ticket_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
+        const ack_n = try boot_plan.add(limits.control_entries_per_connection, max_streams);
         const read_ch_n = try boot_plan.add(n_chunks, 1);
         const leases_n = try boot_plan.add(try boot_plan.mul(max_streams, 2), 1);
         const read_chunk_bytes = try boot_plan.mul(n_chunks, limits_mod.WIRE_CHUNK_SIZE);
@@ -2036,7 +2103,7 @@ pub const Connection = struct {
         try plan.array(session_mod.DispatchRequest, max_streams); // parked
         try plan.array(?zio.JoinHandle(void), max_streams);
         try plan.array(u31, max_streams); // completion_ch_buf
-        try plan.array(wire_pump.WriteCompletion, ticket_n);
+        try plan.array(wire_pump.WriteCompletion, ack_n);
         try plan.array(ticket_table.TicketWait, ticket_n);
         try plan.array(u8, emit_batch.max_plaintext);
         try plan.array(u8, read_chunk_bytes); // read_chunk_storage
@@ -2047,6 +2114,7 @@ pub const Connection = struct {
             try plan.array(wire_pump.WireChunk, try boot_plan.add(n_chunks, tls_edge.Pump.extra_stash_slots));
         }
         try slab_pool.SlabPool.planBoot(plan, limits.frame_slab_bytes, limits.frame_slabs_per_connection); // frame_pool
+        try slab_pool.SlabPool.planBoot(plan, frame.goaway_frame_bytes, try limits.terminalFrames()); // terminal_store
         try plan.array(u31, max_streams); // sid_scratch
         try plan.array(u31, max_streams); // inline_sids
         try plan.array(zio.Event, max_streams); // space_events
@@ -2054,7 +2122,7 @@ pub const Connection = struct {
         try plan.array(session_mod.Intent, @max(limits.intent_entries_per_connection, 16)); // intent_batch
         try fair_scheduler.FairScheduler.planBoot(
             plan,
-            @max(limits.control_entries_per_connection / 8, 16),
+            try limits.terminalFrames(),
             limits.control_entries_per_connection,
             max_streams,
         );
@@ -2067,6 +2135,7 @@ pub const Connection = struct {
         // gets the same answer, not a queue its drain can overrun.
         if (config.mode == .h2c) try config.limits.checkH2cWriteQueue();
         try config.limits.checkFramePool();
+        try config.limits.checkIntentQueue();
         if (config.request_pool == null) return error.RequestPoolMissing;
         var session = try session_mod.Session.initBare(boot, config.gpa, config.limits);
         errdefer {
@@ -2128,6 +2197,15 @@ pub const Connection = struct {
                 fn f(ctx: *anyopaque, buf: []u8) void {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
                     c.releaseWireBytes(buf);
+                }
+            }.f,
+            .retireRst = struct {
+                fn f(ctx: *anyopaque, stream_id: u31) void {
+                    const c: *Connection = @ptrCast(@alignCast(ctx));
+                    const dropped = c.sched.retireTerminalRst(stream_id);
+                    if (comptime test_observe) {
+                        if (dropped) _ = test_rst_retired.fetchAdd(1, .monotonic);
+                    }
                 }
             }.f,
             .requestBodyCap = struct {
@@ -2193,6 +2271,9 @@ pub const Connection = struct {
             config.limits.frame_slabs_per_connection,
         );
         errdefer frame_pool.deinit(boot);
+        const terminal_frames = try config.limits.terminalFrames();
+        var terminal_store = try slab_pool.SlabPool.init(boot, config.io, frame.goaway_frame_bytes, terminal_frames);
+        errdefer terminal_store.deinit(boot);
         const sid_scratch = try boot.alloc(u31, config.limits.max_streams_per_connection);
         errdefer boot.free(sid_scratch);
         const inline_sids = try boot.alloc(u31, config.limits.max_streams_per_connection);
@@ -2208,18 +2289,22 @@ pub const Connection = struct {
             if (config.tls_acceptor == null) return error.InvalidConfig;
         }
 
-        const term_cap = @max(config.limits.control_entries_per_connection / 8, 16);
         var sched = try fair_scheduler.FairScheduler.init(
             boot,
             config.io,
             config.limits.control_bytes_per_connection,
             config.limits.control_entries_per_connection,
-            term_cap,
-            config.limits.control_entries_per_connection,
+            try config.limits.terminalBytes(),
+            terminal_frames,
             config.limits.max_streams_per_connection,
             config.slab_pool,
         );
         errdefer sched.deinit();
+        // One number sizes all three, and a construction that ever stops doing
+        // so must not boot: the bound `Limits.terminalFrames` derives holds
+        // only while the ring, the pool's terminal share and the store agree.
+        if (sched.terminal_q.len != terminal_frames or sched.ctrl.terminal_entries != terminal_frames or
+            terminal_store.capacity != terminal_frames) return error.InvalidConfig;
 
         var self: Connection = .{
             .stream = stream,
@@ -2248,7 +2333,7 @@ pub const Connection = struct {
             .tls_read_buf = tls_read_buf,
             .tls_write_buf = tls_write_buf,
             .frame_pool = frame_pool,
-            .frame_slab_reserve = config.limits.frameSlabReserve(),
+            .terminal_store = terminal_store,
             .read_pool_n = n_chunks,
             .sid_scratch = sid_scratch,
             .inline_sids = inline_sids,
@@ -2445,6 +2530,7 @@ pub const Connection = struct {
         }
         self.sched.releaseHeld();
         self.frame_pool.assertAllReturned();
+        self.terminal_store.assertAllReturned();
         self.write_pool.assertAllReturned();
         if (self.tls) |tls_conn| {
             // The slot (or whoever created it) owns the memory.
@@ -2497,6 +2583,7 @@ pub const Connection = struct {
         if (!self.socket_closed.load(.acquire)) {
             self.stream.close(io);
             self.socket_closed.store(true, .release);
+            if (comptime test_observe) noteTestSocketClose();
         }
     }
 
@@ -2547,6 +2634,7 @@ pub const Connection = struct {
         }
         if (self.write_pool.rentedCount() != 0) return "write pool chunk still rented";
         if (self.frame_pool.rentedCount() != 0) return "frame pool slab still rented";
+        if (self.terminal_store.rentedCount() != 0) return "terminal frame store slot still rented";
         if (self.sched.terminal_len != 0 or self.sched.ordinary_len != 0 or self.sched.framed_len != 0) {
             return "scheduler still holds a queued frame";
         }
@@ -2580,6 +2668,7 @@ pub const Connection = struct {
     fn freeBoot(self: *Connection) void {
         const boot = self.boot;
         self.sched.deinit();
+        self.terminal_store.deinit(boot);
         self.frame_pool.deinit(boot);
         self.session.freeBoot();
         boot.free(self.read_ch_buf);
@@ -2891,10 +2980,11 @@ pub const Connection = struct {
         std.debug.assert(self.held_ack_n < complete_receipt_capacity);
         self.held_acks[self.held_ack_n] = ack;
         self.held_ack_n += 1;
-        test_complete_receipt_ack_held.store(true, .release);
+        if (comptime test_observe) test_complete_receipt_ack_held.store(true, .release);
     }
 
     fn shouldHoldCompleteAck(ack: wire_pump.WriteCompletion) bool {
+        if (comptime !test_observe) return false;
         return ack.ticket != 0 and ack.complete_batch_receipt and
             test_hold_complete_receipt_ack.load(.acquire);
     }
@@ -2914,9 +3004,11 @@ pub const Connection = struct {
     }
 
     fn flushHeldWriteAcks(self: *Connection) void {
-        if (test_hold_complete_receipt_ack.load(.acquire) and self.held_ack_n > 0) {
-            test_complete_receipt_ack_held.store(true, .release);
-            return;
+        if (comptime test_observe) {
+            if (test_hold_complete_receipt_ack.load(.acquire) and self.held_ack_n > 0) {
+                test_complete_receipt_ack_held.store(true, .release);
+                return;
+            }
         }
         var i: usize = 0;
         while (i < self.held_ack_n) : (i += 1) {
@@ -2924,7 +3016,7 @@ pub const Connection = struct {
         }
         if (self.held_ack_n != 0) {
             self.held_ack_n = 0;
-            test_complete_receipt_ack_held.store(false, .release);
+            if (comptime test_observe) test_complete_receipt_ack_held.store(false, .release);
         }
     }
 
@@ -2989,7 +3081,7 @@ pub const Connection = struct {
             _ = self.applyWriteAck(self.held_acks[i]);
         }
         self.held_ack_n = 0;
-        test_complete_receipt_ack_held.store(false, .release);
+        if (comptime test_observe) test_complete_receipt_ack_held.store(false, .release);
         while (io_queue.tryRecv(wire_pump.WriteCompletion, &self.write_ack_ch)) |ack| {
             if (wire_pump.countsChunk(ack)) {
                 self.acks.sub();
@@ -3087,7 +3179,6 @@ pub const Connection = struct {
         }
         // Drain control queues without writing (connection is dead).
         while (self.sched.popTerminal()) |e| {
-            self.sched.ctrl.release(e.control_n, 1);
             self.sched.freePayload(e.payload);
         }
         while (self.sched.popOrdinary()) |e| {
@@ -3297,7 +3388,9 @@ pub const Connection = struct {
     }
 
     fn drainCompletions(self: *Connection) usize {
-        if (test_hold_completion_drain.load(.acquire)) return 0;
+        if (comptime test_observe) {
+            if (test_hold_completion_drain.load(.acquire)) return 0;
+        }
         var n: usize = 0;
         while (io_queue.tryRecv(u31, &self.completion_ch)) |sid| {
             if (self.releaseSlot(sid)) n += 1;
@@ -3347,6 +3440,52 @@ pub const Connection = struct {
         return .go;
     }
 
+    /// Ingest `bytes` and process the intents, as many rounds as it takes.
+    /// `Session.ingestSome` stops at a frame boundary when the intent queue has
+    /// less room than one frame can need, so the queue is materialized and
+    /// ingest goes on with the rest; one read chunk can then never fill the
+    /// queue (`Limits.intentEntriesMin`). Caller holds `session_mu`.
+    fn ingestAndProcess(self: *Connection, bytes: []const u8) !void {
+        self.assertSessionHeld("ingestAndProcess");
+        const io = self.config.io;
+        var rest = bytes;
+        while (true) {
+            const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
+            const taken = self.session.ingestSome(rest) catch |err| return self.sessionErrorExit(err, "ingest_error");
+            if (trace.enabled) {
+                _ = trace.ingest_ns.fetchAdd(nowNs(io) -% ingest_t0, .monotonic);
+                _ = trace.ingest_n.fetchAdd(1, .monotonic);
+            }
+            // The queue is empty on every call (each round below drains it),
+            // and boot keeps it at least one frame's room, so a round that
+            // takes nothing is a broken invariant, not a slow peer.
+            if (taken == 0 and rest.len != 0) std.debug.panic("ingest took nothing from {d} bytes with {d} of {d} intents queued: the intent queue is below Limits.intentEntriesMin", .{ rest.len, self.session.intentLen(), self.session.intentCapacity() });
+            rest = rest[taken..];
+            const intent_t0 = if (trace.enabled) nowNs(io) else 0;
+            try self.processIntents();
+            if (trace.enabled) {
+                _ = trace.intent_ns.fetchAdd(nowNs(io) -% intent_t0, .monotonic);
+                _ = trace.intent_n.fetchAdd(1, .monotonic);
+            }
+            if (rest.len == 0) return;
+        }
+    }
+
+    /// The exit for an error from `Session` in a lock section. The section
+    /// may have queued intents before the error, and the queue must be empty
+    /// when the lock is released (`unlockSession`), so they are materialized
+    /// first. If the session went terminal, its GOAWAY is now in the
+    /// scheduler and the error does not end the connection here: the caller
+    /// goes on, and the closing phase writes it. Otherwise the error is the
+    /// connection's end, returned to `run`, whose teardown releases the
+    /// scheduler.
+    fn sessionErrorExit(self: *Connection, err: anyerror, comptime site: []const u8) anyerror!void {
+        self.assertSessionHeld("sessionErrorExit");
+        self.materializeIntents() catch self.failClosedOnIntentError();
+        if (self.session.terminal != .goaway) return err;
+        self.noteServerClose(site, err);
+    }
+
     /// Ingest one already-taken inbound chunk. Caller recycles the chunk.
     /// Returns true when Session became terminal.
     fn ingestWireChunk(self: *Connection, chunk: wire_pump.WireChunk) !bool {
@@ -3354,20 +3493,7 @@ pub const Connection = struct {
         self.lockSessionUncancelable(io);
         defer self.unlockSession(io);
         self.session.edge_now_ns = nowNs(io);
-        {
-            const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
-            try self.session.ingest(chunk.bytes[0..chunk.len]);
-            if (trace.enabled) {
-                _ = trace.ingest_ns.fetchAdd(nowNs(io) -% ingest_t0, .monotonic);
-                _ = trace.ingest_n.fetchAdd(1, .monotonic);
-            }
-            const intent_t0 = if (trace.enabled) nowNs(io) else 0;
-            try self.processIntents();
-            if (trace.enabled) {
-                _ = trace.intent_ns.fetchAdd(nowNs(io) -% intent_t0, .monotonic);
-                _ = trace.intent_n.fetchAdd(1, .monotonic);
-            }
-        }
+        try self.ingestAndProcess(chunk.bytes[0..chunk.len]);
         // Start closing here, under the hold ingest already has, so the
         // inline queue is frozen before anything can run those handlers.
         self.beginClosingIfTerminal();
@@ -3476,7 +3602,7 @@ pub const Connection = struct {
             const ns: u64 = @intCast(deadline.nanoseconds);
             if (next == null or ns < next.?) next = ns;
         }
-        const canary_tick = test_polling_canary_tick_ns.load(.acquire);
+        const canary_tick: u64 = if (comptime test_observe) test_polling_canary_tick_ns.load(.acquire) else 0;
         if (canary_tick != 0) {
             const deadline = nowNs(self.config.io) +% canary_tick;
             if (next == null or deadline < next.?) next = deadline;
@@ -3642,7 +3768,6 @@ pub const Connection = struct {
         diagActor(self, .tls_turn);
         defer diagActor(self, .running);
         const pump = self.tls_driver.?;
-        if (pump.inbound_eof) return true;
 
         // Closing phase: a completion taken here can be the last send, which
         // is what ends the phase. Only the lock block decides that, so a turn
@@ -3705,7 +3830,7 @@ pub const Connection = struct {
                 switch (pump.readOne()) {
                     .eof => return true,
                     .ok => {},
-                    .want, .stuck => break,
+                    .closed, .want, .stuck => break,
                 }
             }
             const chunk = pump.pending_read orelse break;
@@ -3732,7 +3857,6 @@ pub const Connection = struct {
             return false;
         }
 
-        if (pump.inbound_eof) return true;
         // t-866: never wait while pendingInbound(). Also don't park on a
         // stashed cipher suffix (recv is unarmed until it is fed), or while
         // outbound is only stashed (carried / write_ch) and not yet encrypted.
@@ -3769,9 +3893,11 @@ pub const Connection = struct {
         self.actor_site.store(2, .release);
         defer self.actor_site.store(1, .release);
         if (diag_park) self.traceParkSnapshot();
-        if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
-            test_actor_waiting.set(io);
-            try test_release_actor_wait.wait(io);
+        if (comptime test_observe) {
+            if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
+                test_actor_waiting.set(io);
+                try test_release_actor_wait.wait(io);
+            }
         }
         const timeout: zio.Timeout = if (self.nextDeadlineNs()) |deadline_ns| blk: {
             const now = nowNs(io);
@@ -3798,11 +3924,11 @@ pub const Connection = struct {
             self.config.shutdown_event orelse &no_shutdown_event;
         // The hold leaves completions buffered in the channel, exactly as the
         // gated drain leaves them queued.
-        const comps_ch = if (test_hold_completion_drain.load(.acquire))
+        const comps_ch = if ((comptime test_observe) and test_hold_completion_drain.load(.acquire))
             &hold_dummy_completion_ch
         else
             &self.completion_ch;
-        const ack_hold_ev = if (self.held_ack_n > 0)
+        const ack_hold_ev = if ((comptime test_observe) and self.held_ack_n > 0)
             &test_release_complete_receipt_ack
         else
             &no_ack_hold_event;
@@ -3811,7 +3937,9 @@ pub const Connection = struct {
             // t-866: never park while inbound plaintext, unread records, or a
             // stashed cipher suffix sit. The recv is unarmed in the last case.
             if (pump.pending_read != null or pump.pending_cipher != null or pump.conn.pendingInbound()) return null;
-            std.debug.assert(pump.recv_armed or pump.send_armed);
+            // After the peer's EOF nothing is read, and with no send in flight
+            // only a timer or the doorbell can wake the actor.
+            std.debug.assert(pump.recv_armed or pump.send_armed or pump.inbound_eof);
             self.assertNoLostWake("the TLS select");
             diagActor(self, .select);
             defer diagActor(self, .tls_turn);
@@ -4061,6 +4189,7 @@ pub const Connection = struct {
             self.drainWriteAcksForced();
             if (!self.socket_closed.swap(true, .acq_rel)) {
                 self.stream.close(io);
+                if (comptime test_observe) noteTestSocketClose();
             }
         }
 
@@ -4097,8 +4226,8 @@ pub const Connection = struct {
                 .read_free = &self.read_free_ch,
                 .write_free = &self.write_pool,
                 .live_task_handlers = &self.live_task_handlers,
-                .test_delay_ms = test_write_delay_ms,
-                .test_fail_after = test_write_fail_after,
+                .test_delay_ms = if (comptime test_observe) test_write_delay_ms else 0,
+                .test_fail_after = if (comptime test_observe) test_write_fail_after else 0,
             };
             if (!tls_pump.start()) return;
             self.tls_driver = &tls_pump;
@@ -4143,8 +4272,8 @@ pub const Connection = struct {
                 .ledger = &self.acks,
                 .gpa = gpa,
                 .free_indices = &self.write_pool,
-                .test_delay_ms = test_write_delay_ms,
-                .test_fail_after = test_write_fail_after,
+                .test_delay_ms = if (comptime test_observe) test_write_delay_ms else 0,
+                .test_fail_after = if (comptime test_observe) test_write_fail_after else 0,
             };
             read_handle = try zio.spawnInto(connPlacement(), runReadPump, .{ self, &read_pump });
             write_handle = try zio.spawnInto(connPlacement(), runWritePump, .{ self, &write_pump });
@@ -4173,8 +4302,7 @@ pub const Connection = struct {
                 std.debug.assert(self.config.mode == .tls);
                 _ = h2_work.tls_leftovers.fetchAdd(1, .monotonic);
                 if (comptime test_observe) _ = test_tls_leftover_connections.fetchAdd(1, .acq_rel);
-                try self.session.ingest(self.config.tls_leftover);
-                try self.flushSessionIntents();
+                try self.ingestAndProcess(self.config.tls_leftover);
             }
             // A connection error in the first flight starts the closing phase
             // here, under the lock: its GOAWAY is stashed behind the SETTINGS
@@ -4192,8 +4320,9 @@ pub const Connection = struct {
             try self.runPendingInline();
         }
 
+        // An end of stream met among the extra chunks of a read batch.
         var inbound_eof = false;
-        // Out-of-lock exits (TLS pump gone, empty-chunk EOF) set this and
+        // Out-of-lock exits (TLS pump gone, a failed read) set this and
         // continue. In-lock terminal branches freeze and sweep under the
         // hold they already have; they must not drop and reacquire.
         var leaving = false;
@@ -4229,12 +4358,16 @@ pub const Connection = struct {
                 if (self.closing_deadline_ns == null) {
                     const now = nowNs(io);
                     self.session.edge_now_ns = now;
-                    try self.session.checkIdleDeadlines(now);
-                    if (try self.maybeBeginGraceful()) {
+                    self.session.checkIdleDeadlines(now) catch |err| try self.sessionErrorExit(err, "idle_deadline_error");
+                    const graceful_done = self.maybeBeginGraceful() catch |err| blk: {
+                        try self.sessionErrorExit(err, "graceful_error");
+                        break :blk false;
+                    };
+                    if (graceful_done) {
                         // The drain is over; its RST_STREAMs are queued.
                         self.beginClosing();
                     } else {
-                        try self.checkSlowConsumers();
+                        self.checkSlowConsumers() catch |err| try self.sessionErrorExit(err, "slow_consumer_error");
                         // Deadlines and slow-consumer kills push Session intents
                         // (RST_STREAM, stream_reset). drainEmit only walks the
                         // scheduler, so those intents have to be materialized first or
@@ -4243,7 +4376,7 @@ pub const Connection = struct {
                         // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
                         // Slots freed since the last turn go to parked requests before
                         // any new one, so a waiting request is not overtaken.
-                        try self.dispatchParked();
+                        self.dispatchParked() catch |err| try self.sessionErrorExit(err, "dispatch_parked_error");
                     }
                 }
                 diagActor(self, .lk_materialize);
@@ -4297,9 +4430,6 @@ pub const Connection = struct {
                     {
                         try self.finishGraceful();
                         self.beginClosing();
-                    } else if (inbound_eof) {
-                        self.freezeAndSweepLocked();
-                        break;
                     }
                 }
                 // Checked in the turn that began the phase too. If nothing was
@@ -4318,10 +4448,10 @@ pub const Connection = struct {
             try self.runPendingInline();
 
             if (self.config.mode == .tls) {
-                if (try self.driveTlsTurn()) {
-                    self.beginLeave(&leaving);
-                    continue;
-                }
+                const leave = try self.driveTlsTurn();
+                // An EOF or close_notify the pump saw this turn.
+                if (!leave and self.tls_driver.?.inbound_eof) try self.onPeerEof();
+                if (leave) self.beginLeave(&leaving);
                 continue;
             }
 
@@ -4337,12 +4467,22 @@ pub const Connection = struct {
             const chunk = maybe_chunk.?;
             // Closing phase: read and drop (an EOF too: the write side may
             // still be open, and the GOAWAY is for a peer that half-closed).
-            if (self.closing_deadline_ns != null) {
-                self.recycleReadChunk(chunk);
+            // The EOF is noted: once the output is flushed it ends the
+            // lingering close (`closeFlushed`).
+            if (chunk.len == 0 and chunk.bytes.len == 0) {
+                // A failed read fails the connection; the peer's EOF is an
+                // event (`onPeerEof`), in the closing phase or before it.
+                if (read_pump.read_failed.load(.acquire)) {
+                    self.noteServerClose("read_failed", null);
+                    self.writer_failed.store(true, .release);
+                    self.beginLeave(&leaving);
+                } else {
+                    try self.onPeerEof();
+                }
                 continue;
             }
-            if (chunk.len == 0 and chunk.bytes.len == 0) {
-                self.beginLeave(&leaving);
+            if (self.closing_deadline_ns != null) {
+                self.recycleReadChunk(chunk);
                 continue;
             }
             if (trace.enabled) self.noteReadBacklog();
@@ -4362,7 +4502,7 @@ pub const Connection = struct {
                 while (extra_i < inbound_chunk_batch) : (extra_i += 1) {
                     const extra = io_queue.tryRecv(wire_pump.WireChunk, &self.read_ch) orelse break;
                     if (extra.len == 0 and extra.bytes.len == 0) {
-                        self.recycleReadChunk(extra);
+                        // Handled after the batch, like the first chunk's.
                         inbound_eof = true;
                         break;
                     }
@@ -4380,6 +4520,16 @@ pub const Connection = struct {
                 }
             }
             if (trace.enabled) noteInboundBatch(held_n);
+            // An end of stream behind the batch, after its frames.
+            if (inbound_eof) {
+                inbound_eof = false;
+                if (read_pump.read_failed.load(.acquire)) {
+                    self.noteServerClose("read_failed", null);
+                    self.writer_failed.store(true, .release);
+                } else {
+                    try self.onPeerEof();
+                }
+            }
             // Session went terminal. If that began the closing phase, the lock
             // block above drives it; otherwise the writer failed: leave.
             if (self.writer_failed.load(.acquire) or (leave and self.closing_deadline_ns == null)) {
@@ -4471,8 +4621,7 @@ pub const Connection = struct {
             self.lockSessionUncancelable(self.config.io);
             {
                 defer self.unlockSession(self.config.io);
-                try self.session.ingest(chunk.bytes[0..chunk.len]);
-                try self.processIntents();
+                try self.ingestAndProcess(chunk.bytes[0..chunk.len]);
                 // A bad preface is a connection error. Return to the main
                 // loop, which delivers its GOAWAY.
                 if (self.session.terminal != .none) {
@@ -4588,7 +4737,9 @@ pub const Connection = struct {
                 return self.scratchMem((l.arena.refusal orelse request_pool.Reason.server_cap).status());
             }
         }
-        if (test_no_request_lease.load(.acquire)) return self.scratchMem(503);
+        if (comptime test_observe) {
+            if (test_no_request_lease.load(.acquire)) return self.scratchMem(503);
+        }
         const lease = self.newLease(stream_id) orelse return self.scratchMem(503);
         if (lease.arena.reserve(need)) |_| {
             return self.requestMem(lease);
@@ -4877,13 +5028,75 @@ pub const Connection = struct {
         self.beginClosing();
     }
 
+    /// The peer closed its side: a socket EOF, or TLS close_notify. An event,
+    /// not a failure (a failed read is one, and the caller leaves instead).
+    /// The peer may still read, so what is queued for it is delivered: a
+    /// connection that is not ending yet ends now, with GOAWAY(NO_ERROR)
+    /// (`Session.peerClosed`), and the closing phase writes everything
+    /// queued. Its lingering close then ends as soon as the output is
+    /// flushed, because the peer's EOF is already here (`closeFlushed`).
+    fn onPeerEof(self: *Connection) !void {
+        if (self.closing_peer_eof) return;
+        self.closing_peer_eof = true;
+        if (comptime test_observe) _ = test_peer_eofs.fetchAdd(1, .monotonic);
+        const io = self.config.io;
+        self.lockSessionUncancelable(io);
+        defer self.unlockSession(io);
+        if (self.closing_deadline_ns != null) return;
+        if (self.session.terminal == .none) {
+            self.session.peerClosed() catch |err| try self.sessionErrorExit(err, "peer_eof_error");
+        }
+        self.materializeIntents() catch self.failClosedOnIntentError();
+        self.beginClosingIfTerminal();
+    }
+
     /// The ONE place that decides the closing phase is over: everything queued
-    /// has been written, or the deadline passed, or the writer failed.
+    /// was written and the peer closed, or the deadline passed, or the writer
+    /// failed.
+    ///
+    /// Written means handed to the kernel, not delivered: on Linux the send
+    /// queue takes hundreds of KiB from a peer that is not reading, GOAWAY
+    /// included. Closing the socket then is not enough. If the peer writes
+    /// anything after the close (a WINDOW_UPDATE, a PING), the kernel answers
+    /// with a TCP RST (`TCPAbortOnData`), and the peer drops everything it has
+    /// not read yet, the GOAWAY with it: on nachos the flood test's client got
+    /// ECONNRESET with nothing read in about half the runs. So once flushed
+    /// the send side is shut (a FIN after the queued bytes), the actor keeps
+    /// reading and dropping, and the socket is closed when the peer closes its
+    /// side or the closing deadline passes (a lingering close).
     fn closeFlushed(self: *Connection, deadline_ns: u64) bool {
         self.assertSessionHeld("closeFlushed");
-        if (self.writer_failed.load(.acquire)) return true;
-        if (nowNs(self.config.io) >= deadline_ns) return true;
-        return self.outboundFlushed();
+        if (self.writer_failed.load(.acquire)) {
+            if (comptime test_observe) _ = test_closing_ended_writer_failed.fetchAdd(1, .monotonic);
+            return true;
+        }
+        if (nowNs(self.config.io) >= deadline_ns) {
+            if (comptime test_observe) {
+                if (self.outboundFlushed()) _ = test_closing_ended_deadline_flushed.fetchAdd(1, .monotonic) else _ = test_closing_ended_deadline_blocked.fetchAdd(1, .monotonic);
+            }
+            return true;
+        }
+        if (!self.outboundFlushed()) return false;
+        // TLS: close_notify is the last record, staged once everything else
+        // is written, and it drains under the same deadline before the send
+        // side is shut.
+        if (self.tls_driver) |pump| {
+            if (!self.closing_notify_staged) {
+                self.closing_notify_staged = true;
+                if (!pump.stageCloseNotify()) return true;
+                if (comptime test_observe) _ = test_close_notify_staged.fetchAdd(1, .monotonic);
+                if (!self.outboundFlushed()) return false;
+            }
+        }
+        if (!self.closing_write_shut) {
+            self.closing_write_shut = true;
+            self.stream.shutdown(self.config.io, .send) catch {};
+            if (comptime test_observe) _ = test_closing_write_shut.fetchAdd(1, .monotonic);
+        }
+        if (comptime test_observe) {
+            if (self.closing_peer_eof) _ = test_closing_ended_peer_eof.fetchAdd(1, .monotonic);
+        }
+        return self.closing_peer_eof;
     }
 
     /// True when nothing is left between Session and the socket: no intent,
@@ -5929,8 +6142,10 @@ pub const Connection = struct {
             ) anyerror!void {
                 // A completed batch is still scheduler-originated output even
                 // when it is handed off after `sched.drain` returns.
-                test_in_sched_sink = true;
-                defer test_in_sched_sink = false;
+                if (comptime test_observe) test_in_sched_sink = true;
+                defer if (comptime test_observe) {
+                    test_in_sched_sink = false;
+                };
                 if (trace.enabled) batch.tickets_emitted += ticket_count;
                 try batch.c.queueWire(
                     payload,
@@ -6146,8 +6361,10 @@ pub const Connection = struct {
             ) anyerror!void {
                 // A completed batch is still scheduler-originated output even
                 // when it is handed off after `sched.drain` returns.
-                test_in_sched_sink = true;
-                defer test_in_sched_sink = false;
+                if (comptime test_observe) test_in_sched_sink = true;
+                defer if (comptime test_observe) {
+                    test_in_sched_sink = false;
+                };
                 if (trace.enabled) batch.tickets_emitted += ticket_count;
                 batch.queued_any = true;
                 try batch.c.queueWire(
@@ -6404,6 +6621,11 @@ pub const Connection = struct {
                     if (diag_park) _ = diag_reset_after_ctrl_fail.fetchAdd(1, .monotonic);
                     self.applyStreamResetIntent(r);
                 },
+                .outbound_frame => |f| {
+                    // Its waiter must hear that the frame will never go.
+                    if (f.ticket.id != 0) self.tickets.wake(f.ticket.slot, f.ticket.id, false);
+                    self.session.releaseIntent(it);
+                },
                 else => self.session.releaseIntent(it),
             }
         }
@@ -6432,16 +6654,48 @@ pub const Connection = struct {
     ///
     /// DATA never goes straight to the wire here. It enters the scheduler, so
     /// that fairness between streams is decided in one place.
+    ///
+    /// A batch can queue intents of its own: a dispatch that is refused (a
+    /// failed handler spawn, a refused reaper reservation, no request memory)
+    /// resets or answers its stream. They are drained here, in further rounds,
+    /// before this returns, also after a round fails (the first error is
+    /// returned at the end), so the session queue is empty whenever a lock
+    /// section ends (`unlockSession` asserts it), and the next section starts
+    /// its batch from an empty queue (`Limits.intentEntriesMin`). A ticket
+    /// does not depend on it: it travels in its own frame's intent
+    /// (`OutboundFrame.ticket`). Nothing in a round may materialize the queue
+    /// itself: the batch it would drain into is the one being read.
     fn materializeIntents(self: *Connection) anyerror!void {
         self.assertSessionHeld("materializeIntents");
-        const n = self.session.drainIntentsInto(self.intent_batch);
+        var first_err: ?anyerror = null;
+        self.intents_materialized = true;
+        var requeued = false;
+        while (true) {
+            const n = self.session.drainIntentsInto(self.intent_batch);
+            if (n == 0) {
+                // Once the queue is empty, what the session owes goes in, up
+                // to the room the ordinary share has now, and is materialized
+                // in the rounds that follow. Once per call: a frame refused
+                // again is owed again, for the next call. Every lock section
+                // calls this, the actor's turn after a write completion too,
+                // and a completion is what frees the share.
+                if (requeued or !self.session.owed.any()) break;
+                requeued = true;
+                self.session.requeueOwed(self.sched.ctrl.ordinaryFree());
+                continue;
+            }
+            self.materializeBatch(n) catch |err| {
+                if (first_err == null) first_err = err;
+            };
+        }
+        if (first_err) |err| return err;
+    }
+
+    fn materializeBatch(self: *Connection, n: usize) anyerror!void {
         var consumed: usize = 0;
         errdefer while (consumed < n) : (consumed += 1) {
             self.session.releaseIntent(&self.intent_batch[consumed]);
         };
-        // The last control queued was a HEADERS or CONTINUATION without
-        // END_HEADERS, so the next one is the rest of its block.
-        var block_queued_open = false;
         while (consumed < n) {
             const it = &self.intent_batch[consumed];
             // Every processing branch consumes its current intent, including
@@ -6461,42 +6715,91 @@ pub const Connection = struct {
                         std.debug.panic("framed DATA reached the connection scheduler: no budget credit (stream {d}); handlers write through enqueuePending", .{f.stream_id});
                     }
                     const class = fair_scheduler.FairScheduler.classifyControl(f.typ, f.flags);
-                    var t: u64 = 0;
-                    var s: u32 = 0;
-                    if (self.next_wire_ticket != 0) {
-                        t = self.next_wire_ticket;
-                        s = self.next_wire_slot;
-                        self.next_wire_slot = 0;
-                        self.next_wire_ticket = 0;
-                    }
+                    // The frame's own ticket, if a handler waits on it.
+                    const t = f.ticket.id;
+                    const s = f.ticket.slot;
+                    // A CONTINUATION is always taken with its HEADERS below.
+                    if (f.typ == .continuation) std.debug.panic("a CONTINUATION for stream {d} reached the batch without its HEADERS", .{f.stream_id});
                     const opens_block = fair_scheduler.leavesBlockOpen(f.payload);
-                    self.sched.enqueueControl(f.payload, class, t, s) catch |err| switch (err) {
+                    // The payload is freed by a refusal; what a refused
+                    // WINDOW_UPDATE or PING ack carries is read first.
+                    const wu_increment: u31 = if (f.typ == .window_update and f.payload.len >= frame.FRAME_HEADER_LEN + 4)
+                        @intCast(std.mem.readInt(u32, f.payload[frame.FRAME_HEADER_LEN..][0..4], .big) & 0x7fff_ffff)
+                    else
+                        0;
+                    const ping_payload: [8]u8 = if (f.typ == .ping and f.payload.len >= frame.FRAME_HEADER_LEN + 8)
+                        f.payload[frame.FRAME_HEADER_LEN..][0..8].*
+                    else
+                        @splat(0);
+                    const queued = if (opens_block)
+                        self.enqueueHeaderBlock(n, &consumed)
+                    else
+                        self.sched.enqueueControl(f.payload, class, t, s);
+                    queued catch |err| switch (err) {
                         error.PoolFull, error.QueueFull => {
-                            // Payload already freed by enqueueControl. Do not
-                            // drop the rest of the batch: the next intent is
-                            // often `stream_reset` for this same RST.
+                            // Payload already freed by enqueueControl.
                             if (diag_park) _ = diag_ctrl_fail.fetchAdd(1, .monotonic);
-                            self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
-                            consumed = n;
-                            // A fragment refused after its block began leaves
-                            // the peer waiting for it and the scheduler
-                            // holding the connection to that block
-                            // (`FairScheduler.block_open`): there is no way
-                            // to go on. The first fragment is an ordinary
-                            // per-stream refusal, and the rest of the batch,
-                            // its other fragments, is released above.
+                            if (comptime test_observe) {
+                                if (class != .terminal) {
+                                    if (err == error.PoolFull) _ = test_ctrl_ordinary_pool_full.fetchAdd(1, .monotonic) else _ = test_ctrl_ordinary_queue_full.fetchAdd(1, .monotonic);
+                                }
+                            }
+                            // A terminal frame that cannot be queued: there
+                            // is no way to go on. The rest of the batch runs
+                            // its local resets and is released.
                             if (class == .terminal) {
+                                self.finishIntentsAfterEnqueueFail(self.intent_batch[consumed..n]);
+                                consumed = n;
                                 if (comptime test_observe) _ = test_ctrl_terminal_full.fetchAdd(1, .monotonic);
                                 self.noteServerClose("ctrl_terminal_full", err);
                                 self.writer_failed.store(true, .release);
-                            } else if (block_queued_open) {
-                                self.noteServerClose("ctrl_fragment_full", err);
-                                self.writer_failed.store(true, .release);
+                                return error.OutOfMemory;
                             }
-                            return error.OutOfMemory;
+                            // An ordinary frame, or a whole header block
+                            // (`enqueueHeaderBlock` took its fragments and
+                            // freed them): only it is dropped. The rest of the
+                            // batch is other streams' work, and the
+                            // connection goes on: an ordinary refusal is never
+                            // a connection error.
+                            // The waiter whose ticket rode on it hears now.
+                            if (t != 0) self.tickets.wake(s, t, false);
+                            switch (f.typ) {
+                                // The peer never gets the response's start:
+                                // the stream is reset (a handler waiting on
+                                // it is woken by the reset). The RST is
+                                // queued, and this call's next round sends it.
+                                .headers => self.session.resetRefusedHeaders(f.stream_id, f.owes_rst_if_refused) catch {},
+                                // What RFC 9113 requires is owed and queued
+                                // again when the share has room
+                                // (`Session.Owed`, `materializeIntents`). Past
+                                // its bound the peer gets ENHANCE_YOUR_CALM,
+                                // which this call's next round queues.
+                                .window_update => self.session.oweWindowUpdate(f.stream_id, wu_increment),
+                                .settings => {
+                                    // The server preface goes first, into an
+                                    // empty share (`finishBoot`).
+                                    if (!f.flags.end_stream) std.debug.panic("the server preface SETTINGS was refused", .{});
+                                    try self.session.oweSettingsAck();
+                                },
+                                .ping => if (f.flags.end_stream) {
+                                    try self.session.owePingAck(ping_payload);
+                                },
+                                // Nothing else is ordinary, but the graceful
+                                // PING (non-ack): dropped. Phase 1 ends at its
+                                // deadline without the ack.
+                                else => {},
+                            }
+                            continue;
                         },
                     };
-                    block_queued_open = opens_block;
+                    if (comptime test_observe) {
+                        if (f.typ == .rst_stream and self.controlPausedNow()) _ = test_rst_queued_paused.fetchAdd(1, .monotonic);
+                        if (class == .terminal) {
+                            const len = self.sched.terminal_len;
+                            var high = test_terminal_ring_high.load(.monotonic);
+                            while (len > high) high = test_terminal_ring_high.cmpxchgWeak(high, len, .monotonic, .monotonic) orelse break;
+                        }
+                    }
                 },
                 .dispatch_request => |d| try self.dispatch(d),
                 .early_reject => {},
@@ -6523,6 +6826,33 @@ pub const Connection = struct {
                 },
             }
         }
+    }
+
+    /// The header block whose HEADERS is `intent_batch[consumed.* - 1]`,
+    /// with its CONTINUATIONs right behind it (`Session.cmdHeaders` queues a
+    /// block whole, and a drain takes the whole queue), admitted as one unit
+    /// (`FairScheduler.enqueueControlBlock`). Advances `consumed` past the
+    /// fragments: on success the scheduler owns every payload, on `PoolFull`
+    /// every payload is freed, and either way the fragments' intents hold
+    /// nothing more to release.
+    fn enqueueHeaderBlock(self: *Connection, n: usize, consumed: *usize) error{ PoolFull, QueueFull }!void {
+        const first = self.intent_batch[consumed.* - 1].outbound_frame;
+        var payloads: [limits_mod.MAX_HEADER_FRAGMENTS][]u8 = undefined;
+        payloads[0] = first.payload;
+        var k: usize = 1;
+        var open = true;
+        while (open) : (k += 1) {
+            if (consumed.* >= n) std.debug.panic("the header block of stream {d} ends without END_HEADERS in the batch", .{first.stream_id});
+            const frag = switch (self.intent_batch[consumed.*]) {
+                .outbound_frame => |nf| nf,
+                else => std.debug.panic("the header block of stream {d} is broken by another intent", .{first.stream_id}),
+            };
+            if (frag.typ != .continuation or frag.stream_id != first.stream_id) std.debug.panic("the header block of stream {d} is broken by another frame", .{first.stream_id});
+            payloads[k] = frag.payload;
+            open = fair_scheduler.leavesBlockOpen(frag.payload);
+            consumed.* += 1;
+        }
+        return self.sched.enqueueControlBlock(payloads[0..k], first.ticket.id, first.ticket.slot);
     }
 
     /// Materialize every Session intent and emit all scheduler work now.
@@ -6663,7 +6993,7 @@ pub const Connection = struct {
         // connection ending, not a gate that failed: no trap, no refusal.
         if (self.write_queue_ending.load(.seq_cst)) return error.WriteFailed;
         if (comptime test_observe) _ = test_queue_push_refusals.fetchAdd(1, .monotonic);
-        if (std.debug.runtime_safety and !self.writeGoingAway() and !test_allow_full_queue_push.load(.acquire)) {
+        if (std.debug.runtime_safety and !self.writeGoingAway() and !((comptime test_observe) and test_allow_full_queue_push.load(.acquire))) {
             std.debug.panic("h2c write queue is full at a push: a pause hook or the barrier gate let it through", .{});
         }
         self.noteServerClose("queue_full", null);
@@ -6689,20 +7019,14 @@ pub const Connection = struct {
     /// built inside a pop (`building_pop_frame`) may take any chunk the pop's
     /// room check already counted.
     ///
-    /// A slab is lent to a non-terminal frame only while more than
-    /// `frame_slab_reserve` stay free. The reserve is the frame pool's twin of
-    /// `ControlPool`'s terminal reserve (16 entries): the control pool admits
-    /// at most that many terminal frames beyond the ordinary share, so slabs
-    /// that only they may take mean a GOAWAY or RST_STREAM is not refused for
-    /// the slabs HEADERS, acks and WINDOW_UPDATEs hold. More than the reserve
-    /// of terminal frames at once (a flood of resets in one read) is refused
-    /// here and by the control pool alike, and the connection is torn down
-    /// without a GOAWAY, which is what a refused terminal frame has always
-    /// meant.
+    /// A terminal frame (RST_STREAM, GOAWAY) never comes from here: it is
+    /// built in `terminal_store` (`rentTerminal`), so the slabs and chunks the
+    /// other frames take cannot leave it without room.
     ///
     /// Null means refused. There is no general-allocator fallback: the pools
     /// are the bound.
     fn rentFrame(self: *Connection, n: usize, class: session_mod.FrameClass) ?[]u8 {
+        if (class != .ordinary) return self.rentTerminal(n, class);
         // A small frame built in a pop is written straight into the drain-turn
         // scratch, past what it already holds: no pool memory, no copy. The
         // sink then only counts it (`EmitBatch.adopt`). `packsWithNeighbours`
@@ -6717,15 +7041,10 @@ pub const Connection = struct {
             }
         }
         if (n <= self.frame_pool.slab_bytes) {
-            // A terminal frame (GOAWAY, RST_STREAM) may take any slab; every
-            // other frame leaves `frame_slab_reserve` of them for it.
-            const keep: usize = if (class == .terminal) 0 else self.frame_slab_reserve;
-            if (self.frame_pool.freeCount() > keep) {
-                if (self.frame_pool.tryRent(self.config.io)) |slab| {
-                    _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
-                    _ = outbound_memory.frames_from_slab.fetchAdd(1, .monotonic);
-                    return slab;
-                }
+            if (self.frame_pool.tryRent(self.config.io)) |slab| {
+                _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
+                _ = outbound_memory.frames_from_slab.fetchAdd(1, .monotonic);
+                return slab;
             }
         }
         if (n <= limits_mod.WIRE_CHUNK_SIZE) {
@@ -6742,6 +7061,44 @@ pub const Connection = struct {
         return null;
     }
 
+    /// Build room for one terminal frame in `terminal_store`, or null when the
+    /// peer holds more unwritten terminal frames than a well-behaved peer can
+    /// (`Limits.terminalFrames`, T). Runs under `session_mu`, like every frame
+    /// build.
+    ///
+    /// The final GOAWAY (`.final_goaway`) may take the last slot. Every other
+    /// terminal frame is admitted only while the final GOAWAY would still have
+    /// room. One store slot is enough to say so in all three places it needs:
+    /// a frame holds its store slot from the build until it is copied out at
+    /// the pop, and holds its terminal ring entry and its terminal pool share
+    /// from the queueing until the same pop. So the slots rented are at least
+    /// the ring entries and the pool entries held, and a free slot is a free
+    /// ring entry and a free pool entry. (A frame with a flush ticket is
+    /// written from its slot and keeps it longer, which only makes the check
+    /// refuse a little early.) Bytes need no check of their own: at most M
+    /// RSTs and three GOAWAYs fit in T entries, and `Limits.terminalBytes` is
+    /// exactly that.
+    /// A refused final GOAWAY is a broken invariant, and loud in Debug.
+    fn rentTerminal(self: *Connection, n: usize, class: session_mod.FrameClass) ?[]u8 {
+        std.debug.assert(class != .ordinary);
+        std.debug.assert(n <= self.terminal_store.slab_bytes);
+        const keep: usize = if (class == .final_goaway) 0 else 1;
+        if (self.terminal_store.freeCount() > keep) {
+            if (self.terminal_store.tryRent(self.config.io)) |slot| {
+                _ = outbound_memory.frames_built.fetchAdd(1, .monotonic);
+                _ = outbound_memory.frames_from_terminal_store.fetchAdd(1, .monotonic);
+                return slot;
+            }
+        }
+        _ = outbound_memory.frames_refused.fetchAdd(1, .monotonic);
+        if (class == .final_goaway and builtin.mode == .debug) {
+            std.debug.panic("the final GOAWAY was refused (store free {d}, ring {d}): the terminal bound is broken", .{
+                self.terminal_store.freeCount(), self.sched.terminal_len,
+            });
+        }
+        return null;
+    }
+
     /// True when the scheduler must not pop: the pop could push `POP_PUSHES`
     /// chunks (the batch it flushes, and the frame itself when it is
     /// unbatchable) and fewer are free. The chunks come back when the writer
@@ -6749,9 +7106,25 @@ pub const Connection = struct {
     /// stash (TLS), and either wakes the actor's select, which drains again.
     /// Nothing waits here and no lock is held across a wait.
     fn outboundMemoryPaused(self: *Connection) bool {
-        if (self.write_pool.freeCount() >= wire_const.POP_PUSHES) return false;
+        if (!self.outboundMemoryLow()) return false;
         _ = outbound_memory.drain_memory_pauses.fetchAdd(1, .monotonic);
         return true;
+    }
+
+    /// `outboundMemoryPaused` without counting a pause.
+    fn outboundMemoryLow(self: *const Connection) bool {
+        return self.write_pool.freeCount() < wire_const.POP_PUSHES;
+    }
+
+    /// The scheduler's control pause (`pause_control`) as the hooks would
+    /// answer it, without what the hooks count (`drain_memory_pauses`, the
+    /// test pause counters). For observe-build probes.
+    fn controlPausedNow(self: *Connection) bool {
+        if (self.tls_driver) |p| return p.stashFull() or self.outboundMemoryLow();
+        if (self.config.mode != .h2c or self.sched.pause_control == null) return false;
+        if (self.outboundMemoryLow()) return true;
+        if (self.ack_room_armed and !self.h2cAckRoom(0)) return true;
+        return !self.h2cQueueRoom(h2c_queue_room_per_pop);
     }
 
     fn payloadInScratch(self: *const Connection, buf: []const u8) bool {
@@ -6762,7 +7135,7 @@ pub const Connection = struct {
 
     /// Return a frame buffer to its pool, `frame_pool` or `write_pool`. `buf`
     /// may be a used prefix; the pointer must be the slab base. A buffer in
-    /// neither pool is a bug (every frame comes from `rentFrame`), and there
+    /// no pool is a bug (every frame comes from `rentFrame`), and there
     /// is no general allocator to hand it to.
     fn releaseWireBytes(self: *Connection, buf: []u8) void {
         if (buf.len == 0) return;
@@ -6770,6 +7143,10 @@ pub const Connection = struct {
         if (self.payloadInScratch(buf)) return;
         if (self.frame_pool.containsPtr(buf.ptr)) {
             self.frame_pool.release(self.config.io, self.frame_pool.slabFromPtr(buf.ptr));
+            return;
+        }
+        if (self.terminal_store.containsPtr(buf.ptr)) {
+            self.terminal_store.release(self.config.io, self.terminal_store.slabFromPtr(buf.ptr));
             return;
         }
         if (self.write_pool.containsPtr(buf.ptr)) {
@@ -6782,7 +7159,7 @@ pub const Connection = struct {
     /// The write chunk an owned frame buffer already is, or null for a frame
     /// slab, which is too small to be a write chunk and is copied instead.
     fn frameAsWriteLease(self: *Connection, buf: []u8) ?WriteLease {
-        if (self.frame_pool.containsPtr(buf.ptr)) return null;
+        if (self.frame_pool.containsPtr(buf.ptr) or self.terminal_store.containsPtr(buf.ptr)) return null;
         std.debug.assert(self.write_pool.containsPtr(buf.ptr));
         const idx = self.write_pool.indexFromPtr(buf.ptr);
         return .{ .bytes = self.write_pool.slabAt(idx), .pool_index = idx };
@@ -7028,6 +7405,15 @@ pub const Connection = struct {
     /// `dispatchParked` resumes it when a slot frees. A request never
     /// overtakes one that is already waiting.
     fn dispatch(self: *Connection, d: session_mod.DispatchRequest) anyerror!void {
+        // The stream ended later in the same batch (the peer reset it, or a
+        // stream error closed it): there is no one to answer, so the request
+        // is dropped, as `dispatchParked` drops one that waited. Running it
+        // would also let one batch refuse more dispatches than it has live
+        // streams, and each refusal queues intents (`Limits.intentEntriesMin`).
+        if (self.session.streams.get(d.stream_id) == null) {
+            self.releaseDispatchRequest(d);
+            return;
+        }
         if (self.parked_len == 0 and try self.tryDispatch(d)) return;
         self.park(d);
     }
@@ -7094,6 +7480,7 @@ pub const Connection = struct {
             .status = status,
             .headers = &.{},
             .end_stream = true,
+            .ticket = .none,
         } }) catch {};
         std.debug.assert(self.releaseSlot(d.stream_id));
         return true;
@@ -7119,8 +7506,10 @@ pub const Connection = struct {
         if (!complete_inline) {
             if (self.config.accounting) |acct| {
                 if (!acct.tryReserveReaper()) {
+                    // Queued, not processed: this can run inside
+                    // `materializeIntents`, whose batch a nested drain would
+                    // overwrite. That loop, or the caller's, sends it.
                     self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
-                    try self.processIntents();
                     return true;
                 }
                 reaper_reserved = true;
@@ -7163,7 +7552,9 @@ pub const Connection = struct {
         // arrays are built here. Running out of memory is an answer to the
         // stream, never a connection error: the request is refused (500 when
         // it hit its own cap, 503 for the others) and its memory goes back.
-        if (test_fail_dispatch_alloc.load(.acquire)) return self.refuseDispatchForMemory(d, lease);
+        if (comptime test_observe) {
+            if (test_fail_dispatch_alloc.load(.acquire)) return self.refuseDispatchForMemory(d, lease);
+        }
         const headers = a.alloc(request.Header, d.headers.len) catch return self.refuseDispatchForMemory(d, lease);
         for (d.headers, 0..) |h, i| headers[i] = .{ .name = h.name, .value = h.value };
         const trailers = a.alloc(request.Header, d.trailers.len) catch return self.refuseDispatchForMemory(d, lease);
@@ -7271,7 +7662,7 @@ pub const Connection = struct {
         _ = diag_task_spawn_attempts.fetchAdd(1, .monotonic);
         const where_before = self.diag_actor_where.load(.monotonic);
         diagActor(self, .lk_spawn);
-        const handle = if (test_force_spawn_fail)
+        const handle = if ((comptime test_observe) and test_force_spawn_fail)
             error.OutOfMemory
         else
             zio.spawnInto(probeHandlerPlacement(), runHandlerJob, .{job});
@@ -7282,7 +7673,7 @@ pub const Connection = struct {
             // Refuse rather than run on the actor: a blocking task handler
             // (SSE) would stop ingest, TLS, and FairScheduler on this socket.
             // Do not processIntents here: we are inside materializeIntents and
-            // the intent batch is live. The RST is picked up on the next drain.
+            // the intent batch is live. Its next round sends the RST.
             self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
             finishHandlerJob(job);
             return true;
@@ -7400,15 +7791,16 @@ pub const Connection = struct {
                         job.resp.send(status, &.{}, "internal error") catch {};
                     } else if (!job.resp.finished) {
                         self.withSession(struct {
-                            fn go(c: *Connection, sid: u31) void {
+                            fn go(c: *Connection, at: DelayedReset) void {
                                 if (diag_park) _ = diag_rst_handler.fetchAdd(1, .monotonic);
                                 // A concurrently terminal stream needs no second reset.
-                                c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
+                                if (!at.stillOwed()) return;
+                                c.session.applyCommand(.{ .reset_stream = .{ .stream_id = at.stream_id, .code = .internal_error } }) catch {};
                                 // Swallowing OOM here left RST-tombstoned DATA in
                                 // the scheduler and the connection up — the TLS stall.
                                 c.processIntents() catch c.failClosedOnIntentError();
                             }
-                        }.go, job.stream_id);
+                        }.go, DelayedReset{ .stream_id = job.stream_id, .terminal = &job.slot.terminal });
                     }
                 };
                 if (job.slot.terminal.getCause() == null and !job.resp.committed) {
@@ -7719,6 +8111,22 @@ pub const Connection = struct {
         if (canceled) return error.Canceled;
     }
 
+    /// A handler's reset of its own stream after a failure, which reaches
+    /// `session_mu` late: the stream may have ended meanwhile (the peer reset
+    /// it, the slow-consumer sweep did, the connection is closing), and its
+    /// tombstone may since have been evicted, so Session's state alone cannot
+    /// say whether the peer still counts it open (`Session.rstOwed` refuses an
+    /// absent id). The slot's terminal cause, read under the lock, can: any
+    /// cause means the stream already ended or is ending.
+    const DelayedReset = struct {
+        stream_id: u31,
+        terminal: *const response.SlotTerminal,
+
+        fn stillOwed(self: DelayedReset) bool {
+            return self.terminal.getCause() == null;
+        }
+    };
+
     fn withSession(self: *Connection, comptime f: anytype, arg: anytype) void {
         self.lockSession() catch return;
         defer self.unlockSession(self.config.io);
@@ -7792,6 +8200,14 @@ pub const Connection = struct {
     /// `inline_n`, the inline entry in `grantBudgetLocked`), and changes made
     /// with no `session_mu` at all (wire releases on the actor).
     fn unlockSession(self: *Connection, io: std.Io) void {
+        // Every lock section materializes what it queued before it lets go,
+        // so the next one starts its batch from an empty queue: the intent
+        // bound (`Limits.intentEntriesMin`) counts one batch at a time.
+        // (From the first materialization on: until then the preface that
+        // `Session.init` queued waits for the boot flush.)
+        if (std.debug.runtime_safety and self.intents_materialized and self.session.intentLen() != 0) {
+            std.debug.panic("the session lock was released with {d} intents queued", .{self.session.intentLen()});
+        }
         // Cleared while the mutex is still held, or the next holder would see a
         // stale false.
         self.session_held = false;
@@ -8108,12 +8524,13 @@ pub const Connection = struct {
                 hctx.compressing = false;
             }
             self.withSession(struct {
-                fn go(c: *Connection, sid: u31) void {
+                fn go(c: *Connection, at: DelayedReset) void {
                     if (diag_park) _ = diag_rst_compress.fetchAdd(1, .monotonic);
-                    c.session.applyCommand(.{ .reset_stream = .{ .stream_id = sid, .code = .internal_error } }) catch {};
+                    if (!at.stillOwed()) return;
+                    c.session.applyCommand(.{ .reset_stream = .{ .stream_id = at.stream_id, .code = .internal_error } }) catch {};
                     c.processIntents() catch c.failClosedOnIntentError();
                 }
-            }.go, stream_id);
+            }.go, DelayedReset{ .stream_id = stream_id, .terminal = hctx.terminal });
             return error.WriteFailed;
         };
     }
@@ -8238,11 +8655,14 @@ pub const Connection = struct {
             const fields = try prepareResponseHeaderFields(hctx.arena, &stack_hpack, headers, compress, add_vary, compress, false);
             // Compressed bodies never carry content-length — HTTP/2 length is framing.
             const t_hpack0 = if (traced) nowNs(self.config.io) else 0;
+            // With a body, the ticket goes with the last DATA
+            // (`enqueuePending`); without one, with these HEADERS.
             self.session.applyCommand(.{ .respond_headers = .{
                 .stream_id = stream_id,
                 .status = status,
                 .headers = fields,
                 .end_stream = body_out.len == 0,
+                .ticket = if (body_out.len == 0) .{ .id = ticket, .slot = slot_i } else .none,
             } }) catch |err| return headersRefusal(err);
             if (traced) t_hpack = nowNs(self.config.io) - t_hpack0;
             if (body_out.len > 0) {
@@ -8250,16 +8670,21 @@ pub const Connection = struct {
                 const fits_without_wait = pending_len < self.config.limits.outbound_bytes_per_stream and
                     body_out.len <= self.config.limits.outbound_bytes_per_stream - pending_len;
                 if (hctx.runs_inline or fits_without_wait) {
-                    // Stage DATA first, then place HEADERS in the ordinary
-                    // control queue. Drain is left to the actor (task) or to
-                    // `runPendingInline` after the whole complete batch encodes.
-                    // Complete handlers carry no per-response ticket: the
-                    // drain-turn receipt is reserved after this encode loop.
-                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx) catch |err| return err;
+                    // Place HEADERS in the ordinary control queue, then stage
+                    // DATA (the scheduler holds DATA until its HEADERS left,
+                    // t-482). Drain is left to the actor (task) or to
+                    // `runPendingInline` after the whole complete batch
+                    // encodes. Complete handlers carry no per-response ticket:
+                    // the drain-turn receipt is reserved after this encode
+                    // loop. HEADERS first, because `enqueuePending` may
+                    // release `session_mu` (stream space, connection budget),
+                    // and no lock section may end with intents queued
+                    // (`unlockSession`).
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
                         return error.WriteFailed;
                     };
+                    self.enqueuePending(stream_id, body_out, true, ticket, slot_i, hctx) catch |err| return err;
                 } else {
                     // A body that can fill the stream slab may release this
                     // lock while waiting for capacity. Materialize HEADERS
@@ -8275,10 +8700,6 @@ pub const Connection = struct {
                     };
                 }
             } else {
-                if (ticket != 0) {
-                    self.next_wire_ticket = ticket;
-                    self.next_wire_slot = slot_i;
-                }
                 if (hctx.runs_inline) {
                     self.emitQueuedResponse() catch {
                         self.failClosedOnIntentError();
@@ -8327,11 +8748,10 @@ pub const Connection = struct {
     /// `text/event-stream`, `no-cache`, and `x-accel-buffering: no` for
     /// intermediaries that would otherwise hold events until a buffer fills.
     ///
-    /// `next_wire_ticket` is how the ticket reaches a frame that this function
-    /// does not build. The HEADERS frame is produced inside `Session`, so the
-    /// ticket is parked on the connection and `processIntents` attaches it to
-    /// the next outbound frame it creates. This is safe only because the whole
-    /// sequence runs under `session_mu` on one task.
+    /// The HEADERS frame is built inside `Session`, so the ticket goes in the
+    /// `respond_headers` command and travels on that frame's intent
+    /// (`OutboundFrame.ticket`): it can only complete, or fail, with this
+    /// response's HEADERS.
     fn startCb(ctx: *anyopaque, stream_id: u31, status: u16, headers: []const request.Header, sse: bool) response.ResponseError!void {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
         const self = hctx.conn;
@@ -8372,13 +8792,12 @@ pub const Connection = struct {
                 .status = status,
                 .headers = hlist.items,
                 .end_stream = false,
+                .ticket = .{ .id = ticket, .slot = slot_i },
             } }) catch |err| {
                 const refused = headersRefusal(err);
                 if (refused == error.ResponseRefused) dropEncoder(hctx);
                 return refused;
             };
-            self.next_wire_ticket = ticket;
-            self.next_wire_slot = slot_i;
             // Enqueue and leave. Do NOT drain. writeCb already learned this:
             // 200 task handlers each processIntents/drainEmit is one HEADERS
             // chunk apiece into carried+tls_write_ch (cap 8). The tenth
@@ -8440,8 +8859,10 @@ pub const Connection = struct {
         const io = self.config.io;
         const deadline_ns: u64 = @intCast(deadline.nanoseconds);
 
-        _ = test_deadline_waits.fetchAdd(1, .acq_rel);
-        defer _ = test_deadline_waits.fetchSub(1, .acq_rel);
+        if (comptime test_observe) _ = test_deadline_waits.fetchAdd(1, .acq_rel);
+        defer if (comptime test_observe) {
+            _ = test_deadline_waits.fetchSub(1, .acq_rel);
+        };
 
         while (true) {
             const slot_i = self.slotIndex(stream_id) orelse return error.Canceled;
@@ -9941,13 +10362,13 @@ test "rentFrame: a queued frame leaves POP_PUSHES chunks free, a frame built in 
     var n: usize = 0;
     defer for (held[0..n]) |buf| conn.releaseWireBytes(buf);
 
-    // The slabs the terminal reserve leaves, then chunks, down to POP_PUSHES free.
-    while (conn.frame_pool.freeCount() > conn.frame_slab_reserve) {
+    // Every slab (terminal frames have a store of their own), then chunks, down to POP_PUSHES free.
+    while (conn.frame_pool.freeCount() > 0) {
         held[n] = conn.rentFrame(20, .ordinary) orelse return error.NoSlab;
         try std.testing.expect(conn.frame_pool.containsPtr(held[n].ptr));
         n += 1;
     }
-    try std.testing.expect(n == 3);
+    try std.testing.expect(n == 4);
     while (conn.write_pool.freeCount() > pushes) {
         held[n] = conn.rentFrame(20, .ordinary) orelse return error.NoChunkToSpare;
         try std.testing.expect(conn.write_pool.containsPtr(held[n].ptr));
@@ -9983,20 +10404,23 @@ test "rentFrame: a queued frame leaves POP_PUSHES chunks free, a frame built in 
     try std.testing.expect(!conn.outboundMemoryPaused());
 }
 
-test "rentFrame: a terminal frame takes the slabs that no other frame may" {
+test "rentFrame: a terminal frame never needs a frame slab or a write chunk, and the last slot is the final GOAWAY's" {
     var lim = limits_mod.Limits.defaults;
     lim.frame_slab_bytes = 64;
     lim.frame_slabs_per_connection = 8;
+    lim.max_streams_per_connection = 4;
+    lim.max_streams_per_server = 16;
+    lim.cancellation_reaper_jobs = 16;
     var trap: TrapHop = undefined;
     try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
     defer trap.close();
     const conn = &trap.hop.conn;
     dropQueuedPreface(conn);
-    // A quarter of the slabs, capped at the control pool's terminal reserve.
-    try std.testing.expectEqual(@as(usize, 2), conn.frame_slab_reserve);
+    const t = try lim.terminalFrames();
+    try std.testing.expectEqual(@as(usize, 7), t);
+    try std.testing.expectEqual(t, conn.terminal_store.capacity);
 
-    // The write pool is taken away so a refused slab frame cannot spill into
-    // a chunk and hide the reserve.
+    // Take every chunk and every slab away: ordinary traffic has used all of them.
     var chunks: [16]u32 = undefined;
     var n_chunks: usize = 0;
     defer for (chunks[0..n_chunks]) |idx| conn.write_pool.releaseIndex(std.testing.io, idx);
@@ -10004,22 +10428,664 @@ test "rentFrame: a terminal frame takes the slabs that no other frame may" {
         chunks[n_chunks] = idx;
         n_chunks += 1;
     }
+    var slabs: [8][]u8 = undefined;
+    var n_slabs: usize = 0;
+    defer for (slabs[0..n_slabs]) |buf| conn.releaseWireBytes(buf);
+    while (conn.rentFrame(17, .ordinary)) |buf| {
+        slabs[n_slabs] = buf;
+        n_slabs += 1;
+    }
+    try std.testing.expect(conn.rentFrame(17, .ordinary) == null);
 
     var held: [8][]u8 = undefined;
     var n: usize = 0;
     defer for (held[0..n]) |buf| conn.releaseWireBytes(buf);
-    while (conn.rentFrame(17, .ordinary)) |buf| {
-        held[n] = buf;
-        n += 1;
+    // T - 1 RSTs and graceful GOAWAYs fit, each from the store.
+    while (n < t - 1) : (n += 1) {
+        held[n] = conn.rentFrame(if (n % 2 == 0) 13 else 17, .terminal) orelse return error.TerminalFrameRefused;
+        try std.testing.expect(conn.terminal_store.containsPtr(held[n].ptr));
     }
-    try std.testing.expectEqual(@as(usize, 6), n);
-    // Ordinary traffic cannot take the last two; a GOAWAY and a RST can.
-    held[n] = conn.rentFrame(17, .terminal) orelse return error.TerminalFrameRefused;
+    // The last slot is kept for the GOAWAY that ends the connection.
+    try std.testing.expect(conn.rentFrame(13, .terminal) == null);
+    held[n] = conn.rentFrame(17, .final_goaway) orelse return error.FinalGoawayRefused;
     n += 1;
-    held[n] = conn.rentFrame(13, .terminal) orelse return error.TerminalFrameRefused;
-    n += 1;
-    try std.testing.expect(conn.rentFrame(17, .terminal) == null);
-    try std.testing.expect(conn.frame_pool.freeCount() == 0);
+    try std.testing.expectEqual(@as(usize, 0), conn.terminal_store.freeCount());
+}
+
+test "the terminal ring, the pool's terminal share and the frame store all hold T = M + 3 (t-3562)" {
+    for ([_]usize{ 1, 256, 1024 }) |m| {
+        var lim = limits_mod.Limits.defaults;
+        lim.max_streams_per_connection = m;
+        lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
+        lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
+        lim.outbound_slabs_per_server = @max(lim.outbound_slabs_per_server, lim.max_streams_per_server);
+        lim.intent_entries_per_connection = @max(lim.intent_entries_per_connection, try lim.intentEntriesMin());
+        var trap: TrapHop = undefined;
+        try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
+        defer trap.close();
+        const conn = &trap.hop.conn;
+        try std.testing.expectEqual(m + 3, try lim.terminalFrames());
+        try std.testing.expectEqual(m + 3, conn.sched.terminal_q.len);
+        try std.testing.expectEqual(m + 3, conn.sched.ctrl.terminal_entries);
+        try std.testing.expectEqual(m + 3, conn.terminal_store.capacity);
+        // Bytes: M RSTs and three GOAWAYs, nothing else.
+        try std.testing.expectEqual(m * frame.rst_stream_frame_bytes + 3 * frame.goaway_frame_bytes, conn.sched.ctrl.terminal_bytes);
+        try std.testing.expectEqual(try lim.terminalBytes(), conn.sched.ctrl.terminal_bytes);
+        // The ordinary share is the config value, whatever T is.
+        try std.testing.expectEqual(lim.control_entries_per_connection, conn.sched.ctrl.max_entries);
+        try std.testing.expectEqual(lim.control_bytes_per_connection, conn.sched.ctrl.max_bytes);
+    }
+}
+
+/// Limits for M streams per connection, with the server-wide caps and the
+/// intent queue raised to what boot asks for M. At the default M they are the
+/// defaults, untouched, so the tests check the default intent queue too.
+fn limitsForStreams(m: usize) !limits_mod.Limits {
+    var lim = limits_mod.Limits.defaults;
+    if (m == lim.max_streams_per_connection) return lim;
+    lim.max_streams_per_connection = m;
+    lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
+    lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
+    lim.outbound_slabs_per_server = @max(lim.outbound_slabs_per_server, lim.max_streams_per_server);
+    lim.intent_entries_per_connection = @max(lim.intent_entries_per_connection, try lim.intentEntriesMin());
+    return lim;
+}
+
+/// Feed `bytes` through the edge's own ingest loop, as one read chunk.
+fn trapIngest(conn: *Connection, bytes: []const u8) !void {
+    conn.lockSessionUncancelable(conn.config.io);
+    defer conn.unlockSession(conn.config.io);
+    try conn.ingestAndProcess(bytes);
+}
+
+/// What the server wrote, frame by frame, after the actor's turns so far.
+const TrapWire = struct {
+    rst_per_sid: std.AutoHashMap(u31, usize),
+    rst: usize = 0,
+    goaway_codes: [4]u32 = @splat(0),
+    goaways: usize = 0,
+    settings_acks: usize = 0,
+    ping_acks: [4][8]u8 = undefined,
+    ping_ack_n: usize = 0,
+    conn_credit: u64 = 0,
+
+    fn deinit(self: *TrapWire) void {
+        self.rst_per_sid.deinit();
+    }
+};
+
+/// Emit everything the scheduler holds and read it off the write queue, with
+/// no WritePump: drain, parse, complete, until nothing more comes.
+fn trapCollect(trap: *TrapHop, out: *TrapWire) !void {
+    const conn = &trap.hop.conn;
+    while (true) {
+        {
+            conn.lockSessionUncancelable(conn.config.io);
+            defer conn.unlockSession(conn.config.io);
+            try conn.drainEmit();
+        }
+        var took = false;
+        while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, conn.config.io)) |chunk| {
+            took = true;
+            var rest = chunk.bytes[0..chunk.len];
+            while (rest.len >= frame.FRAME_HEADER_LEN) {
+                const h = frame.FrameHeader.decode(rest[0..frame.FRAME_HEADER_LEN]);
+                const body = rest[frame.FRAME_HEADER_LEN..][0..h.length];
+                switch (h.type) {
+                    .rst_stream => {
+                        out.rst += 1;
+                        const e = try out.rst_per_sid.getOrPutValue(h.stream_id, 0);
+                        e.value_ptr.* += 1;
+                    },
+                    .goaway => {
+                        if (out.goaways < out.goaway_codes.len) out.goaway_codes[out.goaways] = std.mem.readInt(u32, body[4..8], .big);
+                        out.goaways += 1;
+                    },
+                    .settings => if (h.flags.end_stream) {
+                        out.settings_acks += 1;
+                    },
+                    .ping => if (h.flags.end_stream) {
+                        if (out.ping_ack_n < out.ping_acks.len) out.ping_acks[out.ping_ack_n] = body[0..8].*;
+                        out.ping_ack_n += 1;
+                    },
+                    .window_update => if (h.stream_id == 0) {
+                        out.conn_credit += std.mem.readInt(u32, body[0..4], .big) & 0x7fff_ffff;
+                    },
+                    else => {},
+                }
+                rest = rest[frame.FRAME_HEADER_LEN + h.length ..];
+            }
+            if (wire_pump.postsCompletion(chunk)) conn.acks.sub();
+            trap.hop.completeLocalWrite(chunk);
+        }
+        if (!took) return;
+    }
+}
+
+fn refuseEveryAdmit(_: *anyopaque) bool {
+    return false;
+}
+
+/// M streams opened in one read chunk, every one refused by the server-wide
+/// admission (`tryAdmit`): M RSTs, 2M intents from one chunk.
+fn refusedBurstCase(m: usize) !void {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, try limitsForStreams(m));
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    conn.session.stream_hooks.?.tryAdmit = refuseEveryAdmit;
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    for (0..m) |i| {
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try wire.appendSlice(gpa, hopRequestFrame(&req, @intCast(1 + 2 * i)));
+    }
+    try trapIngest(conn, wire.items);
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(m, seen.rst);
+    for (0..m) |i| try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(@intCast(1 + 2 * i)));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "M streams refused by tryAdmit in one read chunk keep the connection: one RST each, no GOAWAY (t-3562)" {
+    try refusedBurstCase(limits_mod.Limits.defaults.max_streams_per_connection);
+}
+
+test "the same at M = 1024, with the intent queue boot asks for (t-3562)" {
+    try refusedBurstCase(1024);
+}
+
+test "a rapid reset under the rate limit in one read chunk keeps the connection: ingest stops and drains (t-3562)" {
+    // Every pair is a request and the peer's RST_STREAM for it: two intents
+    // (the dispatch and the local reset) for 25 bytes, so one 16 KiB chunk
+    // holds far more intents than the queue. The rate limit allows 1,000
+    // RST_STREAMs at once; 600 stay under it.
+    const gpa = std.testing.allocator;
+    // A complete handler runs inline, on the actor, so this needs no executor.
+    const routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .complete = .{ .ptr = undefined, .runFn = hopHundredBytes } },
+    }};
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &routes, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    const pairs = 600;
+    try std.testing.expect(2 * pairs > conn.session.intentCapacity());
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    for (0..pairs) |i| {
+        const sid: u31 = @intCast(1 + 2 * i);
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try wire.appendSlice(gpa, hopRequestFrame(&req, sid));
+        var rst: [frame.rst_stream_frame_bytes]u8 = undefined;
+        _ = try frame.Serializer.rstStream(&rst, sid, .cancel);
+        try wire.appendSlice(gpa, &rst);
+    }
+    try std.testing.expect(wire.items.len <= limits_mod.WIRE_CHUNK_SIZE);
+    try trapIngest(conn, wire.items);
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), conn.session.intentLen());
+    try std.testing.expectEqual(@as(usize, 0), conn.session.active_streams);
+    // Requests the ingest stop let through before their reset run inline;
+    // let them finish so the connection closes clean.
+    try conn.runPendingInline();
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    // A peer's reset is never answered with one.
+    try std.testing.expectEqual(@as(usize, 0), seen.rst);
+    try conn.drainPendingCompleteReceipts(false);
+}
+
+/// A graceful shutdown that ends with M streams still open: the finish resets
+/// every one of them in one batch (2M intents) after the two graceful GOAWAYs.
+fn gracefulFinishCase(m: usize) !void {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, try limitsForStreams(m));
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        // Open streams whose handlers have not answered (no dispatch: the
+        // finish walks the session's map, which is what this needs).
+        for (0..m) |i| {
+            const sid: u31 = @intCast(1 + 2 * i);
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        try conn.session.applyCommand(.graceful_phase1);
+        try conn.processIntents();
+        try conn.session.applyCommand(.graceful_phase2);
+        try conn.processIntents();
+        try conn.finishGraceful();
+        try std.testing.expect(conn.session.terminal == .none);
+    }
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(m, seen.rst);
+    for (0..m) |i| try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(@intCast(1 + 2 * i)));
+    try std.testing.expectEqual(@as(usize, 2), seen.goaways);
+    for (seen.goaway_codes[0..2]) |code| try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.no_error)), code);
+}
+
+test "a graceful shutdown with M live streams sends M RSTs and no ENHANCE_YOUR_CALM (t-3562)" {
+    try gracefulFinishCase(limits_mod.Limits.defaults.max_streams_per_connection);
+    try gracefulFinishCase(1024);
+}
+
+test "a ticket travels with its own frame: a leftover HEADERS does not take the next handler's ticket (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    const a = try conn.reserveTicket();
+    const b = try conn.reserveTicket();
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        for ([_]u31{ 1, 3 }) |sid| {
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        // Handler A's HEADERS, left queued (what a park in the middle of a
+        // command used to do), then handler B's empty response.
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &.{}, .end_stream = false, .ticket = .{ .id = a[0], .slot = a[1] } } });
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 3, .status = 204, .headers = &.{}, .end_stream = true, .ticket = .{ .id = b[0], .slot = b[1] } } });
+        try conn.materializeIntents();
+        // Each scheduler entry carries its own stream's ticket.
+        var seen: usize = 0;
+        var k: usize = 0;
+        while (k < conn.sched.ordinary_len) : (k += 1) {
+            const e = conn.sched.ordinary_q[(conn.sched.ordinary_head + k) % conn.sched.ordinary_q.len];
+            const sid = std.mem.readInt(u32, e.payload[5..9], .big) & 0x7fff_ffff;
+            if (sid == 1) {
+                try std.testing.expectEqual(a[0], e.ticket);
+                seen += 1;
+            }
+            if (sid == 3) {
+                try std.testing.expectEqual(b[0], e.ticket);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+    }
+    // Written: both tickets complete.
+    var wire: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer wire.deinit();
+    try trapCollect(&trap, &wire);
+    try std.testing.expect(conn.tickets.isSignaled(a[1]));
+    try std.testing.expect(conn.tickets.isSignaled(b[1]));
+    try conn.drainPendingCompleteReceipts(false);
+}
+
+test "a header block is admitted whole: one ordinary entry left and a two-fragment response refuse the block, reset its stream once, and keep the connection (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // Pin the ordinary share to one free entry.
+    const caps = conn.sched.ctrl.ordinaryCaps();
+    var pinned: usize = 0;
+    while (conn.sched.ctrl.entries_held.load(.acquire) + 1 < caps.entries) : (pinned += 1) {
+        try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(1));
+    }
+    // A response header block over one frame: HEADERS plus a CONTINUATION.
+    const wide: [20 * 1024]u8 = @splat('w');
+    const fields_wide = [_]hpack.HeaderField{.{ .name = "x-wide", .value = &wide }};
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        try conn.session.streams.put(1, .{ .id = 1, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+        conn.session.active_streams += 1;
+        conn.session.highest_peer_stream = 1;
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 200, .headers = &fields_wide, .end_stream = false, .ticket = .none } });
+        try std.testing.expectEqual(@as(usize, 2), conn.session.intentLen());
+        try conn.materializeIntents();
+        // No fragment went in: the one free entry is still free.
+        try std.testing.expectEqual(@as(usize, 0), conn.sched.ordinary_len);
+        try std.testing.expectEqual(caps.entries - 1, conn.sched.ctrl.entries_held.load(.acquire));
+        try std.testing.expect(!conn.sched.block_open);
+    }
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    try std.testing.expect(conn.session.terminal == .none);
+    conn.sched.ctrl.release(pinned, pinned);
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen.rst);
+    try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "acks the edge refuses are owed and sent once the share has room (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // The whole ordinary share is held, as by a peer that does not read.
+    const caps = conn.sched.ctrl.ordinaryCaps();
+    const pinned = caps.entries - conn.sched.ctrl.entries_held.load(.acquire);
+    for (0..pinned) |_| try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(1));
+    const refused_0 = test_ctrl_ordinary_pool_full.load(.monotonic);
+
+    var wire: [9 + 17 + 17]u8 = undefined;
+    (frame.FrameHeader{ .length = 0, .type = .settings, .flags = .{}, .stream_id = 0 }).encode(wire[0..9]);
+    _ = try frame.Serializer.ping(wire[9..26], false, "owed-p-1");
+    _ = try frame.Serializer.ping(wire[26..43], false, "owed-p-2");
+    try trapIngest(conn, &wire);
+    // All three acks were refused, and the connection goes on.
+    try std.testing.expectEqual(refused_0 + 3, test_ctrl_ordinary_pool_full.load(.monotonic));
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expectEqual(@as(usize, 1), conn.session.owed.settings_acks);
+    try std.testing.expectEqual(@as(usize, 2), conn.session.owed.ping_len);
+
+    // The share frees (a write completion), and the actor's next section
+    // queues what is owed.
+    conn.sched.ctrl.release(pinned, pinned);
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        try conn.materializeIntents();
+    }
+    try std.testing.expect(!conn.session.owed.any());
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen.settings_acks);
+    try std.testing.expectEqual(@as(usize, 2), seen.ping_ack_n);
+    try std.testing.expectEqualSlices(u8, "owed-p-1", &seen.ping_acks[0]);
+    try std.testing.expectEqualSlices(u8, "owed-p-2", &seen.ping_acks[1]);
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+/// Frame hooks for the error-exit tests: refuse every ordinary frame, or
+/// only the final GOAWAY (a broken invariant, forced), and build the rest
+/// the usual way.
+fn rentNoOrdinary(ctx: *anyopaque, n: usize, class: session_mod.FrameClass) ?[]u8 {
+    if (class == .ordinary) return null;
+    const c: *Connection = @ptrCast(@alignCast(ctx));
+    return c.rentFrame(n, class);
+}
+
+fn rentNoFinalGoaway(ctx: *anyopaque, n: usize, class: session_mod.FrameClass) ?[]u8 {
+    if (class == .final_goaway) return null;
+    const c: *Connection = @ptrCast(@alignCast(ctx));
+    return c.rentFrame(n, class);
+}
+
+/// Materialize and collect until nothing is owed: the actor's turns after
+/// write completions.
+fn trapSettle(trap: *TrapHop, out: *TrapWire) !void {
+    const conn = &trap.hop.conn;
+    var turns: usize = 0;
+    while (true) : (turns += 1) {
+        if (turns > 64) return error.NeverSettled;
+        {
+            conn.lockSessionUncancelable(conn.config.io);
+            defer conn.unlockSession(conn.config.io);
+            try conn.materializeIntents();
+        }
+        try trapCollect(trap, out);
+        if (!conn.session.owed.any()) return;
+    }
+}
+
+test "nine PINGs in one read with two frame slabs: the acks that find no frame are owed, not an error, and all nine arrive in order (t-3562)" {
+    const gpa = std.testing.allocator;
+    var lim = limits_mod.Limits.defaults;
+    lim.frame_slabs_per_connection = 2;
+    lim.inbound_wire_chunks_per_connection = wire_const.POP_PUSHES + 2;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    const refused_0 = outbound_memory.frames_refused.load(.monotonic);
+    var wire: [9 * 17]u8 = undefined;
+    for (0..9) |i| {
+        var payload: [8]u8 = "ping-0-x".*;
+        payload[5] = '0' + @as(u8, @intCast(i));
+        _ = try frame.Serializer.ping(wire[i * 17 ..][0..17], false, &payload);
+    }
+    try trapIngest(conn, &wire);
+    // The instrument fired: some acks found no frame buffer.
+    try std.testing.expect(outbound_memory.frames_refused.load(.monotonic) > refused_0);
+    try std.testing.expect(conn.session.owed.ping_len > 0);
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expect(!conn.writer_failed.load(.acquire));
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapSettle(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 9), seen.ping_ack_n);
+    // TrapWire keeps the first four payloads: in the order the PINGs came.
+    for (0..4) |i| try std.testing.expectEqual('0' + @as(u8, @intCast(i)), seen.ping_acks[i][5]);
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "graceful phase 1 with no ordinary frame left: the GOAWAY goes, the PING is dropped, and nothing is left queued (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        try conn.session.applyCommand(.graceful_phase1);
+        try conn.processIntents();
+    }
+    try std.testing.expect(conn.session.grace_phase == .phase1);
+    try std.testing.expect(conn.session.terminal == .none);
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen.goaways);
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.no_error)), seen.goaway_codes[0]);
+}
+
+test "an early 413 with no frame for its response resets the stream instead of failing the read (t-3562)" {
+    const gpa = std.testing.allocator;
+    var lim = limits_mod.Limits.defaults;
+    lim.request_body_bytes = 1024;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
+    var block: [64]u8 = undefined;
+    const fields_post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-length", .value = "4096" },
+    };
+    const parts = [_][]const hpack.HeaderField{&fields_post};
+    const block_len = try hpack.Encoder.encodedLen(&fields_post);
+    std.debug.assert(block_len <= block.len);
+    _ = hpack.Encoder.encodeRange(block[0..block_len], &parts, 0);
+    var wire: [frame.FRAME_HEADER_LEN + 64]u8 = undefined;
+    (frame.FrameHeader{ .length = @intCast(block_len), .type = .headers, .flags = .{ .end_headers = true }, .stream_id = 1 }).encode(wire[0..frame.FRAME_HEADER_LEN]);
+    @memcpy(wire[frame.FRAME_HEADER_LEN..][0..block_len], block[0..block_len]);
+    try trapIngest(conn, wire[0 .. frame.FRAME_HEADER_LEN + block_len]);
+    try std.testing.expect(conn.session.terminal == .none);
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+}
+
+test "an error exit from ingest materializes what the read queued before the unlock (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // A PING (its ack is queued), then DATA on stream 0, a connection error
+    // whose final GOAWAY is refused: `ingestSome` returns an error with the
+    // ack still in the session queue. Forced: the store keeps a slot for that
+    // GOAWAY, so this is the path of any error, not a reachable refusal.
+    conn.session.stream_hooks.?.rentFrame = rentNoFinalGoaway;
+    var wire: [17 + frame.FRAME_HEADER_LEN]u8 = undefined;
+    _ = try frame.Serializer.ping(wire[0..17], false, "err-exit");
+    (frame.FrameHeader{ .length = 0, .type = .data, .flags = .{}, .stream_id = 0 }).encode(wire[17..][0..frame.FRAME_HEADER_LEN]);
+    const ordinary_0 = conn.sched.ordinary_len;
+    // The unlock in `trapIngest` panics in a safe build if the ack is left.
+    try std.testing.expectError(error.OutOfMemory, trapIngest(conn, &wire));
+    try std.testing.expectEqual(@as(usize, 0), conn.session.intentLen());
+    try std.testing.expectEqual(ordinary_0 + 1, conn.sched.ordinary_len);
+}
+
+test "a failed round does not stop the next: intents a refusal queued are materialized before the unlock (t-3562)" {
+    const gpa = std.testing.allocator;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, limits_mod.Limits.defaults);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    // Both shares held. The terminal one is forced: the terminal store, ring
+    // and share hold the same T, so a terminal frame the store built always
+    // finds a share entry; holding the share alone stands for any round that
+    // fails while the session queue has more to give.
+    const caps = conn.sched.ctrl.ordinaryCaps();
+    const pinned = caps.entries - conn.sched.ctrl.entries_held.load(.acquire);
+    for (0..pinned) |_| try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(1));
+    var t_pinned: usize = 0;
+    while (conn.sched.ctrl.tryReserveTerminal(1)) t_pinned += 1;
+    defer {
+        conn.sched.ctrl.release(pinned, pinned);
+        for (0..t_pinned) |_| conn.sched.ctrl.releaseTerminal(1);
+    }
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        // The unlock panics in a safe build if a round was skipped.
+        defer conn.unlockSession(conn.config.io);
+        for ([_]u31{ 1, 3 }) |sid| {
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        // Round 1: stream 1's final HEADERS is refused (its RST goes to the
+        // session queue, for round 2), then stream 3's RST fails the round.
+        try conn.session.applyCommand(.{ .respond_headers = .{ .stream_id = 1, .status = 204, .headers = &.{}, .end_stream = true, .ticket = .none } });
+        try conn.session.applyCommand(.{ .reset_stream = .{ .stream_id = 3, .code = .cancel } });
+        try std.testing.expectError(error.OutOfMemory, conn.materializeIntents());
+        try std.testing.expectEqual(@as(usize, 0), conn.session.intentLen());
+    }
+    try std.testing.expect(conn.writer_failed.load(.acquire));
+}
+
+/// M server RSTs wait in the terminal ring (the drain is held), then one
+/// read chunk carries the peer's RSTs for 3 of those streams and 3 new
+/// streams that `tryAdmit` refuses. The crossed RSTs must free their slots
+/// during the ingest, or the 3rd refusal finds none.
+fn crossedInOneChunkCase(tombstones: usize) !void {
+    const gpa = std.testing.allocator;
+    var lim = limits_mod.Limits.defaults;
+    lim.stream_tombstones = tombstones;
+    var trap: TrapHop = undefined;
+    try openTrapHopLimits(&trap, gpa, std.testing.io, &.{}, lim);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    test_hold_emit.store(true, .release);
+    defer test_hold_emit.store(false, .release);
+    const m = lim.max_streams_per_connection;
+    {
+        conn.lockSessionUncancelable(conn.config.io);
+        defer conn.unlockSession(conn.config.io);
+        for (0..m) |i| {
+            const sid: u31 = @intCast(1 + 2 * i);
+            try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
+            conn.session.active_streams += 1;
+            conn.session.highest_peer_stream = sid;
+        }
+        for (0..m) |i| try conn.session.applyCommand(.{ .reset_stream = .{ .stream_id = @intCast(1 + 2 * i), .code = .cancel } });
+        try conn.materializeIntents();
+    }
+    try std.testing.expectEqual(m, conn.sched.terminal_len);
+    conn.session.stream_hooks.?.tryAdmit = refuseEveryAdmit;
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        var rst: [frame.rst_stream_frame_bytes]u8 = undefined;
+        _ = try frame.Serializer.rstStream(&rst, sid, .cancel);
+        try wire.appendSlice(gpa, &rst);
+    }
+    for (0..3) |i| {
+        var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+        try wire.appendSlice(gpa, hopRequestFrame(&req, @intCast(1 + 2 * (m + i))));
+    }
+    try trapIngest(conn, wire.items);
+    try std.testing.expect(conn.session.terminal == .none);
+    // M - 3 old RSTs and the 3 refusals.
+    try std.testing.expectEqual(m, conn.sched.terminal_len);
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        var k: usize = 0;
+        while (k < conn.sched.terminal_len) : (k += 1) {
+            const e = conn.sched.terminal_q[(conn.sched.terminal_head + k) % conn.sched.terminal_q.len];
+            try std.testing.expect(std.mem.readInt(u32, e.payload[5..9], .big) & 0x7fff_ffff != sid);
+        }
+    }
+}
+
+test "crossed RSTs free their terminal slots during the ingest of the same read chunk (t-3562)" {
+    try crossedInOneChunkCase(limits_mod.Limits.defaults.stream_tombstones);
+}
+
+test "the same when the streams' tombstones were evicted (t-3562)" {
+    try crossedInOneChunkCase(2);
+}
+
+test "a limit that breaks the terminal bound is InvalidConfig, not a small wrong store (t-3562)" {
+    const top = std.math.maxInt(usize);
+    for ([_]usize{ top, top - 1, top - 2 }) |m| {
+        var lim = limits_mod.Limits.defaults;
+        lim.max_streams_per_connection = m;
+        try std.testing.expectError(error.InvalidConfig, lim.terminalFrames());
+        try std.testing.expectError(error.InvalidConfig, lim.slotBootBytes(.h2c));
+        try std.testing.expectError(error.InvalidConfig, lim.slotBootBytes(.tls));
+        try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    }
+    // M * 13 overflows while M + 3 does not.
+    var lim = limits_mod.Limits.defaults;
+    lim.max_streams_per_connection = top / 13 + 1;
+    _ = try lim.terminalFrames();
+    try std.testing.expectError(error.InvalidConfig, lim.terminalBytes());
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
 test "leaseWriteChunk refuses an empty pool and an oversized chunk, and counts the refusal" {

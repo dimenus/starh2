@@ -73,6 +73,7 @@
 //! `Connection.waitForStreamSpace`. That is the mechanism behind the promise
 //! that a connection stays inside `Limits.resourceUpperBound` under any load.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const control_pool = @import("control_pool.zig");
 const slab_pool = @import("slab_pool.zig");
 const Touched = @import("touched.zig").Touched;
@@ -83,7 +84,7 @@ const observe = @import("build_options").observe;
 
 /// Test-only (`observe` builds): HEADERS dropped by `forgetStream` that
 /// carried a ticket, so an integration test can prove that path ran.
-pub var test_dropped_ticketed_headers: std.atomic.Value(usize) = .init(0);
+pub var test_dropped_ticketed_headers: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 /// One round-robin turn. It matches the HTTP/2 default max frame size, so a
 /// quantum is exactly one DATA frame and the scheduler never has to split a
@@ -188,6 +189,12 @@ pub fn leavesBlockOpen(payload: []const u8) bool {
     const typ = payload[3];
     if (typ != @backingInt(frame.FrameType.headers) and typ != @backingInt(frame.FrameType.continuation)) return false;
     return !frame.FrameFlags.fromByte(payload[4]).end_headers;
+}
+
+/// The stream of an RST_STREAM frame payload; null for any other frame.
+fn rstStream(payload: []const u8) ?u31 {
+    if (payload.len < frame.FRAME_HEADER_LEN or payload[3] != @backingInt(frame.FrameType.rst_stream)) return null;
+    return @intCast(std.mem.readInt(u32, payload[5..9], .big) & 0x7fff_ffff);
 }
 
 /// The stream of a CONTINUATION frame payload; null for any other frame.
@@ -429,18 +436,20 @@ pub const FairScheduler = struct {
     pub fn init(
         gpa: std.mem.Allocator,
         io: std.Io,
-        ctrl_bytes: usize,
-        ctrl_entries: usize,
-        terminal_cap: usize,
-        ordinary_cap: usize,
+        ordinary_bytes: usize,
+        ordinary_entries: usize,
+        terminal_bytes: usize,
+        terminal_entries: usize,
         max_streams: usize,
         pool: *slab_pool.SlabPool,
     ) !FairScheduler {
-        const tq = try gpa.alloc(ControlEntry, @max(terminal_cap, 1));
+        // The terminal ring and the pool's terminal share are one argument, so
+        // they cannot disagree (`Limits.terminalFrames`).
+        const tq = try gpa.alloc(ControlEntry, @max(terminal_entries, 1));
         errdefer gpa.free(tq);
-        const oq = try gpa.alloc(ControlEntry, @max(ordinary_cap, 1));
+        const oq = try gpa.alloc(ControlEntry, @max(ordinary_entries, 1));
         errdefer gpa.free(oq);
-        const fq = try gpa.alloc(FramedDataEntry, @max(ordinary_cap, 1));
+        const fq = try gpa.alloc(FramedDataEntry, @max(ordinary_entries, 1));
         errdefer gpa.free(fq);
         std.debug.assert(max_streams < none);
         const slots = try gpa.alloc(DataPending, max_streams);
@@ -461,7 +470,7 @@ pub const FairScheduler = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .ctrl = control_pool.ControlPool.init(ctrl_bytes, ctrl_entries),
+            .ctrl = control_pool.ControlPool.init(ordinary_bytes, ordinary_entries, terminal_bytes, terminal_entries),
             .terminal_q = tq,
             .ordinary_q = oq,
             .framed_data_q = fq,
@@ -528,8 +537,13 @@ pub const FairScheduler = struct {
         return e;
     }
 
+    /// A terminal frame holds its pool share until it leaves the ring
+    /// (`ControlPool`), so every pop gives the share back, the drain's and the
+    /// teardown's alike. The entry's `control_n` is not the sink's to release.
     pub fn popTerminal(self: *FairScheduler) ?ControlEntry {
-        return popRing(ControlEntry, self.terminal_q, &self.terminal_head, &self.terminal_len);
+        const e = popRing(ControlEntry, self.terminal_q, &self.terminal_head, &self.terminal_len) orelse return null;
+        self.ctrl.releaseTerminal(e.control_n);
+        return e;
     }
     pub fn popOrdinary(self: *FairScheduler) ?ControlEntry {
         return popRing(ControlEntry, self.ordinary_q, &self.ordinary_head, &self.ordinary_len);
@@ -641,6 +655,41 @@ pub const FairScheduler = struct {
         }
         self.ordinary_len = kept;
         self.ordinary_tail = (self.ordinary_head + kept) % cap;
+    }
+
+    /// Drop the RST_STREAM for `stream_id` if it still waits in the terminal
+    /// ring, with its pool share, its payload and its ticket. The peer reset
+    /// the stream itself, so it already counts the stream closed, and an
+    /// unwritten RST for it would only hold one of the T terminal slots a
+    /// well-behaved peer's own open streams need (`Limits.terminalFrames`).
+    /// An RST that already left the ring is in the write memory and goes out
+    /// as it is. Returns whether one was dropped. Order of everything kept is
+    /// unchanged. O(T), and a peer RST is rate limited.
+    pub fn retireTerminalRst(self: *FairScheduler, stream_id: u31) bool {
+        const n = self.terminal_len;
+        const cap = self.terminal_q.len;
+        var kept: usize = 0;
+        var k: usize = 0;
+        var dropped = false;
+        while (k < n) : (k += 1) {
+            const e = self.terminal_q[(self.terminal_head + k) % cap];
+            if (!dropped and rstStream(e.payload) == stream_id) {
+                dropped = true;
+                self.ctrl.releaseTerminal(e.control_n);
+                if (e.ticket != 0) {
+                    const fail = self.ticket_fail orelse
+                        std.debug.panic("retired RST_STREAM for stream {d} carries ticket {d} and no ticket_fail is set", .{ stream_id, e.ticket });
+                    fail(self.ticket_fail_ctx.?, e.ticket, e.ticket_slot);
+                }
+                self.freePayload(e.payload);
+                continue;
+            }
+            self.terminal_q[(self.terminal_head + kept) % cap] = e;
+            kept += 1;
+        }
+        self.terminal_len = kept;
+        self.terminal_tail = (self.terminal_head + kept) % cap;
+        return dropped;
     }
 
     fn slotIndex(self: *const FairScheduler, pw: *const DataPending) u32 {
@@ -850,7 +899,7 @@ pub const FairScheduler = struct {
                 .ticket_slot = ticket_slot,
                 .control_n = n,
             }) catch {
-                self.ctrl.release(n, 1);
+                self.ctrl.releaseTerminal(n);
                 self.freePayload(payload);
                 return error.QueueFull;
             };
@@ -870,6 +919,40 @@ pub const FairScheduler = struct {
                 self.freePayload(payload);
                 return error.QueueFull;
             };
+        }
+    }
+
+    /// A header block of more than one frame (HEADERS, then CONTINUATIONs),
+    /// admitted as one unit: the share's room for all its entries and bytes
+    /// is taken before the first fragment is queued, or none is, and every
+    /// payload is freed (`PoolFull`). A block admitted fragment by fragment
+    /// could be refused after its HEADERS went in, and the peer would then
+    /// wait for the rest of a block that never comes (the scheduler holds the
+    /// connection to it, `block_open`). The ticket rides on the first frame.
+    pub fn enqueueControlBlock(
+        self: *FairScheduler,
+        payloads: []const []u8,
+        ticket: u64,
+        ticket_slot: u32,
+    ) error{PoolFull}!void {
+        std.debug.assert(payloads.len >= 2);
+        var total: usize = 0;
+        for (payloads) |p| total += frame.encodedOnWireLen(p);
+        if (!self.ctrl.tryReserveOrdinaryBlock(total, payloads.len)) {
+            for (payloads) |p| self.freePayload(p);
+            return error.PoolFull;
+        }
+        for (payloads, 0..) |p, k| {
+            // The ring holds as many entries as the share, and a popped entry
+            // gives its ring slot back before its share, so a reserved entry
+            // always has a slot.
+            pushRing(ControlEntry, self.ordinary_q, &self.ordinary_head, &self.ordinary_tail, &self.ordinary_len, .{
+                .payload = p,
+                .class = .ordinary,
+                .ticket = if (k == 0) ticket else 0,
+                .ticket_slot = if (k == 0) ticket_slot else 0,
+                .control_n = frame.encodedOnWireLen(p),
+            }) catch unreachable;
         }
     }
 
@@ -1053,7 +1136,8 @@ pub const FairScheduler = struct {
                 self.emits_total += 1;
                 self.sink_origin_emits += 1;
                 self.recordEmitKind(.terminal_control);
-                try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, e.control_n, true);
+                // Not a counted control entry: its share was given back by the pop.
+                try sink(sink_ctx, e.payload, true, e.ticket, e.ticket_slot, 0, false);
             }
             if (comptime wire_ring.enabled) self.diag_ctrl_break = false;
             while (self.ordinary_len > 0) {
@@ -1290,11 +1374,69 @@ fn testPool(gpa: std.mem.Allocator, slab_bytes: usize, capacity: usize) !slab_po
     return slab_pool.SlabPool.init(gpa, std.testing.io, slab_bytes, capacity);
 }
 
+test "retireTerminalRst drops the stream's waiting RST with its share and payload, and keeps the order of the rest (t-3562)" {
+    const gpa = std.testing.allocator;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 16, 13 * 4, 4, 8, &pool);
+    defer sched.deinit();
+    var rst: [13]u8 = undefined;
+    for ([_]u31{ 1, 3, 5 }) |sid| {
+        _ = try frame.Serializer.rstStream(&rst, sid, .cancel);
+        try sched.enqueueControl(try gpa.dupe(u8, &rst), .terminal, 0, 0);
+    }
+    try std.testing.expectEqual(@as(usize, 3), sched.ctrl.terminal_entries_held.load(.acquire));
+    try std.testing.expect(sched.retireTerminalRst(3));
+    try std.testing.expect(!sched.retireTerminalRst(3));
+    try std.testing.expect(!sched.retireTerminalRst(7));
+    try std.testing.expectEqual(@as(usize, 2), sched.terminal_len);
+    try std.testing.expectEqual(@as(usize, 2), sched.ctrl.terminal_entries_held.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2 * 13), sched.ctrl.terminal_bytes_held.load(.acquire));
+    for ([_]u31{ 1, 5 }) |want| {
+        const e = sched.popTerminal().?;
+        try std.testing.expectEqual(@as(?u31, want), rstStream(e.payload));
+        sched.freePayload(e.payload);
+    }
+}
+
+test "terminal frames fit their whole share with the ordinary share pinned, and not one more (t-3562)" {
+    // The pool half of the bound, with no timing: frames already in flight pin
+    // the ordinary share (a `forgetStream` cannot give them back), and the
+    // terminal share must still take T frames. The terminal ring and the pool
+    // are one argument, so the first refusal past T is whichever fills first.
+    const gpa = std.testing.allocator;
+    const terminal = 7;
+    var pool = try testPool(gpa, 64 * 1024, 8);
+    defer pool.deinit(gpa);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 16, 13 * terminal, terminal, 8, &pool);
+    defer sched.deinit();
+    var i: usize = 0;
+    while (i < 16) : (i += 1) try std.testing.expect(sched.ctrl.tryReserveOrdinary(10));
+    try std.testing.expect(!sched.ctrl.tryReserveOrdinary(10));
+
+    var rst: [13]u8 = undefined;
+    _ = try frame.Serializer.rstStream(&rst, 1, .cancel);
+    i = 0;
+    while (i < terminal) : (i += 1) {
+        try sched.enqueueControl(try gpa.dupe(u8, &rst), .terminal, 0, 0);
+    }
+    try std.testing.expectEqual(terminal, sched.terminal_len);
+    // One more is refused, by the pool share and the ring alike.
+    const extra = try gpa.dupe(u8, &rst);
+    try std.testing.expectError(error.PoolFull, sched.enqueueControl(extra, .terminal, 0, 0));
+    // The ordinary share is untouched by terminal frames.
+    try std.testing.expectEqual(@as(usize, 16), sched.ctrl.entries_held.load(.acquire));
+    // A pop gives its share back, so the next terminal frame fits.
+    const popped = sched.popTerminal().?;
+    sched.freePayload(popped.payload);
+    try sched.enqueueControl(try gpa.dupe(u8, &rst), .terminal, 0, 0);
+}
+
 test "scheduler queues own payloads and hold control until complete" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     const p = try gpa.dupe(u8, "helloctl");
     try sched.enqueueControl(p, .ordinary, 0, 0);
@@ -1307,7 +1449,7 @@ test "a stream rents one slab on its first bytes, and none before" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 1024, 4);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
 
     // An idle scheduler holds nothing. This is the whole point of the pool.
@@ -1329,7 +1471,7 @@ test "the per-stream cap is the pool's slab length" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 4);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
 
     try sched.enqueueDataBytes(1, &@as([40]u8, @splat('a')), false, 0, 0);
@@ -1344,7 +1486,7 @@ test "ticket requires an existing DATA frame instead of stranding" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 2);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 2, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 2, &pool);
     defer sched.deinit();
 
     try std.testing.expectError(
@@ -1366,7 +1508,7 @@ test "pool exhaustion is its own error, and strands no slot" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 2);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
 
     try sched.enqueueDataBytes(1, "a", false, 0, 0);
@@ -1385,7 +1527,7 @@ test "removePending returns the slab" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 2);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 4, &pool);
     defer sched.deinit();
 
     try sched.enqueueDataBytes(1, "abc", false, 0, 0);
@@ -1407,7 +1549,7 @@ test "deinit returns every slab it still holds" {
     var pool = try testPool(gpa, 64, 4);
     defer pool.deinit(gpa);
     {
-        var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+        var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 4, &pool);
         defer sched.deinit();
         try sched.enqueueDataBytes(1, "abc", false, 0, 0);
         try sched.enqueueDataBytes(3, "def", false, 0, 0);
@@ -1472,7 +1614,7 @@ test "tier 3 serves ready streams round robin, newcomers in arrival order, not b
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1493,7 +1635,7 @@ test "a newcomer goes out before a running stream's next quantum, and newcomers 
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1515,7 +1657,7 @@ test "a quantum that spends the last connection credit does not strand its strea
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa, .conn = DATA_QUANTUM };
     defer w.deinit();
@@ -1539,7 +1681,7 @@ test "a stream blocked on its own window waits for rearm, and only rearm" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1569,7 +1711,7 @@ test "blocked streams cost no window query on the emit path" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 16);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 16, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 16, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1595,7 +1737,7 @@ test "index delete keeps a colliding key reachable" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 4, 32, 4, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 1024, 32, 256, 4, 4, &pool);
     defer sched.deinit();
 
     // Three odd ids with the same home slot, so they share one probe cluster.
@@ -1663,7 +1805,7 @@ test "DATA never leaves before its stream's HEADERS when the stash frees between
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1748,7 +1890,7 @@ test "nothing leaves inside a header block: a terminal control, forced DATA and 
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: FrameWire = .{ .gpa = gpa };
     defer w.seen.deinit(gpa);
@@ -1798,7 +1940,7 @@ test "a stream reset drops the queued fragments of its header block with its HEA
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: FrameWire = .{ .gpa = gpa };
     defer w.seen.deinit(gpa);
@@ -1853,7 +1995,7 @@ test "the anti-starvation yield does not send DATA before its stream's HEADERS" 
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1890,7 +2032,7 @@ test "a stream waiting for its HEADERS is not visited, and is served once they l
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: TestWire = .{ .gpa = gpa };
     defer w.deinit();
@@ -1918,7 +2060,7 @@ test "HEADERS state outlives a slot freed between writes, and ends at END_STREAM
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1942,7 +2084,7 @@ test "a reset ends the HEADERS state; trailers do not gate and end it too" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -1967,7 +2109,7 @@ test "framed DATA waits for its stream's HEADERS too" {
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -2004,7 +2146,7 @@ test "a reset before its queued HEADERS reaches the sink leaves no started entry
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
     const max_streams = 8;
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, max_streams, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, max_streams, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);
@@ -2031,7 +2173,7 @@ test "a reset drops only that stream's queued HEADERS, with its ticket and contr
     const gpa = std.testing.allocator;
     var pool = try testPool(gpa, 64 * 1024, 8);
     defer pool.deinit(gpa);
-    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 16, 256, 8, &pool);
+    var sched = try FairScheduler.init(gpa, std.testing.io, 64 * 1024, 256, 4 * 1024, 16, 8, &pool);
     defer sched.deinit();
     var w: OrderWire = .{ .gpa = gpa };
     defer w.events.deinit(gpa);

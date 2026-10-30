@@ -14,14 +14,22 @@ test "invalid zero connections" {
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 }
 
-test "control capacity must leave ordinary space above terminal reserve" {
+test "control capacity must be above zero, and the terminal room is added on top" {
     var lim = starh2.Limits.defaults;
-    lim.control_bytes_per_connection = starh2.core.limits.TERMINAL_CONTROL_RESERVE_BYTES;
+    lim.control_bytes_per_connection = 0;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
 
     lim = starh2.Limits.defaults;
-    lim.control_entries_per_connection = starh2.core.limits.TERMINAL_CONTROL_RESERVE_ENTRIES;
+    lim.control_entries_per_connection = 0;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+
+    // One ordinary entry is a legal config: the terminal frames do not live in it.
+    lim = starh2.Limits.defaults;
+    lim.control_entries_per_connection = 1;
+    lim.control_bytes_per_connection = 1;
+    _ = try lim.resourceUpperBound();
+    try std.testing.expectEqual(lim.max_streams_per_connection + 3, try lim.terminalFrames());
+    try std.testing.expectEqual(lim.control_entries_per_connection + lim.max_streams_per_connection + 3, try lim.controlPoolEntries());
 }
 
 test "the connection budget must hold the whole write pool and one stream's cap (t-3538)" {
@@ -453,16 +461,12 @@ test "frame pool: settings that cannot hold the preface and a terminal frame are
     lim.frame_slab_bytes = frame.max_control_frame_bytes;
     _ = try lim.resourceUpperBound();
 
-    // Under 4 slabs the terminal reserve is 0 (a quarter of the pool).
-    for ([_]usize{ 0, 1, 2, 3 }) |slabs| {
+    // Terminal frames do not use the frame pool; it only has to hold the two
+    // preface frames.
+    for ([_]usize{ 0, 1 }) |slabs| {
         lim.frame_slabs_per_connection = slabs;
         try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
     }
-    lim.frame_slabs_per_connection = 4;
-    _ = try lim.resourceUpperBound();
-    try std.testing.expectEqual(@as(usize, 1), lim.frameSlabReserve());
-    // The reserve is capped at the control pool's, and the preface still fits above it.
-    lim.frame_slabs_per_connection = 4096;
-    try std.testing.expectEqual(starh2.core.limits.TERMINAL_CONTROL_RESERVE_ENTRIES, lim.frameSlabReserve());
+    lim.frame_slabs_per_connection = 2;
     _ = try lim.resourceUpperBound();
 }

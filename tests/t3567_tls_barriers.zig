@@ -875,10 +875,10 @@ test "idle table, h2c: an abort reaches the client as a reset" {
     try runIdleOpTop(.h2c, "/idle-abort", want_abort);
 }
 
-/// The control pool for the failure regression. The ordinary share is this
-/// minus the reserve for terminal frames (4 KiB): 18 KiB, which holds the
-/// 16 KiB HEADERS fragment of the wide block and not the CONTINUATION after it.
-const fail_control_bytes = 22 * 1024;
+/// The ordinary control share for the failure regression: 18 KiB, which holds
+/// the 16 KiB HEADERS fragment of the wide block and not the CONTINUATION
+/// after it. Terminal frames have a room of their own on top of it.
+const fail_control_bytes = 18 * 1024;
 
 /// The third member of the class (t-3594). A response that is refused while it
 /// is materialized, for lack of room for a CONTINUATION, fails the connection:
@@ -1010,4 +1010,8 @@ test "tls: 20 bare flush barriers against a held stash (test_hold_stash) do not 
 
 test "h2c control: 20 bare flush barriers against a held writer wait for room and every response ends" {
     try runCaseTop(.h2c, .writes, 20);
+}
+
+test "zz h2 oracle: no protocol violation on any connection in this binary" {
+    try @import("h2_oracle.zig").expectNoViolations();
 }

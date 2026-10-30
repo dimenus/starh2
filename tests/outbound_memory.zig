@@ -1246,3 +1246,7 @@ test "packing: h2c many small responses on one connection share write chunks and
 test "packing: tls many small responses on one connection share write chunks and arrive whole and in order" {
     try runPackCase(.tls);
 }
+
+test "zz h2 oracle: no protocol violation on any connection in this binary" {
+    try @import("h2_oracle.zig").expectNoViolations();
+}

@@ -34,6 +34,9 @@ pub const Stream = struct {
     id: u31,
     state: State = .idle,
     window: flow.StreamWindow = .{},
+    /// Receive credit granted in `window` and not yet sent to the peer
+    /// (`Session.Owed`).
+    window_owed: u31 = 0,
     end_stream_remote: bool = false,
     end_stream_local: bool = false,
     headers_done: bool = false,

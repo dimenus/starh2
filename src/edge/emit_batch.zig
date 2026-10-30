@@ -11,6 +11,7 @@
 //! batch therefore counts entries, not a bool. Releasing 1 after N HEADERS
 //! leaks N-1 slots for the life of the connection.
 const std = @import("std");
+const test_hook = @import("test_hook.zig");
 const wire_const = @import("../core/wire_const.zig");
 
 /// TLS 1.3 application plaintext cap. HTTP/2 packing stops here; one encrypt
@@ -58,7 +59,7 @@ const observe = @import("build_options").observe;
 /// frame, for a gate whose subject needs one completion per frame to fill the
 /// write-ack channel (`tests/ack_channel.zig`). Packing makes a chunk of four
 /// responses, which is the point of it and the opposite of what that gate needs.
-pub var test_pack_small_data: std.atomic.Value(bool) = .init(true);
+pub var test_pack_small_data: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(true) else {};
 
 /// Control frames, ticketed DATA, and DATA small enough to pack
 /// (`packsWithNeighbours`) concat into one queueWire, on h2c and TLS alike.

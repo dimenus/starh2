@@ -7,8 +7,15 @@ const starh2 = @import("starh2");
 const tls = @import("tls");
 
 const frame = starh2.core.frame;
+const h2_oracle = @import("h2_oracle.zig");
 
 pub const client_deadline_ns = 10 * std.time.ns_per_s;
+
+/// FIONREAD: std.c has no macOS entry for it. `_IOR('f', 127, int)` there.
+const fionread = switch (@import("builtin").os.tag) {
+    .linux => std.os.linux.T.FIONREAD,
+    else => 0x4004667f,
+};
 
 pub const Transport = enum { h2c, tls };
 
@@ -40,6 +47,13 @@ pub const Wire = struct {
     plain: std.ArrayList(u8) = .empty,
     /// The payload of the frame `next` returned last.
     last_payload: std.ArrayList(u8) = .empty,
+    /// What the server owes this client, checked on every frame and at the
+    /// server's EOF (`h2_oracle`).
+    oracle: h2_oracle.Oracle,
+    /// TLS: the server's close_notify ended the reading.
+    close_notify: bool = false,
+    /// The read failed with a connection reset, not an EOF.
+    reset: bool = false,
 
     pub const Seen = struct { ftype: u8, flags: u8, sid: u32 };
 
@@ -65,8 +79,36 @@ pub const Wire = struct {
         const tv: std.c.timeval = .{ .sec = 1, .usec = 0 };
         _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(std.c.timeval));
         const self = try gpa.create(Wire);
-        self.* = .{ .gpa = gpa, .transport = transport, .fd = fd };
+        self.* = .{ .gpa = gpa, .transport = transport, .fd = fd, .oracle = .init(gpa, transport == .tls) };
         return self;
+    }
+
+    /// `connectRecvBuf` over a Unix stream socket at `path` (a server's
+    /// `h2c_unix` / `tls_unix` endpoint). The receive buffer is set before
+    /// the connection; on Linux a Unix stream is limited by the SENDER's
+    /// buffer, not this one, so a test must not count on it there.
+    pub fn connectUnix(gpa: std.mem.Allocator, transport: Transport, path: []const u8, rcvbuf: ?c_int) !*Wire {
+        const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        errdefer _ = std.c.close(fd);
+        if (rcvbuf) |n| _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, std.mem.asBytes(&n), @sizeOf(c_int));
+        var addr: std.c.sockaddr.un = .{ .path = @splat(0) };
+        if (path.len >= addr.path.len) return error.NameTooLong;
+        @memcpy(addr.path[0..path.len], path);
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) != 0) return error.Connect;
+        const tv: std.c.timeval = .{ .sec = 1, .usec = 0 };
+        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(std.c.timeval));
+        const self = try gpa.create(Wire);
+        self.* = .{ .gpa = gpa, .transport = transport, .fd = fd, .oracle = .init(gpa, transport == .tls) };
+        return self;
+    }
+
+    /// Bytes the kernel holds for this client that it has not read yet
+    /// (FIONREAD), read without consuming them.
+    pub fn unreadBytes(self: *const Wire) usize {
+        var n: c_int = 0;
+        if (std.c.ioctl(self.fd, fionread, &n) != 0) return 0;
+        return @intCast(n);
     }
 
     pub fn open(gpa: std.mem.Allocator, transport: Transport, port: u16) !*Wire {
@@ -80,6 +122,7 @@ pub const Wire = struct {
         _ = std.c.close(self.fd);
         self.plain.deinit(self.gpa);
         self.last_payload.deinit(self.gpa);
+        self.oracle.deinit();
         self.gpa.destroy(self);
     }
 
@@ -97,6 +140,7 @@ pub const Wire = struct {
     }
 
     fn handshakeImpl(self: *Wire, flight: ?[]const u8) !void {
+        if (flight) |f| self.oracle.onSend(f);
         if (self.transport == .h2c) {
             if (flight) |f| try self.sendRaw(f);
             return;
@@ -145,6 +189,10 @@ pub const Wire = struct {
         if (n < 0) {
             return switch (std.c.errno(n)) {
                 .AGAIN, .INTR => error.WouldBlock,
+                .CONNRESET => {
+                    self.reset = true;
+                    return error.Eof;
+                },
                 else => error.Eof,
             };
         }
@@ -166,6 +214,7 @@ pub const Wire = struct {
     }
 
     pub fn send(self: *Wire, bytes: []const u8) !void {
+        self.oracle.onSend(bytes);
         if (self.transport == .h2c) return self.sendRaw(bytes);
         var off: usize = 0;
         while (off < bytes.len) {
@@ -190,7 +239,10 @@ pub const Wire = struct {
             if (n < 0) {
                 return switch (std.c.errno(n)) {
                     .AGAIN, .INTR => error.WouldBlock,
-                    .CONNRESET => false,
+                    .CONNRESET => {
+                        self.reset = true;
+                        return false;
+                    },
                     else => error.Recv,
                 };
             }
@@ -206,7 +258,10 @@ pub const Wire = struct {
         };
         const res = try self.conn.decrypt(self.in[0..rec_len], &self.rd);
         self.consume(rec_len);
-        if (res.closed) return false;
+        if (res.closed) {
+            self.close_notify = true;
+            return false;
+        }
         try self.plain.appendSlice(self.gpa, res.cleartext);
         return true;
     }
@@ -225,6 +280,7 @@ pub const Wire = struct {
                     };
                     self.last_payload.clearRetainingCapacity();
                     try self.last_payload.appendSlice(self.gpa, h[9 .. 9 + len]);
+                    self.oracle.onFrame(seen.ftype, seen.flags, seen.sid, self.last_payload.items);
                     self.plain.replaceRangeAssumeCapacity(0, 9 + len, &.{});
                     return seen;
                 }
@@ -234,7 +290,10 @@ pub const Wire = struct {
                 error.WouldBlock => continue,
                 else => return err,
             };
-            if (!more) return null;
+            if (!more) {
+                self.oracle.onEnd(if (self.reset) .reset else if (self.close_notify) .close_notify else .eof);
+                return null;
+            }
         }
     }
 

@@ -280,8 +280,8 @@ fn traceHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
         "\"placement_check\":{d},\"placement_checks\":{d},\"placement_mismatches\":{d},",
         .{
             @intFromBool(conn_mod.placement_check),
-            conn_mod.test_placement_checks.load(.acquire),
-            conn_mod.test_placement_mismatches.load(.acquire),
+            if (comptime conn_mod.placement_check) conn_mod.test_placement_checks.load(.acquire) else 0,
+            if (comptime conn_mod.placement_check) conn_mod.test_placement_mismatches.load(.acquire) else 0,
         },
     );
     // Placement probe: per thread (kernel tid), how many units of work each

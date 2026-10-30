@@ -930,7 +930,7 @@ fn runCompleteWaitsForControlEntry(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
     limits.cancellation_reaper_tasks = 2;
     // Four ordinary entries for eight streams. With two, the connection
     // closed before stream 1 was answered; not traced yet (t-3492).
-    limits.control_entries_per_connection = starh2.core.limits.TERMINAL_CONTROL_RESERVE_ENTRIES + 4;
+    limits.control_entries_per_connection = 4;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -1964,7 +1964,7 @@ test "regression: stream map drops closed streams (bounded history)" {
             }
         }
         if (respond_sid) |rsid| {
-            session.applyCommand(.{ .respond_headers = .{
+            session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
                 .stream_id = rsid,
                 .status = 200,
                 .headers = &.{},
