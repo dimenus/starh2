@@ -9485,13 +9485,16 @@ fn bigBodyByte(i: usize) u8 {
     return @intCast('a' + (i / 1000) % 26);
 }
 
-/// A handler that answers 503 itself, with END_STREAM and no body, and
-/// counts that it ran (`expectHandler503Reset`).
+/// A handler that answers 503 itself, with END_STREAM and no body. It counts
+/// that it ran, and records that its own `send` returned without error, so
+/// the test can tell its 503 from the 500 the job sends when a handler fails.
 var hop_503_runs: usize = 0;
+var hop_503_sent_ok: bool = false;
 
 fn hopHandler503(_: *anyopaque, _: *const request.Request, resp: *response.CompleteResponse) anyerror!void {
     hop_503_runs += 1;
     try resp.send(503, &.{}, "");
+    hop_503_sent_ok = true;
 }
 
 fn hopBigBody(_: *anyopaque, _: *const request.Request, resp: *response.CompleteResponse) anyerror!void {
@@ -10652,6 +10655,8 @@ const TrapWire = struct {
     ping_acks: [4][8]u8 = undefined,
     ping_ack_n: usize = 0,
     conn_credit: u64 = 0,
+    /// HEADERS frames read, on any stream.
+    headers: usize = 0,
 
     fn deinit(self: *TrapWire) void {
         self.rst_per_sid.deinit();
@@ -10686,6 +10691,7 @@ fn trapCollect(trap: *TrapHop, out: *TrapWire) !void {
                         if (out.goaways < out.goaway_codes.len) out.goaway_codes[out.goaways] = std.mem.readInt(u32, body[4..8], .big);
                         out.goaways += 1;
                     },
+                    .headers => out.headers += 1,
                     .settings => if (h.flags.end_stream) {
                         out.settings_acks += 1;
                     },
@@ -11157,6 +11163,7 @@ test "a handler's own 503, refused by the ordinary share (its bytes spent), is r
     const conn = &trap.hop.conn;
     try trap.hop.preparePreface();
     hop_503_runs = 0;
+    hop_503_sent_ok = false;
     // The share's entries are free but its bytes are not: a complete handler
     // runs only while an entry is free (`runPendingInline`), so a share pinned
     // by entries, as `.share_full` pins it, would stop the handler before it
@@ -11168,6 +11175,7 @@ test "a handler's own 503, refused by the ordinary share (its bytes spent), is r
     const pin_bytes = caps.bytes - held_bytes - 4;
     try std.testing.expect(conn.sched.ctrl.tryReserveOrdinary(pin_bytes));
     try std.testing.expect(conn.sched.ctrl.hasOrdinaryEntry());
+    const refused_0 = test_ctrl_ordinary_pool_full.load(.monotonic);
     var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
     {
         conn.lockSessionUncancelable(conn.config.io);
@@ -11178,12 +11186,20 @@ test "a handler's own 503, refused by the ordinary share (its bytes spent), is r
     }
     try conn.runPendingInline();
     conn.sched.ctrl.release(pin_bytes, 1);
-    // The handler ran: this is its 503, not the server's refusal.
+    // The handler ran and its own 503 was built: its `send` returned
+    // without error, so this is not the 500 the job sends for a handler that
+    // failed (which the pinned share would refuse the same way). And the
+    // share refused exactly one frame: that HEADERS.
     try std.testing.expectEqual(@as(usize, 1), hop_503_runs);
+    try std.testing.expect(hop_503_sent_ok);
+    try std.testing.expectEqual(refused_0 + 1, test_ctrl_ordinary_pool_full.load(.monotonic));
     try std.testing.expect(conn.session.terminal == .none);
     var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
     defer seen.deinit();
     try trapCollect(&trap, &seen);
+    // No HEADERS reached the wire (stream 1 is the only stream): the 503 was
+    // refused, not sent.
+    try std.testing.expectEqual(@as(usize, 0), seen.headers);
     try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
     try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.internal_error)), seen.rst_code);
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
