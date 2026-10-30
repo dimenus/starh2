@@ -844,3 +844,40 @@ stronger test).
 Do not tell me the tests pass; I recompute. Report as before in
 `tools/t3562-report.md` (replace the round 7 report), then print exactly one
 line: `STATUS: done t62i /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.
+
+## Round 8b (review of df47a43; Fable and gpt-6-astra agree)
+
+Both reviewers, independently, found the same two gaps in round 8's tests;
+Fable added a wording nit. Still test-only, the same rules. One commit per
+item on top of this brief commit.
+
+1. **Item 1's test does not pin the path the brief asked for (both).** It
+   also passes if the handler's `resp.send(503, ...)` fails inside
+   `cmdHeaders` (intent room, frame rent, `HeadersTooLarge`): the handler
+   returns an error, `runHandlerJobBody`'s fallback sends a 500 through
+   `.respond_headers`, the pinned share refuses that HEADERS, and the stream
+   is reset with INTERNAL_ERROR. Every assertion holds and no 503 was built.
+   Mutation 43 cannot tell the two paths apart. Make the test require: the
+   handler's own `send` returned without error (record it in the handler);
+   `test_ctrl_ordinary_pool_full` rose by exactly 1 across the ingest; and no
+   HEADERS for stream 1 reached the wire (if `trapCollect` cannot count
+   HEADERS, say what it can count instead). Show the test fails when the
+   handler's send is forced to fail (a temporary edit), with the fix in place.
+2. **Item 2's wait can see the actor parked on the PING ack's send
+   completion (both).** `ping_acked` is set when the ack's bytes reach the
+   client, which can come before the actor takes its send completion
+   (`onSendComplete`), so the park the test samples can be the one waiting on
+   that completion; the next turn's `pollRecv` then takes the close on the
+   path the guard is not needed on. Add a test-only witness so the test knows
+   the guarded path ran, not just that it was likely: for example, wait until
+   no TLS send is in flight before sampling the park gauge, or count a recv
+   completion taken in the select that leaves plaintext pending and posts the
+   EOF in one call, and require it. Correct the comment's "nothing being
+   written". Run mutation 42 against it again: 10 times on Linux, 3 on the
+   Mac.
+3. **The precondition message (Fable, nit).** The check is `!= +1`, so a
+   delta of 2 fails with a message that says the close was not in the
+   leftover. Print the baseline and the value read.
+
+Report as before (replace the round 8 report), then print exactly one line:
+`STATUS: done t62j /Users/rsaunderson/Source/mine/starh2-wt-3562/tools/t3562-report.md`.
