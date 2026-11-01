@@ -1867,7 +1867,15 @@ pub const Connection = struct {
     parked: []session_mod.DispatchRequest,
     parked_head: usize = 0,
     parked_len: usize = 0,
-    shutting_down: bool = false,
+    /// This connection is ending through the graceful path, because the server is
+    /// shutting down or because the connection was idle (`checkConnectionIdle`).
+    going_away: bool = false,
+    /// When this connection last began to have nothing to do; null while it has
+    /// work, or with the idle timeout off (`checkConnectionIdle`).
+    idle_since_ns: ?u64 = null,
+    /// `session.highest_peer_stream` at the last idle check. A request can open
+    /// and end between two checks, and that is still activity.
+    idle_seen_stream: u31 = 0,
     /// Set by a handler after it refills scheduler slab space; cleared by the
     /// actor at the top of each iteration. Emission happens only in the
     /// actor's drainEmit. The handler's release of `session_mu` (which rings,
@@ -3647,7 +3655,8 @@ pub const Connection = struct {
         self.noteReceiptDepthChange(old_n, self.pending_complete_receipt_n);
     }
 
-    /// Protocol deadlines only (idle, slow-consumer, grace, test canary).
+    /// Protocol deadlines only (body idle, slow-consumer, grace, connection
+    /// idle, test canary).
     /// Handler deadlines are handler-owned zio timed waits and never appear
     /// in the actor's park timer.
     fn nextDeadlineNs(self: *Connection) ?u64 {
@@ -3662,6 +3671,16 @@ pub const Connection = struct {
         if (self.grace_deadline) |deadline| {
             const ns: u64 = @intCast(deadline.nanoseconds);
             if (next == null or ns < next.?) next = ns;
+        }
+        const idle_limit_ns = self.config.limits.connection_idle_timeout_ns;
+        if (idle_limit_ns != 0 and !self.going_away) {
+            // A connection with work wakes once per limit to look again. Its
+            // last stream can end with nothing left to wake the actor: a task
+            // handler's response drains after the check, and the peer is not
+            // reading, so no write completes. It must not stay open for ever
+            // because of that.
+            const deadline = (self.idle_since_ns orelse nowNs(self.config.io)) +| idle_limit_ns;
+            if (next == null or deadline < next.?) next = deadline;
         }
         const canary_tick: u64 = if (comptime test_observe) test_polling_canary_tick_ns.load(.acquire) else 0;
         if (canary_tick != 0) {
@@ -3986,11 +4005,11 @@ pub const Connection = struct {
         };
         if (diag_stuck) _ = self.diag_actor_turns.fetchAdd(1, .monotonic);
         // The server's shutdown event stays set once fired. After this actor
-        // has seen it (`shutting_down`), selecting on it again wins at once on
+        // has seen it (`going_away`), selecting on it again wins at once on
         // every turn, so the actor never parks and holds its executor for the
         // whole drain (t-2652). The drain still wakes on its own deadlines
         // (`grace_deadline` is in nextDeadlineNs) and on peer activity.
-        const shutdown_ev = if (self.shutting_down or self.closing_deadline_ns != null)
+        const shutdown_ev = if (self.going_away or self.closing_deadline_ns != null)
             &no_shutdown_event
         else
             self.config.shutdown_event orelse &no_shutdown_event;
@@ -4466,6 +4485,9 @@ pub const Connection = struct {
                         // Slots freed since the last turn go to parked requests before
                         // any new one, so a waiting request is not overtaken.
                         self.dispatchParked() catch |err| try self.sessionErrorExit(err, "dispatch_parked_error");
+                        // After the kills above, which can end the last stream,
+                        // and before the emit, so a first GOAWAY goes out this turn.
+                        self.checkConnectionIdle(now) catch |err| try self.sessionErrorExit(err, "connection_idle_error");
                     }
                 }
                 diagActor(self, .lk_materialize);
@@ -4509,7 +4531,7 @@ pub const Connection = struct {
                     } else if (self.session.terminal != .none) {
                         self.freezeAndSweepLocked();
                         break;
-                    } else if (self.shutting_down and self.session.grace_phase == .phase2 and
+                    } else if (self.going_away and self.session.grace_phase == .phase2 and
                         // Graceful finish needs all four conditions together: phase 2
                         // reached, nothing left to write, no handler still running,
                         // and no request waiting for a slot. Any one alone would cut
@@ -5004,7 +5026,7 @@ pub const Connection = struct {
         for (self.handlers.slice()) |*slot| {
             if (!slot.in_use) continue;
             std.debug.assert(slot.stream_id != 0);
-            slot.terminal.setCause(.server_shutdown);
+            slot.terminal.setCause(self.connectionEndCause());
             self.wakeHandlerWaiters(slot.stream_id);
         }
         var n: usize = 0;
@@ -5498,7 +5520,7 @@ pub const Connection = struct {
         std.debug.assert(self.handlers.capacity() != 0);
         for (self.handlers.slice()) |*slot| {
             if (!slot.in_use) continue;
-            slot.terminal.setCause(.server_shutdown);
+            slot.terminal.setCause(self.connectionEndCause());
         }
         self.tickets.failAll();
         self.wakeAllDeadlines();
@@ -5584,14 +5606,10 @@ pub const Connection = struct {
     /// The one-second deadline between the phases is a liveness guard: a peer
     /// that never acks the PING must not be able to hold the shutdown open.
     fn maybeBeginGraceful(self: *Connection) !bool {
-        const sf = self.config.shutdown_flag orelse return false;
-        if (!sf.load(.acquire)) return false;
-        if (!self.shutting_down) {
-            self.shutting_down = true;
-            try self.session.applyCommand(.graceful_phase1);
-            try self.processIntents();
-            const now_ns = nowNs(self.config.io);
-            self.grace_deadline = std.Io.Timestamp.fromNanoseconds(@as(i96, now_ns +% std.time.ns_per_s));
+        if (!self.going_away) {
+            const sf = self.config.shutdown_flag orelse return false;
+            if (!sf.load(.acquire)) return false;
+            try self.beginGraceful();
             return false;
         }
         if (self.session.grace_phase == .phase1) {
@@ -5617,6 +5635,53 @@ pub const Connection = struct {
             }
         }
         return false;
+    }
+
+    fn serverShuttingDown(self: *const Connection) bool {
+        const sf = self.config.shutdown_flag orelse return false;
+        return sf.load(.acquire);
+    }
+
+    /// What a handler hears when its connection ends under it. A connection ends
+    /// for many reasons (idle, the peer left, a connection error); only this one
+    /// says the server itself is going away.
+    fn connectionEndCause(self: *const Connection) response.TerminalCause {
+        return if (self.serverShuttingDown()) .server_shutdown else .connection_closed;
+    }
+
+    fn beginGraceful(self: *Connection) !void {
+        self.going_away = true;
+        self.idle_since_ns = null;
+        try self.session.applyCommand(.graceful_phase1);
+        try self.processIntents();
+        const now_ns = nowNs(self.config.io);
+        self.grace_deadline = std.Io.Timestamp.fromNanoseconds(@as(i96, now_ns +% std.time.ns_per_s));
+    }
+
+    /// Ends a connection that has had nothing to do for
+    /// `Limits.connection_idle_timeout_ns`, through the graceful path: a request
+    /// that crosses the first GOAWAY is still served. Runs on every actor turn
+    /// outside the closing phase. Nothing has to wake the actor for it:
+    /// `nextDeadlineNs` keeps a deadline armed.
+    fn checkConnectionIdle(self: *Connection, now: u64) !void {
+        const limit_ns = self.config.limits.connection_idle_timeout_ns;
+        if (limit_ns == 0 or self.going_away) return;
+        const new_stream = self.session.highest_peer_stream != self.idle_seen_stream;
+        self.idle_seen_stream = self.session.highest_peer_stream;
+        // Not `live_handlers`: a handler can wait without limit for the receipt of
+        // its last write when the peer has stopped reading, and its stream has
+        // ended, so no other deadline covers that wait.
+        if (self.session.active_streams != 0 or self.session.expect_continuation != null) {
+            self.idle_since_ns = null;
+            return;
+        }
+        if (new_stream or self.idle_since_ns == null) {
+            self.idle_since_ns = now;
+            return;
+        }
+        if (now -% self.idle_since_ns.? < limit_ns) return;
+        self.noteServerClose("connection_idle", null);
+        try self.beginGraceful();
     }
 
     fn finishGraceful(self: *Connection) !void {
@@ -6699,8 +6764,8 @@ pub const Connection = struct {
         self.sched.forgetStream(r.stream_id);
         const cause: response.TerminalCause = if (r.from_peer)
             .{ .peer_reset = r.code }
-        else if (self.shutting_down)
-            .server_shutdown
+        else if (self.going_away or self.serverShuttingDown())
+            self.connectionEndCause()
         else
             .{ .peer_reset = r.code };
         self.cancelHandler(r.stream_id, cause);
@@ -7014,7 +7079,7 @@ pub const Connection = struct {
     /// have exited (peer close / socket shutdown), and a blocking put then
     /// waits forever while holding `session_mu`.
     fn writeGoingAway(self: *Connection) bool {
-        if (self.writer_failed.load(.acquire) or self.shutting_down) return true;
+        if (self.writer_failed.load(.acquire) or self.going_away) return true;
         const sf = self.config.shutdown_flag orelse return false;
         return sf.load(.acquire);
     }

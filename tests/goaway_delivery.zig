@@ -881,6 +881,9 @@ const StalledCheck = enum {
     /// The client sends nothing more, so the stream's own deadline is the only
     /// thing that can stop the handler: its write must fail with SlowConsumer.
     slow_consumer,
+    /// As `slow_consumer`, and the peer stays silent: with no stream left the
+    /// connection idle timeout must end the connection too.
+    idle_after_kill,
 };
 
 fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, stall: Stall, check_kind: StalledCheck, label: []const u8) !void {
@@ -896,13 +899,14 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     // The cancel check needs a deadline far enough away that "ended at once"
     // cannot be mistaken for "ended at the deadline".
     const deadline_ns: u64 = switch (check_kind) {
-        .deadline => 600 * std.time.ns_per_ms,
+        .deadline, .idle_after_kill => 600 * std.time.ns_per_ms,
         .cancel, .slow_consumer => 30 * std.time.ns_per_s,
     };
     limits.close_flush_timeout_ns = deadline_ns;
     // Above the 500 ms of no progress that says the server has stalled: the
     // handler must still be parked when the stall is seen.
-    if (check_kind == .slow_consumer) limits.slow_consumer_timeout_ns = 1500 * std.time.ns_per_ms;
+    if (check_kind == .slow_consumer or check_kind == .idle_after_kill) limits.slow_consumer_timeout_ns = 1500 * std.time.ns_per_ms;
+    if (check_kind == .idle_after_kill) limits.connection_idle_timeout_ns = 1000 * std.time.ns_per_ms;
 
     // Read by the connection when its WritePump starts, so it must be set
     // before the client connects and cleared afterwards.
@@ -1019,7 +1023,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
         return;
     }
 
-    if (check_kind == .slow_consumer) {
+    if (check_kind == .slow_consumer or check_kind == .idle_after_kill) {
         // The margin covers the actor's wake-up on a loaded machine. A deadline
         // at twice the limit does not fit in it.
         const stop = last_write_ns + limits.slow_consumer_timeout_ns + 1 * std.time.ns_per_s;
@@ -1034,6 +1038,23 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
         // so the floor only allows for a stamp taken late.
         try std.testing.expect(killed_ms >= limits.slow_consumer_timeout_ns / std.time.ns_per_ms - 100);
         try std.testing.expect(killed_ms <= (stop - last_write_ns) / std.time.ns_per_ms);
+        if (check_kind == .idle_after_kill) {
+            // The idle time, then the first GOAWAY's PING that nobody answers,
+            // then the close deadline for frames the full socket cannot take.
+            const idle_ms = limits.connection_idle_timeout_ns / std.time.ns_per_ms;
+            const killed_ns = flood_killed_ns.load(.acquire);
+            const gone_by = killed_ns + limits.connection_idle_timeout_ns + 1 * std.time.ns_per_s + deadline_ns + 1 * std.time.ns_per_s;
+            while (server.active_connections.load(.acquire) != 0) {
+                if (nowNs() >= gone_by) return error.HeldPastIdleTimeout;
+                zio.sleep(.fromMilliseconds(5)) catch {};
+            }
+            const gone_ms = (nowNs() - killed_ns) / std.time.ns_per_ms;
+            std.debug.print("{s}: connection gone {d} ms after the kill (idle limit {d} ms)\n", .{ label, gone_ms, idle_ms });
+            // The clock starts when the handler sees the kill, which is late on a
+            // loaded machine.
+            try std.testing.expect(gone_ms + 300 >= idle_ms + 1000 + deadline_ns / std.time.ns_per_ms);
+            return;
+        }
         // The peer learns of it, and only the stream ended.
         st.read_reset.store(true, .release);
         const read_stop = nowNs() + 2 * client_deadline_ns;
@@ -1055,7 +1076,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     const t0 = st.sent_ns.load(.acquire);
 
     switch (check_kind) {
-        .slow_consumer => unreachable,
+        .slow_consumer, .idle_after_kill => unreachable,
         .deadline => {
             const stop = t0 + deadline_ns + 3 * std.time.ns_per_s;
             while (server.active_connections.load(.acquire) != 0) {
@@ -1157,4 +1178,465 @@ test "goaway: h2c a cancel while an inline drain is held back by the write pool 
 
 test "goaway: h2c a cancel while the main loop drain is held back by the write pool reaches run as error.Canceled (t-3520)" {
     try runStalledCase(.h2c, .main_drain_parked, .cancel, "h2c cancel in main drain");
+}
+
+// ---------------------------------------------------------------------------
+// The connection idle timeout (t-3705)
+// ---------------------------------------------------------------------------
+
+const idle_limit_ms = 300;
+
+const IdleCase = enum {
+    /// The peer connects and never asks for anything, and answers nothing.
+    silent,
+    /// The peer sends PINGs and reads the ACKs, and opens no stream.
+    pings,
+    /// A stream runs for longer than the limit, and then the peer resets it.
+    open_stream,
+    /// The peer does not end its stream, so it stays open with no handler to wait for.
+    unfinished_request,
+    /// The peer resets a stream whose handler keeps running.
+    handler_outlives_reset,
+    /// Requests that each end quickly, over a time longer than the limit.
+    requests,
+    /// A request sent after the first GOAWAY.
+    crosses_goaway,
+    /// The limit is 0.
+    off,
+    /// A header block that takes longer than the limit to arrive.
+    unfinished_headers,
+    /// A stream sent after the first GOAWAY runs past the drain, so the server
+    /// resets it. The server itself is not shutting down.
+    cut_after_goaway,
+    /// h2c: the writer is held, and a task handler's response drains after the
+    /// check, so no write completion wakes the actor, and the handler waits for a
+    /// receipt that never comes. It takes a task handler: an inline response ends
+    /// its stream before the next check, which then sees the end. Not TLS: there
+    /// the hold parks the actor itself, and that is not what a full socket does.
+    stream_ends_with_no_wake,
+};
+
+const IdleRun = struct {
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+    /// Test body -> client: the server's side is checked, so close.
+    release: std.atomic.Value(bool) = .init(false),
+};
+
+/// The cause `recordCause` read from its stream's terminal state; null until then.
+var idle_cause_seen: std.atomic.Value(bool) = .init(false);
+var idle_cause_was_closed: std.atomic.Value(bool) = .init(false);
+
+fn recordCause(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.startSse(&.{});
+    try body.writeAll("data: hi\n\n");
+    while (true) {
+        try zio.sleep(.fromMilliseconds(5));
+        if (body.terminalCause()) |cause| {
+            idle_cause_was_closed.store(cause == .connection_closed, .release);
+            idle_cause_seen.store(true, .release);
+            return error.Canceled;
+        }
+    }
+}
+
+/// Sends its response, which waits for the wire receipt, then records why that
+/// wait ended.
+fn sendThenRecordCause(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try zio.sleep(.fromMilliseconds(slow_handler_ms));
+    resp.send(200, &.{}, "ok") catch {};
+    if (resp.slotTerminal()) |cause| {
+        idle_cause_was_closed.store(cause == .connection_closed, .release);
+        idle_cause_seen.store(true, .release);
+    }
+}
+
+fn idleSendPing(wire: *Wire, ack: bool, payload: *const [8]u8) !void {
+    var ping: [17]u8 = undefined;
+    (frame.FrameHeader{ .length = 8, .type = .ping, .flags = .{ .end_stream = ack }, .stream_id = 0 }).encode(ping[0..9]);
+    @memcpy(ping[9..], payload);
+    try wire.send(&ping);
+}
+
+fn idleSendRst(wire: *Wire, sid: u31) !void {
+    var rst: [32]u8 = undefined;
+    const n = try frame.Serializer.rstStream(&rst, sid, .cancel);
+    try wire.send(rst[0..n]);
+}
+
+fn idleSendRequest(gpa: std.mem.Allocator, wire: *Wire, sid: u31, path: []const u8, end_stream: bool) !void {
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    try h2c.appendHeaders(gpa, &req, sid, path, end_stream);
+    try wire.send(req.items);
+}
+
+/// The first GOAWAY must be phase 1 of a graceful close, and must come when the
+/// connection has had nothing to do for `wait_ms` since `from_ns`.
+fn idleExpectGoaway(wire: *Wire, from_ns: u64, wait_ms: u64, label: []const u8) !void {
+    const deadline = nowNs() + client_deadline_ns;
+    while (true) {
+        const s = try wire.next(deadline) orelse return error.ClosedBeforeGoaway;
+        if (s.ftype != ftype_goaway) continue;
+        const ms = (nowNs() - from_ns) / std.time.ns_per_ms;
+        std.debug.print("{s}: first GOAWAY after {d} ms (expected about {d} ms)\n", .{ label, ms, wait_ms });
+        // The server's clock starts just before the client's on a new connection.
+        if (ms + 100 < wait_ms) return error.GoawayTooEarly;
+        if (ms > wait_ms + 750) return error.GoawayTooLate;
+        if (s.code != @backingInt(frame.ErrorCode.no_error)) return error.WrongGoawayCode;
+        if (s.last_stream_id != std.math.maxInt(u31)) return error.NotPhaseOneGoaway;
+        return;
+    }
+}
+
+/// Reads to the close. The last GOAWAY names the last stream the server took.
+/// `seen` is a GOAWAY that came while the caller was reading.
+fn idleExpectClose(wire: *Wire, last_stream: u32, answer_ping: bool, seen: ?Seen) !void {
+    const deadline = nowNs() + client_deadline_ns;
+    var last_goaway: ?Seen = seen;
+    while (try wire.next(deadline)) |s| {
+        if (s.ftype == ftype_goaway) last_goaway = s;
+        if (answer_ping and s.ftype == ftype_ping and s.flags & 0x1 == 0) try idleSendPing(wire, true, "sh2grace");
+    }
+    const g = last_goaway orelse return error.ClosedWithoutSecondGoaway;
+    if (g.code != @backingInt(frame.ErrorCode.no_error)) return error.WrongGoawayCode;
+    if (g.last_stream_id != last_stream) return error.WrongLastStream;
+}
+
+/// Reads until the stream's response ends. A refusal is a failure. A GOAWAY goes
+/// in `goaway`, or is a failure with none: the connection was not idle.
+fn idleReadResponse(wire: *Wire, sid: u32, goaway: ?*?Seen) !void {
+    const deadline = nowNs() + client_deadline_ns;
+    while (true) {
+        const s = try wire.next(deadline) orelse return error.ClosedBeforeResponse;
+        if (s.ftype == ftype_goaway) {
+            const out = goaway orelse return error.GoawayWhileBusy;
+            out.* = s;
+        }
+        if (s.ftype == ftype_rst_stream and s.sid == sid) return error.RequestRefused;
+        if ((s.ftype == ftype_data or s.ftype == ftype_headers) and s.sid == sid and s.flags & 0x1 != 0) return;
+    }
+}
+
+fn idleReadFirstData(wire: *Wire, sid: u32) !void {
+    const deadline = nowNs() + client_deadline_ns;
+    while (true) {
+        const s = try wire.next(deadline) orelse return error.ClosedBeforeData;
+        if (s.ftype == ftype_goaway) return error.GoawayWhileBusy;
+        if (s.ftype == ftype_data and s.sid == sid) return;
+    }
+}
+
+fn idleMain(port: u16, gpa: std.mem.Allocator, transport: Transport, case: IdleCase, label: []const u8, run: *IdleRun) void {
+    idleClient(port, gpa, transport, case, label, run) catch |err| {
+        run.err = err;
+    };
+    run.done.store(true, .release);
+}
+
+fn idleClient(port: u16, gpa: std.mem.Allocator, transport: Transport, case: IdleCase, label: []const u8, run: *IdleRun) !void {
+    const wire = try Wire.open(gpa, transport, port, null);
+    defer wire.close();
+    var req = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer req.deinit(gpa);
+    try wire.send(req.items);
+    const t0 = nowNs();
+    switch (case) {
+        .silent => {
+            try idleExpectGoaway(wire, t0, idle_limit_ms, label);
+            try idleExpectClose(wire, 0, false, null);
+        },
+        .pings => {
+            const deadline = t0 + client_deadline_ns;
+            var answered: usize = 0;
+            outer: while (true) {
+                try idleSendPing(wire, false, "idleping");
+                while (true) {
+                    const s = try wire.next(deadline) orelse return error.ClosedBeforeGoaway;
+                    if (s.ftype == ftype_goaway) break :outer;
+                    if (s.ftype == ftype_ping and s.flags & 0x1 != 0) break;
+                }
+                answered += 1;
+                sleepMs(50);
+            }
+            const ms = (nowNs() - t0) / std.time.ns_per_ms;
+            std.debug.print("{s}: first GOAWAY after {d} ms, with {d} PINGs answered before it\n", .{ label, ms, answered });
+            if (answered < 2) return error.TooFewPingsAnswered;
+            if (ms + 100 < idle_limit_ms) return error.GoawayTooEarly;
+            if (ms > idle_limit_ms + 750) return error.GoawayTooLate;
+            try idleExpectClose(wire, 0, true, null);
+        },
+        .open_stream => {
+            // The idle time has started before the stream opens, on both transports.
+            sleepMs(100);
+            try idleSendRequest(gpa, wire, 1, "/sse", true);
+            try idleReadFirstData(wire, 1);
+            sleepMs(3 * idle_limit_ms);
+            try idleSendRst(wire, 1);
+            try idleExpectGoaway(wire, nowNs(), idle_limit_ms, label);
+            try idleExpectClose(wire, 1, true, null);
+        },
+        .unfinished_request => {
+            try idleSendRequest(gpa, wire, 1, "/sse", false);
+            sleepMs(3 * idle_limit_ms);
+            try idleSendRst(wire, 1);
+            try idleExpectGoaway(wire, nowNs(), idle_limit_ms, label);
+            try idleExpectClose(wire, 1, true, null);
+        },
+        .handler_outlives_reset => {
+            try idleSendRequest(gpa, wire, 1, "/stubborn", true);
+            try idleReadFirstData(wire, 1);
+            try idleSendRst(wire, 1);
+            // From the reset, not from the handler's end.
+            try idleExpectGoaway(wire, nowNs(), idle_limit_ms, label);
+            try idleExpectClose(wire, 1, true, null);
+        },
+        .requests => {
+            // The gap leaves a loaded machine room; the run is longer than the limit.
+            var sid: u31 = 1;
+            while (true) {
+                try idleSendRequest(gpa, wire, sid, "/hello", true);
+                try idleReadResponse(wire, sid, null);
+                if (nowNs() >= t0 + 2 * idle_limit_ms * std.time.ns_per_ms) break;
+                sleepMs(50);
+                sid += 2;
+            }
+            try idleExpectGoaway(wire, nowNs(), idle_limit_ms, label);
+            try idleExpectClose(wire, sid, true, null);
+        },
+        .crosses_goaway => {
+            try idleExpectGoaway(wire, t0, idle_limit_ms, label);
+            try idleSendRequest(gpa, wire, 1, "/hello", true);
+            var goaway: ?Seen = null;
+            try idleReadResponse(wire, 1, &goaway);
+            try idleExpectClose(wire, 1, true, goaway);
+        },
+        .unfinished_headers => {
+            var req1: std.ArrayList(u8) = .empty;
+            defer req1.deinit(gpa);
+            try h2c.appendHeaders(gpa, &req1, 1, "/hello", true);
+            const block = req1.items[frame.FRAME_HEADER_LEN..];
+            const half = block.len / 2;
+            var hdr: [frame.FRAME_HEADER_LEN]u8 = undefined;
+            (frame.FrameHeader{ .length = @intCast(half), .type = .headers, .flags = .{ .end_stream = true }, .stream_id = 1 }).encode(&hdr);
+            try wire.send(&hdr);
+            try wire.send(block[0..half]);
+            // Under the default 5 s `field_block_timeout_ns`.
+            sleepMs(3 * idle_limit_ms);
+            (frame.FrameHeader{ .length = @intCast(block.len - half), .type = .continuation, .flags = .{ .end_headers = true }, .stream_id = 1 }).encode(&hdr);
+            try wire.send(&hdr);
+            try wire.send(block[half..]);
+            try idleReadResponse(wire, 1, null);
+            try idleExpectGoaway(wire, nowNs(), idle_limit_ms, label);
+            try idleExpectClose(wire, 1, true, null);
+        },
+        .cut_after_goaway => {
+            try idleExpectGoaway(wire, t0, idle_limit_ms, label);
+            try idleSendRequest(gpa, wire, 1, "/record", true);
+            try idleExpectClose(wire, 1, true, null);
+        },
+        .stream_ends_with_no_wake => {
+            // Let the first writes finish, then hold the writer.
+            sleepMs(100);
+            wire_pump.test_hold_writes.store(true, .release);
+            sleepMs(50);
+            try idleSendRequest(gpa, wire, 1, "/send", true);
+            while (!run.release.load(.acquire)) sleepMs(5);
+        },
+        .off => {
+            sleepMs(3 * idle_limit_ms);
+            try idleSendPing(wire, false, "idleping");
+            const deadline = nowNs() + client_deadline_ns;
+            while (true) {
+                const s = try wire.next(deadline) orelse return error.ClosedWithLimitOff;
+                if (s.ftype == ftype_goaway) return error.GoawayWithLimitOff;
+                if (s.ftype == ftype_ping and s.flags & 0x1 != 0) return;
+            }
+        },
+    }
+}
+
+fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case: IdleCase, label: []const u8) !void {
+    const io = rt.io();
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/hello", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
+        .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangSse } } },
+        .{ .method = .GET, .path = "/stubborn", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = stubborn } } },
+        .{ .method = .GET, .path = "/record", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = recordCause } } },
+        .{ .method = .GET, .path = "/send", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sendThenRecordCause } } },
+    };
+    var limits = starh2.Limits.defaults;
+    limits.connection_idle_timeout_ns = if (case == .off) 0 else idle_limit_ms * std.time.ns_per_ms;
+    limits.graceful_drain_timeout_ns = 300 * std.time.ns_per_ms;
+    defer wire_pump.test_hold_writes.store(false, .release);
+    idle_cause_seen.store(false, .release);
+    idle_cause_was_closed.store(false, .release);
+
+    var cert_pem: []u8 = &.{};
+    var key_pem: []u8 = &.{};
+    defer {
+        gpa.free(cert_pem);
+        gpa.free(key_pem);
+    }
+    var endpoint: starh2.EndpointConfig = undefined;
+    var tls_cfg: ?starh2.TlsConfig = null;
+    switch (transport) {
+        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .tls => {
+            cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+            key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
+        },
+    }
+    var server = try starh2.Server.init(gpa, io, .{
+        .endpoints = &.{endpoint},
+        .routes = &routes,
+        .tls = tls_cfg,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    var run: IdleRun = .{};
+    const t = try std.Thread.spawn(.{}, idleMain, .{ server.localAddress(0).getPort(), gpa, transport, case, label, &run });
+    defer run.release.store(true, .release);
+    var no_wake_gone_ms: u64 = 0;
+    if (case == .stream_ends_with_no_wake) {
+        // Nothing reaches the client, so the connection count is the only answer:
+        // the handler, two limits (`nextDeadlineNs`), the unanswered PING, the
+        // drain, the close deadline.
+        const t_start = nowNs();
+        while (server.active_connections.load(.acquire) == 0) {
+            if (nowNs() >= t_start + client_deadline_ns) {
+                run.release.store(true, .release);
+                t.join();
+                return error.ClientNeverConnected;
+            }
+            zio.sleep(.fromMilliseconds(1)) catch {};
+        }
+        const stop = t_start + (slow_handler_ms + 2 * idle_limit_ms + 1000 + 300 + 500 + 1000) * std.time.ns_per_ms;
+        while (server.active_connections.load(.acquire) != 0) {
+            if (nowNs() >= stop) {
+                wire_pump.test_hold_writes.store(false, .release);
+                run.release.store(true, .release);
+                t.join();
+                return error.HeldPastIdleTimeout;
+            }
+            zio.sleep(.fromMilliseconds(5)) catch {};
+        }
+        no_wake_gone_ms = (nowNs() - t_start) / std.time.ns_per_ms;
+        std.debug.print("{s}: connection gone {d} ms after it opened\n", .{ label, no_wake_gone_ms });
+        wire_pump.test_hold_writes.store(false, .release);
+        run.release.store(true, .release);
+    }
+    // Wait inside zio so this executor keeps serving the connection.
+    while (!run.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
+    t.join();
+    if (run.err) |err| return err;
+    // The client saw the close; the server's slot goes back just after it.
+    const stop = nowNs() + 2 * std.time.ns_per_s;
+    while (server.active_connections.load(.acquire) != 0) {
+        if (nowNs() >= stop) return error.ConnectionStillCounted;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    if (case == .stream_ends_with_no_wake) {
+        // Through the whole graceful path, not cut: the client's wait, the handler,
+        // one limit, the PING, the drain, and the close deadline (the writer is
+        // held, so the close never counts as flushed).
+        try std.testing.expect(no_wake_gone_ms + 100 >= 150 + slow_handler_ms + idle_limit_ms + 1000 + 300 + 500);
+    }
+    if (case == .cut_after_goaway or case == .stream_ends_with_no_wake) {
+        // The handler stops on its own poll, just after the close.
+        const seen_stop = nowNs() + 2 * std.time.ns_per_s;
+        while (!idle_cause_seen.load(.acquire)) {
+            if (nowNs() >= seen_stop) return error.HandlerNeverSawCause;
+            zio.sleep(.fromMilliseconds(5)) catch {};
+        }
+        // The connection is closing; the server is not shutting down.
+        try std.testing.expect(idle_cause_was_closed.load(.acquire));
+    }
+}
+
+fn runIdleCase(transport: Transport, case: IdleCase, label: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runIdle, .{ rt, gpa, transport, case, label });
+    try h.join();
+}
+
+test "idle: h2c a connection that asks for nothing ends with both GOAWAYs (t-3705)" {
+    try runIdleCase(.h2c, .silent, "h2c idle silent");
+}
+test "idle: tls a connection that asks for nothing ends with both GOAWAYs (t-3705)" {
+    try runIdleCase(.tls, .silent, "tls idle silent");
+}
+test "idle: h2c PINGs do not hold a connection open (t-3705)" {
+    try runIdleCase(.h2c, .pings, "h2c idle pings");
+}
+test "idle: tls PINGs do not hold a connection open (t-3705)" {
+    try runIdleCase(.tls, .pings, "tls idle pings");
+}
+test "idle: h2c a long stream is not idle, and the time starts when it ends (t-3705)" {
+    try runIdleCase(.h2c, .open_stream, "h2c idle open stream");
+}
+test "idle: tls a long stream is not idle, and the time starts when it ends (t-3705)" {
+    try runIdleCase(.tls, .open_stream, "tls idle open stream");
+}
+test "idle: h2c a stream the peer has not ended is not idle (t-3705)" {
+    try runIdleCase(.h2c, .unfinished_request, "h2c idle unfinished request");
+}
+test "idle: tls a stream the peer has not ended is not idle (t-3705)" {
+    try runIdleCase(.tls, .unfinished_request, "tls idle unfinished request");
+}
+test "idle: h2c a handler still running after its reset does not hold the connection (t-3705)" {
+    try runIdleCase(.h2c, .handler_outlives_reset, "h2c idle handler outlives reset");
+}
+test "idle: tls a handler still running after its reset does not hold the connection (t-3705)" {
+    try runIdleCase(.tls, .handler_outlives_reset, "tls idle handler outlives reset");
+}
+test "idle: h2c short requests each restart the time (t-3705)" {
+    try runIdleCase(.h2c, .requests, "h2c idle requests");
+}
+test "idle: tls short requests each restart the time (t-3705)" {
+    try runIdleCase(.tls, .requests, "tls idle requests");
+}
+test "idle: h2c a request that crosses the first GOAWAY is served (t-3705)" {
+    try runIdleCase(.h2c, .crosses_goaway, "h2c idle crosses goaway");
+}
+test "idle: tls a request that crosses the first GOAWAY is served (t-3705)" {
+    try runIdleCase(.tls, .crosses_goaway, "tls idle crosses goaway");
+}
+test "idle: h2c a limit of 0 turns it off (t-3705)" {
+    try runIdleCase(.h2c, .off, "h2c idle off");
+}
+test "idle: tls a limit of 0 turns it off (t-3705)" {
+    try runIdleCase(.tls, .off, "tls idle off");
+}
+test "idle: h2c a header block that takes longer than the limit is not idle (t-3705)" {
+    try runIdleCase(.h2c, .unfinished_headers, "h2c idle unfinished headers");
+}
+test "idle: tls a header block that takes longer than the limit is not idle (t-3705)" {
+    try runIdleCase(.tls, .unfinished_headers, "tls idle unfinished headers");
+}
+test "idle: h2c a handler cut after the first GOAWAY does not hear the server is shutting down (t-3705)" {
+    try runIdleCase(.h2c, .cut_after_goaway, "h2c idle cut after goaway");
+}
+test "idle: tls a handler cut after the first GOAWAY does not hear the server is shutting down (t-3705)" {
+    try runIdleCase(.tls, .cut_after_goaway, "tls idle cut after goaway");
+}
+test "idle: h2c a last stream that ends with nothing to wake the actor still ends the connection (t-3705)" {
+    try runIdleCase(.h2c, .stream_ends_with_no_wake, "h2c idle no wake");
+}
+test "idle: h2c a peer that never reads and stays silent loses its connection after the kill (t-3705)" {
+    try runStalledCase(.h2c, .peer_never_reads, .idle_after_kill, "h2c idle after kill");
+}
+test "idle: tls a peer that never reads and stays silent loses its connection after the kill (t-3705)" {
+    try runStalledCase(.tls, .peer_never_reads, .idle_after_kill, "tls idle after kill");
 }

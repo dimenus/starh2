@@ -308,6 +308,20 @@ pub const Limits = struct {
     request_body_idle_timeout_ns: u64 = 15 * std.time.ns_per_s,
     slow_consumer_timeout_ns: u64 = 30 * std.time.ns_per_s,
     graceful_drain_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// How long an HTTP/2 connection may have nothing to do before the server
+    /// ends it, with the same two GOAWAYs as a graceful shutdown. It has nothing
+    /// to do when no stream is open and no header block is arriving, so a
+    /// long-lived stream is never idle. A handler does not count: one still
+    /// running after its stream ended (it can be waiting for a write that a peer
+    /// who stopped reading never lets finish) gets until the graceful drain ends.
+    /// A new stream restarts the time. The close can come up to twice this late
+    /// when the last stream ended with nothing left to wake the connection.
+    /// Frames that open no stream (PING, SETTINGS, WINDOW_UPDATE) do not restart
+    /// it: if they did, one PING per timeout would hold a connection slot for
+    /// free. 0 turns it off, and then a peer that stays silent holds its slot
+    /// until it leaves. HTTP/1.1 does not use this: `field_block_timeout_ns`
+    /// already bounds its wait for a request.
+    connection_idle_timeout_ns: u64 = 75 * std.time.ns_per_s,
     /// How long a connection that has decided to close (a connection error, or
     /// the end of a graceful drain) waits for its last queued frames, the
     /// GOAWAY above all, to reach the socket (RFC 9113 section 5.4.1). A frame
