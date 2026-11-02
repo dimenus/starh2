@@ -306,10 +306,78 @@ pub const write_trace = struct {
     }
 };
 
+/// A socket writer like `std.Io.net.Stream.Writer` that also counts the
+/// bytes the socket accepted, in `accepted`, at every partial write. That
+/// count is the progress signal of the write-byte timeout
+/// (`Limits.write_byte_timeout_ns`): progress is a byte the socket took, not
+/// a whole batch written, so a slow reader that takes bytes is seen moving
+/// while a batch is still half written.
+///
+/// With `timeout_ns` set, each call into the socket waits at most that long
+/// for one byte to be accepted, and fails with `error.WriteFailed` (and
+/// `timed_out` set) when none is: the socket took nothing for the timeout,
+/// which is Go's `WriteByteTimeout` rule. HTTP/1.1 uses that form (no actor
+/// watches its writes); the h2c WritePump leaves it 0 and the actor's clock
+/// reads `accepted` instead.
+var unused_accepted: std.atomic.Value(u64) = .init(0);
+var unused_accepted_ns: std.atomic.Value(u64) = .init(0);
+
+pub const SocketWriter = struct {
+    interface: std.Io.Writer,
+    io: std.Io,
+    handle: NetHandle,
+    std_handle: std.Io.net.Socket.Handle,
+    accepted: *std.atomic.Value(u64),
+    /// When the socket last accepted bytes (the awake clock), stored before
+    /// `accepted` grows: a reader that sees the new count sees this time or a
+    /// later one. The write-byte clock dates progress by it, not by when it
+    /// looked.
+    accepted_ns: *std.atomic.Value(u64),
+    /// Read at each call, so a caller may change it between writes.
+    timeout_ns: u64,
+    timed_out: bool = false,
+
+    const NetHandle = @FieldType(zio.net.Socket, "handle");
+
+    pub fn init(io: std.Io, handle: std.Io.net.Socket.Handle, buffer: []u8, accepted: *std.atomic.Value(u64), accepted_ns: *std.atomic.Value(u64), timeout_ns: u64) SocketWriter {
+        return .{
+            .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer },
+            .io = io,
+            .accepted_ns = accepted_ns,
+            .handle = if (@typeInfo(NetHandle) == .pointer) @ptrCast(handle) else handle,
+            .std_handle = handle,
+            .accepted = accepted,
+            .timeout_ns = timeout_ns,
+        };
+    }
+
+    /// `std.Io.net.Stream.Writer.drain`, through zio's `writeSplatHeader`
+    /// (same header and splat contract) so a write can carry a timeout.
+    fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const w: *SocketWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        // An absolute deadline from a fresh clock: a `.duration` is armed
+        // from the loop's scan-cached clock and fires early after a long run
+        // on this executor (zio t-3653).
+        const timeout: zio.Timeout = if (w.timeout_ns == 0) .none else .{ .deadline = .fromNanoseconds(nowNs(w.io) +| w.timeout_ns) };
+        const n = zio.net.writeSplatHeader(w.handle, io_w.buffered(), data, splat, timeout) catch |err| {
+            if (err == error.Timeout) w.timed_out = true;
+            return error.WriteFailed;
+        };
+        w.accepted_ns.store(nowNs(w.io), .release);
+        _ = w.accepted.fetchAdd(n, .release);
+        return io_w.consume(n);
+    }
+};
+
 pub const WritePump = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     from_actor: *std.Io.Queue(WireChunk),
+    /// Bytes the socket accepted, at every partial write (`SocketWriter`):
+    /// the connection's write-byte clock reads it. Tests that drive a pump
+    /// alone may leave the default.
+    accepted: *std.atomic.Value(u64) = &unused_accepted,
+    accepted_ns: *std.atomic.Value(u64) = &unused_accepted_ns,
     /// A zio channel: the actor selects on it, so a post IS the wake. `post`
     /// never parks, so its room is kept by the producers: on h2c a drain
     /// holds a pop back until the channel can take every completion that pop
@@ -406,7 +474,7 @@ pub const WritePump = struct {
     /// drain the buffer, then complete. Without it, it is the shutdown sentinel.
     pub fn run(self: *WritePump) void {
         var write_buf: [limits_mod.WIRE_CHUNK_SIZE]u8 = undefined;
-        var writer = self.stream.writer(self.io, &write_buf);
+        var writer: SocketWriter = .init(self.io, self.stream.socket.handle, &write_buf, self.accepted, self.accepted_ns, 0);
         var carried: ?WireChunk = null;
         while (!self.stopped.load(.acquire)) {
             const first = if (carried) |chunk| blk: {

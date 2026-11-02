@@ -270,9 +270,13 @@ fn taskErrAfter(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response)
 }
 
 fn sseAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    var body = try resp.startSse(&.{});
-    try body.writeAll("data: x\n\n");
-    try body.flush();
+    // The client closes once it has the head, so the abort can reach the
+    // handler at its write as well as at the wait: the connection may see the
+    // close before the handler writes. A write that fails because the
+    // connection closed is the handler learning of the abort too.
+    var body = resp.startSse(&.{}) catch |err| return sseAbortWriteFailed(resp, err);
+    body.writeAll("data: x\n\n") catch |err| return sseAbortWriteFailed(resp, err);
+    body.flush() catch |err| return sseAbortWriteFailed(resp, err);
     const now = std.Io.Clock.awake.now(resp.io);
     const deadline = std.Io.Timestamp.fromNanoseconds(now.nanoseconds + 30 * std.time.ns_per_s);
     body.waitUntil(deadline) catch {
@@ -280,6 +284,13 @@ fn sseAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) any
         return;
     };
     if (body.terminalCause() != null) abort_seen.store(true, .release);
+}
+
+fn sseAbortWriteFailed(resp: *starh2.Response, err: anyerror) anyerror {
+    if (resp.slotTerminal()) |cause| {
+        if (cause == .connection_closed) abort_seen.store(true, .release);
+    }
+    return err;
 }
 
 fn uploadAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {

@@ -971,6 +971,13 @@ pub const Pump = struct {
     send_head: usize = 0,
     send_fill: usize = 0,
     send_armed: bool = false,
+    /// Ciphertext bytes the socket has taken over the connection's life: the
+    /// connection's response-rate clock reads it (`Connection.wireTakenTotal`).
+    /// Atomic because a handler that pushes a chunk reads it too.
+    sent_bytes: std.atomic.Value(u64) = .init(0),
+    /// When the socket last took ciphertext (the awake clock), stored before
+    /// `sent_bytes` grows (`wire_pump.SocketWriter.accepted_ns`).
+    sent_ns: std.atomic.Value(u64) = .init(0),
     /// A write batch that could not finish because the staging buffer is full
     /// behind an in-flight send. `partial_off` is the plaintext offset already
     /// encrypted for `pending_writes[0]` (the chunk bytes do not move). Nothing new is
@@ -1126,6 +1133,8 @@ pub const Pump = struct {
         };
         pump_trace.bump(&pump_trace.send_complete);
         self.send_head += n;
+        self.sent_ns.store(nowNs(self.io), .release);
+        _ = self.sent_bytes.fetchAdd(n, .release);
         std.debug.assert(self.send_head <= self.send_fill);
         if (self.send_head == self.send_fill) {
             self.send_head = 0;

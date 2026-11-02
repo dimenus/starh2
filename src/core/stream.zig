@@ -37,6 +37,14 @@ pub const Stream = struct {
     /// Receive credit granted in `window` and not yet sent to the peer
     /// (`Session.Owed`).
     window_owed: u31 = 0,
+    /// Credit added to `window.recv` whose WINDOW_UPDATE is queued and not
+    /// yet known to be on the wire (`Session.creditOnWire`). Only the body
+    /// clock reads it: the peer may already have it, so flow control does not.
+    window_unsent: u31 = 0,
+    /// When `window_unsent` last went from 0 to more (`edge_now_ns`); 0 while
+    /// it is 0. The queued-credit cap times this entry by it alone
+    /// (`Session.unsentDeadlineNs`).
+    window_unsent_since_ns: u64 = 0,
     end_stream_remote: bool = false,
     end_stream_local: bool = false,
     headers_done: bool = false,

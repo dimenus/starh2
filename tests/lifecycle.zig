@@ -2156,7 +2156,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
     limits.cancellation_reaper_tasks = 2;
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.outbound_bytes_per_connection = 512 * 1024;
-    limits.slow_consumer_timeout_ns = 30 * std.time.ns_per_s;
+    limits.response_min_rate_grace_ns = 30 * std.time.ns_per_s;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 

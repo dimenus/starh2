@@ -84,6 +84,9 @@ pub var test_admission_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test
 pub const InitError = error{
     OutOfMemory,
     InvalidConfig,
+    /// The process cannot have the descriptors `max_connections` needs
+    /// (`checkFileLimit`).
+    FileLimitTooLow,
     InvalidRoute,
     InvalidCertificate,
     CertificateTooLarge,
@@ -158,6 +161,9 @@ pub const Server = struct {
     /// `conn_slot.zig`.
     slots: conn_slot.SlotPool,
     listeners_bound: usize = 0,
+    /// Accept calls that failed with something other than a cancel or a
+    /// connection the peer aborted, over every endpoint (`acceptLoop`).
+    accept_errors: std.atomic.Value(u64) = .init(0),
     bind_state: std.atomic.Value(BindState) = .init(.pending),
     bind_event: std.Io.Event = .unset,
 
@@ -171,6 +177,7 @@ pub const Server = struct {
     /// outlives its caller's configuration, and a route path that a handler
     /// matches against must not be able to disappear.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, config: ServerConfig) InitError!Server {
+        try checkFileLimit(config.limits.max_connections);
         _ = try config.limits.resourceUpperBound();
         if (config.endpoints.len == 0 or config.endpoints.len > config.limits.max_endpoints) return error.InvalidConfig;
         if (config.routes.len > config.limits.max_routes) return error.InvalidConfig;
@@ -604,6 +611,9 @@ pub const Server = struct {
     ///
     /// `ConnectionAborted` continues the loop. A peer that disappears between
     /// the SYN and the accept is normal and must not stop the endpoint.
+    ///
+    /// No other error ends the loop either (`AcceptBackoff`): only a cancel
+    /// does, which is how `serve` stops it.
     fn acceptLoop(
         self: *Server,
         endpoint_index: usize,
@@ -611,6 +621,7 @@ pub const Server = struct {
         connection_group: *std.Io.Group,
     ) std.Io.Cancelable!void {
         const listener = &self.listeners[endpoint_index];
+        var backoff: AcceptBackoff = .{};
         while (!self.shutdown_flag.load(.acquire)) {
             try self.awaitAdmission(mode, admissionRoom);
             connection.probeNote(.accept);
@@ -618,10 +629,12 @@ pub const Server = struct {
                 error.Canceled => return error.Canceled,
                 error.ConnectionAborted => continue,
                 else => {
-                    // Listener failure is endpoint-local; serve teardown owns the socket.
-                    return;
+                    _ = self.accept_errors.fetchAdd(1, .monotonic);
+                    try backoff.fail(endpoint_index, err);
+                    continue;
                 },
             };
+            backoff.ok();
             // HTTP/2 writes small frames. Linux leaves Nagle on, so a frame can
             // sit until the peer's delayed ACK (~40 ms). That was nachos h2c at
             // 21k req/s with p99 glued to 42.01 ms while TLS (larger records)
@@ -775,6 +788,113 @@ pub const Server = struct {
         self.* = undefined;
     }
 };
+
+/// What an accept loop does when `accept` fails: wait and try again, never
+/// give up.
+///
+/// Every error is retried, after 10 ms the first time and twice as long each
+/// time after, up to 1 s; a successful accept resets it. The errors fall in
+/// three groups, and none is fatal to the listener:
+///
+/// - Out of a resource: EMFILE (`ProcessFdQuotaExceeded`), ENFILE
+///   (`SystemFdQuotaExceeded`), ENOBUFS and ENOMEM (`SystemResources`; zio's
+///   io_uring backend reports EMFILE this way too). They clear when a
+///   connection ends or memory is freed, which is what the wait is for: an
+///   immediate retry would fail again at once and spin.
+/// - About the one connection being taken: EPROTO (`ProtocolFailure`), EPERM
+///   (`BlockedByFirewall`), ENETDOWN and the like (Linux's accept(2) says to
+///   retry these as EAGAIN). The next connection is fine; the wait costs at
+///   most 10 ms when they are isolated.
+/// - About the listener itself: EINVAL (`SocketNotListening`) and whatever
+///   zio maps to `Unexpected` (ENOTSOCK, EOPNOTSUPP, EBADF). On this server
+///   they mean the listener was closed, which happens only after `serve`
+///   cancelled this loop, so the cancel ends it first. Exiting instead would
+///   leave the endpoint dead with nothing that could restart it; retrying at
+///   1 s costs one system call a second and keeps the log line coming.
+///
+/// It logs the first failure at once and then at most once a minute, with
+/// the count since the last line, so a flood of EMFILE is visible without
+/// becoming a flood of log lines. `Server.accept_errors` counts every one.
+const AcceptBackoff = struct {
+    delay_ms: u64 = 0,
+    failures_since_log: u64 = 0,
+    last_log_ns: ?u64 = null,
+
+    const first_ms = 10;
+    const max_ms = 1000;
+    const log_interval_ns = 60 * std.time.ns_per_s;
+
+    fn fail(self: *AcceptBackoff, endpoint_index: usize, err: anyerror) std.Io.Cancelable!void {
+        self.delay_ms = if (self.delay_ms == 0) first_ms else @min(self.delay_ms * 2, max_ms);
+        self.failures_since_log += 1;
+        const now = zio.Timestamp.now(.monotonic).toNanoseconds();
+        if (self.last_log_ns == null or now -% self.last_log_ns.? >= log_interval_ns) {
+            log.warn("accept on endpoint {d} failed: {s} ({d} failures since the last report); retrying in {d} ms", .{
+                endpoint_index, @errorName(err), self.failures_since_log, self.delay_ms,
+            });
+            self.last_log_ns = now;
+            self.failures_since_log = 0;
+        }
+        zio.sleep(.fromMilliseconds(self.delay_ms)) catch return error.Canceled;
+    }
+
+    fn ok(self: *AcceptBackoff) void {
+        self.delay_ms = 0;
+    }
+};
+
+const log = std.log.scoped(.starh2);
+
+/// Descriptors the process needs beside one per connection: stdin, stdout
+/// and stderr; one listener per endpoint (`Limits.max_endpoints` is 8 by
+/// default); one socket per endpoint that an accept loop holds before
+/// admission is taken; the runtime's own (a kqueue or epoll or io_uring
+/// descriptor and a wakeup descriptor per executor); and room for a TLS
+/// certificate read and a few that an embedder or a handler opens. 64 covers
+/// those with the default endpoints and up to about 16 executors. What
+/// handlers open beyond that is the application's to budget: a server whose
+/// handlers open files needs a larger limit than this check asks for.
+pub const reserved_fds: usize = 64;
+
+/// Read RLIMIT_NOFILE, raise the soft limit as far as the process may (the
+/// hard limit; on macOS no further than `kern.maxfilesperproc`, since
+/// setrlimit above it fails, and the hard limit can read RLIM_INFINITY), and
+/// refuse to start when even that is below `max_connections` plus
+/// `reserved_fds`.
+///
+/// Without it a soft limit of 1,024, the usual default on Linux, below a
+/// `max_connections` of 1,024, lets the clients use up the descriptors: every
+/// accept then fails with EMFILE. The accept loop survives that
+/// (`AcceptBackoff`), but the server cannot serve what it was configured
+/// for, and that is an error to report at boot, where an operator sees it,
+/// not under load.
+fn checkFileLimit(max_connections: usize) InitError!void {
+    if (builtin.os.tag == .windows) return;
+    const need = std.math.add(usize, max_connections, reserved_fds) catch return error.FileLimitTooLow;
+    var lim = std.posix.getrlimit(.NOFILE) catch return error.FileLimitTooLow;
+    var ceiling: u64 = lim.max;
+    if (builtin.os.tag.isDarwin()) {
+        var per_proc: c_int = 0;
+        var len: usize = @sizeOf(c_int);
+        if (std.c.sysctlbyname("kern.maxfilesperproc", &per_proc, &len, null, 0) == 0 and per_proc > 0) {
+            ceiling = @min(ceiling, @as(u64, @intCast(per_proc)));
+        }
+    }
+    if (lim.cur < ceiling) {
+        lim.cur = @intCast(ceiling);
+        // A refusal leaves the soft limit where it was, which the check
+        // below then judges.
+        std.posix.setrlimit(.NOFILE, lim) catch {};
+        lim = std.posix.getrlimit(.NOFILE) catch return error.FileLimitTooLow;
+    }
+    // macOS lets the soft limit stand above `kern.maxfilesperproc` (a shell
+    // can show 1,048,576), but no descriptor past that is ever given out.
+    const usable = @min(lim.cur, ceiling);
+    if (usable < need) {
+        log.warn("RLIMIT_NOFILE allows {d} descriptors at most (soft {d}, ceiling {d}), below max_connections ({d}) plus {d} reserved: lower max_connections or raise the hard limit", .{ usable, lim.cur, ceiling, max_connections, reserved_fds });
+        return error.FileLimitTooLow;
+    }
+}
 
 /// Bind and listen one endpoint with an explicit accept-queue length.
 ///

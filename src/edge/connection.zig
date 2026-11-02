@@ -153,6 +153,17 @@ pub const conn_placement: zio.Placement = if (zio_scheduling == .work_stealing) 
 /// both arms of the placement A/B. Set it before the server starts.
 pub var placement_override: ?zio.Placement = null;
 
+/// Streams reset by the response minimum rate
+/// (`Limits.response_min_rate_bytes_per_s`), and connections closed by the
+/// write-byte timeout (`Limits.write_byte_timeout_ns`), in every connection
+/// of the process. A test reads them to show which rule fired.
+pub var response_rate_resets: std.atomic.Value(u64) = .init(0);
+pub var response_wire_expiries: std.atomic.Value(u64) = .init(0);
+/// Of `response_rate_resets`, the ones the rate rule decided (the client took
+/// bytes, but too few), as opposed to a wait of a whole grace with nothing
+/// taken. A test reads it to show the rate fired.
+pub var response_rate_rule_resets: std.atomic.Value(u64) = .init(0);
+
 pub fn connPlacement() zio.Placement {
     return placement_override orelse conn_placement;
 }
@@ -2051,6 +2062,27 @@ pub const Connection = struct {
     /// h2c only: completions owed room in `write_ack_ch` (see `AckLedger`).
     /// Producers add under `session_mu`; the actor subtracts on receive.
     acks: wire_pump.AckLedger = .{},
+    /// The write-byte clock (`Limits.write_byte_timeout_ns`, `noteWireWrite`):
+    /// when bytes last began to wait for the socket (0: none wait), and when
+    /// the socket last took one of them (seen by the actor's check,
+    /// `observeWireProgress`), with the count it had taken then. Set under
+    /// `session_mu` by whoever pushes a chunk; cleared by the actor once the
+    /// writer has nothing left (`noteWireDrained`).
+    wire_run_start_ns: std.atomic.Value(u64) = .init(0),
+    wire_progress_ns: std.atomic.Value(u64) = .init(0),
+    wire_seen_taken: std.atomic.Value(u64) = .init(0),
+    /// h2c: bytes the socket accepted, at every partial write, counted by the
+    /// WritePump's `SocketWriter`. TLS counts its ciphertext in the pump
+    /// (`Pump.sent_bytes`).
+    wire_socket_bytes: std.atomic.Value(u64) = .init(0),
+    /// h2c: when the socket last accepted bytes (`SocketWriter.accepted_ns`).
+    wire_socket_ns: std.atomic.Value(u64) = .init(0),
+    /// The run's timeout, read from `Limits` when the run starts: a later
+    /// change to the limit applies from the next run.
+    wire_timeout_ns: std.atomic.Value(u64) = .init(0),
+    /// Pushes so far (`noteWireWrite`): how the actor's `noteWireDrained`
+    /// tells that a push raced its clear.
+    wire_pushes: std.atomic.Value(u64) = .init(0),
     /// Set when the writer starts (the h2c WritePump, or the TLS driver): from
     /// then on a handler's bare flush barrier waits for room in `waitForAckRoom`.
     /// On h2c it also makes `h2cPause` hold a pop back when `write_ack_ch` has no
@@ -3500,53 +3532,90 @@ pub const Connection = struct {
         };
     }
 
-    /// Reset streams whose peer stopped reading.
+    /// The response clocks: what the client holds back.
     ///
-    /// A peer that opens a stream and then never grants window costs the server
-    /// a full per-stream slab for as long as it likes. Flow control cannot help
-    /// here, because withholding credit is legal behaviour. So progress is
-    /// measured instead: `last_progress_ns` advances whenever bytes enter or
-    /// leave the pending slab, and a stream with pending bytes and no progress
-    /// inside `slow_consumer_timeout_ns` loses its stream.
+    /// A peer that opens a stream and then never grants window, or grants it
+    /// a byte at a time, costs the server a per-stream slab and a handler for
+    /// as long as it likes; one that stops reading the socket costs the whole
+    /// connection. Flow control cannot help, because withholding credit is
+    /// legal. So:
+    ///
+    /// - The write-byte timeout (`Limits.write_byte_timeout_ns`, Go's
+    ///   `WriteByteTimeout`): bytes wait for the socket and it takes none of
+    ///   them for the timeout. The connection fails, since nothing on it can
+    ///   move, and every handler on it sees `error.SlowConsumer`.
+    /// - The response minimum rate (`Limits.response_min_rate_bytes_per_s`,
+    ///   `fair_scheduler.Stall`), for a client that reads its socket but
+    ///   starves streams through flow control: a stream's bytes waiting on
+    ///   its own window reset that stream; DATA waiting on the connection
+    ///   window resets every stream with DATA pending.
     ///
     /// The wake order matters. The flush waiter is woken with `ok = false`
     /// AFTER the terminal cause is set, so `TicketTable.wait` finds the cause
     /// and returns the exact `error.SlowConsumer` rather than a generic
     /// `WriteFailed`. The handler then learns why it was stopped.
-    ///
-    /// This is a deliberate kill and not a regression. A test host under load
-    /// can starve a healthy client, which is why the timeout is a limit and not
-    /// a short deadline.
-    fn checkSlowConsumers(self: *Connection) !void {
-        const limit_ns = self.config.limits.slow_consumer_timeout_ns;
-        if (limit_ns == 0) return;
+    fn checkResponseRates(self: *Connection) !void {
         const now = nowNs(self.config.io);
+        self.observeWireProgress(now);
+        if (self.wireDeadlineNs()) |deadline| {
+            if (now >= deadline) {
+                _ = response_wire_expiries.fetchAdd(1, .monotonic);
+                for (self.handlers.slice()) |*slot| {
+                    if (slot.in_use) slot.setCause(.slow_consumer);
+                }
+                self.noteServerClose("write_byte_timeout", null);
+                self.writer_failed.store(true, .release);
+                return;
+            }
+        }
+        // Everything the writer was given is on the wire: the window credit
+        // in it too (`Session.creditOnWire`). Or the credit has waited a whole
+        // body idle period behind a writer that never drains: counted as the
+        // peer's anyway (`Session.unsentDeadlineNs`).
+        const cap_ns = self.config.limits.request_body_idle_timeout_ns;
+        if (self.wireDrained()) {
+            self.session.creditOnWire();
+        } else if (self.session.unsentDeadlineNs(cap_ns)) |deadline| {
+            if (now >= deadline) self.session.creditOnWireBefore(now, cap_ns);
+        }
+        const grace_ns = self.config.limits.response_min_rate_grace_ns;
+        if (grace_ns == 0) return;
+        const rate = self.config.limits.response_min_rate_bytes_per_s;
         var n_stale: usize = 0;
         const StaleCtx = struct {
             c: *Connection,
             now: u64,
-            limit_ns: u64,
+            grace_ns: u64,
+            rate: u32,
+            all: bool,
             n: *usize,
-            fn cb(ctx: *anyopaque, sid: u31, pw: *fair_scheduler.DataPending) void {
+            fn pending(ctx: *anyopaque, sid: u31, pw: *fair_scheduler.DataPending) void {
                 const sc: *@This() = @ptrCast(@alignCast(ctx));
-                if (pw.len == 0) return;
-                if (pw.last_progress_ns == 0) {
-                    pw.last_progress_ns = sc.now;
-                    return;
-                }
-                if (sc.now -% pw.last_progress_ns >= sc.limit_ns) {
-                    if (sc.n.* < sc.c.sid_scratch.len) {
-                        sc.c.sid_scratch[sc.n.*] = sid;
-                        sc.n.* += 1;
-                    }
+                // A bare END_STREAM waits on no window (`emitOneData`,
+                // `firstBareEnd`) and has no clock of its own. One still
+                // pending when the connection clock expires (the drain held
+                // by the transport) is reset with the rest.
+                if (pw.len == 0 and !sc.all) return;
+                if (!sc.all and !pw.stall.expired(sc.now, sc.grace_ns, sc.rate)) return;
+                if (!sc.all and pw.stall.rateExpired(sc.now, sc.grace_ns, sc.rate)) _ = response_rate_rule_resets.fetchAdd(1, .monotonic);
+                if (sc.n.* < sc.c.sid_scratch.len) {
+                    sc.c.sid_scratch[sc.n.*] = sid;
+                    sc.n.* += 1;
                 }
             }
         };
-        var stale: StaleCtx = .{ .c = self, .now = now, .limit_ns = limit_ns, .n = &n_stale };
-        self.sched.forEachPending(@ptrCast(&stale), StaleCtx.cb);
+        const conn_expired = self.sched.conn_stall.expired(now, grace_ns, rate);
+        if (conn_expired and self.sched.conn_stall.rateExpired(now, grace_ns, rate)) _ = response_rate_rule_resets.fetchAdd(1, .monotonic);
+        // Acted on below; the next wait on the connection window starts anew,
+        // so an expired clock with nothing left to reset cannot fire on
+        // every turn.
+        if (conn_expired) self.sched.conn_stall = .{};
+        var stale: StaleCtx = .{ .c = self, .now = now, .grace_ns = grace_ns, .rate = rate, .all = conn_expired, .n = &n_stale };
+        self.sched.forEachPending(@ptrCast(&stale), StaleCtx.pending);
         var i: usize = 0;
         while (i < n_stale) : (i += 1) {
             const sid = self.sid_scratch[i];
+            _ = response_rate_resets.fetchAdd(1, .monotonic);
             if (self.slotIndex(sid)) |si| {
                 self.handlers.slice()[si].setCause(.slow_consumer);
             }
@@ -3563,6 +3632,104 @@ pub const Connection = struct {
             self.wakeStreamSpace(sid);
             try self.processIntents();
         }
+    }
+
+    /// Bytes were just handed to the writer. If it had nothing before, a run
+    /// of the write-byte clock begins: from now until the writer drains, the
+    /// socket must take a byte at least every `write_byte_timeout_ns`. Caller
+    /// holds `session_mu` (every push does).
+    fn noteWireWrite(self: *Connection, n: usize) void {
+        if (n == 0 or self.config.limits.write_byte_timeout_ns == 0) return;
+        // Counted before the look at the run, so a clear that races this push
+        // sees it (`noteWireDrained`).
+        _ = self.wire_pushes.fetchAdd(1, .acq_rel);
+        if (self.wire_run_start_ns.load(.acquire) != 0) return;
+        self.startWireRun();
+    }
+
+    fn startWireRun(self: *Connection) void {
+        const now = nowNs(self.config.io);
+        self.wire_timeout_ns.store(self.config.limits.write_byte_timeout_ns, .release);
+        self.wire_seen_taken.store(self.wireTakenTotal(), .release);
+        self.wire_progress_ns.store(now, .release);
+        self.wire_run_start_ns.store(now, .release);
+    }
+
+    /// End the writer's run once it has nothing left, so the next push starts a
+    /// fresh one: an SSE stream's events, each written at once, are separate
+    /// runs, and the pause between them is nobody's stall. Actor only, at the
+    /// top of every turn and after the TLS driver ran, which is where the
+    /// writer is seen to drain (an h2c ack, a TLS send completion).
+    ///
+    /// A handler can push meanwhile, outside the actor. The push counts itself
+    /// before it looks at the run, and this looks at the count before and
+    /// after the clear: a push that raced the clear either sees the run gone
+    /// and starts one, or is seen here, and the run is started again now.
+    fn noteWireDrained(self: *Connection) void {
+        const start = self.wire_run_start_ns.load(.acquire);
+        if (start == 0) return;
+        const pushes = self.wire_pushes.load(.acquire);
+        if (!self.wireDrained()) return;
+        if (self.wire_run_start_ns.cmpxchgStrong(start, 0, .acq_rel, .acquire) != null) return;
+        if (self.wire_pushes.load(.acquire) != pushes and self.wire_run_start_ns.load(.acquire) == 0) self.startWireRun();
+    }
+
+    /// The socket took bytes since the last look: that is progress now.
+    /// Actor only, under `session_mu`.
+    fn observeWireProgress(self: *Connection, now: u64) void {
+        if (self.wire_run_start_ns.load(.acquire) == 0) return;
+        const taken = self.wireTakenTotal();
+        if (taken == self.wire_seen_taken.load(.acquire)) return;
+        self.wire_seen_taken.store(taken, .release);
+        // Dated when the socket took the bytes, not when this looked (astra
+        // 4): a look that comes late must not stretch the timeout.
+        const at = self.wireTakenNs();
+        self.wire_progress_ns.store(if (at == 0) now else @min(at, now), .release);
+    }
+
+    /// When the socket last took bytes (`wireTakenTotal`'s clock): stored
+    /// before the count grows, so it is at least as new as the count read
+    /// before it.
+    fn wireTakenNs(self: *Connection) u64 {
+        if (self.config.mode == .tls) {
+            const pump = self.tls_driver orelse return 0;
+            return pump.sent_ns.load(.acquire);
+        }
+        return self.wire_socket_ns.load(.acquire);
+    }
+
+    /// Bytes the socket has accepted over the connection's life, partial
+    /// writes included: h2c, counted by the WritePump's `SocketWriter`; TLS,
+    /// the ciphertext of each send completion.
+    fn wireTakenTotal(self: *Connection) u64 {
+        if (self.config.mode == .tls) {
+            const pump = self.tls_driver orelse return 0;
+            return pump.sent_bytes.load(.acquire);
+        }
+        return self.wire_socket_bytes.load(.acquire);
+    }
+
+    /// When the write-byte clock expires: the last byte the socket took (or
+    /// the start of the wait) plus the timeout. Null while nothing waits or
+    /// the timeout is off. Actor only.
+    fn wireDeadlineNs(self: *Connection) ?u64 {
+        const start = self.wire_run_start_ns.load(.acquire);
+        if (start == 0 or self.wireDrained()) return null;
+        // The limit the run read when it started (`startWireRun`).
+        const timeout = self.wire_timeout_ns.load(.acquire);
+        if (timeout == 0) return null;
+        return @max(start, self.wire_progress_ns.load(.acquire)) +| timeout;
+    }
+
+    /// Nothing is left between the scheduler and the socket: h2c, every
+    /// pushed chunk was written and acked; TLS, the stash, the staged records
+    /// and the send are empty. Actor only.
+    fn wireDrained(self: *Connection) bool {
+        if (self.config.mode == .tls) {
+            const pump = self.tls_driver orelse return true;
+            return pump.writesDrained();
+        }
+        return self.acks.owed.load(.acquire) == 0;
     }
 
     fn drainCompletions(self: *Connection) usize {
@@ -3626,6 +3793,10 @@ pub const Connection = struct {
     fn ingestAndProcess(self: *Connection, bytes: []const u8) !void {
         self.assertSessionHeld("ingestAndProcess");
         const io = self.config.io;
+        // Body clocks start and move on this (`session.BodyClock`): a value
+        // left from the turn's checks would date a frame that arrived after a
+        // long park to before the park.
+        self.session.edge_now_ns = nowNs(io);
         var rest = bytes;
         while (true) {
             const ingest_t0 = if (trace.enabled) nowNs(io) else 0;
@@ -3639,6 +3810,7 @@ pub const Connection = struct {
             // takes nothing is a broken invariant, not a slow peer.
             if (taken == 0 and rest.len != 0) std.debug.panic("ingest took nothing from {d} bytes with {d} of {d} intents queued: the intent queue is below Limits.intentEntriesMin", .{ rest.len, self.session.intentLen(), self.session.intentCapacity() });
             rest = rest[taken..];
+            self.noteConnCredit();
             const intent_t0 = if (trace.enabled) nowNs(io) else 0;
             try self.processIntents();
             if (trace.enabled) {
@@ -3647,6 +3819,18 @@ pub const Connection = struct {
             }
             if (rest.len == 0) return;
         }
+    }
+
+    /// The connection-window wait ends when credit comes, not when the
+    /// drain next pops: a drain held by the transport (the writer full) would
+    /// keep the 5 s flow-control clock running on credit the peer already
+    /// gave, and its expiry resets every pending stream (astra 3, round 3).
+    /// A writer that cannot move is the write-byte timeout's. Caller holds
+    /// `session_mu`.
+    fn noteConnCredit(self: *Connection) void {
+        if (self.sched.conn_stall.since_ns == 0) return;
+        if (self.session.windows.conn_send <= 0) return;
+        self.sched.conn_stall.end(nowNs(self.config.io));
     }
 
     /// The exit for an error from `Session` in a lock section. The section
@@ -3764,7 +3948,7 @@ pub const Connection = struct {
         self.noteReceiptDepthChange(old_n, self.pending_complete_receipt_n);
     }
 
-    /// Protocol deadlines only (body idle, slow-consumer, grace, connection
+    /// Protocol deadlines only (request body, response rate, grace, connection
     /// idle, test canary).
     /// Handler deadlines are handler-owned zio timed waits and never appear
     /// in the actor's park timer.
@@ -3774,7 +3958,14 @@ pub const Connection = struct {
         // return at once on every turn.
         if (self.closing_deadline_ns) |deadline| return deadline;
         var next = self.session.nextIdleDeadlineNs();
-        if (self.sched.nextSlowDeadlineNs(self.config.limits.slow_consumer_timeout_ns)) |deadline| {
+        const limits = self.config.limits;
+        if (self.sched.nextStallDeadlineNs(limits.response_min_rate_grace_ns, limits.response_min_rate_bytes_per_s)) |deadline| {
+            if (next == null or deadline < next.?) next = deadline;
+        }
+        if (self.wireDeadlineNs()) |deadline| {
+            if (next == null or deadline < next.?) next = deadline;
+        }
+        if (self.session.unsentDeadlineNs(self.config.limits.request_body_idle_timeout_ns)) |deadline| {
             if (next == null or deadline < next.?) next = deadline;
         }
         if (self.grace_deadline) |deadline| {
@@ -4484,6 +4675,8 @@ pub const Connection = struct {
                 .io = io,
                 .stream = self.stream,
                 .from_actor = &self.write_ch,
+                .accepted = &self.wire_socket_bytes,
+                .accepted_ns = &self.wire_socket_ns,
                 .completions = &self.write_ack_ch,
                 .ledger = &self.acks,
                 .gpa = gpa,
@@ -4547,6 +4740,7 @@ pub const Connection = struct {
             if (comptime test_observe) self.releases_at_turn_top = self.releases_started.load(.seq_cst);
             _ = self.sched_refilled.swap(false, .acq_rel);
             self.drainWriteAcks();
+            self.noteWireDrained();
             if (self.writer_failed.load(.acquire)) self.closeWriterQueues();
             _ = self.drainCompletions();
             try self.drainPendingCompleteReceipts(false);
@@ -4583,7 +4777,7 @@ pub const Connection = struct {
                         // The drain is over; its RST_STREAMs are queued.
                         self.beginClosing();
                     } else {
-                        self.checkSlowConsumers() catch |err| try self.sessionErrorExit(err, "slow_consumer_error");
+                        self.checkResponseRates() catch |err| try self.sessionErrorExit(err, "slow_consumer_error");
                         // Deadlines and slow-consumer kills push Session intents
                         // (RST_STREAM, stream_reset). drainEmit only walks the
                         // scheduler, so those intents have to be materialized first or
@@ -4668,6 +4862,7 @@ pub const Connection = struct {
 
             if (self.config.mode == .tls) {
                 const leave = try self.driveTlsTurn();
+                self.noteWireDrained();
                 // An EOF or close_notify the pump saw, once what came before
                 // it is ingested.
                 if (!leave and self.tls_driver.?.eofReady()) try self.onPeerEof();
@@ -6869,6 +7064,11 @@ pub const Connection = struct {
     /// itself: the batch it would drain into is the one being read.
     fn materializeIntents(self: *Connection) anyerror!void {
         self.assertSessionHeld("materializeIntents");
+        // A refusal and a requeue below stamp queued credit's time (and move
+        // body pauses) with `edge_now_ns`, and any lock section, a handler's
+        // too, runs this: the actor's last value can be stale (Fable F2,
+        // round 4).
+        self.session.edge_now_ns = nowNs(self.config.io);
         var first_err: ?anyerror = null;
         self.intents_materialized = true;
         var requeued = false;
@@ -6976,7 +7176,7 @@ pub const Connection = struct {
                                 // (`Session.Owed`, `materializeIntents`). Past
                                 // its bound the peer gets ENHANCE_YOUR_CALM,
                                 // which this call's next round queues.
-                                .window_update => self.session.oweWindowUpdate(f.stream_id, wu_increment),
+                                .window_update => self.session.refuseWindowUpdate(f.stream_id, wu_increment),
                                 .settings => {
                                     // The server preface goes first, into an
                                     // empty share (`finishBoot`).
@@ -7163,6 +7363,7 @@ pub const Connection = struct {
             // rings (`unlockSession`), so this site rings nothing. The actor's
             // own drains write in the same turn (the hot path). On h2c the pump
             // task waits on the queue.
+            self.noteWireWrite(chunk.len);
             return;
         }
         // Counted before the push: the pump may post its completion, and the
@@ -7189,7 +7390,10 @@ pub const Connection = struct {
         // connection fails closed instead of parking the task that holds
         // `session_mu`. A closed queue (the connection is going away) is a
         // failed write, as before.
-        if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) return;
+        if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
+            self.noteWireWrite(chunk.len);
+            return;
+        }
         // A put that fails with room left in the queue is a closed queue.
         if (io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) < self.write_ch_buf.len) return error.WriteFailed;
         // The teardown sentinel is uncounted, so a full queue after it is the
@@ -9596,6 +9800,68 @@ test "t-894 leftover write acks: skip Forced is visible, Forced then deinit is q
     hop.conn.drainWriteAcksForced();
     try std.testing.expectEqual(@as(usize, 0), hop.conn.leftoverWriteAckCount());
     hop.conn.assertWriteAcksDrained();
+}
+
+test "a connection-window wait ends when the peer's credit arrives, not at the next pop (astra 3, round 3)" {
+    // The drain can be held by the transport (the writer full) when the
+    // peer's connection WINDOW_UPDATE comes; the wait on the peer must end
+    // then, or the 5 s flow-control clock runs on and its expiry resets
+    // every pending stream.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const limits = limits_mod.Limits.defaults;
+    var slabs = try slab_pool.SlabPool.init(gpa, io, limits.outbound_bytes_per_stream, 8);
+    defer slabs.deinit(gpa);
+    var requests = try testRequestPool();
+    defer requests.deinit();
+    const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try bind.listen(io, .{ .reuse_address = true });
+    const dest = listener.socket.address;
+    const peer = dest.connect(io, .{ .mode = .stream }) catch |err| {
+        listener.socket.close(io);
+        return err;
+    };
+    const accepted = listener.accept(io) catch |err| {
+        peer.close(io);
+        listener.socket.close(io);
+        return err;
+    };
+    listener.socket.close(io);
+    var hop: BenchHop = undefined;
+    hop.open(accepted, .{
+        .io = io,
+        .mode = .h2c,
+        .limits = limits,
+        .router = .{ .routes = &.{} },
+        .gpa = gpa,
+        .slab_pool = &slabs,
+        .request_pool = &requests,
+    }) catch |err| {
+        peer.close(io);
+        return err;
+    };
+    defer {
+        hop.conn.drainWriteAcksForced();
+        hop.deinit();
+        peer.close(io);
+    }
+    try hop.preparePreface();
+    hop.conn.lockSessionUncancelable(io);
+    defer hop.conn.unlockSession(io);
+    // DATA was ready with no connection credit: the wait began.
+    hop.conn.session.windows.conn_send = 0;
+    hop.conn.sched.conn_stall.begin(nowNs(io));
+    try std.testing.expect(hop.conn.sched.conn_stall.since_ns != 0);
+    // The drain is held, as the transport pause holds it: it returns before
+    // it pops (`FairScheduler.drain` checks `block_open` with `isPaused`).
+    hop.conn.sched.block_open = true;
+    defer hop.conn.sched.block_open = false;
+    // The peer's connection WINDOW_UPDATE arrives.
+    var wu: [13]u8 = undefined;
+    const n = try frame.Serializer.windowUpdate(&wu, 0, 1000);
+    try hop.conn.ingestAndProcess(wu[0..n]);
+    try std.testing.expect(hop.conn.session.windows.conn_send > 0);
+    try std.testing.expectEqual(@as(u64, 0), hop.conn.sched.conn_stall.since_ns);
 }
 
 fn bigBodyByte(i: usize) u8 {

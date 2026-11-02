@@ -232,10 +232,11 @@ pub const Limits = struct {
     /// `kern.ipc.somaxconn`), so asking for more than it allows is not an
     /// error; it only means the operator's sysctl is the ceiling.
     ///
-    /// A longer queue only helps when the admission limits can take what it
-    /// holds: the accept loop closes a connection over `max_connections` or
-    /// `concurrent_tls_handshakes` instead of waiting for a slot. A TLS burst
-    /// bigger than `concurrent_tls_handshakes` needs that limit raised too.
+    /// While `max_connections` or `concurrent_tls_handshakes` is full the
+    /// accept loop does not call accept: it parks until a slot frees, and new
+    /// connections wait in this queue. So the queue is what absorbs a burst
+    /// larger than those limits, and past it the kernel drops connection
+    /// attempts.
     ///
     /// Not part of `resourceUpperBound`: the queue is kernel memory, and every
     /// queued connection still passes `max_connections` and
@@ -305,8 +306,61 @@ pub const Limits = struct {
     response_compression: bool = false,
     preface_timeout_ns: u64 = 5 * std.time.ns_per_s,
     field_block_timeout_ns: u64 = 5 * std.time.ns_per_s,
+    /// A request body (HTTP/2 or HTTP/1.1) that sends no body byte for this
+    /// long ends: RST_STREAM CANCEL on HTTP/2, 408 and close on HTTP/1.1. The
+    /// clock starts when the body is owed (HTTP/2: the HEADERS without
+    /// END_STREAM), not at its first byte. Padding and empty DATA frames are
+    /// not progress.
     request_body_idle_timeout_ns: u64 = 15 * std.time.ns_per_s,
-    slow_consumer_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// The least average rate a request body may arrive at, once
+    /// `request_body_min_rate_grace_ns` has passed since it became owed
+    /// (Kestrel's MinRequestBodyDataRate, the same numbers). The body expires
+    /// at `start + max(grace, bytes / rate)`; on expiry it ends as the idle
+    /// rule does. Time during which the server itself advertised no receive
+    /// credit does not count. 0 turns the rate off (the idle rule stays).
+    request_body_min_rate_bytes_per_s: u32 = 240,
+    request_body_min_rate_grace_ns: u64 = 5 * std.time.ns_per_s,
+    /// The least average rate a response may be taken at, measured only
+    /// while the client is the reason its bytes do not move (Kestrel's
+    /// MinResponseDataRate is the model). Two clocks, with the same two rules
+    /// (`fair_scheduler.Stall`): the client took less than
+    /// `max(grace, taken / rate)` allows over the time it held the bytes, or
+    /// it took nothing for the grace.
+    ///
+    /// - One per HTTP/2 stream: the time its pending bytes wait for the
+    ///   STREAM's send window. Expiry resets that stream (CANCEL) and its
+    ///   handler sees `error.SlowConsumer`.
+    /// - One per HTTP/2 connection: the time pending DATA waits for the
+    ///   CONNECTION's send window. Expiry resets every stream with DATA
+    ///   pending.
+    ///
+    /// A stream waiting its turn behind other streams on a connection that is
+    /// moving is not stalled, and a stream with nothing queued has no clock,
+    /// so an SSE stream that sends one small event a minute never trips it.
+    /// A 1-byte WINDOW_UPDATE is 1 byte of progress, not a reset of the clock.
+    /// 0 turns the rate rule off and leaves the no-progress rule. A socket
+    /// that takes no byte at all is `write_byte_timeout_ns`'s, not this.
+    response_min_rate_bytes_per_s: u32 = 240,
+    /// The grace above: Kestrel's 5 s. 0 turns both clocks off.
+    response_min_rate_grace_ns: u64 = 5 * std.time.ns_per_s,
+    /// While bytes wait to be written to a connection's socket, the longest
+    /// the socket may take no byte of them; then the whole connection is
+    /// closed (Go's http2 `WriteByteTimeout`). The clock starts when bytes
+    /// begin to wait and restarts on every byte the socket accepts, partial
+    /// writes included; for TLS a byte is ciphertext the socket took, not
+    /// plaintext encrypted. HTTP/2 (h2c and TLS) and HTTP/1.1 alike. A peer
+    /// that stops reading is gone after this, with everything it held; one
+    /// that keeps taking bytes, however slowly, is not (the per-stream rate
+    /// above covers a stream it starves through flow control). Go leaves it
+    /// off by default; this server sets it, so a server is not open to that
+    /// peer because the operator did not know to turn it on. 0 turns it off.
+    ///
+    /// nginx's `send_timeout` (60 s): the kernel shows progress in steps (the
+    /// peer's receive-window updates, a unix socket's whole buffers), so a
+    /// reader that takes less than one step per timeout looks stalled. On
+    /// Linux defaults that is a reader slower than about 2 KB/s; it can lose
+    /// its connection. Each run of the clock reads this when it starts.
+    write_byte_timeout_ns: u64 = 60 * std.time.ns_per_s,
     graceful_drain_timeout_ns: u64 = 30 * std.time.ns_per_s,
     /// How long an HTTP/2 connection may have nothing to do before the server
     /// ends it, with the same two GOAWAYs as a graceful shutdown. It has nothing

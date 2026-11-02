@@ -124,7 +124,9 @@ pub const DataPending = struct {
     slab: []u8 = &.{},
     len: usize = 0,
     end_stream: bool = false,
-    last_progress_ns: u64 = 0,
+    /// The stream's response-rate clock (`Limits.response_min_rate_bytes_per_s`,
+    /// `Stall`): time its bytes wait on the stream's own send window.
+    stall: Stall = .{},
     flush_ticket: u64 = 0,
     flush_slot: u32 = 0,
     flush_remain: usize = 0,
@@ -156,7 +158,7 @@ pub const DataPending = struct {
         self.flush_ticket = 0;
         self.flush_slot = 0;
         self.flush_remain = 0;
-        self.last_progress_ns = 0;
+        self.stall = .{};
         self.place = .free;
         self.served = false;
         self.next = none;
@@ -167,6 +169,78 @@ pub const DataPending = struct {
 };
 
 const none: u32 = std.math.maxInt(u32);
+
+/// A response-rate clock: the time bytes waited because the CLIENT did not
+/// take them, against the bytes it took meanwhile
+/// (`Limits.response_min_rate_bytes_per_s`). It starts at the first wait and
+/// lasts until nothing is pending, so a client that grants one byte at a time
+/// is measured over the whole run and not reset by each byte. It expires when
+/// either holds:
+///
+/// - the waited time reaches `max(grace, taken / rate)`: the client took
+///   less than the rate allows (Kestrel's minimum data rate rule);
+/// - one wait reaches the grace: the client took nothing for that long, even
+///   if it took a lot before (a fast start does not buy a free stall).
+///
+/// Time the bytes spend ready while the connection moves other streams' bytes
+/// is not waiting: the client is taking bytes then, just not this stream's.
+pub const Stall = struct {
+    /// The current wait began; 0 while not waiting.
+    since_ns: u64 = 0,
+    /// Waited time summed over the earlier waits of this run.
+    waited_ns: u64 = 0,
+    /// Payload bytes the client took since the run began.
+    taken: u64 = 0,
+    /// A wait has happened since the bytes began to pend.
+    active: bool = false,
+
+    pub fn begin(self: *Stall, now_ns: u64) void {
+        self.active = true;
+        if (self.since_ns == 0) self.since_ns = now_ns;
+    }
+
+    pub fn end(self: *Stall, now_ns: u64) void {
+        if (self.since_ns == 0) return;
+        self.waited_ns +|= now_ns -| self.since_ns;
+        self.since_ns = 0;
+    }
+
+    pub fn noteTaken(self: *Stall, n: usize) void {
+        if (self.active) self.taken +|= n;
+    }
+
+    fn allowanceNs(self: Stall, grace_ns: u64, rate: u32) u64 {
+        std.debug.assert(rate != 0);
+        return @max(grace_ns, (self.taken *| std.time.ns_per_s) / rate);
+    }
+
+    /// One of the two rules above holds.
+    pub fn expired(self: Stall, now_ns: u64, grace_ns: u64, rate: u32) bool {
+        if (!self.active or grace_ns == 0) return false;
+        const current = if (self.since_ns == 0) 0 else now_ns -| self.since_ns;
+        if (current >= grace_ns) return true;
+        // Rate 0: the rate rule is off, only the wait itself counts.
+        if (rate == 0) return false;
+        return self.waited_ns +| current >= self.allowanceNs(grace_ns, rate);
+    }
+
+    /// The first rule decided it and the second did not (the client took
+    /// bytes, too few, and no single wait reached the grace), for the counter
+    /// that tells the two apart (`connection.response_rate_rule_resets`).
+    pub fn rateExpired(self: Stall, now_ns: u64, grace_ns: u64, rate: u32) bool {
+        if (!self.active or grace_ns == 0 or rate == 0) return false;
+        const current = if (self.since_ns == 0) 0 else now_ns -| self.since_ns;
+        return current < grace_ns and self.waited_ns +| current >= self.allowanceNs(grace_ns, rate);
+    }
+
+    /// When the current wait expires, or null when nothing waits now (the
+    /// waited time does not grow, so there is nothing to wake for).
+    pub fn deadlineNs(self: Stall, grace_ns: u64, rate: u32) ?u64 {
+        if (!self.active or grace_ns == 0 or self.since_ns == 0) return null;
+        if (rate == 0) return self.since_ns +| grace_ns;
+        return self.since_ns +| @min(grace_ns, self.allowanceNs(grace_ns, rate) -| self.waited_ns);
+    }
+};
 
 /// Slots in the stream-id index: a power of two at least twice the slot
 /// count, so the load stays at or below one half and a miss stops at an
@@ -235,7 +309,7 @@ fn probeInsert(keys: []u31, shift: u5, stream_id: u31) usize {
 /// case moving it would put it before its own home and a lookup would
 /// stop at the hole. A plain clear (or a tombstone) is what this replaces.
 /// `vals`, when given, moves with its key.
-fn probeRemove(keys: []u31, vals: ?[]u32, shift: u5, stream_id: u31) void {
+fn probeRemove(comptime V: type, keys: []u31, vals: ?[]V, shift: u5, stream_id: u31) void {
     const mask = keys.len - 1;
     var hole = probeHome(shift, stream_id);
     while (keys[hole] != stream_id) : (hole = (hole + 1) & mask) {
@@ -322,7 +396,7 @@ pub const FairScheduler = struct {
     started_keys: []u31,
     started_len: usize = 0,
     /// Every occupied slot, dense, for the walks that must see blocked
-    /// streams too (`forEachPending`, `nextSlowDeadlineNs`).
+    /// streams too (`forEachPending`, `nextStallDeadlineNs`).
     live: []u32,
     /// Touched slots that are free again. A slot comes from here first, and
     /// is touched fresh only when this is empty.
@@ -341,6 +415,10 @@ pub const FairScheduler = struct {
     blocked_head: u32 = none,
     blocked_tail: u32 = none,
     blocked_len: usize = 0,
+    /// The connection's response-rate clock (`Stall`): time pending DATA
+    /// waits on the CONNECTION's send window. It ends when no stream has
+    /// DATA pending.
+    conn_stall: Stall = .{},
     /// A `forEachPending` callback must not free a slot: `live` is a dense
     /// array and a swap-remove would skip a neighbour.
     iterating: bool = false,
@@ -566,7 +644,7 @@ pub const FairScheduler = struct {
     }
 
     fn idxRemove(self: *FairScheduler, stream_id: u31) void {
-        probeRemove(self.idx_keys, self.idx_vals, self.idx_shift, stream_id);
+        probeRemove(u32, self.idx_keys, self.idx_vals, self.idx_shift, stream_id);
     }
 
     fn startedContains(self: *const FairScheduler, stream_id: u31) bool {
@@ -582,7 +660,7 @@ pub const FairScheduler = struct {
 
     fn startedRemove(self: *FairScheduler, stream_id: u31) void {
         if (!self.startedContains(stream_id)) return;
-        probeRemove(self.started_keys, null, self.idx_shift, stream_id);
+        probeRemove(u32, self.started_keys, null, self.idx_shift, stream_id);
         self.started_len -= 1;
     }
 
@@ -754,10 +832,13 @@ pub const FairScheduler = struct {
     }
 
     fn blockedPush(self: *FairScheduler, i: u32) void {
-        std.debug.assert(self.pending_slots.slice()[i].place == .idle);
+        const s = &self.pending_slots.slice()[i];
+        std.debug.assert(s.place == .idle);
         self.listPushTail(&self.blocked_head, &self.blocked_tail, i);
-        self.pending_slots.slice()[i].place = .blocked;
+        s.place = .blocked;
         self.blocked_len += 1;
+        // Bytes waiting on the stream's own window wait on the client.
+        if (s.len != 0) s.stall.begin(nowNs(self.io));
     }
 
     fn blockedUnlink(self: *FairScheduler, i: u32) void {
@@ -821,13 +902,14 @@ pub const FairScheduler = struct {
             self.framed_len == 0 and self.active_pending == 0;
     }
 
-    pub fn nextSlowDeadlineNs(self: *const FairScheduler, timeout_ns: u64) ?u64 {
-        if (timeout_ns == 0) return null;
-        var next: ?u64 = null;
+    /// The earliest response-rate deadline of the streams and of the
+    /// connection window (`Stall.deadlineNs`), or null when nothing waits on
+    /// the client.
+    pub fn nextStallDeadlineNs(self: *const FairScheduler, grace_ns: u64, rate: u32) ?u64 {
+        if (grace_ns == 0) return null;
+        var next = self.conn_stall.deadlineNs(grace_ns, rate);
         for (self.live[0..self.active_pending]) |i| {
-            const slot = self.pending_slots.slice()[i];
-            if (slot.len == 0 or slot.last_progress_ns == 0) continue;
-            const deadline = slot.last_progress_ns +% timeout_ns;
+            const deadline = self.pending_slots.slice()[i].stall.deadlineNs(grace_ns, rate) orelse continue;
             if (next == null or deadline < next.?) next = deadline;
         }
         return next;
@@ -868,6 +950,8 @@ pub const FairScheduler = struct {
             self.pending_slots.slice()[last].live_pos = pw.live_pos;
             self.free_stack[self.free_len] = i;
             self.free_len += 1;
+            // No DATA pending anywhere: the connection window holds nothing back.
+            if (self.active_pending == 0) self.conn_stall = .{};
         }
         pw.clear();
     }
@@ -1028,7 +1112,6 @@ pub const FairScheduler = struct {
         @memcpy(pw.slab[pw.len..][0..bytes.len], bytes);
         pw.len += bytes.len;
         if (end) pw.end_stream = true;
-        pw.last_progress_ns = nowNs(self.io);
         if (flush_ticket != 0) {
             pw.flush_ticket = flush_ticket;
             pw.flush_slot = flush_slot;
@@ -1086,9 +1169,14 @@ pub const FairScheduler = struct {
     /// A connection WINDOW_UPDATE needs no call, because connection credit
     /// never puts a stream on the blocked list (see `emitOneData`).
     pub fn rearm(self: *FairScheduler, ids: []const u31, all: bool) void {
+        if (self.blocked_len == 0) return;
+        // The client granted credit: the wait on it ends here, and the next
+        // pop decides whether a new one begins.
+        const now = nowNs(self.io);
         if (all) {
             while (self.blocked_head != none) {
                 const i = self.blocked_head;
+                self.pending_slots.slice()[i].stall.end(now);
                 self.blockedUnlink(i);
                 self.readyInsert(i);
             }
@@ -1097,6 +1185,7 @@ pub const FairScheduler = struct {
         for (ids) |sid| {
             const i = self.idxFind(sid) orelse continue;
             if (self.pending_slots.slice()[i].place != .blocked) continue;
+            self.pending_slots.slice()[i].stall.end(now);
             self.blockedUnlink(i);
             self.readyInsert(i);
         }
@@ -1225,9 +1314,17 @@ pub const FairScheduler = struct {
         build_data_frame: BuildDataFrame,
         build_ctx: *anyopaque,
     ) anyerror!bool {
-        if (self.block_open or conn_win(win_ctx) <= 0) return false;
+        if (self.block_open) return false;
+        // With no connection credit only a bare END_STREAM may go: it needs
+        // no window of either kind (RFC 9113 6.9.1; astra 2, round 3).
+        var bare: ?u32 = null;
+        if (conn_win(win_ctx) <= 0) {
+            // DATA ready to go and no connection credit: the client holds it.
+            if (self.ready_len != 0) self.conn_stall.begin(nowNs(self.io));
+            bare = self.firstBareEnd() orelse return false;
+        } else if (self.conn_stall.since_ns != 0) self.conn_stall.end(nowNs(self.io));
 
-        if (self.framed_len > 0) {
+        if (bare == null and self.framed_len > 0) {
             const head = self.framed_data_q[self.framed_head];
             if (self.headersOut(head.stream_id) and (stream_win(win_ctx, head.stream_id) > 0 or self.active_pending == 0)) {
                 if (comptime wire_ring.enabled) self.diagDataBeforeHeaders(head.stream_id, "framed");
@@ -1242,8 +1339,13 @@ pub const FairScheduler = struct {
             }
         }
 
-        while (self.ready_head != none) {
-            const i = self.ready_head;
+        var took_bare = false;
+        while (true) {
+            const i = if (bare) |b| blk: {
+                if (took_bare) break;
+                took_bare = true;
+                break :blk b;
+            } else if (self.ready_head != none) self.ready_head else break;
             const in_front = self.fresh_tail != none;
             self.readyUnlink(i);
             const pw = &self.pending_slots.slice()[i];
@@ -1253,7 +1355,11 @@ pub const FairScheduler = struct {
             std.debug.assert(pw.len > 0 or pw.end_stream);
             std.debug.assert(pw.headers_out);
             const avail = stream_win(win_ctx, sid);
-            if (avail <= 0) {
+            // An empty DATA (a bare END_STREAM) needs no window and may go
+            // out when none is left (RFC 9113 6.9.1). Held, it has no clock:
+            // its slot carries no bytes for the stream's stall to time
+            // (Fable F2).
+            if (avail <= 0 and pw.len != 0) {
                 self.blockedPush(i);
                 continue;
             }
@@ -1282,7 +1388,8 @@ pub const FairScheduler = struct {
             std.debug.assert(pw.len <= pw.slab.len);
             if (rest > 0) @memmove(pw.slab[0..rest], pw.slab[quantum..][0..rest]);
             pw.len = rest;
-            pw.last_progress_ns = nowNs(self.io);
+            pw.stall.noteTaken(quantum);
+            self.conn_stall.noteTaken(quantum);
             if (end) self.startedRemove(sid);
             if (end or rest == 0) {
                 // Drained: free the slot (and its slab) at once. A long-lived
@@ -1302,6 +1409,17 @@ pub const FairScheduler = struct {
             return true;
         }
         return false;
+    }
+
+    /// The first ready slot that is a bare END_STREAM (no bytes left), or null.
+    fn firstBareEnd(self: *const FairScheduler) ?u32 {
+        var i = self.ready_head;
+        while (i != none) {
+            const pw = &self.pending_slots.slice()[i];
+            if (pw.len == 0 and pw.end_stream) return i;
+            i = pw.next;
+        }
+        return null;
     }
 
     pub fn classifyControl(typ: frame.FrameType, flags: frame.FrameFlags) ControlClass {
@@ -2212,4 +2330,26 @@ test "a reset drops only that stream's queued HEADERS, with its ticket and contr
     sched.forgetStream(1);
     sched.forgetStream(5);
     try std.testing.expectEqual(@as(usize, 0), sched.started_len);
+}
+
+test "a response clock with the rate at 0 keeps only the no-progress rule" {
+    // `Limits.response_min_rate_bytes_per_s` 0 turns the rate rule off: many
+    // short waits, each ended by a byte taken, never add up to an expiry.
+    const ms = std.time.ns_per_ms;
+    const grace: u64 = 500 * ms;
+    var st: Stall = .{};
+    var now: u64 = 1_000 * ms;
+    for (0..10) |_| {
+        st.begin(now);
+        now += 100 * ms;
+        try std.testing.expect(!st.expired(now, grace, 0));
+        st.end(now);
+        st.noteTaken(1);
+    }
+    try std.testing.expectEqual(@as(?u64, null), st.deadlineNs(grace, 0));
+    // One wait of the whole grace with nothing taken still ends it.
+    st.begin(now);
+    try std.testing.expectEqual(@as(?u64, now + grace), st.deadlineNs(grace, 0));
+    now += grace;
+    try std.testing.expect(st.expired(now, grace, 0));
 }

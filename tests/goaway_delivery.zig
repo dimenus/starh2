@@ -589,6 +589,14 @@ const Stall = enum {
     /// That yield is the only cancellation point it reaches, which is what the
     /// cancel test needs (t-3520, round 2).
     peer_floods_input,
+    /// A real client that asks for an endless stream, grants it no window
+    /// (SETTINGS_INITIAL_WINDOW_SIZE 0) and reads nothing. The stream's DATA
+    /// waits in the scheduler on the window the client holds, so the
+    /// response clock of that stream (`fair_scheduler.Stall`) is what ends
+    /// it, and the socket is not stalled: the connection stays. A peer that
+    /// stops reading its socket loses its connection instead, at the
+    /// write-byte timeout (`tests/hardening.zig`).
+    peer_holds_window,
     /// The h2c WritePump sleeps before every write (`test_write_delay_ms`), so
     /// no chunk ever completes while the actor stays live.
     writer_never_completes,
@@ -736,9 +744,21 @@ fn expectResetThenPingAck(wire: *Wire) !void {
 fn stalledClient(port: u16, gpa: std.mem.Allocator, transport: Transport, stall: Stall, st: *Stalled) !void {
     // A small receive buffer makes a non-reading client stall the server
     // after a few KiB.
-    const wire = try Wire.open(gpa, transport, port, if (stall == .peer_never_reads or stall == .peer_floods_input) 4096 else null);
+    const wire = try Wire.open(gpa, transport, port, if (stall == .peer_never_reads or stall == .peer_floods_input or stall == .peer_holds_window) 4096 else null);
     defer wire.close();
     switch (stall) {
+        .peer_holds_window => {
+            // An endless stream with no window, then never read.
+            var req = try h2c.buildClientPreface(gpa, .empty);
+            defer req.deinit(gpa);
+            var sbuf: [64]u8 = undefined;
+            const settings = [_]frame.Setting{.{ .id = .initial_window_size, .value = 0 }};
+            const sn = try frame.Serializer.settingsFrame(&sbuf, false, &settings);
+            try req.appendSlice(gpa, sbuf[0..sn]);
+            try h2c.appendWindowUpdate(gpa, &req, 0, 1 << 30);
+            try h2c.appendHeaders(gpa, &req, 1, "/flood", true);
+            try wire.send(req.items);
+        },
         .peer_never_reads, .peer_floods_input => {
             // An endless stream with a huge window, then never read.
             var req = try h2c.buildClientPreface(gpa, .empty);
@@ -905,13 +925,13 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     limits.close_flush_timeout_ns = deadline_ns;
     // Above the 500 ms of no progress that says the server has stalled: the
     // handler must still be parked when the stall is seen.
-    if (check_kind == .slow_consumer or check_kind == .idle_after_kill) limits.slow_consumer_timeout_ns = 1500 * std.time.ns_per_ms;
+    if (check_kind == .slow_consumer or check_kind == .idle_after_kill) limits.response_min_rate_grace_ns = 1500 * std.time.ns_per_ms;
     if (check_kind == .idle_after_kill) limits.connection_idle_timeout_ns = 1000 * std.time.ns_per_ms;
 
     // Read by the connection when its WritePump starts, so it must be set
     // before the client connects and cleared afterwards.
     conn_mod.test_write_delay_ms = switch (stall) {
-        .peer_never_reads, .peer_floods_input, .drain_overflow, .inline_drain_parked, .main_drain_parked => 0,
+        .peer_never_reads, .peer_floods_input, .peer_holds_window, .drain_overflow, .inline_drain_parked, .main_drain_parked => 0,
         .writer_never_completes, .queue_full => 120 * std.time.ms_per_s,
     };
     defer conn_mod.test_write_delay_ms = 0;
@@ -970,7 +990,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
     switch (stall) {
-        .peer_never_reads, .peer_floods_input => {
+        .peer_never_reads, .peer_floods_input, .peer_holds_window => {
             // The server is stalled when the flood handler has written
             // something and then makes no progress for 500 ms. Without this
             // the connection error could arrive while the socket still has
@@ -1026,17 +1046,19 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     if (check_kind == .slow_consumer or check_kind == .idle_after_kill) {
         // The margin covers the actor's wake-up on a loaded machine. A deadline
         // at twice the limit does not fit in it.
-        const stop = last_write_ns + limits.slow_consumer_timeout_ns + 1 * std.time.ns_per_s;
+        const stop = last_write_ns + limits.response_min_rate_grace_ns + 1 * std.time.ns_per_s;
         while (flood_killed_ns.load(.acquire) == 0) {
             if (nowNs() >= stop) return error.NoSlowConsumerKill;
             zio.sleep(.fromMilliseconds(5)) catch {};
         }
         const killed_ms = (flood_killed_ns.load(.acquire) - last_write_ns) / std.time.ns_per_ms;
         std.debug.print("{s}: handler got SlowConsumer {d} ms after its last write (limit 1500 ms)\n", .{ label, killed_ms });
-        // The stream's deadline fired, not something earlier or much later. It
-        // runs from the last slab change, which is close to the handler's stamp,
-        // so the floor only allows for a stamp taken late.
-        try std.testing.expect(killed_ms >= limits.slow_consumer_timeout_ns / std.time.ns_per_ms - 100);
+        // The stream's response clock fired, not something earlier or much
+        // later: its DATA waited on the window the peer holds for the grace
+        // (`Limits.response_min_rate_grace_ns`), from its first wait, which is
+        // close to the handler's stamp, so the floor only allows for a stamp
+        // taken late.
+        try std.testing.expect(killed_ms >= limits.response_min_rate_grace_ns / std.time.ns_per_ms - 100);
         try std.testing.expect(killed_ms <= (stop - last_write_ns) / std.time.ns_per_ms);
         if (check_kind == .idle_after_kill) {
             // The idle time, then the first GOAWAY's PING that nobody answers,
@@ -1132,12 +1154,12 @@ test "goaway: h2c a peer that never reads holds the connection only until the de
     try runStalledCase(.h2c, .peer_never_reads, .deadline, "h2c peer never reads");
 }
 
-test "goaway: h2c a peer that never reads loses its stream at the slow-consumer deadline (t-3521)" {
-    try runStalledCase(.h2c, .peer_never_reads, .slow_consumer, "h2c slow consumer");
+test "goaway: h2c a peer that holds a stream's window loses that stream at the slow-consumer deadline (t-3521)" {
+    try runStalledCase(.h2c, .peer_holds_window, .slow_consumer, "h2c slow consumer");
 }
 
-test "goaway: tls a peer that never reads loses its stream at the slow-consumer deadline (t-3521)" {
-    try runStalledCase(.tls, .peer_never_reads, .slow_consumer, "tls slow consumer");
+test "goaway: tls a peer that holds a stream's window loses that stream at the slow-consumer deadline (t-3521)" {
+    try runStalledCase(.tls, .peer_holds_window, .slow_consumer, "tls slow consumer");
 }
 
 test "goaway: h2c a writer that never completes holds the connection only until the deadline (t-3520)" {
@@ -1637,11 +1659,11 @@ test "idle: tls a handler cut after the first GOAWAY does not hear the server is
 test "idle: h2c a last stream that ends with nothing to wake the actor still ends the connection (t-3705)" {
     try runIdleCase(.h2c, .stream_ends_with_no_wake, "h2c idle no wake");
 }
-test "idle: h2c a peer that never reads and stays silent loses its connection after the kill (t-3705)" {
-    try runStalledCase(.h2c, .peer_never_reads, .idle_after_kill, "h2c idle after kill");
+test "idle: h2c a peer that holds its window and stays silent loses its connection after the kill (t-3705)" {
+    try runStalledCase(.h2c, .peer_holds_window, .idle_after_kill, "h2c idle after kill");
 }
-test "idle: tls a peer that never reads and stays silent loses its connection after the kill (t-3705)" {
-    try runStalledCase(.tls, .peer_never_reads, .idle_after_kill, "tls idle after kill");
+test "idle: tls a peer that holds its window and stays silent loses its connection after the kill (t-3705)" {
+    try runStalledCase(.tls, .peer_holds_window, .idle_after_kill, "tls idle after kill");
 }
 
 // ---------------------------------------------------------------------------

@@ -30,6 +30,12 @@ const reported: u8 = 2;
 /// Test-only: reaper completion posts for HTTP/1.1 connections, process-wide.
 pub var h1_reaper_post_ok: std.atomic.Value(usize) = .init(0);
 
+/// Request bodies ended by the idle rule and by the minimum rate
+/// (`Limits.request_body_min_rate_bytes_per_s`), process-wide. A test reads
+/// them to show which rule fired.
+pub var body_idle_expiries: std.atomic.Value(u64) = .init(0);
+pub var body_rate_expiries: std.atomic.Value(u64) = .init(0);
+
 var no_shutdown_event: zio.Event = .init;
 
 pub const ChannelMutation = enum {
@@ -95,7 +101,17 @@ const H1Conn = struct {
     carry_buf: []u8,
     carry_len: usize = 0,
 
-    writer: std.Io.net.Stream.Writer = undefined,
+    /// The socket writer, with the write-byte timeout on every call
+    /// (`Limits.write_byte_timeout_ns`, `wire_pump.SocketWriter`): a peer
+    /// that takes no byte for the timeout fails the write, and the
+    /// connection is shut (`noteWriteFailed`).
+    writer: wire_pump.SocketWriter = undefined,
+    /// Bytes the socket accepted (`SocketWriter.accepted`).
+    socket_bytes: std.atomic.Value(u64) = .init(0),
+    socket_bytes_ns: std.atomic.Value(u64) = .init(0),
+    /// The write-byte clock of the TLS handler write in flight
+    /// (`TlsWriteClock`), read by `waitDispatchTls`.
+    tls_write_clock: TlsWriteClock = .{ .seen = 0, .progress_ns = 0 },
     reader_bound: bool = false,
 
     // Cleartext inbound. One `ev.NetRecv` the actor submits and re-submits,
@@ -282,7 +298,7 @@ fn initConn(self: *H1Conn, stream: std.Io.net.Stream, config: connection.ConnCon
     self.acc = parser.Accumulator.init(self.head_buf);
     self.completion_ch = .init(&self.completion_buf);
     if (tls == null) {
-        self.writer = stream.writer(config.io, self.write_buf);
+        self.writer = .init(config.io, stream.socket.handle, self.write_buf, &self.socket_bytes, &self.socket_bytes_ns, config.limits.write_byte_timeout_ns);
         self.reader_bound = true;
         startRecv(self);
     }
@@ -416,7 +432,15 @@ fn serveOne(self: *H1Conn) !bool {
                 // Streaming contract: handler starts after the head.
                 if (head.content_length != 0) self.want_close = true;
             } else {
-                body = try readBody(self, head) orelse {
+                body = readBody(self, head) catch |err| switch (err) {
+                    error.BodyTimeout => {
+                        // Nothing final was sent (a 100 Continue is interim),
+                        // so the client can be told why before the close.
+                        writeError(self, 408) catch {};
+                        return false;
+                    },
+                    else => return err,
+                } orelse {
                     try writeError(self, 413);
                     return false;
                 };
@@ -558,18 +582,35 @@ fn readBody(self: *H1Conn, head: parser.Head) !?[]const u8 {
         shiftCarry(self, take);
         got = take;
     }
-    // Idle, not total: re-arm on each byte of progress so a slow-but-moving
-    // body is not killed by time spent on earlier chunks.
-    var idle_deadline_ns = nowNs(self.io) +% self.config.limits.request_body_idle_timeout_ns;
+    // Two rules, as on HTTP/2 (`session.BodyClock`), from the end of the head:
+    // idle (no byte for `request_body_idle_timeout_ns`, renewed by each byte)
+    // and the minimum rate (`start + max(grace, bytes / rate)`). The server
+    // reads whenever the body is owed and never withholds anything here, so
+    // nothing pauses them.
+    const limits = self.config.limits;
+    const start_ns = nowNs(self.io);
+    var idle_deadline_ns = start_ns +| limits.request_body_idle_timeout_ns;
     while (got < need) {
-        if (nowNs(self.io) >= idle_deadline_ns) return error.IdleTimeout;
+        const rate_deadline_ns: u64 = if (limits.request_body_min_rate_bytes_per_s == 0)
+            std.math.maxInt(u64)
+        else
+            start_ns +| @max(limits.request_body_min_rate_grace_ns, (@as(u64, got) *| std.time.ns_per_s) / limits.request_body_min_rate_bytes_per_s);
+        const deadline_ns = @min(idle_deadline_ns, rate_deadline_ns);
         var tmp: [4096]u8 = undefined;
-        const n = try readSome(self, tmp[0..], idle_deadline_ns) orelse return error.IdleTimeout;
+        const read = if (nowNs(self.io) >= deadline_ns) null else try readSome(self, tmp[0..], deadline_ns);
+        const n = read orelse {
+            if (deadline_ns == idle_deadline_ns) {
+                _ = body_idle_expiries.fetchAdd(1, .monotonic);
+            } else {
+                _ = body_rate_expiries.fetchAdd(1, .monotonic);
+            }
+            return error.BodyTimeout;
+        };
         if (n == 0) return error.ConnectionClosed;
         const take = @min(n, need - got);
         @memcpy(self.body_buf[got .. got + take], tmp[0..take]);
         got += take;
-        idle_deadline_ns = nowNs(self.io) +% self.config.limits.request_body_idle_timeout_ns;
+        idle_deadline_ns = nowNs(self.io) +| limits.request_body_idle_timeout_ns;
         if (take < n) try stashCarry(self, tmp[0..n], take);
     }
     return self.body_buf[0..need];
@@ -613,12 +654,60 @@ fn takeTlsPending(pump: *tls_edge.Pump, buf: []u8) ?usize {
 
 fn driveTlsUntilIdle(self: *H1Conn) response.ResponseError!void {
     const pump = self.tls_pump orelse return;
+    var clock: TlsWriteClock = .start(self, pump);
     while (pump.pending_n > 0 or pump.send_armed) {
-        waitTlsCq(self, null) catch return error.WriteFailed;
+        if (clock.expired(self, pump)) return tlsWriteTimedOut(self);
+        waitTlsCq(self, clock.deadline()) catch return error.WriteFailed;
         if (pump.pending_n > 0) {
             if (!pump.drivePending()) return error.WriteFailed;
         }
     }
+}
+
+/// The write-byte timeout (`Limits.write_byte_timeout_ns`) on the TLS pump:
+/// progress is ciphertext the socket accepted (`Pump.sent_bytes`), at every
+/// send completion, partial ones included, dated when the socket took it
+/// (`Pump.sent_ns`). The limit is read when the clock starts.
+const TlsWriteClock = struct {
+    seen: u64,
+    progress_ns: u64,
+    timeout_ns: u64 = 0,
+
+    fn start(self: *H1Conn, pump: *tls_edge.Pump) TlsWriteClock {
+        return .{
+            .seen = pump.sent_bytes.load(.acquire),
+            .progress_ns = nowNs(self.io),
+            .timeout_ns = self.config.limits.write_byte_timeout_ns,
+        };
+    }
+
+    /// Null when the timeout is off.
+    fn deadline(c: *const TlsWriteClock) ?u64 {
+        if (c.timeout_ns == 0) return null;
+        return c.progress_ns +| c.timeout_ns;
+    }
+
+    fn expired(c: *TlsWriteClock, self: *H1Conn, pump: *tls_edge.Pump) bool {
+        const now = nowNs(self.io);
+        const sent = pump.sent_bytes.load(.acquire);
+        if (sent != c.seen) {
+            c.seen = sent;
+            const at = pump.sent_ns.load(.acquire);
+            c.progress_ns = if (at == 0) now else @max(c.progress_ns, @min(at, now));
+        }
+        const d = c.deadline() orelse return false;
+        return now >= d;
+    }
+};
+
+fn tlsWriteTimedOut(self: *H1Conn) response.ResponseError {
+    shutTimedOut(self);
+    return error.SlowConsumer;
+}
+
+fn shutTimedOut(self: *H1Conn) void {
+    _ = write_byte_expiries.fetchAdd(1, .monotonic);
+    self.stream.shutdown(self.io, .both) catch {};
 }
 
 fn waitTlsCq(self: *H1Conn, deadline_ns: ?u64) !void {
@@ -998,6 +1087,7 @@ fn driveHandlerTlsWrite(self: *H1Conn, n: u32) void {
         ackTlsWrite(self, true);
         return;
     }
+    self.tls_write_clock = .start(self, pump);
     self.tls_write_inflight = true;
 }
 
@@ -1038,13 +1128,37 @@ fn waitDispatchTls(self: *H1Conn) !void {
             break;
         }
 
+        // A handler write in flight runs the write-byte clock: the socket
+        // takes none of it for the timeout, and the connection goes.
+        var write_timer: zio.Timeout = .none;
+        if (self.tls_write_inflight) {
+            if (self.tls_write_clock.expired(self, pump)) {
+                // The cause first: the handler's failed write reads it
+                // (`writeRawTlsFromHandler`) as soon as the ack wakes it.
+                self.slot.terminal.setCause(.slow_consumer);
+                ackTlsWrite(self, false);
+                shutTimedOut(self);
+                if (!cancelJoin(self)) {
+                    finishSlot(self);
+                    break;
+                }
+                reaping = true;
+                continue;
+            }
+            if (self.tls_write_clock.deadline()) |d| {
+                // Absolute: a `.duration` arms from a cached clock (zio t-3653).
+                write_timer = .{ .deadline = .fromNanoseconds(d) };
+            }
+        }
         const winner = zio.select(.{
             .io = &pump.cq,
             .comps = self.completion_ch.asyncReceive(),
             .writes = self.tls_req_ch.asyncReceive(),
             .shutdown = shutdown_ev,
+            .timer = write_timer,
         }) catch return error.Canceled;
         switch (winner) {
+            .timer => {},
             .io => |r| {
                 const c = r catch {
                     if (pump.cq.isDrained()) {
@@ -1471,6 +1585,28 @@ fn writeError(self: *H1Conn, status: u16) !void {
     self.committed = true;
 }
 
+/// A write failed. If the socket took no byte for the write-byte timeout, the
+/// peer stopped reading: shut the socket, so the connection's own wait (for
+/// the handler, or for the next request) ends too and the connection goes.
+fn noteWriteFailed(self: *H1Conn) response.ResponseError {
+    if (self.writer.timed_out) {
+        _ = write_byte_expiries.fetchAdd(1, .monotonic);
+        self.stream.shutdown(self.io, .both) catch {};
+        return error.SlowConsumer;
+    }
+    return error.WriteFailed;
+}
+
+/// A handler write the connection failed: the connection's cause, when it
+/// set one (the write-byte timeout's `SlowConsumer`), else `WriteFailed`.
+fn writeFailedCause(self: *H1Conn) response.ResponseError {
+    if (self.slot.terminal.getCause()) |c| return response.causeToError(c);
+    return error.WriteFailed;
+}
+
+/// HTTP/1.1 connections shut by the write-byte timeout, process-wide.
+pub var write_byte_expiries: std.atomic.Value(u64) = .init(0);
+
 fn writeRaw(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
     if (self.tls != null) {
         if (self.offload_tls_io) {
@@ -1480,7 +1616,7 @@ fn writeRaw(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
         }
         return;
     }
-    self.writer.interface.writeAll(bytes) catch return error.WriteFailed;
+    self.writer.interface.writeAll(bytes) catch return noteWriteFailed(self);
 }
 
 fn writeRawTlsFromHandler(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
@@ -1489,8 +1625,8 @@ fn writeRawTlsFromHandler(self: *H1Conn, bytes: []const u8) response.ResponseErr
         const n = @min(bytes.len - off, self.tls_out.len);
         @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
         self.tls_req_ch.send(@intCast(n)) catch return error.WriteFailed;
-        const ok = self.tls_ok_ch.receive() catch return error.WriteFailed;
-        if (!ok) return error.WriteFailed;
+        const ok = self.tls_ok_ch.receive() catch return writeFailedCause(self);
+        if (!ok) return writeFailedCause(self);
         off += n;
     }
 }
@@ -1520,5 +1656,5 @@ fn flushSink(self: *H1Conn) response.ResponseError!void {
         try driveTlsUntilIdle(self);
         return;
     }
-    self.writer.interface.flush() catch return error.WriteFailed;
+    self.writer.interface.flush() catch return noteWriteFailed(self);
 }

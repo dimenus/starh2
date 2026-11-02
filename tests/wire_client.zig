@@ -54,6 +54,10 @@ pub const Wire = struct {
     close_notify: bool = false,
     /// The read failed with a connection reset, not an EOF.
     reset: bool = false,
+    /// TLS: the one ALPN protocol offered, and required back. "http/1.1"
+    /// makes the server's TLS endpoint serve HTTP/1.1; then send with
+    /// `sendUnchecked`, since the HTTP/2 oracle cannot read it.
+    alpn: []const u8 = "h2",
 
     pub const Seen = struct { ftype: u8, flags: u8, sid: u32 };
 
@@ -161,7 +165,7 @@ pub const Wire = struct {
             .root_ca = .empty,
             .insecure_skip_verify = true,
             .cipher_suites = tls.config.cipher_suites.tls13,
-            .alpn_protocols = &.{"h2"},
+            .alpn_protocols = &.{self.alpn},
         });
         var last: std.ArrayList(u8) = .empty;
         defer last.deinit(self.gpa);
@@ -177,7 +181,7 @@ pub const Wire = struct {
             if (r.recv_pos == 0 and r.send.len == 0) try self.fill();
         }
         const alpn = hs.inner.alpn_protocol orelse return error.Alpn;
-        if (!std.mem.eql(u8, alpn, "h2")) return error.Alpn;
+        if (!std.mem.eql(u8, alpn, self.alpn)) return error.Alpn;
         self.conn = .init(hs.cipher().?);
         if (flight) |f| {
             var off: usize = 0;
@@ -224,6 +228,11 @@ pub const Wire = struct {
 
     pub fn send(self: *Wire, bytes: []const u8) !void {
         self.oracle.onSend(bytes);
+        return self.sendUnchecked(bytes);
+    }
+
+    /// `send` without the HTTP/2 oracle: for bytes that are not HTTP/2.
+    pub fn sendUnchecked(self: *Wire, bytes: []const u8) !void {
         if (self.transport == .h2c) return self.sendRaw(bytes);
         var off: usize = 0;
         while (off < bytes.len) {

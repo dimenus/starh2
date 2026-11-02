@@ -639,6 +639,7 @@ pub fn reasonPhrase(status: u16) []const u8 {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         411 => "Length Required",
         413 => "Content Too Large",
         417 => "Expectation Failed",

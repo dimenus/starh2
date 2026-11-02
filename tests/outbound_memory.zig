@@ -708,8 +708,11 @@ const flusher_streams = 12;
 /// is stuck, the queue fills, and flushes with nothing pending arrive: each
 /// must wait for its slot outside `session_mu` (a push that waited in `putOne`
 /// held the lock, and the actor could not run a deadline or end the connection
-/// gracefully). The tests asks for both: the slow-consumer deadline resets the
-/// stuck bulk stream, and a graceful shutdown ends the connection.
+/// gracefully). The test asks for both: a deadline still fires (a request body
+/// that never comes is reset by its body clock, `Limits.request_body_min_rate_grace_ns`),
+/// and a graceful shutdown ends the connection. The write-byte timeout
+/// (`Limits.write_byte_timeout_ns`, 30 s) is longer than the whole test: the
+/// held pump takes no byte, and the connection must stay for the shutdown.
 ///
 /// The pump is held by `wire_pump.test_hold_writes`, not by a full socket. A
 /// socket fills at a size the kernel picks (a Linux loopback pair takes
@@ -721,7 +724,7 @@ const flusher_streams = 12;
 /// there on any OS where it did not happen.
 fn runBarrierQueue(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var limits = starh2.Limits.defaults;
-    limits.slow_consumer_timeout_ns = 600 * std.time.ns_per_ms;
+    limits.request_body_min_rate_grace_ns = 600 * std.time.ns_per_ms;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     var cert: []u8 = &.{};
     var key: []u8 = &.{};
@@ -798,13 +801,25 @@ fn runBarrierQueue(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const finished_held = wire_pump.diag_acks.posted_release.load(.monotonic);
     zio.sleep(.fromMilliseconds(200)) catch {};
     if (wire_pump.diag_acks.posted_release.load(.monotonic) != finished_held) return error.PumpNotHeld;
+    // The probe: a request whose body never comes. Only a deadline the actor
+    // runs can end it.
+    var probe: std.ArrayList(u8) = .empty;
+    defer probe.deinit(gpa);
+    const probe_fields = [_]starh2.core.hpack.HeaderField{.{ .name = "content-length", .value = "10" }};
+    try h2c.appendHeadersExtra(gpa, &probe, bulk_sid + 2, "POST", "/flusher", false, &probe_fields);
+    try w.send(probe.items);
+    const probe_deadline = nowNs() + client_deadline_ns;
+    while (server.accounting.active_streams.load(.acquire) != flusher_streams + 2) {
+        if (nowNs() >= probe_deadline) return error.ProbeNeverOpened;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
     const streams_before = server.accounting.active_streams.load(.acquire);
-    try std.testing.expectEqual(@as(usize, flusher_streams + 1), streams_before);
+    try std.testing.expectEqual(@as(usize, flusher_streams + 2), streams_before);
 
     flush_gate.store(true, .release);
-    // The deadline: the actor runs and resets the bulk stream, which the peer
-    // is not reading. (The flushers wait on tickets the stuck pump cannot
-    // complete, and stay.)
+    // The deadline: the actor runs and resets the probe, whose body never
+    // came. (The flushers wait on tickets the stuck pump cannot complete,
+    // and stay, and so does the bulk stream, held by the pump.)
     const slow_deadline = nowNs() + 5 * std.time.ns_per_s;
     var actor_alive = false;
     while (nowNs() < slow_deadline) {
@@ -820,12 +835,12 @@ fn runBarrierQueue(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         wire_open = false;
         return error.ActorStuckBehindABarrier;
     }
-    // Only the bulk stream was reset: the connection is alive and its flushers
-    // are waiting. A connection that failed closed would also free its
-    // streams, and would not prove the actor was free.
+    // Only the probe was reset: the connection is alive, and its flushers and
+    // the bulk stream are waiting. A connection that failed closed would also
+    // free its streams, and would not prove the actor was free.
     zio.sleep(.fromMilliseconds(150)) catch {};
     try std.testing.expectEqual(@as(usize, 1), server.active_connections.load(.acquire));
-    try std.testing.expectEqual(@as(usize, flusher_streams), server.accounting.active_streams.load(.acquire));
+    try std.testing.expectEqual(@as(usize, flusher_streams + 1), server.accounting.active_streams.load(.acquire));
     if (comptime conn_mod.test_observe and @hasDecl(conn_mod, "test_ack_room_waits")) {
         // The barriers really waited: without a wait there was nothing to test.
         try std.testing.expect(conn_mod.test_ack_room_waits.load(.monotonic) > waits_0);

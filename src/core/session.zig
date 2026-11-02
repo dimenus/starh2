@@ -204,6 +204,43 @@ pub var control_frames_built: std.atomic.Value(u64) = .init(0);
 /// process: the work counter for the idle-sweep list. The bench server prints it.
 pub var body_idle_expiries: std.atomic.Value(u64) = .init(0);
 
+/// Streams reset because their request body fell below the minimum rate
+/// (`Limits.request_body_min_rate_bytes_per_s`), in every Session of the
+/// process. A test reads it to show the rule fired and not the idle one.
+pub var body_rate_expiries: std.atomic.Value(u64) = .init(0);
+
+/// The clock of one request body that is still arriving: from the HEADERS
+/// without END_STREAM until END_STREAM, a reset, or expiry. Two rules read it,
+/// both on the edge clock (`edge_now_ns`):
+///
+/// - Idle: no body byte for `Limits.request_body_idle_timeout_ns`.
+/// - Minimum rate (Kestrel's MinRequestBodyDataRate): once
+///   `request_body_min_rate_grace_ns` has passed, the body must have averaged
+///   `request_body_min_rate_bytes_per_s` since HEADERS. That is the deadline
+///   `start_ns + max(grace, bytes / rate)`, so it is exact and needs no tick.
+///
+/// Only body bytes count: padding and an empty DATA frame are not progress,
+/// so neither renews either rule.
+///
+/// Both stop while the server's own advertised receive credit, for the stream
+/// or for the connection, is zero (`Session.creditBlocked`): the peer may not
+/// send then, so the time is the server's. A pause that ends moves `start_ns`
+/// and `last_ns` forward by its length. Advertised means on the wire: credit
+/// in a WINDOW_UPDATE that is owed (`Owed`) or queued and not yet written
+/// (`creditOnWire`) is not the peer's yet. The server replenishes at half a
+/// window, so that is the only way the credit runs out. A peer that stops
+/// reading keeps such a pause, but the write-byte timeout ends its
+/// connection (`Limits.write_byte_timeout_ns`).
+pub const BodyClock = struct {
+    start_ns: u64,
+    /// The last body byte (the idle rule).
+    last_ns: u64,
+    /// Body bytes received since HEADERS: no padding, no empty DATA.
+    bytes: u64 = 0,
+    /// When the current credit pause began; null while the clock runs.
+    paused_since_ns: ?u64 = null,
+};
+
 /// What a frame is for, when the edge decides which buffer it gets.
 ///
 /// An RST_STREAM and a graceful GOAWAY are `terminal`; the GOAWAY that ends
@@ -273,6 +310,14 @@ pub const Owed = struct {
     /// any stream may have some.
     conn_window: u31 = 0,
     streams: bool = false,
+    /// Credit queued in a WINDOW_UPDATE and not yet known to be on the wire:
+    /// the connection's, and whether any stream has some
+    /// (`Stream.window_unsent`). Cleared by `creditOnWire`.
+    conn_unsent: u31 = 0,
+    streams_unsent: bool = false,
+    /// When `conn_unsent` last went from 0 to more (`edge_now_ns`); 0 while
+    /// it is 0. Each stream keeps its own (`Stream.window_unsent_since_ns`).
+    conn_unsent_since_ns: u64 = 0,
 
     pub fn any(self: *const Owed) bool {
         return self.settings_acks != 0 or self.ping_len != 0 or self.conn_window != 0 or self.streams;
@@ -312,7 +357,7 @@ pub const Session = struct {
     /// Scratch for stream ids copied out of a map before the streams are
     /// reset: `checkIdleDeadlines` (bodies gone idle) and `openStreamIds`
     /// (every open stream). `max_streams_per_connection` ids always fit:
-    /// `body_idle_ns` never holds more entries than there are streams
+    /// `body_clocks` never holds more entries than there are streams
     /// (`putBounded`). One user at a time: `stale_ids_lent` makes a second
     /// one loud in safe builds.
     stale_ids: []u31 = &.{},
@@ -376,8 +421,11 @@ pub const Session = struct {
     edge_now_ns: u64 = 0,
     /// Wall-clock start of unfinished field block (0 = idle).
     field_block_started_ns: u64 = 0,
-    /// Last request-body DATA progress per stream (0 = unset).
-    body_idle_ns: std.AutoHashMap(u31, u64) = undefined,
+    /// The request bodies still arriving, one clock each (`BodyClock`).
+    body_clocks: std.AutoHashMap(u31, BodyClock) = undefined,
+    /// The connection's advertised receive credit was zero at the last
+    /// `syncBodyPauses`: every body clock is paused on it.
+    body_conn_blocked: bool = false,
 
     pub const StreamHooks = struct {
         ctx: *anyopaque,
@@ -584,7 +632,7 @@ pub const Session = struct {
         try plan.hashMap(u31, std.ArrayList(u8), max_streams);
         try plan.hashMap(u31, []hpack.HeaderField, max_streams);
         try plan.hashMap(u31, []hpack.HeaderField, max_streams);
-        try plan.hashMap(u31, u64, max_streams);
+        try plan.hashMap(u31, BodyClock, max_streams);
         try plan.array(u8, headerBlockCapacityFor(limits));
     }
 
@@ -631,7 +679,7 @@ pub const Session = struct {
             .pending_bodies = std.AutoHashMap(u31, std.ArrayList(u8)).init(boot),
             .pending_headers = std.AutoHashMap(u31, []hpack.HeaderField).init(boot),
             .pending_trailers = std.AutoHashMap(u31, []hpack.HeaderField).init(boot),
-            .body_idle_ns = std.AutoHashMap(u31, u64).init(boot),
+            .body_clocks = std.AutoHashMap(u31, BodyClock).init(boot),
         };
         intent_storage_owned = false;
         parser_owned = false;
@@ -644,7 +692,7 @@ pub const Session = struct {
         try s.pending_bodies.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_headers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.pending_trailers.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
-        try s.body_idle_ns.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
+        try s.body_clocks.ensureTotalCapacity(@intCast(limits.max_streams_per_connection));
         try s.header_block.ensureTotalCapacityPrecise(boot, headerBlockCapacityFor(limits));
         return s;
     }
@@ -708,7 +756,7 @@ pub const Session = struct {
         self.pending_bodies.deinit();
         self.pending_headers.deinit();
         self.pending_trailers.deinit();
-        self.body_idle_ns.deinit();
+        self.body_clocks.deinit();
         self.streams.deinit();
     }
 
@@ -1134,7 +1182,7 @@ pub const Session = struct {
         // A stream that ends mid-body (RST, early reject) leaves its idle
         // clock behind otherwise, and a peer that opens and resets streams
         // would fill a map that is sized for the live ones (`putBounded`).
-        _ = self.body_idle_ns.remove(stream_id);
+        _ = self.body_clocks.remove(stream_id);
         _ = self.streams.remove(stream_id);
         self.stream_removes += 1;
     }
@@ -1418,19 +1466,192 @@ pub const Session = struct {
         // Not while `openStreamIds` has lent it.
         if (std.debug.runtime_safety) std.debug.assert(!self.stale_ids_lent);
         var n_stale: usize = 0;
-        var it = self.body_idle_ns.iterator();
+        var it = self.body_clocks.iterator();
         while (it.next()) |e| {
-            if (e.value_ptr.* == 0) continue;
-            if (now_ns -% e.value_ptr.* >= self.limits.request_body_idle_timeout_ns) {
+            const deadline = self.bodyDeadlineNs(e.value_ptr.*) orelse continue;
+            if (now_ns >= deadline) {
                 self.stale_ids[n_stale] = e.key_ptr.*;
                 n_stale += 1;
             }
         }
         for (self.stale_ids[0..n_stale]) |sid| {
-            _ = self.body_idle_ns.remove(sid);
-            _ = body_idle_expiries.fetchAdd(1, .monotonic);
+            const clock = self.body_clocks.fetchRemove(sid).?.value;
+            // A clock whose body already ended is a missed removal, not a slow
+            // peer: drop it without a reset.
+            const s = self.streams.getPtr(sid) orelse continue;
+            if (s.end_stream_remote) continue;
+            if (now_ns -% clock.last_ns >= self.limits.request_body_idle_timeout_ns) {
+                _ = body_idle_expiries.fetchAdd(1, .monotonic);
+            } else {
+                _ = body_rate_expiries.fetchAdd(1, .monotonic);
+            }
+            // CANCEL, as for an idle body: the stream is no longer wanted. Not
+            // ENHANCE_YOUR_CALM, which says the peer causes excessive load: a
+            // slow body is more often a slow network than an attack, and the
+            // reset costs the peer this stream only.
             try self.emitRst(sid, .cancel);
         }
+    }
+
+    /// When `clock` expires, or null while it is paused or was armed with no
+    /// edge clock (an isolated Session in a test). The earlier of the idle
+    /// deadline and the minimum-rate deadline (`BodyClock`).
+    fn bodyDeadlineNs(self: *const Session, clock: BodyClock) ?u64 {
+        if (clock.start_ns == 0 or clock.paused_since_ns != null) return null;
+        var deadline = clock.last_ns +| self.limits.request_body_idle_timeout_ns;
+        const rate = self.limits.request_body_min_rate_bytes_per_s;
+        if (rate != 0) {
+            const earned = (clock.bytes *| std.time.ns_per_s) / rate;
+            const allowed = @max(self.limits.request_body_min_rate_grace_ns, earned);
+            deadline = @min(deadline, clock.start_ns +| allowed);
+        }
+        return deadline;
+    }
+
+    /// Start the body clock of `stream_id`: its HEADERS came without
+    /// END_STREAM, so a body is owed from now. A peer that sends HEADERS and
+    /// then nothing is what this exists for: before it, the clock started at
+    /// the first DATA, and such a stream held its stream token and its request
+    /// memory for ever.
+    fn startBodyClock(self: *Session, stream_id: u31) void {
+        var clock: BodyClock = .{ .start_ns = self.edge_now_ns, .last_ns = self.edge_now_ns };
+        if (self.creditBlocked(stream_id)) clock.paused_since_ns = self.edge_now_ns;
+        putBounded(&self.body_clocks, stream_id, clock);
+    }
+
+    /// The server's advertised receive credit stops `stream_id`'s body: the
+    /// connection's or the stream's window, less the credit still owed
+    /// (`grantWindow`), is not positive. A stream that is gone has none to
+    /// stop it.
+    fn creditBlocked(self: *const Session, stream_id: u31) bool {
+        if (self.connCreditBlocked()) return true;
+        const s = self.streams.getPtr(stream_id) orelse return false;
+        return s.window.recv - @as(i32, s.window_owed) - @as(i32, s.window_unsent) <= 0;
+    }
+
+    fn connCreditBlocked(self: *const Session) bool {
+        return self.windows.conn_recv - @as(i32, self.owed.conn_window) - @as(i32, self.owed.conn_unsent) <= 0;
+    }
+
+    /// Everything queued so far is on the wire (the edge saw its writer
+    /// drain): the credit in those WINDOW_UPDATEs is the peer's now, and a
+    /// body clock paused for it runs again. Until then such credit counts as
+    /// not advertised (`creditBlocked`), since a WINDOW_UPDATE queued behind
+    /// a response the peer reads slowly has not reached it. The pause is
+    /// bounded: a peer that never reads loses its connection at the
+    /// write-byte timeout (`Limits.write_byte_timeout_ns`), and one that keeps
+    /// the writer busy gets its credit counted at `unsentDeadlineNs`.
+    pub fn creditOnWire(self: *Session) void {
+        if (self.owed.conn_unsent == 0 and !self.owed.streams_unsent) return;
+        self.owed.conn_unsent = 0;
+        self.owed.conn_unsent_since_ns = 0;
+        if (self.owed.streams_unsent) {
+            var it = self.streams.iterator();
+            while (it.next()) |e| {
+                e.value_ptr.window_unsent = 0;
+                e.value_ptr.window_unsent_since_ns = 0;
+            }
+            self.owed.streams_unsent = false;
+        }
+        self.syncBodyPauses(0);
+    }
+
+    /// The queued-credit cap: credit queued `cap_ns` or more before `now`
+    /// counts as on the wire though the edge has not seen its writer drain.
+    /// A peer that keeps a response moving keeps the writer from draining,
+    /// and with it every body clock paused on that credit (astra 2, Fable
+    /// F1); the cap bounds that pause. Each entry (the connection's, each
+    /// stream's) is timed by its own `since`, so credit queued later keeps
+    /// its own full cap (astra 4 / Fable F1, round 3).
+    pub fn creditOnWireBefore(self: *Session, now: u64, cap_ns: u64) void {
+        var changed = false;
+        if (self.owed.conn_unsent != 0 and self.owed.conn_unsent_since_ns +| cap_ns <= now) {
+            self.owed.conn_unsent = 0;
+            self.owed.conn_unsent_since_ns = 0;
+            changed = true;
+        }
+        if (self.owed.streams_unsent) {
+            var left = false;
+            var it = self.streams.iterator();
+            while (it.next()) |e| {
+                const st = e.value_ptr;
+                if (st.window_unsent == 0) continue;
+                if (st.window_unsent_since_ns +| cap_ns <= now) {
+                    st.window_unsent = 0;
+                    st.window_unsent_since_ns = 0;
+                    changed = true;
+                } else {
+                    left = true;
+                }
+            }
+            self.owed.streams_unsent = left;
+        }
+        if (changed) self.syncBodyPauses(0);
+    }
+
+    /// When the next entry of queued credit reaches the cap
+    /// (`creditOnWireBefore`): `cap_ns` after the oldest entry's `since`.
+    /// Null while nothing is unsent or `cap_ns` is 0. Walks the streams only
+    /// while some stream has unsent credit.
+    pub fn unsentDeadlineNs(self: *const Session, cap_ns: u64) ?u64 {
+        if (cap_ns == 0) return null;
+        var oldest: ?u64 = null;
+        if (self.owed.conn_unsent != 0) oldest = self.owed.conn_unsent_since_ns;
+        if (self.owed.streams_unsent) {
+            var it = self.streams.iterator();
+            while (it.next()) |e| {
+                const st = e.value_ptr;
+                if (st.window_unsent == 0) continue;
+                if (oldest == null or st.window_unsent_since_ns < oldest.?) oldest = st.window_unsent_since_ns;
+            }
+        }
+        const since = oldest orelse return null;
+        return since +| cap_ns;
+    }
+
+    /// `inc` of credit just went into a queued WINDOW_UPDATE for `stream_id`
+    /// (0: the connection's). An entry that had none starts its cap now.
+    fn noteCreditQueued(self: *Session, stream_id: u31, inc: u31) void {
+        if (stream_id == 0) {
+            if (self.owed.conn_unsent == 0) self.owed.conn_unsent_since_ns = self.edge_now_ns;
+            self.owed.conn_unsent +|= inc;
+            return;
+        }
+        const s = self.streams.getPtr(stream_id) orelse return;
+        if (s.window_unsent == 0) s.window_unsent_since_ns = self.edge_now_ns;
+        s.window_unsent +|= inc;
+        self.owed.streams_unsent = true;
+    }
+
+    fn syncBodyPause(self: *Session, stream_id: u31, clock: *BodyClock) void {
+        if (self.creditBlocked(stream_id)) {
+            if (clock.paused_since_ns == null) clock.paused_since_ns = self.edge_now_ns;
+        } else if (clock.paused_since_ns) |since| {
+            const paused = self.edge_now_ns -| since;
+            clock.start_ns +|= paused;
+            clock.last_ns +|= paused;
+            clock.paused_since_ns = null;
+        }
+    }
+
+    /// Bring every body clock's pause in line with the credit. Called where
+    /// the credit the peer knows can change: after DATA (a debit) and after
+    /// owed credit is queued. The usual case is O(1): only when the
+    /// connection's credit flips, which happens only while a WINDOW_UPDATE is
+    /// owed, does it walk every clock.
+    fn syncBodyPauses(self: *Session, stream_id: u31) void {
+        if (self.body_clocks.count() == 0) {
+            self.body_conn_blocked = false;
+            return;
+        }
+        const conn_blocked = self.connCreditBlocked();
+        if (conn_blocked != self.body_conn_blocked or stream_id == 0) {
+            self.body_conn_blocked = conn_blocked;
+            var it = self.body_clocks.iterator();
+            while (it.next()) |e| self.syncBodyPause(e.key_ptr.*, e.value_ptr);
+            return;
+        }
+        if (self.body_clocks.getPtr(stream_id)) |clock| self.syncBodyPause(stream_id, clock);
     }
 
     /// Earliest edge-owned idle deadline, or null when no protocol timer is armed.
@@ -1446,11 +1667,9 @@ pub const Session = struct {
         if (self.expect_continuation != null and self.field_block_started_ns != 0) {
             next = self.field_block_started_ns +% self.limits.field_block_timeout_ns;
         }
-        var it = self.body_idle_ns.iterator();
+        var it = self.body_clocks.iterator();
         while (it.next()) |entry| {
-            const started = entry.value_ptr.*;
-            if (started == 0) continue;
-            const deadline = started +% self.limits.request_body_idle_timeout_ns;
+            const deadline = self.bodyDeadlineNs(entry.value_ptr.*) orelse continue;
             if (next == null or deadline < next.?) next = deadline;
         }
         return next;
@@ -1576,6 +1795,9 @@ pub const Session = struct {
             try self.failConnection(.protocol_error);
             return;
         }
+        // Every DATA debits the connection's credit, on every path below, and
+        // may leave a body without credit to continue (`BodyClock`).
+        defer self.syncBodyPauses(hdr.stream_id);
         var data = payload;
         var pad: usize = 0;
         if (hdr.flags.padded) {
@@ -1672,9 +1894,18 @@ pub const Session = struct {
         };
 
         if (!hdr.flags.end_stream) {
-            putBounded(&self.body_idle_ns, hdr.stream_id, self.edge_now_ns);
+            // Progress is body bytes only: an empty DATA frame or one that is
+            // all padding renews neither rule (`BodyClock`).
+            const clock = self.body_clocks.getPtr(hdr.stream_id) orelse blk: {
+                self.startBodyClock(hdr.stream_id);
+                break :blk self.body_clocks.getPtr(hdr.stream_id).?;
+            };
+            if (data.len != 0) {
+                clock.bytes +|= data.len;
+                clock.last_ns = self.edge_now_ns;
+            }
         } else {
-            _ = self.body_idle_ns.remove(hdr.stream_id);
+            _ = self.body_clocks.remove(hdr.stream_id);
         }
 
         if (hdr.flags.end_stream) {
@@ -1727,6 +1958,7 @@ pub const Session = struct {
             },
         };
         try self.pushIntentOrFailClosed(.{ .outbound_frame = .{ .typ = .window_update, .payload = p, .stream_id = stream_id } });
+        self.noteCreditQueued(stream_id, inc);
     }
 
     /// The owed credit for `stream_id` (0: the connection), or null for a
@@ -1737,8 +1969,29 @@ pub const Session = struct {
         return &s.window_owed;
     }
 
+    /// The edge refused a queued WINDOW_UPDATE: its credit leaves the queued
+    /// count (`noteCreditQueued` took it when the frame was made) and is owed
+    /// instead, so it is counted once (astra 3).
+    pub fn refuseWindowUpdate(self: *Session, stream_id: u31, inc: u31) void {
+        // An entry left with none forgets its time: credit queued again later
+        // (`requeueOwed`) starts a cap of its own. An entry left with some
+        // takes now as its time: the entry has one time for all its credit,
+        // and the refused frame may have been the one that set it, so the
+        // credit left may be younger (Fable F1, round 4). Now is never
+        // earlier than any credit still queued, so the pause is at worst
+        // longer than that credit's own cap, never shorter, and still ends
+        // at the cap from now.
+        if (stream_id == 0) {
+            self.owed.conn_unsent -|= inc;
+            self.owed.conn_unsent_since_ns = if (self.owed.conn_unsent == 0) 0 else self.edge_now_ns;
+        } else if (self.streams.getPtr(stream_id)) |s| {
+            s.window_unsent -|= inc;
+            s.window_unsent_since_ns = if (s.window_unsent == 0) 0 else self.edge_now_ns;
+        }
+        self.oweWindowUpdate(stream_id, inc);
+    }
+
     /// `inc` of credit, granted and not sent: kept until `requeueOwed`.
-    /// Called by the edge for a WINDOW_UPDATE it refused, too.
     pub fn oweWindowUpdate(self: *Session, stream_id: u31, inc: u31) void {
         const owed = self.windowOwedPtr(stream_id) orelse return;
         // It stays within the window, which a u31 holds: the credit was just
@@ -1810,6 +2063,9 @@ pub const Session = struct {
         if (self.terminal != .none) return;
         var left = room;
         const o = &self.owed;
+        // Owed credit that goes out ends a body pause (`BodyClock`).
+        const credit_owed = o.conn_window != 0 or o.streams;
+        defer if (credit_owed) self.syncBodyPauses(0);
         while (o.settings_acks != 0 and self.owedRoom(left)) {
             const p = self.settingsAckFrame() catch return;
             self.pushIntent(.{ .outbound_frame = .{ .typ = .settings, .payload = p, .flags = .{ .end_stream = true } } }) catch unreachable;
@@ -1851,6 +2107,7 @@ pub const Session = struct {
         const n = frame.Serializer.windowUpdate(&buf, stream_id, owed.*) catch unreachable;
         const p = self.controlFrame(buf[0..n], .ordinary) catch return false;
         self.pushIntent(.{ .outbound_frame = .{ .typ = .window_update, .payload = p, .stream_id = stream_id } }) catch unreachable;
+        self.noteCreditQueued(stream_id, owed.*);
         owed.* = 0;
         return true;
     }
@@ -2064,6 +2321,9 @@ pub const Session = struct {
         const s = s_ptr.?;
 
         if (s.headers_done) {
+            // A trailer block ends the body, or the stream: either way its
+            // clock stops here.
+            _ = self.body_clocks.remove(stream_id);
             // Trailers only legal while remote half is still open, and MUST carry END_STREAM.
             if (!self.header_end_stream) {
                 self.dropDecoded(stream_id, decoded, scratch_status != null);
@@ -2115,6 +2375,11 @@ pub const Session = struct {
             self.releaseConcurrency(stream_id, .no_error);
             return;
         }
+
+        // A body is owed from now, whatever happens to the request below: an
+        // early refusal still reads and discards the body until END_STREAM,
+        // and a reset removes the clock with the stream (`releaseConcurrency`).
+        if (!self.header_end_stream) self.startBodyClock(stream_id);
 
         // More fields or decoded bytes than the limits allow: only a prefix of
         // the block was kept, and a prefix cannot be validated. It is a 431.
@@ -3744,7 +4009,7 @@ test "owed stream credit: DATA up to what the peer was told is taken, one byte m
     const n = drainFrames(gpa, &session, &seen);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expect(seen[0].typ == .window_update and seen[0].sid == 1);
-    session.oweWindowUpdate(1, seen[0].inc);
+    session.refuseWindowUpdate(1, seen[0].inc);
     // Exactly what the peer was told is still taken.
     const told: usize = flow.INITIAL_WINDOW - half;
     wire.clearRetainingCapacity();
@@ -3758,6 +4023,170 @@ test "owed stream credit: DATA up to what the peer was told is taken, one byte m
     try session.ingest(wire.items);
     try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
     try std.testing.expect(session.terminal == .none);
+}
+
+test "the queued-credit cap promotes only credit that waited the whole cap (astra 4 / Fable F1, round 3)" {
+    // Two uploads whose WINDOW_UPDATEs wait behind a busy writer: stream 1's
+    // credit queued at 1 s, stream 3's at 14.9 s. At the cap of stream 1's
+    // credit (16 s) only stream 1 counts as told; stream 3 stays paused
+    // until its own credit has waited the cap (29.9 s).
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    const s_ns = std.time.ns_per_s;
+    const cap_ns = session.limits.request_body_idle_timeout_ns;
+    try std.testing.expectEqual(15 * s_ns, cap_ns);
+    session.edge_now_ns = 1 * s_ns;
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var seen: [16]SeenFrame = undefined;
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try appendTestRequest(gpa, &wire, 3, &post, false);
+    try session.ingest(wire.items);
+    _ = drainFrames(gpa, &session, &seen);
+    if (@hasDecl(Session, "creditOnWire")) session.creditOnWire();
+    // Stream 1 uses its whole window at 1 s.
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, flow.INITIAL_WINDOW);
+    try session.ingest(wire.items);
+    _ = drainFrames(gpa, &session, &seen);
+    // Stream 3 uses its whole window at 14.9 s.
+    session.edge_now_ns = 14 * s_ns + 900 * std.time.ns_per_ms;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 3, flow.INITIAL_WINDOW);
+    try session.ingest(wire.items);
+    _ = drainFrames(gpa, &session, &seen);
+    // The edge at the cap, the way `checkResponseRates` calls it.
+    const edgeCap = struct {
+        fn run(ss: *Session, cap: u64) void {
+            const d = ss.unsentDeadlineNs(cap) orelse return;
+            if (ss.edge_now_ns < d) return;
+            if (@hasDecl(Session, "creditOnWireBefore")) ss.creditOnWireBefore(ss.edge_now_ns, cap) else ss.creditOnWire();
+        }
+    }.run;
+    var t: u64 = 15;
+    while (t <= 46) : (t += 1) {
+        session.edge_now_ns = t * s_ns;
+        edgeCap(&session, cap_ns);
+        try session.checkIdleDeadlines(session.edge_now_ns);
+        const rst = countTerminalIntents(gpa, &session).rst;
+        // Stream 1: told at 16 s, idle 15 s: reset at 31 s. Stream 3 told at
+        // 30 s (its cap at 29.9 s, seen on the next whole second): reset at 45 s.
+        if (t < 31) try std.testing.expectEqual(@as(usize, 0), rst);
+        if (t == 31) try std.testing.expectEqual(@as(usize, 1), rst);
+        if (t > 31 and t < 45) {
+            try std.testing.expectEqual(@as(usize, 0), rst);
+            try std.testing.expect(session.streams.contains(3));
+        }
+        if (t == 45) try std.testing.expectEqual(@as(usize, 1), rst);
+    }
+}
+
+test "a refused older WINDOW_UPDATE does not shorten the cap of younger credit on the same entry (Fable F1, round 4)" {
+    // Stream 1 queues credit A at 1 s and B at 10 s (two frames: B is not
+    // joined to A, which is queued, not owed). The edge refuses A at 10 s.
+    // B's cap must run from no earlier than 10 s, not from A's 1 s.
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    const s_ns = std.time.ns_per_s;
+    const cap_ns = session.limits.request_body_idle_timeout_ns;
+    session.edge_now_ns = 1 * s_ns;
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var seen: [16]SeenFrame = undefined;
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    _ = drainFrames(gpa, &session, &seen);
+    session.creditOnWire();
+    const half: usize = flow.INITIAL_WINDOW / 2 + 1;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, half);
+    try session.ingest(wire.items);
+    var n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    const inc_a = seen[0].inc;
+    session.edge_now_ns = 10 * s_ns;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, half);
+    try session.ingest(wire.items);
+    n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(seen[0].typ == .window_update and seen[0].sid == 1);
+    // The edge refuses the older frame, then requeues what is owed (no room).
+    session.refuseWindowUpdate(1, inc_a);
+    session.requeueOwed(0);
+    var t: u64 = 11;
+    while (t <= 41) : (t += 1) {
+        session.edge_now_ns = t * s_ns;
+        if (session.unsentDeadlineNs(cap_ns)) |d| {
+            if (session.edge_now_ns >= d) session.creditOnWireBefore(session.edge_now_ns, cap_ns);
+        }
+        try session.checkIdleDeadlines(session.edge_now_ns);
+        const rst = countTerminalIntents(gpa, &session).rst;
+        // B told at 25 s (its cap from 10 s): paused 10-25 s, so the idle
+        // rule (last byte at 10 s, 15 s) fires at 40 s. With A's time kept,
+        // B was told at 16 s and the stream reset at 31 s.
+        if (t < 40) try std.testing.expectEqual(@as(usize, 0), rst);
+        if (t == 40) try std.testing.expectEqual(@as(usize, 1), rst);
+    }
+}
+
+test "a refused WINDOW_UPDATE's credit is counted once: the body clock still runs while the peer holds credit (astra 3)" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    const s_ns = std.time.ns_per_s;
+    session.edge_now_ns = 1 * s_ns;
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    if (@hasDecl(Session, "creditOnWire")) session.creditOnWire();
+    // Half the stream window and one byte: the server grants it back, and
+    // the edge refuses the WINDOW_UPDATE (its share is full).
+    const half: usize = flow.INITIAL_WINDOW / 2 + 1;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, half);
+    try session.ingest(wire.items);
+    const n = drainFrames(gpa, &session, &seen);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(seen[0].typ == .window_update and seen[0].sid == 1);
+    if (@hasDecl(Session, "refuseWindowUpdate")) session.refuseWindowUpdate(1, seen[0].inc) else session.oweWindowUpdate(1, seen[0].inc);
+    // The edge's next turn retries owed frames with whatever room it has
+    // (none here): the body clocks' pauses are brought in line then.
+    session.requeueOwed(0);
+    // The peer still holds what it was told and did not send: its body
+    // stalls by its own choice, and the idle rule (15 s) ends it.
+    session.edge_now_ns = 15 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+    session.edge_now_ns = 17 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
 }
 
 test "an owed ack whose retry the edge refuses again keeps the limit: no token is refilled twice (t-3562)" {
@@ -3831,7 +4260,7 @@ test "owed window credit: DATA is held to what the peer was told, and a stream's
     var n = drainFrames(gpa, &session, &seen);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expect(seen[0].typ == .window_update and seen[0].sid == 1);
-    session.oweWindowUpdate(1, seen[0].inc);
+    session.refuseWindowUpdate(1, seen[0].inc);
     // The peer was told INITIAL_WINDOW - half: one byte more on stream 1 is
     // a flow-control error for that stream, even though the server's own
     // window has the credit.
@@ -3855,7 +4284,7 @@ test "owed window credit: DATA is held to what the peer was told, and a stream's
     n = drainFrames(gpa, &session, &seen);
     try std.testing.expectEqual(@as(usize, 1), n);
     const first_inc = seen[0].inc;
-    session.oweWindowUpdate(3, first_inc);
+    session.refuseWindowUpdate(3, first_inc);
     wire.clearRetainingCapacity();
     try appendTestData(gpa, &wire, 3, rest_len);
     try session.ingest(wire.items);
@@ -3961,7 +4390,7 @@ test "streams reset mid-body leave no table entry, so the boot-sized tables neve
     // table that tried to grow could not: `putBounded` would panic first. A
     // peer that opens a stream, sends body bytes without END_STREAM and resets
     // it does this once per stream id, with no limit on the ids. Before
-    // `releaseConcurrency` removed the idle clock, `body_idle_ns` kept one
+    // `releaseConcurrency` removed the idle clock, `body_clocks` kept one
     // entry per such stream and filled up after a handful.
     const gpa = std.testing.allocator;
     var limits: limits_mod.Limits = .defaults;
@@ -4008,6 +4437,156 @@ test "streams reset mid-body leave no table entry, so the boot-sized tables neve
         try std.testing.expectEqual(@as(u32, 0), session.streams.count());
         try std.testing.expectEqual(@as(u32, 0), session.pending_bodies.count());
         try std.testing.expectEqual(@as(u32, 0), session.pending_headers.count());
-        try std.testing.expectEqual(@as(u32, 0), session.body_idle_ns.count());
+        try std.testing.expectEqual(@as(u32, 0), session.body_clocks.count());
     }
+}
+
+test "a body paused on credit the server owes does not expire, and its clock resumes when the credit goes out" {
+    // The one way this server withholds receive credit today: a
+    // WINDOW_UPDATE the edge could not queue is owed (`Owed`), so the peer
+    // was told less than the window holds and, once it has sent that much,
+    // may send nothing. The body clocks must not count that time.
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    const s_ns = std.time.ns_per_s;
+    session.edge_now_ns = 1 * s_ns;
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    try std.testing.expect(session.body_clocks.contains(1));
+    // Half the window and a byte: the stream's WINDOW_UPDATE is refused by
+    // the edge and owed. Then exactly what the peer was told: its credit is
+    // now zero.
+    const half: usize = flow.INITIAL_WINDOW / 2 + 1;
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, half);
+    try session.ingest(wire.items);
+    _ = drainFrames(gpa, &session, &seen);
+    session.refuseWindowUpdate(1, seen[0].inc);
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, flow.INITIAL_WINDOW - half);
+    try session.ingest(wire.items);
+    try std.testing.expect(session.body_clocks.get(1).?.paused_since_ns != null);
+    try std.testing.expectEqual(@as(?u64, null), session.nextIdleDeadlineNs());
+
+    // Far past the idle limit (15 s) while paused: nothing expires.
+    session.edge_now_ns = 100 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+    try std.testing.expect(session.streams.contains(1));
+
+    // The owed credit goes out and reaches the wire: the clock runs again
+    // from here.
+    session.requeueOwed(16);
+    _ = drainFrames(gpa, &session, &seen);
+    session.creditOnWire();
+    try std.testing.expect(session.body_clocks.get(1).?.paused_since_ns == null);
+    session.edge_now_ns = 114 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+    // And it still expires: 15 s with no body byte after the pause ended.
+    session.edge_now_ns = 116 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
+}
+
+test "a body clock starts at HEADERS, and an empty or all-padding DATA frame is not progress" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    const s_ns = std.time.ns_per_s;
+    session.edge_now_ns = 1 * s_ns;
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    // HEADERS alone armed it: the minimum rate's grace from HEADERS.
+    try std.testing.expectEqual(@as(?u64, 1 * s_ns + session.limits.request_body_min_rate_grace_ns), session.nextIdleDeadlineNs());
+    // An empty DATA and a DATA that is all padding, a second later each.
+    var hdr: [frame.FRAME_HEADER_LEN]u8 = undefined;
+    session.edge_now_ns = 2 * s_ns;
+    wire.clearRetainingCapacity();
+    (frame.FrameHeader{ .length = 0, .type = .data, .flags = .{}, .stream_id = 1 }).encode(&hdr);
+    try wire.appendSlice(gpa, &hdr);
+    try session.ingest(wire.items);
+    session.edge_now_ns = 3 * s_ns;
+    wire.clearRetainingCapacity();
+    (frame.FrameHeader{ .length = 9, .type = .data, .flags = .{ .padded = true }, .stream_id = 1 }).encode(&hdr);
+    try wire.appendSlice(gpa, &hdr);
+    try wire.append(gpa, 8);
+    try wire.appendNTimes(gpa, 0, 8);
+    try session.ingest(wire.items);
+    _ = drainFrames(gpa, &session, &seen);
+    const clock = session.body_clocks.get(1).?;
+    try std.testing.expectEqual(@as(u64, 0), clock.bytes);
+    try std.testing.expectEqual(@as(u64, 1 * s_ns), clock.last_ns);
+    // So the grace from HEADERS still ends it.
+    session.edge_now_ns = 1 * s_ns + session.limits.request_body_min_rate_grace_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
+}
+
+test "a body waiting on credit the server queued but has not written does not expire" {
+    // astra 5: the WINDOW_UPDATE that would let the peer go on is queued
+    // (an intent here, on the edge somewhere in the writer), so the peer has
+    // not been told. Its body clock must wait like it does for owed credit,
+    // and run again once the writer has written it (`creditOnWire`).
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    const s_ns = std.time.ns_per_s;
+    session.edge_now_ns = 1 * s_ns;
+    try ingestPrefaceAndSettings(&session, gpa);
+    const post = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":authority", .value = "localhost" },
+    };
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &post, false);
+    try session.ingest(wire.items);
+    var seen: [16]SeenFrame = undefined;
+    _ = drainFrames(gpa, &session, &seen);
+    if (@hasDecl(Session, "creditOnWire")) session.creditOnWire();
+    // The whole stream window the peer was told: the server grants more, and
+    // its WINDOW_UPDATEs are queued, not written.
+    wire.clearRetainingCapacity();
+    try appendTestData(gpa, &wire, 1, flow.INITIAL_WINDOW);
+    try session.ingest(wire.items);
+    // Far past the idle limit (15 s) with the credit still unwritten.
+    session.edge_now_ns = 100 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+    try std.testing.expect(session.streams.contains(1));
+    // The writer drained: the peer has the credit, and the clock runs again.
+    _ = drainFrames(gpa, &session, &seen);
+    if (@hasDecl(Session, "creditOnWire")) session.creditOnWire();
+    session.edge_now_ns = 114 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 0), countTerminalIntents(gpa, &session).rst);
+    session.edge_now_ns = 116 * s_ns;
+    try session.checkIdleDeadlines(session.edge_now_ns);
+    try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
 }
