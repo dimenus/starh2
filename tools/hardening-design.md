@@ -253,19 +253,21 @@ and `examples/datastar_sse.zig` keeps `Server` on its stack. zio's
 `Runtime.deinit` asserts every task stack is back (`runtime.zig:1898`) and
 joins the worker threads, which a non-yielding handler never lets finish.
 
-So:
+So while a handler still runs, the only safe end is the end of the process.
+Returning from `serve` would buy nothing: the caller could not run
+`Server.deinit` (the orphan still writes that memory, and a `defer` would run
+it anyway) nor `Runtime.deinit`. A reference-counted heap core was considered
+and rejected (Ryan, 2026-11-02): it only lets the process keep running after a
+stuck shutdown, which nothing needs, and it still leaves the runtime problem.
 
-- Everything an orphan can reach lives in one heap object, the server core,
-  reference-counted by the `Server` and by every live handler. `Server.deinit`
-  drops its reference; the last holder frees the core. `Server.init` changes
-  shape accordingly (a breaking API change; no users).
-- Shutdown: GOAWAY, wait for the drain deadline, request cancel of every
-  handler, wait a short grace (1 s, as Kestrel), then `serve` returns
-  `error.HandlersStuck` with the count and routes. Cancelling `serve` ends the
-  wait early with the same result. Never a panic.
-- After `HandlersStuck` the embedder must exit the process without
-  `Runtime.deinit`: zio cannot be torn down under a live task. This is part of
-  the `serve` contract, written beside it, and the examples do it.
+- **`serve` never returns while a handler still runs.** Shutdown: GOAWAY, wait
+  for the drain deadline, request cancel of every handler, wait a short grace
+  (1 s, as Kestrel). If handlers remain, log them (count, routes, oldest age)
+  and keep waiting, logging again at a fixed interval. The wait ignores
+  cancel. The process supervisor's kill ends it, and the log has already
+  named the cause. Never a panic, never a use-after-free, no API change.
+- This is the `serve` contract, written beside it: `serve` returns only when
+  no handler can touch the server again.
 - Every `deinit` check becomes a run-time check that logs, not a
   `std.debug.assert`; underflow of any account is a counted run-time error.
 
@@ -317,7 +319,8 @@ its own, so the series bisects. Pushed together when the last one is done
 
 1. Missing deadlines (body at HEADERS, minimum rates in and out) and accept
    robustness with the RLIMIT_NOFILE check. Need no accounts.
-2. The server core as one heap object; lifetime and the shutdown contract.
+2. The shutdown contract: bounded drain, cancel, grace, then an unbounded
+   logged wait; run-time `deinit` checks.
 3. Accounts, the client table, client identity, PROXY protocol v2.
 4. Per-client shares under pressure; the handshake rate.
 5. Route shares; the spike folded in with its charges.
@@ -337,6 +340,7 @@ its own, so the series bisects. Pushed together when the last one is done
 - Q3. HTTP/1.1 moves to the link model in this series (its own commit).
 - Q4. Non-yielding handlers: detect and log, watchdog on zio's monitor
   thread (zio-fork task first).
-- Q5. The server core becomes a reference-counted heap object, and after
-  `HandlersStuck` the embedder exits without `Runtime.deinit`.
+- Q5. DECIDED (Ryan, 2026-11-02): `serve` never returns while a handler still
+  runs; after the shutdown limit it logs the stuck handlers and keeps waiting.
+  No heap core, no `HandlersStuck` error.
 - Q6. Landing: a bisectable series pushed together, not one squash.
