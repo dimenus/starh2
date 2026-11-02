@@ -1,15 +1,16 @@
 # starh2 hardening: no client and no broken route can starve the server
 
-Task t-3759 (widens t-3737). Status: DESIGN, for panel review and Ryan's
-decision. Nothing here is built except the t-3737 spike (`839dd69`).
+Task t-3759 (widens t-3737). Status: DESIGN v2, after one panel round (Opus,
+Fable, gpt-6-astra; `tools/t3759-panel/design-*.md`, and the Opus and Fable
+answers in the t-3737 session). Nothing here is built except the t-3737 spike
+(`839dd69`).
 
-Sources, read them before you argue with a number:
+Evidence:
 
-- Inventory of every finite resource at `839dd69`, with file:line and
-  arithmetic: `tools/t3759-inventory.md`
-- What Envoy, nginx, HAProxy, h2o, Go, hyper, Kestrel and Pingora do, with
+- Resource inventory at `839dd69`, file:line and arithmetic: `tools/t3759-inventory.md`
+- What Envoy, nginx, HAProxy, h2o, Go, hyper, Kestrel, Pingora do, with
   sources: `tools/t3759-research.md`
-- The t-3737 panel on stuck handlers (two rounds): `tools/t3759-panel/`.
+- The t-3737 stuck-handler panel: `tools/t3759-panel/`
 
 ## Premises (settled)
 
@@ -22,230 +23,320 @@ Sources, read them before you argue with a number:
    and enters the connection through a gate; the connection's slot is freed
    when the connection ends.
 5. A process-wide panic is never the answer to client or handler behaviour.
-6. Share-nothing over shared state; zio primitives only (AGENTS.md).
+6. Share-nothing over shared state; zio primitives only (AGENTS.md). One
+   exemption, named below: the executor watchdog runs on an OS thread.
 
 ## The goal, stated as a test
 
-For every resource in the inventory: one client, acting alone with many
-connections, serially or at once, cannot take more than its share; and one
-route whose handler misbehaves cannot take more than the route's share. Every
-other client and route keeps working. Each claim is an attack test on real
-sockets that fails today and passes after.
+For every resource in the inventory except executor time (row 5): one client
+identity, acting alone with many connections, serially or at once, cannot hold
+more than its share while the server is under pressure; and one route whose
+handler misbehaves cannot hold more than the route's share. Every other client
+and route keeps working. Each claim is an attack test on real sockets that
+fails today and passes after.
 
-Not a goal: protecting against a distributed attack from many addresses. Past
-the per-client shares, the server-wide limits and the overload ladder decide.
+Executor time is not contained, because premise 2 makes it impossible: N
+requests to a route that never yields stop N executors. That row is detected
+and reported, and the goal says so.
+
+Not a goal: a distributed attack from many identities. Past the shares, the
+server-wide limits and the overload ladder decide.
 
 ## What the evidence says
 
-- Today nothing keys on the peer address (inventory section 3). Every limit is
-  per stream, per connection or server-wide, and per-connection limits vanish
-  when the connection ends.
-- The cheapest attacks need no broken route (inventory section 4):
-  1. HEADERS without END_STREAM, then silence: no timer at all. 16
-     connections x 256 streams hold every stream token and, at 64 KiB each,
-     the whole 256 MiB request pool. Then every request on the server fails.
-  2. 128 silent TCP connections hold every TLS handshake slot.
-  3. 1,024 sockets hold every connection; the accept loop parks, so all
-     endpoints stop accepting.
-  4. An accept error such as EMFILE ends that endpoint's accept loop for the
-     life of the process.
-  8. Slow request bodies (one DATA per < 15 s) fill the pool.
-  9. Zero window plus 1-byte WINDOW_UPDATEs hold the outbound budget; a tiny
-     update counts as progress.
-- The broken-route attacks: orphans fill task tokens, the pool, compression
-  contexts (rows 6, 10); on HTTP/1.1 an abandoned request on a route that
-  ignores cancel pins one of 64 reaper workers (row 7); a non-yielding handler
-  freezes an executor (row 5).
+- Nothing keys on the peer address (inventory section 3). Every limit is per
+  stream, per connection or server-wide, and per-connection limits vanish when
+  the connection ends.
+- The cheapest attacks need no broken route (inventory section 4): HEADERS
+  without END_STREAM then silence (no timer at all; 16 connections fill every
+  stream token and the 256 MiB pool); silent TLS connects (128 hold every
+  handshake slot); 1,024 sockets (the accept loop parks for every endpoint);
+  an accept error such as EMFILE (the endpoint's accept loop exits for good);
+  slow bodies; a zero window with 1-byte WINDOW_UPDATEs.
+- Broken-route attacks: orphans hold task tokens, pool bytes and compression
+  contexts; on HTTP/1.1 an abandoned request on a cancel-ignoring route pins
+  one of 64 reaper workers; a non-yielding handler freezes an executor.
 - Every surveyed server's HTTP/2 defences are per connection; per-client
-  limits exist only as opt-in limiters (nginx `limit_conn`, HAProxy stick
-  tables, Envoy local rate limit). Go, Kestrel and HAProxy keep charging a
-  handler until it really returns, which is why MadeYouReset did not hit them;
-  servers that released at RST while the work ran on were hit (research,
-  synthesis 2). Only Envoy has an overload model (research, synthesis 3).
+  limits exist only as opt-in limiters. Go, Kestrel and HAProxy charge a
+  handler until it really returns, which is why MadeYouReset missed them.
+  Only Envoy has an overload model (research, synthesis).
 
 ## The rule everything follows
 
 **A resource is charged from the moment it is taken until it is really
-released, to every party that holds it.** RST_STREAM, GOAWAY and connection
-close end a protocol state; they do not release a charge whose holder still
-runs. An orphan handler is still charged.
+released, to every party that holds it.** An orphan handler is still charged.
+
+Two things the round-1 draft merged, kept apart (all three reviewers):
+
+- **Protocol-open streams** are released when the stream closes, RST
+  included, as today (`session.zig:1120-1126`). A browser may reopen within
+  `SETTINGS_MAX_CONCURRENT_STREAMS` after a reset; Datastar resets SSE streams
+  on page change.
+- **Task handlers** are held until the handler returns, orphan included.
 
 The parties ("accounts"):
 
 | account | lives | keyed by |
 |---|---|---|
-| server | process | — |
+| server | until the last holder ends (see Lifetime) | — |
 | client | while anything is charged to it | peer identity (below) |
-| route | server | route index (`Router.match` returns it) |
+| client aggregate (IPv6 only) | while anything is charged to it | the /56 of the identity |
+| route | server | route index (`Router.match` will return it; today `Match.found` carries only the handler) |
 | connection | until its socket ends | — |
-| stream | until its handler returns and its frames are gone | — |
 
 A charge is a small fixed list of account pointers taken at admission. The
-take is all-or-nothing in a fixed order (client, route, server), each a
-bounded CAS on a counter, undone in reverse on refusal. Release walks the same
-list. A connection-level charge moves off the connection when the connection
-ends and stays on the client, route and server.
+take is all-or-nothing in a fixed order (client, aggregate, route, server),
+each a bounded CAS, undone in reverse on refusal. Release walks the same list.
+A connection-level charge moves off the connection when the connection ends
+and stays on the others.
 
-The client table is a fixed-size open-addressing table in the server, sized
-at boot: an entry exists only while something is charged to it, and every
-charge is bounded by the server limits, so the table cannot overflow
-(capacity = `max_connections` + `concurrent_tls_handshakes` + the task-handler
-limit). No allocation after boot, no eviction.
+Validation at boot, for every byte and count resource: stream ≤ connection ≤
+client ≤ server (the draft broke this: a 64 MiB connection pool limit above a
+32 MiB client share is dead).
+
+### The client table
+
+- Fixed size, sized at boot: capacity = `max_connections` +
+  `concurrent_tls_handshakes` + the task-handler limit, because an entry
+  exists only while something is charged and every charge is bounded. No
+  allocation after boot.
+- Open addressing with backward-shift deletion (no tombstones: a client that
+  cycles through identities must not turn lookups into scans). The hash is
+  keyed with a random seed at boot (keys are attacker-chosen).
+- Insert at accept races a delete of the same key when its last charge drops
+  on another executor. The table needs a stated protocol for that; the
+  implementer proposes it and a test drives the race. Alternative to weigh in
+  the build: place every connection of one identity on executor
+  `hash(identity) mod N`, so each executor owns its own table with no atomics
+  and one client's CPU is confined to one executor. Its cost: behind a proxy
+  without PROXY protocol, all traffic lands on one core.
 
 ## Client identity
 
-- Default: the socket peer address. IPv4 per address; IPv6 grouped by /64
-  (no surveyed server does this by default; a /64 is what one subscriber
-  usually gets, and per-address IPv6 limits are free to evade).
-- Unix socket endpoints: one identity per endpoint, unless PROXY protocol.
-- Behind a proxy: PROXY protocol v2, opt-in per endpoint, accepted only from a
-  configured set of source addresses (or on a Unix socket). No
-  X-Forwarded-For: identity is needed before HTTP is parsed, at accept and
-  during the TLS handshake.
-- A proxy without PROXY protocol makes every user one client. The per-client
-  shares would then throttle everyone. Boot cannot detect this. Proposal: the
-  per-client share is a config value per resource, and the docs on the
-  endpoint say to raise it to the server limit when no PROXY header is used.
-  **Decision for Ryan (Q1).**
+Per endpoint, `client_identity = .peer | .proxy_protocol | .none`:
 
-## Per-client shares
+- `.peer` (default): the socket peer address. IPv4 per address. IPv6 by /64,
+  plus a /56 aggregate account with 4x the /64 share, because one subscriber
+  usually gets a /56 or a /48 and 8 /64s would otherwise give 8 shares.
+- `.proxy_protocol`: PROXY protocol v2 only, accepted only from configured
+  source addresses or on a Unix socket. Shares are charged **after** the
+  header is parsed, never to the proxy's address. Connections still waiting
+  for the header have their own small cap and a deadline. A v2 `LOCAL`
+  command (proxy health checks) is keyed to the socket address.
+- `.none`: no per-client shares on that endpoint; logged at boot. This is the
+  honest setting behind an L7 proxy without PROXY protocol (an ALB, a CDN):
+  there, per-client isolation does not exist, and the config says so instead
+  of seven numbers someone must remember to raise.
+- No X-Forwarded-For: identity is needed at accept and during the handshake.
+- Unix socket endpoints without PROXY: `.none` by default.
 
-Each server-wide limit gets a per-client share. Proposed default: 1/8 of the
-server limit, with a floor that a normal browser or Datastar page never
-reaches. **Decision for Ryan (Q2).**
+## Per-client shares, applied under pressure
 
-| resource | server default | client share | refusal when over |
+Users behind one NAT share an identity (an office, a mobile carrier). A share
+that always applies refuses them on an idle server; this is why no surveyed
+server defaults a per-client limit (Fable, astra). So a share bites only under
+pressure:
+
+**A client over its share is refused only while the server resource is at or
+above its pressure mark** (default: 2x the share). One attacker still cannot
+hold more than the mark; a second client is still served; a crowd behind one
+NAT is not refused while there is room. Cost: one atomic load per admission.
+
+| resource | server default | client share | refusal |
 |---|---|---|---|
-| connections | 1,024 | 128 | close at accept (before TLS) |
-| TLS handshakes in progress | 128 | 8 | close at accept |
-| open streams | 4,096 | 512 | RST_STREAM REFUSED_STREAM |
+| connections | 1,024 | 128 | close at accept (after the PROXY header on proxy endpoints) |
+| TLS handshakes in progress | 128 | 16 | close at accept |
+| TLS handshakes started per second | — | token bucket, burst 32, 16/s | close at accept |
+| protocol-open streams | 4,096 | 512 | RST_STREAM REFUSED_STREAM |
 | task handlers, orphans included | 4,096 | 512 | RST_STREAM REFUSED_STREAM / H1 503 |
 | request pool bytes | 256 MiB | 32 MiB | 503 (lease) |
 | outbound bytes | 256 MiB | 32 MiB | the existing per-stream shed |
-| compression contexts | 128 | 16 | identity encoding (as today) |
+| compression contexts | 128 | 16 | identity encoding |
 
-Local development and benches run every client from 127.0.0.1. They get
-explicit config, not a loopback exemption: an exemption would let a proxy on
-the same host bypass every share.
+The handshake rate is new (Opus): a share of handshakes in progress does not
+bound how many full handshakes per second one client forces, each an ECDHE
+plus a signature.
 
-## Route pools
+## Protocol work that holds nothing
 
-Each route has a task-handler limit, reserved at dispatch and held until the
-handler returns (orphan included), plus the request-pool bytes its handlers
-hold. Over either: 503 on that route only. Hard limit, not a breaker: a
-short-lived orphan holds its place for microseconds, so no grace period and
-no age logic. Default: 1/4 of the task-handler limit and 1/4 of the pool.
-A route that needs more (a busy SSE route) raises its own limit.
+HEADERS and DATA are exempt from the frame rate limits (`rates.zig:121-129`),
+and an empty or padding-only DATA frame charges no flow-control bytes. A
+client can spend parse work without holding anything a share counts. Add
+per-connection buckets for HEADERS and for DATA frames that carry no body
+bytes, with ENHANCE_YOUR_CALM when exceeded; padding never counts as body
+progress. Measure the cost of a flood before and after, on one executor.
 
-This is what contains many honest clients on one broken route: the client
-shares cannot, because each client stays under its share.
+## Route shares
+
+Each task route has a limit on task handlers (orphans included) and on the
+request-pool bytes they hold, reserved at dispatch and held until the handler
+returns. Over either: 503 on that route only. A hard limit, not a breaker.
+Default: the server limit divided by the number of task routes, so a Datastar
+app with one SSE route can use the whole server; each route can override.
+Compression contexts are charged to the route too.
+
+This is what contains many honest clients on one broken route; client shares
+cannot, because each client stays under its share.
 
 ## Missing deadlines
 
-- **Request body:** the body clock starts at HEADERS without END_STREAM, not
-  at the first DATA. Add a minimum rate after a grace period, as Kestrel
-  (`MinRequestBodyDataRate`, 240 B/s after 5 s): an idle clock reset by every
-  byte lets one byte per 14 s hold a stream for ever. Same for HTTP/1.1.
-- **Response:** slow-consumer progress is bytes actually sent per second over
-  a window, not "any WINDOW_UPDATE". Minimum rate as Kestrel's
-  `MinResponseDataRate`.
-- **TLS handshake:** keep the 5 s deadline; the per-client share above stops
-  one client holding all 128.
-- **HEADERS-only stream with END_STREAM and a handler:** covered by the task
-  charge and shares, not a timer; a handler may legitimately run for hours (SSE).
+- **Request body:** the clock starts at HEADERS without END_STREAM, not at the
+  first DATA. A minimum rate after a grace period (Kestrel
+  `MinRequestBodyDataRate`: 240 B/s after 5 s), counting body bytes only (not
+  padding, not empty frames), and paused while the server itself is not
+  granting window. Same for HTTP/1.1.
+- **Response:** the minimum rate is measured only while bytes are queued for a
+  stream and the client is not taking them (Kestrel times outstanding writes).
+  An SSE stream that sends one event a minute is not slow; a stream with
+  pending bytes and a 1-byte window is.
+- **TLS handshake:** the 5 s deadline stays; the shares and the rate above
+  stop one client holding the slots.
+
+## Running handlers per connection
+
+There is no new cap: a handler keeps its slot until it returns, there are
+`max_streams_per_connection` slots, and 256 more requests can park before
+REFUSED_STREAM (`connection.zig:7626-7631`). That is already Kestrel's 2x.
+The change: when every slot holds a handler whose stream has ended and the
+park queue is full, send GOAWAY ENHANCE_YOUR_CALM instead of refusing one
+stream at a time.
 
 ## Admission and overload
 
-- Over a per-client share: refuse that client, never park the accept loop for
-  everyone.
-- Server full (connections): first close idle connections, oldest first (an
-  H2 connection with no open stream, an H1 keep-alive between requests), as
-  nginx and Envoy do; only then park. This is the first rung of Envoy's
-  ladder.
-- Pool or outbound near full: refuse new work from the client holding the
-  most, before refusing anyone else (Envoy's victim choice adapted: a reset
-  frees nothing on demand here, because tasks cannot be killed, so the action
-  is refusal and closing that client's idle connections, not stream resets).
-- Accept errors: never leave the loop. EMFILE, ENFILE, ENOBUFS, ENOMEM: log
-  once per burst, back off 10 ms doubling to 1 s, retry.
-- Boot: read RLIMIT_NOFILE, raise the soft limit to the hard limit, and refuse
-  to start when the hard limit is below `max_connections` plus a margin for
-  listeners, the event loop and handlers.
+- Over a share under pressure: refuse that client. Never park the accept loop
+  for everyone because of one client.
+- Pressure-scaled idle timeouts instead of a server-wide idle list (Fable,
+  after Envoy `reduce_timeouts`): each actor reads one atomic pressure level
+  and shortens `connection_idle_timeout_ns` and the HTTP/1.1 keep-alive wait
+  when the server is near full. The oldest idle connection goes first by
+  construction; no list, no cross-executor signal.
+- Last rung before parking: GOAWAY to the oldest connection of the client
+  holding the most connections (Opus). Closing a busy connection does free
+  its slot, protocol-open streams, outbound bytes and pre-dispatch leases.
+  (The draft's "refuse the top holder" is cut: with shares in place it frees
+  nothing.)
+- Accept errors never end the loop. EMFILE, ENFILE, ENOBUFS, ENOMEM: count,
+  log at most once a minute, back off 10 ms doubling to 1 s, retry.
+- Boot: read RLIMIT_NOFILE, raise the soft limit toward the hard limit
+  (clamped: on macOS the hard limit can be RLIM_INFINITY and `setrlimit`
+  above `kern.maxfilesperproc` fails), and refuse to start when it is below
+  `max_connections` plus a margin. File descriptors a handler opens are not
+  bounded by the server; that is the application's.
 
 ## Stuck handlers
 
-- HTTP/2: the spike's link and gate, with the charges above (client, route,
-  server) held until the handler returns.
-- HTTP/1.1 moves to the same model: link, gate, request arena from the request
-  pool (t-3537). The reaper and its `JoinHandle.cancel` wait are deleted. A
-  request abandoned on a cancel-ignoring route no longer pins a worker.
-- RST_STREAM requests a cancel (spike) and the stream's charges stay until the
-  handler returns. Per connection, the number of handlers still running after
-  their stream ended is capped (2x max streams, as Go and Kestrel); over it,
-  stop reading new HEADERS on that connection and send GOAWAY
-  ENHANCE_YOUR_CALM. The per-client task share caps the same debt across
-  connections.
-- Non-yielding handlers: nothing can stop them. Detect and report: a per
-  executor heartbeat timer; when an executor misses it by more than a limit,
-  log the executor and the task running on it (route if known). Tests run
-  with zio's `debug_cancel` so a handler that swallows `error.Canceled` is
-  reported. Examples default to more than one executor. `zio.blockInPlace` is
-  the documented way to call blocking code. Nothing is refused here: it is an
-  application bug to make visible.
+- HTTP/2: the spike's link and gate, with the task charge (client, aggregate,
+  route, server) held until the handler returns.
+- HTTP/1.1 moves to the same model in its own commit: link, gate, request
+  arena from the request pool (t-3537). The reaper and its
+  `JoinHandle.cancel` wait are deleted. H1 request data now lives in buffers
+  the connection owns (`h1.zig:239-262`), so the reaper cannot go before the
+  link and pool move.
+- Non-yielding handlers are detected, not contained. The watchdog cannot run
+  on the executor it watches (a frozen executor runs no timers), and the
+  default runtime has one executor. It runs on an OS thread: each executor
+  bumps a switch counter, and zio's existing monitor thread
+  (`runMetricsMonitor`, zio `runtime.zig:1789`) samples it and logs an
+  executor whose counter has not moved for a limit, with its current task.
+  This is zio-fork work: a task in that repo, and starh2 consumes it. Tests
+  run with zio's `debug_cancel`, which reports a task that swallowed
+  `error.Canceled`. `zio.blockInPlace` is the documented way to call blocking
+  code.
 
-## Shutdown
+## Lifetime and shutdown
 
-GOAWAY, wait for the drain deadline, request cancel of every handler, wait a
-short grace (1 s, as Kestrel), then `serve` returns `error.HandlersStuck`
-naming the count and routes. Cancelling `serve` ends the wait early, with the
-same result. `deinit` with handlers still running frees nothing they can reach
-(request pool, accounts, balancer, compression pool) and logs it: a bounded
-leak at process end, never a panic, never a use-after-free. All the `deinit`
-checks become run-time checks, not `std.debug.assert`.
+An orphan reaches more than the connection (all three reviewers): the
+accounting, the request pool, the client table, the route counters, the
+balancer, the compression pool, and the zio runtime that runs it. Today the
+first ones are value fields of the embedder's `Server` (`server.zig:132-157`),
+and `examples/datastar_sse.zig` keeps `Server` on its stack. zio's
+`Runtime.deinit` asserts every task stack is back (`runtime.zig:1898`) and
+joins the worker threads, which a non-yielding handler never lets finish.
+
+So:
+
+- Everything an orphan can reach lives in one heap object, the server core,
+  reference-counted by the `Server` and by every live handler. `Server.deinit`
+  drops its reference; the last holder frees the core. `Server.init` changes
+  shape accordingly (a breaking API change; no users).
+- Shutdown: GOAWAY, wait for the drain deadline, request cancel of every
+  handler, wait a short grace (1 s, as Kestrel), then `serve` returns
+  `error.HandlersStuck` with the count and routes. Cancelling `serve` ends the
+  wait early with the same result. Never a panic.
+- After `HandlersStuck` the embedder must exit the process without
+  `Runtime.deinit`: zio cannot be torn down under a live task. This is part of
+  the `serve` contract, written beside it, and the examples do it.
+- Every `deinit` check becomes a run-time check that logs, not a
+  `std.debug.assert`; underflow of any account is a counted run-time error.
 
 ## Observability
 
-Counters per resource and per refusal reason; per-route and per-client
-current holdings for the top holders; orphans by age (count, oldest, bytes).
-Log lines are rate-limited: a client or route is logged when it first hits a
-share or first has an orphan older than a limit, then at most once a minute.
-Every refusal is countable; none is silent.
+Counters per resource and per refusal reason, and orphans by age (count,
+oldest, bytes). Top holders are read on demand by scanning the fixed client
+table, not tracked. One global rate-limited log line for refusals and one for
+orphans older than a limit; no per-client or per-route log state.
 
 ## What stays out
 
-- Distributed attacks beyond per-client shares: the server limits and the
-  overload ladder are the answer.
-- Preempting a non-yielding task: impossible in zio (premise 2).
-- Rate limiting of requests per client (nginx `limit_req`): an application
-  concern; the shares above bound what a client holds, not how often it asks.
+- Distributed attacks beyond per-client shares.
+- Preempting a non-yielding task (premise 2).
+- Request-rate limiting per client (nginx `limit_req`): the shares bound what
+  a client holds; the protocol-work buckets bound frames it sends; how often
+  it may call a route is the application's.
+- Task stacks: not a share. `resourceUpperBound` counts committed stack x the
+  task-handler limit, and the embedder's `stack_pool` setting is named there.
 
 ## Tests
 
-One attack test per inventory row, on real sockets, h2c and TLS where both
-apply, HTTP/1.1 where it applies. Each must fail on `839dd69` (or master) and
-pass after, and must show a second, well-behaved client still served during
-the attack. Plus: Rapid Reset and MadeYouReset shapes against the
-running-handler cap; PROXY protocol identity; the accept back-off with an
-injected EMFILE. Mutation-test each defence. Mac and Linux. Bench against
-master with no regression beyond noise.
+- One attack test per inventory row, real sockets, h2c and TLS where both
+  apply, HTTP/1.1 where it applies. Each fails on `839dd69` (or master) and
+  passes after, and shows a second, well-behaved identity still served during
+  the attack. Each prints its refusal counters, so a test whose attack never
+  engaged is visible.
+- Identities in tests: 127.0.0.1 against ::1 for the plain path; PROXY v2
+  headers to inject identities elsewhere. No test hook for identity. (macOS has
+  only 127.0.0.1 on lo0.)
+- Rapid Reset and MadeYouReset shapes; empty and padding-only DATA floods;
+  a HEADERS flood to complete routes; the handshake rate; the NAT case (many
+  connections from one identity on an idle server are not refused).
+- **Charge conservation, the biggest risk (Opus, Fable):** five accounts,
+  eight resources, every refusal and exit path. After every test, attack tests
+  included, assert at quiescence that the client table is empty and every
+  account is zero, as run-time checks. One soak drives every refusal rung with
+  random RST, close and GOAWAY timing over h2c, TLS and HTTP/1.1, against
+  routes that honour and ignore cancel, then asserts zero. Mutation: delete
+  each release and each undo line in turn; the suite fails for each.
+- Bench against master, `failed == 0` read first, no regression beyond noise.
+  Mac and Linux.
 
-## Order of work (one branch, lands as a whole)
+## Order of work
 
-1. Accounts, client identity, route index from the router.
-2. Missing deadlines (body at HEADERS, minimum rates in and out).
-3. Per-client shares on connections, handshakes, streams, tasks, bytes.
-4. Route pools; the spike folded in with its charges.
-5. HTTP/1.1 onto links and the request pool; reaper deleted.
-6. Accept robustness and the RLIMIT_NOFILE boot check.
-7. Overload ladder: close idle connections, refuse the top holder.
-8. Shutdown and `deinit`.
-9. Observability.
+One branch, a series of commits, each with its own attack tests and green on
+its own, so the series bisects. Pushed together when the last one is done
+(Ryan: no half solution).
+
+1. Missing deadlines (body at HEADERS, minimum rates in and out) and accept
+   robustness with the RLIMIT_NOFILE check. Need no accounts.
+2. The server core as one heap object; lifetime and the shutdown contract.
+3. Accounts, the client table, client identity, PROXY protocol v2.
+4. Per-client shares under pressure; the handshake rate.
+5. Route shares; the spike folded in with its charges.
+6. Protocol-work buckets.
+7. HTTP/1.1 onto links and the request pool; reaper deleted.
+8. Overload: pressure-scaled idle timeouts; GOAWAY to the top holder.
+9. Observability; the executor watchdog (after the zio-fork task).
 
 ## Decisions for Ryan
 
-- Q1. Identity: socket peer, IPv6 /64, PROXY protocol v2 opt-in from trusted
-  sources, no X-Forwarded-For. Per-client shares configurable for deployments
-  behind a proxy without PROXY protocol.
-- Q2. Default per-client share 1/8 of each server limit; route default 1/4.
-- Q3. HTTP/1.1 moves to the link model in this change (reaper deleted).
-- Q4. Non-yielding handlers: detect and log only.
+- Q1. Identity: `client_identity` per endpoint (`.peer` default, IPv6 /64
+  plus a /56 aggregate; `.proxy_protocol` v2 from trusted sources, charged
+  after the header; `.none` behind an L7 proxy without PROXY). No
+  X-Forwarded-For.
+- Q2. Shares apply only under pressure (mark = 2x share). Client share 1/8;
+  route share = server / number of task routes.
+- Q3. HTTP/1.1 moves to the link model in this series (its own commit).
+- Q4. Non-yielding handlers: detect and log, watchdog on zio's monitor
+  thread (zio-fork task first).
+- Q5. The server core becomes a reference-counted heap object, and after
+  `HandlersStuck` the embedder exits without `Runtime.deinit`.
+- Q6. Landing: a bisectable series pushed together, not one squash.
