@@ -329,18 +329,20 @@ its own, so the series bisects. Pushed together when the last one is done
 8. Overload: pressure-scaled idle timeouts; GOAWAY to the top holder.
 9. Observability; the executor watchdog (after the zio-fork task).
 
-## Decisions for Ryan
+## Decisions (Ryan, 2026-11-02)
 
-- Q1. Identity: `client_identity` per endpoint (`.peer` default, IPv6 /64
-  plus a /56 aggregate; `.proxy_protocol` v2 from trusted sources, charged
-  after the header; `.none` behind an L7 proxy without PROXY). No
-  X-Forwarded-For.
-- Q2. Shares apply only under pressure (mark = 2x share). Client share 1/8;
-  route share = server / number of task routes.
-- Q3. HTTP/1.1 moves to the link model in this series (its own commit).
-- Q4. Non-yielding handlers: detect and log, watchdog on zio's monitor
-  thread (zio-fork task first).
-- Q5. DECIDED (Ryan, 2026-11-02): `serve` never returns while a handler still
-  runs; after the shutdown limit it logs the stuck handlers and keeps waiting.
-  No heap core, no `HandlersStuck` error.
-- Q6. Landing: a bisectable series pushed together, not one squash.
+- Q1. Identity: deferred by Ryan to the design ("I don't know what the
+  appropriate identifier is"). The proposal stands and is the item the second
+  panel round must stress-test: `client_identity` per endpoint (`.peer`
+  default, IPv6 /64 plus a /56 aggregate; `.proxy_protocol` v2 from trusted
+  sources, charged after the header; `.none` behind an L7 proxy without PROXY).
+  No X-Forwarded-For.
+- Q2. Agreed: shares apply only under pressure (mark = 2x share). Client share
+  1/8; route share = server / number of task routes.
+- Q3. Agreed: HTTP/1.1 moves to the link model in this series, its own commit.
+- Q4. Agreed: non-yielding handlers are detected and logged; the watchdog runs
+  on zio's monitor thread (zio-fork task first).
+- Q5. Decided: `serve` never returns while a handler still runs; after the
+  shutdown limit it logs the stuck handlers and keeps waiting. No heap core,
+  no `HandlersStuck` error.
+- Q6. Agreed: a bisectable series, pushed together.
