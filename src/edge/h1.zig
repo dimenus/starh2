@@ -58,8 +58,21 @@ pub var test_gpa_allocs: std.atomic.Value(usize) = .init(0);
 const Hctx = struct {
     conn: *H1Conn,
     terminal: *response.SlotTerminal,
-    slot: *connection.HandlerSlot,
+    slot: *Slot,
     method: request.Method,
+};
+
+/// The HTTP/1.1 job's slot: the fields of the HTTP/2 `HandlerSlot` this file
+/// used, before t-3737 moved HTTP/2 handler state into stream links. HTTP/1.1
+/// still joins its handler and cancels it through the reaper, with this
+/// four-state `completion_owner`.
+const Slot = struct {
+    terminal: response.SlotTerminal = .{},
+    completion_owner: std.atomic.Value(u8) = .init(reported),
+    stream_id: u31 = 0,
+    in_use: bool = false,
+    /// True while a reaper job capacity token is held for this slot.
+    reaper_reserved: bool = false,
 };
 
 const Framing = enum { content_length, chunked, close_delimited };
@@ -101,7 +114,7 @@ const H1Conn = struct {
     recv_pending: []u8 = &.{},
     recv_eof: bool = false,
 
-    slot: connection.HandlerSlot = .{},
+    slot: Slot = .{},
     arena: std.heap.ArenaAllocator,
     completion_buf: [1]u31 = undefined,
     completion_ch: zio.Channel(u31) = undefined,

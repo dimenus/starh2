@@ -1231,12 +1231,15 @@ fn recordCause(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) 
     var body = try resp.startSse(&.{});
     try body.writeAll("data: hi\n\n");
     while (true) {
-        try zio.sleep(.fromMilliseconds(5));
+        // The connection's end also requests a cancel (t-3737), so the sleep
+        // can end early: read the cause before the cancel is returned.
+        const slept = zio.sleep(.fromMilliseconds(5));
         if (body.terminalCause()) |cause| {
             idle_cause_was_closed.store(cause == .connection_closed, .release);
             idle_cause_seen.store(true, .release);
             return error.Canceled;
         }
+        try slept;
     }
 }
 

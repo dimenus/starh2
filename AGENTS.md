@@ -150,9 +150,14 @@ see `tools/README.md`.
 - Outbound accounting distinguishes pending body bytes from framed wire bytes.
   Pending bytes release when the scheduler accepts the frame; wire/control
   occupancy releases only on WritePump completion.
-- Cancellation ownership transfers to the reaper only when a join handle
-  exists. Shutdown waits until every handler slot is released, not merely
-  `live_handlers == 0`, and drains completions through `releaseSlot`.
+- An HTTP/2 handler reaches only its `StreamLink` (`src/edge/connection.zig`):
+  its request, response, terminal state and request arena live there, in the
+  arena's first block. It enters the connection only through the link's gate
+  (`src/edge/gate.zig`). Teardown closes the gates, requests a cancel, waits
+  only for calls already inside, and orphans a handler still running
+  (`orphanSlot`); `Server.serve` waits for orphans before it returns.
+  HTTP/1.1 still cancels through the reaper, which owns cancellation only when
+  a join handle exists.
 
 ## TLS and allocation traps
 

@@ -11,7 +11,9 @@
 //! 1. Accept loops stop first, so no new connection can arrive during the
 //!    drain.
 //! 2. Connections drain next, so in-flight requests can finish.
-//! 3. Reapers stop last, because a draining connection still needs
+//! 3. Handlers that outlived their connection end next; `serve` waits for
+//!    them without a limit (`waitOrphanedHandlers`).
+//! 4. Reapers stop last, because a draining connection still needs
 //!    cancellation to work.
 //! A single group would cancel all three at once and abort the very work the
 //! graceful path exists to preserve.
@@ -394,9 +396,22 @@ pub const Server = struct {
             };
         }
         connections_live = false;
+        self.waitOrphanedHandlers();
         self.stopReapers(&reaper_group);
         reapers_live = false;
         if (canceled) return error.RuntimeShutdown;
+    }
+
+    /// HTTP/2 task handlers that outlived their connection
+    /// (`Connection.orphanSlot`) still reach the request pool, the accounting
+    /// and the balancer, which `deinit` frees. So `serve` returns only after
+    /// the last one ended. There is no limit: a handler that never ends keeps
+    /// `serve` here. It polls, because a handler's last act is the decrement,
+    /// and a wake after it would touch this struct after `deinit` may run.
+    fn waitOrphanedHandlers(self: *Server) void {
+        while (self.accounting.orphaned_handlers.load(.acquire) != 0) {
+            zio.sleep(.fromMilliseconds(1)) catch {};
+        }
     }
 
     fn tryAdmitConnection(self: *Server) bool {
@@ -734,6 +749,7 @@ pub const Server = struct {
         std.debug.assert(self.active_connections.load(.acquire) == 0);
         std.debug.assert(self.accounting.active_streams.load(.acquire) == 0);
         std.debug.assert(self.accounting.reaper_reserved.load(.acquire) == 0);
+        std.debug.assert(self.accounting.orphaned_handlers.load(.acquire) == 0);
         std.debug.assert(self.accounting.outbound_bytes.load(.acquire) == 0);
         std.debug.assert(self.accounting.active_handshakes.load(.acquire) == 0);
         if (self.compression_pool) |*pool| {

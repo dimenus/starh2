@@ -64,14 +64,21 @@
 //!
 //! `RequestPool` and `ConnBudget` are safe from any thread. An `Arena` is
 //! touched by ONE task at a time: the actor decodes the headers and appends
-//! the body into it, then the handler's task allocates from it, then the
-//! actor returns its blocks after the handler was joined. Each hand-over is
-//! ordered by a spawn, a join or a channel, so the arena has no atomics of its
-//! own. Blocks are returned only by the actor (`Arena.release`), except that
-//! the handler's own allocator may return an emptied non-first block at once.
+//! the body into it, then the handler's task allocates from it, then whoever
+//! drops the last reference to the handler's stream link returns its blocks:
+//! the actor after it joined the handler, or the handler's own task when the
+//! connection ended first. Each hand-over is ordered by a spawn, a join or the
+//! link's reference count, so the arena has no atomics of its own. The handler's
+//! own allocator may also return an emptied non-first block at once.
+//!
+//! The connection budget is the one thing an arena reaches that the
+//! connection owns. Once dispatched, the arena reaches it only through its
+//! link's gate (`Arena.gate`), so a handler that outlives its connection never
+//! touches it.
 const std = @import("std");
 const builtin = @import("builtin");
 const slab_pool = @import("slab_pool.zig");
+const Gate = @import("gate.zig").Gate;
 
 pub const min_block_bytes: usize = 64 * 1024;
 /// 64 KiB << 15 is 2 GiB, far past any sane per-request cap.
@@ -629,14 +636,30 @@ pub const ConnBudget = struct {
 ///   and is left empty goes back to its class at once, so a buffer that grows
 ///   through every class holds its first block, the block it is leaving and
 ///   the block it is entering, and not every class it passed through.
-/// - `release` returns every block; only the actor calls it, after the
-///   handler was joined.
+/// - `release` returns every block. It is called by whoever drops the last
+///   reference to the request: the actor, or a handler that outlived its
+///   connection (see the file header).
 ///
 /// Every charge is the CLASS size, so a 1.5 MiB buffer in a 2 MiB block costs
 /// 2 MiB against all three caps.
 pub const Arena = struct {
     pool: *RequestPool,
-    budget: *ConnBudget,
+    /// The connection's budget, or null once the request no longer counts
+    /// against any connection (its connection ended, and the arena is being
+    /// released by whoever dropped the last reference to its stream link).
+    budget: ?*ConnBudget,
+    /// Set once the arena belongs to a dispatched handler, whose task can
+    /// outlive the connection the budget lives in. Every touch of `budget` is
+    /// then made inside this gate; once it is closed the request is charged
+    /// against its own cap and the server's only. Null while the actor alone
+    /// uses the arena (header decode), when the connection is alive by
+    /// construction.
+    gate: ?*Gate = null,
+    /// Class bytes charged to `budget`, written only inside the gate. After
+    /// the gate is closed and drained the actor gives exactly this back to
+    /// the connection (`Connection.orphanSlot`), because no later charge or
+    /// release reaches the budget.
+    conn_charged: usize = 0,
     /// Class bytes of the blocks this request holds now.
     held: usize = 0,
     /// The most `held` reached. Tests and the bench read it.
@@ -672,6 +695,41 @@ pub const Arena = struct {
 
     pub fn init(pool: *RequestPool, budget: *ConnBudget) Arena {
         return .{ .pool = pool, .budget = budget };
+    }
+
+    /// Charge `size` to the connection, if the request still counts against
+    /// one. True when the charge was made or no connection takes it.
+    fn chargeConn(self: *Arena, size: usize) bool {
+        const b = self.budget orelse return true;
+        if (self.gate) |g| {
+            if (!g.enter()) return true;
+            defer g.exit();
+            return self.chargeIn(b, size);
+        }
+        return self.chargeIn(b, size);
+    }
+
+    fn chargeIn(self: *Arena, b: *ConnBudget, size: usize) bool {
+        if (!b.tryCharge(size)) return false;
+        self.conn_charged += size;
+        return true;
+    }
+
+    fn unchargeConn(self: *Arena, size: usize) void {
+        const b = self.budget orelse return;
+        if (self.gate) |g| {
+            if (!g.enter()) return;
+            defer g.exit();
+            self.unchargeIn(b, size);
+            return;
+        }
+        self.unchargeIn(b, size);
+    }
+
+    fn unchargeIn(self: *Arena, b: *ConnBudget, size: usize) void {
+        std.debug.assert(self.conn_charged >= size);
+        self.conn_charged -= size;
+        b.uncharge(size);
     }
 
     pub fn allocator(self: *Arena) std.mem.Allocator {
@@ -718,12 +776,12 @@ pub const Arena = struct {
             self.refuse(.request_cap);
             return null;
         }
-        if (!self.budget.tryCharge(size)) {
+        if (!self.chargeConn(size)) {
             self.refuse(.connection_cap);
             return null;
         }
         const blk = self.pool.take(class) orelse {
-            self.budget.uncharge(size);
+            self.unchargeConn(size);
             self.refuse(.server_cap);
             return null;
         };
@@ -765,7 +823,7 @@ pub const Arena = struct {
         };
         self.held -= size;
         self.pool.give(blk);
-        self.budget.uncharge(size);
+        self.unchargeConn(size);
     }
 
     fn bump(h: *Header, len: usize, alignment: std.mem.Alignment) ?[*]u8 {

@@ -510,7 +510,11 @@ fn stuckHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteR
         if (ctx == 0 or stage >= 3) continue;
         listed += 1;
         if (listed > 60) continue;
-        const st = conn_mod.diagHandlerState(@ptrFromInt(ctx));
+        // Null once the handler's connection ended (its link's gate is
+        // closed). The entry must still be live (`stage < 3`): the context
+        // now lives in the handler's stream link, which is freed when the
+        // handler ends.
+        const st = conn_mod.diagHandlerState(@ptrFromInt(ctx)) orelse continue;
         w.print("stage={d} sid={d} conn=0x{x} wait={s} waited_ms={d} sched_term={d} sched_ord={d} sched_framed={d} sched_pending={d} sched_emits={d} stash_full={?} session_held={} live_task_handlers={d} conn_send_avail={d} actor_turns={d} actor_where={s} tls_carried={} tls_write_ch={d} tls_send_armed={} tls_recv_armed={} tls_pending_read={} tls_pending_cipher={}\n", .{
             stage,                     st.stream_id,          st.conn_addr,        @tagName(st.wait),       st.waited_ms,
             st.sched_terminal_len,     st.sched_ordinary_len, st.sched_framed_len, st.sched_active_pending, st.sched_emits_total,
