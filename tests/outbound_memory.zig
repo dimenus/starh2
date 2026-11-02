@@ -16,6 +16,7 @@
 //! the frames in wire order.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -287,7 +288,7 @@ fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpor
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -353,7 +354,7 @@ fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpor
     try std.testing.expect(stalled_turns <= 64);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -472,7 +473,7 @@ fn runContinuation(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpor
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -500,7 +501,7 @@ fn runContinuation(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpor
     try std.testing.expectEqual(@as(usize, small_streams), c.small_done);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -628,7 +629,7 @@ fn runBound(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !voi
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -679,7 +680,7 @@ fn runBound(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !voi
     try std.testing.expectEqual(@as(u64, bound_paths.len + 1), lists);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -734,7 +735,7 @@ fn runBarrierQueue(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -938,7 +939,7 @@ fn runSmallestPools(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpo
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -958,7 +959,7 @@ fn runSmallestPools(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpo
     try std.testing.expect(c.saw_hello);
     try std.testing.expect(c.saw_goaway);
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1057,7 +1058,7 @@ fn runMany(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1086,7 +1087,7 @@ fn runMany(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void
     try std.testing.expectEqual(@as(u16, 500), m.status[2]);
     try std.testing.expectEqualStrings("internal error", m.body[2][0..m.body_len[2]]);
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1205,7 +1206,7 @@ fn runPack(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1242,7 +1243,7 @@ fn runPack(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void
     try std.testing.expect(chunks * 2 <= p.data_frames);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 

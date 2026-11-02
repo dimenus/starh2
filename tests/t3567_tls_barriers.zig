@@ -39,6 +39,7 @@
 //! has a deadline, so a lost wake fails a case and does not hang the suite.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -531,7 +532,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, hold:
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer flush_gate.store(true, .release);
@@ -653,7 +654,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, hold:
     if (transport == .h2c) try std.testing.expectEqual(@as(usize, 0), refusals);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -685,7 +686,7 @@ fn runSpinCase(rt: *zio.Runtime, gpa: std.mem.Allocator, n: usize, keepers: usiz
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer spin_stop.store(true, .release);
@@ -736,7 +737,7 @@ fn runSpinCase(rt: *zio.Runtime, gpa: std.mem.Allocator, n: usize, keepers: usiz
     try std.testing.expect(waits > 0);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -787,7 +788,7 @@ fn runIdleOp(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, pat
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -823,7 +824,7 @@ fn runIdleOp(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, pat
     try std.testing.expectEqual(@as(usize, 0), park_missed.load(.acquire));
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -905,7 +906,7 @@ fn runFailedAndAlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transp
     defer if (serving) {
         fail_gate.store(true, .release);
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -957,7 +958,7 @@ fn runFailedAndAlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transp
     try std.testing.expectEqual(@as(usize, 0), park_missed.load(.acquire));
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 

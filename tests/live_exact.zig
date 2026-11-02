@@ -2,6 +2,7 @@
 //! No vacuous ors; >cap capacity wait; credit-exact WINDOW_UPDATE.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -300,7 +301,7 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     zio.sleep(.fromMilliseconds(40)) catch {};
     const port = server.localAddress(0).getPort();
@@ -441,7 +442,7 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     zio.sleep(.fromMilliseconds(40)) catch {};
     const port = server.localAddress(0).getPort();
@@ -529,7 +530,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     zio.sleep(.fromMilliseconds(40)) catch {};
     const port = server.localAddress(0).getPort();
@@ -591,7 +592,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     zio.sleep(.fromMilliseconds(40)) catch {};
     const port = server.localAddress(0).getPort();
@@ -647,7 +648,7 @@ fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     zio.sleep(.fromMilliseconds(40)) catch {};
     const port = server.localAddress(0).getPort();
@@ -723,7 +724,7 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     zio.sleep(.fromMilliseconds(40)) catch {};
     const port = server.localAddress(0).getPort();

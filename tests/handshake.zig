@@ -14,6 +14,7 @@
 //! server sends the typed fatal alert, then closes.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const tls = @import("tls");
 
@@ -88,7 +89,7 @@ fn runHandshakeTimeout(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
@@ -188,7 +189,7 @@ fn runFragmentedHello(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
@@ -297,7 +298,7 @@ fn runHandshakeAlerts(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());

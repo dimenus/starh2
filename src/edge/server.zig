@@ -12,7 +12,7 @@
 //!    drain.
 //! 2. Connections drain next, so in-flight requests can finish.
 //! 3. Handlers that outlived their connection end next; `serve` waits for
-//!    them without a limit (`waitOrphanedHandlers`).
+//!    them without a limit, and reports what it waits for (`waitForHandlers`).
 //! 4. Reapers stop last, because a draining connection still needs
 //!    cancellation to work.
 //! A single group would cancel all three at once and abort the very work the
@@ -79,6 +79,20 @@ pub var test_handshake_timeouts: test_hook.Hook(std.atomic.Value(usize)) = if (t
 
 /// Test-only: times an accept loop parked because the connection or TLS
 /// handshake limit was full. Counted in Debug and `-Dobserve=true`.
+/// Test-only: the accept loop of this endpoint index fails to spawn once
+/// `test_accept_spawn_gate` opens. A spawn failure cannot be caused from
+/// outside (zio refuses a spawn only for no memory or a runtime going down),
+/// and the exit it takes must be tested with a handler already running on an
+/// earlier endpoint.
+pub var test_fail_accept_spawn: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(std.math.maxInt(usize)) else {};
+pub var test_accept_spawn_gate: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+
+fn testFailAcceptSpawn(i: usize) bool {
+    if (test_fail_accept_spawn.load(.acquire) != i) return false;
+    while (!test_accept_spawn_gate.load(.acquire)) zio.sleep(.fromMilliseconds(1)) catch {};
+    return true;
+}
+
 pub var test_admission_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 pub const InitError = error{
@@ -164,6 +178,17 @@ pub const Server = struct {
     /// Accept calls that failed with something other than a cancel or a
     /// connection the peer aborted, over every endpoint (`acceptLoop`).
     accept_errors: std.atomic.Value(u64) = .init(0),
+    /// Shutdown reports `serve` has written (`waitForHandlers`), and the task
+    /// handlers the last one counted. A test reads them; an operator reads
+    /// the log.
+    shutdown_reports: std.atomic.Value(u32) = .init(0),
+    /// True from the start of `serve` until it returns. `deinit` checks it
+    /// as well as the counters: a serving server with nothing charged still
+    /// has accept loops, listeners and reaper tasks in use.
+    serving: std.atomic.Value(bool) = .init(false),
+    shutdown_report_handlers: std.atomic.Value(usize) = .init(0),
+    /// Report 1's count of task handlers the connections asked to cancel.
+    shutdown_report_asked: std.atomic.Value(usize) = .init(0),
     bind_state: std.atomic.Value(BindState) = .init(.pending),
     bind_event: std.Io.Event = .unset,
 
@@ -332,6 +357,9 @@ pub const Server = struct {
 
     pub fn serve(self: *Server, gpa: std.mem.Allocator) ServeError!void {
         std.debug.assert(gpa.vtable == self.gpa.vtable);
+        self.serving.store(true, .release);
+        // The last thing `serve` does, after every wait below.
+        defer self.serving.store(false, .release);
         self.listeners_bound = 0;
         errdefer {
             self.closeListeners();
@@ -352,8 +380,6 @@ pub const Server = struct {
         var accept_group: std.Io.Group = .init;
         var connection_group: std.Io.Group = .init;
         var reapers_live = false;
-        var accepts_live = false;
-        var connections_live = false;
 
         if (self.reaper) |*pool| {
             var i: usize = 0;
@@ -367,18 +393,31 @@ pub const Server = struct {
         }
         errdefer if (reapers_live) self.stopReapers(&reaper_group);
 
+        // Spawned now, while spawning works (`CancelSignal`). No connection
+        // exists yet, so its own failure needs no wait.
+        const conn_group = zio.Group.fromStd(&connection_group);
+        var cancel: CancelSignal = .{};
+        var canceller = zio.spawn(cancelOnSignal, .{ conn_group, &cancel }) catch return error.TransportSetupFailed;
+
         for (self.endpoints, 0..) |endpoint, i| {
-            accept_group.concurrent(self.io, acceptLoop, .{ self, i, endpoint.mode(), &connection_group }) catch {
-                accept_group.cancel(self.io);
-                connection_group.cancel(self.io);
-                return error.TransportSetupFailed;
+            const spawned = if (comptime test_hook.on) testFailAcceptSpawn(i) else false;
+            const failed = spawned or blk: {
+                accept_group.concurrent(self.io, acceptLoop, .{ self, i, endpoint.mode(), &connection_group }) catch break :blk true;
+                break :blk false;
             };
-            accepts_live = true;
-            connections_live = true;
-        }
-        errdefer {
-            if (accepts_live) accept_group.cancel(self.io);
-            if (connections_live) connection_group.cancel(self.io);
+            if (failed) {
+                // An earlier endpoint may have taken connections, and their
+                // handlers may run: this exit waits for them like every
+                // other (`waitForHandlers`), so `serve` never returns under
+                // a running handler.
+                accept_group.cancel(self.io);
+                zio.beginShield();
+                defer zio.endShield();
+                self.waitForHandlers(conn_group, true, &cancel, &canceller);
+                self.stopReapers(&reaper_group);
+                reapers_live = false;
+                return error.TransportSetupFailed;
+            }
         }
 
         self.bind_state.store(.listening, .release);
@@ -391,33 +430,179 @@ pub const Server = struct {
         self.shutdown_flag.store(true, .release);
         self.shutdown_event.set();
         accept_group.cancel(self.io);
-        accepts_live = false;
         self.closeListeners();
 
-        if (canceled) {
-            connection_group.cancel(self.io);
-        } else {
-            connection_group.await(self.io) catch {
-                // If the serve task is canceled during graceful drain, force task cleanup.
-                connection_group.cancel(self.io);
-            };
-        }
-        connections_live = false;
-        self.waitOrphanedHandlers();
+        // From here on `serve` waits for every connection and every handler,
+        // and a cancel of its own task does not cut that short: it stays
+        // pending, and `serve` reports it (RuntimeShutdown) once it returns.
+        zio.beginShield();
+        defer zio.endShield();
+        self.waitForHandlers(conn_group, canceled, &cancel, &canceller);
         self.stopReapers(&reaper_group);
         reapers_live = false;
         if (canceled) return error.RuntimeShutdown;
     }
 
-    /// HTTP/2 task handlers that outlived their connection
-    /// (`Connection.orphanSlot`) still reach the request pool, the accounting
-    /// and the balancer, which `deinit` frees. So `serve` returns only after
-    /// the last one ended. There is no limit: a handler that never ends keeps
-    /// `serve` here. It polls, because a handler's last act is the decrement,
-    /// and a wake after it would touch this struct after `deinit` may run.
-    fn waitOrphanedHandlers(self: *Server) void {
-        while (self.accounting.orphaned_handlers.load(.acquire) != 0) {
-            zio.sleep(.fromMilliseconds(1)) catch {};
+    /// The shutdown contract: `serve` never returns while a handler still
+    /// runs, because a handler still reaches the request pool, the slabs,
+    /// this struct's accounting and the balancer, which `deinit` frees.
+    ///
+    /// 1. The drain. Every connection saw the shutdown: HTTP/2 sends GOAWAY
+    ///    and drains its streams (a first phase of up to 1 s, then
+    ///    `graceful_drain_timeout_ns`), HTTP/1.1 cancels its handler at once.
+    /// 2. The cancel. Each connection reaches its cancel step (HTTP/2 when its
+    ///    drain ends, HTTP/1.1 at once) and counts itself, with the handlers
+    ///    it asks to cancel (`GlobalAccounting.shutdown_cancelled`,
+    ///    `shutdown_cancel_asked`). When every live connection has, report
+    ///    right then: how many were asked, what still runs, how long the
+    ///    drain ran and its deadline, because a supervisor's kill can come
+    ///    before the next step. A connection that never reaches its step (an
+    ///    actor stuck) does not hold the report back past the drain deadline
+    ///    and a second; the report then says how many are missing. A
+    ///    canceled `serve` (or a startup failure) skips the drain and cancels
+    ///    the connections at once, from the task spawned at startup
+    ///    (`CancelSignal`), so this keeps reporting while they end.
+    /// 3. Wait `shutdown_cancel_grace_ns`. If anything still runs, report
+    ///    again, then keep waiting and report every
+    ///    `shutdown_report_interval_ns`. There is no limit.
+    ///
+    /// Every wait polls the counters, from 1 ms doubling to 50 ms: a
+    /// handler's last act is its decrement (`dropLinkRef`), and a wake after
+    /// it would touch this struct after `deinit` may have run. The polls run
+    /// under the caller's shield, so a cancel of `serve` neither ends the wait
+    /// nor makes it spin (a delivered error.Canceled would come back from
+    /// every sleep; zio's `checkCancel` delivers none under a shield).
+    ///
+    /// Reports are `warn` lines (`log`), counted in `shutdown_reports`.
+    /// Counts per route are not available: nothing accounts handlers per
+    /// route yet, so the report says how many and that per route is missing.
+    ///
+    /// With one executor and a handler that never yields, this task never
+    /// runs again and nothing is reported; only a watchdog on an OS thread
+    /// could (design: the executor watchdog).
+    fn waitForHandlers(self: *Server, connection_group: *zio.Group, canceled: bool, cancel: *CancelSignal, canceller: *zio.JoinHandle(void)) void {
+        const t0 = monoNs();
+        // A canceled `serve` (or a startup failure) cancels the connections
+        // at once, through the task spawned at startup, so this keeps
+        // reporting while they end.
+        if (canceled) cancel.fire(true);
+        const drain_ns: u64 = if (canceled) 0 else std.time.ns_per_s +| self.limits.graceful_drain_timeout_ns;
+        // Report 1 comes when the cancel does: every live connection has
+        // reached its cancel step (`GlobalAccounting.shutdown_cancelled`), or
+        // the cancel was the group's. The drain deadline is the backstop for
+        // a connection that cannot reach it (its actor stuck).
+        // The connections' own deadlines run from when each saw the shutdown,
+        // a little after `t0`: the backstop waits a second more.
+        const backstop_ns: u64 = if (canceled) 0 else drain_ns +| std.time.ns_per_s;
+        const how = self.waitCancelTransition(t0 +| backstop_ns, canceled, canceller);
+        if (how != .quiet) {
+            self.reportShutdown(if (canceled) .cancel_group else if (how == .asked) .cancel else .cancel_backstop, t0, drain_ns);
+            var deadline = monoNs() +| self.limits.shutdown_cancel_grace_ns;
+            var phase: ReportPhase = .grace;
+            while (!self.waitQuiet(deadline, canceled, canceller)) {
+                self.reportShutdown(phase, t0, drain_ns);
+                phase = .interval;
+                deadline = monoNs() +| self.limits.shutdown_report_interval_ns;
+            }
+        }
+        // Not canceled: the cancelling task has nothing to do.
+        cancel.fire(false);
+        canceller.join();
+        // Every connection task has ended: this returns at once.
+        connection_group.wait() catch {};
+    }
+
+    /// The cancelling task's signal. The task is started with `serve`, while
+    /// a spawn cannot fail for the runtime going down (zio refuses every
+    /// spawn once `shutting_down` is set: `runtime.zig` `getNextExecutor`),
+    /// and is told at the end whether to cancel the connections. A cancel of
+    /// a group waits for its tasks (`Group.cancel`), so it runs there and not
+    /// on `serve`, which keeps reporting meanwhile.
+    const CancelSignal = struct {
+        event: zio.Event = .init,
+        cancel: std.atomic.Value(bool) = .init(false),
+        fired: bool = false,
+
+        fn fire(self: *CancelSignal, cancel_group: bool) void {
+            if (self.fired) return;
+            self.fired = true;
+            self.cancel.store(cancel_group, .release);
+            self.event.set();
+        }
+    };
+
+    fn cancelOnSignal(group: *zio.Group, signal: *CancelSignal) void {
+        zio.beginShield();
+        defer zio.endShield();
+        signal.event.wait() catch {};
+        if (signal.cancel.load(.acquire)) group.cancel();
+    }
+
+    const Transition = enum { quiet, asked, backstop };
+
+    /// Wait until nothing is left, or every handler still running has been
+    /// asked to cancel (every live connection is past its cancel step, or
+    /// only orphans are left, or the group cancel was requested), or
+    /// `backstop_ns`.
+    fn waitCancelTransition(self: *Server, backstop_ns: u64, canceled: bool, canceller: *zio.JoinHandle(void)) Transition {
+        var pause_ms: u64 = 1;
+        while (true) {
+            // Checked before `quiet`: handlers that were asked to cancel and
+            // ended at once are still the cancel this report is about.
+            const asked = self.accounting.shutdown_cancel_asked.load(.acquire);
+            const handlers = self.accounting.reaper_reserved.load(.acquire) + self.accounting.orphaned_handlers.load(.acquire);
+            if (asked != 0 or handlers != 0) {
+                if (canceled) return .asked;
+                const live = self.active_connections.load(.acquire);
+                if (self.accounting.shutdown_cancelled.load(.acquire) >= live) return .asked;
+            }
+            if (self.quiet() and (!canceled or canceller.hasResult())) return .quiet;
+            const now = monoNs();
+            if (now >= backstop_ns) return .backstop;
+            zio.sleep(.fromNanoseconds(@min(backstop_ns - now, pause_ms * std.time.ns_per_ms))) catch {};
+            pause_ms = @min(pause_ms * 2, 50);
+        }
+    }
+
+    /// No connection, no task handler (HTTP/2, orphans included, or
+    /// HTTP/1.1), and a group cancel, if one was asked, done; or
+    /// `deadline_ns`. True when quiet. `orphaned_handlers` is the last thing
+    /// an orphan releases, so reading it zero means that orphan is done with
+    /// this struct.
+    fn waitQuiet(self: *Server, deadline_ns: u64, canceled: bool, canceller: *zio.JoinHandle(void)) bool {
+        var pause_ms: u64 = 1;
+        while (true) {
+            if (self.quiet() and (!canceled or canceller.hasResult())) return true;
+            const now = monoNs();
+            if (now >= deadline_ns) return false;
+            zio.sleep(.fromNanoseconds(@min(deadline_ns - now, pause_ms * std.time.ns_per_ms))) catch {};
+            pause_ms = @min(pause_ms * 2, 50);
+        }
+    }
+
+    fn quiet(self: *Server) bool {
+        return self.active_connections.load(.acquire) == 0 and
+            self.accounting.orphaned_handlers.load(.acquire) == 0 and
+            self.accounting.reaper_reserved.load(.acquire) == 0;
+    }
+
+    const ReportPhase = enum { cancel, cancel_group, cancel_backstop, grace, interval };
+
+    fn reportShutdown(self: *Server, phase: ReportPhase, t0: u64, drain_ns: u64) void {
+        const n = self.shutdown_reports.fetchAdd(1, .acq_rel) + 1;
+        const handlers = self.accounting.reaper_reserved.load(.acquire);
+        const orphans = self.accounting.orphaned_handlers.load(.acquire);
+        const conns = self.active_connections.load(.acquire);
+        self.shutdown_report_handlers.store(handlers, .release);
+        const asked = self.accounting.shutdown_cancel_asked.load(.acquire);
+        if (n == 1) self.shutdown_report_asked.store(asked, .release);
+        const since_ms = (monoNs() -| t0) / std.time.ns_per_ms;
+        switch (phase) {
+            .cancel => log.warn("shutdown report {d}: after {d} ms (drain deadline {d} ms) every connection has asked its handlers to cancel, {d} task handlers in all; still running: {d} ({d} of them HTTP/2 handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, since_ms, drain_ns / std.time.ns_per_ms, asked, handlers, orphans, conns }),
+            .cancel_group => log.warn("shutdown report {d}: serve was canceled or failed to start, and every connection is being cancelled now; still running: {d} task handlers ({d} of them HTTP/2 handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, handlers, orphans, conns }),
+            .cancel_backstop => log.warn("shutdown report {d}: the drain deadline passed ({d} ms) with {d} of {d} connections not yet at their cancel step, so not every handler has been asked to cancel; still running: {d} task handlers ({d} of them HTTP/2 handlers whose connection ended); counts per route are not available (no per-route accounts)", .{ n, since_ms, conns -| self.accounting.shutdown_cancelled.load(.acquire), conns, handlers, orphans }),
+            .grace => log.warn("shutdown report {d}: {d} task handlers ({d} orphaned), {d} connections still running {d} ms after shutdown, past the cancel grace of {d} ms; serve keeps waiting and reports every {d} ms", .{ n, handlers, orphans, conns, since_ms, self.limits.shutdown_cancel_grace_ns / std.time.ns_per_ms, self.limits.shutdown_report_interval_ns / std.time.ns_per_ms }),
+            .interval => log.warn("shutdown report {d}: still waiting {d} ms after shutdown for {d} task handlers ({d} orphaned), {d} connections", .{ n, since_ms, handlers, orphans, conns }),
         }
     }
 
@@ -430,8 +615,7 @@ pub const Server = struct {
     }
 
     fn releaseConnection(self: *Server) void {
-        const prev = self.active_connections.fetchSub(1, .seq_cst);
-        std.debug.assert(prev > 0);
+        self.accounting.saturatingRelease(&self.active_connections, 1, "active_connections", .seq_cst);
         self.accounting.wakeAdmission();
     }
 
@@ -753,20 +937,37 @@ pub const Server = struct {
         return self.local_addrs[endpoint_index];
     }
 
-    /// The asserts are the leak gate, not defensive style. Every counter must
-    /// be zero once `serve` has returned, so a release that some path forgot
-    /// fails a test run instead of drifting in production, where it would look
-    /// like a slow capacity leak under load.
+    /// Every counter must be zero once `serve` has returned, so a release
+    /// that some path forgot is reported here instead of drifting in
+    /// production, where it would look like a slow capacity leak under load.
+    ///
+    /// The checks run in every build and log (`err`) instead of asserting: a
+    /// release build must not free the request pool under a live handler.
+    /// `serve` still running (`serving`), or a connection, a stream, a task
+    /// handler (orphans included), outbound bytes, a handshake or a
+    /// compression context still counted, means `deinit` was called while
+    /// `serve` had not returned, a contract violation by the caller. Then `deinit` frees nothing at all and leaks
+    /// the whole server, since anything here may still be reached by what is
+    /// running; the caller must not reuse the `Server`'s own memory either.
     pub fn deinit(self: *Server, gpa: std.mem.Allocator) void {
         std.debug.assert(gpa.vtable == self.gpa.vtable);
-        std.debug.assert(self.active_connections.load(.acquire) == 0);
-        std.debug.assert(self.accounting.active_streams.load(.acquire) == 0);
-        std.debug.assert(self.accounting.reaper_reserved.load(.acquire) == 0);
-        std.debug.assert(self.accounting.orphaned_handlers.load(.acquire) == 0);
-        std.debug.assert(self.accounting.outbound_bytes.load(.acquire) == 0);
-        std.debug.assert(self.accounting.active_handshakes.load(.acquire) == 0);
+        var live = false;
+        if (self.serving.load(.acquire)) {
+            log.err("Server.deinit: serve has not returned", .{});
+            live = true;
+        }
+        live = checkZero("active_connections", self.active_connections.load(.acquire)) or live;
+        live = checkZero("active_streams", self.accounting.active_streams.load(.acquire)) or live;
+        live = checkZero("task handlers (reaper_reserved)", self.accounting.reaper_reserved.load(.acquire)) or live;
+        live = checkZero("orphaned_handlers", self.accounting.orphaned_handlers.load(.acquire)) or live;
+        live = checkZero("outbound_bytes", self.accounting.outbound_bytes.load(.acquire)) or live;
+        live = checkZero("active_handshakes", self.accounting.active_handshakes.load(.acquire)) or live;
         if (self.compression_pool) |*pool| {
-            std.debug.assert(pool.liveCount() == 0);
+            live = checkZero("compression contexts", pool.liveCount()) or live;
+        }
+        if (live) {
+            log.err("Server.deinit with work still counted (serve has not returned?): freeing nothing, leaking the server", .{});
+            return;
         }
         for (self.routes) |route| gpa.free(route.path);
         gpa.free(self.routes);
@@ -827,7 +1028,7 @@ const AcceptBackoff = struct {
     fn fail(self: *AcceptBackoff, endpoint_index: usize, err: anyerror) std.Io.Cancelable!void {
         self.delay_ms = if (self.delay_ms == 0) first_ms else @min(self.delay_ms * 2, max_ms);
         self.failures_since_log += 1;
-        const now = zio.Timestamp.now(.monotonic).toNanoseconds();
+        const now = monoNs();
         if (self.last_log_ns == null or now -% self.last_log_ns.? >= log_interval_ns) {
             log.warn("accept on endpoint {d} failed: {s} ({d} failures since the last report); retrying in {d} ms", .{
                 endpoint_index, @errorName(err), self.failures_since_log, self.delay_ms,
@@ -894,6 +1095,17 @@ fn checkFileLimit(max_connections: usize) InitError!void {
         log.warn("RLIMIT_NOFILE allows {d} descriptors at most (soft {d}, ceiling {d}), below max_connections ({d}) plus {d} reserved: lower max_connections or raise the hard limit", .{ usable, lim.cur, ceiling, max_connections, reserved_fds });
         return error.FileLimitTooLow;
     }
+}
+
+/// Log a counter `deinit` expects at zero. True when it is not.
+fn checkZero(comptime name: []const u8, value: usize) bool {
+    if (value == 0) return false;
+    log.err("Server.deinit: " ++ name ++ " is {d}, expected 0", .{value});
+    return true;
+}
+
+fn monoNs() u64 {
+    return zio.Timestamp.now(.monotonic).toNanoseconds();
 }
 
 /// Bind and listen one endpoint with an explicit accept-queue length.

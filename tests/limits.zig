@@ -1,6 +1,7 @@
 const std = @import("std");
 const starh2 = @import("starh2");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 
 test "resource upper bound positive" {
     const b = try starh2.Limits.defaults.resourceUpperBound();
@@ -296,7 +297,7 @@ test "counting allocator peak under live hello stays under ceiling" {
     var serve_live = true;
     defer if (serve_live) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     zio.sleep(.fromMilliseconds(30)) catch {};
     const port = server.localAddress(0).getPort();

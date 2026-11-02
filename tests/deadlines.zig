@@ -1,6 +1,7 @@
 //! Actor-owned handler deadlines (t-824). T1 fails if waitUntil is Io.sleep.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -135,7 +136,7 @@ fn runServer(
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     try body(&server, rt, gpa);
@@ -405,7 +406,7 @@ test "T4: deadline slack rounds the wait up, and never holds back a late handler
             var serve_handle = try runtime.spawn(starh2.Server.serve, .{ &server, a });
             defer {
                 server.requestShutdown();
-                serve_handle.join() catch {};
+                serve_deadline.join(&server, &serve_handle);
             }
             try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -494,7 +495,7 @@ test "T5: a deadline before zero returns at once on both wait paths (h2c and h1c
             var serve_handle = try runtime.spawn(starh2.Server.serve, .{ &server, a });
             defer {
                 server.requestShutdown();
-                serve_handle.join() catch {};
+                serve_deadline.join(&server, &serve_handle);
             }
             try server.waitUntilListening(5 * std.time.ns_per_s);
             {

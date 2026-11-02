@@ -10,6 +10,7 @@
 //! every test skips there.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -164,7 +165,7 @@ fn runShutdownWaits(rt: *zio.Runtime, gpa: std.mem.Allocator, balance: bool, tar
     defer releaser.join();
     const t0 = nowNs();
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     const took_ms = (nowNs() - t0) / std.time.ns_per_ms;
     const live_at_return = server.active_connections.load(.acquire);
     std.debug.print("shutdown: balance={} connection on executor {s}: serve returned after {d} ms with {d} live connection(s)\n", .{ balance, if (!balance) "auto" else &[_]u8{'0' + target}, took_ms, live_at_return });
@@ -282,7 +283,7 @@ fn runNarrowRuntime(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     try second;
 }
 
@@ -393,7 +394,7 @@ fn runH1Counted(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     client.close();
     client_open = false;
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     // The balanced connection is detached from serve (see the shutdown test);
     // without this wait, deinit's active_connections assert fires. That
     // crash was observed before this wait was added.
@@ -452,7 +453,7 @@ fn serveB(rt: *zio.Runtime, gpa: std.mem.Allocator, b: *ServerB) !void {
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
 }
 
 /// Runs a second runtime on its own OS thread. That thread drives the
@@ -507,7 +508,7 @@ fn runTwoRuntimes(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
 
     if (b.err) |err| return err;
     const on_exec0 = b.spot.thread.load(.acquire) == b.runtime_thread;

@@ -19,6 +19,7 @@
 //! seam's scenario sizes come from them, per system.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 const wire_client = @import("wire_client.zig");
@@ -223,7 +224,7 @@ fn runProbe(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, vari
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 

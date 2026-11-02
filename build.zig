@@ -856,6 +856,74 @@ pub fn build(b: *std.Build) void {
     const hardening_step = b.step("test-hardening", "Run the t-3759 attack gates (missing deadlines, accept errors, the descriptor boot check)");
     hardening_step.dependOn(&run_hardening_tests.step);
 
+    const shutdown_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/shutdown.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_shutdown_tests = b.addRunArtifact(shutdown_tests);
+    const shutdown_step = b.step("test-shutdown", "Run the shutdown contract gates (serve waits for handlers and reports them; deinit and accounting checks)");
+    shutdown_step.dependOn(&run_shutdown_tests.step);
+    // The cases a test process cannot survive run in a child process of
+    // their own, checked on what they print.
+    const shutdown_child = b.addExecutable(.{
+        .name = "shutdown-child",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/shutdown_child.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_shutdown_stuck = b.addRunArtifact(shutdown_child);
+    run_shutdown_stuck.addArg("stuck");
+    run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "shutdown report 1: after" });
+    run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "every connection has asked its handlers to cancel, 1 task handlers in all; still running: 1 (" });
+    run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "shutdown report 2: 1 task handlers" });
+    run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "shutdown report 4: still waiting" });
+    run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "child: serve still waiting for the stuck handler" });
+    run_shutdown_stuck.expectExitCode(0);
+    run_shutdown_stuck.has_side_effects = true;
+    const run_shutdown_deinit = b.addRunArtifact(shutdown_child);
+    run_shutdown_deinit.addArg("deinit-live");
+    run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "Server.deinit: task handlers (reaper_reserved) is 1, expected 0" });
+    run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "freeing nothing, leaking the server" });
+    run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "child: deinit returned with 1 task handlers live" });
+    run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "child: request memory still live after deinit" });
+    run_shutdown_deinit.expectExitCode(0);
+    run_shutdown_deinit.has_side_effects = true;
+    const run_shutdown_deinit_idle = b.addRunArtifact(shutdown_child);
+    run_shutdown_deinit_idle.addArg("deinit-idle");
+    run_shutdown_deinit_idle.addCheck(.{ .expect_stderr_match = "Server.deinit: serve has not returned" });
+    run_shutdown_deinit_idle.addCheck(.{ .expect_stderr_match = "freeing nothing, leaking the server" });
+    run_shutdown_deinit_idle.addCheck(.{ .expect_stderr_match = "child: served a request after deinit" });
+    run_shutdown_deinit_idle.expectExitCode(0);
+    run_shutdown_deinit_idle.has_side_effects = true;
+    const run_shutdown_underflow = b.addRunArtifact(shutdown_child);
+    run_shutdown_underflow.addArg("underflow");
+    run_shutdown_underflow.addCheck(.{ .expect_stderr_match = "accounting underflow: a release of 1 from active_streams found 0" });
+    run_shutdown_underflow.addCheck(.{ .expect_stderr_match = "accounting underflow: a release of 7 from outbound_bytes found 0" });
+    run_shutdown_underflow.addCheck(.{ .expect_stderr_match = "child: active_streams=0 outbound_bytes=0 underflows=2" });
+    run_shutdown_underflow.expectExitCode(0);
+    run_shutdown_underflow.has_side_effects = true;
+    shutdown_step.dependOn(&run_shutdown_stuck.step);
+    shutdown_step.dependOn(&run_shutdown_deinit.step);
+    shutdown_step.dependOn(&run_shutdown_deinit_idle.step);
+    shutdown_step.dependOn(&run_shutdown_underflow.step);
+
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/macos_sdk.zig"),
@@ -891,6 +959,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ack_channel_tests.step);
     test_step.dependOn(&run_admission_tests.step);
     test_step.dependOn(&run_hardening_tests.step);
+    test_step.dependOn(shutdown_step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);
     test_step.dependOn(&run_outbound_memory_tests.step);

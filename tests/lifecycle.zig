@@ -1,6 +1,7 @@
 //! Lifecycle stress under DebugAllocator — must fail on leaks / nonzero counters.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -187,7 +188,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
 
     // `waitUntilListening`, never a sleep: `.listening` publishes only after
@@ -302,7 +303,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     }
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
 
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
@@ -340,7 +341,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
 
     try server.waitUntilListening(5 * std.time.ns_per_s);
@@ -401,7 +402,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     stream_open = false;
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
 
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
@@ -539,7 +540,7 @@ fn runSlotHeldByReceipt(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -635,7 +636,7 @@ fn runTaskSlotHeldAfterResponse(rt: *zio.Runtime, gpa: std.mem.Allocator) !void 
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -729,7 +730,7 @@ fn runTaskWaitDuringCompleteBatch(rt: *zio.Runtime, gpa: std.mem.Allocator) !voi
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -807,7 +808,7 @@ fn runParkedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, how: ParkedEnd) !void 
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -942,7 +943,7 @@ fn runCompleteWaitsForControlEntry(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -1059,7 +1060,7 @@ fn runResetsEndHeadersState(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -1148,7 +1149,7 @@ fn runResetDropsQueuedHeaders(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -1252,7 +1253,7 @@ fn runRefusedWithoutRequestMemory(rt: *zio.Runtime, gpa: std.mem.Allocator) !voi
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -1336,7 +1337,7 @@ fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator) !void
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -1479,7 +1480,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     // `waitUntilListening`, never a sleep: `.listening` publishes only after
     // every endpoint is bound AND its accept loop is spawned, and it reports
@@ -1674,7 +1675,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     // `waitUntilListening`, never a sleep: `.listening` publishes only after
     // every endpoint is bound AND its accept loop is spawned, and it reports
@@ -1712,7 +1713,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     zio.sleep(.fromMilliseconds(200)) catch {};
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
 }
@@ -1833,7 +1834,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
     } else |_| {}
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serve_live = false;
     server.deinit(gpa);
     server_live = false;
@@ -2170,7 +2171,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     // `waitUntilListening`, never a sleep: `.listening` publishes only after
     // every endpoint is bound AND its accept loop is spawned, and it reports
@@ -2323,7 +2324,7 @@ fn runCapCrossingBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
@@ -2452,7 +2453,7 @@ fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();

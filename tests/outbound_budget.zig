@@ -29,6 +29,7 @@
 //!   complete through a write pool of three chunks. (h2c and TLS)
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -370,7 +371,7 @@ fn runScenario(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, s
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer openAllGates();
@@ -442,7 +443,7 @@ fn runScenario(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, s
     try waitReservedZero(&server);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -511,7 +512,7 @@ fn runExit(rt: *zio.Runtime, gpa: std.mem.Allocator, exit: Exit) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer openAllGates();
@@ -571,7 +572,7 @@ fn runExit(rt: *zio.Runtime, gpa: std.mem.Allocator, exit: Exit) !void {
     try std.testing.expectEqual(full_0, conn_mod.test_ctrl_terminal_full.load(.monotonic));
     try waitReservedZero(&server);
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -613,7 +614,7 @@ fn runServerCap(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer openAllGates();
@@ -661,7 +662,7 @@ fn runServerCap(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
     try waitReservedZero(&server);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -698,7 +699,7 @@ fn runInline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer openAllGates();
@@ -754,7 +755,7 @@ fn runInline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try waitReservedZero(&server);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -790,7 +791,7 @@ fn runTlsTransition(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer openAllGates();
@@ -842,7 +843,7 @@ fn runTlsTransition(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try waitReservedZero(&server);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -916,7 +917,7 @@ fn runEmpties(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !v
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -938,7 +939,7 @@ fn runEmpties(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !v
     try waitReservedZero(&server);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 

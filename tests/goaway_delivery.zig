@@ -9,6 +9,7 @@
 //! GOAWAY, or a server that never closes, fails too.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 const tls = @import("tls");
@@ -432,7 +433,7 @@ fn runScenario(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, s
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1524,7 +1525,7 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1753,7 +1754,7 @@ fn runOutlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !v
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     var run: IdleRun = .{};

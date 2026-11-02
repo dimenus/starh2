@@ -362,6 +362,14 @@ pub const Limits = struct {
     /// its connection. Each run of the clock reads this when it starts.
     write_byte_timeout_ns: u64 = 60 * std.time.ns_per_s,
     graceful_drain_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// After the drain deadline of a shutdown, when every handler has been
+    /// asked to cancel, how long `Server.serve` waits before it reports the
+    /// handlers that are still running a second time (Kestrel waits 1 s).
+    /// `serve` keeps waiting after it: it never returns while a handler runs.
+    shutdown_cancel_grace_ns: u64 = 1 * std.time.ns_per_s,
+    /// After that grace, how often `Server.serve` reports the handlers it is
+    /// still waiting for. Must be non-zero.
+    shutdown_report_interval_ns: u64 = 10 * std.time.ns_per_s,
     /// How long an HTTP/2 connection may have nothing to do before the server
     /// ends it, with the same two GOAWAYs as a graceful shutdown. It has nothing
     /// to do when no stream is open and no header block is arriving, so a
@@ -628,6 +636,7 @@ pub const Limits = struct {
         _ = try self.controlPoolBytes();
         // Zero would close before the GOAWAY is written, the defect this limit exists to remove.
         if (self.close_flush_timeout_ns == 0) return error.InvalidConfig;
+        if (self.shutdown_report_interval_ns == 0) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.listen_backlog == 0) return error.InvalidConfig;
         try self.checkFramePool();

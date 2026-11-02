@@ -79,6 +79,7 @@
 //! - `I8 compressed stream surfaces PeerReset exactly`
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -251,7 +252,7 @@ fn runServer(
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     defer {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
     try body(&server, rt, gpa);
@@ -936,7 +937,7 @@ test "lifecycle: shutdown releases live encoder context" {
             try readUntil(stream, &cap, 5000, doneHeaders);
             try std.testing.expect(server.compression_pool.?.liveCount() >= 1);
             server.requestShutdown();
-            serve_handle.join() catch {};
+            serve_deadline.join(&server, &serve_handle);
             try std.testing.expectEqual(@as(usize, 0), server.compression_pool.?.liveCount());
         }
     }.f);

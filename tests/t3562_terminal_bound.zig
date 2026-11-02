@@ -75,6 +75,7 @@
 //! Run it with `./zb build test-t3562` (it is also part of `./zb build test`).
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -728,7 +729,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer data_gate.store(true, .release);
@@ -942,7 +943,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
         try std.testing.expectEqual(ended_eof_0, conn_mod.test_closing_ended_peer_eof.load(.monotonic));
         try std.testing.expect(closed_ns - bound_ns <= unread_close_ns + unread_close_slack_ns);
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
         serving = false;
         return;
     }
@@ -1027,7 +1028,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
     }
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1054,7 +1055,7 @@ fn runRefusedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport,
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer hold(transport, false);
@@ -1141,7 +1142,7 @@ fn runRefusedBatch(rt: *zio.Runtime, gpa: std.mem.Allocator, post_end: PostEnd) 
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer hold(.h2c, false);
@@ -1366,7 +1367,7 @@ fn runOwedAcks(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer hold(.h2c, false);
@@ -1439,7 +1440,7 @@ fn runOwedAcks(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expect(c.conn_credit_after_go >= upload_streams * upload_body_len - (4 * 1024 * 1024 - flow_initial_window) - flow_initial_window);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1481,7 +1482,7 @@ fn runShielded(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1524,7 +1525,7 @@ fn runShielded(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !
     try std.testing.expect(shielded_done_ns.load(.acquire) > closed);
     std.debug.print("T3562-shielded transport={s} close_before_handler_ms={d}\n", .{ @tagName(transport), (shielded_done_ns.load(.acquire) - closed) / std.time.ns_per_ms });
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1552,7 +1553,7 @@ fn runIdleEof(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1602,7 +1603,7 @@ fn runIdleEof(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expect(c.goaways >= 1);
     try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1642,7 +1643,7 @@ fn runAbortAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1687,7 +1688,7 @@ fn runAbortAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(in_window_0 + 1, conn_mod.test_abort_began_in_window.load(.acquire));
     try std.testing.expectEqual(saw_0, conn_mod.test_abort_saw_pump_shut.load(.acquire));
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1731,7 +1732,7 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1814,7 +1815,7 @@ fn runFrameThenNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // close, so the close is waited for, not read at once.
     try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1841,7 +1842,7 @@ fn runNotifyThenRecord(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
     defer abort_gate.store(true, .release);
@@ -1888,7 +1889,7 @@ fn runNotifyThenRecord(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     joinClient(&c, t);
     joined = true;
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1920,7 +1921,7 @@ fn runPipelinedNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1967,7 +1968,7 @@ fn runPipelinedNotify(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expect(c.eof);
     try expectClosedAfterPeer(&c, closes_0, limits.close_flush_timeout_ns);
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 

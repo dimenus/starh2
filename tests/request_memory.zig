@@ -16,6 +16,7 @@
 //! `slot_reuse.zig`, beside the boot-call gate it extends.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -348,7 +349,7 @@ fn Scenario(comptime run: fn (*starh2.Server, std.mem.Allocator, u16) anyerror!v
             var serving = true;
             defer if (serving) {
                 server.requestShutdown();
-                serve_handle.join() catch {};
+                serve_deadline.join(&server, &serve_handle);
             };
             try server.waitUntilListening(5 * std.time.ns_per_s);
             hold_started.store(0, .release);
@@ -358,7 +359,7 @@ fn Scenario(comptime run: fn (*starh2.Server, std.mem.Allocator, u16) anyerror!v
             // every block is home before it stops.
             try waitHome(&server);
             server.requestShutdown();
-            serve_handle.join() catch {};
+            serve_deadline.join(&server, &serve_handle);
             serving = false;
             try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
         }

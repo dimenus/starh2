@@ -24,6 +24,7 @@
 //! `goaway_delivery.zig`, so it sees exactly what the socket carries.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 const tls = @import("tls");
@@ -232,7 +233,7 @@ fn runReuse(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, endi
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -242,7 +243,7 @@ fn runReuse(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, endi
     while (!out.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
     t.join();
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 
     if (out.err) |err| return err;
@@ -639,7 +640,7 @@ fn runBootCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Transport)
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -670,7 +671,7 @@ fn runBootCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Transport)
     try std.testing.expectEqual(@as(usize, 0), counting.boot_max_len.load(.monotonic));
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -707,7 +708,7 @@ fn runDirty(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: conn_mod.DirtyKind, 
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -736,7 +737,7 @@ fn runDirty(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: conn_mod.DirtyKind, 
     try std.testing.expectEqual(@as(usize, 0), slots.refused);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -811,7 +812,7 @@ fn runExhausted(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -842,7 +843,7 @@ fn runExhausted(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
     try std.testing.expect(slots.refused >= 1);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -915,7 +916,7 @@ fn runShutdown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -936,7 +937,7 @@ fn runShutdown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 3), server.slots.snapshot().created);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
     while (h.done.load(.acquire) < 3) zio.sleep(.fromMilliseconds(5)) catch {};
     for (threads) |t| t.join();
@@ -1022,7 +1023,7 @@ fn runRequestMemoryCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: T
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1085,7 +1086,7 @@ fn runRequestMemoryCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: T
     try std.testing.expectEqual(@as(usize, 0), large_2 - large_1);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 
@@ -1337,7 +1338,7 @@ fn runHttp2PathCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Trans
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_handle.join() catch {};
+        serve_deadline.join(&server, &serve_handle);
     };
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
@@ -1390,7 +1391,7 @@ fn runHttp2PathCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Trans
     try std.testing.expectEqual(@as(usize, 0), calls_2 - calls_1);
 
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     serving = false;
 }
 

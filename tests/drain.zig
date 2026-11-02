@@ -12,6 +12,7 @@
 //! (under work stealing an idle executor takes the ticker); skips otherwise.
 const std = @import("std");
 const zio = @import("zio");
+const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -92,7 +93,7 @@ fn runDrain(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     }
     const t0 = nowNs();
     server.requestShutdown();
-    serve_handle.join() catch {};
+    serve_deadline.join(&server, &serve_handle);
     const drain_ms = (nowNs() - t0) / std.time.ns_per_ms;
     stop.store(true, .release);
     var max_ms: u64 = 0;

@@ -33,6 +33,7 @@ const zio = @import("zio");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 const wire_client = @import("wire_client.zig");
+const serve_deadline = @import("serve_deadline.zig");
 
 const frame = starh2.core.frame;
 const hpack = starh2.core.hpack;
@@ -271,7 +272,7 @@ const Running = struct {
 
     fn stop(self: *Running) void {
         self.server.requestShutdown();
-        self.handle.join() catch {};
+        serve_deadline.join(&self.server, &self.handle);
         self.server.deinit(self.gpa);
         self.gpa.free(self.cert);
         self.gpa.free(self.key);

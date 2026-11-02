@@ -266,6 +266,13 @@ fn probeHandlerPlacement() zio.Placement {
 pub var test_force_spawn_fail: test_hook.Hook(bool) = if (test_hook.on) false else {};
 /// Test-only: when true, actor skips draining completion_ch (sticky until cleared).
 pub var test_hold_completion_drain: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+/// Test-only: a reaper worker that has claimed the report (`reported`)
+/// waits here before it posts the completion, while this is set. Nothing
+/// else can hold the gap between the claim and the post open long enough
+/// to test what a connection does inside it (astra 1, round 3). Counts the
+/// workers that reached it.
+pub var test_reaper_hold_post: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+pub var test_reaper_held: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: when true, the actor takes no write completion off
 /// `write_ack_ch` (sticky until cleared), so a test can make the one receiver
 /// slower than the drains that feed the pump. A real actor is that slow when
@@ -1131,6 +1138,45 @@ pub const GlobalAccounting = struct {
     admission_waiters: std.atomic.Value(usize) = .init(0),
     admission_mu: zio.Mutex = .init,
     admission_cond: zio.Condition = .init,
+    /// Releases refused because they would have taken a counter below zero
+    /// (`saturatingRelease`). Each is a bug: some path released twice, or
+    /// released what it never took. The counter stays at zero instead of
+    /// wrapping to a huge value that would refuse every later admission, and
+    /// nothing is freed on the strength of it.
+    underflows: std.atomic.Value(u64) = .init(0),
+    /// Connections alive and past their shutdown cancel step: HTTP/2 at its
+    /// teardown (the end of its drain, where it cancels and orphans its
+    /// handlers), HTTP/1.1 when it cancels its handler. Each counts itself
+    /// once and takes itself off when it ends. `Server.serve` reports when
+    /// this equals the live connections (`waitForHandlers`).
+    shutdown_cancelled: std.atomic.Value(usize) = .init(0),
+    /// Task handlers the connections asked to cancel at their shutdown cancel
+    /// step, summed (`shutdown_cancelled`'s steps). Report 1 says how many,
+    /// though they may all have ended by the time `serve` looks.
+    shutdown_cancel_asked: std.atomic.Value(usize) = .init(0),
+
+    /// Subtract `n` from `counter` unless that would go below zero. Then the
+    /// subtraction is refused, the counter keeps its value, and the event is
+    /// counted in `underflows` and logged with the counter's name. The
+    /// sites, every release in `GlobalAccounting` and the orphan count:
+    /// `releaseStream`, `releaseReaper`, `releaseOutbound`,
+    /// `releaseHandshake`, `releaseOrphan`. `Server.releaseConnection` does
+    /// the same for `active_connections`.
+    pub fn saturatingRelease(self: *GlobalAccounting, counter: *std.atomic.Value(usize), n: usize, comptime name: []const u8, comptime order: std.builtin.AtomicOrder) void {
+        const load_order: std.builtin.AtomicOrder = if (order == .seq_cst) .seq_cst else .acquire;
+        var cur = counter.load(load_order);
+        while (true) {
+            if (cur < n) {
+                noteUnderflow(&self.underflows, name, cur, n);
+                return;
+            }
+            cur = counter.cmpxchgWeak(cur, cur - n, order, load_order) orelse return;
+        }
+    }
+
+    pub fn releaseOrphan(self: *GlobalAccounting) void {
+        self.saturatingRelease(&self.orphaned_handlers, 1, "orphaned_handlers", .acq_rel);
+    }
 
     pub fn tryAdmitStream(self: *GlobalAccounting) bool {
         while (true) {
@@ -1141,8 +1187,7 @@ pub const GlobalAccounting = struct {
     }
 
     pub fn releaseStream(self: *GlobalAccounting) void {
-        const prev = self.active_streams.fetchSub(1, .acq_rel);
-        std.debug.assert(prev > 0);
+        self.saturatingRelease(&self.active_streams, 1, "active_streams", .acq_rel);
     }
 
     pub fn tryReserveReaper(self: *GlobalAccounting) bool {
@@ -1154,8 +1199,7 @@ pub const GlobalAccounting = struct {
     }
 
     pub fn releaseReaper(self: *GlobalAccounting) void {
-        const prev = self.reaper_reserved.fetchSub(1, .acq_rel);
-        std.debug.assert(prev > 0);
+        self.saturatingRelease(&self.reaper_reserved, 1, "reaper_reserved", .acq_rel);
     }
 
     pub fn tryReserveOutbound(self: *GlobalAccounting, n: usize) bool {
@@ -1169,8 +1213,7 @@ pub const GlobalAccounting = struct {
 
     pub fn releaseOutbound(self: *GlobalAccounting, n: usize) void {
         if (n == 0) return;
-        const prev = self.outbound_bytes.fetchSub(n, .acq_rel);
-        std.debug.assert(prev >= n);
+        self.saturatingRelease(&self.outbound_bytes, n, "outbound_bytes", .acq_rel);
     }
 
     pub fn tryAdmitHandshake(self: *GlobalAccounting) bool {
@@ -1182,8 +1225,7 @@ pub const GlobalAccounting = struct {
     }
 
     pub fn releaseHandshake(self: *GlobalAccounting) void {
-        const prev = self.active_handshakes.fetchSub(1, .seq_cst);
-        std.debug.assert(prev > 0);
+        self.saturatingRelease(&self.active_handshakes, 1, "active_handshakes", .seq_cst);
         self.wakeAdmission();
     }
 
@@ -1197,6 +1239,16 @@ pub const GlobalAccounting = struct {
         self.admission_cond.broadcast();
     }
 };
+
+const accounting_log = std.log.scoped(.starh2);
+
+/// Count and log a refused release (`GlobalAccounting.saturatingRelease`). A
+/// release with nothing to release is a bug in this server, not something a
+/// client can cause, so every one is logged; the count says how many.
+pub fn noteUnderflow(underflows: *std.atomic.Value(u64), comptime name: []const u8, held: usize, n: usize) void {
+    const total = underflows.fetchAdd(1, .monotonic) + 1;
+    accounting_log.err("accounting underflow: a release of {d} from " ++ name ++ " found {d}; refused, counter kept ({d} refused so far)", .{ n, held, total });
+}
 
 /// Actor-owned state for one stream whose request was dispatched.
 ///
@@ -1677,10 +1729,7 @@ fn dropLinkRef(link: *StreamLink) void {
     arena.release();
     if (accounting) |a| {
         if (token) a.releaseReaper();
-        if (orphaned) {
-            const n = a.orphaned_handlers.fetchSub(1, .acq_rel);
-            std.debug.assert(n != 0);
-        }
+        if (orphaned) a.releaseOrphan();
     }
     if (comptime test_observe) _ = test_links_freed.fetchAdd(1, .acq_rel);
 }
@@ -1815,6 +1864,12 @@ pub const ReaperPool = struct {
             std.debug.assert(job.owner.load(.acquire) == reaper_running);
             job.handle.cancel();
             const prev = job.owner.swap(reported, .acq_rel);
+            if (comptime test_hook.on) {
+                if (prev == reaper_running and test_reaper_hold_post.load(.acquire)) {
+                    _ = test_reaper_held.fetchAdd(1, .acq_rel);
+                    while (test_reaper_hold_post.load(.acquire)) zio.sleep(.fromMilliseconds(2)) catch {};
+                }
+            }
             if (prev == reaper_running) {
                 if (job.completion.trySend(job.stream_id)) |_| {
                     _ = job.post_ok.fetchAdd(1, .acq_rel);
@@ -2050,6 +2105,8 @@ pub const Connection = struct {
     trace_emit_ns: std.atomic.Value(u64) = .init(0),
     trace_queued_ns: std.atomic.Value(u64) = .init(0),
     trace_written_ns: std.atomic.Value(u64) = .init(0),
+    /// Counted in `GlobalAccounting.shutdown_cancelled` (`noteShutdownCancel`).
+    shutdown_cancel_counted: bool = false,
     live_handlers: std.atomic.Value(usize) = .init(0),
     /// Spawned task handlers only. Complete oneshots stay on `live_handlers`
     /// and must not trip the ReadPump donation.
@@ -2636,6 +2693,10 @@ pub const Connection = struct {
     /// released the wrong kind, which no test would otherwise notice.
     fn quiesce(self: *Connection) void {
         const io = self.config.io;
+        if (self.shutdown_cancel_counted) {
+            self.shutdown_cancel_counted = false;
+            if (self.config.accounting) |a| a.saturatingRelease(&a.shutdown_cancelled, 1, "shutdown_cancelled", .acq_rel);
+        }
         // Must not release while handlers still live.
         const live_n = self.live_handlers.load(.acquire);
         if (std.debug.runtime_safety and live_n != 0) {
@@ -4985,6 +5046,7 @@ pub const Connection = struct {
         if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), self.sched.pendingCount(), close_probe_parked.load(.acquire) });
         self.finishTerminalInline(self.teardown_inline_n);
         self.teardown_inline_n = 0;
+        self.noteShutdownCancel();
         self.shutdownHandlers();
         std.debug.assert(self.countInUseSlots() == 0);
     }
@@ -5862,6 +5924,8 @@ pub const Connection = struct {
         } else if (self.session.grace_phase == .phase2) {
             if (self.grace_deadline) |dl| {
                 if (nowNs(self.config.io) >= @as(u64, @intCast(dl.nanoseconds))) {
+                    // The drain is over: what still runs is cancelled now.
+                    self.noteShutdownCancel();
                     try self.finishGraceful();
                     // The remaining handlers are canceled by shutdownHandlers
                     // after the actor loop. Staying in this loop waits for
@@ -5871,6 +5935,19 @@ pub const Connection = struct {
             }
         }
         return false;
+    }
+
+    /// The server's shutdown reached this connection's cancel step (the end
+    /// of its drain, or its teardown if it ends first): count it once, with
+    /// the task handlers it is asking to cancel
+    /// (`GlobalAccounting.shutdown_cancelled`, `shutdown_cancel_asked`).
+    fn noteShutdownCancel(self: *Connection) void {
+        if (self.shutdown_cancel_counted or !self.serverShuttingDown()) return;
+        self.shutdown_cancel_counted = true;
+        if (self.config.accounting) |a| {
+            _ = a.shutdown_cancel_asked.fetchAdd(self.live_task_handlers.load(.acquire), .acq_rel);
+            _ = a.shutdown_cancelled.fetchAdd(1, .acq_rel);
+        }
     }
 
     fn serverShuttingDown(self: *const Connection) bool {

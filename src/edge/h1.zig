@@ -151,6 +151,9 @@ const H1Conn = struct {
     job_handler: router_mod.TaskHandler = undefined,
     committed: bool = false,
     occupies: bool = false,
+    /// This connection asked its handler to cancel because the server is
+    /// shutting down (`GlobalAccounting.shutdown_cancelled`).
+    shutdown_cancel_counted: bool = false,
     want_close: bool = false,
     finished: bool = false,
     no_payload: bool = false,
@@ -182,8 +185,16 @@ const H1Conn = struct {
     tls_out: []u8 = &.{},
     offload_tls_io: bool = false,
     tls_write_inflight: bool = false,
+    /// The handler was handed to the reaper (`cancelJoin`) and its
+    /// completion has not been taken yet (`finishSlot`). Until then the
+    /// reaper still posts into `completion_ch`, whatever the owner byte says:
+    /// it claims `reported` before it posts.
+    reaper_has_job: bool = false,
 
     fn deinit(self: *H1Conn) void {
+        if (self.shutdown_cancel_counted) {
+            if (self.config.accounting) |a| a.saturatingRelease(&a.shutdown_cancelled, 1, "shutdown_cancelled", .acq_rel);
+        }
         std.debug.assert(!self.slot.in_use);
         if (self.tls_pump) |p| {
             p.shutdownCq();
@@ -239,6 +250,9 @@ pub fn serve(
         return;
     };
     defer conn.deinit();
+    // Runs before `deinit`: never free the buffers under a running handler.
+    var canceled = false;
+    defer joinHandler(&conn, canceled);
     if (comptime connection.placement_check) conn.actor_thread = std.Thread.getCurrentId();
     if (tls != null) startTlsPump(&conn) catch {
         return;
@@ -247,7 +261,10 @@ pub fn serve(
         stashCarry(&conn, leftover, 0) catch return;
     }
     runLoop(&conn) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
+        error.Canceled => {
+            canceled = true;
+            return error.Canceled;
+        },
         else => {},
     };
 }
@@ -904,7 +921,11 @@ fn dispatch(
             return;
         }
     }
-    errdefer if (self.config.accounting) |a| a.releaseStream();
+    // Until the slot takes the charges (below), an error gives them back here.
+    var slot_owns = false;
+    errdefer if (!slot_owns) {
+        if (self.config.accounting) |a| a.releaseStream();
+    };
 
     const method = request.Method.parse(head.method_raw);
     const matched = self.config.router.match(method, head.path);
@@ -924,7 +945,7 @@ fn dispatch(
             reaper_reserved = true;
         }
     }
-    errdefer if (reaper_reserved) {
+    errdefer if (reaper_reserved and !slot_owns) {
         if (self.config.accounting) |a| a.releaseReaper();
     };
 
@@ -935,6 +956,9 @@ fn dispatch(
     self.slot.completion_owner.store(live, .release);
     self.slot.reaper_reserved = reaper_reserved;
     self.join = null;
+    // From here the slot holds the charges, and `finishSlot` gives them back;
+    // on an error, `serve` does (`joinHandler`), after the handler ends.
+    slot_owns = true;
     // Preserve unread-body close from serveOne. A bare assignment dropped it,
     // so leftover Content-Length bytes became the next request.
     self.want_close = self.want_close or head.connection_close;
@@ -1115,6 +1139,7 @@ fn waitDispatchTls(self: *H1Conn) !void {
     while (self.slot.in_use) {
         if (shutdownRequested(self) and !reaping) {
             self.slot.terminal.setCause(.server_shutdown);
+            noteShutdownCancel(self);
             if (!cancelJoin(self)) {
                 finishSlot(self);
                 break;
@@ -1215,6 +1240,7 @@ fn waitDispatchTls(self: *H1Conn) !void {
             },
             .shutdown => {
                 self.slot.terminal.setCause(.server_shutdown);
+                noteShutdownCancel(self);
                 if (!cancelJoin(self)) {
                     finishSlot(self);
                     break;
@@ -1232,6 +1258,7 @@ fn waitDispatch(self: *H1Conn) !void {
     while (self.slot.in_use) {
         if (shutdownRequested(self) and !reaping) {
             self.slot.terminal.setCause(.server_shutdown);
+            noteShutdownCancel(self);
             if (!cancelJoin(self)) {
                 finishSlot(self);
                 break;
@@ -1285,6 +1312,7 @@ fn waitDispatch(self: *H1Conn) !void {
             },
             .shutdown => {
                 self.slot.terminal.setCause(.server_shutdown);
+                noteShutdownCancel(self);
                 if (!cancelJoin(self)) {
                     finishSlot(self);
                     break;
@@ -1313,8 +1341,41 @@ fn finishSlot(self: *H1Conn) void {
         self.slot.reaper_reserved = false;
     }
     self.slot.in_use = false;
+    self.reaper_has_job = false;
     self.slot.completion_owner.store(reported, .release);
     if (self.config.accounting) |a| a.releaseStream();
+}
+
+/// The connection is ending, by any path, with its slot in use: a running
+/// handler still reads and writes this connection's buffers, so it is asked
+/// to cancel and waited for here, under a shield (the path may be this task's
+/// own cancel: a canceled `serve` cancels every connection, and an unshielded
+/// wait would end at once). Then the slot gives the request's charges back.
+/// While it waits, the handler is still counted (`reaper_reserved`), so
+/// `Server.serve` keeps waiting and reports it.
+fn joinHandler(self: *H1Conn, canceled: bool) void {
+    if (!self.slot.in_use) return;
+    zio.beginShield();
+    defer zio.endShield();
+    if (self.slot.terminal.getCause() == null) self.slot.terminal.setCause(.server_shutdown);
+    // A cancel of this task is the server's (shutdown or a canceled
+    // `serve`): this is the connection's cancel step, counted for the report.
+    if (canceled or shutdownRequested(self)) noteShutdownCancel(self);
+    // Either this asks the reaper now, or an earlier step did (a shutdown or
+    // the peer's close, then this task's cancel came during that wait): the
+    // reaper posts the completion, and this waits for the post itself. The
+    // owner byte cannot say so: the reaper claims `reported` before it posts
+    // (astra 1, round 3).
+    const reaper_holds = cancelJoin(self) or self.reaper_has_job;
+    if (!reaper_holds) {
+        finishSlot(self);
+        return;
+    }
+    while (self.slot.in_use) {
+        // Shielded: no cancel is delivered, and nothing closes this channel.
+        _ = self.completion_ch.receive() catch |err| std.debug.panic("h1: the handler's completion channel failed while the connection waited for it: {s}", .{@errorName(err)});
+        finishSlot(self);
+    }
 }
 
 fn cancelJoin(self: *H1Conn) bool {
@@ -1330,7 +1391,10 @@ fn cancelJoin(self: *H1Conn) bool {
                     .stream_id = 1,
                     .post_ok = &h1_reaper_post_ok,
                 });
-                if (queued) return true;
+                if (queued) {
+                    self.reaper_has_job = true;
+                    return true;
+                }
             }
             var h = handle;
             h.cancel();
@@ -1341,9 +1405,22 @@ fn cancelJoin(self: *H1Conn) bool {
     return false;
 }
 
+/// The server's shutdown reached this connection's cancel step: count it
+/// once, so `Server.serve` knows when every live connection has asked its
+/// handlers to cancel (`GlobalAccounting.shutdown_cancelled`).
+fn noteShutdownCancel(self: *H1Conn) void {
+    if (self.shutdown_cancel_counted) return;
+    self.shutdown_cancel_counted = true;
+    if (self.config.accounting) |a| {
+        if (self.slot.in_use) _ = a.shutdown_cancel_asked.fetchAdd(1, .acq_rel);
+        _ = a.shutdown_cancelled.fetchAdd(1, .acq_rel);
+    }
+}
+
 fn shutdownHandlers(self: *H1Conn) !void {
     if (!self.slot.in_use) return;
     self.slot.terminal.setCause(.server_shutdown);
+    noteShutdownCancel(self);
     if (!cancelJoin(self)) {
         finishSlot(self);
         return;
