@@ -1640,3 +1640,149 @@ test "idle: h2c a peer that never reads and stays silent loses its connection af
 test "idle: tls a peer that never reads and stays silent loses its connection after the kill (t-3705)" {
     try runStalledCase(.tls, .peer_never_reads, .idle_after_kill, "tls idle after kill");
 }
+
+// ---------------------------------------------------------------------------
+// A handler that outlives its connection (t-3737)
+// ---------------------------------------------------------------------------
+
+/// How the handler spends the time after its peer has gone.
+const OutliveMode = enum {
+    /// `try zio.sleep`: an ordinary handler that honours cancellation.
+    honours_cancel,
+    /// A shielded sleep: it cannot be canceled.
+    shielded,
+    /// A loop that swallows `error.Canceled`.
+    ignores_cancel,
+};
+
+var outlive_mode: OutliveMode = .honours_cancel;
+var outlive_started: std.atomic.Value(bool) = .init(false);
+var outlive_done: std.atomic.Value(bool) = .init(false);
+/// Longer than the 5 s teardown watchdog on master, so master panics here.
+const outlive_hold_ms = 6_000;
+
+fn outliveHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    defer outlive_done.store(true, .release);
+    var body = try resp.startSse(&.{});
+    try body.writeAll("data: hi\n\n");
+    outlive_started.store(true, .release);
+    const t0 = nowNs();
+    switch (outlive_mode) {
+        .honours_cancel => try zio.sleep(.fromMilliseconds(outlive_hold_ms)),
+        .shielded => {
+            zio.beginShield();
+            defer zio.endShield();
+            zio.sleep(.fromMilliseconds(outlive_hold_ms)) catch {};
+        },
+        .ignores_cancel => while (nowNs() < t0 + outlive_hold_ms * std.time.ns_per_ms) {
+            zio.sleep(.fromMilliseconds(20)) catch {};
+        },
+    }
+    // Still running after the connection has ended: this call must fail
+    // cleanly, without touching the connection.
+    if (body.writeAll("data: late\n\n")) |_| return error.LateWriteSucceeded else |_| {}
+}
+
+fn outliveClient(port: u16, gpa: std.mem.Allocator, transport: Transport, run: *IdleRun) void {
+    outliveClientInner(port, gpa, transport) catch |err| {
+        run.err = err;
+    };
+    run.done.store(true, .release);
+}
+
+fn outliveClientInner(port: u16, gpa: std.mem.Allocator, transport: Transport) !void {
+    const wire = try Wire.open(gpa, transport, port, null);
+    defer wire.close();
+    var req = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer req.deinit(gpa);
+    try wire.send(req.items);
+    try idleSendRequest(gpa, wire, 1, "/outlive", true);
+    try idleReadFirstData(wire, 1);
+    // The peer goes away: `wire.close` on return.
+}
+
+fn runOutlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
+    const io = rt.io();
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/outlive", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = outliveHandler } } },
+    };
+    var cert_pem: []u8 = &.{};
+    var key_pem: []u8 = &.{};
+    defer {
+        gpa.free(cert_pem);
+        gpa.free(key_pem);
+    }
+    var endpoint: starh2.EndpointConfig = undefined;
+    var tls_cfg: ?starh2.TlsConfig = null;
+    switch (transport) {
+        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .tls => {
+            cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+            key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
+        },
+    }
+    var server = try starh2.Server.init(gpa, io, .{ .endpoints = &.{endpoint}, .routes = &routes, .tls = tls_cfg, .limits = starh2.Limits.defaults });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_handle.join() catch {};
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    var run: IdleRun = .{};
+    const t = try std.Thread.spawn(.{}, outliveClient, .{ server.localAddress(0).getPort(), gpa, transport, &run });
+    while (!run.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
+    t.join();
+    if (run.err) |err| return err;
+    try std.testing.expect(outlive_started.load(.acquire));
+    const t_gone = nowNs();
+    // The connection ends, and gives its slot back, without waiting for the
+    // handler.
+    while (server.active_connections.load(.acquire) != 0) {
+        if (nowNs() >= t_gone + 3 * std.time.ns_per_s) return error.ConnectionWaitedForHandler;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    const gone_ms = (nowNs() - t_gone) / std.time.ns_per_ms;
+    std.debug.print("outlive {s} {s}: connection gone after {d} ms, handler done={}\n", .{ @tagName(transport), @tagName(outlive_mode), gone_ms, outlive_done.load(.acquire) });
+    // .honours_cancel may end early if teardown cancels it; the other two
+    // cannot, so the connection really did end first.
+    if (outlive_mode != .honours_cancel) try std.testing.expect(!outlive_done.load(.acquire));
+    // The handler ends on its own; its memory must come back (the testing
+    // allocator reports a leak otherwise).
+    while (!outlive_done.load(.acquire)) {
+        if (nowNs() >= t_gone + (outlive_hold_ms + 5000) * std.time.ns_per_ms) return error.HandlerNeverEnded;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+}
+
+fn outliveCase(transport: Transport, mode: OutliveMode) !void {
+    outlive_mode = mode;
+    outlive_started.store(false, .release);
+    outlive_done.store(false, .release);
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runOutlive, .{ rt, gpa, transport });
+    try h.join();
+}
+
+test "outlive: h2c a handler that honours cancel does not hold its connection (t-3737)" {
+    try outliveCase(.h2c, .honours_cancel);
+}
+test "outlive: tls a handler that honours cancel does not hold its connection (t-3737)" {
+    try outliveCase(.tls, .honours_cancel);
+}
+test "outlive: h2c a shielded handler does not hold its connection (t-3737)" {
+    try outliveCase(.h2c, .shielded);
+}
+test "outlive: tls a shielded handler does not hold its connection (t-3737)" {
+    try outliveCase(.tls, .shielded);
+}
+test "outlive: h2c a handler that swallows cancel does not hold its connection (t-3737)" {
+    try outliveCase(.h2c, .ignores_cancel);
+}
+test "outlive: tls a handler that swallows cancel does not hold its connection (t-3737)" {
+    try outliveCase(.tls, .ignores_cancel);
+}
