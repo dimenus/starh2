@@ -41,7 +41,17 @@ const Fixture = enum {
     io_cancel_identity,
     io_send_after_close,
     io_cancel_parked,
+    spawn_read_after_publish,
+    spawn_cancel_race,
 };
+
+/// Fixtures whose runtime allocates from `std.heap.page_allocator`: a task
+/// with a context past the task pool's item size then comes from it, and its
+/// memory is unmapped when it is freed, so a read of a freed task faults
+/// instead of reading stale bytes (t-3818).
+fn unmapsFreedTasks(fixture: Fixture) bool {
+    return fixture == .spawn_read_after_publish or fixture == .spawn_cancel_race;
+}
 
 const RunOut = struct {
     trace: u64,
@@ -77,7 +87,7 @@ fn runFixture(gpa: std.mem.Allocator, seed: u64, fixture: Fixture, print_scope: 
     defer zio.sim.end();
     if (print_scope) zio.sim.printScope();
 
-    const rt = try zio.Runtime.init(gpa, runtimeOpts());
+    const rt = try zio.Runtime.init(if (unmapsFreedTasks(fixture)) std.heap.page_allocator else gpa, runtimeOpts());
     defer rt.deinit();
 
     runNamed(rt, fixture) catch |err| {
@@ -117,6 +127,8 @@ fn runNamed(rt: *zio.Runtime, fixture: Fixture) !void {
         .io_backpressure => try ioBackpressure(rt),
         .io_send_after_close => try ioSendAfterClose(rt),
         .io_cancel_parked => try ioCancelParked(rt),
+        .spawn_read_after_publish => try spawnReadAfterPublish(rt),
+        .spawn_cancel_race => try spawnCancelRace(rt),
         .io_id_identity, .io_cancel_identity => unreachable,
     }
 }
@@ -779,6 +791,58 @@ fn overflow1k(rt: *zio.Runtime) !void {
     try group.wait();
     if (counter != 1000) {
         std.debug.panic("overflow_1k: counter={d} want 1000", .{counter});
+    }
+}
+
+/// A group task's context the size of starh2's `connEntry` arguments (640
+/// bytes), so the task skips the pool and its memory is unmapped on free.
+const BigCtx = struct { pad: [640]u8 = @splat(0) };
+
+fn quickTask(c: BigCtx) void {
+    std.mem.doNotOptimizeAway(c.pad[0]);
+}
+
+/// t-3818, the read the ci core faulted on. A group task homed on the other
+/// executor: in the spawn's publication window that executor runs it to the
+/// end and frees it, before `registerTask` would read `task.runtime`. The
+/// spawner holds no reference of its own to a group task.
+fn spawnReadAfterPublish(rt: *zio.Runtime) !void {
+    _ = rt;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var group: zio.Group = .init;
+        defer group.cancel();
+        try group.spawnInto(.{ .executor = 1 }, quickTask, .{.{}});
+        try group.wait();
+    }
+}
+
+const CancelRace = struct {
+    group: zio.Group = .init,
+    /// Set by the spawner just before `group.spawnInto`; nothing between
+    /// that and the window after `registerGroupTask` can yield.
+    armed: bool = false,
+};
+
+fn raceCanceler(r: *CancelRace) void {
+    while (!r.armed) zio.yield() catch return;
+    r.group.cancel();
+}
+
+/// t-3818, the second read after publication: `registerGroupTask` puts the
+/// task in the group's list before `registerTask` schedules it. A concurrent
+/// `Group.cancel` pops it, releases the group's reference and wakes it; the
+/// task runs, finishes and is freed; then the spawner's own `scheduleTask`
+/// reads `task.state`.
+fn spawnCancelRace(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var r: CancelRace = .{};
+        var canceler = try rt.spawnInto(.{ .executor = 1 }, raceCanceler, .{&r});
+        r.armed = true;
+        r.group.spawnInto(.{ .executor = 1 }, quickTask, .{.{}}) catch {};
+        canceler.join();
+        r.group.cancel();
     }
 }
 
