@@ -860,6 +860,29 @@ pub fn build(b: *std.Build) void {
     const h2c_settle_step = b.step("test-h2c-settle", "Run the t-3794 gate: a failed h2c batch acks ok the chunks the socket accepted in full");
     h2c_settle_step.dependOn(&run_h2c_settle_tests.step);
 
+    // t-3807: a record that fails to decrypt while the TLS pump holds a
+    // chunk, on h2 and HTTP/1.1. Its own step so it can be run alone; `test`
+    // runs it.
+    const tls_decrypt_error_tests = b.addTest(.{
+        .name = "tls_decrypt_error",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/tls_decrypt_error.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_tls_decrypt_error_tests = b.addRunArtifact(tls_decrypt_error_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_tls_decrypt_error_tests.setCwd(b.path("."));
+    const tls_decrypt_error_step = b.step("test-tls-decrypt-error", "Run the t-3807 gate: a record that fails to decrypt while the TLS pump holds a chunk, on h2 and HTTP/1.1");
+    tls_decrypt_error_step.dependOn(&run_tls_decrypt_error_tests.step);
+
     const t3562_tests = b.addTest(.{
         .name = "t3562",
         .root_module = b.createModule(.{
@@ -1153,6 +1176,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_outbound_budget_tests.step);
     test_step.dependOn(&run_t3567_tests.step);
     test_step.dependOn(&run_h2c_settle_tests.step);
+    test_step.dependOn(&run_tls_decrypt_error_tests.step);
     test_step.dependOn(&run_t3562_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 

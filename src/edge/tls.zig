@@ -144,6 +144,13 @@ pub var test_close_at_pump_start: test_hook.Hook(std.atomic.Value(usize)) = if (
 /// Counted apart from the guard, so a test can require that its run reached
 /// that case whatever the guard does.
 pub var test_eof_held_for_plaintext: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// Test-only: a received record failed to decrypt (`readOne`); of those, how
+/// many found a write chunk held in `pending_writes`, and how many found a
+/// send in flight. A test counts them to know its corrupt record reached the
+/// decrypt-error `failDrain`, and in which state (t-3807).
+pub var test_decrypt_failures: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_decrypt_failures_holding: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+pub var test_decrypt_failures_sending: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
 pub fn writeFailJson(w: *std.Io.Writer) !void {
     try w.print(
@@ -1518,8 +1525,23 @@ pub const Pump = struct {
             pump_trace.bump(&pump_trace.read_free_empty_yield);
             return .stuck;
         }
+        // The one `failDrain` that posts no shutdown, so `stopped` stays
+        // false. It needs no refusal of its own, because tls.zig gives one:
+        // any error that reaches here leaves the record layer
+        // `fatal_alert_pending` (an error of ours) or `failed` (a fatal alert
+        // from the peer), and `encrypt` refuses in both, so a later write
+        // fails in `encryptSome` and takes the full failure path, and its
+        // chunk is failed without `popPending`. The actors leave on the
+        // `.eof` anyway. The transport witness's `Rx` and `Ra` (a write after
+        // them must be refused) and `tests/tls_decrypt_error.zig` pin it
+        // (t-3807).
         const n = self.conn.decryptInto(buf) catch |err| {
             if (diag_wait) rawPrint("TLSERR recv2 {s}\n", .{@errorName(err)});
+            if (comptime test_hook.on) {
+                _ = test_decrypt_failures.fetchAdd(1, .acq_rel);
+                if (self.pending_n > 0) _ = test_decrypt_failures_holding.fetchAdd(1, .acq_rel);
+                if (self.send_armed) _ = test_decrypt_failures_sending.fetchAdd(1, .acq_rel);
+            }
             self.failDrain();
             self.postEof();
             return .eof;

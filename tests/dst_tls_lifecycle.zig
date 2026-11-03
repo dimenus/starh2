@@ -31,6 +31,15 @@
 //!   held chunk (`drivePending`), as `driveTlsUntilIdle` does.
 //! - `Re`/`Rf`: the armed receive completes with
 //!   `error.ConnectionResetByPeer` / 0 bytes (EOF).
+//! - `Rx`: the armed receive delivers one record with a valid header and a
+//!   junk payload. `readOne`'s decrypt error runs `failDrain` and posts the
+//!   EOF but no shutdown, the one failure path without one (t-3807).
+//!   tls.zig then refuses to encrypt (the connection is
+//!   `fatal_alert_pending`).
+//! - `Ra`: the armed receive delivers a fatal alert from the peer, correctly
+//!   encrypted. The same `readOne` path runs, but tls.zig queues no alert of
+//!   its own for a peer's alert, so the cipher stays open: only the pump can
+//!   refuse a later write.
 //! - `T`: teardown, last in every case: the kernel drops what is in flight
 //!   (what `shutdownCq`'s cancel and drain do to it), then `H1Tls.close`,
 //!   the same call `H1Conn.deinit` makes, which decides itself whether a
@@ -113,7 +122,7 @@ const commit_seeds = 16;
 /// The enumerated corpus at `enum_depth`, measured; fewer cases means the
 /// legality rules or the pump changed what is reachable. Re-measure (the
 /// pass line prints the count) when either changes on purpose.
-const min_enum_cases = 8961;
+const min_enum_cases = 10255;
 /// The step targets 30 s without compilation (the corpus ran in about 6 s
 /// alone on an M-series Mac in Debug when this was set). The hard limit is
 /// twice that, so a loaded `ci` machine does not fail on time alone, while
@@ -137,6 +146,8 @@ const Action = enum {
     send_err,
     recv_err,
     recv_eof,
+    recv_corrupt,
+    recv_alert,
     teardown,
 
     fn token(a: Action) []const u8 {
@@ -148,6 +159,8 @@ const Action = enum {
             .send_err => "Se",
             .recv_err => "Re",
             .recv_eof => "Rf",
+            .recv_corrupt => "Rx",
+            .recv_alert => "Ra",
             .teardown => "T",
         };
     }
@@ -176,6 +189,10 @@ const Mark = enum {
     send_half,
     recv_err,
     recv_eof,
+    recv_corrupt,
+    corrupt_with_chunk_held,
+    recv_alert,
+    alert_with_chunk_held,
     fail_with_chunk_held,
     teardown_with_chunk_held,
     teardown_with_send_in_flight,
@@ -300,6 +317,8 @@ const Failure = struct {
 const Globals = struct {
     io: std.Io,
     cipher: @FieldType(tls_edge.Conn, "cipher"),
+    /// The peer's half of the same handshake, for records the peer sends.
+    client_cipher: @FieldType(tls_edge.Conn, "cipher"),
     argv0: []const u8,
     commit: []const u8,
     counts: Counts = .{},
@@ -421,6 +440,10 @@ const Run = struct {
                 n += 1;
                 out[n] = .recv_eof;
                 n += 1;
+                out[n] = .recv_corrupt;
+                n += 1;
+                out[n] = .recv_alert;
+                n += 1;
             }
         }
         out[n] = .teardown;
@@ -485,6 +508,34 @@ const Run = struct {
         switch (how) {
             .recv_err => c.setError(injected_error),
             .recv_eof => c.setResult(.net_recv, 0),
+            .recv_corrupt => {
+                // The kernel delivers one application-data record with a
+                // valid header and a payload that is not ciphertext under
+                // this connection's keys: `readOne`'s decrypt error.
+                var junk: [5 + 64]u8 = undefined;
+                junk[0..5].* = .{ 0x17, 0x03, 0x03, 0x00, 64 };
+                @memset(junk[5..], 0xa5);
+                const iov = c.cast(zio.ev.NetRecv).buffers.iovecs[0];
+                if (iov.len < junk.len) std.debug.panic("dst: receive buffer of {d} bytes", .{iov.len});
+                @memcpy(iov.base[0..junk.len], &junk);
+                c.setResult(.net_recv, junk.len);
+            },
+            .recv_alert => {
+                // The peer sends a fatal alert, correctly encrypted: the
+                // first record this case receives, so it is sealed with the
+                // peer's first sequence number. tls.zig returns the alert as
+                // an error and, since it came from the peer, queues nothing,
+                // so the cipher stays open for writing.
+                var peer = self.g.client_cipher;
+                peer.inner.pending_alert = .handshake_failure;
+                peer.inner.state = .fatal_alert_pending;
+                var buf: [64]u8 = undefined;
+                const rec = peer.close(&buf) catch |err| std.debug.panic("dst: encoding the peer's alert: {t}", .{err});
+                const iov = c.cast(zio.ev.NetRecv).buffers.iovecs[0];
+                if (iov.len < rec.len) std.debug.panic("dst: receive buffer of {d} bytes", .{iov.len});
+                @memcpy(iov.base[0..rec.len], rec);
+                c.setResult(.net_recv, rec.len);
+            },
             else => unreachable,
         }
         return self.afterCompletion(c);
@@ -524,7 +575,7 @@ const Run = struct {
             .write_small => self.write(small_write),
             .write_big => self.write(self.t.out.len),
             .send_ok, .send_half, .send_err => self.completeSend(a),
-            .recv_err, .recv_eof => self.completeRecv(a),
+            .recv_err, .recv_eof, .recv_corrupt, .recv_alert => self.completeRecv(a),
             .teardown => blk: {
                 if (held_before) self.mark(.teardown_with_chunk_held);
                 if (self.k.send != null) self.mark(.teardown_with_send_in_flight);
@@ -545,6 +596,14 @@ const Run = struct {
             .send_half => self.mark(.send_half),
             .recv_err => self.mark(.recv_err),
             .recv_eof => self.mark(.recv_eof),
+            .recv_corrupt => {
+                self.mark(.recv_corrupt);
+                if (held_before) self.mark(.corrupt_with_chunk_held);
+            },
+            .recv_alert => {
+                self.mark(.recv_alert);
+                if (held_before) self.mark(.alert_with_chunk_held);
+            },
             .write_small, .write_big => {
                 if (eof_before) self.mark(.write_after_eof);
                 if (exited_before) {
@@ -575,6 +634,11 @@ const Run = struct {
                 }
             },
             .recv_eof => if (!p.inbound_eof) return self.fail(.TerminalNotReached, "Rf did not post the EOF", .{}),
+            // The decrypt error ends the pump with the EOF and no shutdown
+            // post (`readOne`): the one failure path that posts none.
+            .recv_corrupt, .recv_alert => if (!self.exited or !p.inbound_eof or self.t.failures != failures_before) {
+                return self.fail(.TerminalNotReached, "{s} did not end the pump with the EOF and no shutdown post (exited={} eof={} failures {d} -> {d})", .{ a.token(), self.exited, p.inbound_eof, failures_before, self.t.failures });
+            },
             else => {},
         }
         return null;
@@ -854,7 +918,7 @@ fn runMain(io: std.Io, argv0: []const u8, mode_replay: ?[]const u8) !void {
     var acceptor = try tls_edge.Acceptor.initFromPem(std.heap.page_allocator, io, tls_edge.fixture_cert_pem, tls_edge.fixture_key_pem);
     defer acceptor.deinit();
     const pair = try tls_edge.memHandshake(&acceptor, &.{tls_edge.alpn_http11}, std.Io.Clock.real.now(io));
-    var g: Globals = .{ .io = io, .cipher = pair.server, .argv0 = argv0, .commit = commit };
+    var g: Globals = .{ .io = io, .cipher = pair.server, .client_cipher = pair.client, .argv0 = argv0, .commit = commit };
     if (mode_replay) |case| return replay(&g, case);
     std.debug.print("dst-transport: scope: this witness proves the HTTP/1.1 TLS transport cannot regain an unread failure channel. It does not reproduce the HTTPS crash end to end, and it says nothing about HTTP/2, the scheduler, or real threads.\n", .{});
     try corpus(&g);
