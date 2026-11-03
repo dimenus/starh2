@@ -374,6 +374,16 @@ pub const SocketWriter = struct {
         w.accepted_ns.store(nowNs(w.io), .release);
         _ = w.accepted.fetchAdd(n, .release);
         w.taken += n;
+        if (comptime @import("build_options").dst_mutant == .short_write_drop) {
+            // DST validity mutant: a short write is reported as complete, so
+            // the bytes the socket did not take are dropped.
+            var offered: usize = io_w.buffered().len;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1]) |d| offered += d.len;
+                offered += data[data.len - 1].len * splat;
+            }
+            return io_w.consume(offered);
+        }
         return io_w.consume(n);
     }
 };

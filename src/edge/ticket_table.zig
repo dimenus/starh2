@@ -41,6 +41,26 @@ const response = @import("../http/response.zig");
 /// t-866 ticket-ledger diagnostics and the r158 `waiting` flag. Gated so the
 /// official bench path pays no atomic increments.
 pub const observe = @import("build_options").observe;
+const dst_mutant = @import("build_options").dst_mutant;
+
+/// Coverage marks for the DST connection harness (`tools/dst-conn`), counted
+/// in observe builds only. They prove a run reached the window the t-537 rule
+/// guards, rather than inferring it from a seed count.
+pub const Marks = struct {
+    /// A wait found its ticket completed ok while a cancel or a terminal
+    /// cause had also arrived: the case `ok` must win.
+    ok_with_cancel: std.atomic.Value(u64) = .init(0),
+    /// A wait was parked on its ticket and, when it woke, a cancel or a
+    /// terminal cause had arrived. Teardown publishes the cause, then fails
+    /// every ticket, then sets `dead` (`Connection.publishTeardownWakes`), so
+    /// the cancel a parked send sees is that cause, not the select's cancel.
+    cancel_while_waiting: std.atomic.Value(u64) = .init(0),
+    /// The narrower case: the select itself returned through `dead` or a
+    /// task cancel while parked. Reported, not required: by the order above
+    /// the ticket arm wins first.
+    task_cancel_while_waiting: std.atomic.Value(u64) = .init(0),
+};
+pub var test_marks: test_hook.Hook(Marks) = if (test_hook.on) .{} else {};
 
 pub const no_completion_slot = std.math.maxInt(u32);
 
@@ -278,31 +298,50 @@ pub const TicketTable = struct {
         if (comptime observe) slot.waiting.store(true, .release);
         defer if (comptime observe) slot.waiting.store(false, .release);
         var canceled = false;
+        var parked = false;
         if (!slot.event.isSet()) {
             if (self.dead) |dead| {
                 if (dead.isSet()) {
                     canceled = true;
-                } else if (zio.select(.{
-                    .ticket = &slot.event,
-                    .dead = dead,
-                })) |winner| {
-                    switch (winner) {
-                        .ticket => {},
-                        .dead => canceled = true,
+                } else {
+                    parked = true;
+                    if (zio.select(.{
+                        .ticket = &slot.event,
+                        .dead = dead,
+                    })) |winner| {
+                        switch (winner) {
+                            .ticket => {},
+                            .dead => canceled = true,
+                        }
+                    } else |_| {
+                        canceled = true;
                     }
-                } else |_| {
-                    canceled = true;
                 }
             } else {
+                parked = true;
                 slot.event.wait() catch {
                     canceled = true;
                 };
             }
         }
-        // Completed-ok is a fact about the past (t-537). Check it before
-        // cause or cancel, including when `dead` won the select.
-        if (slot.ok.load(.acquire) == ok_pass) return;
-        if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
+        if (comptime test_hook.on) {
+            const has_cause = if (terminal) |t| t.getCause() != null else false;
+            if (slot.ok.load(.acquire) == ok_pass and (canceled or has_cause)) {
+                _ = test_marks.ok_with_cancel.fetchAdd(1, .monotonic);
+            }
+            if (parked and (canceled or has_cause)) _ = test_marks.cancel_while_waiting.fetchAdd(1, .monotonic);
+            if (parked and canceled) _ = test_marks.task_cancel_while_waiting.fetchAdd(1, .monotonic);
+        }
+        if (comptime dst_mutant == .ticket_cause_first) {
+            // DST validity mutant: the pre-t-537 order, cause before ok.
+            if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
+            if (slot.ok.load(.acquire) == ok_pass) return;
+        } else {
+            // Completed-ok is a fact about the past (t-537). Check it before
+            // cause or cancel, including when `dead` won the select.
+            if (slot.ok.load(.acquire) == ok_pass) return;
+            if (terminal) |t| if (t.getCause()) |c| return response.causeToError(c);
+        }
         if (canceled) return error.Canceled;
         return error.WriteFailed;
     }

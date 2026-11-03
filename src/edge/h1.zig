@@ -402,7 +402,7 @@ fn h1AckSink(ctx: *anyopaque, c: wire_pump.WriteCompletion) void {
 /// four-slot `acks` channel that nothing reads, which is the first version
 /// of t-3759 step 7. Only the witness's own mutant build sets the option,
 /// and `test_hook.on` keeps it out of every release build.
-pub const mutant_no_ack_sink = test_hook.on and @import("build_options").dst_mutant_no_h1_ack_sink;
+pub const mutant_no_ack_sink = test_hook.on and @import("build_options").dst_mutant == .no_h1_ack_sink;
 
 /// The HTTP/1.1 TLS transport: the pump and everything it borrows (the
 /// ciphertext read buffer, the decrypt chunk, the channels the pump's shape

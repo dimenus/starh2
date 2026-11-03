@@ -23,6 +23,25 @@ comptime {
 /// build holds two zio modules and fails to compile.
 const ZioScheduling = enum { single_executor, pinned, work_stealing };
 
+/// Validity mutants of the DST gates: the connection harness (`dst-conn`)
+/// and the HTTP/1.1 TLS transport witness (`dst-transport`). Every module but
+/// those gates' mutant arms is built with `.none`, and each mutant site in
+/// `src/` is `if (comptime ... == .<mutant>)`, so no other build contains a
+/// mutant. Each tag is read in the file that carries it.
+const DstMutant = enum {
+    none,
+    /// `h1.zig` `H1Tls.init`: the TLS pump gets no `ack_apply` sink, so its
+    /// failure completions go to a channel nothing reads (the first step-7
+    /// routing). Only `dst-transport`'s mutant arm.
+    no_h1_ack_sink,
+    /// `ticket_table.zig` `wait`: the terminal cause is checked before the
+    /// completed-ok result (the pre-t-537 order).
+    ticket_cause_first,
+    /// `wire_pump.zig` `SocketWriter.drain`: a short write is reported as if
+    /// the socket took every byte, so the unsent tail is lost.
+    short_write_drop,
+};
+
 const brotli_common_sources = [_][]const u8{
     "common/constants.c",
     "common/context.c",
@@ -159,8 +178,6 @@ fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *st
     mod.linkLibrary(lib);
 }
 
-/// `dst_mutant_no_h1_ack_sink` is true only on the transport witness's
-/// mutant module (`dst-transport`); every other module passes false.
 /// The commit this build is from, for the transport witness's seeds and
 /// build identity, or "" when there is none to read: not a git checkout
 /// (a `git archive` export carries it in `tests/dst_commit.txt` instead),
@@ -177,12 +194,12 @@ fn gitCommit(b: *std.Build) []const u8 {
     return sha;
 }
 
-fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, wire_ring: bool, zio_scheduling: ZioScheduling, dst_mutant_no_h1_ack_sink: bool) void {
+fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, wire_ring: bool, zio_scheduling: ZioScheduling, dst_mutant: DstMutant) void {
     const opts = b.addOptions();
     opts.addOption(bool, "observe", observe);
     opts.addOption(bool, "wire_ring", wire_ring);
     opts.addOption(ZioScheduling, "zio_scheduling", zio_scheduling);
-    opts.addOption(bool, "dst_mutant_no_h1_ack_sink", dst_mutant_no_h1_ack_sink);
+    opts.addOption(DstMutant, "dst_mutant", dst_mutant);
     mod.addOptions("build_options", opts);
 }
 
@@ -251,7 +268,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, starh2_mod, observe_hot, wire_ring, zio_scheduling, false);
+    attachStarh2Options(b, starh2_mod, observe_hot, wire_ring, zio_scheduling, .none);
     // Encoder only on the production module (static lib — see brotliEncLib).
     // Decoder is linked only into test artifacts that round-trip.
     const brotli_enc = brotliEncLib(b, brotli_dep, target, optimize, "brotli_enc");
@@ -295,7 +312,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, lib_test_mod, true, false, zio_scheduling, false);
+    attachStarh2Options(b, lib_test_mod, true, false, zio_scheduling, .none);
     linkBrotliEnc(lib_test_mod, brotli_dep, brotli_enc);
     linkBrotliDec(lib_test_mod, brotli_dep, brotli_dec);
     const lib_tests = b.addTest(.{
@@ -806,7 +823,7 @@ pub fn build(b: *std.Build) void {
     const dst_opts = b.addOptions();
     dst_opts.addOption([]const u8, "git_commit", gitCommit(b));
     var dst_bins: [2]*std.Build.Step.Compile = undefined;
-    for ([_]bool{ false, true }, 0..) |mutant, i| {
+    for ([_]DstMutant{ .none, .no_h1_ack_sink }, 0..) |mutant, i| {
         const dst_starh2 = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
@@ -820,7 +837,7 @@ pub fn build(b: *std.Build) void {
         attachStarh2Options(b, dst_starh2, true, false, zio_scheduling, mutant);
         linkBrotliEnc(dst_starh2, brotli_dep, dst_brotli_enc);
         dst_bins[i] = b.addExecutable(.{
-            .name = if (mutant) "dst-transport-mutant" else "dst-transport-control",
+            .name = if (mutant == .no_h1_ack_sink) "dst-transport-mutant" else "dst-transport-control",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/dst_tls_lifecycle.zig"),
                 .target = target,
@@ -1267,7 +1284,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zio", .module = zio_rt.module("zio") },
             },
         });
-        attachStarh2Options(b, starh2_rt, false, false, zio_scheduling, false);
+        attachStarh2Options(b, starh2_rt, false, false, zio_scheduling, .none);
         const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .safe, b.fmt("brotli_enc_{s}", .{rq.name}));
         linkBrotliEnc(starh2_rt, brotli_rt, brotli_enc_rt);
         const datastar_mod_rt = b.createModule(.{
@@ -1511,6 +1528,85 @@ pub fn build(b: *std.Build) void {
             run.has_side_effects = true;
             run.stdio = .inherit;
             dst_zio_step.dependOn(&run.step);
+        }
+    }
+
+    // The DST connection gate (tools/dst-conn). One real h2c `Connection`
+    // and an in-sim HTTP/2 peer on a sim pipe, every interleaving chosen by
+    // one seed. zio is a separate instance here: sim on, pinned scheduling
+    // (the simulator does not model task migration). starh2 is built again
+    // against it with the test hooks on (`observe`: the coverage marks), once
+    // per validity mutant. Run arguments, not build options, carry the commit
+    // seed, so a new commit does not rebuild the harness.
+    const dst_conn_step = b.step("dst-conn", "DST: one h2c connection in the zio simulator; seeds to a budget, determinism, and every validity mutant caught (tools/dst-conn)");
+    const dst_conn_install = b.step("dst-conn-install", "Install the dst-conn harness binaries (zig-out/bin/dst-conn*) to rerun seeds directly");
+    {
+        const zio_sim_dep = b.dependency("zio", .{
+            .target = target,
+            .optimize = optimize,
+            .scheduling = .pinned,
+            .sim = true,
+        });
+        const oracle_mod = b.createModule(.{
+            .root_source_file = b.path("tests/h2_oracle.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        var exit_code: u8 = 0;
+        // No git (a `git archive` tree): the commit seed is skipped, and the
+        // harness says so; the regression file and the fixed range still run.
+        const commit: []const u8 = if (b.runAllowFail(&.{ "git", "rev-parse", "HEAD" }, &exit_code, .ignore)) |out|
+            std.mem.trim(u8, out, " \n\r")
+        else |_|
+            "none";
+        inline for (.{ DstMutant.none, DstMutant.ticket_cause_first, DstMutant.short_write_drop }) |mutant| {
+            const starh2_dst = b.createModule(.{
+                .root_source_file = b.path("src/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "tls", .module = tls_mod },
+                    .{ .name = "zio", .module = zio_sim_dep.module("zio") },
+                },
+            });
+            attachStarh2Options(b, starh2_dst, true, false, .pinned, mutant);
+            linkBrotliEnc(starh2_dst, brotli_dep, brotli_enc);
+            const h2_client_dst = b.createModule(.{
+                .root_source_file = b.path("src/h2_client.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "starh2", .module = starh2_dst }},
+            });
+            const harness_opts = b.addOptions();
+            harness_opts.addOption([]const u8, "mutant", @tagName(mutant));
+            const name = if (mutant == .none) "dst-conn" else "dst-conn-" ++ @tagName(mutant);
+            const exe = b.addExecutable(.{
+                .name = name,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tools/dst-conn/main.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "zio", .module = zio_sim_dep.module("zio") },
+                        .{ .name = "starh2", .module = starh2_dst },
+                        .{ .name = "h2_client", .module = h2_client_dst },
+                        .{ .name = "h2_oracle", .module = oracle_mod },
+                        .{ .name = "harness_options", .module = harness_opts.createModule() },
+                    },
+                }),
+            });
+            dst_conn_install.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            const run = b.addRunArtifact(exe);
+            run.setCwd(b.path("."));
+            run.has_side_effects = true;
+            run.stdio = .inherit;
+            if (mutant == .none) {
+                run.addArgs(&.{ "--ci", "--seeds-file", "tools/dst-conn/regression-seeds.txt", "--commit", commit, "--budget-ms", "45000" });
+            } else {
+                run.addArgs(&.{"--expect-mutant"});
+            }
+            dst_conn_step.dependOn(&run.step);
         }
     }
 
