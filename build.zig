@@ -842,6 +842,24 @@ pub fn build(b: *std.Build) void {
     const dst_transport_step = b.step("dst-transport", "HTTP/1.1 TLS transport witness: the control passes every enumerated and seeded case; the mutant without h1AckSink fails UnconsumedTlsAck and replays identically twice");
     dst_transport_step.dependOn(&dst_transport_run.step);
 
+    // t-3794: the h2c WritePump settles a failed batch by the bytes the
+    // socket accepted. Its own step so it can be run alone; `test` runs it.
+    const h2c_settle_tests = b.addTest(.{
+        .name = "h2c_settle",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/h2c_settle.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_h2c_settle_tests = b.addRunArtifact(h2c_settle_tests);
+    const h2c_settle_step = b.step("test-h2c-settle", "Run the t-3794 gate: a failed h2c batch acks ok the chunks the socket accepted in full");
+    h2c_settle_step.dependOn(&run_h2c_settle_tests.step);
+
     const t3562_tests = b.addTest(.{
         .name = "t3562",
         .root_module = b.createModule(.{
@@ -1134,6 +1152,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_outbound_memory_tests.step);
     test_step.dependOn(&run_outbound_budget_tests.step);
     test_step.dependOn(&run_t3567_tests.step);
+    test_step.dependOn(&run_h2c_settle_tests.step);
     test_step.dependOn(&run_t3562_tests.step);
     test_step.dependOn(&run_macos_sdk_tests.step);
 

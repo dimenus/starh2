@@ -340,6 +340,10 @@ pub const SocketWriter = struct {
     /// Read at each call, so a caller may change it between writes.
     timeout_ns: u64,
     timed_out: bool = false,
+    /// Bytes the socket accepted through this writer, ever. `WritePump`
+    /// settles a failed batch by it (`settleCut`). Owned by the writer's
+    /// task, so a plain integer.
+    taken: u64 = 0,
 
     const NetHandle = @FieldType(zio.net.Socket, "handle");
 
@@ -369,6 +373,7 @@ pub const SocketWriter = struct {
         };
         w.accepted_ns.store(nowNs(w.io), .release);
         _ = w.accepted.fetchAdd(n, .release);
+        w.taken += n;
         return io_w.consume(n);
     }
 };
@@ -468,10 +473,31 @@ pub const WritePump = struct {
         self.post(.{ .fail_all = true });
     }
 
+    /// A batch write or its flush failed after the socket had accepted
+    /// `taken` bytes of the batch. Every batch starts with the writer's
+    /// buffer empty (each one ends with a flush) and goes to the socket in
+    /// chunk order, so the accepted bytes are a prefix of the batch. A chunk
+    /// that lies wholly inside that prefix reached the socket: it settles ok,
+    /// exactly as on success. The chunk the failure cut through and every
+    /// later one settle failed, and so does a chunk whose bytes were copied
+    /// into the writer's buffer but never accepted. Acks go out in chunk
+    /// order, as on success. (t-3794: failing the whole batch made `send`
+    /// return an error for a response the peer had received in full; TLS
+    /// already acks a chunk once its records are staged.)
+    fn settleCut(self: *WritePump, chunks: []const WireChunk, taken: u64) void {
+        var end: u64 = 0;
+        for (chunks) |chunk| {
+            end += chunk.len;
+            self.releaseChunk(chunk, end <= taken, false);
+        }
+    }
+
     /// Write chunks in FIFO order, gathering already-queued chunks into the
     /// buffered writer. Completions fire only after an explicit flush, so a
     /// ticket still means the bytes reached the socket — not merely this
-    /// buffer. Frame ORDER is decided upstream by the `FairScheduler`.
+    /// buffer. When the write fails, a chunk the socket already accepted in
+    /// full still settles ok (`settleCut`). Frame ORDER is decided upstream
+    /// by the `FairScheduler`.
     ///
     /// Two zero-length chunks mean different things, and the flag tells them
     /// apart. With `flush_barrier` it is a flush that had no bytes of its own:
@@ -559,6 +585,10 @@ pub const WritePump = struct {
             for (chunks[0..count], 0..) |chunk, i| {
                 slices[i] = chunk.bytes[0..chunk.len];
             }
+            // `settleCut` counts the batch's bytes from here: nothing of an
+            // earlier write may still sit in the buffer.
+            if (writer.interface.end != 0) std.debug.panic("WritePump: {d} bytes left in the writer buffer before a batch", .{writer.interface.end});
+            const taken_before = writer.taken;
             if (close_probe) {
                 var types: [max_batch]u8 = undefined;
                 var lens: [max_batch]usize = undefined;
@@ -579,7 +609,7 @@ pub const WritePump = struct {
                 writer.interface.writeVecAll(slices[0..count]);
             write_result catch |err| {
                 if (close_probe) probePrint("t1002 pump={x} write_err {s}\n", .{ @intFromPtr(self), @errorName(err) });
-                for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
+                self.settleCut(chunks[0..count], writer.taken - taken_before);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return;
@@ -589,7 +619,7 @@ pub const WritePump = struct {
             // whose bytes are still sitting here.
             writer.interface.flush() catch |err| {
                 if (close_probe) probePrint("t1002 pump={x} flush_err {s}\n", .{ @intFromPtr(self), @errorName(err) });
-                for (chunks[0..count]) |chunk| self.releaseChunk(chunk, false, false);
+                self.settleCut(chunks[0..count], writer.taken - taken_before);
                 self.failDrain();
                 self.post(.{ .shutdown = true });
                 return;
