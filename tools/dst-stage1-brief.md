@@ -124,3 +124,27 @@ Never push. Write `tools/dst-stage1-report.md` (not committed): per milestone,
 the commit, each test's result before and after, the mutation table, ci on both
 machines, every corner cut, and anything not measured labelled as inference.
 Stop after milestone 0 and report; the orchestrator will tell you to continue.
+
+## Handoff (2026-11-03, orchestrator)
+
+The first witness seat stopped on repeated API 500 errors at the start of
+milestone 1; a new seat takes over from this file.
+
+- **Done and verified by the orchestrator:** milestone 0, commit `874ce91`
+  ("Make t3567's idle table judge the handler's own result record..."). The
+  orchestrator recomputed it on the Mac with its own mutant (a 500 ms sleep
+  after a successful ticket wait in `Connection.waitTicket`): the old test
+  failed 3 of 3 with `status=204 ended=true ops=0`, `expected 1, found 0`; the
+  new test passed 3 of 3 with 10 of 10 `terminal=ok`; a control passed 3 of 3.
+  Do not redo it.
+- **Not started:** milestone 1. No code exists for it. The previous seat's
+  untracked `tools/dst-stage1-report.md` holds the milestone 0 section; append
+  milestone 1 to it.
+- **Reading:** rounds 2 and 3 cover milestone 1. Do not read round 1 or the
+  TigerBeetle survey in one piece (the previous seat failed while loading
+  them); read any large file in parts.
+- **New rule:** never write the shared Zig global cache (`~/.cache/zig`) with a
+  hand-made tarball or a `zig fetch` of a scratch package; pass your own
+  `--global-cache-dir` if you need one.
+- Tripwire for the new seat: HEAD is the commit adding this handoff; its
+  parent is `874ce91`.
