@@ -63,6 +63,9 @@ const Client = struct {
     /// Answer the server's PINGs: the first GOAWAY phase then ends at once,
     /// not after its 1 s.
     ack_pings: bool = false,
+    /// Retry a refused connect for a while: the server is held before it
+    /// listens, and only the kernel's accept says when it does.
+    connect_retry: bool = false,
     release: std.atomic.Value(bool) = .init(false),
     sent: std.atomic.Value(bool) = .init(false),
     err: ?anyerror = null,
@@ -76,7 +79,7 @@ const Client = struct {
 
     fn run(c: *Client) !void {
         const gpa = std.heap.page_allocator;
-        const w = try Wire.open(gpa, .h2c, c.port);
+        const w = if (c.connect_retry) try openRetry(gpa, c.port) else try Wire.open(gpa, .h2c, c.port);
         defer w.close();
         var req = try h2c.buildClientPrefaceAndSettings(gpa);
         defer req.deinit(gpa);
@@ -180,6 +183,45 @@ test "shutdown: with a client that answers the drain PING, the cancel report sti
 
 /// A raw HTTP/1.1 client that asks for `/linger` on `port` and reads
 /// nothing. The caller closes the descriptor.
+fn openRetry(gpa: std.mem.Allocator, port: u16) !*Wire {
+    const deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return Wire.open(gpa, .h2c, port) catch |err| switch (err) {
+            error.Connect => {
+                if (nowNs() >= deadline) return err;
+                const t: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&t, null);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+/// `h1Linger` on a thread of its own, retrying a refused connect (the
+/// server is held before it listens): the fd, or the error.
+const H1LingerRetry = struct {
+    port: u16,
+    fd: c_int = -1,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn main(c: *H1LingerRetry) void {
+        c.run() catch |err| {
+            c.err = err;
+        };
+        c.done.store(true, .release);
+    }
+
+    fn run(c: *H1LingerRetry) !void {
+        const fd = try wire_client.connectRetry(c.port, nowNs() + 5 * std.time.ns_per_s);
+        errdefer _ = std.c.close(fd);
+        const req = "GET /linger HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        if (std.c.send(fd, req.ptr, req.len, 0) != req.len) return error.Send;
+        c.fd = fd;
+    }
+};
+
 fn h1Linger(port: u16) !c_int {
     const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
     if (fd < 0) return error.Socket;
@@ -252,8 +294,13 @@ test "shutdown: an HTTP/1.1 handler cancelled at shutdown is reported then, not 
 /// make a spawn fail) once the handler on endpoint 0 runs.
 fn runStartupFailure(rt: *zio.Runtime, gpa: std.mem.Allocator, h1: bool) !void {
     const server_mod = starh2.edge.server;
-    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
-    const endpoints: [2]starh2.EndpointConfig = if (h1) .{ .{ .h1c = addr }, .{ .h1c = addr } } else .{ .{ .h2c_prior_knowledge = addr }, .{ .h2c_prior_knowledge = addr } };
+    // Endpoint 0's port is the test's own: the server is held before it
+    // listens, so its `local_addrs` are never published to this task
+    // (`wire_client.freeLoopbackPort`).
+    const port = try wire_client.freeLoopbackPort();
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", port);
+    const addr1 = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const endpoints: [2]starh2.EndpointConfig = if (h1) .{ .{ .h1c = addr }, .{ .h1c = addr1 } } else .{ .{ .h2c_prior_knowledge = addr }, .{ .h2c_prior_knowledge = addr1 } };
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &endpoints,
         .routes = &routes,
@@ -268,12 +315,7 @@ fn runStartupFailure(rt: *zio.Runtime, gpa: std.mem.Allocator, h1: bool) !void {
     running.store(0, .release);
     ended_ns.store(0, .release);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
-    const bound_deadline = nowNs() + 5 * std.time.ns_per_s;
-    while (server.listeners_bound < 2) {
-        if (nowNs() >= bound_deadline) return error.NeverBound;
-        zio.sleep(.fromMilliseconds(5)) catch {};
-    }
-    var c: Client = .{ .port = server.local_addrs[0].getPort(), .path = "/linger", .count = 1 };
+    var c: Client = .{ .port = port, .path = "/linger", .count = 1, .connect_retry = true };
     var t: ?std.Thread = null;
     var h1_fd: c_int = -1;
     defer {
@@ -282,7 +324,12 @@ fn runStartupFailure(rt: *zio.Runtime, gpa: std.mem.Allocator, h1: bool) !void {
         if (h1_fd >= 0) _ = std.c.close(h1_fd);
     }
     if (h1) {
-        h1_fd = try h1Linger(server.local_addrs[0].getPort());
+        var lc: H1LingerRetry = .{ .port = port };
+        const lt = try std.Thread.spawn(.{}, H1LingerRetry.main, .{&lc});
+        while (!lc.done.load(.acquire)) zio.sleep(.fromMilliseconds(2)) catch {};
+        lt.join();
+        if (lc.err) |err| return err;
+        h1_fd = lc.fd;
     } else {
         t = try std.Thread.spawn(.{}, Client.main, .{&c});
     }
@@ -323,9 +370,9 @@ test "shutdown: an HTTP/1.1 startup failure with a handler already running waits
     try h.join();
 }
 
-/// astra 1 / Fable F3: a canceled `serve` cancels every connection task. An
-/// HTTP/1.1 connection must still wait for its running handler (whose memory
-/// is the connection's) before it ends, and `serve` reports that wait.
+/// astra 1 / Fable F3: a canceled `serve` cancels every connection task. A
+/// running HTTP/1.1 handler is cut off from its connection (orphaned, t-3759
+/// step 7), and `serve` waits for it and reports that wait.
 const CancelKind = enum { h2c, h1c, h1_tls };
 
 /// An HTTP/1.1-over-TLS client asking for `/linger`, opened on a thread of
@@ -428,73 +475,6 @@ fn runCanceledServe(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: CancelKind) 
     // Reported while the handler still ran.
     try std.testing.expect(server.shutdown_reports.load(.acquire) >= 1);
     try std.testing.expectEqual(@as(usize, 1), server.shutdown_report_handlers.load(.acquire));
-}
-
-/// astra 1, round 3: the reaper claims the report (`reported`) and then
-/// posts the completion. A connection whose task is canceled in that gap
-/// must still wait for the post: the post writes into the connection's
-/// channel. The peer's close hands the handler to the reaper; the reaper is
-/// held between its claim and its post (a test hook: nothing else holds
-/// that gap open); then `serve` is canceled, which cancels the connection.
-fn runReaperGap(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    const conn_mod = starh2.edge.connection;
-    var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
-        .routes = &routes,
-        .tls = null,
-        .limits = .defaults,
-    });
-    defer server.deinit(gpa);
-    running.store(0, .release);
-    ended_ns.store(0, .release);
-    conn_mod.test_reaper_held.store(0, .release);
-    conn_mod.test_reaper_hold_post.store(true, .release);
-    defer conn_mod.test_reaper_hold_post.store(false, .release);
-    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
-    try server.waitUntilListening(5 * std.time.ns_per_s);
-    const fd = try h1Linger(server.localAddress(0).getPort());
-    try waitRunning(1);
-    // The peer goes: the connection hands its handler to the reaper.
-    _ = std.c.close(fd);
-    const held_deadline = nowNs() + 5 * std.time.ns_per_s;
-    while (conn_mod.test_reaper_held.load(.acquire) != 1) {
-        if (nowNs() >= held_deadline) return error.ReaperNeverHeld;
-        zio.sleep(.fromMilliseconds(2)) catch {};
-    }
-    // Now cancel `serve`: the connection's task is canceled while the reaper
-    // holds its claimed, unposted completion.
-    const SH = @TypeOf(serve_handle);
-    const Canceller = struct {
-        fn run(h: *SH, done: *std.atomic.Value(bool)) void {
-            h.cancel();
-            done.store(true, .release);
-        }
-    };
-    var done: std.atomic.Value(bool) = .init(false);
-    var ch = try rt.spawn(Canceller.run, .{ &serve_handle, &done });
-    defer ch.join();
-    zio.sleep(.fromMilliseconds(300)) catch {};
-    const conns_in_gap = server.active_connections.load(.acquire);
-    const returned_in_gap = done.load(.acquire);
-    conn_mod.test_reaper_hold_post.store(false, .release);
-    const deadline = nowNs() + 5 * std.time.ns_per_s;
-    while (!done.load(.acquire)) {
-        if (nowNs() >= deadline) return error.ServeNeverReturned;
-        zio.sleep(.fromMilliseconds(1)) catch {};
-    }
-    std.debug.print("shutdown reaper gap: while the reaper held its post the connection count was {d} and serve returned={}\n", .{ conns_in_gap, returned_in_gap });
-    // The connection count is what tells: with the old rule the connection
-    // ended inside the gap. `serve` cannot return inside it either way (its
-    // reaper is held in the hook), so `returned_in_gap` is only printed.
-    try std.testing.expectEqual(@as(usize, 1), conns_in_gap);
-}
-
-test "shutdown: an HTTP/1.1 connection canceled between the reaper's claim and its post waits for the post" {
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
-    defer rt.deinit();
-    var h = try rt.spawn(runReaperGap, .{ rt, gpa });
-    try h.join();
 }
 
 test "shutdown: a canceled serve waits for a running HTTP/1.1 handler and reports it" {

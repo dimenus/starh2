@@ -1,22 +1,21 @@
 //! Listen, accept, global limits, graceful stop.
 //!
 //! `Server` owns everything that outlives a single connection: the listeners,
-//! the routes, the TLS key material, the reaper pool, and the server-wide
+//! the routes, the TLS key material, the request pool, and the server-wide
 //! counters in `GlobalAccounting`. A `Connection` borrows all of it and owns
 //! only its own stream.
 //!
-//! # Task groups, and why there are three
+//! # Task groups, and why there are two
 //!
 //! Shutdown has an ORDER, and one group cannot express it:
 //! 1. Accept loops stop first, so no new connection can arrive during the
 //!    drain.
 //! 2. Connections drain next, so in-flight requests can finish.
-//! 3. Handlers that outlived their connection end next; `serve` waits for
-//!    them without a limit, and reports what it waits for (`waitForHandlers`).
-//! 4. Reapers stop last, because a draining connection still needs
-//!    cancellation to work.
-//! A single group would cancel all three at once and abort the very work the
-//! graceful path exists to preserve.
+//! 3. Handlers that outlived their connection end last; they are in no
+//!    group, and `serve` waits for them without a limit, and reports what it
+//!    waits for (`waitForHandlers`).
+//! A single group would cancel the connections with the accept loops and
+//! abort the very work the graceful path exists to preserve.
 //!
 //! # Two shutdown signals, not one
 //!
@@ -159,7 +158,6 @@ pub const Server = struct {
     active_connections: std.atomic.Value(usize) = .init(0),
     accounting: connection.GlobalAccounting,
     router: router_mod.Router = undefined,
-    reaper: ?connection.ReaperPool = null,
     /// Server-wide outbound DATA slabs. Shared so an idle connection holds
     /// none, and capped so the ceiling stays computable.
     slabs: slab_pool.SlabPool,
@@ -184,7 +182,7 @@ pub const Server = struct {
     shutdown_reports: std.atomic.Value(u32) = .init(0),
     /// True from the start of `serve` until it returns. `deinit` checks it
     /// as well as the counters: a serving server with nothing charged still
-    /// has accept loops, listeners and reaper tasks in use.
+    /// has accept loops and listeners in use.
     serving: std.atomic.Value(bool) = .init(false),
     shutdown_report_handlers: std.atomic.Value(usize) = .init(0),
     /// Report 1's count of task handlers the connections asked to cancel.
@@ -206,8 +204,6 @@ pub const Server = struct {
         _ = try config.limits.resourceUpperBound();
         if (config.endpoints.len == 0 or config.endpoints.len > config.limits.max_endpoints) return error.InvalidConfig;
         if (config.routes.len > config.limits.max_routes) return error.InvalidConfig;
-        if (config.limits.cancellation_reaper_jobs < config.limits.max_streams_per_server) return error.InvalidConfig;
-        if (config.limits.cancellation_reaper_tasks == 0) return error.InvalidConfig;
 
         var need_tls = false;
         var need_h2c = false;
@@ -272,9 +268,6 @@ pub const Server = struct {
         const local_addrs = try gpa.alloc(EndpointAddress, config.endpoints.len);
         errdefer gpa.free(local_addrs);
 
-        var reaper = connection.ReaperPool.init(gpa, io, config.limits.cancellation_reaper_jobs) catch return error.OutOfMemory;
-        errdefer reaper.deinit();
-
         var slabs = slab_pool.SlabPool.init(
             gpa,
             io,
@@ -322,11 +315,10 @@ pub const Server = struct {
             .tls_acceptor = tls_acceptor,
             .accounting = .{
                 .max_streams = config.limits.max_streams_per_server,
-                .reaper_capacity = config.limits.cancellation_reaper_jobs,
+                .task_handler_capacity = config.limits.max_task_handlers,
                 .max_outbound_bytes = config.limits.outbound_bytes_per_server,
                 .max_handshakes = config.limits.concurrent_tls_handshakes,
             },
-            .reaper = reaper,
             .slabs = slabs,
             .requests = requests,
             .compression_pool = compression_pool,
@@ -345,14 +337,6 @@ pub const Server = struct {
             if (self.endpoints[i].unixPath()) |path| std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
         }
         self.listeners_bound = 0;
-    }
-
-    fn stopReapers(self: *Server, group: *std.Io.Group) void {
-        if (self.reaper) |*pool| pool.jobs.close(self.io);
-        group.await(self.io) catch {
-            // A canceled serve task still must wait until every queued handler join is consumed.
-            group.cancel(self.io);
-        };
     }
 
     pub fn serve(self: *Server, gpa: std.mem.Allocator) ServeError!void {
@@ -376,22 +360,8 @@ pub const Server = struct {
             self.listeners_bound = i + 1;
         }
 
-        var reaper_group: std.Io.Group = .init;
         var accept_group: std.Io.Group = .init;
         var connection_group: std.Io.Group = .init;
-        var reapers_live = false;
-
-        if (self.reaper) |*pool| {
-            var i: usize = 0;
-            while (i < self.limits.cancellation_reaper_tasks) : (i += 1) {
-                reaper_group.concurrent(self.io, connection.ReaperPool.worker, .{pool}) catch {
-                    reaper_group.cancel(self.io);
-                    return error.TransportSetupFailed;
-                };
-                reapers_live = true;
-            }
-        }
-        errdefer if (reapers_live) self.stopReapers(&reaper_group);
 
         // Spawned now, while spawning works (`CancelSignal`). No connection
         // exists yet, so its own failure needs no wait.
@@ -414,8 +384,6 @@ pub const Server = struct {
                 zio.beginShield();
                 defer zio.endShield();
                 self.waitForHandlers(conn_group, true, &cancel, &canceller);
-                self.stopReapers(&reaper_group);
-                reapers_live = false;
                 return error.TransportSetupFailed;
             }
         }
@@ -438,8 +406,6 @@ pub const Server = struct {
         zio.beginShield();
         defer zio.endShield();
         self.waitForHandlers(conn_group, canceled, &cancel, &canceller);
-        self.stopReapers(&reaper_group);
-        reapers_live = false;
         if (canceled) return error.RuntimeShutdown;
     }
 
@@ -550,7 +516,7 @@ pub const Server = struct {
             // Checked before `quiet`: handlers that were asked to cancel and
             // ended at once are still the cancel this report is about.
             const asked = self.accounting.shutdown_cancel_asked.load(.acquire);
-            const handlers = self.accounting.reaper_reserved.load(.acquire) + self.accounting.orphaned_handlers.load(.acquire);
+            const handlers = self.accounting.task_handlers.load(.acquire) + self.accounting.orphaned_handlers.load(.acquire);
             if (asked != 0 or handlers != 0) {
                 if (canceled) return .asked;
                 const live = self.active_connections.load(.acquire);
@@ -564,8 +530,8 @@ pub const Server = struct {
         }
     }
 
-    /// No connection, no task handler (HTTP/2, orphans included, or
-    /// HTTP/1.1), and a group cancel, if one was asked, done; or
+    /// No connection, no task handler (either protocol, orphans included),
+    /// and a group cancel, if one was asked, done; or
     /// `deadline_ns`. True when quiet. `orphaned_handlers` is the last thing
     /// an orphan releases, so reading it zero means that orphan is done with
     /// this struct.
@@ -583,14 +549,14 @@ pub const Server = struct {
     fn quiet(self: *Server) bool {
         return self.active_connections.load(.acquire) == 0 and
             self.accounting.orphaned_handlers.load(.acquire) == 0 and
-            self.accounting.reaper_reserved.load(.acquire) == 0;
+            self.accounting.task_handlers.load(.acquire) == 0;
     }
 
     const ReportPhase = enum { cancel, cancel_group, cancel_backstop, grace, interval };
 
     fn reportShutdown(self: *Server, phase: ReportPhase, t0: u64, drain_ns: u64) void {
         const n = self.shutdown_reports.fetchAdd(1, .acq_rel) + 1;
-        const handlers = self.accounting.reaper_reserved.load(.acquire);
+        const handlers = self.accounting.task_handlers.load(.acquire);
         const orphans = self.accounting.orphaned_handlers.load(.acquire);
         const conns = self.active_connections.load(.acquire);
         self.shutdown_report_handlers.store(handlers, .release);
@@ -598,9 +564,9 @@ pub const Server = struct {
         if (n == 1) self.shutdown_report_asked.store(asked, .release);
         const since_ms = (monoNs() -| t0) / std.time.ns_per_ms;
         switch (phase) {
-            .cancel => log.warn("shutdown report {d}: after {d} ms (drain deadline {d} ms) every connection has asked its handlers to cancel, {d} task handlers in all; still running: {d} ({d} of them HTTP/2 handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, since_ms, drain_ns / std.time.ns_per_ms, asked, handlers, orphans, conns }),
-            .cancel_group => log.warn("shutdown report {d}: serve was canceled or failed to start, and every connection is being cancelled now; still running: {d} task handlers ({d} of them HTTP/2 handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, handlers, orphans, conns }),
-            .cancel_backstop => log.warn("shutdown report {d}: the drain deadline passed ({d} ms) with {d} of {d} connections not yet at their cancel step, so not every handler has been asked to cancel; still running: {d} task handlers ({d} of them HTTP/2 handlers whose connection ended); counts per route are not available (no per-route accounts)", .{ n, since_ms, conns -| self.accounting.shutdown_cancelled.load(.acquire), conns, handlers, orphans }),
+            .cancel => log.warn("shutdown report {d}: after {d} ms (drain deadline {d} ms) every connection has asked its handlers to cancel, {d} task handlers in all; still running: {d} ({d} of them handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, since_ms, drain_ns / std.time.ns_per_ms, asked, handlers, orphans, conns }),
+            .cancel_group => log.warn("shutdown report {d}: serve was canceled or failed to start, and every connection is being cancelled now; still running: {d} task handlers ({d} of them handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, handlers, orphans, conns }),
+            .cancel_backstop => log.warn("shutdown report {d}: the drain deadline passed ({d} ms) with {d} of {d} connections not yet at their cancel step, so not every handler has been asked to cancel; still running: {d} task handlers ({d} of them handlers whose connection ended); counts per route are not available (no per-route accounts)", .{ n, since_ms, conns -| self.accounting.shutdown_cancelled.load(.acquire), conns, handlers, orphans }),
             .grace => log.warn("shutdown report {d}: {d} task handlers ({d} orphaned), {d} connections still running {d} ms after shutdown, past the cancel grace of {d} ms; serve keeps waiting and reports every {d} ms", .{ n, handlers, orphans, conns, since_ms, self.limits.shutdown_cancel_grace_ns / std.time.ns_per_ms, self.limits.shutdown_report_interval_ns / std.time.ns_per_ms }),
             .interval => log.warn("shutdown report {d}: still waiting {d} ms after shutdown for {d} task handlers ({d} orphaned), {d} connections", .{ n, since_ms, handlers, orphans, conns }),
         }
@@ -849,7 +815,6 @@ pub const Server = struct {
                 .gpa = self.gpa,
                 .shutdown_flag = &self.shutdown_flag,
                 .shutdown_event = &self.shutdown_event,
-                .reaper = if (self.reaper) |*pool| pool else null,
                 .accounting = &self.accounting,
                 .slab_pool = &self.slabs,
                 .request_pool = &self.requests,
@@ -958,7 +923,7 @@ pub const Server = struct {
         }
         live = checkZero("active_connections", self.active_connections.load(.acquire)) or live;
         live = checkZero("active_streams", self.accounting.active_streams.load(.acquire)) or live;
-        live = checkZero("task handlers (reaper_reserved)", self.accounting.reaper_reserved.load(.acquire)) or live;
+        live = checkZero("task handlers (task_handlers)", self.accounting.task_handlers.load(.acquire)) or live;
         live = checkZero("orphaned_handlers", self.accounting.orphaned_handlers.load(.acquire)) or live;
         live = checkZero("outbound_bytes", self.accounting.outbound_bytes.load(.acquire)) or live;
         live = checkZero("active_handshakes", self.accounting.active_handshakes.load(.acquire)) or live;
@@ -974,7 +939,6 @@ pub const Server = struct {
         freeEndpoints(gpa, self.endpoints);
         gpa.free(self.listeners);
         gpa.free(self.local_addrs);
-        if (self.reaper) |*pool| pool.deinit();
         // Asserts every slab came home; a connection teardown that missed one
         // fails here rather than silently shrinking the pool.
         self.slabs.deinit(gpa);

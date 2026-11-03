@@ -119,21 +119,23 @@ test "placement: an h2c connection's pumps and SSE handlers run on the actor's e
 }
 
 // ---------------------------------------------------------------------------
-// HTTP/1.1 reaper across executors.
+// HTTP/1.1 handler jobs and the connection's end, across executors.
 //
-// The HTTP/1.1 edge hands a task handler's join handle to a server-wide reaper
-// worker when the client goes away. With the connection on executor 0 and the
-// worker on executor 1, the cancel request, the wait for completion, and the
-// completion post back to the connection all cross threads on every run.
+// An HTTP/1.1 task handler spawns with `connPlacement()`. When the client
+// goes away, the connection asks the handler to cancel (a request, never a
+// wait) and ends; the handler, which may run on another executor, sees the
+// cancel there and frees its link last.
 // ---------------------------------------------------------------------------
 
 var h1_handler_thread: std.atomic.Value(std.Thread.Id) = .init(0);
 var h1_handler_started: std.atomic.Value(bool) = .init(false);
 var h1_handler_saw_cancel: std.atomic.Value(bool) = .init(false);
+var h1_handler_ended: std.atomic.Value(bool) = .init(false);
 
-/// Ignores the terminal cause on purpose, so only the reaper's cancel can
-/// stop it and the cancel -> wait path must run.
+/// Ignores the terminal cause on purpose, so only the cancel the
+/// connection's end requests can stop it.
 fn parkUntilCanceled(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    defer h1_handler_ended.store(true, .release);
     h1_handler_thread.store(std.Thread.getCurrentId(), .release);
     var body = try resp.startSse(&.{});
     try body.writeAll("data: hi\n\n");
@@ -160,29 +162,14 @@ fn readUntilSuffix(stream: zio.net.Stream, buf: []u8, suffix: []const u8) !void 
     }
 }
 
-fn recordThread(out: *std.Thread.Id) void {
-    out.* = std.Thread.getCurrentId();
-}
-
-fn runH1ReaperCrossExecutor(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+fn runH1HandlerPlacement(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const io = rt.io();
     const conn_at: zio.Placement = if (pinned) .{ .executor = 0 } else .auto;
-    const reaper_at: zio.Placement = if (pinned) .{ .executor = 1 } else .auto;
-
-    var reaper_thread: std.Thread.Id = 0;
-    var probe = try rt.spawnInto(reaper_at, recordThread, .{&reaper_thread});
-    probe.join();
-
-    var pool = try conn_mod.ReaperPool.init(gpa, io, 1);
-    defer pool.deinit();
-    var worker = try rt.spawnInto(reaper_at, conn_mod.ReaperPool.worker, .{&pool});
-    defer {
-        pool.jobs.close(io);
-        worker.join() catch {};
-    }
 
     var slabs = try starh2.edge.slab_pool.SlabPool.init(gpa, io, starh2.Limits.defaults.outbound_bytes_per_stream, 4);
     defer slabs.deinit(gpa);
+    var requests = try starh2.edge.request_pool.RequestPool.init(starh2.Limits.defaults.requestPoolConfig());
+    defer requests.deinit();
 
     const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try bind.listen(io, .{ .reuse_address = true });
@@ -208,15 +195,15 @@ fn runH1ReaperCrossExecutor(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .router = .{ .routes = &routes },
         .gpa = gpa,
         .slab_pool = &slabs,
-        .reaper = &pool,
+        .request_pool = &requests,
     };
 
     h1_handler_thread.store(0, .release);
     h1_handler_started.store(false, .release);
     h1_handler_saw_cancel.store(false, .release);
+    h1_handler_ended.store(false, .release);
     conn_mod.test_placement_checks.store(0, .release);
     conn_mod.test_placement_mismatches.store(0, .release);
-    const posts_before = starh2.edge.h1.h1_reaper_post_ok.load(.acquire);
 
     var serve = try rt.spawnInto(conn_at, starh2.edge.h1.serve, .{ accepted, config, null, &.{} });
     // Two handler spawns on one connection. An `.auto` placement homes them
@@ -244,30 +231,29 @@ fn runH1ReaperCrossExecutor(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
     try serve.join();
+    // The handler's link lives in the request pool: it must be back before
+    // the pool goes.
+    deadline = nowNs() +% 5 * std.time.ns_per_s;
+    while (!h1_handler_ended.load(.acquire) or requests.held_bytes.load(.acquire) != 0) {
+        if (nowNs() >= deadline) return error.HandlerNeverEnded;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
 
-    const posts = starh2.edge.h1.h1_reaper_post_ok.load(.acquire) - posts_before;
-    const handler_thread = h1_handler_thread.load(.acquire);
-    std.debug.print("h1 reaper: scheduling={s} reaper_posts={d} saw_cancel={} handler_thread={d} reaper_thread={d} checks={d} mismatches={d}\n", .{
+    std.debug.print("h1 placement: scheduling={s} saw_cancel={} handler_thread={d} checks={d} mismatches={d}\n", .{
         @tagName(conn_mod.zio_scheduling),
-        posts,
         h1_handler_saw_cancel.load(.acquire),
-        handler_thread,
-        reaper_thread,
+        h1_handler_thread.load(.acquire),
         conn_mod.test_placement_checks.load(.acquire),
         conn_mod.test_placement_mismatches.load(.acquire),
     });
     try std.testing.expect(h1_handler_saw_cancel.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), posts);
-    if (pinned) {
-        try std.testing.expect(handler_thread != reaper_thread);
-    }
     if (conn_mod.placement_check) {
         try std.testing.expectEqual(@as(usize, 2), conn_mod.test_placement_checks.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), conn_mod.test_placement_mismatches.load(.acquire));
     }
 }
 
-test "placement: HTTP/1.1 reaper on another executor cancels, waits, and posts the completion" {
+test "placement: HTTP/1.1 handler jobs spawn on the connection's placement, and the connection's end cancels them" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
@@ -275,6 +261,6 @@ test "placement: HTTP/1.1 reaper on another executor cancels, waits, and posts t
     });
     defer rt.deinit();
     const main_at: zio.Placement = if (pinned) .{ .executor = 0 } else .auto;
-    var handle = try rt.spawnInto(main_at, runH1ReaperCrossExecutor, .{ rt, gpa });
+    var handle = try rt.spawnInto(main_at, runH1HandlerPlacement, .{ rt, gpa });
     try handle.join();
 }

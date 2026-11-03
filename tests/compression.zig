@@ -218,8 +218,7 @@ fn enableCompressionLimits(base: starh2.Limits) starh2.Limits {
     lim.max_connections = 16;
     lim.max_streams_per_connection = 32;
     lim.max_streams_per_server = 64;
-    lim.cancellation_reaper_jobs = 64;
-    lim.cancellation_reaper_tasks = 2;
+    lim.max_task_handlers = 64;
     lim.outbound_slabs_per_server = 64;
     return lim;
 }

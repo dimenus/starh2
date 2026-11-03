@@ -19,6 +19,42 @@ const fionread = switch (@import("builtin").os.tag) {
 
 pub const Transport = enum { h2c, tls };
 
+/// A loopback TCP port that is free now: bound with port 0, read back,
+/// closed. For a test that must know a server's port while the server is
+/// held before it listens (the step-2 startup-failure hook): the server's
+/// `local_addrs` and `listeners_bound` are plain fields its `serve` task
+/// writes, published only through `bind_state` (`waitUntilListening`), which
+/// a held server never reaches, so another task must not read them. Another
+/// process can take the port before the server binds it; the server's bind
+/// then fails, loudly (`ListenFailed`).
+pub fn freeLoopbackPort() !u16 {
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return error.Socket;
+    defer _ = std.c.close(fd);
+    var addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.Bind;
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(fd, @ptrCast(&addr), &len) != 0) return error.GetSockName;
+    return std.mem.bigToNative(u16, addr.port);
+}
+
+/// A loopback TCP connection to `port`, retrying while it is refused (the
+/// server may not listen yet) until `deadline_ns` (`nowNs`). The kernel's
+/// accept, not a server field, says the server listens. Blocking: call it
+/// off the zio executors.
+pub fn connectRetry(port: u16, deadline_ns: u64) !c_int {
+    while (true) {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        var addr: std.c.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) == 0) return fd;
+        _ = std.c.close(fd);
+        if (nowNs() >= deadline_ns) return error.Connect;
+        const t: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&t, null);
+    }
+}
+
 pub fn nowNs() u64 {
     return zio.Timestamp.now(.monotonic).toNanoseconds();
 }

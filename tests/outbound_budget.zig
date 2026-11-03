@@ -910,7 +910,7 @@ fn runEmpties(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !v
     var limits = limitsFor(2 * stream_cap, starh2.Limits.defaults.outbound_bytes_per_server);
     limits.max_streams_per_connection = 128;
     limits.max_streams_per_server = 256;
-    limits.cancellation_reaper_jobs = 256;
+    limits.max_task_handlers = 256;
     var server = try serverFor(rt, gpa, transport, limits, &cert, &key);
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });

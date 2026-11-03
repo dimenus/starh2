@@ -129,14 +129,14 @@ fn waitAccountingZeroAt(server: *starh2.Server, timeout_ms: u64, caller_line: us
     const deadline = zio.Timestamp.now(.monotonic).toNanoseconds() +% timeout_ms * std.time.ns_per_ms;
     while (true) {
         const streams = server.accounting.active_streams.load(.acquire);
-        const reaper = server.accounting.reaper_reserved.load(.acquire);
+        const tokens = server.accounting.task_handlers.load(.acquire);
         const outbound = server.accounting.outbound_bytes.load(.acquire);
         const request = server.requests.held_bytes.load(.acquire);
         const live = starh2.edge.connection.test_observed_live_handlers.load(.acquire);
         const slots = starh2.edge.connection.test_observed_slots_in_use.load(.acquire);
-        if (streams == 0 and reaper == 0 and outbound == 0 and request == 0 and live == 0 and slots == 0) return;
+        if (streams == 0 and tokens == 0 and outbound == 0 and request == 0 and live == 0 and slots == 0) return;
         if (zio.Timestamp.now(.monotonic).toNanoseconds() >= deadline) {
-            std.debug.print("accounting not zero (called from line {d}): streams={d} reaper={d} outbound={d} request={d} live={d} slots={d}\n", .{ caller_line, streams, reaper, outbound, request, live, slots });
+            std.debug.print("accounting not zero (called from line {d}): streams={d} task_handlers={d} outbound={d} request={d} live={d} slots={d}\n", .{ caller_line, streams, tokens, outbound, request, live, slots });
             return error.AccountingNotZero;
         }
         zio.sleep(.fromMilliseconds(10)) catch {};
@@ -168,8 +168,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 64;
     limits.max_streams_per_connection = 128;
     limits.max_streams_per_server = 256;
-    limits.cancellation_reaper_jobs = 256;
-    limits.cancellation_reaper_tasks = 4;
+    limits.max_task_handlers = 256;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
     limits.inbound_wire_chunks_per_connection = 512;
@@ -199,7 +198,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try server.waitUntilListening(5 * std.time.ns_per_s);
     const port = server.localAddress(0).getPort();
 
-    // --- Real-path forced spawn failure: slot/live/reaper must return to zero. ---
+    // --- Real-path forced spawn failure: slot/live/task-handler tokens must return to zero. ---
     starh2.edge.connection.test_force_spawn_fail = true;
     {
         const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -307,7 +306,7 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.task_handlers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_handshakes.load(.acquire));
@@ -327,8 +326,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 4;
     limits.max_streams_per_connection = 16;
     limits.max_streams_per_server = 32;
-    limits.cancellation_reaper_jobs = 32;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 32;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -406,7 +404,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.task_handlers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), c.test_observed_live_handlers.load(.acquire));
@@ -527,8 +525,7 @@ fn runSlotHeldByReceipt(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 4;
     limits.max_streams_per_connection = 1;
     limits.max_streams_per_server = 8;
-    limits.cancellation_reaper_jobs = 8;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 8;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -612,7 +609,7 @@ test "a stream inside the advertised limit waits for a receipt-held slot instead
 /// Stream 1's task handler has answered but not returned, so its slot is busy
 /// while the peer may already open stream 3 inside the advertised limit of
 /// one. Stream 3 must wait for the slot, never be refused (t-3494). The
-/// no-slot path once also leaked a server-wide reaper token per stream, so
+/// no-slot path once also leaked a server-wide task-handler token per stream, so
 /// the accounting must come back to zero after it.
 fn runTaskSlotHeldAfterResponse(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
@@ -623,8 +620,7 @@ fn runTaskSlotHeldAfterResponse(rt: *zio.Runtime, gpa: std.mem.Allocator) !void 
     limits.max_connections = 4;
     limits.max_streams_per_connection = 1;
     limits.max_streams_per_server = 8;
-    limits.cancellation_reaper_jobs = 8;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 8;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -794,8 +790,7 @@ fn runParkedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, how: ParkedEnd) !void 
     limits.max_connections = 4;
     limits.max_streams_per_connection = 1;
     limits.max_streams_per_server = 8;
-    limits.cancellation_reaper_jobs = 8;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 8;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -870,7 +865,7 @@ fn runParkedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, how: ParkedEnd) !void 
             serve_handle.join() catch {};
             serving = false;
             try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
-            try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), server.accounting.task_handlers.load(.acquire));
         },
         .peer_close => {
             stream.close();
@@ -927,8 +922,7 @@ fn runCompleteWaitsForControlEntry(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     // Four ordinary entries for eight streams. With two, the connection
     // closed before stream 1 was answered; not traced yet (t-3492).
     limits.control_entries_per_connection = 4;
@@ -1047,8 +1041,7 @@ fn runResetsEndHeadersState(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 4;
     limits.max_streams_per_connection = 4;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -1136,8 +1129,7 @@ fn runResetDropsQueuedHeaders(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 4;
     limits.max_streams_per_connection = 4;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -1240,8 +1232,7 @@ fn runRefusedWithoutRequestMemory(rt: *zio.Runtime, gpa: std.mem.Allocator) !voi
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -1324,8 +1315,7 @@ fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator) !void
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
@@ -1464,8 +1454,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 8;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
@@ -1521,7 +1510,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         writeAllStreamAt(stream, boost.items, @src()) catch {};
         try waitAccountingZeroAt(&server, 2_000, 392);
         try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
-        try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), server.accounting.task_handlers.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), starh2.edge.connection.test_observed_live_handlers.load(.acquire));
@@ -1659,8 +1648,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 8;
     limits.max_streams_per_connection = 32;
     limits.max_streams_per_server = 4;
-    limits.cancellation_reaper_jobs = 4;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 4;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
@@ -1715,7 +1703,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     server.requestShutdown();
     serve_deadline.join(&server, &serve_handle);
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.task_handlers.load(.acquire));
 }
 
 test "lifecycle: global stream cap and cancellation storm" {
@@ -1754,8 +1742,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
         .max_connections = 1,
         .max_streams_per_connection = 2,
         .max_streams_per_server = 2,
-        .cancellation_reaper_jobs = 2,
-        .cancellation_reaper_tasks = 1,
+        .max_task_handlers = 2,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
         // The write pool (3 chunks) and one stream's cap must fit the budget.
@@ -2153,8 +2140,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.outbound_bytes_per_connection = 512 * 1024;
     limits.response_min_rate_grace_ns = 30 * std.time.ns_per_s;

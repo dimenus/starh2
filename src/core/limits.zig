@@ -59,7 +59,6 @@ pub const Terms = struct {
     /// memory. The per-connection share, `request_bytes_per_connection`, is a
     /// slice of this term and adds nothing to it.
     request_pool: usize = 0,
-    reaper_jobs: usize = 0,
     /// The slot objects themselves (each holds a whole `Connection`) plus the
     /// two lists the pool keeps, the free list and the quarantine, each sized
     /// to `max_connections`. The boot buffer of each slot is `slot_boot`.
@@ -76,9 +75,6 @@ pub const Terms = struct {
     h1_head: usize = 0,
     h1_body: usize = 0,
 };
-
-/// Must match `edge.connection.ReaperJob` — comptime-asserted in connection.zig.
-pub const REAPER_JOB_SIZE: usize = 40;
 
 pub const WIRE_CHUNK_SIZE = wire_const.WIRE_CHUNK_SIZE;
 pub const TLS_PLAINTEXT_SCRATCH_SIZE = wire_const.TLS_PLAINTEXT_SCRATCH_SIZE;
@@ -245,8 +241,14 @@ pub const Limits = struct {
     certificate_chain_bytes: usize = 64 * 1024,
     private_key_bytes: usize = 16 * 1024,
     tls_handshake_scratch_bytes: usize = 256 * 1024,
-    cancellation_reaper_tasks: usize = 64,
-    cancellation_reaper_jobs: usize = 4_096,
+    /// Task handlers alive at once, server-wide, both protocols, handlers
+    /// whose connection already ended included. Each takes a token at
+    /// dispatch (`GlobalAccounting.tryReserveTaskHandler`) that its stream
+    /// link holds until it is freed, after the handler returned. A task
+    /// request past the bound is refused: RST_STREAM REFUSED_STREAM on
+    /// HTTP/2, 503 on HTTP/1.1. Complete handlers run on the connection's
+    /// actor and take none.
+    max_task_handlers: usize = 4_096,
     decoded_header_bytes: usize = 32 * 1024,
     compressed_header_bytes: usize = 64 * 1024,
     header_fields: usize = 100,
@@ -266,10 +268,11 @@ pub const Limits = struct {
     path_component_bytes: usize = 16 * 1024,
     query_component_bytes: usize = 16 * 1024,
     /// Per-stream decoded body cap (413). Each H1 connection reserves this
-    /// size twice (`body_buf` and the body suffix of `carry_buf`). A new
-    /// value moves `terms.h1_body` and `allocator_bytes`. An H2 body lives in
-    /// the request's arena and counts against `request_arena_bytes`, which
-    /// must be large enough for it.
+    /// size twice (`body_buf` and the body suffix of `carry_buf`), where it
+    /// reads a body; a dispatched H1 request is copied into its request
+    /// arena. A new value moves `terms.h1_body` and `allocator_bytes`. Either
+    /// protocol's body lives in the request's arena at dispatch and counts
+    /// against `request_arena_bytes`, which must be large enough for it.
     request_body_bytes: usize = 256 * 1024,
     /// Outbound DATA slabs for the WHOLE SERVER, each `outbound_bytes_per_stream`
     /// bytes. Slabs are rented when a stream first queues DATA and returned when
@@ -498,7 +501,7 @@ pub const Limits = struct {
     /// - A reset of every live stream at once: the graceful finish
     ///   (`Connection.finishGraceful`), the request body idle sweep
     ///   (`Session.checkIdleDeadlines`), or the dispatch refusals of a batch
-    ///   (a failed handler spawn, a refused reaper reservation), which
+    ///   (a failed handler spawn, a refused task-handler token), which
     ///   `Connection.materializeIntents` drains in the same call. Each stream
     ///   is reset once in such a batch, because a reset takes it out of the
     ///   map and every one of these walks the map (a dispatch of a stream
@@ -587,14 +590,7 @@ pub const Limits = struct {
     pub fn resourceUpperBound(self: Limits) error{InvalidConfig}!ResourceUpperBound {
         if (self.max_connections == 0 or self.max_streams_per_connection == 0) return error.InvalidConfig;
         if (self.max_streams_per_server == 0) return error.InvalidConfig;
-        if (self.cancellation_reaper_tasks == 0 or self.cancellation_reaper_jobs == 0) return error.InvalidConfig;
-        // Every live *task* stream may need a reaper job at once, because a peer
-        // may reset all of them in one flight. Complete oneshots have no join
-        // handle and do not take a token; the bound is still max_streams because
-        // a config cannot promise the mix. A smaller reaper queue would reject a
-        // job that the cancel path has no way to retry, which strands the
-        // handler slot and its capacity token.
-        if (self.cancellation_reaper_jobs < self.max_streams_per_server) return error.InvalidConfig;
+        if (self.max_task_handlers == 0) return error.InvalidConfig;
         if (self.inbound_wire_chunks_per_connection < MIN_WRITE_POOL_CHUNKS) return error.InvalidConfig;
         if (self.response_header_fields == 0 or self.response_header_bytes == 0) return error.InvalidConfig;
         if (self.response_header_bytes > MAX_HEADER_FRAGMENTS * frame.DEFAULT_MAX_FRAME_SIZE) return error.InvalidConfig;
@@ -688,7 +684,6 @@ pub const Limits = struct {
             try checkedMul(self.max_routes, bound.ROUTE_SIZE),
         );
         terms.certs = try checkedAdd(self.certificate_chain_bytes, self.private_key_bytes);
-        terms.reaper_jobs = try checkedMul(self.cancellation_reaper_jobs, REAPER_JOB_SIZE);
         terms.conn_slots = try checkedMul(
             self.max_connections,
             try checkedAdd(@sizeOf(conn_slot.ConnSlot), 2 * @sizeOf(*conn_slot.ConnSlot)),
@@ -699,7 +694,7 @@ pub const Limits = struct {
             try checkedAdd(bound.LISTENER_SIZE, bound.ENDPOINT_ADDRESS_SIZE),
         );
         terms.endpoints_listeners = try checkedMul(self.max_endpoints, endpoint_slot);
-        const server_static = try checkedAdd(terms.routes, try checkedAdd(terms.certs, try checkedAdd(terms.reaper_jobs, try checkedAdd(terms.conn_slots, terms.endpoints_listeners))));
+        const server_static = try checkedAdd(terms.routes, try checkedAdd(terms.certs, try checkedAdd(terms.conn_slots, terms.endpoints_listeners)));
 
         const all_conns = try checkedMul(self.max_connections, per_conn);
         // Global on-demand ceilings counted once (admission counters + payload pools).
@@ -714,11 +709,14 @@ pub const Limits = struct {
         );
 
         // Maximum std.Io task topology: accept loops + per-connection
-        // actor/read/write/ack and three Select wait branches + handlers + reapers.
+        // actor/read/write/ack and three Select wait branches + task
+        // handlers. Task handlers are bounded by their tokens, orphans
+        // included (`max_task_handlers`), not by the stream count: a handler
+        // whose connection ended holds no stream.
         const per_conn_tasks: usize = 7;
         terms.tasks = try checkedAdd(
             try checkedAdd(self.max_endpoints, try checkedMul(self.max_connections, per_conn_tasks)),
-            try checkedAdd(self.max_streams_per_server, self.cancellation_reaper_tasks),
+            self.max_task_handlers,
         );
         // Backend task storage is intentionally outside starh2's allocator bound.
         const committed_stack_bytes: usize = 0;
@@ -751,10 +749,8 @@ test "mutation canary: the slot term moves with each limit that sizes a boot tab
     }) |name| {
         var more = Limits.defaults;
         @field(more, name) = @field(Limits.defaults, name) * 2;
-        // The reaper queue must stay at least the global stream cap, and the
-        // global cap at least the per-connection one.
+        // The global stream cap must stay at least the per-connection one.
         more.max_streams_per_server = @max(more.max_streams_per_server, more.max_streams_per_connection);
-        more.cancellation_reaper_jobs = @max(more.cancellation_reaper_jobs, more.max_streams_per_server);
         more.outbound_slabs_per_server = @max(more.outbound_slabs_per_server, more.max_streams_per_server);
         // The intent queue must hold a reset of every live stream.
         more.intent_entries_per_connection = @max(more.intent_entries_per_connection, try more.intentEntriesMin());
@@ -837,11 +833,18 @@ test "the slab pool is counted once for the server, not per connection" {
     try std.testing.expect(bigger.terms.outbound_slabs > wide.terms.outbound_slabs);
 }
 
-test "rejects reaper jobs below global streams" {
+test "rejects zero task handlers" {
     var lim = Limits.defaults;
-    lim.max_streams_per_server = 100;
-    lim.cancellation_reaper_jobs = 50;
+    lim.max_task_handlers = 0;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
+test "the task bound counts task handlers, not streams" {
+    const base = try Limits.defaults.resourceUpperBound();
+    var more = Limits.defaults;
+    more.max_task_handlers = Limits.defaults.max_task_handlers * 2;
+    const bigger = try more.resourceUpperBound();
+    try std.testing.expectEqual(base.terms.tasks + Limits.defaults.max_task_handlers, bigger.terms.tasks);
 }
 
 test "mutation canary: dropping the slot term shrinks the bound" {
@@ -851,7 +854,6 @@ test "mutation canary: dropping the slot term shrinks the bound" {
     var tiny = Limits.defaults;
     tiny.max_streams_per_connection = 1;
     tiny.max_streams_per_server = 64;
-    tiny.cancellation_reaper_jobs = 64;
     const b2 = try tiny.resourceUpperBound();
     try std.testing.expect(b.terms.slot_boot > b2.terms.slot_boot);
     try std.testing.expect(b.allocator_bytes > b2.allocator_bytes);

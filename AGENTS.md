@@ -123,7 +123,7 @@ see `tools/README.md`.
   `Condition`, `Semaphore`. Each differs from the zio primitive under it in a
   way that has already cost a defect: `Select.cancelDiscard` discarded bytes
   already read off the socket (t-1760); `Future.cancel` is request PLUS
-  mandatory await, so a reaper worker blocks forever on a handler in an
+  mandatory await, so a task that cancels with it blocks forever on a handler in an
   uncancelable wait, where zio's `AnyTask.cancel` is setCanceled+wake and
   returns at once (t-1802); `Event.set` on an already-set event neither wakes
   nor re-synchronizes a waiter that already returned, so a plain field read
@@ -143,21 +143,22 @@ see `tools/README.md`.
   FairScheduler, not the cipher.
 - Per-connection spawns (h2c pumps, task handlers, the HTTP/1.1 handler job)
   use `zio.spawnInto(connPlacement(), ...)`; only server-wide tasks (accept
-  loops, `connEntry`, reaper workers) use `.auto`. Check it with
+  loops, `connEntry`) use `.auto`. Check it with
   `./zb build test-placement -Dzio-scheduling=pinned`.
 - All production wire output passes through `FairScheduler`'s sink. Preserve
   the `test_queue_wire_bypass == 0` mutation canary.
 - Outbound accounting distinguishes pending body bytes from framed wire bytes.
   Pending bytes release when the scheduler accepts the frame; wire/control
   occupancy releases only on WritePump completion.
-- An HTTP/2 handler reaches only its `StreamLink` (`src/edge/connection.zig`):
-  its request, response, terminal state and request arena live there, in the
-  arena's first block. It enters the connection only through the link's gate
-  (`src/edge/gate.zig`). Teardown closes the gates, requests a cancel, waits
-  only for calls already inside, and orphans a handler still running
-  (`orphanSlot`); `Server.serve` waits for orphans before it returns.
-  HTTP/1.1 still cancels through the reaper, which owns cancellation only when
-  a join handle exists.
+- A handler, either protocol, reaches only its link: `StreamLink`
+  (`src/edge/connection.zig`) or `H1Link` (`src/edge/h1.zig`), both built on
+  one `LinkCore`. Its request, response, terminal state and request arena
+  live there, in the arena's first block. It enters the connection only
+  through the link's gate (`src/edge/gate.zig`). Teardown closes the gates,
+  requests a cancel (never a wait), waits only for calls already inside, and
+  orphans a handler still running (`LinkCore.orphan`); `Server.serve` waits
+  for orphans and task-handler tokens before it returns. Nothing joins a
+  handler that has not reported.
 
 ## TLS and allocation traps
 
@@ -212,9 +213,9 @@ chunk into the send staging buffer. Do not wrap a record API beside this.
   `Limits.request_pool_retain_bytes` is decommitted at once (`retired`). The
   pool mapping asks Linux for no huge pages.
   `./zb build test-request-memory` runs the cap, decode and blocks-home gates.
-  HTTP/1.1 is the exception: it keeps its preallocated buffers (`h1_body`) and
-  has no server-wide body reservation since stage 2; t-3537 moves it onto the
-  pool.
+  HTTP/1.1 reads a request into buffers of its own (`h1_head`, `h1_body`)
+  and copies it into a pool arena at dispatch (`h1.newLink`); a handler never
+  sees those buffers.
 - An outbound frame is built in a frame slab, or in a write-pool chunk when it
   is bigger than a slab or the slabs are rented; there is no `config.gpa`
   fallback, and a refusal is `OutOfMemory`. A frame made outside a scheduler

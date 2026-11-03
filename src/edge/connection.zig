@@ -2,7 +2,7 @@
 //!
 //! # Task topology — read this before you change anything here
 //!
-//! One accepted socket runs SIX kinds of concurrent task. Almost every defect
+//! One accepted socket runs FOUR kinds of concurrent task. Almost every defect
 //! this file has carried came from a wrong assumption about which task owns a
 //! thing, so the ownership table is the contract:
 //!
@@ -19,8 +19,8 @@
 //! |                |       | Enters the connection only through the        |
 //! |                |       | link's gate, and can outlive the connection.  |
 //! |                |       | Task handlers spawn; complete oneshots run on |
-//! |                |       | the actor. SSE always spawns.                 |
-//! | reaper worker  | pool  | HTTP/1.1 only: canceling a handler job        |
+//! |                |       | the actor. SSE always spawns. HTTP/1.1 has    |
+//! |                |       | the same shape (`h1.zig`, `LinkCore`).        |
 //!
 //! The edge takes a DIRECT zio dependency, openly: the actor parks in one
 //! `zio.select`, its inbound/ack/completion channels are zio channels, and
@@ -102,7 +102,7 @@
 //!
 //! Every task a connection spawns for itself (h2c pumps, task handlers, the
 //! HTTP/1.1 handler job) is spawned with `connPlacement()`. Only server-wide
-//! tasks (accept loops, `connEntry`, reaper workers) use `.auto`. Without
+//! tasks (accept loops, `connEntry`) use `.auto`. Without
 //! task migration, `.auto` homes each new task round-robin, so one
 //! connection's tasks scatter over executors by spawn-time luck and a bad
 //! draw lasts for the connection's life. With migration there is no fixed
@@ -199,7 +199,7 @@ pub fn notePlacement(actor_thread: std.Thread.Id) void {
 /// Threads are keyed by kernel tid in first-seen slots, so a row can be
 /// joined with /proc/<pid>/task/<tid>/stat. Linux only: other targets count
 /// nothing.
-pub const ProbeKind = enum(u8) { accept, conn_entry, actor_start, actor_turn, handler_start, handler_iter, reaper_job, tls_recv_submit, tls_send_submit };
+pub const ProbeKind = enum(u8) { accept, conn_entry, actor_start, actor_turn, handler_start, handler_iter, tls_recv_submit, tls_send_submit };
 pub const probe_slots = 8;
 pub var probe_tids: [probe_slots]std.atomic.Value(i32) = std.mem.zeroes([probe_slots]std.atomic.Value(i32));
 pub var probe_counts: [@typeInfo(ProbeKind).@"enum".field_names.len][probe_slots]std.atomic.Value(u64) =
@@ -266,13 +266,6 @@ fn probeHandlerPlacement() zio.Placement {
 pub var test_force_spawn_fail: test_hook.Hook(bool) = if (test_hook.on) false else {};
 /// Test-only: when true, actor skips draining completion_ch (sticky until cleared).
 pub var test_hold_completion_drain: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
-/// Test-only: a reaper worker that has claimed the report (`reported`)
-/// waits here before it posts the completion, while this is set. Nothing
-/// else can hold the gap between the claim and the post open long enough
-/// to test what a connection does inside it (astra 1, round 3). Counts the
-/// workers that reached it.
-pub var test_reaper_hold_post: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
-pub var test_reaper_held: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: when true, the actor takes no write completion off
 /// `write_ack_ch` (sticky until cleared), so a test can make the one receiver
 /// slower than the drains that feed the pump. A real actor is that slow when
@@ -528,12 +521,13 @@ var shutdown_sweep: zio.TaskLocal(void) = .{};
 /// task. `get() == self` tells the actor from a handler's task (`pushWriteChunk`
 /// rings only for the latter). Same discipline as `shutdown_sweep`.
 var actor_marker: zio.TaskLocal(*Connection) = .{};
-/// Set on a task handler's task, from the start of `runHandlerJob` to its end
-/// (observe builds only). A request's blocks go back to the pool from the
-/// actor, after the join; `releaseLease` asserts it is not called from inside
-/// a handler's task. A thread-local would be wrong here: a handler yields and
-/// can resume on another thread.
-var handler_job_marker: zio.TaskLocal(void) = .{};
+/// Set on a task handler's task, from the start of its job to its end
+/// (observe builds only; HTTP/2 `runHandlerJob`, HTTP/1.1 `h1.runJob`). A
+/// request's blocks go back to the pool from the actor, after the join;
+/// `releaseLease` and `dropLink` assert they are not called from inside a
+/// handler's task while the connection lives. A thread-local would be wrong
+/// here: a handler yields and can resume on another thread.
+pub var handler_job_marker: zio.TaskLocal(void) = .{};
 /// Test-only gate that parks the actor immediately before its event-driven wait.
 pub var test_hold_before_actor_wait: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 pub var test_actor_waiting: test_hook.Hook(std.Io.Event) = if (test_hook.on) .unset else {};
@@ -1078,16 +1072,16 @@ pub const ConnConfig = struct {
     /// One-shot: set once at server shutdown, never reset, so selecting on it
     /// is race-free (persistent set, no edge to lose).
     shutdown_event: ?*zio.Event = null,
-    reaper: ?*ReaperPool = null,
-    /// Server-wide stream + reaper reservation (optional for unit tests).
+    /// Server-wide stream and task-handler admission (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
     /// Server-wide outbound DATA slabs, borrowed for this connection's lifetime.
     slab_pool: *slab_pool.SlabPool,
-    /// Server-wide request memory. Every HTTP/2 request's header list, body
-    /// and handler allocations come from here and nowhere else; there is no
-    /// fallback to `gpa`. Required for h2c and TLS (`Connection.init` fails
-    /// without it); h1c keeps its own buffers and ignores it.
-    request_pool: ?*request_pool.RequestPool = null,
+    /// Server-wide request memory. Every request's header list, body and
+    /// handler allocations come from here and nowhere else; there is no
+    /// fallback to `gpa`, and no default: a configuration without one does
+    /// not compile. HTTP/1.1 reads a request in buffers of its own and copies
+    /// it into an arena from here at dispatch.
+    request_pool: *request_pool.RequestPool,
     /// Server-wide brotli encoder pool when response compression is enabled.
     compression_pool: ?*brotli.Pool = null,
     /// True when accept path reserved a concurrent TLS handshake slot.
@@ -1097,7 +1091,7 @@ pub const ConnConfig = struct {
     tls_leftover: []const u8 = &.{},
 };
 
-/// Shared with Server: global stream/reaper/memory/handshake admission.
+/// Shared with Server: global stream/task-handler/memory/handshake admission.
 ///
 /// Every counter here is touched by many connections at once, so each one uses
 /// a compare-and-swap loop and not a read-then-add. A `fetchAdd` followed by a
@@ -1110,17 +1104,17 @@ pub const ConnConfig = struct {
 pub const GlobalAccounting = struct {
     active_streams: std.atomic.Value(usize) = .init(0),
     max_streams: usize,
-    /// Task-handler tokens. An HTTP/2 task handler holds one from dispatch
-    /// until its stream link is freed, which can be after its connection
-    /// ended (`StreamLink.task_token`), so this is the server-wide bound on
-    /// live HTTP/2 task handlers, orphaned ones included. HTTP/1.1 takes one
-    /// per handler job for its reaper.
-    reaper_reserved: std.atomic.Value(usize) = .init(0),
-    reaper_capacity: usize,
-    /// HTTP/2 task handlers still running after their connection ended
-    /// (`Connection.orphanSlot`). `Server.serve` waits for zero before it
-    /// returns, because such a handler still reaches the request pool, this
-    /// struct and the balancer.
+    /// Task-handler tokens (`Limits.max_task_handlers`). A task handler,
+    /// either protocol, holds one from dispatch until its link is freed,
+    /// which can be after its connection ended (`LinkCore.task_token`), so
+    /// this is the server-wide bound on live task handlers, orphaned ones
+    /// included.
+    task_handlers: std.atomic.Value(usize) = .init(0),
+    task_handler_capacity: usize,
+    /// Task handlers still running after their connection ended
+    /// (`LinkCore.orphan`: `Connection.orphanSlot`, `h1.endHandler`).
+    /// `Server.serve` waits for zero before it returns, because such a
+    /// handler still reaches the request pool, this struct and the balancer.
     orphaned_handlers: std.atomic.Value(usize) = .init(0),
     outbound_bytes: std.atomic.Value(usize) = .init(0),
     max_outbound_bytes: usize,
@@ -1159,7 +1153,7 @@ pub const GlobalAccounting = struct {
     /// subtraction is refused, the counter keeps its value, and the event is
     /// counted in `underflows` and logged with the counter's name. The
     /// sites, every release in `GlobalAccounting` and the orphan count:
-    /// `releaseStream`, `releaseReaper`, `releaseOutbound`,
+    /// `releaseStream`, `releaseTaskHandler`, `releaseOutbound`,
     /// `releaseHandshake`, `releaseOrphan`. `Server.releaseConnection` does
     /// the same for `active_connections`.
     pub fn saturatingRelease(self: *GlobalAccounting, counter: *std.atomic.Value(usize), n: usize, comptime name: []const u8, comptime order: std.builtin.AtomicOrder) void {
@@ -1190,16 +1184,16 @@ pub const GlobalAccounting = struct {
         self.saturatingRelease(&self.active_streams, 1, "active_streams", .acq_rel);
     }
 
-    pub fn tryReserveReaper(self: *GlobalAccounting) bool {
+    pub fn tryReserveTaskHandler(self: *GlobalAccounting) bool {
         while (true) {
-            const cur = self.reaper_reserved.load(.acquire);
-            if (cur >= self.reaper_capacity) return false;
-            if (self.reaper_reserved.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
+            const cur = self.task_handlers.load(.acquire);
+            if (cur >= self.task_handler_capacity) return false;
+            if (self.task_handlers.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
         }
     }
 
-    pub fn releaseReaper(self: *GlobalAccounting) void {
-        self.saturatingRelease(&self.reaper_reserved, 1, "reaper_reserved", .acq_rel);
+    pub fn releaseTaskHandler(self: *GlobalAccounting) void {
+        self.saturatingRelease(&self.task_handlers, 1, "task_handlers", .acq_rel);
     }
 
     pub fn tryReserveOutbound(self: *GlobalAccounting, n: usize) bool {
@@ -1283,7 +1277,7 @@ pub const HandlerSlot = struct {
 
     /// Record why the stream ended, in the link the handler reads. Actor.
     fn setCause(self: *HandlerSlot, why: response.TerminalCause) void {
-        if (self.link) |l| l.terminal.setCause(why);
+        if (self.link) |l| l.core.terminal.setCause(why);
     }
 };
 
@@ -1614,39 +1608,146 @@ fn joinAcceptEncodingLines(a: std.mem.Allocator, headers: []const request.Header
     return out;
 }
 
-/// Everything a dispatched handler can reach between starh2 calls (t-3737).
+/// What every handler's link holds, whatever its protocol (t-3737, t-3759).
 ///
 /// A task handler can outlive its connection: zio cancellation is only a
 /// request (`AnyTask.cancel`), and a handler that is shielded, swallows
 /// `error.Canceled`, or never yields keeps running. The connection still has
-/// to end and give its slot back, and memory a running task can reach must not
-/// be freed. So the handler's request, response, context, terminal state and
-/// request arena live here, and the link itself is the first allocation in
-/// that arena: nothing a handler holds points into the connection's slot.
+/// to end and give its memory back, and memory a running task can reach must
+/// not be freed. So everything a handler holds between starh2 calls lives in
+/// its link, and the link itself is the first allocation in the request's
+/// arena (a block of the server-wide `RequestPool`): nothing a handler holds
+/// points into connection memory. Each protocol embeds this core in its own
+/// link (`StreamLink` here, `h1.H1Link`), which adds the request, the
+/// response, and a pointer to its connection that is valid only inside the
+/// gate.
 ///
-/// Inside a starh2 call (`Response`'s callbacks, the fallback reset after a
-/// handler error, the handler's report when it ends) the handler enters the
-/// connection only through `gate`, and only while it is open. Teardown closes
-/// the gate, requests a cancel, and waits only for the calls already inside;
-/// that wait is bounded by starh2 code, because every starh2 wait also wakes
-/// on the connection's `dead` event. See `gate.zig`.
+/// The protocol, the same for both:
 ///
-/// Two references, counted in `refs`: the actor's, dropped when it frees the
-/// slot (`releaseSlot` after the join, or `orphanSlot` at teardown when the
-/// handler is still running), and the handler's, dropped as the last act of
-/// `finishHandlerJob`. Whoever drops the last one frees the link and the
-/// arena with it (`dropLinkRef`).
-const StreamLink = struct {
+/// - Inside a starh2 call (`Response`'s callbacks, the fallback after a
+///   handler error, the handler's report when it ends) the handler enters the
+///   connection only through `gate`, and only while it is open (`gate.zig`).
+/// - Teardown sets the cause, wakes every wait a call inside the gate can be
+///   in, closes the gate, requests a cancel (never waits for it), and waits
+///   only for the calls already inside (`Gate.waitDrained`). A handler that
+///   did not report by then is orphaned (`orphan`): its link keeps its
+///   server-wide token and is counted in `orphaned_handlers`, so
+///   `Server.serve` waits for it.
+/// - Two references, counted in `refs`: the actor's, dropped when it frees
+///   the request (after the join), or when it orphans the handler; and the
+///   handler's, dropped as its job's last act. Whoever drops the last one
+///   frees the link and the arena with it (`dropLink`).
+pub const LinkCore = struct {
     gate: Gate = .{},
-    /// Valid only between a successful `gate.enter` and its `exit`.
-    conn: *Connection,
     refs: std.atomic.Value(u8) = .init(1),
-    /// The request's memory, moved here from its lease at dispatch. Its
-    /// connection charges go through `gate` (`request_pool.Arena.gate`).
+    /// The request's memory. Its connection charges go through `gate`
+    /// (`request_pool.Arena.gate`), set once the arena is in its link.
     arena: request_pool.Arena,
     /// The stream's terminal cause and generation. The actor writes it while
     /// it holds its reference; the handler reads it at any time.
     terminal: response.SlotTerminal = .{},
+    /// True for a spawned task handler. Complete oneshots stay false so they
+    /// never touch the connection's task counters or the balancer.
+    task_counted: bool = false,
+    /// A server-wide task-handler token
+    /// (`GlobalAccounting.tryReserveTaskHandler`), held until the link is
+    /// freed: a handler that outlives its connection still counts against
+    /// the server's bound on live task handlers.
+    task_token: bool = false,
+    /// Server-wide, and they outlive every handler (`Server.serve` waits for
+    /// orphaned handlers before it returns).
+    accounting: ?*GlobalAccounting = null,
+    balancer: ?*Balancer = null,
+    exec_index: ?zio.ExecutorId = null,
+    /// Written by the actor in `orphan` before it drops its reference; read
+    /// by whoever frees the link. The reference count orders the two.
+    orphaned: bool = false,
+    /// The actor's thread at dispatch, for the placement probe only. A copy,
+    /// because the handler may first run after its connection ended.
+    actor_thread: std.Thread.Id = 0,
+
+    /// The error a call gets once the gate is closed: the cause teardown set
+    /// before it closed the gate.
+    pub fn closedError(self: *const LinkCore) response.ResponseError {
+        const c = self.terminal.getCause() orelse return error.ConnectionClosed;
+        return response.causeToError(c);
+    }
+
+    /// Actor only, after the gate was closed and drained: give the
+    /// connection exactly the request bytes it was charged
+    /// (`request_pool.Arena.conn_charged`, which nothing changes once the
+    /// gate is closed). A later release of the arena reaches no connection.
+    pub fn returnConnCharges(self: *LinkCore, budget: *request_pool.ConnBudget) void {
+        std.debug.assert(self.gate.isClosed());
+        std.debug.assert(self.gate.inside() == 0);
+        const b = self.arena.budget orelse return;
+        std.debug.assert(b == budget);
+        b.uncharge(self.arena.conn_charged);
+    }
+
+    /// Actor only, after the gate was closed and drained and the handler did
+    /// not report: from here the handler runs on its link alone. The caller
+    /// detaches its join handle and then drops its reference (`dropLink`).
+    pub fn orphan(self: *LinkCore) void {
+        std.debug.assert(self.gate.isClosed());
+        std.debug.assert(self.gate.inside() == 0);
+        self.orphaned = true;
+        if (self.accounting) |a| _ = a.orphaned_handlers.fetchAdd(1, .acq_rel);
+    }
+
+    /// The handler's job ended. Outside the gate: the balancer is server-wide.
+    pub fn noteHandlerEnd(self: *const LinkCore) void {
+        if (!self.task_counted) return;
+        if (self.balancer) |b| b.noteHandlerEnd(self.exec_index.?);
+    }
+};
+
+/// Drop one reference to a link (`L` embeds a `LinkCore` named `core`). The
+/// last one frees the link, the request's arena (the link lives in its first
+/// block), and the server-wide token.
+///
+/// Who may be last: on the ordinary path the actor, after the join, with the
+/// gate still open; the arena then gives its connection charges back as it
+/// releases. When the connection ended first, the gate is closed and the
+/// actor already gave the connection its charges back
+/// (`LinkCore.returnConnCharges`), so the arena releases with no connection
+/// at all, from whichever task is last.
+pub fn dropLink(comptime L: type, link: *L) void {
+    const core = &link.core;
+    const prev = core.refs.fetchSub(1, .acq_rel);
+    std.debug.assert(prev != 0);
+    if (prev != 1) return;
+    // The arena struct is inside the block it is about to return.
+    var arena = core.arena;
+    arena.gate = null;
+    if (core.gate.isClosed()) {
+        arena.budget = null;
+    } else if (comptime test_observe) {
+        // An open gate means the connection is alive, and then the actor is
+        // the last holder, never the handler's own task.
+        std.debug.assert(handler_job_marker.get() == null);
+    }
+    const accounting = core.accounting;
+    const token = core.task_token;
+    const orphaned = core.orphaned;
+    // Poison it in safe builds: a handler that still used the link would read
+    // garbage and fail loudly instead of working on freed memory.
+    link.* = undefined;
+    arena.release();
+    if (accounting) |a| {
+        if (token) a.releaseTaskHandler();
+        if (orphaned) a.releaseOrphan();
+    }
+    if (comptime test_observe) _ = test_links_freed.fetchAdd(1, .acq_rel);
+}
+
+/// An HTTP/2 handler's link: the shared core (`LinkCore`) plus the decoded
+/// request, the response, and its stream's slot. The arena moves here from
+/// the stream's lease at dispatch.
+const StreamLink = struct {
+    core: LinkCore,
+    /// Valid only between a successful `enter` and its `exit`.
+    conn: *Connection,
     stream_id: u31,
     owned_request: session_mod.DispatchRequest,
     req: request.Request,
@@ -1655,24 +1756,6 @@ const StreamLink = struct {
     /// The connection's slot for this stream. Inside the gate only.
     slot: *HandlerSlot,
     hctx: HandlerCtx,
-    /// True for a spawned task handler. Complete oneshots stay false so they
-    /// never touch `live_task_handlers` or the balancer.
-    task_counted: bool = false,
-    /// A server-wide task-handler token (`GlobalAccounting.tryReserveReaper`),
-    /// held until the link is freed: a handler that outlives its connection
-    /// still counts against the server's bound on live task handlers.
-    task_token: bool = false,
-    /// Server-wide, and they outlive every handler (`Server.serve` waits for
-    /// orphaned handlers before it returns).
-    accounting: ?*GlobalAccounting = null,
-    balancer: ?*Balancer = null,
-    exec_index: ?zio.ExecutorId = null,
-    /// Written by the actor in `orphanSlot` before it drops its reference;
-    /// read by whoever frees the link. The reference count orders the two.
-    orphaned: bool = false,
-    /// The actor's thread at dispatch, for the placement probe only. A copy,
-    /// because the handler may first run after its connection ended.
-    actor_thread: std.Thread.Id = 0,
 
     fn fromCtx(ctx: *anyopaque) *StreamLink {
         const hctx: *HandlerCtx = @ptrCast(@alignCast(ctx));
@@ -1682,67 +1765,25 @@ const StreamLink = struct {
     /// The connection, for a call that has entered the gate; null when the
     /// connection has ended (or is ending) for this handler.
     fn enter(self: *StreamLink) ?*Connection {
-        if (!self.gate.enter()) return null;
+        if (!self.core.gate.enter()) return null;
         return self.conn;
     }
 
     fn exit(self: *StreamLink) void {
-        self.gate.exit();
+        self.core.gate.exit();
     }
 
-    /// The error a call gets once the gate is closed: the cause teardown set
-    /// before it closed the gate.
     fn closedError(self: *const StreamLink) response.ResponseError {
-        const c = self.terminal.getCause() orelse return error.ConnectionClosed;
-        return response.causeToError(c);
+        return self.core.closedError();
     }
 };
 
-/// Drop one reference. The last one frees the link, the request's arena (the
-/// link lives in its first block), and the server-wide token.
-///
-/// Who may be last: on the ordinary path the actor, in `releaseSlot`, after
-/// the join, with the gate still open; the arena then gives its connection
-/// charges back as it releases. When the connection ended first, the gate is
-/// closed and `orphanSlot` already gave the connection its charges back, so
-/// the arena releases with no connection at all, from whichever task is last.
 fn dropLinkRef(link: *StreamLink) void {
-    const prev = link.refs.fetchSub(1, .acq_rel);
-    std.debug.assert(prev != 0);
-    if (prev != 1) return;
-    // The arena struct is inside the block it is about to return.
-    var arena = link.arena;
-    arena.gate = null;
-    if (link.gate.isClosed()) {
-        arena.budget = null;
-    } else if (comptime test_observe) {
-        // An open gate means the connection is alive, and then the actor is
-        // the last holder, never the handler's own task.
-        std.debug.assert(handler_job_marker.get() == null);
-    }
-    const accounting = link.accounting;
-    const token = link.task_token;
-    const orphaned = link.orphaned;
-    // Poison it in safe builds: a handler that still used the link would read
-    // garbage and fail loudly instead of working on freed memory.
-    link.* = undefined;
-    arena.release();
-    if (accounting) |a| {
-        if (token) a.releaseReaper();
-        if (orphaned) a.releaseOrphan();
-    }
-    if (comptime test_observe) _ = test_links_freed.fetchAdd(1, .acq_rel);
+    dropLink(StreamLink, link);
 }
 
 /// Test-only: links freed, all connections.
 pub var test_links_freed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
-
-/// One optional deadline per live task-handler slot. Actor is the only mutator
-/// of the heap (handlers insert under `session_mu`, same shape as `writeFn`).
-const live: u8 = 0;
-const reaper_owned: u8 = 1;
-const reported: u8 = 2;
-const reaper_running: u8 = 3;
 
 /// Complete-handler drain turns that may await their wire receipts at once.
 /// Independent of the deeper WritePump queue. 2 serialized the 8-worker
@@ -1790,101 +1831,6 @@ comptime {
         @compileError("inbound chunk batch cannot exceed the receipt window");
     }
 }
-
-pub const ReaperJob = struct {
-    handle: zio.JoinHandle(void),
-    owner: *std.atomic.Value(u8),
-    /// The actor selects on this channel; the post IS the wake.
-    completion: *zio.Channel(u31),
-    stream_id: u31,
-    /// Connection-local count of successful `trySend` publications.
-    post_ok: *std.atomic.Value(usize),
-};
-
-comptime {
-    if (@sizeOf(ReaperJob) != limits_mod.REAPER_JOB_SIZE) {
-        @compileError(std.fmt.comptimePrint(
-            "REAPER_JOB_SIZE must match @sizeOf(ReaperJob) (got {d})",
-            .{@sizeOf(ReaperJob)},
-        ));
-    }
-}
-
-/// Cancellation happens off the actor, and this pool is why.
-///
-/// `JoinHandle.cancel` BLOCKS until the target task actually stops. If the actor
-/// called it directly, one handler that is slow to notice cancellation would
-/// stall the whole connection — including the reads and the writes that might
-/// be what lets the handler finish. So the actor hands the join handle to a
-/// worker here and continues at once.
-///
-/// The reaper capacity is reserved BEFORE a *task* handler is admitted
-/// (`tryReserveReaper` in `dispatch`), never at cancel time. Cancellation must
-/// not be able to fail for want of a resource, because there is no way to
-/// retry it and no other path that would release the slot. Complete oneshots
-/// never spawn and never own a join handle, so they do not take a token.
-pub const ReaperPool = struct {
-    io: std.Io,
-    jobs: std.Io.Queue(ReaperJob),
-    job_buf: []ReaperJob,
-    gpa: std.mem.Allocator,
-
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, capacity: usize) !ReaperPool {
-        const buf = try gpa.alloc(ReaperJob, capacity);
-        return .{ .io = io, .jobs = .init(buf), .job_buf = buf, .gpa = gpa };
-    }
-
-    pub fn deinit(self: *ReaperPool) void {
-        // Workers must already be joined; only free storage.
-        self.gpa.free(self.job_buf);
-        self.* = undefined;
-    }
-
-    /// The worker's order is fixed and load-bearing:
-    ///
-    /// 1. Mark `reaper_running` so a stall dump can tell queued from cancel.
-    /// 2. `zio.JoinHandle.cancel` requests cancel, then waits until the task
-    ///    actually stops (`waitUntilComplete`). The handler may live on
-    ///    another executor; its completion wakes this worker cross-thread.
-    ///    A handler in an uncancelable wait (lockUncancelable, or Futex's
-    ///    no_cancel handshake after a racing wake) never returns, so this
-    ///    worker never posts.
-    /// 3. `swap(reported)` — claim the right to report. If the previous value
-    ///    is not `reaper_running`, the handler already reported; stay silent.
-    /// 4. post the completion. The actor selects on the channel, so the post
-    ///    IS the wake.
-    pub fn worker(self: *ReaperPool) std.Io.Cancelable!void {
-        while (true) {
-            var job = self.jobs.getOne(self.io) catch |err| switch (err) {
-                error.Closed => return,
-                error.Canceled => return error.Canceled,
-            };
-            probeNote(.reaper_job);
-            job.owner.store(reaper_running, .release);
-            std.debug.assert(job.owner.load(.acquire) == reaper_running);
-            job.handle.cancel();
-            const prev = job.owner.swap(reported, .acq_rel);
-            if (comptime test_hook.on) {
-                if (prev == reaper_running and test_reaper_hold_post.load(.acquire)) {
-                    _ = test_reaper_held.fetchAdd(1, .acq_rel);
-                    while (test_reaper_hold_post.load(.acquire)) zio.sleep(.fromMilliseconds(2)) catch {};
-                }
-            }
-            if (prev == reaper_running) {
-                if (job.completion.trySend(job.stream_id)) |_| {
-                    _ = job.post_ok.fetchAdd(1, .acq_rel);
-                } else |err| switch (err) {
-                    // One completion per slot, capacity max_streams: full is a
-                    // broken invariant, never a wait.
-                    error.WouldBlock => @panic("completion channel over proven capacity"),
-                    error.Closed => {
-                        // Connection teardown has already closed completion delivery.
-                    },
-                }
-            }
-        }
-    }
-};
 
 /// The byte layout of a slot's boot buffer for `mode`: the TLS `Conn` first,
 /// when there is one, then everything `Connection.init` takes. `mode` must be
@@ -2111,7 +2057,6 @@ pub const Connection = struct {
     /// Spawned task handlers only. Complete oneshots stay on `live_handlers`
     /// and must not trip the ReadPump donation.
     live_task_handlers: std.atomic.Value(usize) = .init(0),
-    reaper: ?*ReaperPool = null,
     completion_ch_buf: []u31 = &.{},
     completion_ch: zio.Channel(u31) = undefined,
     write_ack_buf: []wire_pump.WriteCompletion = &.{},
@@ -2403,7 +2348,6 @@ pub const Connection = struct {
         if (config.mode == .h2c) try config.limits.checkH2cWriteQueue();
         try config.limits.checkFramePool();
         try config.limits.checkIntentQueue();
-        if (config.request_pool == null) return error.RequestPoolMissing;
         var session = try session_mod.Session.initBare(boot, config.gpa, config.limits);
         errdefer {
             // Hooks are installed below with `ctx` still unset, and no frame
@@ -2588,7 +2532,6 @@ pub const Connection = struct {
             .completion_ch_buf = completion_ch_buf,
             .write_ack_buf = write_ack_buf,
             .ticket_slots = ticket_slots,
-            .reaper = config.reaper,
             .plaintext_scratch = plaintext_scratch,
             .sched = sched,
             .read_chunk_storage = read_chunk_storage,
@@ -2672,7 +2615,7 @@ pub const Connection = struct {
     }
 
     /// Everything `deinit` does except free the boot memory: end the
-    /// connection's use of the server (handshake slot, streams, slabs, reaper
+    /// connection's use of the server (handshake slot, streams, slabs, task
     /// tokens, socket) and prove the books balance. After it returns the
     /// connection holds nothing outside its own boot memory, and the slot may
     /// rewind that. Do not use the connection afterwards.
@@ -2879,8 +2822,8 @@ pub const Connection = struct {
     /// - Reachable only through a bookkeeping bug, because `quiesce` does not
     ///   check it: request bytes still reserved (`request_budget`), streams
     ///   still admitted (`session.active_streams`), a handler join still held
-    ///   (`handler_joins`), and the completion channel (a reaper can post to
-    ///   it from another thread after the drain). No known path sets any of
+    ///   (`handler_joins`), and the completion channel (a handler can post
+    ///   to it from another thread after the drain). No known path sets any of
     ///   them. These are what this check is for, and each has a test that
     ///   leaves it set (`DirtyKind`).
     pub fn dirtiness(self: *Connection) ?[]const u8 {
@@ -5162,7 +5105,7 @@ pub const Connection = struct {
             &self.request_leases.storage[pos]
         else
             self.request_leases.touchNext(.{}) orelse return null;
-        lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.request_pool.?, &self.request_budget) };
+        lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.request_pool, &self.request_budget) };
         self.lease_index.insert(self.request_leases.storage, self.leasePos(lease));
         return lease;
     }
@@ -5314,17 +5257,12 @@ pub const Connection = struct {
         std.debug.assert(slot.in_use);
         std.debug.assert(slot.admitted);
         const link = slot.link.?;
-        std.debug.assert(link.gate.isClosed());
-        std.debug.assert(link.gate.inside() == 0);
         recordFinalize(slot);
         _ = self.slots_finalized.fetchAdd(1, .acq_rel);
         self.slots_orphaned += 1;
         _ = self.live_handlers.fetchSub(1, .acq_rel);
-        if (link.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
-        if (link.arena.budget) |b| {
-            std.debug.assert(b == &self.request_budget);
-            b.uncharge(link.arena.conn_charged);
-        }
+        if (link.core.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
+        link.core.returnConnCharges(&self.request_budget);
         if (self.handler_joins[i]) |*handle| handle.detach();
         self.handler_joins[i] = null;
         if (self.findLease(slot.stream_id)) |lease| self.releaseLease(lease);
@@ -5333,8 +5271,7 @@ pub const Connection = struct {
         slot.admitted = false;
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
         slot.link = null;
-        link.orphaned = true;
-        if (link.accounting) |a| _ = a.orphaned_handlers.fetchAdd(1, .acq_rel);
+        link.core.orphan();
         dropLinkRef(link);
     }
 
@@ -5843,13 +5780,13 @@ pub const Connection = struct {
         for (self.handlers.slice(), 0..) |*slot, i| {
             if (!slot.in_use) continue;
             const link = slot.link orelse continue;
-            link.gate.close();
+            link.core.gate.close();
             self.requestHandlerCancel(i);
         }
         for (self.handlers.slice()) |*slot| {
             if (!slot.in_use) continue;
             const link = slot.link orelse continue;
-            link.gate.waitDrained();
+            link.core.gate.waitDrained();
         }
         // Every gate is closed and drained, so whether a handler reported is
         // settled: its report (`finishHandlerJob`) runs inside the gate, and
@@ -7130,7 +7067,7 @@ pub const Connection = struct {
     /// that fairness between streams is decided in one place.
     ///
     /// A batch can queue intents of its own: a dispatch that is refused (a
-    /// failed handler spawn, a refused reaper reservation, no request memory)
+    /// failed handler spawn, a refused task-handler token, no request memory)
     /// resets or answers its stream. They are drained here, in further rounds,
     /// before this returns, also after a round fails (the first error is
     /// returned at the end), so the session queue is empty whenever a lock
@@ -7965,7 +7902,7 @@ pub const Connection = struct {
 
     /// `refuseDispatchForMemory` after the arena moved into the stream's link.
     fn refuseLinkForMemory(self: *Connection, d: session_mod.DispatchRequest, link: *StreamLink) bool {
-        return self.refuseForMemory(d, link.arena.refusal);
+        return self.refuseForMemory(d, link.core.arena.refusal);
     }
 
     fn refuseForMemory(self: *Connection, d: session_mod.DispatchRequest, refusal: ?request_pool.Reason) bool {
@@ -8008,26 +7945,26 @@ pub const Connection = struct {
             else => false,
         };
 
-        var reaper_reserved = false;
+        var token_reserved = false;
         if (!complete_inline) {
             if (self.config.accounting) |acct| {
-                if (!acct.tryReserveReaper()) {
+                if (!acct.tryReserveTaskHandler()) {
                     // Queued, not processed: this can run inside
                     // `materializeIntents`, whose batch a nested drain would
                     // overwrite. That loop, or the caller's, sends it.
                     self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
                     return true;
                 }
-                reaper_reserved = true;
+                token_reserved = true;
             }
         }
         // `defer`, not `errdefer`: the no-slot return below carries no error,
         // and an errdefer leaked one server-wide token per such task stream
         // until every task stream was refused. A parked request reserves a
         // fresh token when it resumes. The link takes ownership where
-        // `link.task_token` is set.
-        defer if (reaper_reserved) {
-            if (self.config.accounting) |acct| acct.releaseReaper();
+        // `link.core.task_token` is set.
+        defer if (token_reserved) {
+            if (self.config.accounting) |acct| acct.releaseTaskHandler();
         };
 
         const slot = self.allocSlot(d.stream_id) orelse {
@@ -8053,8 +7990,14 @@ pub const Connection = struct {
         // link (`StreamLink`, `dropLinkRef`), not to the connection.
         const link = lease.arena.allocator().create(StreamLink) catch return self.refuseDispatchForMemory(d, lease);
         link.* = .{
+            .core = .{
+                .arena = lease.arena,
+                .accounting = self.config.accounting,
+                .balancer = self.config.balancer,
+                .exec_index = self.config.exec_index,
+                .actor_thread = self.actor_thread,
+            },
             .conn = self,
-            .arena = lease.arena,
             .stream_id = d.stream_id,
             .owned_request = undefined,
             .req = undefined,
@@ -8062,15 +8005,11 @@ pub const Connection = struct {
             .matched = .not_found,
             .slot = slot,
             .hctx = undefined,
-            .accounting = self.config.accounting,
-            .balancer = self.config.balancer,
-            .exec_index = self.config.exec_index,
-            .actor_thread = self.actor_thread,
         };
-        link.arena.gate = &link.gate;
+        link.core.arena.gate = &link.core.gate;
         self.forgetLease(lease);
         slot.link = link;
-        const a = link.arena.allocator();
+        const a = link.core.arena.allocator();
 
         // The strings are already in this arena; only the handler-facing
         // arrays are built here. Running out of memory is an answer to the
@@ -8097,8 +8036,8 @@ pub const Connection = struct {
         };
         link.resp = .{
             .stream_id = d.stream_id,
-            .generation = link.terminal.currentGeneration(),
-            .terminal = &link.terminal,
+            .generation = link.core.terminal.currentGeneration(),
+            .terminal = &link.core.terminal,
             .ctx = &link.hctx,
             .io = self.config.io,
             .sendFn = sendCb,
@@ -8110,7 +8049,7 @@ pub const Connection = struct {
         };
         link.hctx = .{
             .conn = self,
-            .terminal = &link.terminal,
+            .terminal = &link.core.terminal,
             .slot = slot,
             .stream_id = d.stream_id,
             .method = link.req.method,
@@ -8123,15 +8062,15 @@ pub const Connection = struct {
             else => {},
         }
 
-        link.task_token = reaper_reserved;
-        reaper_reserved = false;
+        link.core.task_token = token_reserved;
+        token_reserved = false;
         // From here every exit must `finishHandlerJob` (task `defer`, the end
         // of the complete batch's drain turn, or spawn-fail below). Do not run a task
         // handler synchronously on this path: that is the ingest-park.
         link.owned_request = d;
         dispatch_owned = false;
         // The handler's reference; the actor's is the one `create` began with.
-        _ = link.refs.fetchAdd(1, .monotonic);
+        _ = link.core.refs.fetchAdd(1, .monotonic);
 
         self.admitHandler(slot);
         if (trace.enabled) {
@@ -8168,7 +8107,7 @@ pub const Connection = struct {
         }
         // Count before spawn so a handler that finishes before this function
         // stores the join handle still decrements in finishHandlerJob.
-        link.task_counted = true;
+        link.core.task_counted = true;
         _ = self.live_task_handlers.fetchAdd(1, .acq_rel);
         if (self.config.balancer) |b| b.noteHandlerStart(self.config.exec_index.?);
         // With `.local`, a burst of 13+ spawns fills this executor's queue and
@@ -8244,17 +8183,15 @@ pub const Connection = struct {
                 error.Closed => @panic("completion channel closed with a handler inside its gate"),
             };
             _ = self.live_handlers.fetchSub(1, .acq_rel);
-            if (link.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
+            if (link.core.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
         }
-        if (link.task_counted) {
-            if (link.balancer) |b| b.noteHandlerEnd(link.exec_index.?);
-        }
+        link.core.noteHandlerEnd();
         if (comptime test_observe) _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
         dropLinkRef(link);
     }
 
     fn runHandlerJob(link: *StreamLink) void {
-        notePlacement(link.actor_thread);
+        notePlacement(link.core.actor_thread);
         probeNote(.handler_start);
         var marker: @TypeOf(handler_job_marker).Node = .unset;
         if (comptime test_observe) handler_job_marker.set(&marker, {});
@@ -8277,8 +8214,8 @@ pub const Connection = struct {
 
     fn runHandlerJobBody(link: *StreamLink) void {
         if (link.hctx.trace_on) link.hctx.t_handler = nowNs(link.resp.io);
-        if (link.terminal.cancel_flag.load(.acquire)) return;
-        if (link.terminal.getCause() != null) return;
+        if (link.core.terminal.cancel_flag.load(.acquire)) return;
+        if (link.core.terminal.getCause() != null) return;
         switch (link.matched) {
             .found => |f| {
                 const run_res: anyerror!void = switch (f.handler) {
@@ -8289,13 +8226,13 @@ pub const Connection = struct {
                     },
                 };
                 run_res catch {
-                    if (link.terminal.getCause() != null) return;
+                    if (link.core.terminal.getCause() != null) return;
                     if (!link.resp.committed) {
                         // The original handler error remains terminal if the
                         // fallback cannot write. A handler that failed because
                         // the request's memory ran out says which cap: its own
                         // is a 500, the connection's and the server's a 503.
-                        const status: u16 = if (link.arena.refusal) |r| r.status() else 500;
+                        const status: u16 = if (link.core.arena.refusal) |r| r.status() else 500;
                         link.resp.send(status, &.{}, "internal error") catch {};
                     } else if (!link.resp.finished) {
                         // The reset reaches the connection only through the
@@ -8312,22 +8249,22 @@ pub const Connection = struct {
                                 // the scheduler and the connection up — the TLS stall.
                                 c.processIntents() catch c.failClosedOnIntentError();
                             }
-                        }.go, DelayedReset{ .stream_id = link.stream_id, .terminal = &link.terminal });
+                        }.go, DelayedReset{ .stream_id = link.stream_id, .terminal = &link.core.terminal });
                     }
                 };
-                if (link.terminal.getCause() == null and !link.resp.committed) {
+                if (link.core.terminal.getCause() == null and !link.resp.committed) {
                     // Terminal transport state supersedes the synthetic fallback.
                     link.resp.send(500, &.{}, "no response") catch {};
                 }
             },
             .not_found => {
-                if (link.terminal.getCause() == null) {
+                if (link.core.terminal.getCause() == null) {
                     // Terminal transport state supersedes the synthetic response.
                     link.resp.send(404, &.{}, "not found") catch {};
                 }
             },
             .method_not_allowed => {
-                if (link.terminal.getCause() == null) {
+                if (link.core.terminal.getCause() == null) {
                     const allow = [_]request.Header{.{ .name = "allow", .value = "GET, POST" }};
                     // Terminal transport state supersedes the synthetic response.
                     link.resp.send(405, &allow, "method not allowed") catch {};
@@ -8490,7 +8427,7 @@ pub const Connection = struct {
             // budget: the handler fails at its first check.
             job.hctx.inline_credit = 0;
             job.hctx.inline_shed = false;
-            if (job.terminal.getCause() != null) {
+            if (job.core.terminal.getCause() != null) {
                 // The entry may be queued, or granted by a release on the way
                 // here (`handleWriterFailed` sets the causes and releases
                 // pending DATA, and calls nothing that abandons it). Whatever
@@ -10383,8 +10320,8 @@ fn fakeBudgetWaiter(conn: *Connection, stream_id: u31) usize {
     // What `claimSlot` does for a real handler.
     conn.space_events[i] = .init;
     test_fake_links[i] = .{
+        .core = .{ .arena = undefined },
         .conn = conn,
-        .arena = undefined,
         .stream_id = stream_id,
         .owned_request = undefined,
         .req = undefined,
@@ -10469,7 +10406,7 @@ test "budget queue: a head refused by the SERVER cap is woken to fail, not left 
     defer trap.close();
     const conn = &trap.hop.conn;
     defer endFakeWaiters(conn);
-    var acct: GlobalAccounting = .{ .max_streams = 8, .reaper_capacity = 8, .max_outbound_bytes = 160, .max_handshakes = 1 };
+    var acct: GlobalAccounting = .{ .max_streams = 8, .task_handler_capacity = 8, .max_outbound_bytes = 160, .max_handshakes = 1 };
     conn.config.accounting = &acct;
     conn.config.limits.outbound_bytes_per_connection = 100;
 
@@ -10591,20 +10528,20 @@ test "budget: a grant that arrives with a reset or a failed writer goes back" {
 
     // A terminal cause set after the grant.
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(50, .pending));
-    conn.handlers.storage[a].link.?.terminal.setCause(.server_shutdown);
-    try std.testing.expectError(response.causeToError(.server_shutdown), conn.acceptGrant(&conn.handlers.storage[a].link.?.terminal, 50));
+    conn.handlers.storage[a].link.?.core.terminal.setCause(.server_shutdown);
+    try std.testing.expectError(response.causeToError(.server_shutdown), conn.acceptGrant(&conn.handlers.storage[a].link.?.core.terminal, 50));
     try expectBudget(conn, 0, 0);
 
     // The writer failed after the grant.
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(50, .pending));
     conn.writer_failed.store(true, .release);
-    try std.testing.expectError(error.WriteFailed, conn.acceptGrant(&conn.handlers.storage[b].link.?.terminal, 50));
+    try std.testing.expectError(error.WriteFailed, conn.acceptGrant(&conn.handlers.storage[b].link.?.core.terminal, 50));
     conn.writer_failed.store(false, .release);
     try expectBudget(conn, 0, 0);
 
     // Neither: the handler keeps its bytes.
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(50, .pending));
-    try conn.acceptGrant(&conn.handlers.storage[c].link.?.terminal, 50);
+    try conn.acceptGrant(&conn.handlers.storage[c].link.?.core.terminal, 50);
     try expectBudget(conn, 50, 0);
     conn.applyOutboundRelease(50, .pending);
 }
@@ -10628,7 +10565,7 @@ fn cancelParkedScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     const i = fakeBudgetWaiter(conn, 1);
     const slot = &conn.handlers.storage[i];
-    var hctx: HandlerCtx = .{ .conn = conn, .terminal = &slot.link.?.terminal, .slot = slot, .stream_id = 1, .arena = gpa };
+    var hctx: HandlerCtx = .{ .conn = conn, .terminal = &slot.link.?.core.terminal, .slot = slot, .stream_id = 1, .arena = gpa };
     var out: ?anyerror = null;
     var task = try rt.spawn(parkedTaskMain, .{ conn, &hctx, &out });
     const deadline = nowNs(conn.config.io) + 5 * std.time.ns_per_s;
@@ -10638,7 +10575,7 @@ fn cancelParkedScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     }
     try std.testing.expectEqual(@as(u32, 1), conn.budget_waiters.load(.acquire));
 
-    // The task is cancelled while it waits (the reaper's way of stopping a
+    // The task is cancelled while it waits (teardown's way of stopping a
     // handler that does not come out by itself).
     task.cancel();
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), out);
@@ -10767,7 +10704,7 @@ test "budget queue: a complete job whose stream is reset while it waits leaves t
     {
         conn.lockSessionUncancelable(io);
         defer conn.unlockSession(io);
-        conn.handlers.storage[0].link.?.terminal.setCause(.server_shutdown);
+        conn.handlers.storage[0].link.?.core.terminal.setCause(.server_shutdown);
         conn.wakeHandlerWaiters(1);
     }
     try std.testing.expectEqual(@as(u32, 0), conn.budget_waiters.load(.acquire));
@@ -10828,7 +10765,7 @@ test "budget queue: a GRANTED complete job whose stream is reset gives its cap b
     {
         conn.lockSessionUncancelable(io);
         defer conn.unlockSession(io);
-        conn.handlers.storage[0].link.?.terminal.setCause(.server_shutdown);
+        conn.handlers.storage[0].link.?.core.terminal.setCause(.server_shutdown);
         conn.wakeHandlerWaiters(1);
     }
     try expectBudget(conn, 0, 0);
@@ -10889,7 +10826,7 @@ test "budget queue: a writer failure grants a queued complete job and ends its s
     // `handleWriterFailed` released the scheduler's DATA and that granted the
     // entry; the stream is terminal. Nothing else released anything.
     try std.testing.expectEqual(BudgetWait.State.granted, conn.handlers.storage[0].budget.state);
-    try std.testing.expect(conn.handlers.storage[0].link.?.terminal.getCause() != null);
+    try std.testing.expect(conn.handlers.storage[0].link.?.core.terminal.getCause() != null);
     try expectBudget(conn, cap, 0);
 
     // The batch: the job is terminal, so its entry ends before it runs, the
@@ -11034,7 +10971,6 @@ test "rentFrame: a terminal frame never needs a frame slab or a write chunk, and
     lim.frame_slabs_per_connection = 8;
     lim.max_streams_per_connection = 4;
     lim.max_streams_per_server = 16;
-    lim.cancellation_reaper_jobs = 16;
     var trap: TrapHop = undefined;
     try openTrapHopLimits(&trap, std.testing.allocator, std.testing.io, &.{}, lim);
     defer trap.close();
@@ -11081,7 +11017,6 @@ test "the terminal ring, the pool's terminal share and the frame store all hold 
         var lim = limits_mod.Limits.defaults;
         lim.max_streams_per_connection = m;
         lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
-        lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
         lim.outbound_slabs_per_server = @max(lim.outbound_slabs_per_server, lim.max_streams_per_server);
         lim.intent_entries_per_connection = @max(lim.intent_entries_per_connection, try lim.intentEntriesMin());
         var trap: TrapHop = undefined;
@@ -11109,7 +11044,6 @@ fn limitsForStreams(m: usize) !limits_mod.Limits {
     if (m == lim.max_streams_per_connection) return lim;
     lim.max_streams_per_connection = m;
     lim.max_streams_per_server = @max(lim.max_streams_per_server, m);
-    lim.cancellation_reaper_jobs = @max(lim.cancellation_reaper_jobs, lim.max_streams_per_server);
     lim.outbound_slabs_per_server = @max(lim.outbound_slabs_per_server, lim.max_streams_per_server);
     lim.intent_entries_per_connection = @max(lim.intent_entries_per_connection, try lim.intentEntriesMin());
     return lim;
@@ -12008,7 +11942,7 @@ pub fn testTrapDoubleFinalize(io: std.Io) void {
     const link = trapAdmitJob(&trap.hop.conn, 1);
     // The second report must reach `recordFinalize`, so the first must not
     // free the link: hold a third reference.
-    _ = link.refs.fetchAdd(1, .monotonic);
+    _ = link.core.refs.fetchAdd(1, .monotonic);
     Connection.finishHandlerJob(link);
     Connection.finishHandlerJob(link);
 }
@@ -12056,8 +11990,8 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *StreamLink {
     const lease = conn.newLease(sid) orelse std.debug.panic("no free test lease", .{});
     const link = lease.arena.allocator().create(StreamLink) catch std.debug.panic("trap link alloc failed", .{});
     link.* = .{
+        .core = .{ .arena = lease.arena },
         .conn = conn,
-        .arena = lease.arena,
         .stream_id = sid,
         .owned_request = .{
             .stream_id = sid,
@@ -12076,19 +12010,19 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *StreamLink {
         .slot = slot,
         .hctx = undefined,
     };
-    link.arena.gate = &link.gate;
+    link.core.arena.gate = &link.core.gate;
     conn.forgetLease(lease);
     link.hctx = .{
         .conn = conn,
-        .terminal = &link.terminal,
+        .terminal = &link.core.terminal,
         .slot = slot,
         .stream_id = sid,
-        .arena = link.arena.allocator(),
+        .arena = link.core.arena.allocator(),
     };
     link.resp = .{
         .stream_id = sid,
         .generation = 0,
-        .terminal = &link.terminal,
+        .terminal = &link.core.terminal,
         .ctx = &link.hctx,
         .io = conn.config.io,
         .sendFn = Connection.sendCb,
@@ -12099,7 +12033,7 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *StreamLink {
         .waitUntilFn = Connection.waitUntilCb,
     };
     slot.link = link;
-    _ = link.refs.fetchAdd(1, .monotonic);
+    _ = link.core.refs.fetchAdd(1, .monotonic);
     conn.admitHandler(slot);
     std.debug.assert(slot.admitted);
     return link;
@@ -12114,7 +12048,7 @@ fn trapR158ParkedHolder(link: *StreamLink) void {
     defer link.exit();
     const pair = conn.tickets.reserve() catch return;
     trap_r158_ticket_slot.store(pair[1], .release);
-    conn.waitTicket(link.stream_id, pair[1], &link.terminal) catch {};
+    conn.waitTicket(link.stream_id, pair[1], &link.core.terminal) catch {};
 }
 
 /// A2 gate, after t-3737: a handler parked in `tickets.wait` inside its gate
@@ -12141,7 +12075,7 @@ pub fn testTrapR158Parked(io: std.Io) void {
         std.debug.assert(spins < 1_000_000);
         zio.yield() catch std.debug.panic("trap yield canceled before wait", .{});
     }
-    std.debug.assert(link.gate.inside() == 1);
+    std.debug.assert(link.core.gate.inside() == 1);
     const freed_before = test_links_freed.load(.acquire);
     trap.hop.conn.shutdownHandlers();
     std.debug.assert(trap.hop.conn.countTicketWaiters() == 0);
@@ -12690,8 +12624,8 @@ test "a call after the link's gate closed fails without touching the connection 
     // gate exists for: `Response` checks the cause first, so only the gate
     // stands between a call that raced teardown and freed memory.
     var link: StreamLink = .{
+        .core = .{ .arena = undefined },
         .conn = @ptrFromInt(0xdead0000),
-        .arena = undefined,
         .stream_id = 1,
         .owned_request = undefined,
         .req = undefined,
@@ -12700,8 +12634,8 @@ test "a call after the link's gate closed fails without touching the connection 
         .slot = @ptrFromInt(0xdead1000),
         .hctx = undefined,
     };
-    link.hctx = .{ .conn = link.conn, .terminal = &link.terminal, .slot = link.slot, .stream_id = 1, .arena = std.testing.allocator };
-    link.gate.close();
+    link.hctx = .{ .conn = link.conn, .terminal = &link.core.terminal, .slot = link.slot, .stream_id = 1, .arena = std.testing.allocator };
+    link.core.gate.close();
     const ctx: *anyopaque = &link.hctx;
     try std.testing.expectError(error.ConnectionClosed, Connection.writeCb(ctx, 1, "late", false, true, true));
     try std.testing.expectError(error.ConnectionClosed, Connection.sendCb(ctx, 1, 200, &.{}, "late"));
@@ -12710,7 +12644,7 @@ test "a call after the link's gate closed fails without touching the connection 
     try std.testing.expectError(error.ConnectionClosed, Connection.abortCb(ctx, 1));
     try std.testing.expectError(error.ConnectionClosed, Connection.waitUntilCb(ctx, 1, .{ .nanoseconds = 0 }));
     // A cause set before the close is the error the call gets.
-    link.terminal.setCause(.{ .peer_reset = .cancel });
+    link.core.terminal.setCause(.{ .peer_reset = .cancel });
     try std.testing.expectError(error.PeerReset, Connection.writeCb(ctx, 1, "late", false, true, true));
-    try std.testing.expectEqual(@as(u32, 0), link.gate.inside());
+    try std.testing.expectEqual(@as(u32, 0), link.core.gate.inside());
 }

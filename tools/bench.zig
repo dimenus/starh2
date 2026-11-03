@@ -23,7 +23,12 @@
 //!   run measure an RSA handshake (~17 ms user on the old tls.zig pin), not
 //!   the record layer.
 //!   The harness prints user vs sys CPU so that cannot hide in one number.
-//! - `--opponent <binary>` adds a third arm. It is optional, and its absence
+//! - `starh2 h1c` is the same binary and handler over HTTP/1.1 on cleartext
+//!   TCP, keep-alive, one request at a time per connection (`h2load --h1
+//!   -m 1`: no pipelining). It is not a ratio against the HTTP/2 arms, whose
+//!   `-m` streams share a connection; it is there to see the HTTP/1.1 hot
+//!   path move between commits.
+//! - `--opponent <binary>` adds another arm. It is optional, and its absence
 //!   is PRINTED rather than assumed, because a table with a missing row reads
 //!   like a complete table.
 //! - `--opponent-name` and `--opponent-revision` make that arm attributable.
@@ -90,7 +95,7 @@ fn abort(comptime fmt: []const u8, args: anytype) noreturn {
 /// at spawn), so stopping the group also stops whatever a wrapper script
 /// started: `--opponent` is often a script around the real server, and
 /// signalling only the script's pid orphans that server on its port.
-var spawned: [3]std.atomic.Value(std.posix.pid_t) = @splat(.init(0));
+var spawned: [4]std.atomic.Value(std.posix.pid_t) = @splat(.init(0));
 
 /// How long a server gets to exit on SIGTERM before it gets SIGKILL.
 const stop_grace_ns: u64 = 3 * std.time.ns_per_s;
@@ -103,7 +108,7 @@ fn spawnServer(io: std.Io, options: std.process.SpawnOptions) std.process.SpawnE
     for (&spawned) |*slot| {
         if (slot.cmpxchgStrong(0, pid, .acq_rel, .acquire) == null) return child;
     }
-    unreachable; // three servers at most: tls, h2c, opponent
+    unreachable; // four servers at most: tls, h2c, h1c, opponent
 }
 
 fn untrack(pid: std.posix.pid_t) void {
@@ -196,6 +201,8 @@ const Arm = struct {
     name: []const u8,
     url: []const u8,
     child: ?*std.process.Child = null,
+    /// HTTP/1.1: `h2load --h1`, one request in flight per connection.
+    h1: bool = false,
     body_bytes: usize = 0,
     /// Per round, at the base thread count.
     rps: [8]f64 = @splat(0),
@@ -289,6 +296,7 @@ fn h2load(
     c: usize,
     m: usize,
     t: usize,
+    h1: bool,
 ) !Sample {
     const n_s = try std.fmt.allocPrint(gpa, "{d}", .{n});
     defer gpa.free(n_s);
@@ -299,9 +307,11 @@ fn h2load(
     const t_s = try std.fmt.allocPrint(gpa, "{d}", .{t});
     defer gpa.free(t_s);
 
-    const res = std.process.run(gpa, io, .{
-        .argv = &.{ "h2load", "-n", n_s, "-c", c_s, "-m", m_s, "-t", t_s, url },
-    }) catch abort("cannot run h2load — install nghttp2", .{});
+    const argv: []const []const u8 = if (h1)
+        &.{ "h2load", "--h1", "-n", n_s, "-c", c_s, "-m", "1", "-t", t_s, url }
+    else
+        &.{ "h2load", "-n", n_s, "-c", c_s, "-m", m_s, "-t", t_s, url };
+    const res = std.process.run(gpa, io, .{ .argv = argv }) catch abort("cannot run h2load — install nghttp2", .{});
     defer gpa.free(res.stdout);
     defer gpa.free(res.stderr);
     switch (res.term) {
@@ -549,6 +559,15 @@ fn run(init: std.process.Init) !void {
     const h2c_port = try awaitReadyPort(io, &h2c_child);
     const h2c_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{h2c_port});
 
+    var h1c_child = spawnServer(io, .{
+        .argv = &.{ cfg.server, "--mode", "h1c", "--port", "0" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .request_resource_usage_statistics = true,
+    }) catch abort("cannot spawn {s}", .{cfg.server});
+    const h1c_port = try awaitReadyPort(io, &h1c_child);
+    const h1c_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/", .{h1c_port});
+
     var opponent_child: ?std.process.Child = null;
     if (cfg.opponent.len != 0) {
         opponent_child = spawnServer(io, .{
@@ -565,6 +584,7 @@ fn run(init: std.process.Init) !void {
     if (!cfg.opponent_only) {
         try arms.append(arena, .{ .name = "starh2 tls", .url = tls_url, .child = &tls_child });
         try arms.append(arena, .{ .name = "starh2 h2c", .url = h2c_url, .child = &h2c_child });
+        try arms.append(arena, .{ .name = "starh2 h1c", .url = h1c_url, .child = &h1c_child, .h1 = true });
     }
     if (cfg.opponent.len != 0) {
         try arms.append(arena, .{
@@ -584,7 +604,7 @@ fn run(init: std.process.Init) !void {
 
     // Reachability and equal payload, before any number is taken.
     for (arms.items) |*arm| {
-        const probe = try h2load(arena, io, arm.url, 1, 1, 1, 1);
+        const probe = try h2load(arena, io, arm.url, 1, 1, 1, 1, arm.h1);
         if (probe.succeeded != 1) abort("{s} did not answer 200 at {s}", .{ arm.name, arm.url });
         arm.body_bytes = probe.data_bytes;
     }
@@ -608,7 +628,7 @@ fn run(init: std.process.Init) !void {
         // drift cannot consistently favor one implementation.
         for (0..arms.items.len) |offset| {
             const arm = &arms.items[(round + offset) % arms.items.len];
-            const s = try h2load(arena, io, arm.url, cfg.requests, cfg.connections, cfg.streams, cfg.threads);
+            const s = try h2load(arena, io, arm.url, cfg.requests, cfg.connections, cfg.streams, cfg.threads, arm.h1);
             if (s.failed != 0) abort("{s} failed {d} requests — the number is meaningless", .{ arm.name, s.failed });
             arm.rps[round] = s.rps;
             arm.p50_us[round] = s.p50_us;
@@ -625,7 +645,7 @@ fn run(init: std.process.Init) !void {
 
     // The client-limited check, once per arm, at double the client threads.
     for (arms.items) |*arm| {
-        const s = try h2load(arena, io, arm.url, cfg.requests, cfg.connections, cfg.streams, cfg.threads * 2);
+        const s = try h2load(arena, io, arm.url, cfg.requests, cfg.connections, cfg.streams, cfg.threads * 2, arm.h1);
         arm.rps_double = s.rps;
     }
 

@@ -284,8 +284,7 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.outbound_bytes_per_connection = 512 * 1024;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
@@ -424,8 +423,7 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     // Body 192KiB > per-stream cap 64KiB → waitForStreamSpace must block; actor reuses slab.
     limits.outbound_bytes_per_stream = 64 * 1024;
     limits.outbound_bytes_per_connection = 512 * 1024;
@@ -513,8 +511,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.outbound_bytes_per_stream = 64 * 1024;
     limits.outbound_bytes_per_connection = 512 * 1024;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
@@ -576,8 +573,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
@@ -633,8 +629,7 @@ fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 8;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
@@ -707,8 +702,7 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.response_min_rate_grace_ns = 80 * std.time.ns_per_ms;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
@@ -780,8 +774,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 4;
     limits.max_streams_per_connection = 8;
     limits.max_streams_per_server = 16;
-    limits.cancellation_reaper_jobs = 16;
-    limits.cancellation_reaper_tasks = 2;
+    limits.max_task_handlers = 16;
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.graceful_drain_timeout_ns = 100 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
@@ -816,7 +809,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     serve_handle.join() catch {};
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_streams.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), server.accounting.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), server.accounting.task_handlers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.outbound_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.requests.held_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.accounting.active_handshakes.load(.acquire));

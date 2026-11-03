@@ -283,6 +283,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
+    const unit_step = b.step("test-unit", "Run the library's own unit tests (the tests in src/, through src/root.zig)");
+    unit_step.dependOn(&run_lib_tests.step);
 
     const protocol_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -899,7 +901,7 @@ pub fn build(b: *std.Build) void {
     run_shutdown_stuck.has_side_effects = true;
     const run_shutdown_deinit = b.addRunArtifact(shutdown_child);
     run_shutdown_deinit.addArg("deinit-live");
-    run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "Server.deinit: task handlers (reaper_reserved) is 1, expected 0" });
+    run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "Server.deinit: task handlers (task_handlers) is 1, expected 0" });
     run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "freeing nothing, leaking the server" });
     run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "child: deinit returned with 1 task handlers live" });
     run_shutdown_deinit.addCheck(.{ .expect_stderr_match = "child: request memory still live after deinit" });

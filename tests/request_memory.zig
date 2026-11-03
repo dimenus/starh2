@@ -327,8 +327,7 @@ fn smallLimits() starh2.Limits {
     l.max_connections = 8;
     l.max_streams_per_connection = 16;
     l.max_streams_per_server = 32;
-    l.cancellation_reaper_jobs = 32;
-    l.cancellation_reaper_tasks = 2;
+    l.max_task_handlers = 32;
     l.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     l.preface_timeout_ns = 500 * std.time.ns_per_ms;
     return l;

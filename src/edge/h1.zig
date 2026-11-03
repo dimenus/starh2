@@ -1,14 +1,35 @@
-//! HTTP/1.1 edge channel. One stream, no Session, no FairScheduler.
+//! HTTP/1.1 edge channel. One request at a time, no Session, no FairScheduler.
 //!
 //! The connection task owns the socket (h1c) or the TLS `Conn` (ALPN `http/1.1`
-//! / no ALPN). It accumulates a head into a boot-reserved buffer and parses
-//! once. A complete handler reads the Content-Length body, then runs on the
-//! actor. A task handler reads the same bounded body, then runs on its own
-//! task (`Request.body` holds those bytes). `TaskHandler.stream_request`
-//! starts after the head with an empty body; unread Content-Length forces
-//! close so leftover bytes are not the next request. The response uses one
-//! framing (Content-Length, chunked, or close-delimited). Keep-alive loops
-//! until a close reason.
+//! / no ALPN). It accumulates a head into a buffer of its own and parses
+//! once, and reads a Content-Length body into another. `TaskHandler.
+//! stream_request` starts after the head with an empty body; unread
+//! Content-Length forces close so leftover bytes are not the next request.
+//! The response uses one framing (Content-Length, chunked, or
+//! close-delimited). Keep-alive loops until a close reason.
+//!
+//! # A handler reaches only its link (t-3759)
+//!
+//! At dispatch the request (method, authority, path, query, headers, body)
+//! is copied into a request arena from the server's `RequestPool`, and the
+//! request's link (`H1Link`) is that arena's first allocation. The link
+//! embeds `connection.LinkCore`, the core HTTP/2's `StreamLink` uses: the
+//! gate, the two references, the terminal cause, the task-handler token and
+//! the orphan count. The connection's head, body and scratch buffers are
+//! never handed to a handler. Every `Response` call enters the connection
+//! through the link's gate; once the gate is closed it fails with the cause.
+//!
+//! A complete handler runs on the actor. A task handler runs on its own task,
+//! and the actor waits in `waitDispatch` for its report, for the peer, for
+//! the shutdown, and (TLS) for the handler's writes, which the actor drives.
+//!
+//! Teardown does not wait for handler code (`endHandler`): it sets the
+//! cause, wakes every wait a call inside the gate can be in (the socket is
+//! shut, the TLS write channels are closed, `dead` is set), closes the gate,
+//! requests a cancel (never waits for it), and waits only for the calls
+//! already inside. A handler that did not report by then is orphaned: its
+//! link keeps the server-wide token and the orphan count, so `Server.serve`
+//! keeps waiting and reporting, and the connection ends at once.
 const std = @import("std");
 const slab_pool = @import("slab_pool.zig");
 const zio = @import("zio");
@@ -19,16 +40,10 @@ const hpack = @import("../core/hpack.zig");
 const parser = @import("../http1/parser.zig");
 const connection = @import("connection.zig");
 const tls_edge = @import("tls.zig");
-const io_queue = @import("io_queue.zig");
+const request_pool = @import("request_pool.zig");
+const test_hook = @import("test_hook.zig");
 const wire_pump = @import("wire_pump.zig");
 const limits_mod = @import("../core/wire_const.zig");
-
-const live: u8 = 0;
-const reaper_owned: u8 = 1;
-const reported: u8 = 2;
-
-/// Test-only: reaper completion posts for HTTP/1.1 connections, process-wide.
-pub var h1_reaper_post_ok: std.atomic.Value(usize) = .init(0);
 
 /// Request bodies ended by the idle rule and by the minimum rate
 /// (`Limits.request_body_min_rate_bytes_per_s`), process-wide. A test reads
@@ -37,6 +52,15 @@ pub var body_idle_expiries: std.atomic.Value(u64) = .init(0);
 pub var body_rate_expiries: std.atomic.Value(u64) = .init(0);
 
 var no_shutdown_event: zio.Event = .init;
+
+/// Bound on the connection's own task for the whole of `serve`: `get() ==
+/// conn` tells the actor from a handler's task (`writeRaw`, `flushSink`). A
+/// task-local, not a thread-local: tasks move between threads.
+var actor_marker: zio.TaskLocal(*H1Conn) = .{};
+
+fn onActor(self: *H1Conn) bool {
+    return actor_marker.get() == self;
+}
 
 pub const ChannelMutation = enum {
     none,
@@ -61,29 +85,40 @@ pub fn applyTestMutationFromEnv() void {
 /// request whose head fits `h1_head_bytes` (I4). Tests snapshot it.
 pub var test_gpa_allocs: std.atomic.Value(usize) = .init(0);
 
-const Hctx = struct {
+/// Everything an HTTP/1.1 handler can reach between starh2 calls: the shared
+/// link core (`connection.LinkCore`: gate, references, arena, terminal
+/// cause, token, orphan count), the request copied into the arena, and the
+/// response. It is the first allocation in the request's arena. `conn` is
+/// valid only between a successful `enter` and its `exit`. `Response.ctx`
+/// points at the link itself.
+pub const H1Link = struct {
+    core: connection.LinkCore,
     conn: *H1Conn,
-    terminal: *response.SlotTerminal,
-    slot: *Slot,
     method: request.Method,
-};
+    req: request.Request,
+    resp: response.Response,
+    /// The task route's handler; unused for a complete handler.
+    handler: router_mod.TaskHandler = undefined,
 
-/// The HTTP/1.1 job's slot: the fields of the HTTP/2 `HandlerSlot` this file
-/// used, before t-3737 moved HTTP/2 handler state into stream links. HTTP/1.1
-/// still joins its handler and cancels it through the reaper, with this
-/// four-state `completion_owner`.
-const Slot = struct {
-    terminal: response.SlotTerminal = .{},
-    completion_owner: std.atomic.Value(u8) = .init(reported),
-    stream_id: u31 = 0,
-    in_use: bool = false,
-    /// True while a reaper job capacity token is held for this slot.
-    reaper_reserved: bool = false,
+    fn fromCtx(ctx: *anyopaque) *H1Link {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// The connection, for a call that has entered the gate; null once the
+    /// connection has ended (or is ending) for this handler.
+    fn enter(self: *H1Link) ?*H1Conn {
+        if (!self.core.gate.enter()) return null;
+        return self.conn;
+    }
+
+    fn exit(self: *H1Link) void {
+        self.core.gate.exit();
+    }
 };
 
 const Framing = enum { content_length, chunked, close_delimited };
 
-const H1Conn = struct {
+pub const H1Conn = struct {
     config: connection.ConnConfig,
     stream: std.Io.net.Stream,
     tls: ?*tls_edge.Conn,
@@ -130,10 +165,29 @@ const H1Conn = struct {
     recv_pending: []u8 = &.{},
     recv_eof: bool = false,
 
-    slot: Slot = .{},
-    arena: std.heap.ArenaAllocator,
+    /// Server-wide request memory: every dispatched request is copied into
+    /// an arena from here (`newLink`).
+    pool: *request_pool.RequestPool,
+    /// What this connection's requests may hold of the pool at once
+    /// (`Limits.request_bytes_per_connection`). Reached by a handler only
+    /// through its link's gate (`request_pool.Arena.gate`).
+    request_budget: request_pool.ConnBudget,
+    /// The dispatched request's link, from `newLink` until `releaseRequest`
+    /// or `endHandler`. The actor holds one reference to it.
+    link: ?*H1Link = null,
+    /// This connection holds a server-wide stream for the dispatched request
+    /// (`GlobalAccounting.tryAdmitStream`), released when the request ends:
+    /// at the handler's report, or when the connection ends.
+    stream_held: bool = false,
+    /// Set once, when the connection ends with a request dispatched
+    /// (`endHandler`): a call inside the gate that waits (`waitUntilCb`)
+    /// selects on it.
+    dead: zio.Event = .init,
+    /// The task handler's report: one post, from inside its gate.
     completion_buf: [1]u31 = undefined,
     completion_ch: zio.Channel(u31) = undefined,
+    /// The task handler's join handle. Joined after its report, detached
+    /// when it is orphaned; never cancelled with a wait.
     join: ?zio.JoinHandle(void) = null,
     /// Written once by `serve` before any spawn; read by `connection.notePlacement`.
     actor_thread: std.Thread.Id = 0,
@@ -145,10 +199,6 @@ const H1Conn = struct {
     framing: Framing = .content_length,
     pending_storage: []u8,
     pending_len: usize = 0,
-    job_req: request.Request = undefined,
-    job_resp: response.Response = undefined,
-    job_hctx: Hctx = undefined,
-    job_handler: router_mod.TaskHandler = undefined,
     committed: bool = false,
     occupies: bool = false,
     /// This connection asked its handler to cancel because the server is
@@ -183,21 +233,31 @@ const H1Conn = struct {
     tls_site: std.atomic.Value(u8) = .init(0),
     tls_live_handlers: std.atomic.Value(usize) = .init(0),
     tls_out: []u8 = &.{},
-    offload_tls_io: bool = false,
     tls_write_inflight: bool = false,
-    /// The handler was handed to the reaper (`cancelJoin`) and its
-    /// completion has not been taken yet (`finishSlot`). Until then the
-    /// reaper still posts into `completion_ch`, whatever the owner byte says:
-    /// it claims `reported` before it posts.
-    reaper_has_job: bool = false,
+    /// Pump failures on this connection (shutdown completions the pump
+    /// posted, `h1AckSink`). After the first the connection submits nothing
+    /// more, so it is at most 1.
+    tls_failures: u32 = 0,
 
     fn deinit(self: *H1Conn) void {
         if (self.shutdown_cancel_counted) {
             if (self.config.accounting) |a| a.saturatingRelease(&a.shutdown_cancelled, 1, "shutdown_cancelled", .acq_rel);
         }
-        std.debug.assert(!self.slot.in_use);
+        std.debug.assert(self.link == null);
+        std.debug.assert(!self.stream_held);
+        // Every request's connection charge came back: at the release of its
+        // link, or at teardown (`LinkCore.returnConnCharges`).
+        if (self.request_budget.held.load(.acquire) != 0) {
+            std.debug.panic("h1: {d} request bytes still charged to the connection at its end", .{self.request_budget.held.load(.acquire)});
+        }
         if (self.tls_pump) |p| {
             p.shutdownCq();
+            // Give back the write chunks the pump still holds (queued behind
+            // a full staging buffer): the write pool's `deinit` below checks
+            // that every one came home. A connection that ends under a
+            // handler's TLS write can leave one there (round 1 of the step-7
+            // review found it with the multi-chunk test).
+            p.failDrain();
         }
         if (self.recv_started) {
             self.cq.close();
@@ -209,9 +269,23 @@ const H1Conn = struct {
             self.stream.close(self.io);
             self.socket_closed = true;
         }
+        // Poison what a handler must never hold, in safe builds: a request
+        // field that still pointed here would read garbage, and the outlive
+        // tests (`tests/goaway_delivery.zig`) check what a handler reads
+        // after its connection ended. After the receive op is cancelled and
+        // drained: it writes into `recv_buf`.
+        if (std.debug.runtime_safety) {
+            @memset(self.head_buf, 0xaa);
+            @memset(self.body_buf, 0xaa);
+            @memset(self.recv_buf, 0xaa);
+            @memset(self.carry_buf, 0xaa);
+            @memset(self.name_scratch, 0xaa);
+            @memset(self.path_q_buf, 0xaa);
+            @memset(std.mem.sliceAsBytes(self.header_storage), 0xaa);
+            @memset(std.mem.sliceAsBytes(self.field_scratch), 0xaa);
+        }
         // The caller owns the `Conn`'s memory (a connection slot's buffer).
         if (self.tls) |t| t.deinit();
-        self.arena.deinit();
         self.gpa.free(self.head_buf);
         self.gpa.free(self.body_buf);
         self.gpa.free(self.recv_buf);
@@ -250,9 +324,13 @@ pub fn serve(
         return;
     };
     defer conn.deinit();
-    // Runs before `deinit`: never free the buffers under a running handler.
+    var marker: @TypeOf(actor_marker).Node = .unset;
+    actor_marker.set(&marker, &conn);
+    defer actor_marker.clear(&marker);
+    // Runs before `deinit`, on every exit: a handler still running is cut
+    // off from the connection (orphaned), never waited for.
     var canceled = false;
-    defer joinHandler(&conn, canceled);
+    defer endOnExit(&conn, canceled);
     if (comptime connection.placement_check) conn.actor_thread = std.Thread.getCurrentId();
     if (tls != null) startTlsPump(&conn) catch {
         return;
@@ -271,6 +349,7 @@ pub fn serve(
 
 fn initConn(self: *H1Conn, stream: std.Io.net.Stream, config: connection.ConnConfig, tls: ?*tls_edge.Conn) !void {
     const gpa = config.gpa;
+    const pool = config.request_pool;
     const head_buf = try gpa.alloc(u8, config.limits.h1_head_bytes);
     errdefer gpa.free(head_buf);
     const body_buf = try gpa.alloc(u8, config.limits.request_body_bytes);
@@ -309,7 +388,8 @@ fn initConn(self: *H1Conn, stream: std.Io.net.Stream, config: connection.ConnCon
         .path_q_buf = path_q_buf,
         .carry_buf = carry_buf,
         .pending_storage = pending_storage,
-        .arena = std.heap.ArenaAllocator.init(gpa),
+        .pool = pool,
+        .request_budget = .init(config.limits.request_bytes_per_connection),
         .scheme = if (tls != null) "https" else "http",
     };
     self.acc = parser.Accumulator.init(self.head_buf);
@@ -318,6 +398,38 @@ fn initConn(self: *H1Conn, stream: std.Io.net.Stream, config: connection.ConnCon
         self.writer = .init(config.io, stream.socket.handle, self.write_buf, &self.socket_bytes, &self.socket_bytes_ns, config.limits.write_byte_timeout_ns);
         self.reader_bound = true;
         startRecv(self);
+    }
+}
+
+/// Test-only (observe builds): pump failures seen by `h1AckSink`, over all
+/// connections, and the most on one connection. A test reads the first to
+/// know its attack reached a pump failure, and the second to know no
+/// connection went on writing after one.
+pub var test_tls_failures: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
+pub var test_tls_failures_max: test_hook.Hook(std.atomic.Value(u32)) = if (test_hook.on) .init(0) else {};
+
+/// Every write completion the HTTP/1.1 TLS pump posts (`Pump.post`). The
+/// pump reports a failure as completions (`failDrain`'s `fail_all`, then a
+/// `shutdown`), and a chunk as one only when it carries a ticket or
+/// accounting. HTTP/1.1 chunks carry neither: no tickets (a handler's write
+/// waits for the actor's `tls_ok_ch` ack), no outbound-budget release, no
+/// control-pool entries, and the write-byte clock reads `Pump.sent_bytes`.
+/// The actor learns of a failure from the pump's `.exit`, not from these.
+/// So there is nothing to apply, and a completion that does carry
+/// accounting is a bug in this file: it would be a release dropped here.
+/// HTTP/2 applies the same posts in `Connection.takeWriteAck`. Applied on
+/// the posting task, as HTTP/2's are, so no channel and no capacity.
+fn h1AckSink(ctx: *anyopaque, c: wire_pump.WriteCompletion) void {
+    const self: *H1Conn = @ptrCast(@alignCast(ctx));
+    if (c.shutdown) {
+        self.tls_failures += 1;
+        if (comptime test_hook.on) {
+            _ = test_tls_failures.fetchAdd(1, .monotonic);
+            _ = test_tls_failures_max.fetchMax(self.tls_failures, .monotonic);
+        }
+    }
+    if (c.ticket != 0 or c.ticket_count != 0 or c.outbound_release != 0 or c.control_entries != 0 or c.control_release != 0) {
+        std.debug.panic("h1: a TLS write completion carries accounting HTTP/1.1 never charges (ticket {d}, outbound {d}, control {d})", .{ c.ticket, c.outbound_release, c.control_entries });
     }
 }
 
@@ -355,6 +467,8 @@ fn startTlsPump(self: *H1Conn) !void {
         .recv_buf = self.tls_recv_buf,
         .site = &self.tls_site,
         .completions = &self.tls_acks,
+        .ack_apply = h1AckSink,
+        .ack_ctx = self,
         .gpa = gpa,
         .chunk_storage = self.tls_chunk_storage,
         .n_chunks = 1,
@@ -376,9 +490,6 @@ fn runLoop(self: *H1Conn) !void {
         keep = try serveOne(self);
         if (self.occupies) break;
         if (!keep) break;
-        // `Request.arena` is request memory: free it, or a keep-alive
-        // connection holds its largest request's arena for its whole life.
-        _ = self.arena.reset(.free_all);
         self.acc.reset();
         self.committed = false;
         self.finished = false;
@@ -387,7 +498,7 @@ fn runLoop(self: *H1Conn) !void {
         self.framing = .content_length;
         self.pending_len = 0;
     }
-    try shutdownHandlers(self);
+    std.debug.assert(self.link == null);
     self.stream.shutdown(self.io, .both) catch {};
 }
 
@@ -496,7 +607,7 @@ fn serveOne(self: *H1Conn) !bool {
                 if (v.authority.len != 0) authority = v.authority;
             }
 
-            try dispatch(self, head, body, headers, path, query, authority);
+            try dispatch(self, head, matched, body, headers, path, query, authority);
             if (test_channel_mutation == .m3_ignore_close) self.want_close = false;
             if (self.want_close or close_after) return false;
             return true;
@@ -674,11 +785,21 @@ fn driveTlsUntilIdle(self: *H1Conn) response.ResponseError!void {
     var clock: TlsWriteClock = .start(self, pump);
     while (pump.pending_n > 0 or pump.send_armed) {
         if (clock.expired(self, pump)) return tlsWriteTimedOut(self);
-        waitTlsCq(self, clock.deadline()) catch return error.WriteFailed;
+        const out = waitTlsCq(self, clock.deadline()) catch return error.WriteFailed;
+        if (out == .exit) return tlsPumpEnded(self);
         if (pump.pending_n > 0) {
-            if (!pump.drivePending()) return error.WriteFailed;
+            if (!pump.drivePending()) return tlsPumpEnded(self);
         }
     }
+}
+
+/// The pump failed (a send or receive error, a closed queue): nothing more
+/// can be written on this connection. The actor's own write fails with the
+/// cause, and the connection closes; no further send is submitted.
+fn tlsPumpEnded(self: *H1Conn) response.ResponseError {
+    self.want_close = true;
+    if (self.link) |l| l.core.terminal.setCause(.connection_closed);
+    return writeFailedCause(self);
 }
 
 /// The write-byte timeout (`Limits.write_byte_timeout_ns`) on the TLS pump:
@@ -727,12 +848,17 @@ fn shutTimedOut(self: *H1Conn) void {
     self.stream.shutdown(self.io, .both) catch {};
 }
 
-fn waitTlsCq(self: *H1Conn, deadline_ns: ?u64) !void {
-    const pump = self.tls_pump orelse return;
+const CqOutcome = enum { more, exit };
+
+/// One turn of the TLS pump's completion queue. `.exit`: the pump has ended
+/// (`Pump.onCqComplete` said so, or the queue is drained), and the caller
+/// must not submit more.
+fn waitTlsCq(self: *H1Conn, deadline_ns: ?u64) error{Canceled}!CqOutcome {
+    const pump = self.tls_pump orelse return .exit;
     const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
     const timeout: zio.Timeout = if (deadline_ns) |d| blk: {
         const now = nowNs(self.io);
-        if (d <= now) return;
+        if (d <= now) return .more;
         break :blk .{ .duration = .fromNanoseconds(d - now) };
     } else .none;
     const winner = zio.select(.{
@@ -742,13 +868,10 @@ fn waitTlsCq(self: *H1Conn, deadline_ns: ?u64) !void {
     }) catch return error.Canceled;
     switch (winner) {
         .io => |r| {
-            const c = r catch {
-                if (pump.cq.isDrained()) return;
-                return;
-            };
-            _ = pump.onCqComplete(c);
+            const c = r catch return if (pump.cq.isDrained()) .exit else .more;
+            return if (pump.onCqComplete(c) == .exit) .exit else .more;
         },
-        .timer => {},
+        .timer => return .more,
         .shutdown => return error.Canceled,
     }
 }
@@ -778,9 +901,11 @@ fn readSomeTls(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
             .progress => continue,
             .none => {},
         }
-        waitTlsCq(self, deadline_ns) catch |err| switch (err) {
+        const out = waitTlsCq(self, deadline_ns) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
         };
+        // The pump ended: nothing more will be read.
+        if (out == .exit) return @as(usize, 0);
         if (nowNs(self.io) >= deadline_ns) return null;
     }
 }
@@ -905,94 +1030,92 @@ fn suppressPayload(method: request.Method, status: u16) bool {
     return method == .HEAD or status < 200 or status == 204 or status == 304;
 }
 
-fn dispatch(
+/// Give back the server-wide stream this connection holds for its request.
+fn releaseStream(self: *H1Conn) void {
+    if (!self.stream_held) return;
+    self.stream_held = false;
+    if (self.config.accounting) |a| a.releaseStream();
+}
+
+/// Copy the request into a fresh request arena from the pool, behind its
+/// link, the arena's first allocation. Nothing the handler gets points into
+/// this connection: `path`, `query`, `authority` and the header strings may
+/// be slices of the head buffer or of the validation scratch, and `body` of
+/// the body buffer, all of which the next request (or the connection's end)
+/// overwrites. Null when the pool refuses: the status to answer, from the
+/// cap that refused (`request_pool.Reason.status`).
+fn newLink(
     self: *H1Conn,
-    head: parser.Head,
+    method: request.Method,
+    matched: router_mod.Match,
     body: []const u8,
     headers: []const request.Header,
     path: []const u8,
     query: []const u8,
     authority: []const u8,
-) !void {
-    if (self.config.accounting) |a| {
-        if (!a.tryAdmitStream()) {
-            try writeError(self, 503);
-            self.want_close = true;
-            return;
-        }
-    }
-    // Until the slot takes the charges (below), an error gives them back here.
-    var slot_owns = false;
-    errdefer if (!slot_owns) {
-        if (self.config.accounting) |a| a.releaseStream();
+) union(enum) { link: *H1Link, refused: u16 } {
+    var arena = request_pool.Arena.init(self.pool, &self.request_budget);
+    const link = arena.allocator().create(H1Link) catch {
+        const status = (arena.refusal orelse request_pool.Reason.server_cap).status();
+        arena.release();
+        return .{ .refused = status };
     };
-
-    const method = request.Method.parse(head.method_raw);
-    const matched = self.config.router.match(method, head.path);
-    const complete_inline = switch (matched) {
-        .found => |f| f.handler == .complete,
-        else => true,
-    };
-
-    var reaper_reserved = false;
-    if (!complete_inline) {
-        if (self.config.accounting) |a| {
-            if (!a.tryReserveReaper()) {
-                try writeError(self, 503);
-                self.want_close = true;
-                return;
-            }
-            reaper_reserved = true;
-        }
-    }
-    errdefer if (reaper_reserved and !slot_owns) {
-        if (self.config.accounting) |a| a.releaseReaper();
-    };
-
-    self.slot.in_use = true;
-    self.slot.stream_id = 1;
-    self.slot.terminal.clear();
-    _ = self.slot.terminal.generation.fetchAdd(1, .acq_rel);
-    self.slot.completion_owner.store(live, .release);
-    self.slot.reaper_reserved = reaper_reserved;
-    self.join = null;
-    // From here the slot holds the charges, and `finishSlot` gives them back;
-    // on an error, `serve` does (`joinHandler`), after the handler ends.
-    slot_owns = true;
-    // Preserve unread-body close from serveOne. A bare assignment dropped it,
-    // so leftover Content-Length bytes became the next request.
-    self.want_close = self.want_close or head.connection_close;
-    self.occupies = false;
-
-    const req: request.Request = .{
-        .method = method,
-        .scheme = self.scheme,
-        .authority = authority,
-        .path = path,
-        .path_remainder = switch (matched) {
-            .found => |f| f.path_remainder,
-            else => "",
+    link.* = .{
+        .core = .{
+            .arena = arena,
+            .accounting = self.config.accounting,
+            .balancer = self.config.balancer,
+            .exec_index = self.config.exec_index,
+            .actor_thread = self.actor_thread,
         },
-        .query = query,
-        .headers = headers,
-        .body = body,
-        .trailers = &.{},
-        .arena = self.arena.allocator(),
-        .peer = connection.peerFromHandle(self.stream.socket.handle),
-    };
-
-    self.job_hctx = .{
         .conn = self,
-        .terminal = &self.slot.terminal,
-        .slot = &self.slot,
         .method = method,
+        .req = undefined,
+        .resp = undefined,
     };
-    self.job_req = req;
-    self.job_resp = .{
+    // From here the arena is the link's (`link.core.arena`); the local copy
+    // is stale.
+    link.core.arena.gate = &link.core.gate;
+    const a = link.core.arena.allocator();
+    const remainder = switch (matched) {
+        .found => |f| f.path_remainder,
+        else => "",
+    };
+    var total: usize = authority.len + path.len + query.len + remainder.len + body.len;
+    for (headers) |h| total += h.name.len + h.value.len;
+    const copied = copy: {
+        const hdrs = a.alloc(request.Header, headers.len) catch break :copy false;
+        const bytes = a.alloc(u8, total) catch break :copy false;
+        var at: usize = 0;
+        for (headers, hdrs) |h, *out| {
+            out.* = .{ .name = takeCopy(bytes, &at, h.name), .value = takeCopy(bytes, &at, h.value) };
+        }
+        link.req = .{
+            .method = method,
+            .scheme = self.scheme,
+            .authority = takeCopy(bytes, &at, authority),
+            .path = takeCopy(bytes, &at, path),
+            .path_remainder = takeCopy(bytes, &at, remainder),
+            .query = takeCopy(bytes, &at, query),
+            .headers = hdrs,
+            .body = takeCopy(bytes, &at, body),
+            .trailers = &.{},
+            .arena = a,
+            .peer = connection.peerFromHandle(self.stream.socket.handle),
+        };
+        std.debug.assert(at == total);
+        break :copy true;
+    };
+    if (!copied) {
+        const status = (link.core.arena.refusal orelse request_pool.Reason.server_cap).status();
+        connection.dropLink(H1Link, link);
+        return .{ .refused = status };
+    }
+    link.resp = .{
         .stream_id = 1,
-        .generation = self.slot.terminal.currentGeneration(),
-        .terminal = &self.slot.terminal,
-        .ctx = &self.job_hctx,
+        .generation = link.core.terminal.currentGeneration(),
+        .terminal = &link.core.terminal,
+        .ctx = link,
         .io = self.io,
         .sendFn = sendCb,
         .startFn = startCb,
@@ -1001,83 +1124,184 @@ fn dispatch(
         .abortFn = abortCb,
         .waitUntilFn = waitUntilCb,
     };
+    return .{ .link = link };
+}
+
+fn takeCopy(bytes: []u8, at: *usize, s: []const u8) []const u8 {
+    const out = bytes[at.*..][0..s.len];
+    @memcpy(out, s);
+    at.* += s.len;
+    return out;
+}
+
+fn dispatch(
+    self: *H1Conn,
+    head: parser.Head,
+    matched: router_mod.Match,
+    body: []const u8,
+    headers: []const request.Header,
+    path: []const u8,
+    query: []const u8,
+    authority: []const u8,
+) !void {
+    std.debug.assert(self.link == null);
+    if (self.config.accounting) |a| {
+        if (!a.tryAdmitStream()) {
+            try writeError(self, 503);
+            self.want_close = true;
+            return;
+        }
+        self.stream_held = true;
+    }
+    // Until the link exists, an error gives the stream back here; from then
+    // on `releaseRequest` or `endHandler` does.
+    var link_owns = false;
+    errdefer if (!link_owns) releaseStream(self);
+
+    const method = request.Method.parse(head.method_raw);
+    const complete_inline = switch (matched) {
+        .found => |f| f.handler == .complete,
+        else => true,
+    };
+
+    var token = false;
+    if (!complete_inline) {
+        if (self.config.accounting) |a| {
+            if (!a.tryReserveTaskHandler()) {
+                releaseStream(self);
+                try writeError(self, 503);
+                self.want_close = true;
+                return;
+            }
+            token = true;
+        }
+    }
+    const link = switch (newLink(self, method, matched, body, headers, path, query, authority)) {
+        .link => |l| l,
+        .refused => |status| {
+            if (token) {
+                if (self.config.accounting) |a| a.releaseTaskHandler();
+            }
+            releaseStream(self);
+            try writeError(self, status);
+            self.want_close = true;
+            return;
+        },
+    };
+    // The link holds the token until it is freed, after the handler ends.
+    link.core.task_token = token;
+    self.link = link;
+    link_owns = true;
+    // Preserve unread-body close from serveOne. A bare assignment dropped it,
+    // so leftover Content-Length bytes became the next request.
+    self.want_close = self.want_close or head.connection_close;
+    self.occupies = false;
 
     if (complete_inline) {
+        // On the actor, so nothing can outlive the connection: the link has
+        // the actor's reference only, and is freed when this returns.
+        defer releaseRequest(self);
         switch (matched) {
             .found => |f| {
-                var cr: response.CompleteResponse = .{ .inner = &self.job_resp };
-                f.handler.complete.runFn(f.handler.complete.ptr, &self.job_req, &cr) catch {
-                    if (!self.committed) writeError(self, 500) catch {};
+                var cr: response.CompleteResponse = .{ .inner = &link.resp };
+                f.handler.complete.runFn(f.handler.complete.ptr, &link.req, &cr) catch {
+                    // The same rule as a task handler (`runTaskBody`) and
+                    // as HTTP/2: a handler that failed because its request's
+                    // memory ran out says which cap, its own a 500, the
+                    // connection's and the server's a 503.
+                    const status: u16 = if (link.core.arena.refusal) |r| r.status() else 500;
+                    if (!self.committed) writeError(self, status) catch {};
                     self.want_close = true;
                 };
             },
-            .not_found => try self.job_resp.send(404, &.{}, "not found"),
+            .not_found => try link.resp.send(404, &.{}, "not found"),
             .method_not_allowed => |ms| {
                 _ = ms;
-                try self.job_resp.send(405, &.{.{ .name = "allow", .value = "GET" }}, "");
+                try link.resp.send(405, &.{.{ .name = "allow", .value = "GET" }}, "");
             },
         }
-        if (!self.job_resp.committed) {
-            try self.job_resp.send(200, &.{}, "");
+        if (!link.resp.committed) {
+            try link.resp.send(200, &.{}, "");
         }
-        finishSlot(self);
         return;
     }
 
-    self.job_handler = matched.found.handler.task;
-    const Job = struct {
-        fn run(conn: *H1Conn) void {
-            connection.notePlacement(conn.actor_thread);
-            defer finishSlotFromTask(conn);
-            // Runs before finishSlotFromTask: after that the connection may
-            // reuse the slot, and the count belongs to this job.
-            defer if (conn.config.balancer) |b| b.noteHandlerEnd(conn.config.exec_index.?);
-            runTaskBody(conn);
-        }
-    };
-    self.offload_tls_io = self.tls_pump != null;
+    link.handler = matched.found.handler.task;
+    // The handler's reference; the actor's is the one `newLink` began with.
+    _ = link.core.refs.fetchAdd(1, .monotonic);
+    link.core.task_counted = true;
     // Counted before the spawn, so a job that finishes at once still finds
     // its count to release.
     if (self.config.balancer) |b| b.noteHandlerStart(self.config.exec_index.?);
-    const handle = zio.spawnInto(connection.connPlacement(), Job.run, .{self}) catch {
+    const handle = zio.spawnInto(connection.connPlacement(), runJob, .{link}) catch {
         if (self.config.balancer) |b| b.noteHandlerEnd(self.config.exec_index.?);
-        self.offload_tls_io = false;
-        if (reaper_reserved) {
-            if (self.config.accounting) |a| a.releaseReaper();
-            self.slot.reaper_reserved = false;
-        }
+        link.core.task_counted = false;
+        _ = link.core.refs.fetchSub(1, .monotonic);
+        releaseRequest(self);
         try writeError(self, 503);
         self.want_close = true;
-        finishSlot(self);
         return;
     };
     self.join = handle;
-    waitDispatch(self) catch |err| {
-        self.offload_tls_io = false;
-        return err;
-    };
-    self.offload_tls_io = false;
+    try waitDispatch(self);
 }
 
-fn runTaskBody(self: *H1Conn) void {
-    if (self.slot.terminal.cancel_flag.load(.acquire)) return;
-    if (self.slot.terminal.getCause() != null) return;
-    const run_res: anyerror!void = self.job_handler.runFn(self.job_handler.ptr, &self.job_req, &self.job_resp);
+/// The task handler's job. It reaches the connection only inside its link's
+/// gate, so it may run on after the connection ended.
+fn runJob(link: *H1Link) void {
+    connection.notePlacement(link.core.actor_thread);
+    var marker: @TypeOf(connection.handler_job_marker).Node = .unset;
+    if (comptime connection.test_observe) connection.handler_job_marker.set(&marker, {});
+    defer if (comptime connection.test_observe) connection.handler_job_marker.clear(&marker);
+    defer finishJob(link);
+    runTaskBody(link);
+}
+
+/// The handler's report, its job's last act. Inside the gate: post the
+/// completion (the actor selects on the channel; it joins this task, then
+/// frees the request). With the gate closed the connection ended while this
+/// handler ran and orphaned it; it reports nothing. Then, outside the gate:
+/// the balancer, and the handler's reference, which frees the link only when
+/// the actor dropped first (the orphan case).
+fn finishJob(link: *H1Link) void {
+    if (link.enter()) |self| {
+        defer link.exit();
+        self.completion_ch.trySend(1) catch |err| switch (err) {
+            // One request at a time: one completion per request, capacity 1.
+            error.WouldBlock => @panic("h1: a second handler completion for one request"),
+            error.Closed => @panic("h1: completion channel closed with a handler inside its gate"),
+        };
+    }
+    link.core.noteHandlerEnd();
+    connection.dropLink(H1Link, link);
+}
+
+fn runTaskBody(link: *H1Link) void {
+    const t = &link.core.terminal;
+    if (t.cancel_flag.load(.acquire)) return;
+    if (t.getCause() != null) return;
+    const run_res: anyerror!void = link.handler.runFn(link.handler.ptr, &link.req, &link.resp);
     run_res catch {
-        if (self.slot.terminal.getCause() != null) return;
-        if (!self.job_resp.committed) {
-            self.job_resp.send(500, &.{}, "internal error") catch {};
-        } else if (!self.job_resp.finished) {
+        if (t.getCause() != null) return;
+        if (!link.resp.committed) {
+            // A handler that failed because its request's memory ran out
+            // says which cap: its own is a 500, the others a 503.
+            const status: u16 = if (link.core.arena.refusal) |r| r.status() else 500;
+            link.resp.send(status, &.{}, "internal error") catch {};
+        } else if (!link.resp.finished) {
+            // The framing reaches the connection only through the gate, like
+            // every other call.
+            const self = link.enter() orelse return;
+            defer link.exit();
             finishFraming(self) catch {};
             self.want_close = true;
-            self.job_resp.finished = true;
+            link.resp.finished = true;
         }
     };
-    if (self.slot.terminal.getCause() == null and !self.job_resp.committed) {
-        self.job_resp.send(500, &.{}, "no response") catch {};
+    if (t.getCause() == null and !link.resp.committed) {
+        link.resp.send(500, &.{}, "no response") catch {};
     }
 }
-
 
 fn tlsIdle(pump: *tls_edge.Pump) bool {
     return pump.pending_n == 0 and !pump.send_armed;
@@ -1088,14 +1312,17 @@ fn ackTlsWrite(self: *H1Conn, ok: bool) void {
     self.tls_ok_ch.trySend(ok) catch {};
 }
 
-fn driveHandlerTlsWrite(self: *H1Conn, n: u32) void {
+/// Drive one chunk of a task handler's write. False: the pump ended (it
+/// failed and gave back what it held), and the caller ends the connection;
+/// nothing more may be submitted to it.
+fn driveHandlerTlsWrite(self: *H1Conn, n: u32) bool {
     const pump = self.tls_pump orelse {
         ackTlsWrite(self, false);
-        return;
+        return true;
     };
     const idx = self.tls_write_pool.tryRentIndex(self.io) orelse {
         ackTlsWrite(self, false);
-        return;
+        return true;
     };
     var chunk = wire_pump.WireChunk{
         .bytes = self.tls_out[0..n],
@@ -1104,15 +1331,18 @@ fn driveHandlerTlsWrite(self: *H1Conn, n: u32) void {
     };
     pump.stampPush(&chunk);
     if (!pump.writeChunks(chunk)) {
+        // The cause first: the failed ack wakes the handler, which reads it.
+        if (self.link) |l| l.core.terminal.setCause(.connection_closed);
         ackTlsWrite(self, false);
-        return;
+        return false;
     }
     if (tlsIdle(pump)) {
         ackTlsWrite(self, true);
-        return;
+        return true;
     }
     self.tls_write_clock = .start(self, pump);
     self.tls_write_inflight = true;
+    return true;
 }
 
 fn ingestTlsPeer(self: *H1Conn) bool {
@@ -1132,24 +1362,16 @@ fn ingestTlsPeer(self: *H1Conn) bool {
     return pump.inbound_eof;
 }
 
+/// The actor's wait while a task handler runs, on TLS: the actor also drives
+/// the handler's writes (`tls_req_ch`) through the pump. Returns when the
+/// handler reported (`releaseRequest`), or when the connection ends under it
+/// (`endHandler`, which never waits for handler code).
 fn waitDispatchTls(self: *H1Conn) !void {
-    var reaping = false;
     const pump = self.tls_pump.?;
     const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
-    while (self.slot.in_use) {
-        if (shutdownRequested(self) and !reaping) {
-            self.slot.terminal.setCause(.server_shutdown);
-            noteShutdownCancel(self);
-            if (!cancelJoin(self)) {
-                finishSlot(self);
-                break;
-            }
-            reaping = true;
-        }
-        if (reaping) {
-            const sid = self.completion_ch.receive() catch return error.Canceled;
-            _ = sid;
-            finishSlot(self);
+    while (self.link) |link| {
+        if (shutdownRequested(self)) {
+            endForShutdown(self);
             break;
         }
 
@@ -1160,15 +1382,11 @@ fn waitDispatchTls(self: *H1Conn) !void {
             if (self.tls_write_clock.expired(self, pump)) {
                 // The cause first: the handler's failed write reads it
                 // (`writeRawTlsFromHandler`) as soon as the ack wakes it.
-                self.slot.terminal.setCause(.slow_consumer);
+                link.core.terminal.setCause(.slow_consumer);
                 ackTlsWrite(self, false);
                 shutTimedOut(self);
-                if (!cancelJoin(self)) {
-                    finishSlot(self);
-                    break;
-                }
-                reaping = true;
-                continue;
+                endHandler(self, .slow_consumer);
+                break;
             }
             if (self.tls_write_clock.deadline()) |d| {
                 // Absolute: a `.duration` arms from a cached clock (zio t-3653).
@@ -1187,96 +1405,71 @@ fn waitDispatchTls(self: *H1Conn) !void {
             .io => |r| {
                 const c = r catch {
                     if (pump.cq.isDrained()) {
-                        self.slot.terminal.setCause(.connection_closed);
-                        if (!cancelJoin(self)) {
-                            finishSlot(self);
-                            break;
-                        }
-                        reaping = true;
+                        endHandler(self, .connection_closed);
+                        break;
                     }
                     continue;
                 };
                 if (pump.onCqComplete(c) == .exit) {
-                    self.slot.terminal.setCause(.connection_closed);
-                    if (!cancelJoin(self)) {
-                        finishSlot(self);
-                        break;
-                    }
-                    reaping = true;
-                    continue;
+                    endHandler(self, .connection_closed);
+                    break;
                 }
                 if (self.tls_write_inflight) {
                     if (pump.pending_n > 0) {
                         if (!pump.drivePending()) {
+                            // The cause first: the failed ack wakes the
+                            // handler, which reads it (`writeFailedCause`).
+                            link.core.terminal.setCause(.connection_closed);
                             ackTlsWrite(self, false);
-                            self.slot.terminal.setCause(.connection_closed);
-                            if (!cancelJoin(self)) {
-                                finishSlot(self);
-                                break;
-                            }
-                            reaping = true;
-                            continue;
+                            endHandler(self, .connection_closed);
+                            break;
                         }
                     }
                     if (tlsIdle(pump)) ackTlsWrite(self, true);
                 }
                 if (ingestTlsPeer(self)) {
-                    self.slot.terminal.setCause(.connection_closed);
-                    if (!cancelJoin(self)) {
-                        finishSlot(self);
-                        break;
-                    }
-                    reaping = true;
+                    endHandler(self, .connection_closed);
+                    break;
                 }
             },
             .comps => |r| {
                 _ = r catch {};
-                finishSlot(self);
+                releaseRequest(self);
                 break;
             },
             .writes => |r| {
                 const n = r catch continue;
-                driveHandlerTlsWrite(self, n);
-            },
-            .shutdown => {
-                self.slot.terminal.setCause(.server_shutdown);
-                noteShutdownCancel(self);
-                if (!cancelJoin(self)) {
-                    finishSlot(self);
+                if (!driveHandlerTlsWrite(self, n)) {
+                    endHandler(self, .connection_closed);
                     break;
                 }
-                reaping = true;
+            },
+            .shutdown => {
+                endForShutdown(self);
+                break;
             },
         }
     }
 }
 
+/// The actor's wait while a task handler runs, on h1c: the handler writes
+/// the socket itself (inside its gate); the actor keeps reading, so a
+/// pipelined request is kept and the peer's close is seen.
 fn waitDispatch(self: *H1Conn) !void {
     if (self.tls_pump != null) return waitDispatchTls(self);
-    var reaping = false;
     const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
-    while (self.slot.in_use) {
-        if (shutdownRequested(self) and !reaping) {
-            self.slot.terminal.setCause(.server_shutdown);
-            noteShutdownCancel(self);
-            if (!cancelJoin(self)) {
-                finishSlot(self);
-                break;
-            }
-            reaping = true;
-        }
-        if (reaping) {
-            _ = self.completion_ch.receive() catch return error.Canceled;
-            finishSlot(self);
+    while (self.link != null) {
+        if (shutdownRequested(self)) {
+            endForShutdown(self);
             break;
         }
         // `zio.select` over the CQ and the completion channel, the same wait the
         // TLS actor uses. Not `std.Io.Select`: that one discards results from
         // tasks that finish during cancelation, and for the completion channel
-        // that result is the handler's only token, sent once behind a cmpxchg.
-        // zio closed the equivalent hole in its own select (lalinsky/zio #700,
-        // #701, #706, all in the pinned revision), so a committed item survives
-        // a cancel here instead of needing to be reaped by hand.
+        // that result is the handler's only report. zio closed the
+        // equivalent hole in its own select (lalinsky/zio #700, #701, #706,
+        // all in the pinned revision), so a committed item survives a cancel
+        // here; a report left in the channel is found by `endHandler`.
         const winner = zio.select(.{
             .io = &self.cq,
             .comps = self.completion_ch.asyncReceive(),
@@ -1298,111 +1491,112 @@ fn waitDispatch(self: *H1Conn) !void {
                     _ = armRecv(self);
                 }
                 if (self.recv_eof) {
-                    self.slot.terminal.setCause(.connection_closed);
-                    if (!cancelJoin(self)) {
-                        finishSlot(self);
-                        break;
-                    }
-                    reaping = true;
+                    endHandler(self, .connection_closed);
+                    break;
                 }
             },
             .comps => {
-                finishSlot(self);
+                releaseRequest(self);
                 break;
             },
             .shutdown => {
-                self.slot.terminal.setCause(.server_shutdown);
-                noteShutdownCancel(self);
-                if (!cancelJoin(self)) {
-                    finishSlot(self);
-                    break;
-                }
-                reaping = true;
+                endForShutdown(self);
+                break;
             },
         }
     }
 }
 
-fn finishSlotFromTask(self: *H1Conn) void {
-    const prev = self.slot.completion_owner.cmpxchgStrong(live, reported, .acq_rel, .acquire);
-    if (prev == null) {
-        self.completion_ch.trySend(1) catch {};
-    }
-}
-
-fn finishSlot(self: *H1Conn) void {
-    if (!self.slot.in_use) return;
+/// The request ended on the ordinary path: a task handler reported (inside
+/// its gate, so it runs no handler code any more), or a complete handler
+/// returned on the actor, or the dispatch was undone. Join the task (its
+/// last instructions: the balancer and its own reference drop), drop the
+/// actor's reference, which is then the last, so the link and the request's
+/// memory go back here, with the gate open, and give the stream back.
+fn releaseRequest(self: *H1Conn) void {
+    const link = self.link orelse return;
     if (self.join) |*h| {
         h.join();
         self.join = null;
     }
-    if (self.slot.reaper_reserved) {
-        if (self.config.accounting) |a| a.releaseReaper();
-        self.slot.reaper_reserved = false;
-    }
-    self.slot.in_use = false;
-    self.reaper_has_job = false;
-    self.slot.completion_owner.store(reported, .release);
-    if (self.config.accounting) |a| a.releaseStream();
+    self.link = null;
+    connection.dropLink(H1Link, link);
+    releaseStream(self);
 }
 
-/// The connection is ending, by any path, with its slot in use: a running
-/// handler still reads and writes this connection's buffers, so it is asked
-/// to cancel and waited for here, under a shield (the path may be this task's
-/// own cancel: a canceled `serve` cancels every connection, and an unshielded
-/// wait would end at once). Then the slot gives the request's charges back.
-/// While it waits, the handler is still counted (`reaper_reserved`), so
-/// `Server.serve` keeps waiting and reports it.
-fn joinHandler(self: *H1Conn, canceled: bool) void {
-    if (!self.slot.in_use) return;
+/// The server is shutting down: this connection's cancel step
+/// (`noteShutdownCancel`), then its end.
+fn endForShutdown(self: *H1Conn) void {
+    noteShutdownCancel(self);
+    endHandler(self, .server_shutdown);
+}
+
+/// The connection ends with a request dispatched. Actor only. It does not
+/// wait for handler code, the same steps as HTTP/2's `shutdownHandlers`:
+///
+/// 1. Publish the end: the cause (the first one set wins), `dead`, the
+///    socket shut (a handler blocked in an h1c socket write fails at once),
+///    and the TLS write channels closed (a handler waiting for the actor to
+///    drive its write fails at once).
+/// 2. Close the gate, so no new call enters, and request a cancel through
+///    the join handle's awaitable, which never waits.
+/// 3. Wait for the calls already inside the gate. Bounded by starh2 code:
+///    step 1 woke every wait a call can be in.
+/// 4. Give the connection its request bytes back
+///    (`LinkCore.returnConnCharges`). A handler whose report is in the
+///    channel is done with handler code: join it. One that did not report
+///    is orphaned (`LinkCore.orphan`): its join handle is detached, its link
+///    keeps the server-wide token and the orphan count, and `Server.serve`
+///    waits for it. Either way the actor drops its reference.
+///
+/// The connection must end after this: `dead` is set for good, the socket is
+/// shut, and the channels are closed. `want_close` says so to the loop.
+fn endHandler(self: *H1Conn, cause: response.TerminalCause) void {
+    const link = self.link orelse return;
     zio.beginShield();
     defer zio.endShield();
-    if (self.slot.terminal.getCause() == null) self.slot.terminal.setCause(.server_shutdown);
-    // A cancel of this task is the server's (shutdown or a canceled
-    // `serve`): this is the connection's cancel step, counted for the report.
-    if (canceled or shutdownRequested(self)) noteShutdownCancel(self);
-    // Either this asks the reaper now, or an earlier step did (a shutdown or
-    // the peer's close, then this task's cancel came during that wait): the
-    // reaper posts the completion, and this waits for the post itself. The
-    // owner byte cannot say so: the reaper claims `reported` before it posts
-    // (astra 1, round 3).
-    const reaper_holds = cancelJoin(self) or self.reaper_has_job;
-    if (!reaper_holds) {
-        finishSlot(self);
-        return;
+    link.core.terminal.setCause(cause);
+    self.dead.set();
+    if (!self.socket_closed) self.stream.shutdown(self.io, .both) catch {};
+    if (self.tls_pump != null) {
+        self.tls_req_ch.close(.immediate);
+        self.tls_ok_ch.close(.immediate);
     }
-    while (self.slot.in_use) {
-        // Shielded: no cancel is delivered, and nothing closes this channel.
-        _ = self.completion_ch.receive() catch |err| std.debug.panic("h1: the handler's completion channel failed while the connection waited for it: {s}", .{@errorName(err)});
-        finishSlot(self);
+    link.core.gate.close();
+    if (self.join) |h| {
+        if (h.awaitable) |aw| aw.cancel();
     }
+    link.core.gate.waitDrained();
+    link.core.returnConnCharges(&self.request_budget);
+    // A complete handler ran on this task and is done; a task handler is
+    // done with handler code only if its report is in.
+    const reported = if (self.join == null) true else blk: {
+        _ = self.completion_ch.tryReceive() catch break :blk false;
+        break :blk true;
+    };
+    if (self.join) |*h| {
+        if (reported) h.join() else h.detach();
+        self.join = null;
+    }
+    if (!reported) link.core.orphan();
+    // After the drain: a call inside the gate may write it too.
+    self.want_close = true;
+    self.link = null;
+    connection.dropLink(H1Link, link);
+    releaseStream(self);
 }
 
-fn cancelJoin(self: *H1Conn) bool {
-    if (self.join) |handle| {
-        const prev = self.slot.completion_owner.cmpxchgStrong(live, reaper_owned, .acq_rel, .acquire);
-        if (prev == null) {
-            self.join = null;
-            if (self.config.reaper) |pool| {
-                const queued = io_queue.tryPut(connection.ReaperJob, &pool.jobs, self.io, .{
-                    .handle = handle,
-                    .owner = &self.slot.completion_owner,
-                    .completion = &self.completion_ch,
-                    .stream_id = 1,
-                    .post_ok = &h1_reaper_post_ok,
-                });
-                if (queued) {
-                    self.reaper_has_job = true;
-                    return true;
-                }
-            }
-            var h = handle;
-            h.cancel();
-            self.slot.completion_owner.store(reported, .release);
-            return false;
-        }
+/// `serve` is leaving, by any path, with a request maybe still dispatched:
+/// the end of its loop, an error, or this task's own cancel (a canceled
+/// `serve` cancels every connection). A cancel of this task is the
+/// server's, so it is this connection's cancel step.
+fn endOnExit(self: *H1Conn, canceled: bool) void {
+    if (self.link == null) return;
+    if (canceled or shutdownRequested(self)) {
+        endForShutdown(self);
+        return;
     }
-    return false;
+    endHandler(self, .connection_closed);
 }
 
 /// The server's shutdown reached this connection's cancel step: count it
@@ -1412,23 +1606,8 @@ fn noteShutdownCancel(self: *H1Conn) void {
     if (self.shutdown_cancel_counted) return;
     self.shutdown_cancel_counted = true;
     if (self.config.accounting) |a| {
-        if (self.slot.in_use) _ = a.shutdown_cancel_asked.fetchAdd(1, .acq_rel);
+        if (self.join != null) _ = a.shutdown_cancel_asked.fetchAdd(1, .acq_rel);
         _ = a.shutdown_cancelled.fetchAdd(1, .acq_rel);
-    }
-}
-
-fn shutdownHandlers(self: *H1Conn) !void {
-    if (!self.slot.in_use) return;
-    self.slot.terminal.setCause(.server_shutdown);
-    noteShutdownCancel(self);
-    if (!cancelJoin(self)) {
-        finishSlot(self);
-        return;
-    }
-    while (self.slot.in_use) {
-        const sid = self.completion_ch.receive() catch return error.Canceled;
-        _ = sid;
-        finishSlot(self);
     }
 }
 
@@ -1442,23 +1621,27 @@ fn headerLineOk(name: []const u8, value: []const u8) bool {
     return true;
 }
 
+// Every callback below enters the connection only through the link's gate,
+// and fails with the cause once the gate is closed (`LinkCore.closedError`).
+
 fn sendCb(ctx: *anyopaque, _: u31, status: u16, headers: []const request.Header, body: []const u8) response.ResponseError!void {
-    const h: *Hctx = @ptrCast(@alignCast(ctx));
-    const self = h.conn;
+    const link = H1Link.fromCtx(ctx);
+    const self = link.enter() orelse return link.core.closedError();
+    defer link.exit();
     if (self.committed) return error.ResponseCommitted;
     for (headers) |hdr| {
         if (!headerLineOk(hdr.name, hdr.value)) return error.InvalidHeader;
     }
     self.committed = true;
     self.resp_status = status;
-    self.no_payload = suppressPayload(h.method, status);
+    self.no_payload = suppressPayload(link.method, status);
     if (self.head.version == .http10) {
         self.framing = .close_delimited;
         self.want_close = true;
     } else {
         self.framing = .content_length;
     }
-    const cl: usize = if (h.method == .HEAD) body.len else if (self.no_payload) 0 else body.len;
+    const cl: usize = if (link.method == .HEAD) body.len else if (self.no_payload) 0 else body.len;
     try writeStatus(self, status);
     try writeCommonHeaders(self, headers, self.framing, cl);
     try writeRaw(self, "\r\n");
@@ -1468,15 +1651,16 @@ fn sendCb(ctx: *anyopaque, _: u31, status: u16, headers: []const request.Header,
 }
 
 fn startCb(ctx: *anyopaque, _: u31, status: u16, headers: []const request.Header, sse: bool) response.ResponseError!void {
-    const h: *Hctx = @ptrCast(@alignCast(ctx));
-    const self = h.conn;
+    const link = H1Link.fromCtx(ctx);
+    const self = link.enter() orelse return link.core.closedError();
+    defer link.exit();
     if (self.committed) return error.ResponseCommitted;
     for (headers) |hdr| {
         if (!headerLineOk(hdr.name, hdr.value)) return error.InvalidHeader;
     }
     self.committed = true;
     self.resp_status = status;
-    self.no_payload = suppressPayload(h.method, status);
+    self.no_payload = suppressPayload(link.method, status);
     if (sse) self.occupies = true;
     if (self.no_payload) {
         self.framing = .content_length;
@@ -1500,8 +1684,9 @@ fn startCb(ctx: *anyopaque, _: u31, status: u16, headers: []const request.Header
 }
 
 fn writeCb(ctx: *anyopaque, _: u31, bytes: []const u8, end: bool, wait: bool, emit: bool) response.ResponseError!void {
-    const h: *Hctx = @ptrCast(@alignCast(ctx));
-    const self = h.conn;
+    const link = H1Link.fromCtx(ctx);
+    const self = link.enter() orelse return link.core.closedError();
+    defer link.exit();
     _ = wait;
     if (self.no_payload) {
         if (end) {
@@ -1519,32 +1704,47 @@ fn writeCb(ctx: *anyopaque, _: u31, bytes: []const u8, end: bool, wait: bool, em
 }
 
 fn flushCb(ctx: *anyopaque, _: u31) response.ResponseError!void {
-    const h: *Hctx = @ptrCast(@alignCast(ctx));
-    const self = h.conn;
+    const link = H1Link.fromCtx(ctx);
+    const self = link.enter() orelse return link.core.closedError();
+    defer link.exit();
     if (test_channel_mutation == .m6_buffer_sse and self.occupies) return;
     try emitPending(self);
     try flushSink(self);
 }
 
 fn abortCb(ctx: *anyopaque, _: u31) response.ResponseError!void {
-    const h: *Hctx = @ptrCast(@alignCast(ctx));
-    h.conn.want_close = true;
+    const link = H1Link.fromCtx(ctx);
+    const self = link.enter() orelse return link.core.closedError();
+    defer link.exit();
+    self.want_close = true;
 }
 
 /// Sleeps to the deadline rounded up by `Limits.handler_deadline_slack_ns`,
 /// the same rule as the HTTP/2 path. A handler already past its own deadline
-/// returns at once.
+/// returns at once. The wait is inside the gate, so it also wakes on the
+/// connection's end (`dead`), as HTTP/2's does.
 fn waitUntilCb(ctx: *anyopaque, _: u31, deadline: std.Io.Timestamp) response.ResponseError!void {
-    const h: *Hctx = @ptrCast(@alignCast(ctx));
-    if (h.terminal.getCause()) |c| return response.causeToError(c);
+    const link = H1Link.fromCtx(ctx);
+    const self = link.enter() orelse return link.core.closedError();
+    defer link.exit();
+    const t = &link.core.terminal;
+    if (t.getCause()) |c| return response.causeToError(c);
     const deadline_ns = connection.handlerDeadlineNs(deadline);
-    if (nowNs(h.conn.io) >= deadline_ns) return;
-    const armed: std.Io.Timestamp = .fromNanoseconds(h.conn.config.limits.handlerDeadlineNs(deadline_ns));
-    const timeout: std.Io.Timeout = .{ .deadline = .{ .raw = armed, .clock = .awake } };
-    timeout.sleep(h.conn.io) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
+    if (nowNs(self.io) >= deadline_ns) return;
+    const armed_ns = self.config.limits.handlerDeadlineNs(deadline_ns);
+    const winner = zio.select(.{
+        .dead = &self.dead,
+        .timer = zio.Timeout{ .deadline = .fromNanoseconds(armed_ns) },
+    }) catch |err| switch (err) {
+        error.Canceled => {
+            if (t.getCause()) |c| return response.causeToError(c);
+            return error.Canceled;
+        },
     };
-    if (h.terminal.getCause()) |c| return response.causeToError(c);
+    switch (winner) {
+        .dead, .timer => {},
+    }
+    if (t.getCause()) |c| return response.causeToError(c);
 }
 
 fn appendPending(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
@@ -1671,25 +1871,34 @@ fn noteWriteFailed(self: *H1Conn) response.ResponseError {
         self.stream.shutdown(self.io, .both) catch {};
         return error.SlowConsumer;
     }
-    return error.WriteFailed;
+    // The connection ended under a handler's write (`endHandler` shut the
+    // socket): the handler is told why.
+    return writeFailedCause(self);
 }
 
 /// A handler write the connection failed: the connection's cause, when it
 /// set one (the write-byte timeout's `SlowConsumer`), else `WriteFailed`.
 fn writeFailedCause(self: *H1Conn) response.ResponseError {
-    if (self.slot.terminal.getCause()) |c| return response.causeToError(c);
+    if (self.link) |l| {
+        if (l.core.terminal.getCause()) |c| return response.causeToError(c);
+    }
     return error.WriteFailed;
 }
 
 /// HTTP/1.1 connections shut by the write-byte timeout, process-wide.
 pub var write_byte_expiries: std.atomic.Value(u64) = .init(0);
 
+/// On TLS only the actor drives the pump. The path is chosen by which task
+/// calls, not by a flag the actor sets and clears: a task handler's write,
+/// even one still inside the gate while teardown runs, always goes to the
+/// actor (`writeRawTlsFromHandler`); the actor's own writes (a complete
+/// handler, `writeError`) drive the pump (`writeRawTlsOwner`).
 fn writeRaw(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
     if (self.tls != null) {
-        if (self.offload_tls_io) {
-            try writeRawTlsFromHandler(self, bytes);
-        } else {
+        if (onActor(self)) {
             try writeRawTlsOwner(self, bytes);
+        } else {
+            try writeRawTlsFromHandler(self, bytes);
         }
         return;
     }
@@ -1701,7 +1910,9 @@ fn writeRawTlsFromHandler(self: *H1Conn, bytes: []const u8) response.ResponseErr
     while (off < bytes.len) {
         const n = @min(bytes.len - off, self.tls_out.len);
         @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
-        self.tls_req_ch.send(@intCast(n)) catch return error.WriteFailed;
+        // Teardown closes this channel too (`endHandler`): a handler that got
+        // the ack for one chunk meets it closed at the next.
+        self.tls_req_ch.send(@intCast(n)) catch return writeFailedCause(self);
         const ok = self.tls_ok_ch.receive() catch return writeFailedCause(self);
         if (!ok) return writeFailedCause(self);
         off += n;
@@ -1721,7 +1932,7 @@ fn writeRawTlsOwner(self: *H1Conn, bytes: []const u8) response.ResponseError!voi
             .pool_index = idx,
         };
         pump.stampPush(&chunk);
-        if (!pump.writeChunks(chunk)) return error.WriteFailed;
+        if (!pump.writeChunks(chunk)) return tlsPumpEnded(self);
         try driveTlsUntilIdle(self);
         off += n;
     }
@@ -1729,9 +1940,98 @@ fn writeRawTlsOwner(self: *H1Conn, bytes: []const u8) response.ResponseError!voi
 
 fn flushSink(self: *H1Conn) response.ResponseError!void {
     if (self.tls != null) {
-        if (self.offload_tls_io) return;
+        // A handler's chunks are driven by the actor, ack by ack.
+        if (!onActor(self)) return;
         try driveTlsUntilIdle(self);
         return;
     }
     self.writer.interface.flush() catch return noteWriteFailed(self);
+}
+
+test "an HTTP/1.1 call after its link's gate closed fails without touching the connection (t-3759)" {
+    // The connection pointer is poison: a call that enters the connection
+    // anyway faults here. No cause is set, which is the window the gate
+    // exists for: `Response` checks the cause first, so only the gate stands
+    // between a call that raced teardown and freed memory.
+    var link: H1Link = .{
+        .core = .{ .arena = undefined },
+        .conn = @ptrFromInt(0xdead0000),
+        .method = .GET,
+        .req = undefined,
+        .resp = undefined,
+    };
+    link.core.gate.close();
+    const ctx: *anyopaque = &link;
+    try std.testing.expectError(error.ConnectionClosed, writeCb(ctx, 1, "late", false, true, true));
+    try std.testing.expectError(error.ConnectionClosed, sendCb(ctx, 1, 200, &.{}, "late"));
+    try std.testing.expectError(error.ConnectionClosed, startCb(ctx, 1, 200, &.{}, true));
+    try std.testing.expectError(error.ConnectionClosed, flushCb(ctx, 1));
+    try std.testing.expectError(error.ConnectionClosed, abortCb(ctx, 1));
+    try std.testing.expectError(error.ConnectionClosed, waitUntilCb(ctx, 1, .{ .nanoseconds = 0 }));
+    // A cause set before the close is the error the call gets.
+    link.core.terminal.setCause(.slow_consumer);
+    try std.testing.expectError(error.SlowConsumer, writeCb(ctx, 1, "late", false, true, true));
+    try std.testing.expectEqual(@as(u32, 0), link.core.gate.inside());
+}
+
+test "a TLS handler write that meets the closed request channel fails with the cause (t-3759 round 1)" {
+    // Teardown (`endHandler`) closes `tls_req_ch` and `tls_ok_ch`. A handler
+    // that got the ack for one chunk of a write meets the request channel
+    // closed at the next one, and must be told why, like one that was
+    // waiting for an ack. Only the fields `writeRawTlsFromHandler` and
+    // `writeFailedCause` read are set.
+    var conn: H1Conn = undefined;
+    var out: [64]u8 = undefined;
+    var req_buf: [1]u32 = undefined;
+    var ok_buf: [1]bool = undefined;
+    conn.tls_out = &out;
+    conn.tls_req_ch = .init(&req_buf);
+    conn.tls_ok_ch = .init(&ok_buf);
+    var link: H1Link = .{
+        .core = .{ .arena = undefined },
+        .conn = &conn,
+        .method = .GET,
+        .req = undefined,
+        .resp = undefined,
+    };
+    conn.link = &link;
+    link.core.terminal.setCause(.server_shutdown);
+    conn.tls_req_ch.close(.immediate);
+    conn.tls_ok_ch.close(.immediate);
+    try std.testing.expectError(error.ConnectionClosed, writeRawTlsFromHandler(&conn, "a chunk"));
+}
+
+test "a write from a task that is not the actor never takes the actor's TLS path (t-3759 round 2)" {
+    // On TLS only the actor drives the pump (`writeRawTlsOwner`,
+    // `driveTlsUntilIdle`); a task handler hands its chunks to the actor.
+    // The first version chose by a flag the actor cleared when its wait for
+    // the handler was cancelled, before teardown had closed and drained the
+    // gate, so a handler still inside could take the actor's path from its
+    // own task. Here the flag (where it exists) is in that state, the caller
+    // is not the actor (a unit test runs on no zio task), and teardown has
+    // closed the channels: the write must go the handler's way and fail with
+    // the cause, never touch the pump (there is none: a dangling `tls`, no
+    // `tls_pump`).
+    var conn: H1Conn = undefined;
+    if (@hasField(H1Conn, "offload_tls_io")) @field(conn, "offload_tls_io") = false;
+    conn.tls = @ptrFromInt(0x10000);
+    conn.tls_pump = null;
+    var out: [64]u8 = undefined;
+    var req_buf: [1]u32 = undefined;
+    var ok_buf: [1]bool = undefined;
+    conn.tls_out = &out;
+    conn.tls_req_ch = .init(&req_buf);
+    conn.tls_ok_ch = .init(&ok_buf);
+    var link: H1Link = .{
+        .core = .{ .arena = undefined },
+        .conn = &conn,
+        .method = .GET,
+        .req = undefined,
+        .resp = undefined,
+    };
+    conn.link = &link;
+    link.core.terminal.setCause(.server_shutdown);
+    conn.tls_req_ch.close(.immediate);
+    conn.tls_ok_ch.close(.immediate);
+    try std.testing.expectError(error.ConnectionClosed, writeRaw(&conn, "a chunk"));
 }

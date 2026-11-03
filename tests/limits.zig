@@ -62,7 +62,6 @@ test "bound terms use concrete sizes and capacities" {
     try std.testing.expect(b.terms.slot_boot > 0);
     try std.testing.expect(b.terms.on_demand_conn > 0);
     try std.testing.expect(b.terms.on_demand_server > 0);
-    try std.testing.expect(b.terms.reaper_jobs > 0);
     // Every slot object and the pool's two lists are in the bound, not only
     // the boot buffer each slot owns.
     try std.testing.expect(b.terms.conn_slots >= lim.max_connections * @sizeOf(starh2.edge.conn_slot.ConnSlot));
@@ -87,7 +86,7 @@ test "bound terms use concrete sizes and capacities" {
     var tiny_streams = lim;
     tiny_streams.max_streams_per_connection = 1;
     tiny_streams.max_streams_per_server = 64;
-    tiny_streams.cancellation_reaper_jobs = 64;
+    tiny_streams.max_task_handlers = 64;
     const b3 = try tiny_streams.resourceUpperBound();
     try std.testing.expect(b.terms.slot_boot > b3.terms.slot_boot);
 
@@ -96,8 +95,6 @@ test "bound terms use concrete sizes and capacities" {
     no_tls.tls_handshake_scratch_bytes = 1024;
     const b4 = try no_tls.resourceUpperBound();
     try std.testing.expect(b.terms.tls_scratch > b4.terms.tls_scratch);
-
-    try std.testing.expectEqual(@sizeOf(starh2.edge.connection.ReaperJob), starh2.core.limits.REAPER_JOB_SIZE);
 }
 
 test "counting allocator: Server.init under published ceiling" {
@@ -105,8 +102,7 @@ test "counting allocator: Server.init under published ceiling" {
         .max_connections = 2,
         .max_streams_per_connection = 4,
         .max_streams_per_server = 8,
-        .cancellation_reaper_jobs = 8,
-        .cancellation_reaper_tasks = 2,
+        .max_task_handlers = 8,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
         // The write pool (3 chunks) and one stream's cap must fit the budget.
@@ -167,8 +163,7 @@ test "fail-index iteration: Server.init fails closed" {
         .max_connections = 1,
         .max_streams_per_connection = 2,
         .max_streams_per_server = 4,
-        .cancellation_reaper_jobs = 4,
-        .cancellation_reaper_tasks = 1,
+        .max_task_handlers = 4,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 1024,
         .outbound_bytes_per_connection = 64 * 1024,
@@ -236,8 +231,7 @@ test "counting allocator peak under live hello stays under ceiling" {
         .max_connections = 2,
         .max_streams_per_connection = 4,
         .max_streams_per_server = 8,
-        .cancellation_reaper_jobs = 8,
-        .cancellation_reaper_tasks = 2,
+        .max_task_handlers = 8,
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 4 * 1024,
         // The write pool (3 chunks) and one stream's cap must fit the budget.

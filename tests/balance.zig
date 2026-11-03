@@ -126,9 +126,8 @@ fn testRuntime(gpa: std.mem.Allocator, executors: u8) !*zio.Runtime {
 
 /// The handler outlives its cancellation until a releaser posts it
 /// `hold_ms` after shutdown starts. That matters because the drain
-/// busy-spins the actor (t-2652) and stalls every task on its executor,
-/// including the reaper workers `serve` waits for last, so a connection that
-/// ends with the drain holds `serve` up by accident. `target` pre-loads the
+/// busy-spins the actor (t-2652) and stalls every task on its executor, so a
+/// connection that ends with the drain holds `serve` up by accident. `target` pre-loads the
 /// connection counts of executors below it, so the balanced connection lands
 /// on executor `target`; every placement runs.
 fn runShutdownWaits(rt: *zio.Runtime, gpa: std.mem.Allocator, balance: bool, target: u8) !usize {

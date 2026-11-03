@@ -1074,7 +1074,7 @@ fn runAbortMidUpload(
         io.sleep(.fromMilliseconds(20), .awake) catch {};
     }
     try std.testing.expectEqual(@as(usize, 0), acct.active_streams.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), acct.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), acct.task_handlers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), peak);
 }
 

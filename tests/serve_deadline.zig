@@ -36,7 +36,7 @@ pub fn joinWithin(server: anytype, handle: anytype, timeout_ns: u64) void {
         if (now() - start >= timeout_ns) {
             std.debug.panic("serve did not return {d} ms after shutdown: {d} task handlers ({d} orphaned), {d} connections, {d} streams still counted; {d} shutdown reports written", .{
                 timeout_ns / std.time.ns_per_ms,
-                s.accounting.reaper_reserved.load(.acquire),
+                s.accounting.task_handlers.load(.acquire),
                 s.accounting.orphaned_handlers.load(.acquire),
                 s.active_connections.load(.acquire),
                 s.accounting.active_streams.load(.acquire),

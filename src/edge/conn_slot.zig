@@ -16,7 +16,7 @@
 //! 2. TLS only: `createTlsConn` takes the `Conn` first, at offset 0.
 //! 3. `serveAccepted` calls `Connection.init` into `slot.conn` (state
 //!    `booted`), runs it, and `quiesce`s it: the connection gives back
-//!    everything it borrowed from the server (streams, slabs, reaper tokens,
+//!    everything it borrowed from the server (streams, slabs, task tokens,
 //!    the socket) but frees none of its own boot memory.
 //! 4. `connEntry` calls `recycle`, which checks the slot is clean, rewinds the
 //!    buffer, and `SlotPool.put` pushes it. Only then does it release the

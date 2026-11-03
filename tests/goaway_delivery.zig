@@ -10,6 +10,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
+const wire_client = @import("wire_client.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 const tls = @import("tls");
@@ -116,6 +117,11 @@ const Wire = struct {
     /// `rcvbuf` shrinks the kernel receive buffer before connecting, so a
     /// client that stops reading stalls the server after a few KiB.
     fn open(gpa: std.mem.Allocator, transport: Transport, port: u16, rcvbuf: ?c_int) !*Wire {
+        return openAlpn(gpa, transport, port, rcvbuf, "h2");
+    }
+
+    /// `open`, offering `alpn` on TLS (`http/1.1` for an HTTP/1.1 client).
+    fn openAlpn(gpa: std.mem.Allocator, transport: Transport, port: u16, rcvbuf: ?c_int, alpn: []const u8) !*Wire {
         const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
         if (fd < 0) return error.Socket;
         errdefer _ = std.c.close(fd);
@@ -131,7 +137,7 @@ const Wire = struct {
         const self = try gpa.create(Wire);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .transport = transport, .fd = fd };
-        if (transport == .tls) try self.handshake();
+        if (transport == .tls) try self.handshake(alpn);
         return self;
     }
 
@@ -141,7 +147,7 @@ const Wire = struct {
         self.gpa.destroy(self);
     }
 
-    fn handshake(self: *Wire) !void {
+    fn handshake(self: *Wire, want_alpn: []const u8) !void {
         var prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(@as(i128, realNow().nanoseconds)))));
         var hs = tls.nonblock.Client.init(.{
             .rng = prng.random(),
@@ -150,7 +156,7 @@ const Wire = struct {
             .root_ca = .empty,
             .insecure_skip_verify = true,
             .cipher_suites = tls.config.cipher_suites.tls13,
-            .alpn_protocols = &.{"h2"},
+            .alpn_protocols = &.{want_alpn},
         });
         while (!hs.done()) {
             const r = try hs.run(self.in[0..self.in_len], &self.out);
@@ -160,7 +166,7 @@ const Wire = struct {
             if (r.recv_pos == 0 and r.send.len == 0) try self.fill();
         }
         const alpn = hs.inner.alpn_protocol orelse return error.Alpn;
-        if (!std.mem.eql(u8, alpn, "h2")) return error.Alpn;
+        if (!std.mem.eql(u8, alpn, want_alpn)) return error.Alpn;
         self.conn = .init(hs.cipher().?);
     }
 
@@ -1811,4 +1817,1085 @@ test "outlive: h2c a handler that swallows cancel does not hold its connection (
 }
 test "outlive: tls a handler that swallows cancel does not hold its connection (t-3737)" {
     try outliveCase(.tls, .ignores_cancel);
+}
+
+// ---------------------------------------------------------------------------
+// An HTTP/1.1 handler that outlives its connection (t-3759 step 7)
+//
+// The HTTP/1.1 form of the `outlive:` tests above. On h1c and on HTTP/1.1
+// over TLS, a handler that honours cancel, a shielded one and one that
+// swallows `error.Canceled` hold for `outlive_hold_ms`. At the peer's close,
+// or at the server's shutdown, the connection (and, on TLS, its slot) must be
+// gone within 3 s while the handler still runs; the handler's late write
+// must fail with the cause; the request it reads after its connection ended
+// must be intact (the connection poisons its buffers when it ends, in safe
+// builds, so a request field left pointing into them reads garbage); `serve`
+// must not return until the handler ends; and a second client is served
+// while the handler runs.
+// ---------------------------------------------------------------------------
+
+const H1Transport = enum { h1c, tls };
+const H1Trigger = enum { peer_close, shutdown };
+
+const h1o_path = "/h1outlive";
+const h1o_query = "probe=query-value-0123";
+const h1o_header_value = "probe-header-value-abcdefghij";
+const h1o_body = "probe-body-0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// The HTTP/1.1 modes: `OutliveMode`'s three, and a shielded handler parked
+/// inside the response's own `waitUntil`, inside the gate, when its
+/// connection ends (round 1 of the step-7 review). Teardown must wake it
+/// (`dead`), or the gate drain waits for its deadline.
+const H1OutliveMode = enum { honours_cancel, shielded, ignores_cancel, waits_shielded };
+
+var h1o_mode: H1OutliveMode = .honours_cancel;
+/// `waits_shielded`: what the `waitUntil` returned (0 not called, 1 ok at its
+/// deadline, 2 `ConnectionClosed`, 3 another error), and when, from the
+/// handler's start.
+var h1o_wait: std.atomic.Value(u8) = .init(0);
+var h1o_wait_ms: std.atomic.Value(u64) = .init(0);
+var h1o_hold_ms: u64 = outlive_hold_ms;
+var h1o_started: std.atomic.Value(bool) = .init(false);
+var h1o_done: std.atomic.Value(bool) = .init(false);
+/// The late write: 0 not tried, 1 succeeded, 2 failed.
+var h1o_late: std.atomic.Value(u8) = .init(0);
+var h1o_late_closed: std.atomic.Value(bool) = .init(false);
+/// The cause the late write saw: 0 none, else 1 + the `TerminalCause` tag.
+var h1o_late_cause: std.atomic.Value(u8) = .init(0);
+/// The request read after the hold: 0 not read, 1 intact, 2 not.
+var h1o_request: std.atomic.Value(u8) = .init(0);
+
+fn h1CauseCode(c: starh2.TerminalCause) u8 {
+    return 1 + @as(u8, @intFromEnum(std.meta.activeTag(c)));
+}
+
+fn h1RequestIntact(req: *const starh2.Request) bool {
+    if (!std.mem.eql(u8, req.path, h1o_path)) return false;
+    if (!std.mem.endsWith(u8, req.query, h1o_query)) return false;
+    if (!std.mem.eql(u8, req.body, h1o_body)) return false;
+    if (!std.mem.eql(u8, req.authority, "localhost")) return false;
+    for (req.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-probe") and std.mem.eql(u8, h.value, h1o_header_value)) return true;
+    }
+    return false;
+}
+
+fn h1OutliveHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    defer h1o_done.store(true, .release);
+    var body = try resp.startSse(&.{});
+    try body.writeAll("data: hi\n\n");
+    // On h1c an SSE write stays in the connection's socket buffer until a
+    // flush (t-3784); the client waits for this event.
+    try body.flush();
+    h1o_started.store(true, .release);
+    const t0 = nowNs();
+    switch (h1o_mode) {
+        .honours_cancel => try zio.sleep(.fromMilliseconds(h1o_hold_ms)),
+        .shielded => {
+            zio.beginShield();
+            defer zio.endShield();
+            zio.sleep(.fromMilliseconds(h1o_hold_ms)) catch {};
+        },
+        .ignores_cancel => while (nowNs() < t0 + h1o_hold_ms * std.time.ns_per_ms) {
+            zio.sleep(.fromMilliseconds(20)) catch {};
+        },
+        .waits_shielded => {
+            zio.beginShield();
+            defer zio.endShield();
+            const now = std.Io.Clock.awake.now(resp.io).nanoseconds;
+            const deadline: std.Io.Timestamp = .{ .nanoseconds = now + @as(i96, h1o_hold_ms) * std.time.ns_per_ms };
+            const code: u8 = if (body.waitUntil(deadline)) |_| 1 else |err| if (err == error.ConnectionClosed) 2 else 3;
+            h1o_wait_ms.store((nowNs() - t0) / std.time.ns_per_ms, .release);
+            h1o_wait.store(code, .release);
+            // Then hold, as the shielded mode, so the connection ended first.
+            while (nowNs() < t0 + h1o_hold_ms * std.time.ns_per_ms) zio.sleep(.fromMilliseconds(20)) catch {};
+        },
+    }
+    // The connection ended (and poisoned its buffers) a while ago.
+    h1o_request.store(if (h1RequestIntact(req)) 1 else 2, .release);
+    if (body.writeAll("data: late\n\n")) |_| {
+        h1o_late.store(1, .release);
+    } else |err| {
+        h1o_late_closed.store(err == error.ConnectionClosed, .release);
+        const cause: u8 = if (body.terminalCause()) |c| h1CauseCode(c) else 0;
+        h1o_late_cause.store(cause, .release);
+        h1o_late.store(2, .release);
+    }
+}
+
+fn h1OkHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    try resp.send(200, &.{}, "ok");
+}
+
+fn h1WireTransport(t: H1Transport) Transport {
+    return switch (t) {
+        .h1c => .h2c,
+        .tls => .tls,
+    };
+}
+
+fn h1ReadUntil(w: *Wire, needle: []const u8, deadline: u64) !void {
+    while (std.mem.indexOf(u8, w.plain.items, needle) == null) {
+        if (nowNs() >= deadline) return error.Deadline;
+        const more = w.pump() catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => {
+                std.debug.print("h1 client: {s} after {d} bytes, waiting for \"{s}\": {s}\n", .{ @errorName(err), w.plain.items.len, needle, w.plain.items[0..@min(w.plain.items.len, 200)] });
+                return err;
+            },
+        };
+        if (!more) {
+            std.debug.print("h1 client: closed after {d} bytes, waiting for \"{s}\": {s}\n", .{ w.plain.items.len, needle, w.plain.items[0..@min(w.plain.items.len, 200)] });
+            return error.ClosedBeforeExpected;
+        }
+    }
+}
+
+/// The attacker: asks for the outliving handler, reads its first event,
+/// then holds the socket open and reads nothing until released, and closes.
+/// Runs on a thread of its own: its socket calls block.
+const H1OutliveClient = struct {
+    port: u16,
+    transport: H1Transport,
+    trigger: H1Trigger,
+    err: ?anyerror = null,
+    ready: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn main(c: *H1OutliveClient) void {
+        c.run() catch |err| {
+            c.err = err;
+        };
+        c.ready.store(true, .release);
+        c.done.store(true, .release);
+    }
+
+    fn run(c: *H1OutliveClient) !void {
+        const gpa = std.heap.page_allocator;
+        const w = try Wire.openAlpn(gpa, h1WireTransport(c.transport), c.port, null, "http/1.1");
+        defer w.close();
+        var buf: [512]u8 = undefined;
+        const req = try std.fmt.bufPrint(&buf, "POST {s}?{s} HTTP/1.1\r\nHost: localhost\r\nx-probe: {s}\r\ncontent-length: {d}\r\n\r\n{s}", .{ h1o_path, h1o_query, h1o_header_value, h1o_body.len, h1o_body });
+        try w.send(req);
+        try h1ReadUntil(w, "data: hi", nowNs() + client_deadline_ns);
+        c.ready.store(true, .release);
+        // Closed (`peer_close`) or let go (`shutdown`) when the test says, so
+        // the handler's first event has been acknowledged to it first.
+        while (!c.release.load(.acquire)) {
+            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&t, null);
+        }
+    }
+};
+
+/// A well-behaved client: one `GET /ok`, on a thread of its own.
+const H1OkClient = struct {
+    port: u16,
+    transport: H1Transport,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn main(c: *H1OkClient) void {
+        c.run() catch |err| {
+            c.err = err;
+        };
+        c.done.store(true, .release);
+    }
+
+    fn run(c: *H1OkClient) !void {
+        const gpa = std.heap.page_allocator;
+        const w = try Wire.openAlpn(gpa, h1WireTransport(c.transport), c.port, null, "http/1.1");
+        defer w.close();
+        try w.send("GET /ok HTTP/1.1\r\nHost: localhost\r\nconnection: close\r\n\r\n");
+        try h1ReadUntil(w, "\r\n\r\nok", nowNs() + client_deadline_ns);
+        if (!std.mem.startsWith(u8, w.plain.items, "HTTP/1.1 200")) return error.NotOk;
+    }
+};
+
+/// Serve one `GET /ok` from a second client, and fail if it is not served.
+fn h1ServedOk(port: u16, transport: H1Transport) !void {
+    var c: H1OkClient = .{ .port = port, .transport = transport };
+    const t = try std.Thread.spawn(.{}, H1OkClient.main, .{&c});
+    while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+    t.join();
+    if (c.err) |err| return err;
+}
+
+fn runH1Outlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: H1Transport, trigger: H1Trigger) !void {
+    const io = rt.io();
+    const routes = [_]starh2.Route{
+        .{ .method = .POST, .path = h1o_path, .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1OutliveHandler } } },
+        .{ .method = .GET, .path = "/ok", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = h1OkHandler } } },
+    };
+    var cert_pem: []u8 = &.{};
+    var key_pem: []u8 = &.{};
+    defer {
+        gpa.free(cert_pem);
+        gpa.free(key_pem);
+    }
+    var endpoint: starh2.EndpointConfig = undefined;
+    var tls_cfg: ?starh2.TlsConfig = null;
+    switch (transport) {
+        .h1c => endpoint = .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .tls => {
+            cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+            key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
+        },
+    }
+    var server = try starh2.Server.init(gpa, io, .{ .endpoints = &.{endpoint}, .routes = &routes, .tls = tls_cfg, .limits = starh2.Limits.defaults });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var client: H1OutliveClient = .{ .port = 0, .transport = transport, .trigger = trigger };
+    var client_thread: ?std.Thread = null;
+    defer {
+        server.requestShutdown();
+        client.release.store(true, .release);
+        if (client_thread) |t| t.join();
+        serve_deadline.join(&server, &serve_handle);
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+    client.port = port;
+    const t0 = nowNs();
+    client_thread = try std.Thread.spawn(.{}, H1OutliveClient.main, .{&client});
+    while (!client.ready.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+    if (client.err) |err| return err;
+    // The client can read the first event before the handler's write
+    // returns (TLS acks it after the record went out).
+    while (!h1o_started.load(.acquire)) {
+        if (nowNs() >= t0 + 5 * std.time.ns_per_s) return error.HandlerNeverStarted;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+
+    // A second client is served while the handler runs.
+    try h1ServedOk(port, transport);
+
+    const t_trigger = nowNs();
+    switch (trigger) {
+        .peer_close => {
+            client.release.store(true, .release);
+            while (!client.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+            if (client.err) |err| return err;
+        },
+        .shutdown => server.requestShutdown(),
+    }
+    // The connection ends, and gives its slot back, without waiting for the
+    // handler.
+    while (server.active_connections.load(.acquire) != 0) {
+        if (nowNs() >= t_trigger + 3 * std.time.ns_per_s) return error.ConnectionWaitedForHandler;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    const gone_ms = (nowNs() - t_trigger) / std.time.ns_per_ms;
+    const done_at_gone = h1o_done.load(.acquire);
+    const orphans_at_gone = server.accounting.orphaned_handlers.load(.acquire);
+    const slots = server.slots.snapshot();
+    std.debug.print("h1 outlive {s} {s} {s}: connection gone after {d} ms, handler done={}, orphans={d}, slots back {d} of {d}\n", .{
+        @tagName(transport), @tagName(trigger), @tagName(h1o_mode), gone_ms, done_at_gone, orphans_at_gone, slots.len, slots.created,
+    });
+    try std.testing.expectEqual(slots.created, slots.len);
+    // .honours_cancel may end at the cancel; the other two cannot, so the
+    // connection really did end first.
+    if (h1o_mode != .honours_cancel) {
+        try std.testing.expect(!done_at_gone);
+        try std.testing.expectEqual(@as(usize, 1), orphans_at_gone);
+    }
+
+    if (trigger == .peer_close) {
+        // Still served after the connection is gone, with the handler running.
+        try h1ServedOk(port, transport);
+        server.requestShutdown();
+    }
+    // `serve` does not return while the handler runs.
+    while (!h1o_done.load(.acquire)) {
+        if (serve_handle.hasResult()) return error.ServeReturnedUnderHandler;
+        if (nowNs() >= t_trigger + (h1o_hold_ms + 5000) * std.time.ns_per_ms) return error.HandlerNeverEnded;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    if (h1o_mode != .honours_cancel) {
+        const want_cause: starh2.TerminalCause = switch (trigger) {
+            .peer_close => .connection_closed,
+            .shutdown => .server_shutdown,
+        };
+        std.debug.print("h1 outlive {s} {s} {s}: late write {s}, closed={}, cause={d} (want {d}), request intact={d}\n", .{
+            @tagName(transport),                                     @tagName(trigger),
+            @tagName(h1o_mode),                                      if (h1o_late.load(.acquire) == 2) "failed" else "did not fail",
+            h1o_late_closed.load(.acquire),                          h1o_late_cause.load(.acquire),
+            h1CauseCode(want_cause), h1o_request.load(.acquire),
+        });
+        try std.testing.expectEqual(@as(u8, 2), h1o_late.load(.acquire));
+        try std.testing.expect(h1o_late_closed.load(.acquire));
+        try std.testing.expectEqual(h1CauseCode(want_cause), h1o_late_cause.load(.acquire));
+        try std.testing.expectEqual(@as(u8, 1), h1o_request.load(.acquire));
+    }
+    if (h1o_mode == .waits_shielded) {
+        const waited_ms = h1o_wait_ms.load(.acquire);
+        std.debug.print("h1 outlive {s} {s} waits_shielded: waitUntil returned {d} after {d} ms (hold {d} ms)\n", .{
+            @tagName(transport), @tagName(trigger), h1o_wait.load(.acquire), waited_ms, h1o_hold_ms,
+        });
+        // Woken by the connection's end with its cause, not by its deadline.
+        try std.testing.expectEqual(@as(u8, 2), h1o_wait.load(.acquire));
+        try std.testing.expect(waited_ms < h1o_hold_ms / 2);
+    }
+}
+
+fn h1OutliveCase(transport: H1Transport, trigger: H1Trigger, mode: H1OutliveMode, hold_ms: u64) !void {
+    h1o_mode = mode;
+    h1o_wait.store(0, .release);
+    h1o_wait_ms.store(0, .release);
+    h1o_hold_ms = hold_ms;
+    h1o_started.store(false, .release);
+    h1o_done.store(false, .release);
+    h1o_late.store(0, .release);
+    h1o_late_closed.store(false, .release);
+    h1o_late_cause.store(0, .release);
+    h1o_request.store(0, .release);
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runH1Outlive, .{ rt, gpa, transport, trigger });
+    try h.join();
+}
+
+test "outlive: h1c a handler that honours cancel does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.h1c, .peer_close, .honours_cancel, outlive_hold_ms);
+}
+test "outlive: h1c a shielded handler does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.h1c, .peer_close, .shielded, outlive_hold_ms);
+}
+test "outlive: h1c a handler that swallows cancel does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.h1c, .peer_close, .ignores_cancel, outlive_hold_ms);
+}
+test "outlive: h1c a handler that honours cancel does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.h1c, .shutdown, .honours_cancel, outlive_hold_ms);
+}
+test "outlive: h1c a shielded handler does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.h1c, .shutdown, .shielded, outlive_hold_ms);
+}
+test "outlive: h1c a handler that swallows cancel does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.h1c, .shutdown, .ignores_cancel, outlive_hold_ms);
+}
+test "outlive: h1 tls a handler that honours cancel does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.tls, .peer_close, .honours_cancel, outlive_hold_ms);
+}
+test "outlive: h1 tls a shielded handler does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.tls, .peer_close, .shielded, outlive_hold_ms);
+}
+test "outlive: h1 tls a handler that swallows cancel does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.tls, .peer_close, .ignores_cancel, outlive_hold_ms);
+}
+test "outlive: h1 tls a handler that honours cancel does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.tls, .shutdown, .honours_cancel, outlive_hold_ms);
+}
+test "outlive: h1 tls a shielded handler does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.tls, .shutdown, .shielded, outlive_hold_ms);
+}
+test "outlive: h1 tls a handler that swallows cancel does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.tls, .shutdown, .ignores_cancel, outlive_hold_ms);
+}
+test "outlive: h1c a shielded handler in waitUntil does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.h1c, .peer_close, .waits_shielded, outlive_hold_ms);
+}
+test "outlive: h1c a shielded handler in waitUntil does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.h1c, .shutdown, .waits_shielded, outlive_hold_ms);
+}
+test "outlive: h1 tls a shielded handler in waitUntil does not hold its connection when the peer closes (t-3759)" {
+    try h1OutliveCase(.tls, .peer_close, .waits_shielded, outlive_hold_ms);
+}
+test "outlive: h1 tls a shielded handler in waitUntil does not hold its connection at shutdown (t-3759)" {
+    try h1OutliveCase(.tls, .shutdown, .waits_shielded, outlive_hold_ms);
+}
+
+// A handler blocked INSIDE a write when its connection ends: the peer reads
+// nothing, so on h1c the handler's socket write waits for room, and on TLS
+// it waits for the actor to drive its record out. It writes under a shield,
+// so a cancel cannot free it: only teardown's wakes can (the socket shut,
+// the TLS write channels closed). The connection must end within 3 s, far
+// inside the 60 s write-byte timeout, and the write must fail with the
+// cause.
+
+var h1w_started: std.atomic.Value(bool) = .init(false);
+var h1w_done: std.atomic.Value(bool) = .init(false);
+var h1w_closed: std.atomic.Value(bool) = .init(false);
+var h1w_cause: std.atomic.Value(u8) = .init(0);
+
+fn h1BlockedWriter(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    defer h1w_done.store(true, .release);
+    var body = try resp.startSse(&.{});
+    h1w_started.store(true, .release);
+    var chunk: [16 * 1024]u8 = undefined;
+    @memset(&chunk, 'x');
+    zio.beginShield();
+    defer zio.endShield();
+    while (true) {
+        body.writeAll(&chunk) catch |err| {
+            h1w_closed.store(err == error.ConnectionClosed, .release);
+            const cause: u8 = if (body.terminalCause()) |c| h1CauseCode(c) else 0;
+            h1w_cause.store(cause, .release);
+            return;
+        };
+    }
+}
+
+/// Asks for the endless response with a small receive buffer and reads
+/// nothing until released.
+const H1StalledClient = struct {
+    port: u16,
+    transport: H1Transport,
+    err: ?anyerror = null,
+    ready: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn main(c: *H1StalledClient) void {
+        c.run() catch |err| {
+            c.err = err;
+        };
+        c.ready.store(true, .release);
+    }
+
+    fn run(c: *H1StalledClient) !void {
+        const gpa = std.heap.page_allocator;
+        const w = try Wire.openAlpn(gpa, h1WireTransport(c.transport), c.port, 4096, "http/1.1");
+        defer w.close();
+        try w.send("GET /flood HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        c.ready.store(true, .release);
+        while (!c.release.load(.acquire)) {
+            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&t, null);
+        }
+    }
+};
+
+fn runH1BlockedWrite(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: H1Transport) !void {
+    const io = rt.io();
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/flood", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1BlockedWriter } } },
+    };
+    var cert_pem: []u8 = &.{};
+    var key_pem: []u8 = &.{};
+    defer {
+        gpa.free(cert_pem);
+        gpa.free(key_pem);
+    }
+    var endpoint: starh2.EndpointConfig = undefined;
+    var tls_cfg: ?starh2.TlsConfig = null;
+    switch (transport) {
+        .h1c => endpoint = .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .tls => {
+            cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+            key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
+        },
+    }
+    var server = try starh2.Server.init(gpa, io, .{ .endpoints = &.{endpoint}, .routes = &routes, .tls = tls_cfg, .limits = starh2.Limits.defaults });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var client: H1StalledClient = .{ .port = 0, .transport = transport };
+    var client_thread: ?std.Thread = null;
+    defer {
+        server.requestShutdown();
+        client.release.store(true, .release);
+        if (client_thread) |t| t.join();
+        serve_deadline.join(&server, &serve_handle);
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    client.port = server.localAddress(0).getPort();
+    client_thread = try std.Thread.spawn(.{}, H1StalledClient.main, .{&client});
+    while (!client.ready.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+    if (client.err) |err| return err;
+    const t_start = nowNs();
+    while (!h1w_started.load(.acquire)) {
+        if (nowNs() >= t_start + 5 * std.time.ns_per_s) return error.HandlerNeverStarted;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    // Let the writes fill every buffer between the handler and the peer.
+    zio.sleep(.fromMilliseconds(500)) catch {};
+    try std.testing.expect(!h1w_done.load(.acquire));
+    const t_trigger = nowNs();
+    server.requestShutdown();
+    while (server.active_connections.load(.acquire) != 0) {
+        if (nowNs() >= t_trigger + 3 * std.time.ns_per_s) return error.ConnectionWaitedForHandlerWrite;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    const gone_ms = (nowNs() - t_trigger) / std.time.ns_per_ms;
+    while (!h1w_done.load(.acquire)) {
+        if (nowNs() >= t_trigger + 5 * std.time.ns_per_s) return error.HandlerNeverEnded;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    std.debug.print("h1 blocked write {s}: connection gone after {d} ms; the write failed closed={} cause={d}\n", .{
+        @tagName(transport), gone_ms, h1w_closed.load(.acquire), h1w_cause.load(.acquire),
+    });
+    try std.testing.expect(h1w_closed.load(.acquire));
+    try std.testing.expectEqual(h1CauseCode(.server_shutdown), h1w_cause.load(.acquire));
+}
+
+fn h1BlockedWriteCase(transport: H1Transport) !void {
+    h1w_started.store(false, .release);
+    h1w_done.store(false, .release);
+    h1w_closed.store(false, .release);
+    h1w_cause.store(0, .release);
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runH1BlockedWrite, .{ rt, gpa, transport });
+    try h.join();
+}
+
+test "outlive: h1c a handler blocked in a socket write does not hold its connection at shutdown (t-3759)" {
+    try h1BlockedWriteCase(.h1c);
+}
+test "outlive: h1 tls a handler blocked in a TLS write does not hold its connection at shutdown (t-3759)" {
+    try h1BlockedWriteCase(.tls);
+}
+
+// HTTP/1.1 refusals that answer 503 and close: a task request past the
+// server's task-handler bound (`Limits.max_task_handlers`), and a request
+// whose copy into a request arena the connection's request memory refuses
+// (`Limits.request_bytes_per_connection`, t-3759 step 7: an HTTP/1.1
+// request is now pool memory, like an HTTP/2 one).
+
+var h1r_hold: std.atomic.Value(bool) = .init(false);
+var h1r_running: std.atomic.Value(usize) = .init(0);
+
+fn h1HoldHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    _ = h1r_running.fetchAdd(1, .acq_rel);
+    defer _ = h1r_running.fetchSub(1, .acq_rel);
+    while (h1r_hold.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch break;
+    try resp.send(200, &.{}, "held");
+}
+
+/// One raw HTTP/1.1 exchange on its own thread: sends `req`, reads until the
+/// server closes or `want` appears, and keeps what it read.
+const H1Exchange = struct {
+    port: u16,
+    req: []const u8,
+    want: []const u8,
+    /// Hold the connection open after the answer, until released.
+    hold: bool = false,
+    got: [512]u8 = undefined,
+    got_len: usize = 0,
+    err: ?anyerror = null,
+    answered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn main(c: *H1Exchange) void {
+        c.run() catch |err| {
+            c.err = err;
+        };
+        c.answered.store(true, .release);
+        c.done.store(true, .release);
+    }
+
+    fn run(c: *H1Exchange) !void {
+        const w = try Wire.openAlpn(std.heap.page_allocator, .h2c, c.port, null, "http/1.1");
+        defer w.close();
+        try w.send(c.req);
+        h1ReadUntil(w, c.want, nowNs() + client_deadline_ns) catch |err| switch (err) {
+            error.ClosedBeforeExpected => {},
+            else => return err,
+        };
+        c.got_len = @min(w.plain.items.len, c.got.len);
+        @memcpy(c.got[0..c.got_len], w.plain.items[0..c.got_len]);
+        c.answered.store(true, .release);
+        while (c.hold and !c.release.load(.acquire)) {
+            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&t, null);
+        }
+    }
+
+    fn text(c: *const H1Exchange) []const u8 {
+        return c.got[0..c.got_len];
+    }
+};
+
+const H1Refusal = enum {
+    task_bound,
+    connection_memory,
+    /// A complete handler whose own allocation the connection's request
+    /// memory refuses: 503, as for a task handler (round 1, astra).
+    complete_connection_memory,
+    /// A complete handler whose allocation passes its request's own cap:
+    /// 500.
+    complete_request_cap,
+};
+
+/// Bytes `h1AllocHandler` asks of its request's arena.
+var h1r_alloc: usize = 0;
+
+fn h1AllocHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    const buf = try req.arena.alloc(u8, h1r_alloc);
+    @memset(buf, 'a');
+    try resp.send(200, &.{}, "allocated");
+}
+
+fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void {
+    const io = rt.io();
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/hold", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1HoldHandler } } },
+        .{ .method = .POST, .path = "/hold", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1HoldHandler } } },
+        .{ .method = .GET, .path = "/alloc", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = h1AllocHandler } } },
+    };
+    var limits = starh2.Limits.defaults;
+    switch (kind) {
+        // Compiles against 6ea2fcf too, where the bound was the reaper queue
+        // and could not be below the stream bound: there the stream bound
+        // refuses instead, with the same answer.
+        .task_bound => if (@hasField(starh2.Limits, "max_task_handlers")) {
+            @field(limits, "max_task_handlers") = 1;
+        } else {
+            limits.max_streams_per_connection = 1;
+            limits.max_streams_per_server = 1;
+            @field(limits, "cancellation_reaper_jobs") = 1;
+        },
+        .connection_memory, .complete_connection_memory => limits.request_bytes_per_connection = try limits.firstBlockBytes(),
+        .complete_request_cap => {},
+    }
+    var server = try starh2.Server.init(gpa, io, .{
+        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    h1r_hold.store(true, .release);
+    defer {
+        h1r_hold.store(false, .release);
+        server.requestShutdown();
+        serve_deadline.join(&server, &serve_handle);
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+
+    switch (kind) {
+        .task_bound => {
+            // The first request takes the only token and holds it.
+            var first: H1Exchange = .{ .port = port, .req = "GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n", .want = "held", .hold = true };
+            const t1 = try std.Thread.spawn(.{}, H1Exchange.main, .{&first});
+            defer {
+                h1r_hold.store(false, .release);
+                first.release.store(true, .release);
+                t1.join();
+            }
+            const deadline = nowNs() + 5 * std.time.ns_per_s;
+            while (h1r_running.load(.acquire) != 1) {
+                if (nowNs() >= deadline) return error.HandlerNeverStarted;
+                zio.sleep(.fromMilliseconds(5)) catch {};
+            }
+            var second: H1Exchange = .{ .port = port, .req = "GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n", .want = "connection: close\r\n\r\n" };
+            const t2 = try std.Thread.spawn(.{}, H1Exchange.main, .{&second});
+            while (!second.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+            t2.join();
+            if (second.err) |err| return err;
+            std.debug.print("h1 refusal task_bound: {s}\n", .{second.text()});
+            try std.testing.expect(std.mem.startsWith(u8, second.text(), "HTTP/1.1 503"));
+            try std.testing.expect(std.mem.indexOf(u8, second.text(), "connection: close") != null);
+        },
+        .connection_memory => {
+            h1r_hold.store(false, .release);
+            // A body that fits `request_body_bytes` but not, with its first
+            // block, the connection's request memory.
+            const body_len = 100 * 1024;
+            const body = try gpa.alloc(u8, body_len);
+            defer gpa.free(body);
+            @memset(body, 'b');
+            const head = try std.fmt.allocPrint(gpa, "POST /hold HTTP/1.1\r\nHost: localhost\r\ncontent-length: {d}\r\n\r\n", .{body_len});
+            defer gpa.free(head);
+            const req = try std.mem.concat(gpa, u8, &.{ head, body });
+            defer gpa.free(req);
+            var c: H1Exchange = .{ .port = port, .req = req, .want = "connection: close\r\n\r\n" };
+            const t = try std.Thread.spawn(.{}, H1Exchange.main, .{&c});
+            while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+            t.join();
+            if (c.err) |err| return err;
+            std.debug.print("h1 refusal connection_memory: {s}\n", .{c.text()});
+            try std.testing.expect(std.mem.startsWith(u8, c.text(), "HTTP/1.1 503"));
+            try std.testing.expect(std.mem.indexOf(u8, c.text(), "connection: close") != null);
+            try std.testing.expectEqual(@as(usize, 0), h1r_running.load(.acquire));
+        },
+        .complete_connection_memory, .complete_request_cap => {
+            h1r_hold.store(false, .release);
+            // 100 KiB needs a second block the connection's memory cannot
+            // charge; twice the request's own cap no block class holds.
+            h1r_alloc = if (kind == .complete_connection_memory) 100 * 1024 else 2 * limits.request_arena_bytes;
+            var c: H1Exchange = .{ .port = port, .req = "GET /alloc HTTP/1.1\r\nHost: localhost\r\n\r\n", .want = "connection: close\r\n\r\n" };
+            const t = try std.Thread.spawn(.{}, H1Exchange.main, .{&c});
+            while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+            t.join();
+            if (c.err) |err| return err;
+            std.debug.print("h1 refusal {s}: {s}\n", .{ @tagName(kind), c.text() });
+            const want = if (kind == .complete_connection_memory) "HTTP/1.1 503" else "HTTP/1.1 500";
+            try std.testing.expect(std.mem.startsWith(u8, c.text(), want));
+        },
+    }
+}
+
+fn h1RefusalCase(kind: H1Refusal) !void {
+    h1r_running.store(0, .release);
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runH1Refusal, .{ rt, gpa, kind });
+    try h.join();
+}
+
+test "h1 refusal: a task request past the task-handler bound is answered 503 and closed (t-3759)" {
+    try h1RefusalCase(.task_bound);
+}
+test "h1 refusal: a request the connection's request memory cannot hold is answered 503 and closed (t-3759)" {
+    try h1RefusalCase(.connection_memory);
+}
+test "h1 refusal: a complete handler the connection's request memory refuses answers 503 (t-3759 round 1)" {
+    try h1RefusalCase(.complete_connection_memory);
+}
+test "h1 refusal: a complete handler over its request's own cap answers 500 (t-3759 round 1)" {
+    try h1RefusalCase(.complete_request_cap);
+}
+
+// A TLS handler in the middle of one write larger than a TLS write chunk
+// when its connection ends (rounds 1 and 2 of the step-7 review). The
+// handler hands the actor one chunk at a time (`tls_req_ch`) and waits for
+// its ack (`tls_ok_ch`); teardown closes both. Whichever it meets, the write
+// must fail with the connection's cause. Each case runs `h1m_rounds`
+// connections, the client reading as fast as it can, and checks every round
+// three ways: the client was still reading and the handler still writing
+// when the trigger came (so the trigger, not something before it, ended the
+// connection), the write failed `ConnectionClosed`, and the cause recorded
+// is the trigger's (`connection_closed` for the peer's close,
+// `server_shutdown` for a shutdown or a canceled `serve`).
+//
+// `canceled_serve` (round 2, astra): `serve` fails to start its second
+// listener (the step-2 test hook) and cancels every connection task, so the
+// actor's wait for the handler returns `error.Canceled` and the request ends
+// on `serve`'s exit path (`endOnExit`).
+
+const h1m_rounds = 12;
+const H1MultiTrigger = enum { peer_close, shutdown, canceled_serve };
+var h1m_started: std.atomic.Value(bool) = .init(false);
+var h1m_done: std.atomic.Value(bool) = .init(false);
+/// How the handler's last write failed: 0 not yet, 1 `ConnectionClosed`,
+/// 2 another error.
+var h1m_end: std.atomic.Value(u8) = .init(0);
+var h1m_err: std.atomic.Value(u16) = .init(0);
+/// The cause the failed write saw (`h1CauseCode`), 0 none.
+var h1m_cause: std.atomic.Value(u8) = .init(0);
+/// Whole writes that went out, so a round that never wrote (the instrument
+/// not firing) is seen.
+var h1m_writes: std.atomic.Value(usize) = .init(0);
+var h1m_writes_at_end: std.atomic.Value(usize) = .init(0);
+
+fn h1MultiChunkWriter(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    defer h1m_done.store(true, .release);
+    var body = try resp.startSse(&.{});
+    // Several TLS write chunks per `writeAll` (a chunk is a little over
+    // 16 KiB), and below `outbound_bytes_per_stream` (64 KiB), the most one
+    // HTTP/1.1 write may hold: a larger one fails at once with
+    // `WriteFailed`, whatever the connection does.
+    var big: [48 * 1024]u8 = undefined;
+    @memset(&big, 'm');
+    zio.beginShield();
+    defer zio.endShield();
+    h1m_started.store(true, .release);
+    while (true) {
+        body.writeAll(&big) catch |err| {
+            h1m_err.store(@intFromError(err), .release);
+            h1m_cause.store(if (body.terminalCause()) |c| h1CauseCode(c) else 0, .release);
+            h1m_writes_at_end.store(h1m_writes.load(.acquire), .release);
+            h1m_end.store(if (err == error.ConnectionClosed) 1 else 2, .release);
+            return;
+        };
+        _ = h1m_writes.fetchAdd(1, .acq_rel);
+    }
+}
+
+/// Reads and decrypts everything until released, then closes. Any read
+/// error or end before `release` is kept (`err`, `ended_early`): the test
+/// checks the client was still reading when it pulled the trigger.
+const H1Drainer = struct {
+    port: u16,
+    /// Retry a refused connect for a while: the server is held before it
+    /// listens (`canceled_serve`), and only the kernel's accept says when.
+    connect_retry: bool = false,
+    err: ?anyerror = null,
+    /// The server closed before the client was released.
+    ended_early: bool = false,
+    reading: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn main(c: *H1Drainer) void {
+        c.run() catch |err| {
+            c.err = err;
+        };
+        c.reading.store(true, .release);
+        c.done.store(true, .release);
+    }
+
+    fn run(c: *H1Drainer) !void {
+        const deadline = nowNs() + 5 * std.time.ns_per_s;
+        const w = while (true) {
+            break Wire.openAlpn(std.heap.page_allocator, .tls, c.port, null, "http/1.1") catch |err| switch (err) {
+                error.Connect => {
+                    if (!c.connect_retry or nowNs() >= deadline) return err;
+                    const t: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+                    _ = std.c.nanosleep(&t, null);
+                    continue;
+                },
+                else => return err,
+            };
+        };
+        defer w.close();
+        try w.send("GET /multi HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        c.reading.store(true, .release);
+        while (!c.release.load(.acquire)) {
+            const more = w.pump() catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (!more) {
+                c.ended_early = true;
+                return;
+            }
+            w.plain.clearRetainingCapacity();
+        }
+    }
+};
+
+const H1MultiTally = struct {
+    closed: usize = 0,
+    other: usize = 0,
+    writes: usize = 0,
+};
+
+fn runH1MultiChunk(rt: *zio.Runtime, gpa: std.mem.Allocator, trigger: H1MultiTrigger, tally: *H1MultiTally) !void {
+    const io = rt.io();
+    const server_mod = starh2.edge.server;
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/multi", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = h1MultiChunkWriter } } },
+    };
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    // `canceled_serve`: a second listener whose accept loop fails to spawn
+    // once the test opens the gate. That server is held before it listens,
+    // so its `local_addrs` are never published to this task: the first
+    // listener's port is the test's own (`wire_client.freeLoopbackPort`),
+    // and the client retries until the kernel accepts.
+    const held_port: u16 = if (trigger == .canceled_serve) try wire_client.freeLoopbackPort() else 0;
+    const held_addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", held_port);
+    const endpoints: []const starh2.EndpointConfig = if (trigger == .canceled_serve) &.{ .{ .tls = held_addr }, .{ .tls = addr } } else &.{.{ .tls = addr }};
+    var server = try starh2.Server.init(gpa, io, .{
+        .endpoints = endpoints,
+        .routes = &routes,
+        .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
+        .limits = starh2.Limits.defaults,
+    });
+    defer server.deinit(gpa);
+    if (trigger == .canceled_serve) {
+        server_mod.test_accept_spawn_gate.store(false, .release);
+        server_mod.test_fail_accept_spawn.store(1, .release);
+    }
+    defer if (trigger == .canceled_serve) {
+        server_mod.test_fail_accept_spawn.store(std.math.maxInt(usize), .release);
+        server_mod.test_accept_spawn_gate.store(true, .release);
+    };
+    h1m_started.store(false, .release);
+    h1m_done.store(false, .release);
+    h1m_end.store(0, .release);
+    h1m_cause.store(0, .release);
+    h1m_writes.store(0, .release);
+    h1m_writes_at_end.store(0, .release);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var client: H1Drainer = .{ .port = 0, .connect_retry = trigger == .canceled_serve };
+    var client_thread: ?std.Thread = null;
+    defer {
+        server.requestShutdown();
+        if (trigger == .canceled_serve) server_mod.test_accept_spawn_gate.store(true, .release);
+        client.release.store(true, .release);
+        if (client_thread) |t| t.join();
+        serve_deadline.join(&server, &serve_handle);
+    }
+    const t0 = nowNs();
+    if (trigger == .canceled_serve) {
+        client.port = held_port;
+    } else {
+        try server.waitUntilListening(5 * std.time.ns_per_s);
+        client.port = server.localAddress(0).getPort();
+    }
+    client_thread = try std.Thread.spawn(.{}, H1Drainer.main, .{&client});
+    while (!h1m_started.load(.acquire)) {
+        if (client.done.load(.acquire)) return client.err orelse error.ClientEndedBeforeHandler;
+        if (nowNs() >= t0 + 5 * std.time.ns_per_s) return error.HandlerNeverStarted;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    // Let a few chunks go by, then end the connection under the write.
+    zio.sleep(.fromMilliseconds(50)) catch {};
+    // The trigger must be what ends it: the client still reads, the handler
+    // still writes.
+    if (client.done.load(.acquire)) {
+        std.debug.print("h1 multi-chunk {s}: the client ended before the trigger: err={?} ended_early={}\n", .{ @tagName(trigger), client.err, client.ended_early });
+        return error.ClientEndedBeforeTrigger;
+    }
+    if (h1m_done.load(.acquire)) return error.HandlerEndedBeforeTrigger;
+    switch (trigger) {
+        .peer_close => client.release.store(true, .release),
+        .shutdown => server.requestShutdown(),
+        .canceled_serve => server_mod.test_accept_spawn_gate.store(true, .release),
+    }
+    while (!h1m_done.load(.acquire)) {
+        if (nowNs() >= t0 + 10 * std.time.ns_per_s) return error.HandlerNeverEnded;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    // The write under test is one after at least one that went out whole.
+    if (h1m_writes_at_end.load(.acquire) == 0) return error.NoWriteWentOut;
+    tally.writes += h1m_writes_at_end.load(.acquire);
+    const want_cause = h1CauseCode(switch (trigger) {
+        .peer_close => .connection_closed,
+        .shutdown, .canceled_serve => .server_shutdown,
+    });
+    if (h1m_end.load(.acquire) == 1 and h1m_cause.load(.acquire) == want_cause) {
+        tally.closed += 1;
+    } else {
+        tally.other += 1;
+        std.debug.print("h1 multi-chunk {s}: a write failed with {s}, cause {d} (want ConnectionClosed, cause {d})\n", .{
+            @tagName(trigger), @errorName(@errorFromInt(h1m_err.load(.acquire))), h1m_cause.load(.acquire), want_cause,
+        });
+    }
+}
+
+fn h1MultiChunkCase(trigger: H1MultiTrigger) !void {
+    const gpa = std.testing.allocator;
+    var tally: H1MultiTally = .{};
+    for (0..h1m_rounds) |_| {
+        const rt = try newRuntime(gpa);
+        defer rt.deinit();
+        var h = try rt.spawn(runH1MultiChunk, .{ rt, gpa, trigger, &tally });
+        try h.join();
+    }
+    std.debug.print("h1 multi-chunk {s}: {d} rounds, {d} whole 48 KiB writes before the end, {d} ended ConnectionClosed with the trigger's cause, {d} otherwise\n", .{ @tagName(trigger), h1m_rounds, tally.writes, tally.closed, tally.other });
+    try std.testing.expectEqual(@as(usize, 0), tally.other);
+}
+
+test "outlive: h1 tls a handler between the chunks of one write fails with the cause when the peer closes (t-3759 round 1)" {
+    try h1MultiChunkCase(.peer_close);
+}
+test "outlive: h1 tls a handler between the chunks of one write fails with the cause at shutdown (t-3759 round 1)" {
+    try h1MultiChunkCase(.shutdown);
+}
+test "outlive: h1 tls a handler between the chunks of one write fails with the cause when serve is canceled (t-3759 round 2)" {
+    try h1MultiChunkCase(.canceled_serve);
+}
+
+// A client that resets its connection during a response (round 2, Fable).
+// The HTTP/1.1 TLS pump reports every failure as write completions (one for
+// `failDrain`, one for the shutdown), and the first version gave it a
+// four-slot channel nothing ever read, with a panic when it was full: two
+// failures and a `deinit` crashed the whole server. Each round asks for a
+// response two TLS write chunks long from a complete handler (it runs on the
+// actor, through the actor's own write path) and resets the connection
+// (SO_LINGER 0) after the response head, or straight after the request.
+// The server must survive every round and still serve a well-behaved
+// client.
+
+const h1x_rounds = 40;
+
+fn h1BigHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    var body: [30 * 1024]u8 = undefined;
+    @memset(&body, 'r');
+    try resp.send(200, &.{}, &body);
+}
+
+/// Resets each connection with SO_LINGER 0: the close sends RST.
+const H1Resetter = struct {
+    port: u16,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn main(c: *H1Resetter) void {
+        c.run() catch |err| {
+            c.err = err;
+        };
+        c.done.store(true, .release);
+    }
+
+    fn run(c: *H1Resetter) !void {
+        for (0..h1x_rounds) |i| {
+            const w = try Wire.openAlpn(std.heap.page_allocator, .tls, c.port, null, "http/1.1");
+            defer w.close();
+            try w.send("GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            // Even rounds: reset once the head is in, with the body still
+            // being written. Odd rounds: reset at once.
+            if (i % 2 == 0) h1ReadUntil(w, "\r\n\r\n", nowNs() + client_deadline_ns) catch {};
+            const lg: std.c.linger = .{ .onoff = 1, .linger = 0 };
+            _ = std.c.setsockopt(w.fd, std.c.SOL.SOCKET, std.c.SO.LINGER, std.mem.asBytes(&lg), @sizeOf(std.c.linger));
+        }
+    }
+};
+
+fn runH1Reset(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const io = rt.io();
+    const routes = [_]starh2.Route{
+        .{ .method = .GET, .path = "/big", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = h1BigHandler } } },
+        .{ .method = .GET, .path = "/ok", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = h1OkHandler } } },
+    };
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+    var server = try starh2.Server.init(gpa, io, .{
+        .endpoints = &.{.{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .routes = &routes,
+        .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
+        .limits = starh2.Limits.defaults,
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_deadline.join(&server, &serve_handle);
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+    const failures_before: u32 = if (@hasDecl(starh2.edge.h1, "test_tls_failures")) blk: {
+        @field(starh2.edge.h1, "test_tls_failures_max").store(0, .release);
+        break :blk @field(starh2.edge.h1, "test_tls_failures").load(.acquire);
+    } else 0;
+    var c: H1Resetter = .{ .port = port };
+    const t = try std.Thread.spawn(.{}, H1Resetter.main, .{&c});
+    while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+    t.join();
+    if (c.err) |err| return err;
+    // Every reset connection is gone, and the server still serves.
+    const t0 = nowNs();
+    while (server.active_connections.load(.acquire) != 0) {
+        if (nowNs() >= t0 + 5 * std.time.ns_per_s) return error.ResetConnectionsStayed;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    try h1ServedOk(port, .tls);
+    std.debug.print("h1 tls reset: {d} connections reset during or right after the request; the server still serves\n", .{h1x_rounds});
+    // Compiles against versions without the counters too.
+    const h1 = starh2.edge.h1;
+    if (@hasDecl(h1, "test_tls_failures")) {
+        const failures = @field(h1, "test_tls_failures").load(.acquire) - failures_before;
+        const most = @field(h1, "test_tls_failures_max").load(.acquire);
+        std.debug.print("h1 tls reset: {d} TLS pump failures in all, at most {d} on one connection\n", .{ failures, most });
+        // The attack reached the pump's failure path at all ...
+        try std.testing.expect(failures >= 1);
+        // ... and no connection went on writing after its pump failed.
+        try std.testing.expectEqual(@as(u32, 1), most);
+    }
+}
+
+test "h1 tls: clients that reset during a response do not crash the server (t-3759 round 2)" {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runH1Reset, .{ rt, gpa });
+    try h.join();
 }

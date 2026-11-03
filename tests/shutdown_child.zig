@@ -130,7 +130,7 @@ fn runDeinitLive(rt: *zio.Runtime) anyerror!void {
     const t = try std.Thread.spawn(.{}, clientMain, .{ server.localAddress(0).getPort(), &release });
     t.detach();
     while (!started.load(.acquire)) try zio.sleep(.fromMilliseconds(5));
-    const handlers = server.accounting.reaper_reserved.load(.acquire);
+    const handlers = server.accounting.task_handlers.load(.acquire);
     server.deinit(gpa);
     // The handler still writes its request memory after `deinit`.
     const before = held_touches.load(.acquire);
@@ -142,7 +142,7 @@ fn runDeinitLive(rt: *zio.Runtime) anyerror!void {
 }
 
 /// astra 6: `deinit` while `serve` runs and no counter is charged. The
-/// listeners, the accept loops and the reaper pool are still in use, so
+/// listeners and the accept loops are still in use, so
 /// `deinit` must free nothing; the server then serves a request.
 fn runDeinitIdle(rt: *zio.Runtime) anyerror!void {
     const gpa = std.heap.page_allocator;
@@ -196,7 +196,7 @@ fn okClient(port: u16, ok: *std.atomic.Value(bool), done: *std.atomic.Value(bool
 }
 
 fn runUnderflow(_: *zio.Runtime) anyerror!void {
-    var a: starh2.edge.connection.GlobalAccounting = .{ .max_streams = 1, .reaper_capacity = 1, .max_outbound_bytes = 1, .max_handshakes = 1 };
+    var a: starh2.edge.connection.GlobalAccounting = .{ .max_streams = 1, .task_handler_capacity = 1, .max_outbound_bytes = 1, .max_handshakes = 1 };
     a.releaseStream();
     a.releaseOutbound(7);
     std.debug.print("child: active_streams={d} outbound_bytes={d} underflows={d}\n", .{ a.active_streams.load(.acquire), a.outbound_bytes.load(.acquire), a.underflows.load(.acquire) });

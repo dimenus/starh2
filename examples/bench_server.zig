@@ -14,6 +14,7 @@
 //! `--mode h2c` runs the identical handler, router and framing path with the
 //! TLS record layer removed. That arm exists to answer one question with a
 //! measurement instead of a hypothesis: how much of the number is crypto?
+//! `--mode h1c` serves the same handler over HTTP/1.1 on cleartext TCP.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -772,6 +773,8 @@ fn sseFedHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response
 const Args = struct {
     port: u16 = 0,
     tls: bool = true,
+    /// `--mode h1c`: HTTP/1.1 over cleartext TCP, the same handler.
+    h1c: bool = false,
     cert: []const u8 = "testdata/cert.pem",
     key: []const u8 = "testdata/key.pem",
     sse_interval_ms: u64 = 100,
@@ -846,7 +849,9 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Args {
         if (std.mem.eql(u8, a, "--port")) {
             out.port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, a, "--mode")) {
-            out.tls = std.mem.eql(u8, args.next() orelse return error.MissingValue, "tls");
+            const mode = args.next() orelse return error.MissingValue;
+            out.tls = std.mem.eql(u8, mode, "tls");
+            out.h1c = std.mem.eql(u8, mode, "h1c");
         } else if (std.mem.eql(u8, a, "--cert")) {
             out.cert = try gpa.dupe(u8, args.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, a, "--key")) {
@@ -1560,7 +1565,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         key_pem = try std.Io.Dir.cwd().readFileAlloc(io, args.key, gpa, .limited(16 * 1024));
         tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
         break :blk .{ .tls = addr };
-    } else .{ .h2c_prior_knowledge = addr };
+    } else if (args.h1c) .{ .h1c = addr } else .{ .h2c_prior_knowledge = addr };
 
     var limits: starh2.Limits = .defaults;
     if (args.listen_backlog) |v| limits.listen_backlog = v;
@@ -1598,7 +1603,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         gpa,
         "{{\"ready\":true,\"mode\":\"{s}\",\"port\":{d},\"executors\":{d},\"announce_running_wakes\":{d},\"batch_wake_sleepers\":{d},\"zio_scheduling\":\"{s}\",\"spawn_placement\":\"{s}\",\"probe\":{d},\"probe_handler_placement\":\"{s}\",\"probe_conn_placement\":\"{s}\",\"conn_balance\":{d},\"balance_rank\":\"{s}\",\"placement_log\":{d},\"listen_backlog\":{d},\"max_connections\":{d},\"tls_handshakes\":{d},\"gpa\":\"{s}\",\"count_gpa\":{d},\"thp_disabled\":{d},\"deadline_slack_ns\":{d}}}\n",
         .{
-            if (args.tls) "tls" else "h2c",
+            if (args.tls) "tls" else if (args.h1c) "h1c" else "h2c",
             port,
             exec_n,
             @as(u8, @intFromBool(args.announce_running_wakes)),
@@ -1626,6 +1631,8 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     try out.interface.flush();
 
     if (args.self_drive_oneshots) |n| {
+        // The driver speaks HTTP/2 only.
+        if (args.h1c) return error.SelfDriveNeedsHttp2;
         // The listener lives on rt.io(); init.io would block this task
         // and starve accept.
         try driveOneshots(gpa, rt.io(), args.tls, server.localAddress(0), n);

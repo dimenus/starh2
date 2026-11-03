@@ -369,7 +369,7 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .requests = try starh2.edge.request_pool.RequestPool.init(starh2.Limits.defaults.requestPoolConfig()),
         .accounting = .{
             .max_streams = starh2.Limits.defaults.max_streams_per_server,
-            .reaper_capacity = starh2.Limits.defaults.cancellation_reaper_jobs,
+            .task_handler_capacity = starh2.Limits.defaults.max_task_handlers,
             .max_outbound_bytes = starh2.Limits.defaults.outbound_bytes_per_server,
             .max_handshakes = starh2.Limits.defaults.concurrent_tls_handshakes,
         },
@@ -380,16 +380,6 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     defer rig.requests.deinit();
     rig.pool = try starh2.edge.conn_slot.SlotPool.init(gpa, 1, try rig.limits.slotBootBytes(.h2c));
     defer rig.pool.deinit();
-
-    // The handler needs a reaper to cancel an SSE stream when the connection
-    // goes, as the server provides.
-    var reaper = try conn_mod.ReaperPool.init(gpa, io, rig.limits.cancellation_reaper_jobs);
-    defer reaper.deinit();
-    var worker = try rt.spawn(conn_mod.ReaperPool.worker, .{&reaper});
-    defer {
-        reaper.jobs.close(io);
-        worker.join() catch {};
-    }
 
     const bind = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try bind.listen(io, .{ .reuse_address = true });
@@ -404,14 +394,14 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     {
         const stream = try listener.accept(io);
         const slot = try rig.pool.take();
-        var h = try rt.spawn(rigConnectionReaper, .{ &rig, &reaper, stream, slot });
+        var h = try rt.spawn(rigConnection, .{ &rig, stream, slot });
         try h.join();
     }
     // Connection 2: dirties the slot with an open stream, then is canceled.
     var h2 = blk: {
         const stream = try listener.accept(io);
         const slot = try rig.pool.take();
-        break :blk try rt.spawn(rigConnectionReaper, .{ &rig, &reaper, stream, slot });
+        break :blk try rt.spawn(rigConnection, .{ &rig, stream, slot });
     };
     const give_up = nowNs() + client_deadline_ns;
     while (!out.a_ready.load(.acquire)) {
@@ -425,7 +415,7 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     {
         const stream = try listener.accept(io);
         const slot = try rig.pool.take();
-        var h = try rt.spawn(rigConnectionReaper, .{ &rig, &reaper, stream, slot });
+        var h = try rt.spawn(rigConnection, .{ &rig, stream, slot });
         try h.join();
     }
     while (!out.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
@@ -442,15 +432,13 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), rig.accounting.active_streams.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), rig.accounting.outbound_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), rig.requests.held_bytes.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), rig.accounting.reaper_reserved.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), rig.accounting.task_handlers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), rig.slabs.rentedCount());
 }
 
-fn rigConnectionReaper(rig: *Rig, reaper: *conn_mod.ReaperPool, stream: std.Io.net.Stream, slot: *starh2.edge.conn_slot.ConnSlot) std.Io.Cancelable!void {
+fn rigConnection(rig: *Rig, stream: std.Io.net.Stream, slot: *starh2.edge.conn_slot.ConnSlot) std.Io.Cancelable!void {
     defer _ = rig.pool.recycle(slot);
-    var cfg = rig.config();
-    cfg.reaper = reaper;
-    return conn_mod.serveAccepted(stream, cfg, slot);
+    return conn_mod.serveAccepted(stream, rig.config(), slot);
 }
 
 test "slot reuse: h2c after a cancel behaves like a fresh slot" {
