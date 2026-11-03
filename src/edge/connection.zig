@@ -5304,7 +5304,7 @@ pub const Connection = struct {
     }
 
     fn slotIndex(self: *Connection, stream_id: u31) ?usize {
-        for (self.handlers.slice(), 0..) |slot, i| {
+        for (self.handlers.slice(), 0..) |*slot, i| {
             if (slot.in_use and slot.stream_id == stream_id) return i;
         }
         return null;
