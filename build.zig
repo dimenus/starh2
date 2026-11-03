@@ -1610,6 +1610,84 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // The ThreadSanitizer lane. The simulator runs one OS thread and cannot
+    // run work stealing, so it cannot find a race that needs real
+    // parallelism; this runs the concurrency test binaries on real executor
+    // threads with TSan instead. Each binary sets `sanitize_thread` on its
+    // root module only: starh2, zio, tls and std take the value from the
+    // first module that imports them (Zig 0.17 `Module.create`, inherited
+    // orelse parent), so the shared modules above stay uninstrumented for
+    // every other step. zio's fiber hooks (`coro/tsan.zig`) switch on with
+    // `builtin.sanitize_thread`. tools/tsan/runner.zig has the run protocol.
+    // Not in `ci`: it is slow, and its TSan builds are kept out of the
+    // compile walk below.
+    const tsan_step = b.step("tsan", "ThreadSanitizer lane: the concurrency test binaries and bug 2's churn test under TSan; fails on any report, or if the canary race is not reported (tools/tsan)");
+    const tsan_runs = b.option(usize, "tsan-runs", "Runs of each binary in the TSan lane (default 1)") orelse 1;
+    const tsan_runner = b.addExecutable(.{
+        .name = "tsan-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tsan/runner.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    {
+        const run = b.addRunArtifact(tsan_runner);
+        run.addArg("--suppressions");
+        run.addFileArg(b.path("tools/tsan/suppressions.txt"));
+        run.addArgs(&.{ "--log-dir", ".zig-cache/tsan-lane" });
+        run.addArgs(&.{ "--timeout-s", "900" });
+        run.addArg("--runs");
+        run.addArg(b.fmt("{d}", .{tsan_runs}));
+        // Several test binaries read testdata/cert.pem relative to the root.
+        run.setCwd(b.path("."));
+        run.has_side_effects = true;
+        run.stdio = .inherit;
+        const tsan_imports: []const std.Build.Module.Import = &.{
+            .{ .name = "starh2", .module = starh2_mod },
+            .{ .name = "starh2_h2_client", .module = h2_client_mod },
+            .{ .name = "zio", .module = zio_dep.module("zio") },
+            .{ .name = "tls", .module = tls_mod },
+        };
+        const canary = b.addTest(.{
+            .name = "tsan_canary",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/tsan_canary.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = true,
+                .imports = tsan_imports,
+            }),
+        });
+        run.addArg("--canary");
+        run.addArtifactArg(canary);
+        const tsan_bins = [_][]const u8{
+            "goaway_delivery",
+            "shutdown",
+            "lifecycle",
+            "slot_reuse",
+            "admission",
+            "placement",
+            "h1_battery",
+            "bug2_churn",
+        };
+        for (tsan_bins) |name| {
+            const t = b.addTest(.{
+                .name = name,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("tests/{s}.zig", .{name})),
+                    .target = target,
+                    .optimize = optimize,
+                    .sanitize_thread = true,
+                    .imports = tsan_imports,
+                }),
+            });
+            run.addArgs(&.{ "--bin", name });
+            run.addArtifactArg(t);
+        }
+        tsan_step.dependOn(&run.step);
+    }
+
     const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + zio DST gate (dst-zio) + connection DST gate (dst-conn) + every artifact a named step or the install step compiles");
     ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(&session_mu_gate_run.step);
@@ -1639,8 +1717,15 @@ pub fn build(b: *std.Build) void {
         var seen: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
         var named: std.ArrayList(*std.Build.Step.Compile) = .empty;
         collectCompiles(b.getInstallStep(), &seen, &named, b.allocator);
-        for (b.top_level_steps.values()) |tls| collectCompiles(&tls.step, &seen, &named, b.allocator);
+        // The TSan lane's binaries are not ci's: they are slow to build and
+        // need a TSan runtime for the host. Its runner is a plain tool, so
+        // ci still compiles that.
+        for (b.top_level_steps.values()) |tls| {
+            if (&tls.step == tsan_step) continue;
+            collectCompiles(&tls.step, &seen, &named, b.allocator);
+        }
         for (named.items) |compile| ci_step.dependOn(&compile.step);
+        ci_step.dependOn(&tsan_runner.step);
     }
 
     // Per-artifact libc file for native macOS only. A global `--libc` would

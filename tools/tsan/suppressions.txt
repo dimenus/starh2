@@ -1,0 +1,22 @@
+# ThreadSanitizer suppressions for the TSan lane (`./zb build tsan`).
+#
+# An entry is allowed only for a true false positive: a report whose two
+# accesses ARE ordered by a happens-before edge that TSan cannot see (for
+# example, ordering made by the kernel through io_uring, which TSan does not
+# model). The `#` lines directly above an entry must name that edge: which
+# release, which acquire, at which file and line. tools/tsan/runner.zig
+# refuses an entry without them.
+#
+# A real race, even a harmless-looking one, is not suppressed here. It is
+# filed as a task with the TSan output, and the lane stays red until it is
+# fixed.
+#
+# Keep entries narrow. TSan matches a `race:` pattern against every frame of
+# every stack in a report, both accesses and both thread-creation stacks, so a
+# pattern naming a function that sits low in many stacks (a scheduler entry, a
+# wake path) hides every real race that passes through it. `race_top:` matches
+# only frame #0, which is TSan's own memcpy or memset interceptor for any
+# race inside a copy.
+#
+# Every entry this lane needs has to keep tests/tsan_canary.zig firing; the
+# runner checks that on every run.
