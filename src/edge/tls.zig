@@ -925,6 +925,11 @@ pub const Pump = struct {
     n_chunks: u32,
     write_free: ?*slab_pool.SlabPool = null,
     live_task_handlers: *std.atomic.Value(usize),
+    /// Set when the pump posts its shutdown (`post`, `c.shutdown`): it has
+    /// failed. From then on `writeChunks` fails its chunk without staging
+    /// it, and `submitOp` refuses every submission as a closed CQ would, so
+    /// an owner that goes on gets `false` instead of a send on a dead
+    /// socket. Only the driver touches it.
     stopped: std.atomic.Value(bool) = .init(false),
     test_delay_ms: u64 = 0,
     test_fail_after: u64 = 0,
@@ -988,10 +993,41 @@ pub const Pump = struct {
     /// the last one written. See `WireChunk.stash_seq`.
     stash_pushed: wire_pump.StashSeq = wire_pump.stash_seq_none,
     stash_written: wire_pump.StashSeq = wire_pump.stash_seq_none,
+    /// Observe builds only: the kernel model of the transport witness
+    /// (`tests/dst_tls_lifecycle.zig`). When set, the pump's two
+    /// submissions (`armSend`, `rearmRecv`) go to the model instead of the
+    /// CQ, and the model completes them by calling `onCqComplete` with a
+    /// result it set on the same completion. Nothing else in the pump
+    /// changes, so the witness runs the real completion handlers on the
+    /// real staging state. `void` in release builds.
+    test_io: test_hook.Hook(?*const TestIo) = if (test_hook.on) null else {},
 
     pub const max_write_batch = 16;
 
+    /// The witness's kernel: `submit` takes a completion the pump would have
+    /// put on its CQ. `error.Closed` stands for a CQ already closed by
+    /// `shutdownCq`, as `CompletionQueue.submit` returns it.
+    pub const TestIo = struct {
+        ctx: *anyopaque,
+        submit: *const fn (ctx: *anyopaque, c: *zio.ev.Completion) error{Closed}!void,
+    };
+
+    /// The one place the pump hands an operation to the kernel. Refused
+    /// after the shutdown post (`stopped`).
+    fn submitOp(self: *Pump, c: *zio.ev.Completion) error{Closed}!void {
+        if (self.stopped.load(.monotonic)) return error.Closed;
+        if (comptime test_hook.on) {
+            if (self.test_io) |m| return m.submit(m.ctx, c);
+        }
+        self.cq.submit(c) catch |err| switch (err) {
+            error.Closed => return error.Closed,
+            // The ops are ours alone: never grouped, never rearm-flagged.
+            error.InvalidCompletion => unreachable,
+        };
+    }
+
     fn post(self: *Pump, c: wire_pump.WriteCompletion) void {
+        if (c.shutdown) self.stopped.store(true, .monotonic);
         _ = wire_pump.diag_acks.posted_release.fetchAdd(c.outbound_release, .monotonic);
         if (self.ack_apply) |f| {
             f(self.ack_ctx, c);
@@ -1101,10 +1137,7 @@ pub const Pump = struct {
             .{},
         );
         @import("connection.zig").probeNote(.tls_send_submit);
-        self.cq.submit(&self.send_op.c) catch |err| switch (err) {
-            error.Closed => return false,
-            error.InvalidCompletion => unreachable,
-        };
+        self.submitOp(&self.send_op.c) catch return false;
         pump_trace.bump(&pump_trace.send_arms);
         self.send_armed = true;
         return true;
@@ -1329,6 +1362,14 @@ pub const Pump = struct {
     /// parked case (`pending_n > 0`, waiting for a send completion).
     pub fn writeChunks(self: *Pump, first: wire_pump.WireChunk) bool {
         std.debug.assert(self.pending_n == 0);
+        if (self.stopped.load(.monotonic)) {
+            // The pump has failed (`stopped`). Staging the chunk would ack
+            // it as written although nothing can send it, and `failDrain`
+            // already gave back a held chunk without advancing the stash
+            // order, so popping this one would trip that check. Fail it.
+            self.releaseChunk(first, false, false);
+            return false;
+        }
         if (first.len == 0 and first.bytes.len == 0 and !first.flush_barrier) {
             _ = tls_stage_failed.fetchAdd(1, .monotonic);
             if (diag_wait) rawPrint("TLSERR sentinel\n", .{});
@@ -1555,11 +1596,7 @@ pub const Pump = struct {
         if (self.recv_armed) return true;
         std.debug.assert(self.pending_cipher == null);
         @import("connection.zig").probeNote(.tls_recv_submit);
-        self.cq.submit(&self.recv_op.c) catch |err| switch (err) {
-            error.Closed => return false,
-            // The op is ours alone: never grouped, never rearm-flagged.
-            error.InvalidCompletion => unreachable,
-        };
+        self.submitOp(&self.recv_op.c) catch return false;
         self.recv_armed = true;
         return true;
     }
@@ -1697,8 +1734,9 @@ pub const fixture_key_pem =
 ;
 
 /// Server and client cipher states after a handshake run entirely in
-/// memory, with the ALPN the server selected.
-const MemPair = struct {
+/// memory, with the ALPN the server selected. The record tests and the
+/// transport witness (`tests/dst_tls_lifecycle.zig`) use it.
+pub const MemPair = struct {
     server: tls.nonblock.Connection,
     client: tls.nonblock.Connection,
     alpn: ?[]const u8,
@@ -1706,9 +1744,10 @@ const MemPair = struct {
 
 /// Run a full handshake between tls.zig's non-blocking client and the
 /// server configuration `Conn.handshake` uses, shuttling bytes in memory.
-fn memHandshake(acceptor: *Acceptor, client_alpn: []const []const u8) !MemPair {
+/// The randomness is a fixed seed, so the cipher states are the same on
+/// every run; `now` only dates the certificate check.
+pub fn memHandshake(acceptor: *Acceptor, client_alpn: []const []const u8, now: std.Io.Timestamp) !MemPair {
     var prng = std.Random.DefaultPrng.init(0x5747_4832);
-    const now = std.Io.Clock.real.now(std.testing.io);
     var srv = tls.nonblock.Server.init(.{
         .rng = prng.random(),
         .auth = &acceptor.auth,
@@ -1757,7 +1796,7 @@ fn memHandshake(acceptor: *Acceptor, client_alpn: []const []const u8) !MemPair {
 test "a second record in one chunk is work; a partial record is not" {
     var acceptor = try Acceptor.initFromPem(std.testing.allocator, std.testing.io, fixture_cert_pem, fixture_key_pem);
     defer acceptor.deinit();
-    var pair = try memHandshake(&acceptor, &.{alpn_h2});
+    var pair = try memHandshake(&acceptor, &.{alpn_h2}, std.Io.Clock.real.now(std.testing.io));
 
     var server: Conn = .{};
     server.state = .open;
@@ -1796,6 +1835,44 @@ test "a second record in one chunk is work; a partial record is not" {
     try std.testing.expectEqual(@as(usize, 0), try server.decryptInto(&plain_b));
     try std.testing.expectEqual(c.ciphertext.len - half, server.acceptCipher(wire[half..c.ciphertext.len]));
     try std.testing.expect(server.pendingInbound());
+}
+
+test "a stopped pump submits nothing (DST stage 1 review round 1)" {
+    // `writeChunks` refuses a stopped pump before it stages anything (the
+    // transport witness drives that). This is the guard under it:
+    // `submitOp` must refuse the send and the receive too. Only the fields
+    // `armSend` and `rearmRecv` read are set; the model counts what reaches
+    // it.
+    if (comptime !test_hook.on) return error.SkipZigTest;
+    const Count = struct {
+        n: u32 = 0,
+        fn submit(ctx: *anyopaque, c: *zio.ev.Completion) error{Closed}!void {
+            _ = c;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n += 1;
+        }
+    };
+    var count: Count = .{};
+    const io_model: Pump.TestIo = .{ .ctx = &count, .submit = Count.submit };
+    var staged: [16]u8 = undefined;
+    var pump: Pump = undefined;
+    pump.test_io = &io_model;
+    pump.sock = if (@typeInfo(zio.ev.Backend.NetHandle) == .pointer) undefined else -1;
+    pump.send_buf = &staged;
+    pump.send_head = 0;
+    pump.send_fill = 4;
+    pump.send_armed = false;
+    pump.recv_armed = false;
+    pump.pending_cipher = null;
+    pump.stopped = .init(true);
+    try std.testing.expect(!pump.armSend());
+    try std.testing.expect(!pump.rearmRecv());
+    try std.testing.expectEqual(@as(u32, 0), count.n);
+    // The control: the same pump, not stopped, submits both.
+    pump.stopped = .init(false);
+    try std.testing.expect(pump.armSend());
+    try std.testing.expect(pump.rearmRecv());
+    try std.testing.expectEqual(@as(u32, 2), count.n);
 }
 
 test "writesDrained is false while anything pushed is not yet on the socket (t-3520)" {
@@ -1896,18 +1973,18 @@ test "ALPN select prefers h2, falls back to http/1.1, none selects nothing, unkn
     var acceptor = try Acceptor.initFromPem(std.testing.allocator, std.testing.io, fixture_cert_pem, fixture_key_pem);
     defer acceptor.deinit();
 
-    const both = try memHandshake(&acceptor, &.{ alpn_http11, alpn_h2 });
+    const both = try memHandshake(&acceptor, &.{ alpn_http11, alpn_h2 }, std.Io.Clock.real.now(std.testing.io));
     try std.testing.expectEqualStrings(alpn_h2, both.alpn.?);
 
-    const h1_only = try memHandshake(&acceptor, &.{alpn_http11});
+    const h1_only = try memHandshake(&acceptor, &.{alpn_http11}, std.Io.Clock.real.now(std.testing.io));
     try std.testing.expectEqualStrings(alpn_http11, h1_only.alpn.?);
 
     // No ALPN extension: no selection, which the server serves as HTTP/1.1.
-    const none = try memHandshake(&acceptor, &.{});
+    const none = try memHandshake(&acceptor, &.{}, std.Io.Clock.real.now(std.testing.io));
     try std.testing.expect(none.alpn == null);
     try std.testing.expect(isHttp11Alpn(none.alpn));
 
-    try std.testing.expectError(error.TlsNoApplicationProtocol, memHandshake(&acceptor, &.{"spdy/3"}));
+    try std.testing.expectError(error.TlsNoApplicationProtocol, memHandshake(&acceptor, &.{"spdy/3"}, std.Io.Clock.real.now(std.testing.io)));
 }
 
 // tls.zig issue #36: the server cannot reassemble a ClientHello that the

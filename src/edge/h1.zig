@@ -211,31 +211,14 @@ pub const H1Conn = struct {
     socket_closed: bool = false,
     dispatch_headers: []request.Header = &.{},
 
-    tls_pump: ?*tls_edge.Pump = null,
-    tls_pump_storage: []u8 = &.{},
-    tls_recv_buf: []u8 = &.{},
-    tls_chunk_storage: []u8 = &.{},
-    tls_to_actor_buf: []wire_pump.WireChunk = &.{},
-    tls_write_ch_buf: []wire_pump.WireChunk = &.{},
-    tls_ack_buf: []wire_pump.WriteCompletion = &.{},
-    tls_to_actor: zio.Channel(wire_pump.WireChunk) = undefined,
-    tls_write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
-    tls_acks: zio.Channel(wire_pump.WriteCompletion) = undefined,
-    /// One write chunk: slab 0 is `tls_out`, and holding it is the token that
-    /// says the TLS pump has not yet finished the previous write.
-    tls_write_pool: slab_pool.SlabPool = undefined,
+    /// The TLS transport (`H1Tls`): the pump and everything it borrows. The
+    /// actor reaches the pump through `tls_t.running()`.
+    tls_t: H1Tls = .{},
     tls_req_buf: [1]u32 = undefined,
     tls_req_ch: zio.Channel(u32) = undefined,
     tls_ok_buf: [1]bool = undefined,
     tls_ok_ch: zio.Channel(bool) = undefined,
-    tls_site: std.atomic.Value(u8) = .init(0),
-    tls_live_handlers: std.atomic.Value(usize) = .init(0),
-    tls_out: []u8 = &.{},
     tls_write_inflight: bool = false,
-    /// Pump failures on this connection (shutdown completions the pump
-    /// posted, `h1AckSink`). After the first the connection submits nothing
-    /// more, so it is at most 1.
-    tls_failures: u32 = 0,
 
     fn deinit(self: *H1Conn) void {
         if (self.shutdown_cancel_counted) {
@@ -248,15 +231,7 @@ pub const H1Conn = struct {
         if (self.request_budget.held.load(.acquire) != 0) {
             std.debug.panic("h1: {d} request bytes still charged to the connection at its end", .{self.request_budget.held.load(.acquire)});
         }
-        if (self.tls_pump) |p| {
-            p.shutdownCq();
-            // Give back the write chunks the pump still holds (queued behind
-            // a full staging buffer): the write pool's `deinit` below checks
-            // that every one came home. A connection that ends under a
-            // handler's TLS write can leave one there (round 1 of the step-7
-            // review found it with the multi-chunk test).
-            p.failDrain();
-        }
+        self.tls_t.close();
         if (self.recv_started) {
             self.cq.close();
             self.cq.cancelAll(.keep);
@@ -294,16 +269,7 @@ pub const H1Conn = struct {
         self.gpa.free(self.path_q_buf);
         self.gpa.free(self.carry_buf);
         self.gpa.free(self.pending_storage);
-        if (self.tls_pump) |p| {
-            self.gpa.destroy(p);
-            self.tls_pump = null;
-        }
-        if (self.tls_recv_buf.len != 0) self.gpa.free(self.tls_recv_buf);
-        if (self.tls_chunk_storage.len != 0) self.gpa.free(self.tls_chunk_storage);
-        if (self.tls_to_actor_buf.len != 0) self.gpa.free(self.tls_to_actor_buf);
-        if (self.tls_write_ch_buf.len != 0) self.gpa.free(self.tls_write_ch_buf);
-        if (self.tls_ack_buf.len != 0) self.gpa.free(self.tls_ack_buf);
-        if (self.tls_out.len != 0) self.tls_write_pool.deinit(self.gpa);
+        self.tls_t.deinit(self.gpa);
         self.* = undefined;
     }
 };
@@ -417,12 +383,13 @@ pub var test_tls_failures_max: test_hook.Hook(std.atomic.Value(u32)) = if (test_
 /// HTTP/2 applies the same posts in `Connection.takeWriteAck`. Applied on
 /// the posting task, as HTTP/2's are, so no channel and no capacity.
 fn h1AckSink(ctx: *anyopaque, c: wire_pump.WriteCompletion) void {
-    const self: *H1Conn = @ptrCast(@alignCast(ctx));
+    const self: *H1Tls = @ptrCast(@alignCast(ctx));
+    if (comptime test_hook.on) self.applied += 1;
     if (c.shutdown) {
-        self.tls_failures += 1;
+        self.failures += 1;
         if (comptime test_hook.on) {
             _ = test_tls_failures.fetchAdd(1, .monotonic);
-            _ = test_tls_failures_max.fetchMax(self.tls_failures, .monotonic);
+            _ = test_tls_failures_max.fetchMax(self.failures, .monotonic);
         }
     }
     if (c.ticket != 0 or c.ticket_count != 0 or c.outbound_release != 0 or c.control_entries != 0 or c.control_release != 0) {
@@ -430,51 +397,153 @@ fn h1AckSink(ctx: *anyopaque, c: wire_pump.WriteCompletion) void {
     }
 }
 
+/// The transport witness's mutant (`./zb build dst-transport`): the shared
+/// constructor leaves the ack sink out, so `Pump.post` falls back to the
+/// four-slot `acks` channel that nothing reads, which is the first version
+/// of t-3759 step 7. Only the witness's own mutant build sets the option,
+/// and `test_hook.on` keeps it out of every release build.
+pub const mutant_no_ack_sink = test_hook.on and @import("build_options").dst_mutant_no_h1_ack_sink;
+
+/// The HTTP/1.1 TLS transport: the pump and everything it borrows (the
+/// ciphertext read buffer, the decrypt chunk, the channels the pump's shape
+/// carries, the one-chunk write pool), wired to `h1AckSink`. `H1Conn`
+/// embeds one, and the transport witness (`tests/dst_tls_lifecycle.zig`)
+/// builds one through the same calls, so the wiring the witness checks is
+/// this code and not a copy of it:
+///
+/// 1. `init`, at the struct's final address (the channels point into its
+///    buffers, the pump into the struct): allocate and wire. Submits
+///    nothing.
+/// 2. `arm`: `Pump.start`, which submits the first receive. From here
+///    until `close`, `running` returns the pump; that is the actor's only
+///    way to reach it.
+/// 3. `close` when the connection ends, while the socket is still open:
+///    it decides whether there is a running pump to tear down, so the
+///    witness's teardown and `H1Conn.deinit`'s are one call.
+/// 4. `deinit` frees. It refuses a pump that is still running.
+///
+/// After a failed `init` or `arm`, `close` does nothing and `deinit` frees
+/// what was allocated.
+pub const H1Tls = struct {
+    /// Allocated by `init`. Reach it through `running`.
+    pump: ?*tls_edge.Pump = null,
+    /// Set by a successful `arm`, cleared by `close`.
+    armed: bool = false,
+    recv_buf: []u8 = &.{},
+    chunk_storage: []u8 = &.{},
+    to_actor_buf: []wire_pump.WireChunk = &.{},
+    write_ch_buf: []wire_pump.WireChunk = &.{},
+    ack_buf: []wire_pump.WriteCompletion = &.{},
+    to_actor: zio.Channel(wire_pump.WireChunk) = undefined,
+    write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
+    /// The pump's completion channel (`Pump.completions`). With the sink
+    /// wired nothing reaches it, and nothing reads it: a completion here is
+    /// abandoned. The witness fails on the first one (`UnconsumedTlsAck`).
+    acks: zio.Channel(wire_pump.WriteCompletion) = undefined,
+    /// One write chunk: slab 0 is `out`, and holding it is the token that
+    /// says the pump has not yet finished the previous write.
+    write_pool: slab_pool.SlabPool = undefined,
+    out: []u8 = &.{},
+    site: std.atomic.Value(u8) = .init(0),
+    live_handlers: std.atomic.Value(usize) = .init(0),
+    /// Pump failures on this connection (shutdown completions the pump
+    /// posted, `h1AckSink`). After the first the connection submits nothing
+    /// more, so it is at most 1.
+    failures: u32 = 0,
+    /// Observe builds: the completions `h1AckSink` applied. The witness
+    /// reads it to know the sink ran.
+    applied: test_hook.Hook(u32) = if (test_hook.on) 0 else {},
+
+    pub fn init(self: *H1Tls, gpa: std.mem.Allocator, io: std.Io, conn: *tls_edge.Conn, sock: zio.ev.Backend.NetHandle) !void {
+        self.* = .{};
+        self.recv_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
+        self.chunk_storage = try gpa.alloc(u8, limits_mod.WIRE_CHUNK_SIZE);
+        self.to_actor_buf = try gpa.alloc(wire_pump.WireChunk, 1);
+        self.write_ch_buf = try gpa.alloc(wire_pump.WireChunk, 4);
+        self.ack_buf = try gpa.alloc(wire_pump.WriteCompletion, 4);
+        self.write_pool = try slab_pool.SlabPool.init(gpa, io, limits_mod.WIRE_CHUNK_SIZE, 1);
+        self.out = self.write_pool.slabAt(0);
+
+        self.to_actor = .init(self.to_actor_buf);
+        self.write_ch = .init(self.write_ch_buf);
+        self.acks = .init(self.ack_buf);
+
+        const pump = try gpa.create(tls_edge.Pump);
+        self.pump = pump;
+        pump.* = .{
+            .io = io,
+            .conn = conn,
+            .to_actor = &self.to_actor,
+            .write_ch = &self.write_ch,
+            .sock = sock,
+            .recv_buf = self.recv_buf,
+            .site = &self.site,
+            .completions = &self.acks,
+            .ack_apply = if (comptime mutant_no_ack_sink) null else h1AckSink,
+            .ack_ctx = self,
+            .gpa = gpa,
+            .chunk_storage = self.chunk_storage,
+            .n_chunks = 1,
+            .write_free = &self.write_pool,
+            .live_task_handlers = &self.live_handlers,
+        };
+    }
+
+    /// Start the pump: its first receive is submitted.
+    pub fn arm(self: *H1Tls) error{TlsPumpStartFailed}!void {
+        const pump = self.pump.?;
+        if (!pump.start()) {
+            pump.shutdownCq();
+            return error.TlsPumpStartFailed;
+        }
+        self.armed = true;
+    }
+
+    /// The pump, from a successful `arm` until `close`; null otherwise.
+    pub fn running(self: *H1Tls) ?*tls_edge.Pump {
+        return if (self.armed) self.pump.? else null;
+    }
+
+    /// The connection ended. If the pump is running: stop the queue
+    /// (cancel and drain what is in flight; nothing more reaches the
+    /// pump's handlers), then give back the write chunk the pump still
+    /// holds (queued behind a full staging buffer): `deinit` checks that it
+    /// came home. A connection that ends under a handler's TLS write can
+    /// leave one there (round 1 of the step-7 review found it with the
+    /// multi-chunk test). The `fail_all` this posts goes to the sink. Call
+    /// it before the socket closes: the cancel names the socket.
+    pub fn close(self: *H1Tls) void {
+        if (!self.armed) return;
+        self.armed = false;
+        const pump = self.pump.?;
+        pump.shutdownCq();
+        pump.failDrain();
+    }
+
+    pub fn deinit(self: *H1Tls, gpa: std.mem.Allocator) void {
+        if (self.armed) std.debug.panic("h1: H1Tls.deinit with the TLS pump still running; close() it first, while the socket is open", .{});
+        if (self.pump) |p| gpa.destroy(p);
+        if (self.recv_buf.len != 0) gpa.free(self.recv_buf);
+        if (self.chunk_storage.len != 0) gpa.free(self.chunk_storage);
+        if (self.to_actor_buf.len != 0) gpa.free(self.to_actor_buf);
+        if (self.write_ch_buf.len != 0) gpa.free(self.write_ch_buf);
+        if (self.ack_buf.len != 0) gpa.free(self.ack_buf);
+        // Checks that the write chunk came home.
+        if (self.out.len != 0) self.write_pool.deinit(gpa);
+        self.* = .{};
+    }
+};
+
 fn tlsNetHandle(h: std.Io.net.Socket.Handle) zio.ev.Backend.NetHandle {
     return if (@typeInfo(zio.ev.Backend.NetHandle) == .pointer) @ptrCast(h) else h;
 }
 
 fn startTlsPump(self: *H1Conn) !void {
     const t = self.tls orelse return;
-    const gpa = self.gpa;
-    self.tls_recv_buf = try gpa.alloc(u8, limits_mod.TLS_CIPHER_CHUNK_SIZE);
-    self.tls_chunk_storage = try gpa.alloc(u8, limits_mod.WIRE_CHUNK_SIZE);
-    self.tls_to_actor_buf = try gpa.alloc(wire_pump.WireChunk, 1);
-    self.tls_write_ch_buf = try gpa.alloc(wire_pump.WireChunk, 4);
-    self.tls_ack_buf = try gpa.alloc(wire_pump.WriteCompletion, 4);
-    self.tls_write_pool = try slab_pool.SlabPool.init(gpa, self.io, limits_mod.WIRE_CHUNK_SIZE, 1);
-    self.tls_out = self.tls_write_pool.slabAt(0);
-
-    self.tls_to_actor = .init(self.tls_to_actor_buf);
-    self.tls_write_ch = .init(self.tls_write_ch_buf);
-    self.tls_acks = .init(self.tls_ack_buf);
     self.tls_req_ch = .init(&self.tls_req_buf);
     self.tls_ok_ch = .init(&self.tls_ok_buf);
-
-    const pump = try gpa.create(tls_edge.Pump);
-    errdefer gpa.destroy(pump);
-    pump.* = .{
-        .io = self.io,
-        .conn = t,
-        .to_actor = &self.tls_to_actor,
-        .write_ch = &self.tls_write_ch,
-        .sock = tlsNetHandle(self.stream.socket.handle),
-        .recv_buf = self.tls_recv_buf,
-        .site = &self.tls_site,
-        .completions = &self.tls_acks,
-        .ack_apply = h1AckSink,
-        .ack_ctx = self,
-        .gpa = gpa,
-        .chunk_storage = self.tls_chunk_storage,
-        .n_chunks = 1,
-        .write_free = &self.tls_write_pool,
-        .live_task_handlers = &self.tls_live_handlers,
-    };
-    if (!pump.start()) {
-        pump.shutdownCq();
-        return error.TlsPumpStartFailed;
-    }
-    self.tls_pump = pump;
+    try self.tls_t.init(self.gpa, self.io, t, tlsNetHandle(self.stream.socket.handle));
+    try self.tls_t.arm();
 }
 
 fn runLoop(self: *H1Conn) !void {
@@ -775,7 +844,7 @@ fn takeTlsPending(pump: *tls_edge.Pump, buf: []u8) ?usize {
 }
 
 fn driveTlsUntilIdle(self: *H1Conn) response.ResponseError!void {
-    const pump = self.tls_pump orelse return;
+    const pump = self.tls_t.running() orelse return;
     var clock: TlsWriteClock = .start(self, pump);
     while (pump.pending_n > 0 or pump.send_armed) {
         if (clock.expired(self, pump)) return tlsWriteTimedOut(self);
@@ -848,7 +917,7 @@ const CqOutcome = enum { more, exit };
 /// (`Pump.onCqComplete` said so, or the queue is drained), and the caller
 /// must not submit more.
 fn waitTlsCq(self: *H1Conn, deadline_ns: ?u64) error{Canceled}!CqOutcome {
-    const pump = self.tls_pump orelse return .exit;
+    const pump = self.tls_t.running() orelse return .exit;
     const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
     const timeout: zio.Timeout = if (deadline_ns) |d| blk: {
         const now = nowNs(self.io);
@@ -871,7 +940,7 @@ fn waitTlsCq(self: *H1Conn, deadline_ns: ?u64) error{Canceled}!CqOutcome {
 }
 
 fn readSomeTls(self: *H1Conn, buf: []u8, deadline_ns: u64) !?usize {
-    const pump = self.tls_pump orelse return error.TlsReadFailed;
+    const pump = self.tls_t.running() orelse return error.TlsReadFailed;
     if (takeTlsPending(pump, buf)) |n| return n;
     if (pump.inbound_eof) return @as(usize, 0);
     while (true) {
@@ -1312,16 +1381,16 @@ fn ackTlsWrite(self: *H1Conn, ok: bool) void {
 /// failed and gave back what it held), and the caller ends the connection;
 /// nothing more may be submitted to it.
 fn driveHandlerTlsWrite(self: *H1Conn, n: u32) bool {
-    const pump = self.tls_pump orelse {
+    const pump = self.tls_t.running() orelse {
         ackTlsWrite(self, false);
         return true;
     };
-    const idx = self.tls_write_pool.tryRentIndex(self.io) orelse {
+    const idx = self.tls_t.write_pool.tryRentIndex(self.io) orelse {
         ackTlsWrite(self, false);
         return true;
     };
     var chunk = wire_pump.WireChunk{
-        .bytes = self.tls_out[0..n],
+        .bytes = self.tls_t.out[0..n],
         .len = n,
         .pool_index = idx,
     };
@@ -1342,7 +1411,7 @@ fn driveHandlerTlsWrite(self: *H1Conn, n: u32) bool {
 }
 
 fn ingestTlsPeer(self: *H1Conn) bool {
-    const pump = self.tls_pump orelse return false;
+    const pump = self.tls_t.running() orelse return false;
     if (pump.inbound_eof) return true;
     if (pump.pending_read == null and pump.conn.pendingInbound()) {
         switch (pump.readOne()) {
@@ -1363,7 +1432,7 @@ fn ingestTlsPeer(self: *H1Conn) bool {
 /// handler reported (`releaseRequest`), or when the connection ends under it
 /// (`endHandler`, which never waits for handler code).
 fn waitDispatchTls(self: *H1Conn) !void {
-    const pump = self.tls_pump.?;
+    const pump = self.tls_t.running().?;
     const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
     while (self.link) |link| {
         if (shutdownRequested(self)) {
@@ -1452,7 +1521,7 @@ fn waitDispatchTls(self: *H1Conn) !void {
 /// the socket itself (inside its gate); the actor keeps reading, so a
 /// pipelined request is kept and the peer's close is seen.
 fn waitDispatch(self: *H1Conn) !void {
-    if (self.tls_pump != null) return waitDispatchTls(self);
+    if (self.tls_t.running() != null) return waitDispatchTls(self);
     const shutdown_ev = self.config.shutdown_event orelse &no_shutdown_event;
     while (self.link != null) {
         if (shutdownRequested(self)) {
@@ -1554,7 +1623,7 @@ fn endHandler(self: *H1Conn, cause: response.TerminalCause) void {
     link.core.terminal.setCause(cause);
     self.dead.set();
     if (!self.socket_closed) self.stream.shutdown(self.io, .both) catch {};
-    if (self.tls_pump != null) {
+    if (self.tls_t.running() != null) {
         self.tls_req_ch.close(.immediate);
         self.tls_ok_ch.close(.immediate);
     }
@@ -1904,8 +1973,8 @@ fn writeRaw(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
 fn writeRawTlsFromHandler(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = @min(bytes.len - off, self.tls_out.len);
-        @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
+        const n = @min(bytes.len - off, self.tls_t.out.len);
+        @memcpy(self.tls_t.out[0..n], bytes[off..][0..n]);
         // Teardown closes this channel too (`endHandler`): a handler that got
         // the ack for one chunk meets it closed at the next.
         self.tls_req_ch.send(@intCast(n)) catch return writeFailedCause(self);
@@ -1916,14 +1985,14 @@ fn writeRawTlsFromHandler(self: *H1Conn, bytes: []const u8) response.ResponseErr
 }
 
 fn writeRawTlsOwner(self: *H1Conn, bytes: []const u8) response.ResponseError!void {
-    const pump = self.tls_pump orelse return error.WriteFailed;
+    const pump = self.tls_t.running() orelse return error.WriteFailed;
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = @min(bytes.len - off, self.tls_out.len);
-        @memcpy(self.tls_out[0..n], bytes[off..][0..n]);
-        const idx = self.tls_write_pool.tryRentIndex(self.io) orelse return error.WriteFailed;
+        const n = @min(bytes.len - off, self.tls_t.out.len);
+        @memcpy(self.tls_t.out[0..n], bytes[off..][0..n]);
+        const idx = self.tls_t.write_pool.tryRentIndex(self.io) orelse return error.WriteFailed;
         var chunk = wire_pump.WireChunk{
-            .bytes = self.tls_out[0..n],
+            .bytes = self.tls_t.out[0..n],
             .len = n,
             .pool_index = idx,
         };
@@ -1980,7 +2049,7 @@ test "a TLS handler write that meets the closed request channel fails with the c
     var out: [64]u8 = undefined;
     var req_buf: [1]u32 = undefined;
     var ok_buf: [1]bool = undefined;
-    conn.tls_out = &out;
+    conn.tls_t.out = &out;
     conn.tls_req_ch = .init(&req_buf);
     conn.tls_ok_ch = .init(&ok_buf);
     var link: H1Link = .{
@@ -2007,15 +2076,15 @@ test "a write from a task that is not the actor never takes the actor's TLS path
     // is not the actor (a unit test runs on no zio task), and teardown has
     // closed the channels: the write must go the handler's way and fail with
     // the cause, never touch the pump (there is none: a dangling `tls`, no
-    // `tls_pump`).
+    // running pump).
     var conn: H1Conn = undefined;
     if (@hasField(H1Conn, "offload_tls_io")) @field(conn, "offload_tls_io") = false;
     conn.tls = @ptrFromInt(0x10000);
-    conn.tls_pump = null;
+    conn.tls_t = .{};
     var out: [64]u8 = undefined;
     var req_buf: [1]u32 = undefined;
     var ok_buf: [1]bool = undefined;
-    conn.tls_out = &out;
+    conn.tls_t.out = &out;
     conn.tls_req_ch = .init(&req_buf);
     conn.tls_ok_ch = .init(&ok_buf);
     var link: H1Link = .{

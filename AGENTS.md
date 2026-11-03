@@ -90,6 +90,7 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ./zb build h1-go-smoke  # HTTP/1.1 Go net/http oracle: keep-alive reuse and Expect 100-continue; ABORTS if go is missing
 ./zb build std-io-gate  # fails on any NEW std.Io concurrency abstraction; prints files and lines scanned
 ./zb build session-mu-gate  # fails on session_mu used outside lockSession/unlockSession, or a doorbell send outside ring; runs in ci
+./zb build dst-transport  # HTTP/1.1 TLS transport witness: control passes, the no-h1AckSink mutant must fail UnconsumedTlsAck and replay identically; runs in ci
 ```
 
 **`zig build test` reaches only part of the TLS edge.** `tests/h1_battery.zig`

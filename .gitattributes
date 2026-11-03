@@ -1,0 +1,3 @@
+# git archive writes the commit into this file; the transport witness
+# derives its seeds and build identity from it (tests/dst_tls_lifecycle.zig).
+tests/dst_commit.txt export-subst

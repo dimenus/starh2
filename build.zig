@@ -159,11 +159,30 @@ fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *st
     mod.linkLibrary(lib);
 }
 
-fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, wire_ring: bool, zio_scheduling: ZioScheduling) void {
+/// `dst_mutant_no_h1_ack_sink` is true only on the transport witness's
+/// mutant module (`dst-transport`); every other module passes false.
+/// The commit this build is from, for the transport witness's seeds and
+/// build identity, or "" when there is none to read: not a git checkout
+/// (a `git archive` export carries it in `tests/dst_commit.txt` instead),
+/// or a tree nested inside some other repository, whose HEAD is not ours.
+/// "-dirty" is appended when tracked files differ from HEAD.
+fn gitCommit(b: *std.Build) []const u8 {
+    const root = b.root.toString(b.graph.arena) catch @panic("OOM");
+    var code: u8 = 0;
+    const cdup = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--show-cdup" }, &code, .ignore) catch return "";
+    if (std.mem.trim(u8, cdup, " \r\n\t").len != 0) return "";
+    const head = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "HEAD" }, &code, .ignore) catch return "";
+    const sha = std.mem.trim(u8, head, " \r\n\t");
+    _ = b.runAllowFail(&.{ "git", "-C", root, "diff", "--quiet", "HEAD", "--" }, &code, .ignore) catch return b.fmt("{s}-dirty", .{sha});
+    return sha;
+}
+
+fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, wire_ring: bool, zio_scheduling: ZioScheduling, dst_mutant_no_h1_ack_sink: bool) void {
     const opts = b.addOptions();
     opts.addOption(bool, "observe", observe);
     opts.addOption(bool, "wire_ring", wire_ring);
     opts.addOption(ZioScheduling, "zio_scheduling", zio_scheduling);
+    opts.addOption(bool, "dst_mutant_no_h1_ack_sink", dst_mutant_no_h1_ack_sink);
     mod.addOptions("build_options", opts);
 }
 
@@ -232,7 +251,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, starh2_mod, observe_hot, wire_ring, zio_scheduling);
+    attachStarh2Options(b, starh2_mod, observe_hot, wire_ring, zio_scheduling, false);
     // Encoder only on the production module (static lib — see brotliEncLib).
     // Decoder is linked only into test artifacts that round-trip.
     const brotli_enc = brotliEncLib(b, brotli_dep, target, optimize, "brotli_enc");
@@ -276,7 +295,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio_dep.module("zio") },
         },
     });
-    attachStarh2Options(b, lib_test_mod, true, false, zio_scheduling);
+    attachStarh2Options(b, lib_test_mod, true, false, zio_scheduling, false);
     linkBrotliEnc(lib_test_mod, brotli_dep, brotli_enc);
     linkBrotliDec(lib_test_mod, brotli_dep, brotli_dec);
     const lib_tests = b.addTest(.{
@@ -764,6 +783,65 @@ pub fn build(b: *std.Build) void {
     const t3567_step = b.step("test-t3567", "Run the t-3567 gate: bare flush barriers against a held writer wait for room on h2c and TLS");
     t3567_step.dependOn(&run_t3567_tests.step);
 
+    // The HTTP/1.1 TLS transport witness (DST stage 1,
+    // `tests/dst_tls_lifecycle.zig`). Two builds of the same source: the
+    // control, and the mutant whose shared constructor leaves the ack sink
+    // out (`h1.mutant_no_ack_sink`). Each has its own starh2 module, observe
+    // on in every optimize mode, because the witness drives the pump through
+    // `Pump.test_io`. `tools/dst/transport.sh` requires the control to pass
+    // its floors and the mutant to fail with `UnconsumedTlsAck`, the same
+    // case and trace twice more from its printed replay command. Debug
+    // always, dependencies included, whatever `-Doptimize` says: the slab
+    // pool's double-release assert and the pump's own asserts are part of
+    // the witness's oracle, and a ReleaseFast build drops them (the witness
+    // refuses to compile without runtime safety).
+    const dst_optimize: std.builtin.OptimizeMode = .debug;
+    const dst_zio = b.dependency("zio", .{
+        .target = target,
+        .optimize = dst_optimize,
+        .scheduling = zio_scheduling,
+    }).module("zio");
+    const dst_tls = b.dependency("tls", .{ .target = target, .optimize = dst_optimize }).module("tls");
+    const dst_brotli_enc = brotliEncLib(b, brotli_dep, target, dst_optimize, "brotli_enc_dst");
+    const dst_opts = b.addOptions();
+    dst_opts.addOption([]const u8, "git_commit", gitCommit(b));
+    var dst_bins: [2]*std.Build.Step.Compile = undefined;
+    for ([_]bool{ false, true }, 0..) |mutant, i| {
+        const dst_starh2 = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = dst_optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "tls", .module = dst_tls },
+                .{ .name = "zio", .module = dst_zio },
+            },
+        });
+        attachStarh2Options(b, dst_starh2, true, false, zio_scheduling, mutant);
+        linkBrotliEnc(dst_starh2, brotli_dep, dst_brotli_enc);
+        dst_bins[i] = b.addExecutable(.{
+            .name = if (mutant) "dst-transport-mutant" else "dst-transport-control",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/dst_tls_lifecycle.zig"),
+                .target = target,
+                .optimize = dst_optimize,
+                .imports = &.{
+                    .{ .name = "starh2", .module = dst_starh2 },
+                    .{ .name = "zio", .module = dst_zio },
+                    .{ .name = "dst_options", .module = dst_opts.createModule() },
+                },
+            }),
+        });
+    }
+    const dst_transport_run = b.addSystemCommand(&.{ "sh", "tools/dst/transport.sh" });
+    dst_transport_run.addArtifactArg(dst_bins[0]);
+    dst_transport_run.addArtifactArg(dst_bins[1]);
+    dst_transport_run.setCwd(b.path("."));
+    dst_transport_run.has_side_effects = true;
+    dst_transport_run.stdio = .inherit;
+    const dst_transport_step = b.step("dst-transport", "HTTP/1.1 TLS transport witness: the control passes every enumerated and seeded case; the mutant without h1AckSink fails UnconsumedTlsAck and replays identically twice");
+    dst_transport_step.dependOn(&dst_transport_run.step);
+
     const t3562_tests = b.addTest(.{
         .name = "t3562",
         .root_module = b.createModule(.{
@@ -1146,7 +1224,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zio", .module = zio_rt.module("zio") },
             },
         });
-        attachStarh2Options(b, starh2_rt, false, false, zio_scheduling);
+        attachStarh2Options(b, starh2_rt, false, false, zio_scheduling, false);
         const brotli_enc_rt = brotliEncLib(b, brotli_rt, rt, .safe, b.fmt("brotli_enc_{s}", .{rq.name}));
         linkBrotliEnc(starh2_rt, brotli_rt, brotli_enc_rt);
         const datastar_mod_rt = b.createModule(.{
@@ -1370,9 +1448,10 @@ pub fn build(b: *std.Build) void {
     const session_mu_gate_step = b.step("session-mu-gate", "Fail on any use of the session mutex outside lockSession/unlockSession, or a send on the actor bell outside ring");
     session_mu_gate_step.dependOn(&session_mu_gate_run.step);
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + every release target + every artifact a named step or the install step compiles");
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + every artifact a named step or the install step compiles");
     ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(&session_mu_gate_run.step);
+    ci_step.dependOn(&dst_transport_run.step);
     ci_step.dependOn(test_step);
     // Placement and balancer gates; each test says what it checks under the
     // scheduling this `ci` was built with.
