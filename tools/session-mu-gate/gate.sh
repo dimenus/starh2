@@ -11,7 +11,7 @@
 # the lock and forget the wake.
 #
 # That only holds if nothing else touches the mutex or the doorbell. A direct
-# `self.session_mu.unlock(io)` skips the ring, and so does an alias.
+# `self.session_mu.unlock()` skips the ring, and so does an alias.
 #
 # WHAT THIS GATE IS, AND IS NOT. It catches an ACCIDENTAL direct use: the shape
 # every past hang had (someone calls the mutex or the doorbell directly, or takes
@@ -220,10 +220,10 @@ while read -r f; do
     }
     END {
       conn = (file ~ /src\/edge\/connection\.zig$/)
-      T_DECL = "session_mu: std.Io.Mutex = .init,"
-      T_LOCK = "self.session_mu.lock(self.config.io) catch return error.Canceled;"
-      T_LOCKU = "self.session_mu.lockUncancelable(io);"
-      T_UNLOCK = "self.session_mu.unlock(io);"
+      T_DECL = "session_mu: zio.Mutex = .init,"
+      T_LOCK = "self.session_mu.lock() catch return error.Canceled;"
+      T_LOCKU = "self.session_mu.lockUncancelable();"
+      T_UNLOCK = "self.session_mu.unlock();"
       B_DECL = "doorbell: zio.Channel(u8) = undefined,"
       B_INIT = "self.doorbell = .init(&self.doorbell_buf);"
       B_SEND = "self.doorbell.trySend(0) catch |err| switch (err) {"

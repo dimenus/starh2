@@ -2091,7 +2091,7 @@ pub const Connection = struct {
     closing_peer_eof: bool = false,
     /// Production fair scheduler — sole emit path for controls + DATA.
     sched: fair_scheduler.FairScheduler = undefined,
-    session_mu: std.Io.Mutex = .init,
+    session_mu: zio.Mutex = .init,
     /// One-shot teardown event. Set once, never reset. Handlers select on
     /// this OR their work. Same shape as `ConnConfig.shutdown_event`.
     dead: zio.Event = .init,
@@ -3593,8 +3593,8 @@ pub const Connection = struct {
         defer zio.endShield();
         self.tickets.wait(slot_i, terminal) catch |err| {
             if (terminal.getCause()) |c| return response.causeToError(c);
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
+            self.lockSessionUncancelable();
+            defer self.unlockSession();
             return response.mapFailedTicketWait(terminal, self.session.tombstoneCode(stream_id), err);
         };
     }
@@ -3846,8 +3846,8 @@ pub const Connection = struct {
         _ = self.drainCompletions();
         try self.drainPendingCompleteReceipts(false);
         if (self.writer_failed.load(.acquire)) return .failed;
-        self.lockSessionUncancelable(self.config.io);
-        defer self.unlockSession(self.config.io);
+        self.lockSessionUncancelable();
+        defer self.unlockSession();
         if (self.session.terminal != .none) return .terminal;
         return .go;
     }
@@ -3919,8 +3919,8 @@ pub const Connection = struct {
     /// Returns true when Session became terminal.
     fn ingestWireChunk(self: *Connection, chunk: wire_pump.WireChunk) !bool {
         const io = self.config.io;
-        self.lockSessionUncancelable(io);
-        defer self.unlockSession(io);
+        self.lockSessionUncancelable();
+        defer self.unlockSession();
         self.session.edge_now_ns = nowNs(io);
         try self.ingestAndProcess(chunk.bytes[0..chunk.len]);
         // Start closing here, under the hold ingest already has, so the
@@ -4771,8 +4771,8 @@ pub const Connection = struct {
         // reaches Session before any byte the pump received. Emit after the CQ is armed so queueWire can
         // encrypt.
         {
-            self.lockSessionUncancelable(io);
-            defer self.unlockSession(io);
+            self.lockSessionUncancelable();
+            defer self.unlockSession();
             try self.flushSessionIntents();
             if (self.config.tls_leftover.len != 0) {
                 std.debug.assert(self.config.mode == .tls);
@@ -4817,9 +4817,9 @@ pub const Connection = struct {
 
             {
                 diagActor(self, .loop_lock);
-                self.lockSessionUncancelable(io);
+                self.lockSessionUncancelable();
                 diagActor(self, .lk_checks);
-                defer self.unlockSession(io);
+                defer self.unlockSession();
                 defer diagActor(self, .running);
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
                 // `.transport` is the writer-failed terminal: nothing to deliver.
@@ -5033,8 +5033,8 @@ pub const Connection = struct {
         if (comptime test_observe) _ = test_actor_teardowns.fetchAdd(1, .release);
         self.closeWriterQueues();
         {
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
+            self.lockSessionUncancelable();
+            defer self.unlockSession();
             self.freezeAndSweepLocked();
         }
         zio.beginShield();
@@ -5094,9 +5094,9 @@ pub const Connection = struct {
             const chunk = try self.receiveUntilDeadline();
             defer self.recycleReadChunk(chunk);
             if (chunk.len == 0) return error.ConnectionClosed;
-            self.lockSessionUncancelable(self.config.io);
+            self.lockSessionUncancelable();
             {
-                defer self.unlockSession(self.config.io);
+                defer self.unlockSession();
                 try self.ingestAndProcess(chunk.bytes[0..chunk.len]);
                 // A bad preface is a connection error. Return to the main
                 // loop, which delivers its GOAWAY.
@@ -5516,8 +5516,8 @@ pub const Connection = struct {
     /// `teardownExhaustive`.
     fn detachTlsPump(self: *Connection) void {
         self.closeWriterQueues();
-        self.lockSessionUncancelable(self.config.io);
-        defer self.unlockSession(self.config.io);
+        self.lockSessionUncancelable();
+        defer self.unlockSession();
         self.tls_driver = null;
     }
 
@@ -5564,9 +5564,8 @@ pub const Connection = struct {
         if (self.closing_peer_eof) return;
         self.closing_peer_eof = true;
         if (comptime test_observe) _ = test_peer_eofs.fetchAdd(1, .monotonic);
-        const io = self.config.io;
-        self.lockSessionUncancelable(io);
-        defer self.unlockSession(io);
+        self.lockSessionUncancelable();
+        defer self.unlockSession();
         if (self.closing_deadline_ns != null) return;
         if (self.session.terminal == .none) {
             self.session.peerClosed() catch |err| try self.sessionErrorExit(err, "peer_eof_error");
@@ -6109,7 +6108,7 @@ pub const Connection = struct {
             _ = self.ack_room_waiters.fetchAdd(1, .seq_cst); // W1
             defer _ = self.ack_room_waiters.fetchSub(1, .seq_cst);
             if (self.barrierRoomSeqCst()) return; // R1
-            self.unlockSession(self.config.io);
+            self.unlockSession();
             const wait_res: anyerror!void = if (event) |e| blk: {
                 const winner = zio.select(.{
                     .space = e,
@@ -6120,7 +6119,7 @@ pub const Connection = struct {
                     .dead => error.Canceled,
                 };
             } else error.Canceled;
-            self.lockSessionUncancelable(self.config.io);
+            self.lockSessionUncancelable();
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             wait_res catch return error.Canceled;
@@ -6217,7 +6216,7 @@ pub const Connection = struct {
             // cleared, after which wait would never return.
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
-            self.unlockSession(self.config.io);
+            self.unlockSession();
             const wait_res: anyerror!void = if (event) |e| blk: {
                 const winner = zio.select(.{
                     .space = e,
@@ -6228,7 +6227,7 @@ pub const Connection = struct {
                     .dead => error.Canceled,
                 };
             } else error.Canceled;
-            self.lockSessionUncancelable(self.config.io);
+            self.lockSessionUncancelable();
             if (terminal.getCause()) |c| return response.causeToError(c);
             if (self.writer_failed.load(.acquire)) return error.WriteFailed;
             wait_res catch {
@@ -6378,7 +6377,6 @@ pub const Connection = struct {
     /// `Limits.resourceUpperBound`; the ack frees them) and by granted bytes whose
     /// handler only needs `session_mu` to copy them.
     fn parkForBudget(self: *Connection, hctx: *HandlerCtx, stream_id: u31, need: usize) response.ResponseError!void {
-        const io = self.config.io;
         const terminal = hctx.terminal;
         if (terminal.getCause()) |c| return response.causeToError(c);
         if (self.writer_failed.load(.acquire)) return error.WriteFailed;
@@ -6411,7 +6409,7 @@ pub const Connection = struct {
                 _ = self.budget_parks.fetchAdd(1, .monotonic);
                 if (comptime test_observe) _ = test_budget_waits.fetchAdd(1, .monotonic);
             }
-            self.unlockSession(io);
+            self.unlockSession();
             const wait_res: anyerror!void = blk: {
                 const winner = zio.select(.{
                     .space = event,
@@ -6422,7 +6420,7 @@ pub const Connection = struct {
                     .dead => error.Canceled,
                 };
             };
-            self.lockSessionUncancelable(io);
+            self.lockSessionUncancelable();
             wait_res catch {
                 self.abandonBudget(slot, i);
                 if (terminal.getCause()) |c| return response.causeToError(c);
@@ -8447,8 +8445,8 @@ pub const Connection = struct {
         }
 
         const queued_n: usize = blk: {
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
+            self.lockSessionUncancelable();
+            defer self.unlockSession();
             break :blk self.inline_n;
         };
         if (queued_n == 0) return;
@@ -8526,8 +8524,8 @@ pub const Connection = struct {
         var canceled = false;
         var receipt_trace: ?SendTrace = null;
         {
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
+            self.lockSessionUncancelable();
+            defer self.unlockSession();
 
             i = 0;
             while (i < batch_n) : (i += 1) {
@@ -8609,8 +8607,8 @@ pub const Connection = struct {
         _ = self.drainCompletions();
 
         {
-            self.lockSessionUncancelable(self.config.io);
-            defer self.unlockSession(self.config.io);
+            self.lockSessionUncancelable();
+            defer self.unlockSession();
             std.debug.assert(self.inline_n >= batch_n);
             const rest = self.inline_n - batch_n;
             if (rest != 0) {
@@ -8639,13 +8637,13 @@ pub const Connection = struct {
 
     fn withSession(self: *Connection, comptime f: anytype, arg: anytype) void {
         self.lockSession() catch return;
-        defer self.unlockSession(self.config.io);
+        defer self.unlockSession();
         f(self, arg);
     }
 
     fn lockSession(self: *Connection) response.ResponseError!void {
         assertNotInShutdownSweep();
-        self.session_mu.lock(self.config.io) catch return error.Canceled;
+        self.session_mu.lock() catch return error.Canceled;
         self.session_held = true;
     }
 
@@ -8653,14 +8651,14 @@ pub const Connection = struct {
     /// this and `unlockSession`, so `session_held` cannot drift from the mutex
     /// and every release by a task that is not the actor rings it. Do not call
     /// the mutex directly: `./zb build session-mu-gate` fails the build.
-    fn lockSessionUncancelable(self: *Connection, io: std.Io) void {
+    fn lockSessionUncancelable(self: *Connection) void {
         assertNotInShutdownSweep();
         if (diag_park) {
             self.actor_site.store(3, .release);
-            self.session_mu.lockUncancelable(io);
+            self.session_mu.lockUncancelable();
             self.actor_site.store(1, .release);
         } else {
-            self.session_mu.lockUncancelable(io);
+            self.session_mu.lockUncancelable();
         }
         self.session_held = true;
     }
@@ -8709,7 +8707,7 @@ pub const Connection = struct {
     /// ringing itself for work it made after its turn's check (`tryDispatch`'s
     /// `inline_n`, the inline entry in `grantBudgetLocked`), and changes made
     /// with no `session_mu` at all (wire releases on the actor).
-    fn unlockSession(self: *Connection, io: std.Io) void {
+    fn unlockSession(self: *Connection) void {
         // Every lock section materializes what it queued before it lets go,
         // so the next one starts its batch from an empty queue: the intent
         // bound (`Limits.intentEntriesMin`) counts one batch at a time.
@@ -8721,7 +8719,7 @@ pub const Connection = struct {
         // Cleared while the mutex is still held, or the next holder would see a
         // stale false.
         self.session_held = false;
-        self.session_mu.unlock(io);
+        self.session_mu.unlock();
         if (actor_marker.get() != self) {
             // Two counters, because one cannot be right (`lostWakeSince`).
             const seq = if (comptime test_observe) self.releaseStarted() else 0;
@@ -9162,7 +9160,7 @@ pub const Connection = struct {
         {
             try self.lockSession();
             if (traced) t_acquired = nowNs(self.config.io);
-            defer self.unlockSession(self.config.io);
+            defer self.unlockSession();
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
             var stack_hpack: [32]hpack.HeaderField = undefined;
             const fields = try prepareResponseHeaderFields(hctx.arena, &stack_hpack, headers, compress, add_vary, compress, false);
@@ -9284,7 +9282,7 @@ pub const Connection = struct {
             diagWait(hctx, .start_lock);
             try self.lockSession();
             diagWait(hctx, .running);
-            defer self.unlockSession(self.config.io);
+            defer self.unlockSession();
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
             var hlist: std.ArrayList(hpack.HeaderField) = .empty;
             appendResponseHeaders(hctx.arena, &hlist, headers, .{
@@ -9501,7 +9499,7 @@ pub const Connection = struct {
             try self.lockSession();
             diagWait(hctx, .write_space_or_enqueue);
             if (traced) t_acquired = nowNs(self.config.io);
-            defer self.unlockSession(self.config.io);
+            defer self.unlockSession();
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
             // The handler enqueues and leaves. It does NOT drain.
             //
@@ -9617,7 +9615,7 @@ pub const Connection = struct {
                 {
                     errdefer self.tickets.releaseReserved(slot_i);
                     try self.lockSession();
-                    defer self.unlockSession(self.config.io);
+                    defer self.unlockSession();
                     try self.refuseIfStreamDead(stream_id, hctx.terminal);
                     self.enqueuePending(stream_id, out.items, false, ticket, slot_i, hctx) catch |err| return err;
                     self.processIntents() catch {
@@ -9635,7 +9633,7 @@ pub const Connection = struct {
         {
             errdefer self.tickets.releaseReserved(slot_i);
             try self.lockSession();
-            defer self.unlockSession(self.config.io);
+            defer self.unlockSession();
             try self.refuseIfStreamDead(stream_id, hctx.terminal);
             if (self.sched.findPending(stream_id)) |pw| {
                 if (pw.len > 0 or pw.end_stream) {
@@ -9672,7 +9670,7 @@ pub const Connection = struct {
             }
         }
         try self.lockSession();
-        defer self.unlockSession(self.config.io);
+        defer self.unlockSession();
         if (comptime test_observe) {
             const dwell = test_abort_dwell_ms.load(.acquire);
             if (dwell != 0) {
@@ -9718,8 +9716,8 @@ pub const BenchHop = struct {
     /// that `processIntents` queued. Not part of the timed hop.
     pub fn preparePreface(self: *BenchHop) !void {
         {
-            self.conn.lockSessionUncancelable(self.conn.config.io);
-            defer self.conn.unlockSession(self.conn.config.io);
+            self.conn.lockSessionUncancelable();
+            defer self.conn.unlockSession();
             try self.conn.session.ingest(frame.CLIENT_PREFACE);
             var settings_header: [frame.FRAME_HEADER_LEN]u8 = undefined;
             (frame.FrameHeader{
@@ -9738,8 +9736,8 @@ pub const BenchHop = struct {
     /// emit through the scheduler, complete the receipt locally.
     pub fn completeOneshot(self: *BenchHop, headers_frame: []const u8) !usize {
         {
-            self.conn.lockSessionUncancelable(self.conn.config.io);
-            defer self.conn.unlockSession(self.conn.config.io);
+            self.conn.lockSessionUncancelable();
+            defer self.conn.unlockSession();
             self.conn.session.windows.conn_send = flow.INITIAL_WINDOW;
             try self.conn.session.ingest(headers_frame);
             try self.conn.processIntents();
@@ -9921,8 +9919,8 @@ test "a connection-window wait ends when the peer's credit arrives, not at the n
         peer.close(io);
     }
     try hop.preparePreface();
-    hop.conn.lockSessionUncancelable(io);
-    defer hop.conn.unlockSession(io);
+    hop.conn.lockSessionUncancelable();
+    defer hop.conn.unlockSession();
     // DATA was ready with no connection credit: the wait began.
     hop.conn.session.windows.conn_send = 0;
     hop.conn.sched.conn_stall.begin(nowNs(io));
@@ -10077,8 +10075,8 @@ test "a full DATA frame is built in a write-pool chunk and reaches the pump with
     }).encode(headers[0..frame.FRAME_HEADER_LEN]);
     @memcpy(headers[frame.FRAME_HEADER_LEN..], &block);
     {
-        hop.conn.lockSessionUncancelable(io);
-        defer hop.conn.unlockSession(io);
+        hop.conn.lockSessionUncancelable();
+        defer hop.conn.unlockSession();
         hop.conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         try hop.conn.session.ingest(&headers);
         try hop.conn.processIntents();
@@ -10255,8 +10253,8 @@ test "budget: a DATA frame is counted once, pending until the pump has it, wire 
 
     var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
     {
-        hop.conn.lockSessionUncancelable(io);
-        defer hop.conn.unlockSession(io);
+        hop.conn.lockSessionUncancelable();
+        defer hop.conn.unlockSession();
         hop.conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         try hop.conn.session.ingest(hopRequestFrame(&req, 1));
         try hop.conn.processIntents();
@@ -10297,8 +10295,8 @@ test "budget: a packed batch of small DATA frames and controls releases exactly 
     try hop.preparePreface();
 
     {
-        hop.conn.lockSessionUncancelable(io);
-        defer hop.conn.unlockSession(io);
+        hop.conn.lockSessionUncancelable();
+        defer hop.conn.unlockSession();
         hop.conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
         for ([_]u31{ 1, 3, 5 }) |sid| try hop.conn.session.ingest(hopRequestFrame(&req, sid));
@@ -10341,8 +10339,8 @@ test "budget: an inline job waits for room and runs when it comes back, with no 
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(filler, .pending));
 
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
         try conn.session.ingest(hopRequestFrame(&req, 1));
@@ -10608,8 +10606,8 @@ test "budget: a grant that arrives with a reset or a failed writer goes back" {
 }
 
 fn parkedTaskMain(conn: *Connection, hctx: *HandlerCtx, out: *?anyerror) void {
-    conn.lockSessionUncancelable(conn.config.io);
-    defer conn.unlockSession(conn.config.io);
+    conn.lockSessionUncancelable();
+    defer conn.unlockSession();
     conn.parkForBudget(hctx, hctx.stream_id, 100) catch |err| {
         out.* = err;
     };
@@ -10682,8 +10680,8 @@ test "budget queue: a gated inline job is served in arrival order behind task wr
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
 
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
         try conn.session.ingest(hopRequestFrame(&req, 1));
@@ -10751,8 +10749,8 @@ test "budget queue: a complete job whose stream is reset while it waits leaves t
     const lim = conn.config.limits.outbound_bytes_per_connection;
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
         try conn.session.ingest(hopRequestFrame(&req, 1));
@@ -10763,8 +10761,8 @@ test "budget queue: a complete job whose stream is reset while it waits leaves t
 
     // Reset while queued: it leaves, nothing is owed.
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.handlers.storage[0].link.?.core.terminal.setCause(.server_shutdown);
         conn.wakeHandlerWaiters(1);
     }
@@ -10791,8 +10789,8 @@ fn inlineEntryHop(trap: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: []
     try trap.hop.preparePreface();
     const lim = conn.config.limits.outbound_bytes_per_connection;
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
-    conn.lockSessionUncancelable(io);
-    defer conn.unlockSession(io);
+    conn.lockSessionUncancelable();
+    defer conn.unlockSession();
     conn.session.windows.conn_send = flow.INITIAL_WINDOW;
     var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
     try conn.session.ingest(hopRequestFrame(&req, 1));
@@ -10824,8 +10822,8 @@ test "budget queue: a GRANTED complete job whose stream is reset gives its cap b
 
     // The stream is reset before the actor runs it: the cap goes back now.
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.handlers.storage[0].link.?.core.terminal.setCause(.server_shutdown);
         conn.wakeHandlerWaiters(1);
     }
@@ -10880,8 +10878,8 @@ test "budget queue: a writer failure grants a queued complete job and ends its s
 
     conn.writer_failed.store(true, .release);
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.handleWriterFailed();
     }
     // `handleWriterFailed` released the scheduler's DATA and that granted the
@@ -10916,8 +10914,8 @@ test "budget queue: admitting a complete job to an empty queue rings no bell; a 
     const conn = &hop.conn;
     try hop.preparePreface();
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
         try conn.session.ingest(hopRequestFrame(&req, 1));
@@ -10937,8 +10935,8 @@ test "budget queue: admitting a complete job to an empty queue rings no bell; a 
     const lim = conn.config.limits.outbound_bytes_per_connection;
     try std.testing.expectEqual(Connection.ReserveResult.ok, conn.tryReserveOutboundBytes(lim, .pending));
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
         try conn.session.ingest(hopRequestFrame(&req, 3));
         try conn.processIntents();
@@ -11112,8 +11110,8 @@ fn limitsForStreams(m: usize) !limits_mod.Limits {
 
 /// Feed `bytes` through the edge's own ingest loop, as one read chunk.
 fn trapIngest(conn: *Connection, bytes: []const u8) !void {
-    conn.lockSessionUncancelable(conn.config.io);
-    defer conn.unlockSession(conn.config.io);
+    conn.lockSessionUncancelable();
+    defer conn.unlockSession();
     try conn.ingestAndProcess(bytes);
 }
 
@@ -11143,8 +11141,8 @@ fn trapCollect(trap: *TrapHop, out: *TrapWire) !void {
     const conn = &trap.hop.conn;
     while (true) {
         {
-            conn.lockSessionUncancelable(conn.config.io);
-            defer conn.unlockSession(conn.config.io);
+            conn.lockSessionUncancelable();
+            defer conn.unlockSession();
             try conn.drainEmit();
         }
         var took = false;
@@ -11285,8 +11283,8 @@ fn gracefulFinishCase(m: usize) !void {
     const conn = &trap.hop.conn;
     try trap.hop.preparePreface();
     {
-        conn.lockSessionUncancelable(conn.config.io);
-        defer conn.unlockSession(conn.config.io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         // Open streams whose handlers have not answered (no dispatch: the
         // finish walks the session's map, which is what this needs).
         for (0..m) |i| {
@@ -11327,8 +11325,8 @@ test "a ticket travels with its own frame: a leftover HEADERS does not take the 
     const a = try conn.reserveTicket();
     const b = try conn.reserveTicket();
     {
-        conn.lockSessionUncancelable(conn.config.io);
-        defer conn.unlockSession(conn.config.io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         for ([_]u31{ 1, 3 }) |sid| {
             try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
             conn.session.active_streams += 1;
@@ -11382,8 +11380,8 @@ test "a header block is admitted whole: one ordinary entry left and a two-fragme
     const wide: [20 * 1024]u8 = @splat('w');
     const fields_wide = [_]hpack.HeaderField{.{ .name = "x-wide", .value = &wide }};
     {
-        conn.lockSessionUncancelable(conn.config.io);
-        defer conn.unlockSession(conn.config.io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         try conn.session.streams.put(1, .{ .id = 1, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
         conn.session.active_streams += 1;
         conn.session.highest_peer_stream = 1;
@@ -11435,8 +11433,8 @@ test "acks the edge refuses are owed and sent once the share has room (t-3562)" 
     // queues what is owed.
     conn.sched.ctrl.release(pinned, pinned);
     {
-        conn.lockSessionUncancelable(conn.config.io);
-        defer conn.unlockSession(conn.config.io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         try conn.materializeIntents();
     }
     try std.testing.expect(!conn.session.owed.any());
@@ -11473,8 +11471,8 @@ fn trapSettle(trap: *TrapHop, out: *TrapWire) !void {
     while (true) : (turns += 1) {
         if (turns > 64) return error.NeverSettled;
         {
-            conn.lockSessionUncancelable(conn.config.io);
-            defer conn.unlockSession(conn.config.io);
+            conn.lockSessionUncancelable();
+            defer conn.unlockSession();
             try conn.materializeIntents();
         }
         try trapCollect(trap, out);
@@ -11523,8 +11521,8 @@ test "graceful phase 1 with no ordinary frame left: the GOAWAY goes, the PING is
     try trap.hop.preparePreface();
     conn.session.stream_hooks.?.rentFrame = rentNoOrdinary;
     {
-        conn.lockSessionUncancelable(conn.config.io);
-        defer conn.unlockSession(conn.config.io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         try conn.session.applyCommand(.graceful_phase1);
         try conn.processIntents();
     }
@@ -11652,8 +11650,8 @@ test "a handler's own 503, refused by the ordinary share (its bytes spent), is r
     const refused_0 = test_ctrl_ordinary_pool_full.load(.monotonic);
     var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
     {
-        conn.lockSessionUncancelable(conn.config.io);
-        defer conn.unlockSession(conn.config.io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         try conn.session.ingest(hopRequestFrame(&req, 1));
         try conn.processIntents();
@@ -11730,9 +11728,9 @@ test "a failed round does not stop the next: intents a refusal queued are materi
         for (0..t_pinned) |_| conn.sched.ctrl.releaseTerminal(1);
     }
     {
-        conn.lockSessionUncancelable(conn.config.io);
+        conn.lockSessionUncancelable();
         // The unlock panics in a safe build if a round was skipped.
-        defer conn.unlockSession(conn.config.io);
+        defer conn.unlockSession();
         for ([_]u31{ 1, 3 }) |sid| {
             try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
             conn.session.active_streams += 1;
@@ -11765,8 +11763,8 @@ fn crossedInOneChunkCase(tombstones: usize) !void {
     defer test_hold_emit.store(false, .release);
     const m = lim.max_streams_per_connection;
     {
-        conn.lockSessionUncancelable(conn.config.io);
-        defer conn.unlockSession(conn.config.io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         for (0..m) |i| {
             const sid: u31 = @intCast(1 + 2 * i);
             try conn.session.streams.put(sid, .{ .id = sid, .state = .half_closed_remote, .window = .{ .send = flow.INITIAL_WINDOW } });
@@ -12019,7 +12017,7 @@ pub fn testTrapLockDuringShutdownSweep(io: std.Io) void {
     var node: @TypeOf(shutdown_sweep).Node = .unset;
     shutdown_sweep.set(&node, {});
     defer shutdown_sweep.clear(&node);
-    trap.hop.conn.lockSessionUncancelable(trap.hop.conn.config.io);
+    trap.hop.conn.lockSessionUncancelable();
 }
 
 /// Axis B arm: bind the sweep TaskLocal, then `lockSession`.
@@ -12318,7 +12316,7 @@ const ReleaseWay = enum { cancelable, uncancelable, error_return };
 
 fn releaseThenFail(conn: *Connection) !void {
     try conn.lockSession();
-    defer conn.unlockSession(conn.config.io);
+    defer conn.unlockSession();
     release_probe.store(42, .release);
     return error.Boom;
 }
@@ -12328,12 +12326,12 @@ fn releasingTask(conn: *Connection, way: ReleaseWay) void {
     switch (way) {
         .cancelable => {
             conn.lockSession() catch return;
-            defer conn.unlockSession(conn.config.io);
+            defer conn.unlockSession();
             release_probe.store(42, .release);
         },
         .uncancelable => {
-            conn.lockSessionUncancelable(conn.config.io);
-            defer conn.unlockSession(conn.config.io);
+            conn.lockSessionUncancelable();
+            defer conn.unlockSession();
             release_probe.store(42, .release);
         },
         .error_return => releaseThenFail(conn) catch {},
@@ -12412,7 +12410,6 @@ fn markerScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     defer trap_b.close();
     const a = &trap_a.hop.conn;
     const b = &trap_b.hop.conn;
-    const io = rt.io();
     drainDoorbell(a);
     drainDoorbell(b);
     const count_0 = a.releases_rung_max.load(.seq_cst);
@@ -12422,16 +12419,16 @@ fn markerScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // Bound to this connection: the task is its actor, and an unlock rings
     // nothing.
     actor_marker.set(&node, a);
-    a.lockSessionUncancelable(io);
-    a.unlockSession(io);
+    a.lockSessionUncancelable();
+    a.unlockSession();
     actor_marker.clear(&node);
     try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(u8, &a.doorbell));
     try std.testing.expectEqual(count_0, a.releases_rung_max.load(.seq_cst));
 
     // Bound to ANOTHER connection: still not this one's actor, so it rings.
     actor_marker.set(&node, b);
-    a.lockSessionUncancelable(io);
-    a.unlockSession(io);
+    a.lockSessionUncancelable();
+    a.unlockSession();
     actor_marker.clear(&node);
     try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &a.doorbell));
     try std.testing.expectEqual(count_0 + 1, a.releases_rung_max.load(.seq_cst));
@@ -12455,21 +12452,20 @@ fn coalesceScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try openTrapHop(&trap, gpa, rt.io());
     defer trap.close();
     const conn = &trap.hop.conn;
-    const io = rt.io();
     drainDoorbell(conn);
 
     // Repeated releases with the doorbell full return (a ring that blocked
     // would hang this test) and leave one token.
     for (0..5) |_| {
-        conn.lockSessionUncancelable(io);
-        conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        conn.unlockSession();
     }
     try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &conn.doorbell));
     // After the token is consumed, the next release makes a fresh one.
     try std.testing.expect(io_queue.tryRecv(u8, &conn.doorbell) != null);
     try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(u8, &conn.doorbell));
-    conn.lockSessionUncancelable(io);
-    conn.unlockSession(io);
+    conn.lockSessionUncancelable();
+    conn.unlockSession();
     try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &conn.doorbell));
 }
 
@@ -12495,7 +12491,6 @@ fn selfDispatchScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     defer trap.close();
     const hop = &trap.hop;
     const conn = &hop.conn;
-    const io = rt.io();
     try hop.preparePreface();
 
     // This task is the actor, as far as `unlockSession` can tell, so its unlock
@@ -12507,8 +12502,8 @@ fn selfDispatchScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     defer actor_marker.clear(&node);
     drainDoorbell(conn);
     {
-        conn.lockSessionUncancelable(io);
-        defer conn.unlockSession(io);
+        conn.lockSessionUncancelable();
+        defer conn.unlockSession();
         conn.session.windows.conn_send = flow.INITIAL_WINDOW;
         var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
         try conn.session.ingest(hopRequestFrame(&req, 1));
@@ -12588,7 +12583,6 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try openTrapHop(&trap, gpa, rt.io());
     defer trap.close();
     const conn = &trap.hop.conn;
-    const io = rt.io();
     hook_target = conn;
     defer {
         test_release_hook = null;
@@ -12601,8 +12595,8 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     drainDoorbell(conn);
     conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
     test_release_hook = actorTakesTokenAfterRing;
-    conn.lockSessionUncancelable(io);
-    conn.unlockSession(io);
+    conn.lockSessionUncancelable();
+    conn.unlockSession();
     test_release_hook = null;
     // The forced schedule ran: the hook was entered once, the actor took the
     // token (the doorbell is empty), and the release still counted.
@@ -12617,8 +12611,8 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     hook_false_alarm = false;
     conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
     test_release_hook = actorLooksBeforeRing;
-    conn.lockSessionUncancelable(io);
-    conn.unlockSession(io);
+    conn.lockSessionUncancelable();
+    conn.unlockSession();
     test_release_hook = null;
     // The hook ran once, between the start and the ring, and the ring then made
     // the token (the doorbell holds one).
@@ -12665,8 +12659,8 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     overlap_caught = false;
     drainDoorbell(conn);
     test_release_hook = overlapHook;
-    conn.lockSessionUncancelable(io);
-    conn.unlockSession(io);
+    conn.lockSessionUncancelable();
+    conn.unlockSession();
     test_release_hook = null;
     try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.after_ring)]);
     try std.testing.expect(overlap_caught);
