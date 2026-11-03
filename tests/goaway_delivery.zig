@@ -331,6 +331,11 @@ const Scenario = enum {
     graceful_slow_stream,
     /// h2c only: the client sends something that is not the HTTP/2 preface.
     bad_preface,
+    /// The client reads the server's preface and holds back its own, and the
+    /// server shuts down meanwhile. The server's SETTINGS already went out,
+    /// so this is an HTTP/2 connection: it must get a GOAWAY before the close
+    /// (found by DST stage 3, `dst-conn` seed 2).
+    shutdown_before_preface,
 };
 
 fn clientMain(port: u16, gpa: std.mem.Allocator, transport: Transport, scenario: Scenario, out: *Outcome) void {
@@ -350,6 +355,23 @@ fn runClient(port: u16, gpa: std.mem.Allocator, transport: Transport, scenario: 
         try wire.readUntil(out, deadline, null);
         return;
     }
+    if (scenario == .shutdown_before_preface) {
+        const settings_seen = struct {
+            fn f(o: *const Outcome) bool {
+                for (o.slice()) |s| {
+                    if (s.ftype == ftype_settings and s.flags & 0x1 == 0) return true;
+                }
+                return false;
+            }
+        }.f;
+        try wire.readUntil(out, deadline, settings_seen);
+        if (out.closed) return;
+        // The client preface is never sent: the server shuts down while it
+        // still waits for it.
+        out.ready.store(true, .release);
+        try wire.readUntil(out, deadline, null);
+        return;
+    }
 
     var req = try h2c.buildClientPrefaceAndSettings(gpa);
     defer req.deinit(gpa);
@@ -357,7 +379,7 @@ fn runClient(port: u16, gpa: std.mem.Allocator, transport: Transport, scenario: 
         .connection_error, .graceful => try h2c.appendHeaders(gpa, &req, 1, "/hello", true),
         .graceful_open_stream => try h2c.appendHeaders(gpa, &req, 1, "/sse", true),
         .graceful_slow_stream => try h2c.appendHeaders(gpa, &req, 1, "/slow", true),
-        .bad_preface => unreachable,
+        .bad_preface, .shutdown_before_preface => unreachable,
     }
     try wire.send(req.items);
     switch (scenario) {
@@ -365,12 +387,12 @@ fn runClient(port: u16, gpa: std.mem.Allocator, transport: Transport, scenario: 
         .graceful_open_stream => try wire.readUntil(out, deadline, stream1HasData),
         // The handler has started by the time the server sees the shutdown.
         .graceful_slow_stream => sleepMs(50),
-        .bad_preface => unreachable,
+        .bad_preface, .shutdown_before_preface => unreachable,
     }
     if (out.closed) return;
 
     switch (scenario) {
-        .bad_preface => unreachable,
+        .bad_preface, .shutdown_before_preface => unreachable,
         .connection_error => {
             var bad: std.ArrayList(u8) = .empty;
             defer bad.deinit(gpa);
@@ -445,7 +467,7 @@ fn runScenario(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, s
 
     var out: Outcome = .{};
     const t = try std.Thread.spawn(.{}, clientMain, .{ server.localAddress(0).getPort(), gpa, transport, scenario, &out });
-    const graceful = scenario == .graceful or scenario == .graceful_open_stream or scenario == .graceful_slow_stream;
+    const graceful = scenario == .graceful or scenario == .graceful_open_stream or scenario == .graceful_slow_stream or scenario == .shutdown_before_preface;
     if (graceful) {
         while (!out.ready.load(.acquire) and !out.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
         server.requestShutdown();
@@ -487,6 +509,20 @@ fn check(scenario: Scenario, out: *const Outcome) !void {
             const last = seen[seen.len - 1];
             if (last.ftype != ftype_goaway) return error.GoawayNotLast;
             if (last.code != @backingInt(frame.ErrorCode.protocol_error)) return error.WrongGoawayCode;
+            if (last.last_stream_id != 0) return error.WrongLastStreamId;
+        },
+        // The server's preface went out, so the shutdown ends in a GOAWAY
+        // NO_ERROR, the last frame, naming stream 0 (no stream was opened).
+        .shutdown_before_preface => {
+            var goaways: usize = 0;
+            for (seen) |s| {
+                if (s.ftype != ftype_goaway) continue;
+                if (s.code != 0) return error.WrongGoawayCode;
+                goaways += 1;
+            }
+            if (goaways == 0) return error.NoGoaway;
+            const last = seen[seen.len - 1];
+            if (last.ftype != ftype_goaway) return error.GoawayNotLast;
             if (last.last_stream_id != 0) return error.WrongLastStreamId;
         },
         // Phase 1: GOAWAY NO_ERROR with the maximum stream id, then a PING.
@@ -575,6 +611,14 @@ test "goaway: tls graceful drain that ends with an open stream delivers its RST_
 
 test "goaway: h2c a bad preface delivers its GOAWAY (t-3520)" {
     try runCase(.h2c, .bad_preface, "h2c bad preface");
+}
+
+test "goaway: h2c shutdown while the server waits for the client preface delivers a GOAWAY (dst-conn seed 2)" {
+    try runCase(.h2c, .shutdown_before_preface, "h2c shutdown before preface");
+}
+
+test "goaway: tls shutdown while the server waits for the client preface delivers a GOAWAY (dst-conn seed 2)" {
+    try runCase(.tls, .shutdown_before_preface, "tls shutdown before preface");
 }
 
 // ---------------------------------------------------------------------------

@@ -5100,7 +5100,10 @@ pub const Connection = struct {
         std.debug.assert(self.countInUseSlots() == 0);
     }
 
-    fn receiveUntilDeadline(self: *Connection) !wire_pump.WireChunk {
+    /// The next inbound chunk while the h2c preface is awaited, or null when
+    /// the server's shutdown event wins: the caller stops waiting and the main
+    /// loop takes the shutdown down the graceful path.
+    fn receiveUntilDeadline(self: *Connection) !?wire_pump.WireChunk {
         const io = self.config.io;
         const timeout: zio.Timeout = if (self.preface_deadline) |deadline| blk: {
             const deadline_ns: u64 = @intCast(deadline.nanoseconds);
@@ -5116,7 +5119,7 @@ pub const Connection = struct {
         });
         return switch (winner) {
             .read => |result| result catch error.ConnectionClosed,
-            .shutdown => error.ConnectionClosed,
+            .shutdown => null,
             .timer => error.PrefaceTimeout,
         };
     }
@@ -5131,9 +5134,16 @@ pub const Connection = struct {
         }
     }
 
+    /// Wait for the client preface, under the preface deadline. A server
+    /// shutdown ends the wait early but not the connection: the server's own
+    /// preface (SETTINGS) is already out, so this is an HTTP/2 connection and
+    /// it gets the graceful GOAWAYs like any other. The main loop sends them
+    /// (`maybeBeginGraceful`) and still parses a preface that arrives during
+    /// the drain. Closing here, before any GOAWAY, was the defect DST found
+    /// (`dst-conn` seed 2).
     fn waitH2cPreface(self: *Connection) !void {
         while (self.session.parser.expecting_preface) {
-            const chunk = try self.receiveUntilDeadline();
+            const chunk = (try self.receiveUntilDeadline()) orelse break;
             defer self.recycleReadChunk(chunk);
             if (chunk.len == 0) return error.ConnectionClosed;
             self.lockSessionUncancelable();
