@@ -1,2 +1,3 @@
 # Seeds that once failed `./zb build dst-conn`, run first on every ci run.
 # One seed per line; text after the seed is the reason it is here.
+2  shutdown during the h2c preface wait closed with no GOAWAY (fixed: 17cc1d5)
