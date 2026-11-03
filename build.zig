@@ -1495,8 +1495,9 @@ pub fn build(b: *std.Build) void {
     // line of zio (`zio_options.sim` declared in its root) and runs D1-D5
     // over the fixtures, then one build per validity mutant, each of which
     // must be FOUND by some seed and replay identically (a clean sweep
-    // exits 1). Not in `ci` yet. It builds zio three times, so it is
-    // separate from the suite's own zio pin.
+    // exits 1). It builds the sim zio three times (sim on, and once per
+    // mutant), separately from the suite's own build of the same zio
+    // commit. In `ci`.
     const dst_zio_step = b.step("dst-zio", "zio DST harness: D1-D5 over every fixture, and every validity mutant found (tools/zio-dst)");
     {
         const checks = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run", "--", "--d1", "--d2", "--d4", "--d5", "--all-fixtures" });
@@ -1513,7 +1514,7 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + every artifact a named step or the install step compiles");
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + zio DST gate (dst-zio) + every artifact a named step or the install step compiles");
     ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(&session_mu_gate_run.step);
     ci_step.dependOn(&dst_transport_run.step);
@@ -1529,6 +1530,7 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(&readme_doctest_run.step);
     ci_step.dependOn(pipeline_bench_smoke_step);
     ci_step.dependOn(release_step);
+    ci_step.dependOn(dst_zio_step);
 
     // Every artifact that `zig build <step>` or a plain `zig build` can
     // compile is compiled by `ci` too. A tool or example is otherwise only
