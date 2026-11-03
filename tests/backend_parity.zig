@@ -95,9 +95,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
         defer preface.deinit(gpa);
         try writer.interface.writeAll(preface.items);
         try writer.interface.flush();
-        starh2.edge.connection.test_actor_waiting.waitTimeout(io, .{
-            .duration = .{ .raw = .fromNanoseconds(2 * std.time.ns_per_s), .clock = .awake },
-        }) catch |err| {
+        starh2.edge.connection.test_actor_waiting.waitTimeout(.fromNanoseconds(2 * std.time.ns_per_s)) catch |err| {
             std.debug.print("wakeup setup failed: active={d} boot={} sends={d} live={d}\n", .{
                 server.active_connections.load(.acquire),
                 starh2.edge.connection.test_boot_ready.load(.acquire),
@@ -111,7 +109,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
         defer headers.deinit(gpa);
         try h2c.appendHeaders(gpa, &headers, 1, "/parity", true);
         const started = std.Io.Clock.awake.now(io).nanoseconds;
-        starh2.edge.connection.test_release_actor_wait.set(io);
+        starh2.edge.connection.test_release_actor_wait.set();
         try writer.interface.writeAll(headers.items);
         try writer.interface.flush();
         try readUntilBody(io, &reader, 250 * std.time.ns_per_ms);

@@ -324,7 +324,7 @@ pub const Server = struct {
     /// Report 1's count of task handlers the connections asked to cancel.
     shutdown_report_asked: std.atomic.Value(usize) = .init(0),
     bind_state: std.atomic.Value(BindState) = .init(.pending),
-    bind_event: std.Io.Event = .unset,
+    bind_event: zio.Event = .init,
 
     /// Validate everything, then own everything.
     ///
@@ -510,7 +510,7 @@ pub const Server = struct {
         errdefer {
             self.closeListeners();
             self.bind_state.store(.failed, .release);
-            self.bind_event.set(self.io);
+            self.bind_event.set();
         }
 
         for (self.endpoints, 0..) |endpoint, i| {
@@ -550,7 +550,7 @@ pub const Server = struct {
         }
 
         self.bind_state.store(.listening, .release);
-        self.bind_event.set(self.io);
+        self.bind_event.set();
 
         const canceled = blk: {
             self.shutdown_event.wait() catch break :blk true;
@@ -1232,11 +1232,7 @@ pub const Server = struct {
             .failed => return error.BindFailed,
             .pending => {},
         }
-        const timeout: std.Io.Timeout = .{ .duration = .{
-            .raw = .fromNanoseconds(@intCast(timeout_ns)),
-            .clock = .awake,
-        } };
-        self.bind_event.waitTimeout(self.io, timeout) catch |err| switch (err) {
+        self.bind_event.waitTimeout(.fromNanoseconds(timeout_ns)) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Timeout => return switch (self.bind_state.load(.acquire)) {
                 .listening => {},

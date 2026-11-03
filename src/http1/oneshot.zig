@@ -113,9 +113,9 @@ pub const Server = struct {
     listener: ?std.Io.net.Server = null,
     local_addr: std.Io.net.IpAddress = undefined,
     shutdown_flag: std.atomic.Value(bool) = .init(false),
-    shutdown_event: std.Io.Event = .unset,
+    shutdown_event: zio.Event = .init,
     bind_state: std.atomic.Value(BindState) = .init(.pending),
-    bind_event: std.Io.Event = .unset,
+    bind_event: zio.Event = .init,
     active_connections: std.atomic.Value(usize) = .init(0),
     /// Test hook: 0 none, 1 `SystemResources` (backoff), 2 `NetworkDown` (fail).
     next_accept_fault: std.atomic.Value(u8) = .init(0),
@@ -139,7 +139,7 @@ pub const Server = struct {
         errdefer {
             self.closeListener();
             self.bind_state.store(.failed, .release);
-            self.bind_event.set(self.io);
+            self.bind_event.set();
         }
 
         self.listener = self.address.listen(self.io, .{
@@ -157,14 +157,14 @@ pub const Server = struct {
         };
 
         self.bind_state.store(.listening, .release);
-        self.bind_event.set(self.io);
+        self.bind_event.set();
 
         const canceled = blk: {
-            self.shutdown_event.wait(self.io) catch break :blk true;
+            self.shutdown_event.wait() catch break :blk true;
             break :blk false;
         };
         self.shutdown_flag.store(true, .release);
-        self.shutdown_event.set(self.io);
+        self.shutdown_event.set();
         accept_group.cancel();
         self.closeListener();
 
@@ -181,7 +181,7 @@ pub const Server = struct {
 
     pub fn requestShutdown(self: *Server) void {
         self.shutdown_flag.store(true, .release);
-        self.shutdown_event.set(self.io);
+        self.shutdown_event.set();
     }
 
     pub const WaitListeningError = error{ BindFailed, Timeout, Canceled };
@@ -192,11 +192,7 @@ pub const Server = struct {
             .failed => return error.BindFailed,
             .pending => {},
         }
-        const timeout: std.Io.Timeout = .{ .duration = .{
-            .raw = .fromNanoseconds(@intCast(timeout_ns)),
-            .clock = .awake,
-        } };
-        self.bind_event.waitTimeout(self.io, timeout) catch |err| switch (err) {
+        self.bind_event.waitTimeout(.fromNanoseconds(timeout_ns)) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Timeout => return switch (self.bind_state.load(.acquire)) {
                 .listening => {},
@@ -241,7 +237,7 @@ pub const Server = struct {
         // Any exit that is not an explicit shutdown must wake `serve`.
         defer if (!self.shutdown_flag.load(.acquire)) {
             self.bind_state.store(.failed, .release);
-            self.shutdown_event.set(self.io);
+            self.shutdown_event.set();
         };
         while (!self.shutdown_flag.load(.acquire)) {
             const listener = if (self.listener) |*l| l else return;

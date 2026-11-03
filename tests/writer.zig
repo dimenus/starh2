@@ -6,7 +6,7 @@ const starh2 = @import("starh2");
 test "ticket table: 100 reserve/fail/release reuse cycles" {
     const ticket_table = starh2.edge.ticket_table;
     var storage: [8]ticket_table.TicketWait = undefined;
-    var table = ticket_table.TicketTable.init(std.testing.io, &storage);
+    var table = ticket_table.TicketTable.init(&storage);
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         const a = try table.reserve();
@@ -29,7 +29,7 @@ test "ticket table: 100 reserve/fail/release reuse cycles" {
 test "ticket table: failAll wakes every waiter" {
     const ticket_table = starh2.edge.ticket_table;
     var storage: [4]ticket_table.TicketWait = undefined;
-    var table = ticket_table.TicketTable.init(std.testing.io, &storage);
+    var table = ticket_table.TicketTable.init(&storage);
     const a = try table.reserve();
     const b = try table.reserve();
     table.failAll();
@@ -61,7 +61,7 @@ test "100x failAll vs reserve never hangs" {
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         // Fresh table each round — never reset live atomics with .{} concurrently.
-        var table = ticket_table.TicketTable.init(std.testing.io, &storage);
+        var table = ticket_table.TicketTable.init(&storage);
         const a = table.reserve() catch continue;
         table.failAll();
         _ = table.reserve() catch {};
@@ -86,18 +86,18 @@ fn reserveTask(ctx: *BarrierCtx) void {
 
 fn adversaryTask(ctx: *BarrierCtx) void {
     // Wait until reserve passed precheck, then failAll at adversarial point, release gates.
-    ctx.barrier.after_precheck.wait(ctx.table.io) catch {};
+    ctx.barrier.after_precheck.wait() catch {};
     ctx.table.failAll();
-    ctx.barrier.go_claim.set(ctx.table.io);
+    ctx.barrier.go_claim.set();
     // Always release finish — reserve may return WriteFailed before claim (no after_claim).
-    ctx.barrier.go_finish.set(ctx.table.io);
+    ctx.barrier.go_finish.set();
 }
 
 fn runTwoTaskBarrier(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     _ = gpa;
     const ticket_table = starh2.edge.ticket_table;
     var storage: [2]ticket_table.TicketWait = undefined;
-    var table = ticket_table.TicketTable.init(rt.io(), &storage);
+    var table = ticket_table.TicketTable.init(&storage);
     var barrier: ticket_table.TestReserveBarrier = .{};
     ticket_table.test_reserve_barrier = &barrier;
     defer ticket_table.test_reserve_barrier = null;
@@ -166,7 +166,7 @@ test "ticket wait maps peer RST tombstone before SlotTerminal cause (t-718)" {
     try std.testing.expect(term.getCause() == null);
 
     var storage: [1]ticket_table.TicketWait = undefined;
-    var table = ticket_table.TicketTable.init(std.testing.io, &storage);
+    var table = ticket_table.TicketTable.init(&storage);
     const reserved = try table.reserve();
     table.complete(reserved[1], reserved[0], false);
 

@@ -531,8 +531,8 @@ var actor_marker: zio.TaskLocal(*Connection) = .{};
 pub var handler_job_marker: zio.TaskLocal(void) = .{};
 /// Test-only gate that parks the actor immediately before its event-driven wait.
 pub var test_hold_before_actor_wait: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
-pub var test_actor_waiting: test_hook.Hook(std.Io.Event) = if (test_hook.on) .unset else {};
-pub var test_release_actor_wait: test_hook.Hook(std.Io.Event) = if (test_hook.on) .unset else {};
+pub var test_actor_waiting: test_hook.Hook(zio.Event) = if (test_hook.on) .init else {};
+pub var test_release_actor_wait: test_hook.Hook(zio.Event) = if (test_hook.on) .init else {};
 /// Test-only fallback timer raced against actor events by the wakeup canary.
 pub var test_polling_canary_tick_ns: test_hook.Hook(std.atomic.Value(u64)) = if (test_hook.on) .init(0) else {};
 /// Bench `--diag`: print one line when the actor parks with scheduler or TLS
@@ -2611,7 +2611,7 @@ pub const Connection = struct {
             .deadline_events = deadline_events,
             .intent_batch = intent_batch,
         };
-        self.tickets = ticket_table.TicketTable.init(config.io, self.ticket_slots);
+        self.tickets = ticket_table.TicketTable.init(self.ticket_slots);
         self.read_ch = .init(self.read_ch_buf);
         self.write_ch = .init(self.write_ch_buf);
         self.completion_ch = .init(self.completion_ch_buf);
@@ -4353,8 +4353,8 @@ pub const Connection = struct {
         if (diag_park) self.traceParkSnapshot();
         if (comptime test_observe) {
             if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
-                test_actor_waiting.set(io);
-                try test_release_actor_wait.wait(io);
+                test_actor_waiting.set();
+                try test_release_actor_wait.wait();
             }
         }
         const timeout: zio.Timeout = if (self.nextDeadlineNs()) |deadline_ns| blk: {

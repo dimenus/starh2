@@ -328,6 +328,37 @@ fn runAcceptResourceBackoffStillServes(io: std.Io, gpa: std.mem.Allocator) !void
     serving = false;
 }
 
+/// The tie between a shutdown request and a cancel of `serve`'s own task.
+/// On one executor both land before `serve` runs again: `requestShutdown`'s
+/// `set` claims serve's waiter on `shutdown_event`, then the cancel arrives.
+/// `zio.Event.wait` reports the cancel (the event stays set), so `serve`
+/// classifies the stop as a cancel: `RuntimeShutdown`. Through the old
+/// `std.Io.Event` the zio futex took the claimed wake and re-armed the
+/// cancel, so `serve` returned success here and left the cancel pending.
+fn runShutdownCancelTie(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    const io = rt.io();
+    var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleTask });
+    defer server.deinit(gpa);
+    var serve = try rt.spawn(starh2.http1.Server.serve, .{&server});
+    var joined = false;
+    defer if (!joined) {
+        server.requestShutdown();
+        _ = serve.join() catch {};
+    };
+    try server.waitUntilListening(2 * std.time.ns_per_s);
+    // `serve` parks on `shutdown_event` right after it publishes the bind.
+    var spins: usize = 0;
+    while (!server.shutdown_event.wait_queue.hasWaiters()) : (spins += 1) {
+        if (spins == 100_000) return error.ServeNeverParked;
+        try zio.yield();
+    }
+    // No yield between these two: `serve` cannot run until this task parks.
+    server.requestShutdown();
+    serve.awaitable.?.cancel();
+    joined = true;
+    try std.testing.expectError(error.RuntimeShutdown, serve.join());
+}
+
 fn runZio(rt: *zio.Runtime, gpa: std.mem.Allocator, f: *const fn (std.Io, std.mem.Allocator) anyerror!void) !void {
     try f(rt.io(), gpa);
 }
@@ -392,5 +423,12 @@ test "accept resource pressure backs off and keeps serving" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator, runAcceptResourceBackoffStillServes });
+    try handle.join();
+}
+
+test "serve reports RuntimeShutdown when a shutdown request and its own cancel tie" {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    var handle = try rt.spawn(runShutdownCancelTie, .{ rt, std.testing.allocator });
     try handle.join();
 }

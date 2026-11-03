@@ -70,13 +70,13 @@ fn publishOk(slot: *TicketWait, passed: bool) void {
 /// Test-only two-task barrier around reserve preclaim/postclaim.
 pub const TestReserveBarrier = struct {
     /// Posted by reserve after first write_failed check (before claim).
-    after_precheck: std.Io.Event = .unset,
+    after_precheck: zio.Event = .init,
     /// Waited by reserve before claiming — test posts after failAll.
-    go_claim: std.Io.Event = .unset,
+    go_claim: zio.Event = .init,
     /// Posted by reserve after successful claim, before postclaim recheck.
-    after_claim: std.Io.Event = .unset,
+    after_claim: zio.Event = .init,
     /// Waited by reserve before finishing — test may failAll again here.
-    go_finish: std.Io.Event = .unset,
+    go_finish: zio.Event = .init,
 };
 
 pub var test_reserve_barrier: test_hook.Hook(?*TestReserveBarrier) = if (test_hook.on) null else {};
@@ -91,16 +91,15 @@ inline fn bump(counter: *std.atomic.Value(u64)) void {
 }
 
 pub const TicketTable = struct {
-    io: std.Io,
     slots: []TicketWait,
     next_ticket: std.atomic.Value(u64) = .init(1),
     write_failed: std.atomic.Value(bool) = .init(false),
     /// Connection teardown event. One-shot, never reset. Null in unit tests.
     dead: ?*zio.Event = null,
 
-    pub fn init(io: std.Io, slots: []TicketWait) TicketTable {
+    pub fn init(slots: []TicketWait) TicketTable {
         for (slots) |*s| s.* = .{};
-        return .{ .io = io, .slots = slots };
+        return .{ .slots = slots };
     }
 
     /// Returns ticket + slot index. Caller must waitTicket or releaseReserved on error before wait.
@@ -108,8 +107,8 @@ pub const TicketTable = struct {
         if (self.write_failed.load(.acquire)) return error.WriteFailed;
         if (comptime test_hook.on) {
             if (test_reserve_barrier) |b| {
-                b.after_precheck.set(self.io);
-                b.go_claim.wait(self.io) catch return error.WriteFailed;
+                b.after_precheck.set();
+                b.go_claim.wait() catch return error.WriteFailed;
             }
         }
         if (self.write_failed.load(.acquire)) return error.WriteFailed;
@@ -120,8 +119,8 @@ pub const TicketTable = struct {
             if (slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
                 if (comptime test_hook.on) {
                     if (test_reserve_barrier) |b| {
-                        b.after_claim.set(self.io);
-                        b.go_finish.wait(self.io) catch return error.WriteFailed;
+                        b.after_claim.set();
+                        b.go_finish.wait() catch return error.WriteFailed;
                     }
                 }
                 // Claim won — recheck failure. failAll may have scanned past this free slot
@@ -311,7 +310,7 @@ pub const TicketTable = struct {
 
 test "complete ok is not overwritten by failAll" {
     var storage: [1]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     const a = try table.reserve();
     table.complete(a[1], a[0], true);
     table.failAll();
@@ -320,7 +319,7 @@ test "complete ok is not overwritten by failAll" {
 
 test "ticket reserve wait complete reuse" {
     var storage: [4]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     const a = try table.reserve();
     const b = try table.reserve();
     try std.testing.expect(a[0] != b[0]);
@@ -334,7 +333,7 @@ test "ticket reserve wait complete reuse" {
 
 test "isSignaled is per-slot: completing B does not make A look ready (t-900)" {
     var storage: [2]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     const a = try table.reserve();
     const b = try table.reserve();
     try std.testing.expect(!table.isSignaled(a[1]));
@@ -348,7 +347,7 @@ test "isSignaled is per-slot: completing B does not make A look ready (t-900)" {
 
 test "completion links survive until every batched ticket is snapped" {
     var storage: [4]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     const a = try table.reserve();
     const b = try table.reserve();
     const c = try table.reserve();
@@ -379,7 +378,7 @@ test "a truncated completion chain is visible before the next complete" {
     // ticket_count too high, or a missed linkCompletion: AckDrainer must fail
     // the walk instead of hanging the un-linked waiter.
     var storage: [4]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     const a = try table.reserve();
     const b = try table.reserve();
     const c = try table.reserve();
@@ -407,7 +406,7 @@ test "an over-long completion chain is visible on the last hop" {
     // ticket_count too low: the leftover link would strand the next waiter if
     // AckDrainer treated the walk as done.
     var storage: [4]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     const a = try table.reserve();
     const b = try table.reserve();
     try table.linkCompletion(a[1], b[1]);
@@ -422,7 +421,7 @@ test "a six-ticket one-shot chain snaps in order without dropping a link" {
     // Snapshot next BEFORE complete, because complete wakes the handler which
     // may reuse the slot. Truncating the walk would hang the un-snapped waiters.
     var storage: [8]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     var ids: [6]struct { ticket: u64, slot: u32 } = undefined;
     for (&ids) |*id| {
         const got = try table.reserve();
@@ -448,7 +447,7 @@ test "a six-ticket one-shot chain snaps in order without dropping a link" {
 
 test "ticket releaseReserved on abandon" {
     var storage: [2]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         const t = try table.reserve();
@@ -459,14 +458,14 @@ test "ticket releaseReserved on abandon" {
 
 test "reserve after failAll returns WriteFailed" {
     var storage: [2]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     table.failAll();
     try std.testing.expectError(error.WriteFailed, table.reserve());
 }
 
 test "a completed-ok ticket survives a terminal cause that lands after the ack (t-537)" {
     var storage: [1]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     var term: response.SlotTerminal = .{};
     const a = try table.reserve();
     // The wire acked the write, THEN the peer closed (the wake-to-run gap).
@@ -485,7 +484,7 @@ test "a completed-ok ticket survives a terminal cause that lands after the ack (
 
 test "wait maps SlotTerminal slow_consumer over WriteFailed" {
     var storage: [1]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     var term: response.SlotTerminal = .{};
     const a = try table.reserve();
     term.setCause(.slow_consumer);
@@ -495,7 +494,7 @@ test "wait maps SlotTerminal slow_consumer over WriteFailed" {
 
 test "wait maps SlotTerminal connection_closed over WriteFailed" {
     var storage: [1]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     var term: response.SlotTerminal = .{};
     const a = try table.reserve();
     term.setCause(.server_shutdown);
@@ -505,7 +504,7 @@ test "wait maps SlotTerminal connection_closed over WriteFailed" {
 
 test "wait returns through dead without a ticket signal" {
     var storage: [1]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     var dead: zio.Event = .init;
     table.dead = &dead;
     var term: response.SlotTerminal = .{};
@@ -517,7 +516,7 @@ test "wait returns through dead without a ticket signal" {
 
 test "a completed-ok ticket survives dead (t-537)" {
     var storage: [1]TicketWait = undefined;
-    var table = TicketTable.init(std.testing.io, &storage);
+    var table = TicketTable.init(&storage);
     var dead: zio.Event = .init;
     table.dead = &dead;
     var term: response.SlotTerminal = .{};

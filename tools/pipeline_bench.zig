@@ -561,7 +561,7 @@ const TicketCtx = struct {
     table: ticket_table.TicketTable = undefined,
 
     fn init(self: *TicketCtx) void {
-        self.table = ticket_table.TicketTable.init(self.io, &self.storage);
+        self.table = ticket_table.TicketTable.init(&self.storage);
     }
 };
 
