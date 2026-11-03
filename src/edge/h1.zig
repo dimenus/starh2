@@ -1034,7 +1034,7 @@ fn suppressPayload(method: request.Method, status: u16) bool {
 fn releaseStream(self: *H1Conn) void {
     if (!self.stream_held) return;
     self.stream_held = false;
-    if (self.config.accounting) |a| a.releaseStream();
+    if (self.config.accounting) |a| a.releaseStream(self.config.charge);
 }
 
 /// Copy the request into a fresh request arena from the pool, behind its
@@ -1054,7 +1054,7 @@ fn newLink(
     query: []const u8,
     authority: []const u8,
 ) union(enum) { link: *H1Link, refused: u16 } {
-    var arena = request_pool.Arena.init(self.pool, &self.request_budget);
+    var arena = request_pool.Arena.init(self.pool, &self.request_budget, self.config.charge);
     const link = arena.allocator().create(H1Link) catch {
         const status = (arena.refusal orelse request_pool.Reason.server_cap).status();
         arena.release();
@@ -1063,6 +1063,7 @@ fn newLink(
     link.* = .{
         .core = .{
             .arena = arena,
+            .charge = self.config.charge,
             .accounting = self.config.accounting,
             .balancer = self.config.balancer,
             .exec_index = self.config.exec_index,
@@ -1076,6 +1077,7 @@ fn newLink(
     // From here the arena is the link's (`link.core.arena`); the local copy
     // is stale.
     link.core.arena.gate = &link.core.gate;
+    link.core.retainCharge();
     const a = link.core.arena.allocator();
     const remainder = switch (matched) {
         .found => |f| f.path_remainder,
@@ -1101,7 +1103,7 @@ fn newLink(
             .body = takeCopy(bytes, &at, body),
             .trailers = &.{},
             .arena = a,
-            .peer = connection.peerFromHandle(self.stream.socket.handle),
+            .peer = self.config.peer,
         };
         std.debug.assert(at == total);
         break :copy true;
@@ -1146,7 +1148,7 @@ fn dispatch(
 ) !void {
     std.debug.assert(self.link == null);
     if (self.config.accounting) |a| {
-        if (!a.tryAdmitStream()) {
+        if (!a.tryAdmitStream(self.config.charge)) {
             try writeError(self, 503);
             self.want_close = true;
             return;
@@ -1167,7 +1169,7 @@ fn dispatch(
     var token = false;
     if (!complete_inline) {
         if (self.config.accounting) |a| {
-            if (!a.tryReserveTaskHandler()) {
+            if (!a.tryReserveTaskHandler(self.config.charge)) {
                 releaseStream(self);
                 try writeError(self, 503);
                 self.want_close = true;
@@ -1180,7 +1182,7 @@ fn dispatch(
         .link => |l| l,
         .refused => |status| {
             if (token) {
-                if (self.config.accounting) |a| a.releaseTaskHandler();
+                if (self.config.accounting) |a| a.releaseTaskHandler(self.config.charge);
             }
             releaseStream(self);
             try writeError(self, status);
@@ -1954,7 +1956,7 @@ test "an HTTP/1.1 call after its link's gate closed fails without touching the c
     // exists for: `Response` checks the cause first, so only the gate stands
     // between a call that raced teardown and freed memory.
     var link: H1Link = .{
-        .core = .{ .arena = undefined },
+        .core = .{ .arena = undefined, .charge = .none },
         .conn = @ptrFromInt(0xdead0000),
         .method = .GET,
         .req = undefined,
@@ -1988,7 +1990,7 @@ test "a TLS handler write that meets the closed request channel fails with the c
     conn.tls_req_ch = .init(&req_buf);
     conn.tls_ok_ch = .init(&ok_buf);
     var link: H1Link = .{
-        .core = .{ .arena = undefined },
+        .core = .{ .arena = undefined, .charge = .none },
         .conn = &conn,
         .method = .GET,
         .req = undefined,
@@ -2023,7 +2025,7 @@ test "a write from a task that is not the actor never takes the actor's TLS path
     conn.tls_req_ch = .init(&req_buf);
     conn.tls_ok_ch = .init(&ok_buf);
     var link: H1Link = .{
-        .core = .{ .arena = undefined },
+        .core = .{ .arena = undefined, .charge = .none },
         .conn = &conn,
         .method = .GET,
         .req = undefined,

@@ -56,7 +56,9 @@
 //! A request holds blocks through an `Arena`. Every block it takes is charged,
 //! by its CLASS size and never by how much of it is used, against three limits
 //! in this order: the request's own (`arena_bytes`), the connection's
-//! (`ConnBudget`), and the server's (the resident counter above). Whichever
+//! (`ConnBudget`), and the server's (the resident counter above). Between the
+//! connection and the server it is also charged to the request's client
+//! accounts (`Arena.charge`, `accounts.zig`), which refuse nothing yet. Whichever
 //! refuses is recorded in `Arena.refusal` as a `Reason`, and the edge maps it
 //! to a status: `request_cap` is a 500, the others a 503.
 //!
@@ -79,6 +81,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const slab_pool = @import("slab_pool.zig");
 const Gate = @import("gate.zig").Gate;
+const accounts = @import("accounts.zig");
 
 pub const min_block_bytes: usize = 64 * 1024;
 /// 64 KiB << 15 is 2 GiB, far past any sane per-request cap.
@@ -670,6 +673,11 @@ pub const Arena = struct {
     first: ?*Header = null,
     /// The reason of the most recent refusal, null if none.
     refusal: ?Reason = null,
+    /// The client accounts the request's blocks are charged to
+    /// (`accounts.Charge`), between the connection and the server. A copy of
+    /// its connection's; after dispatch the request's link holds the
+    /// references, so it stays valid, and charged, after the connection ends.
+    charge: accounts.Charge,
 
     /// Lives in the first `header_bytes` of every block.
     const Header = struct {
@@ -693,8 +701,8 @@ pub const Arena = struct {
         std.debug.assert(@sizeOf(Header) <= header_bytes);
     }
 
-    pub fn init(pool: *RequestPool, budget: *ConnBudget) Arena {
-        return .{ .pool = pool, .budget = budget };
+    pub fn init(pool: *RequestPool, budget: *ConnBudget, charge: accounts.Charge) Arena {
+        return .{ .pool = pool, .budget = budget, .charge = charge };
     }
 
     /// Charge `size` to the connection, if the request still counts against
@@ -780,7 +788,9 @@ pub const Arena = struct {
             self.refuse(.connection_cap);
             return null;
         }
+        self.charge.add(.request_bytes, size);
         const blk = self.pool.take(class) orelse {
+            self.charge.sub(.request_bytes, size);
             self.unchargeConn(size);
             self.refuse(.server_cap);
             return null;
@@ -823,6 +833,7 @@ pub const Arena = struct {
         };
         self.held -= size;
         self.pool.give(blk);
+        self.charge.sub(.request_bytes, size);
         self.unchargeConn(size);
     }
 
@@ -987,9 +998,9 @@ test "the server cap refuses at exactly its limit, in class bytes, and records t
     var pool = try testPool(512 * 1024, 256 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
-    var b = Arena.init(&pool, &budget);
-    var c = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
+    var b = Arena.init(&pool, &budget, .none);
+    var c = Arena.init(&pool, &budget, .none);
     defer a.release();
     defer b.release();
     defer c.release();
@@ -1010,7 +1021,7 @@ test "the request cap refuses at exactly its limit, charging class bytes" {
     var pool = try testPool(8 * 1024 * 1024, 256 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     // 100 KiB lands in the 128 KiB class: 128 KiB charged, not 100.
@@ -1035,8 +1046,8 @@ test "the connection cap refuses at exactly its limit and the budget is exact" {
     var pool = try testPool(8 * 1024 * 1024, 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(192 * 1024);
-    var a = Arena.init(&pool, &budget);
-    var b = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
+    var b = Arena.init(&pool, &budget, .none);
     defer a.release();
     defer b.release();
     _ = try a.allocator().alloc(u8, 10);
@@ -1056,7 +1067,7 @@ test "bump arena: alloc, alignment and distinct memory" {
     var pool = try testPool(8 * 1024 * 1024, 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     const p = try al.alloc(u8, 7);
@@ -1079,7 +1090,7 @@ test "bump arena: tail resize grows and shrinks in place, a non-tail does not gr
     var pool = try testPool(8 * 1024 * 1024, 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     var list: std.ArrayList(u8) = .empty;
@@ -1104,7 +1115,7 @@ test "bump arena: a tail free rewinds, a non-tail free changes nothing" {
     var pool = try testPool(8 * 1024 * 1024, 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     const one = try al.alloc(u8, 100);
@@ -1126,7 +1137,7 @@ test "bump arena: a block emptied by a free goes home at once, the first block n
     var pool = try testPool(16 * 1024 * 1024, 4 * 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     const small = try al.alloc(u8, 1000);
@@ -1159,7 +1170,7 @@ test "an ArrayList render of 1 MiB stays under the 4 MiB cap and holds a bounded
     var pool = try testPool(64 * 1024 * 1024, 4 * 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     // Headers decode first: the first block.
@@ -1182,7 +1193,7 @@ test "reserve guarantees room for a bounded run of allocations" {
     var pool = try testPool(8 * 1024 * 1024, 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     _ = try al.alloc(u8, 60 * 1024);
@@ -1199,7 +1210,7 @@ test "release returns every block, and the arena is reusable" {
     var pool = try testPool(8 * 1024 * 1024, 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     const al = a.allocator();
     _ = try al.alloc(u8, 1);
     _ = try al.alloc(u8, 200 * 1024);
@@ -1410,7 +1421,7 @@ test "an alignment above a page takes a block sized for the padding, and a block
     var pool = try testPool(16 * 1024 * 1024, 1024 * 1024);
     defer pool.deinit();
     var budget = ConnBudget.init(1 << 30);
-    var a = Arena.init(&pool, &budget);
+    var a = Arena.init(&pool, &budget, .none);
     defer a.release();
     const al = a.allocator();
     // 64 KiB alignment: the block is a page-aligned class block, and the
@@ -1432,7 +1443,7 @@ test "an alignment above a page takes a block sized for the padding, and a block
     // boundary inside a held block with room after it, the arena rightly
     // bumps there, and the result depends on where the OS placed the mapping
     // (t-3568).
-    var c = Arena.init(&pool, &budget);
+    var c = Arena.init(&pool, &budget, .none);
     defer c.release();
     const cl = c.allocator();
     const first = try cl.alloc(u8, 60 * 1024);
@@ -1448,7 +1459,7 @@ test "an alignment above a page takes a block sized for the padding, and a block
     // and not a memory error: the request would be over its own cap. (On an
     // arena with no block yet, so no address in a held block can happen to
     // be aligned.)
-    var b = Arena.init(&pool, &budget);
+    var b = Arena.init(&pool, &budget, .none);
     defer b.release();
     try testing.expectError(error.OutOfMemory, b.allocator().alignedAlloc(u8, .fromByteUnits(2 * 1024 * 1024), 100));
     try testing.expectEqual(Reason.request_cap, b.refusal.?);
@@ -1618,7 +1629,7 @@ test "an aligned allocation that ends exactly at a class boundary fits that clas
             if (size <= start_max) continue;
             const exact = size - start_max;
             // Exactly the class: fits, aligned, and charges the class size.
-            var a = Arena.init(&pool, &budget);
+            var a = Arena.init(&pool, &budget, .none);
             const p = a.allocator().rawAlloc(exact, alignment, 0) orelse return error.TestUnexpectedResult;
             try testing.expectEqual(@as(usize, 0), @intFromPtr(p) % align_bytes);
             @memset(p[0..exact], 0x77);
@@ -1626,7 +1637,7 @@ test "an aligned allocation that ends exactly at a class boundary fits that clas
             try testing.expectEqual(@as(?Reason, null), a.refusal);
             a.release();
             // One byte more: the next class, or the request cap at the top.
-            var b = Arena.init(&pool, &budget);
+            var b = Arena.init(&pool, &budget, .none);
             if (b.allocator().rawAlloc(exact + 1, alignment, 0)) |q| {
                 try testing.expectEqual(@as(usize, 0), @intFromPtr(q) % align_bytes);
                 try testing.expectEqual(size * 2, b.held);

@@ -159,6 +159,15 @@ see `tools/README.md`.
   orphans a handler still running (`LinkCore.orphan`); `Server.serve` waits
   for orphans and task-handler tokens before it returns. Nothing joins a
   handler that has not reported.
+- Every server-wide charge (a connection, a TLS handshake, a stream, a task
+  handler, a request-pool block, outbound bytes, a compression context) also
+  charges the holder's `accounts.Charge`, its client and IPv6 aggregate
+  records (`src/edge/accounts.zig`), and the matching release gives them back.
+  A connection holds one reference on its records from accept to the end of
+  `Server.connEntry`; a link holds its own from dispatch to `dropLink`, so an
+  orphan stays charged to its client. `Server.deinit` logs an error, which
+  fails a test, for any record left charged. `./zb build test-accounts` is the
+  gate.
 
 ## TLS and allocation traps
 

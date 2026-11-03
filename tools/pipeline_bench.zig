@@ -393,6 +393,8 @@ const ConnHopCtx = struct {
         self.peer = pair.peer;
         try self.hop.open(pair.accepted, .{
             .io = io,
+            .charge = .none,
+            .peer = .unknown,
             .mode = .h2c,
             .limits = starh2.Limits.defaults,
             .router = .{ .routes = &hop_routes },

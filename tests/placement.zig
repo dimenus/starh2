@@ -190,6 +190,8 @@ fn runH1HandlerPlacement(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     };
     const config: conn_mod.ConnConfig = .{
         .io = io,
+        .charge = .none,
+        .peer = .unknown,
         .mode = .h1c,
         .limits = starh2.Limits.defaults,
         .router = .{ .routes = &routes },

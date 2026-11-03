@@ -310,6 +310,8 @@ const Rig = struct {
     fn config(self: *Rig) conn_mod.ConnConfig {
         return .{
             .io = self.io,
+            .charge = .none,
+            .peer = .unknown,
             .mode = .h2c,
             .limits = self.limits,
             .router = .{ .routes = &routes },
@@ -852,6 +854,69 @@ test "slots: h2c with every slot quarantined, the next connection is refused and
 
 test "slots: tls with every slot quarantined, the next connection is refused and its handshake slot is released" {
     try runExhaustedCase(.tls);
+}
+
+/// The same exhaustion seen from a PROXY v2 endpoint (t-3759 step 3): its
+/// accept takes a header-waiter slot with the connection slot, and a
+/// connection slot that cannot be had must give the waiter slot back too
+/// (`Server.undoAccept`), or every later PROXY connection parks for ever.
+/// The slots are quarantined through a plain endpoint of the same server,
+/// since slots are server-wide.
+fn runExhaustedProxy(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 2;
+    const trusted = [_]starh2.edge.proxy_protocol.Cidr{.{ .addr = .{ .ip4 = .{ 127, 0, 0, 1 } }, .prefix_bits = 32 }};
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{
+            .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+            .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        },
+        .routes = &routes,
+        .tls = null,
+        .limits = limits,
+        .client_identity = &.{ .peer, .{ .proxy_protocol = .{ .trusted = &trusted } } },
+    });
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    var serving = true;
+    defer if (serving) {
+        server.requestShutdown();
+        serve_deadline.join(&server, &serve_handle);
+    };
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    conn_mod.test_dirty_kind = .write_chunk_rented;
+    conn_mod.test_dirty_remaining.store(2, .release);
+    defer conn_mod.test_dirty_remaining.store(0, .release);
+    try runRound(&server, gpa, .h2c, 1);
+    try runRound(&server, gpa, .h2c, 1);
+    try std.testing.expectEqual(@as(usize, 2), server.slots.snapshot().leaked);
+
+    // Twice: a waiter slot kept by the first refusal would park the second.
+    for (0..2) |_| {
+        var r: Refused = .{ .port = server.localAddress(1).getPort(), .gpa = gpa, .transport = .h2c };
+        const t = try std.Thread.spawn(.{}, refusedClient, .{&r});
+        while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
+        t.join();
+        try std.testing.expect(r.closed);
+    }
+    const give_up = nowNs() + client_deadline_ns;
+    while (server.active_connections.load(.acquire) != 0 or server.proxy_waiters.load(.acquire) != 0) {
+        if (nowNs() >= give_up) return error.RefusalNeverReleased;
+        zio.sleep(.fromMilliseconds(5)) catch {};
+    }
+    try std.testing.expect(server.slots.snapshot().refused >= 2);
+    server.requestShutdown();
+    serve_deadline.join(&server, &serve_handle);
+    serving = false;
+}
+
+test "slots: a PROXY endpoint with every slot quarantined refuses the connection and gives its header-waiter slot back" {
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runExhaustedProxy, .{ rt, gpa });
+    try h.join();
 }
 
 // ---------------------------------------------------------------------------

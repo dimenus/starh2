@@ -27,6 +27,8 @@ const boot_plan = @import("boot_plan.zig");
 const connection = @import("../edge/connection.zig");
 const conn_slot = @import("../edge/conn_slot.zig");
 const request_pool = @import("../edge/request_pool.zig");
+const accounts = @import("../edge/accounts.zig");
+const proxy_protocol = @import("../edge/proxy_protocol.zig");
 const hpack = @import("hpack.zig");
 const frame = @import("frame.zig");
 
@@ -71,6 +73,9 @@ pub const Terms = struct {
     outbound_slabs: usize = 0,
     /// Concurrent brotli contexts × per-context budget, counted once server-wide.
     compression_contexts: usize = 0,
+    /// The client table (`accounts.Table`): its records, index and free
+    /// list, sized by `clientTableRecords`.
+    client_table: usize = 0,
     tasks: usize = 0,
     h1_head: usize = 0,
     h1_body: usize = 0,
@@ -249,6 +254,23 @@ pub const Limits = struct {
     /// HTTP/2, 503 on HTTP/1.1. Complete handlers run on the connection's
     /// actor and take none.
     max_task_handlers: usize = 4_096,
+    /// IPv6 clients are keyed by their /64, and every /64 is also charged to
+    /// an aggregate account on this prefix (`accounts.keysFor`), so one /48
+    /// (a free tunnel allocation holds 65,536 /64s) holds no more than one
+    /// address would. 1 to 63.
+    client_ipv6_aggregate_prefix_bits: u8 = 48,
+    /// The longest PROXY v2 header a `.proxy_protocol` endpoint reads, the
+    /// fixed 16 bytes included. A header whose length field says more is
+    /// closed unread (the field allows 64 KiB). At least
+    /// `proxy_protocol.min_header_cap` (a UNIX address block); the rest is room
+    /// for the TLVs a proxy adds, which are ignored.
+    proxy_header_bytes: usize = 512,
+    /// Connections accepted on `.proxy_protocol` endpoints and not yet past
+    /// their header (on TLS, until they hold a handshake slot), server-wide.
+    /// While it is full those accept loops park, as for the connection limit.
+    /// Its own cap, not the handshake slots, because the handshake slot is
+    /// taken only once the header is read.
+    proxy_header_waiters: usize = 64,
     decoded_header_bytes: usize = 32 * 1024,
     compressed_header_bytes: usize = 64 * 1024,
     header_fields: usize = 100,
@@ -587,6 +609,24 @@ pub const Limits = struct {
         return .{ .server_bytes = self.request_bytes_per_server, .arena_bytes = self.request_arena_bytes, .retain_bytes = self.request_pool_retain_bytes };
     }
 
+    /// Records in the client table: for each party that can hold a client
+    /// account at once, connections (`max_connections`), TLS handshakes in
+    /// progress (`concurrent_tls_handshakes`), task handlers, orphans
+    /// included (`max_task_handlers`), and accept loops (`max_endpoints`: an
+    /// accept loop keys the connection it accepted, then waits for admission
+    /// holding those records, one connection per loop), as many records as
+    /// one party's charge can name (`accounts.max_refs`: an IPv6 client is
+    /// its /64 and its aggregate). Admitted and waiting parties alone can
+    /// then never fill the table. A later step adds a reserve for rate-only
+    /// records. An insert that still fails (records a bug left quarantined,
+    /// or slots retired) refuses its connection (`accounts.Table.acquire`).
+    pub fn clientTableRecords(self: Limits) error{InvalidConfig}!usize {
+        const parties = try checkedAdd(try checkedAdd(self.max_connections, self.max_endpoints), try checkedAdd(self.concurrent_tls_handshakes, self.max_task_handlers));
+        const n = try checkedMul(parties, accounts.max_refs);
+        if (n == 0 or n >= std.math.maxInt(u32) / 2) return error.InvalidConfig;
+        return n;
+    }
+
     pub fn resourceUpperBound(self: Limits) error{InvalidConfig}!ResourceUpperBound {
         if (self.max_connections == 0 or self.max_streams_per_connection == 0) return error.InvalidConfig;
         if (self.max_streams_per_server == 0) return error.InvalidConfig;
@@ -658,6 +698,9 @@ pub const Limits = struct {
         }
         if (self.response_compression and self.compression_contexts_per_server == 0) return error.InvalidConfig;
         if (self.h1_head_bytes == 0) return error.InvalidConfig;
+        if (self.client_ipv6_aggregate_prefix_bits == 0 or self.client_ipv6_aggregate_prefix_bits >= 64) return error.InvalidConfig;
+        if (self.proxy_header_bytes < proxy_protocol.min_header_cap or self.proxy_header_bytes > proxy_protocol.fixed_bytes + std.math.maxInt(u16)) return error.InvalidConfig;
+        if (self.proxy_header_waiters == 0) return error.InvalidConfig;
 
         var terms: Terms = .{};
 
@@ -703,9 +746,10 @@ pub const Limits = struct {
         terms.compression_contexts = try checkedMul(self.compression_contexts_per_server, self.compression_context_bytes);
         terms.on_demand_server = try checkedAdd(slab_bytes, self.outbound_bytes_per_server);
         terms.request_pool = try checkedAdd(self.request_bytes_per_server, try self.requestPoolConfig().bitmapBytes());
+        terms.client_table = accounts.Table.bootBytes(try self.clientTableRecords()) catch return error.InvalidConfig;
         const allocator_bytes = try checkedAdd(
             server_static,
-            try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, try checkedAdd(terms.on_demand_server, try checkedAdd(terms.request_pool, terms.compression_contexts)))),
+            try checkedAdd(terms.tls_scratch, try checkedAdd(all_conns, try checkedAdd(terms.on_demand_server, try checkedAdd(terms.request_pool, try checkedAdd(terms.compression_contexts, terms.client_table))))),
         );
 
         // Maximum std.Io task topology: accept loops + per-connection
@@ -1096,7 +1140,7 @@ test "the largest legal body fits the arena bound" {
         var pool = try request_pool.RequestPool.init(lim.requestPoolConfig());
         defer pool.deinit();
         var budget = request_pool.ConnBudget.init(lim.request_bytes_per_connection);
-        var arena = request_pool.Arena.init(&pool, &budget);
+        var arena = request_pool.Arena.init(&pool, &budget, .none);
         defer arena.release();
         const al = arena.allocator();
         try arena.reserve(try lim.hpackDecodeBytes());
@@ -1117,4 +1161,16 @@ test "the largest legal body fits the arena bound" {
         // larger bodies, or the formula would be paying for nothing.
         if (body_bytes >= 256 * 1024) try std.testing.expect(arena.peak > lim.request_arena_bytes / 4);
     }
+}
+
+test "clientTableRecords counts every party that can hold records, accept loops included" {
+    var l: Limits = .defaults;
+    l.max_connections = 3;
+    l.concurrent_tls_handshakes = 1;
+    l.max_task_handlers = 1;
+    l.max_endpoints = 4;
+    // Connections, handshakes, task handlers, and one accept loop per
+    // endpoint holding the records of a connection it waits to admit; each
+    // party up to max_refs records.
+    try std.testing.expectEqual(@as(usize, (3 + 1 + 1 + 4) * accounts.max_refs), try l.clientTableRecords());
 }

@@ -858,6 +858,25 @@ pub fn build(b: *std.Build) void {
     const hardening_step = b.step("test-hardening", "Run the t-3759 attack gates (missing deadlines, accept errors, the descriptor boot check)");
     hardening_step.dependOn(&run_hardening_tests.step);
 
+    const accounts_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/accounts.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_accounts_tests = b.addRunArtifact(accounts_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_accounts_tests.setCwd(b.path("."));
+    const accounts_step = b.step("test-accounts", "Run the t-3759 step 3 gates (client accounts, client identity, PROXY v2, conservation soak)");
+    accounts_step.dependOn(&run_accounts_tests.step);
+
     const shutdown_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/shutdown.zig"),
@@ -925,6 +944,55 @@ pub fn build(b: *std.Build) void {
     shutdown_step.dependOn(&run_shutdown_deinit.step);
     shutdown_step.dependOn(&run_shutdown_deinit_idle.step);
     shutdown_step.dependOn(&run_shutdown_underflow.step);
+    const run_accounts_underflow = b.addRunArtifact(shutdown_child);
+    run_accounts_underflow.addArg("accounts-underflow");
+    run_accounts_underflow.addCheck(.{ .expect_stderr_match = "client account underflow: a release of 1 from streams found 0; refused, count kept (1 refused so far)" });
+    run_accounts_underflow.addCheck(.{ .expect_stderr_match = "client account: a reference to record 0 generation 0 found generation 1; skipped (1 so far)" });
+    run_accounts_underflow.addCheck(.{ .expect_stderr_match = "client account: a reference to record 0 generation 0 found generation 1; skipped (3 so far)" });
+    run_accounts_underflow.addCheck(.{ .expect_stderr_match = "child: accounts underflows=1 stale=3 removals=1 full_after_two=true b.streams=1 b.holders=1" });
+    run_accounts_underflow.expectExitCode(0);
+    run_accounts_underflow.has_side_effects = true;
+    shutdown_step.dependOn(&run_accounts_underflow.step);
+    accounts_step.dependOn(&run_accounts_underflow.step);
+    const run_accounts_race = b.addRunArtifact(shutdown_child);
+    run_accounts_race.addArg("accounts-release-race");
+    run_accounts_race.addCheck(.{ .expect_stderr_match = "child: release race same_record=true after_locked=1 b.live=true b.holders=2 stale=3 underflows=0 removals=1" });
+    run_accounts_race.expectExitCode(0);
+    run_accounts_race.has_side_effects = true;
+    shutdown_step.dependOn(&run_accounts_race.step);
+    accounts_step.dependOn(&run_accounts_race.step);
+    const run_accounts_quarantine = b.addRunArtifact(shutdown_child);
+    run_accounts_quarantine.addArg("accounts-quarantine");
+    run_accounts_quarantine.addCheck(.{ .expect_stderr_match = "with connections = 1, streams = 1; record quarantined" });
+    run_accounts_quarantine.addCheck(.{ .expect_stderr_match = "child: quarantine live=0 quarantined=1 removals=1" });
+    run_accounts_quarantine.expectExitCode(0);
+    run_accounts_quarantine.has_side_effects = true;
+    shutdown_step.dependOn(&run_accounts_quarantine.step);
+    accounts_step.dependOn(&run_accounts_quarantine.step);
+    const run_proxy_trusted_range = b.addRunArtifact(shutdown_child);
+    run_proxy_trusted_range.addArg("proxy-trusted-range");
+    run_proxy_trusted_range.addCheck(.{ .expect_stderr_match = "endpoint 0: the trusted PROXY source range ::/0 holds every IPv4-mapped address (::ffff:0:0/96) without being one of them" });
+    run_proxy_trusted_range.addCheck(.{ .expect_stderr_match = "list the IPv4 range (for example 192.0.2.0/24) or the mapped range (::ffff:192.0.2.0/120) explicitly" });
+    run_proxy_trusted_range.addCheck(.{ .expect_stderr_match = "child: trusted range ::/0 ProxyTrustedRangeHoldsIpv4" });
+    run_proxy_trusted_range.expectExitCode(0);
+    run_proxy_trusted_range.has_side_effects = true;
+    shutdown_step.dependOn(&run_proxy_trusted_range.step);
+    accounts_step.dependOn(&run_proxy_trusted_range.step);
+    const run_accounts_charge_race = b.addRunArtifact(shutdown_child);
+    run_accounts_charge_race.addArg("accounts-charge-race");
+    run_accounts_charge_race.addCheck(.{ .expect_stderr_match = "child: charge race same_record=true b.streams=0 b.request_bytes=10 stale=2 underflows=0" });
+    run_accounts_charge_race.expectExitCode(0);
+    run_accounts_charge_race.has_side_effects = true;
+    shutdown_step.dependOn(&run_accounts_charge_race.step);
+    accounts_step.dependOn(&run_accounts_charge_race.step);
+    const run_accounts_generation_wrap = b.addRunArtifact(shutdown_child);
+    run_accounts_generation_wrap.addArg("accounts-generation-wrap");
+    run_accounts_generation_wrap.addCheck(.{ .expect_stderr_match = "client table: record 0 retired: its generation would wrap" });
+    run_accounts_generation_wrap.addCheck(.{ .expect_stderr_match = "child: generation wrap cycles=2 b.acquired=false b.live=false stale=1 insert_failures=2" });
+    run_accounts_generation_wrap.expectExitCode(0);
+    run_accounts_generation_wrap.has_side_effects = true;
+    shutdown_step.dependOn(&run_accounts_generation_wrap.step);
+    accounts_step.dependOn(&run_accounts_generation_wrap.step);
 
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -961,6 +1029,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_ack_channel_tests.step);
     test_step.dependOn(&run_admission_tests.step);
     test_step.dependOn(&run_hardening_tests.step);
+    test_step.dependOn(&run_accounts_tests.step);
     test_step.dependOn(shutdown_step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);

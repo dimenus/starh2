@@ -137,6 +137,7 @@ const io_queue = @import("io_queue.zig");
 pub const Balancer = @import("balancer.zig").Balancer;
 const slab_pool = @import("slab_pool.zig");
 const request_pool = @import("request_pool.zig");
+const accounts = @import("accounts.zig");
 const Touched = @import("touched.zig").Touched;
 const Gate = @import("gate.zig").Gate;
 const flow = @import("../core/flow.zig");
@@ -1074,6 +1075,16 @@ pub const ConnConfig = struct {
     shutdown_event: ?*zio.Event = null,
     /// Server-wide stream and task-handler admission (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
+    /// The client accounts this connection is charged to, and holds one
+    /// reference on (`accounts.Table.acquire`, at accept or after the PROXY
+    /// header), until its task ends (`Server.connEntry`). `.none` on an
+    /// endpoint whose `client_identity` is `.none`. No default: a connection
+    /// built without saying whom it charges does not compile.
+    charge: accounts.Charge,
+    /// The client as the handler sees it (`Request.peer`): the socket peer,
+    /// or the source a PROXY v2 header named. Read once at accept, not at
+    /// every request.
+    peer: request.Peer,
     /// Server-wide outbound DATA slabs, borrowed for this connection's lifetime.
     slab_pool: *slab_pool.SlabPool,
     /// Server-wide request memory. Every request's header list, body and
@@ -1091,16 +1102,17 @@ pub const ConnConfig = struct {
     tls_leftover: []const u8 = &.{},
 };
 
-/// Shared with Server: global stream/task-handler/memory/handshake admission.
+/// Shared with Server: global stream/task-handler/memory/handshake admission,
+/// the server's account (`accounts.zig` has the charge rule).
 ///
 /// Every counter here is touched by many connections at once, so each one uses
 /// a compare-and-swap loop and not a read-then-add. A `fetchAdd` followed by a
 /// limit check would admit past the limit whenever two connections raced, and
 /// the overshoot is exactly the case the limit exists to prevent.
 ///
-/// The release paths use `fetchSub` with an assert instead. A release is always
-/// paired with a successful reserve, so it cannot fail; the assert is there to
-/// catch a double release, which is the failure this shape actually has.
+/// Every charge takes the holder's `accounts.Charge` and charges its client
+/// accounts first; every release gives them back. A release that would go
+/// below zero is refused and counted (`saturatingRelease`).
 pub const GlobalAccounting = struct {
     active_streams: std.atomic.Value(usize) = .init(0),
     max_streams: usize,
@@ -1172,54 +1184,81 @@ pub const GlobalAccounting = struct {
         self.saturatingRelease(&self.orphaned_handlers, 1, "orphaned_handlers", .acq_rel);
     }
 
-    pub fn tryAdmitStream(self: *GlobalAccounting) bool {
+    // Every charge below walks the holder's list (`accounts.Charge`: the
+    // client, then the aggregate) and the server's counter last, and undoes
+    // the list in reverse when the server refuses. Every release gives back
+    // the server's counter, then the list. The connection's own account is
+    // the caller's (the Session's stream count, `ConnBudget`, the
+    // connection's outbound budget), charged before these.
+
+    pub fn tryAdmitStream(self: *GlobalAccounting, c: accounts.Charge) bool {
+        c.add(.streams, 1);
         while (true) {
             const cur = self.active_streams.load(.acquire);
-            if (cur >= self.max_streams) return false;
+            if (cur >= self.max_streams) {
+                c.sub(.streams, 1);
+                return false;
+            }
             if (self.active_streams.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
         }
     }
 
-    pub fn releaseStream(self: *GlobalAccounting) void {
+    pub fn releaseStream(self: *GlobalAccounting, c: accounts.Charge) void {
         self.saturatingRelease(&self.active_streams, 1, "active_streams", .acq_rel);
+        c.sub(.streams, 1);
     }
 
-    pub fn tryReserveTaskHandler(self: *GlobalAccounting) bool {
+    pub fn tryReserveTaskHandler(self: *GlobalAccounting, c: accounts.Charge) bool {
+        c.add(.task_handlers, 1);
         while (true) {
             const cur = self.task_handlers.load(.acquire);
-            if (cur >= self.task_handler_capacity) return false;
+            if (cur >= self.task_handler_capacity) {
+                c.sub(.task_handlers, 1);
+                return false;
+            }
             if (self.task_handlers.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
         }
     }
 
-    pub fn releaseTaskHandler(self: *GlobalAccounting) void {
+    pub fn releaseTaskHandler(self: *GlobalAccounting, c: accounts.Charge) void {
         self.saturatingRelease(&self.task_handlers, 1, "task_handlers", .acq_rel);
+        c.sub(.task_handlers, 1);
     }
 
-    pub fn tryReserveOutbound(self: *GlobalAccounting, n: usize) bool {
+    pub fn tryReserveOutbound(self: *GlobalAccounting, c: accounts.Charge, n: usize) bool {
         if (n == 0) return true;
+        c.add(.outbound_bytes, n);
         while (true) {
             const cur = self.outbound_bytes.load(.acquire);
-            if (cur > self.max_outbound_bytes or self.max_outbound_bytes - cur < n) return false;
+            if (cur > self.max_outbound_bytes or self.max_outbound_bytes - cur < n) {
+                c.sub(.outbound_bytes, n);
+                return false;
+            }
             if (self.outbound_bytes.cmpxchgWeak(cur, cur + n, .acq_rel, .acquire) == null) return true;
         }
     }
 
-    pub fn releaseOutbound(self: *GlobalAccounting, n: usize) void {
+    pub fn releaseOutbound(self: *GlobalAccounting, c: accounts.Charge, n: usize) void {
         if (n == 0) return;
         self.saturatingRelease(&self.outbound_bytes, n, "outbound_bytes", .acq_rel);
+        c.sub(.outbound_bytes, n);
     }
 
-    pub fn tryAdmitHandshake(self: *GlobalAccounting) bool {
+    pub fn tryAdmitHandshake(self: *GlobalAccounting, c: accounts.Charge) bool {
+        c.add(.handshakes, 1);
         while (true) {
             const cur = self.active_handshakes.load(.seq_cst);
-            if (cur >= self.max_handshakes) return false;
+            if (cur >= self.max_handshakes) {
+                c.sub(.handshakes, 1);
+                return false;
+            }
             if (self.active_handshakes.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) == null) return true;
         }
     }
 
-    pub fn releaseHandshake(self: *GlobalAccounting) void {
+    pub fn releaseHandshake(self: *GlobalAccounting, c: accounts.Charge) void {
         self.saturatingRelease(&self.active_handshakes, 1, "active_handshakes", .seq_cst);
+        c.sub(.handshakes, 1);
         self.wakeAdmission();
     }
 
@@ -1425,6 +1464,9 @@ const HandlerCtx = struct {
     accept_encoding: []const u8 = "",
     encoder: ?*brotli.Encoder = null,
     compressing: bool = false,
+    /// The link's client accounts (`LinkCore.charge`): the encoder is charged
+    /// to them from `prepareCompression` to `dropEncoder`.
+    charge: accounts.Charge,
     /// One-shot lifecycle sample, decided at dispatch so spawn delay is visible.
     trace_on: bool = false,
     t_dispatch: u64 = 0,
@@ -1643,6 +1685,13 @@ pub const LinkCore = struct {
     /// The request's memory. Its connection charges go through `gate`
     /// (`request_pool.Arena.gate`), set once the arena is in its link.
     arena: request_pool.Arena,
+    /// The client accounts everything this link holds is charged to: its
+    /// arena's blocks, its task-handler token, its compression context. The
+    /// link holds its own reference on each record (`retainCharge`, at
+    /// dispatch, while the connection's reference keeps them alive), given
+    /// back by `dropLink` after those charges, so a handler that outlives
+    /// its connection stays charged to its client until it returns.
+    charge: accounts.Charge,
     /// The stream's terminal cause and generation. The actor writes it while
     /// it holds its reference; the handler reads it at any time.
     terminal: response.SlotTerminal = .{},
@@ -1695,6 +1744,13 @@ pub const LinkCore = struct {
         if (self.accounting) |a| _ = a.orphaned_handlers.fetchAdd(1, .acq_rel);
     }
 
+    /// Take the link's own references on its client accounts. Called once,
+    /// by the actor, at dispatch, after `charge` is set and the arena is in
+    /// the link: from then on `dropLink` gives them back.
+    pub fn retainCharge(self: *LinkCore) void {
+        if (self.charge.table) |t| t.retain(self.charge);
+    }
+
     /// The handler's job ended. Outside the gate: the balancer is server-wide.
     pub fn noteHandlerEnd(self: *const LinkCore) void {
         if (!self.task_counted) return;
@@ -1730,12 +1786,19 @@ pub fn dropLink(comptime L: type, link: *L) void {
     const accounting = core.accounting;
     const token = core.task_token;
     const orphaned = core.orphaned;
+    const charge = core.charge;
     // Poison it in safe builds: a handler that still used the link would read
     // garbage and fail loudly instead of working on freed memory.
     link.* = undefined;
     arena.release();
     if (accounting) |a| {
-        if (token) a.releaseTaskHandler();
+        if (token) a.releaseTaskHandler(charge);
+    }
+    // The link's references go after every charge it held, and before the
+    // orphan count, which `Server.serve` waits on: once that is zero this
+    // link touches nothing of the server's.
+    if (charge.table) |t| t.release(charge);
+    if (accounting) |a| {
         if (orphaned) a.releaseOrphan();
     }
     if (comptime test_observe) _ = test_links_freed.fetchAdd(1, .acq_rel);
@@ -1887,7 +1950,7 @@ pub fn serveAccepted(stream: std.Io.net.Stream, config: ConnConfig, slot: *conn_
     slot.conn = booted catch |err| {
         if (close_probe) diagRawPrint("t1002 init_fail {s}\n", .{@errorName(err)});
         if (config.handshake_held) {
-            if (config.accounting) |a| a.releaseHandshake();
+            if (config.accounting) |a| a.releaseHandshake(config.charge);
         }
         if (config.tls_ready) |t| t.deinit();
         stream.close(config.io);
@@ -2361,14 +2424,14 @@ pub const Connection = struct {
             .tryAdmit = struct {
                 fn f(ctx: *anyopaque) bool {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
-                    if (c.config.accounting) |a| return a.tryAdmitStream();
+                    if (c.config.accounting) |a| return a.tryAdmitStream(c.config.charge);
                     return true;
                 }
             }.f,
             .onRelease = struct {
                 fn f(ctx: *anyopaque) void {
                     const c: *Connection = @ptrCast(@alignCast(ctx));
-                    if (c.config.accounting) |a| a.releaseStream();
+                    if (c.config.accounting) |a| a.releaseStream(c.config.charge);
                 }
             }.f,
             .headerListMem = struct {
@@ -2647,7 +2710,7 @@ pub const Connection = struct {
         }
         std.debug.assert(self.live_task_handlers.load(.acquire) == 0);
         if (self.handshake_held) {
-            if (self.config.accounting) |a| a.releaseHandshake();
+            if (self.config.accounting) |a| a.releaseHandshake(self.config.charge);
             self.handshake_held = false;
         }
         // Drain channels before their backing buffers are released.
@@ -2926,7 +2989,7 @@ pub const Connection = struct {
             const cur = self.outbound_held.load(.seq_cst);
             if (cur > lim or lim - cur < n) return .connection_full;
             if (self.config.accounting) |a| {
-                if (!a.tryReserveOutbound(n)) return .server_full;
+                if (!a.tryReserveOutbound(self.config.charge, n)) return .server_full;
             }
             if (self.outbound_held.cmpxchgWeak(cur, cur + n, .seq_cst, .seq_cst) == null) {
                 switch (kind) {
@@ -2942,7 +3005,7 @@ pub const Connection = struct {
                 if (close_reason) self.noteOutboundHighWater(cur + n);
                 return .ok;
             }
-            if (self.config.accounting) |a| a.releaseOutbound(n);
+            if (self.config.accounting) |a| a.releaseOutbound(self.config.charge, n);
         }
     }
 
@@ -2983,7 +3046,7 @@ pub const Connection = struct {
         std.debug.assert(kind_prev >= n);
         const prev = self.outbound_held.fetchSub(n, .seq_cst);
         std.debug.assert(prev >= n);
-        if (self.config.accounting) |a| a.releaseOutbound(n);
+        if (self.config.accounting) |a| a.releaseOutbound(self.config.charge, n);
         // The one function every release passes through (drain failure, ack,
         // slow consumer, reset, writer failure, teardown), so no release site
         // can forget to hand the room to a waiter.
@@ -4610,7 +4673,7 @@ pub const Connection = struct {
             self.tls = self.config.tls_ready orelse
                 @panic("tls mode needs tls_ready: the handshake runs in Server.serveTlsThenBranch");
             if (self.handshake_held) {
-                if (self.config.accounting) |a| a.releaseHandshake();
+                if (self.config.accounting) |a| a.releaseHandshake(self.config.charge);
                 self.handshake_held = false;
             }
             self.tls_pump = .{
@@ -5105,7 +5168,7 @@ pub const Connection = struct {
             &self.request_leases.storage[pos]
         else
             self.request_leases.touchNext(.{}) orelse return null;
-        lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.request_pool, &self.request_budget) };
+        lease.* = .{ .stream_id = stream_id, .arena = .init(self.config.request_pool, &self.request_budget, self.config.charge) };
         self.lease_index.insert(self.request_leases.storage, self.leasePos(lease));
         return lease;
     }
@@ -7948,7 +8011,7 @@ pub const Connection = struct {
         var token_reserved = false;
         if (!complete_inline) {
             if (self.config.accounting) |acct| {
-                if (!acct.tryReserveTaskHandler()) {
+                if (!acct.tryReserveTaskHandler(self.config.charge)) {
                     // Queued, not processed: this can run inside
                     // `materializeIntents`, whose batch a nested drain would
                     // overwrite. That loop, or the caller's, sends it.
@@ -7964,7 +8027,7 @@ pub const Connection = struct {
         // fresh token when it resumes. The link takes ownership where
         // `link.core.task_token` is set.
         defer if (token_reserved) {
-            if (self.config.accounting) |acct| acct.releaseTaskHandler();
+            if (self.config.accounting) |acct| acct.releaseTaskHandler(self.config.charge);
         };
 
         const slot = self.allocSlot(d.stream_id) orelse {
@@ -7992,6 +8055,7 @@ pub const Connection = struct {
         link.* = .{
             .core = .{
                 .arena = lease.arena,
+                .charge = self.config.charge,
                 .accounting = self.config.accounting,
                 .balancer = self.config.balancer,
                 .exec_index = self.config.exec_index,
@@ -8007,6 +8071,7 @@ pub const Connection = struct {
             .hctx = undefined,
         };
         link.core.arena.gate = &link.core.gate;
+        link.core.retainCharge();
         self.forgetLease(lease);
         slot.link = link;
         const a = link.core.arena.allocator();
@@ -8032,7 +8097,7 @@ pub const Connection = struct {
             .body = d.body,
             .trailers = trailers,
             .arena = a,
-            .peer = peerFromHandle(self.stream.socket.handle),
+            .peer = self.config.peer,
         };
         link.resp = .{
             .stream_id = d.stream_id,
@@ -8055,6 +8120,7 @@ pub const Connection = struct {
             .method = link.req.method,
             .arena = a,
             .accept_encoding = accept_encoding,
+            .charge = link.core.charge,
         };
         link.matched = classified;
         switch (link.matched) {
@@ -8163,11 +8229,7 @@ pub const Connection = struct {
     fn finishHandlerJob(link: *StreamLink) void {
         // Encoder contexts are server-wide; release even on cancel/reset so
         // a stranded SSE cannot pin a pool slot past handler death.
-        if (link.hctx.encoder) |enc| {
-            enc.destroy();
-            link.hctx.encoder = null;
-            link.hctx.compressing = false;
-        }
+        dropEncoder(&link.hctx);
         if (link.enter()) |self| {
             defer link.exit();
             const slot = link.slot;
@@ -8843,7 +8905,11 @@ pub const Connection = struct {
         const pool = self.config.compression_pool orelse {
             return .{ .compress = false, .add_vary = add_vary };
         };
-        const enc = pool.tryAcquire() orelse return .{ .compress = false, .add_vary = add_vary };
+        hctx.charge.add(.compression, 1);
+        const enc = pool.tryAcquire() orelse {
+            hctx.charge.sub(.compression, 1);
+            return .{ .compress = false, .add_vary = add_vary };
+        };
         hctx.encoder = enc;
         hctx.compressing = true;
         return .{ .compress = true, .add_vary = add_vary };
@@ -8951,13 +9017,16 @@ pub const Connection = struct {
         };
     }
 
-    /// Give back the brotli encoder `prepareCompression` took, for a response
-    /// that was refused before it started.
+    /// Give back the brotli encoder `prepareCompression` took, to the pool and
+    /// to the client accounts it was charged to: a response refused before it
+    /// started, finished, or failed, and the handler's end. The only release
+    /// of an encoder.
     fn dropEncoder(hctx: *HandlerCtx) void {
         if (hctx.encoder) |enc| {
             enc.destroy();
             hctx.encoder = null;
             hctx.compressing = false;
+            hctx.charge.sub(.compression, 1);
         }
     }
 
@@ -8966,11 +9035,7 @@ pub const Connection = struct {
         const self = hctx.conn;
         enc.compress(input, op, out, self.config.gpa) catch {
             // Budget/encode failure after headers committed: RST, never switch coding.
-            if (hctx.encoder) |e| {
-                e.destroy();
-                hctx.encoder = null;
-                hctx.compressing = false;
-            }
+            dropEncoder(hctx);
             self.withSession(struct {
                 fn go(c: *Connection, at: DelayedReset) void {
                     if (diag_park) _ = diag_rst_compress.fetchAdd(1, .monotonic);
@@ -9044,9 +9109,7 @@ pub const Connection = struct {
                 compress = false;
                 body_out = body;
             }
-            enc.destroy();
-            hctx.encoder = null;
-            hctx.compressing = false;
+            dropEncoder(hctx);
         }
 
         var ticket: u64 = 0;
@@ -9211,11 +9274,7 @@ pub const Connection = struct {
         diagWait(hctx, .start_reserve_ticket);
         defer diagWait(hctx, .running);
         const ticket_pair = self.reserveTicket() catch |err| {
-            if (hctx.encoder) |enc| {
-                enc.destroy();
-                hctx.encoder = null;
-                hctx.compressing = false;
-            }
+            dropEncoder(hctx);
             return err;
         };
         const ticket = ticket_pair[0];
@@ -9386,9 +9445,7 @@ pub const Connection = struct {
             try compressOrAbort(hctx, stream_id, bytes, op, &out);
             if (end and hctx.encoder != null) {
                 // finish already done in compress; release encoder
-                hctx.encoder.?.destroy();
-                hctx.encoder = null;
-                hctx.compressing = false;
+                dropEncoder(hctx);
             }
             owned = try out.toOwnedSlice(self.config.gpa);
             wire_bytes = owned.?;
@@ -9791,6 +9848,8 @@ test "t-894 leftover write acks: skip Forced is visible, Forced then deinit is q
     hop.open(accepted, .{
         .io = io,
         .mode = .h2c,
+        .charge = .none,
+        .peer = .unknown,
         .limits = limits,
         .router = .{ .routes = &.{} },
         .gpa = gpa,
@@ -9845,6 +9904,8 @@ test "a connection-window wait ends when the peer's credit arrives, not at the n
     hop.open(accepted, .{
         .io = io,
         .mode = .h2c,
+        .charge = .none,
+        .peer = .unknown,
         .limits = limits,
         .router = .{ .routes = &.{} },
         .gpa = gpa,
@@ -10320,7 +10381,7 @@ fn fakeBudgetWaiter(conn: *Connection, stream_id: u31) usize {
     // What `claimSlot` does for a real handler.
     conn.space_events[i] = .init;
     test_fake_links[i] = .{
-        .core = .{ .arena = undefined },
+        .core = .{ .arena = undefined, .charge = .none },
         .conn = conn,
         .stream_id = stream_id,
         .owned_request = undefined,
@@ -10416,7 +10477,7 @@ test "budget queue: a head refused by the SERVER cap is woken to fail, not left 
     try std.testing.expectEqual(BudgetWait.State.queued, conn.handlers.storage[w].budget.state);
     // Other connections take the server's room while this one waits: 60 more
     // bytes, then the cap is all used up.
-    try std.testing.expect(acct.tryReserveOutbound(60));
+    try std.testing.expect(acct.tryReserveOutbound(.none, 60));
     acct.max_outbound_bytes = 140;
 
     // 50 bytes come back. The connection has room for the head (50 >= 40);
@@ -10431,7 +10492,7 @@ test "budget queue: a head refused by the SERVER cap is woken to fail, not left 
     try std.testing.expectEqual(@as(usize, 110), acct.outbound_bytes.load(.acquire));
     try std.testing.expectEqual(BudgetWait.State.refused, conn.takeBudgetOutcome(&conn.handlers.storage[w], &conn.space_events[w]));
     conn.applyOutboundRelease(50, .pending);
-    acct.releaseOutbound(60);
+    acct.releaseOutbound(.none, 60);
     try std.testing.expectEqual(@as(usize, 0), acct.outbound_bytes.load(.acquire));
 }
 
@@ -10565,7 +10626,7 @@ fn cancelParkedScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     const i = fakeBudgetWaiter(conn, 1);
     const slot = &conn.handlers.storage[i];
-    var hctx: HandlerCtx = .{ .conn = conn, .terminal = &slot.link.?.core.terminal, .slot = slot, .stream_id = 1, .arena = gpa };
+    var hctx: HandlerCtx = .{ .conn = conn, .terminal = &slot.link.?.core.terminal, .slot = slot, .stream_id = 1, .arena = gpa, .charge = .none };
     var out: ?anyerror = null;
     var task = try rt.spawn(parkedTaskMain, .{ conn, &hctx, &out });
     const deadline = nowNs(conn.config.io) + 5 * std.time.ns_per_s;
@@ -11851,6 +11912,8 @@ fn openTrapHopLimits(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: 
     out.hop.open(accepted, .{
         .io = io,
         .mode = .h2c,
+        .charge = .none,
+        .peer = .unknown,
         .limits = limits,
         .router = .{ .routes = routes },
         .gpa = gpa,
@@ -11990,7 +12053,7 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *StreamLink {
     const lease = conn.newLease(sid) orelse std.debug.panic("no free test lease", .{});
     const link = lease.arena.allocator().create(StreamLink) catch std.debug.panic("trap link alloc failed", .{});
     link.* = .{
-        .core = .{ .arena = lease.arena },
+        .core = .{ .arena = lease.arena, .charge = .none },
         .conn = conn,
         .stream_id = sid,
         .owned_request = .{
@@ -12018,6 +12081,7 @@ fn trapAdmitJob(conn: *Connection, sid: u31) *StreamLink {
         .slot = slot,
         .stream_id = sid,
         .arena = link.core.arena.allocator(),
+        .charge = .none,
     };
     link.resp = .{
         .stream_id = sid,
@@ -12175,6 +12239,8 @@ fn bootIntoBuffer(io: std.Io, lim: limits_mod.Limits, mode: Mode, bytes: usize) 
     var conn = try Connection.init(boot, pair.accepted, .{
         .io = io,
         .mode = mode,
+        .charge = .none,
+        .peer = .unknown,
         .limits = lim,
         .router = .{ .routes = &.{} },
         .tls_acceptor = if (mode == .tls) &acceptor else null,
@@ -12624,7 +12690,7 @@ test "a call after the link's gate closed fails without touching the connection 
     // gate exists for: `Response` checks the cause first, so only the gate
     // stands between a call that raced teardown and freed memory.
     var link: StreamLink = .{
-        .core = .{ .arena = undefined },
+        .core = .{ .arena = undefined, .charge = .none },
         .conn = @ptrFromInt(0xdead0000),
         .stream_id = 1,
         .owned_request = undefined,
@@ -12634,7 +12700,7 @@ test "a call after the link's gate closed fails without touching the connection 
         .slot = @ptrFromInt(0xdead1000),
         .hctx = undefined,
     };
-    link.hctx = .{ .conn = link.conn, .terminal = &link.core.terminal, .slot = link.slot, .stream_id = 1, .arena = std.testing.allocator };
+    link.hctx = .{ .conn = link.conn, .terminal = &link.core.terminal, .slot = link.slot, .stream_id = 1, .arena = std.testing.allocator, .charge = .none };
     link.core.gate.close();
     const ctx: *anyopaque = &link.hctx;
     try std.testing.expectError(error.ConnectionClosed, Connection.writeCb(ctx, 1, "late", false, true, true));

@@ -70,6 +70,8 @@ pub const edge = struct {
     pub const touched = @import("edge/touched.zig");
     pub const wire_ring = @import("edge/wire_ring.zig");
     pub const gate = @import("edge/gate.zig");
+    pub const accounts = @import("edge/accounts.zig");
+    pub const proxy_protocol = @import("edge/proxy_protocol.zig");
 };
 
 pub const http = struct {
@@ -140,6 +142,8 @@ test {
     _ = edge.touched;
     _ = edge.wire_ring;
     _ = edge.gate;
+    _ = edge.accounts;
+    _ = edge.proxy_protocol;
     _ = core.bound_shapes;
     _ = core.boot_plan;
     _ = edge.conn_slot;

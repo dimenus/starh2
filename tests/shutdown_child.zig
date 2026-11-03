@@ -13,6 +13,22 @@
 //!   server then still accepts and serves a request.
 //! - `underflow`: a release of a counter at zero is refused, counted and
 //!   logged, and the counter stays at zero.
+//! - `accounts-underflow`: a client account released twice is refused,
+//!   counted (`underflows`) and logged; a record reference given back twice
+//!   is refused, counted (`stale`: its record's generation moved when it was
+//!   freed) and logged; the record is freed once, not twice (the free list
+//!   would overflow its array), and a reference that outlived its record does
+//!   not touch the record's next key. On d33e615 this case does not exist (no
+//!   client accounts).
+//! - `accounts-release-race`: two releases of one reference both take the
+//!   locked path, and an acquire reuses the record between them; the second
+//!   is refused (`stale`) and the new key's record stays, with its holder.
+//!   On 8eb220f the second removed the new key's live record. Then a release
+//!   and a retain through the same stale reference, on the lock-free paths
+//!   (the new key has two holders), are refused too.
+//! - `accounts-quarantine`: a record whose last reference goes with two counts
+//!   not zero is quarantined once, and one log line names both counts. On
+//!   8eb220f it counted two quarantines.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -197,9 +213,157 @@ fn okClient(port: u16, ok: *std.atomic.Value(bool), done: *std.atomic.Value(bool
 
 fn runUnderflow(_: *zio.Runtime) anyerror!void {
     var a: starh2.edge.connection.GlobalAccounting = .{ .max_streams = 1, .task_handler_capacity = 1, .max_outbound_bytes = 1, .max_handshakes = 1 };
-    a.releaseStream();
-    a.releaseOutbound(7);
+    a.releaseStream(.none);
+    a.releaseOutbound(.none, 7);
     std.debug.print("child: active_streams={d} outbound_bytes={d} underflows={d}\n", .{ a.active_streams.load(.acquire), a.outbound_bytes.load(.acquire), a.underflows.load(.acquire) });
+}
+
+fn runAccountsUnderflow(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    var t = try accounts.Table.init(gpa, 2, 7);
+    defer t.deinit(gpa);
+    var kb: [accounts.max_refs]accounts.Key = undefined;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &kb))).?;
+    a.add(.streams, 1);
+    a.sub(.streams, 1);
+    // The double release of the charge.
+    a.sub(.streams, 1);
+    t.release(a);
+    // The double release of the reference, before the record is reused.
+    t.release(a);
+    // Both records are still there to take: freed once, not twice.
+    var k2: [accounts.max_refs]accounts.Key = undefined;
+    var k3: [accounts.max_refs]accounts.Key = undefined;
+    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &k2))).?;
+    const c = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 3 } }, 48, &k3))).?;
+    var k4: [accounts.max_refs]accounts.Key = undefined;
+    const full = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 4 } }, 48, &k4))) == null;
+    b.add(.streams, 1);
+    // `a`'s record now holds 10.0.0.2 (or 10.0.0.3): a release through the
+    // stale reference is refused and leaves the new key's counts alone.
+    a.sub(.streams, 1);
+    t.release(a);
+    const eb = t.lookup(k2[0]).?;
+    const s = t.stats();
+    std.debug.print("child: accounts underflows={d} stale={d} removals={d} full_after_two={} b.streams={d} b.holders={d}\n", .{ s.underflows, s.stale, s.removals, full, eb.count(.streams), eb.holders });
+    b.sub(.streams, 1);
+    t.release(b);
+    t.release(c);
+}
+
+fn runAccountsReleaseRace(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    var t = try accounts.Table.init(gpa, 2, 7);
+    defer t.deinit(gpa);
+    var ka: [accounts.max_refs]accounts.Key = undefined;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka))).?;
+    // Two releases of `a`'s one reference race: both read one holder, so
+    // both take the locked path (`Table.release`). The first wins the lock
+    // and removes the record; an acquire then takes the lock before the
+    // second and reuses the record for a new key; then the second runs its
+    // locked step. The steps, in that order:
+    t.release(a);
+    var kb: [accounts.max_refs]accounts.Key = undefined;
+    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &kb))).?;
+    const same_record = b.refs[0].index == a.refs[0].index;
+    t.releaseLast(a.refs[0]);
+    const after_locked = if (t.lookup(kb[0])) |e| e.holders else 0;
+    // The lock-free paths, through the same stale reference: with two
+    // holders on the new key, a release of `a` is a lock-free decrement and
+    // must be refused too; so must a retain.
+    if (after_locked == 1) t.retain(b);
+    t.release(a);
+    t.retain(a);
+    const eb = t.lookup(kb[0]);
+    const s = t.stats();
+    std.debug.print("child: release race same_record={} after_locked={d} b.live={} b.holders={d} stale={d} underflows={d} removals={d}\n", .{ same_record, after_locked, eb != null, if (eb) |e| e.holders else 0, s.stale, s.underflows, s.removals });
+    if (eb) |e| {
+        for (0..e.holders) |_| t.release(b);
+    }
+}
+
+fn runAccountsQuarantine(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    var t = try accounts.Table.init(gpa, 2, 7);
+    defer t.deinit(gpa);
+    var ka: [accounts.max_refs]accounts.Key = undefined;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka))).?;
+    // Two counts a path forgot to release: one record, quarantined once.
+    a.add(.streams, 1);
+    a.add(.connections, 1);
+    t.release(a);
+    const s = t.stats();
+    std.debug.print("child: quarantine live={d} quarantined={d} removals={d}\n", .{ s.live, s.quarantined, s.removals });
+}
+
+fn runProxyTrustedRange(rt: *zio.Runtime) anyerror!void {
+    const gpa = std.heap.page_allocator;
+    const wide = [_]starh2.edge.proxy_protocol.Cidr{try starh2.edge.proxy_protocol.Cidr.parse("::/0")};
+    const ep: starh2.EndpointConfig = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+    if (starh2.Server.init(gpa, rt.io(), .{ .endpoints = &.{ep}, .routes = &.{}, .tls = null, .client_identity = &.{.{ .proxy_protocol = .{ .trusted = &wide } }} })) |srv| {
+        var s = srv;
+        s.deinit(gpa);
+        std.debug.print("child: trusted range ::/0 booted\n", .{});
+    } else |err| std.debug.print("child: trusted range ::/0 {s}\n", .{@errorName(err)});
+}
+
+fn runAccountsChargeRace(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    var t = try accounts.Table.init(gpa, 1, 7);
+    defer t.deinit(gpa);
+    var ka: [accounts.max_refs]accounts.Key = undefined;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka))).?;
+    // A charge through `a` checks its record's generation (`Charge.add` and
+    // `sub` do that first) while `a` still holds it. Then `a` is released,
+    // and an acquire reuses the record for a new key, before the charge's
+    // add and sub land (`Table.addAt`, `subAt`). The steps, in that order:
+    const rec = t.record(a.refs[0]).?;
+    t.release(a);
+    var kb: [accounts.max_refs]accounts.Key = undefined;
+    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &kb))).?;
+    const same_record = b.refs[0].index == a.refs[0].index;
+    b.add(.request_bytes, 10);
+    t.addAt(rec, a.refs[0], .streams, 5);
+    t.subAt(rec, a.refs[0], .request_bytes, 4);
+    const eb = t.lookup(kb[0]).?;
+    const s = t.stats();
+    std.debug.print("child: charge race same_record={} b.streams={d} b.request_bytes={d} stale={d} underflows={d}\n", .{ same_record, eb.count(.streams), eb.count(.request_bytes), s.stale, s.underflows });
+    // Leave `b` clean, whichever code ran.
+    if (eb.count(.streams) != 0) b.sub(.streams, eb.count(.streams));
+    b.sub(.request_bytes, t.lookup(kb[0]).?.count(.request_bytes));
+    t.release(b);
+}
+
+fn runAccountsGenerationWrap(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    var t = try accounts.Table.init(gpa, 1, 7);
+    defer t.deinit(gpa);
+    var k1: [accounts.max_refs]accounts.Key = undefined;
+    const key1 = accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &k1);
+    // The oldest reference to the one record: generation 0.
+    const a0 = (try t.acquire(key1)).?;
+    t.release(a0);
+    // Two removals short of 2^32: then cycle the record until it can no
+    // longer be taken, at most three times.
+    t.forceGenerationForTest(0, std.math.maxInt(u32) - 2);
+    var cycles: usize = 0;
+    while (cycles < 3) : (cycles += 1) {
+        const c = (try t.acquire(key1)) orelse break;
+        t.release(c);
+    }
+    var k2: [accounts.max_refs]accounts.Key = undefined;
+    const key2 = accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &k2);
+    const b = try t.acquire(key2);
+    // The generation-0 reference, given back again: it must never match.
+    t.release(a0);
+    const s = t.stats();
+    std.debug.print("child: generation wrap cycles={d} b.acquired={} b.live={} stale={d} insert_failures={d}\n", .{ cycles, b != null, t.lookup(k2[0]) != null, s.stale, s.insert_failures });
+    if (t.lookup(k2[0]) != null) t.release(b.?);
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -215,6 +379,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runDeinitIdle, .{rt})
     else if (std.mem.eql(u8, case, "underflow"))
         try rt.spawn(runUnderflow, .{rt})
+    else if (std.mem.eql(u8, case, "accounts-underflow"))
+        try rt.spawn(runAccountsUnderflow, .{rt})
+    else if (std.mem.eql(u8, case, "accounts-release-race"))
+        try rt.spawn(runAccountsReleaseRace, .{rt})
+    else if (std.mem.eql(u8, case, "accounts-quarantine"))
+        try rt.spawn(runAccountsQuarantine, .{rt})
+    else if (std.mem.eql(u8, case, "proxy-trusted-range"))
+        try rt.spawn(runProxyTrustedRange, .{rt})
+    else if (std.mem.eql(u8, case, "accounts-charge-race"))
+        try rt.spawn(runAccountsChargeRace, .{rt})
+    else if (std.mem.eql(u8, case, "accounts-generation-wrap"))
+        try rt.spawn(runAccountsGenerationWrap, .{rt})
     else
         return error.UnknownCase;
     try h.join();
