@@ -1610,7 +1610,7 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + zio DST gate (dst-zio) + every artifact a named step or the install step compiles");
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + zio DST gate (dst-zio) + connection DST gate (dst-conn) + every artifact a named step or the install step compiles");
     ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(&session_mu_gate_run.step);
     ci_step.dependOn(&dst_transport_run.step);
@@ -1627,6 +1627,7 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(pipeline_bench_smoke_step);
     ci_step.dependOn(release_step);
     ci_step.dependOn(dst_zio_step);
+    ci_step.dependOn(dst_conn_step);
 
     // Every artifact that `zig build <step>` or a plain `zig build` can
     // compile is compiled by `ci` too. A tool or example is otherwise only
