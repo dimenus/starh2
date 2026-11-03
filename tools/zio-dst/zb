@@ -1,2 +1,4 @@
 #!/bin/sh
-exec "$HOME/.zvm/bin/zig" "$@"
+# Run the zig starh2 targets, through starh2's own zb: this package pins the
+# same minimum_zig_version, and one shim keeps the version rule in one place.
+exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/../../zb" "$@"

@@ -1491,6 +1491,28 @@ pub fn build(b: *std.Build) void {
     const session_mu_gate_step = b.step("session-mu-gate", "Fail on any use of the session mutex outside lockSession/unlockSession, or a send on the actor bell outside ring");
     session_mu_gate_step.dependOn(&session_mu_gate_run.step);
 
+    // The zio DST gate. tools/zio-dst is its own package: it builds the sim
+    // line of zio (`zio_options.sim` declared in its root) and runs D1-D5
+    // over the fixtures, then one build per validity mutant, each of which
+    // must be FOUND by some seed and replay identically (a clean sweep
+    // exits 1). Not in `ci` yet. It builds zio three times, so it is
+    // separate from the suite's own zio pin.
+    const dst_zio_step = b.step("dst-zio", "zio DST harness: D1-D5 over every fixture, and every validity mutant found (tools/zio-dst)");
+    {
+        const checks = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run", "--", "--d1", "--d2", "--d4", "--d5", "--all-fixtures" });
+        checks.setCwd(b.path("tools/zio-dst"));
+        checks.has_side_effects = true;
+        checks.stdio = .inherit;
+        dst_zio_step.dependOn(&checks.step);
+        inline for (.{ "arm_timer_stale", "omit_timeout_recheck" }) |mutant| {
+            const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run", "-Dsim-mutant=" ++ mutant, "--", "--arm-mutant" });
+            run.setCwd(b.path("tools/zio-dst"));
+            run.has_side_effects = true;
+            run.stdio = .inherit;
+            dst_zio_step.dependOn(&run.step);
+        }
+    }
+
     const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + every artifact a named step or the install step compiles");
     ci_step.dependOn(&std_io_gate_run.step);
     ci_step.dependOn(&session_mu_gate_run.step);

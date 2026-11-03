@@ -2,12 +2,15 @@
     .name = .zio_dst,
     .version = "0.0.0",
     .fingerprint = 0x6e270d0db05b332f,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // dimenus/zio sim/dst-m1 (round-5 cancel ids and terminal errors).
+        // dimenus/zio sim/dst-m2: the sim line ported onto starh2's zio pin
+        // (dbf1beb). The hash is of `git archive d8ac2fd`, which hashes the
+        // same as a GitHub fetch of that commit (both checked when the pin
+        // moved to it).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#913ffda783f73244a028d8eb0381aa4dcedad3fa",
-            .hash = "zio-0.17.0-xHbVVJzKKQBnr_vM4YfsMU6sqKRHoIh38gLaAt8q-GQh",
+            .url = "git+https://github.com/dimenus/zio#d8ac2fdd40d53f101b5b807f11fc3b3ae2af4fac",
+            .hash = "zio-0.19.0-xHbVVIakLwCojwesQxrQP9UCPevbc-ydBYHtz-hs91wj",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },

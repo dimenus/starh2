@@ -7,6 +7,17 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const harness_options = @import("harness_options");
+
+/// zio reads its compile-time configuration from the root module. Sim on,
+/// pinned scheduling (sim does not simulate task migration), and the mutant
+/// chosen with `-Dsim-mutant`.
+pub const zio_options: zio.Options = .{
+    .sim = true,
+    .scheduling = .pinned,
+    .sim_mutant = std.meta.stringToEnum(zio.SimMutant, harness_options.sim_mutant) orelse
+        @compileError("unknown -Dsim-mutant=" ++ harness_options.sim_mutant),
+};
 
 const Fixture = enum {
     same_tick_race,
@@ -15,6 +26,7 @@ const Fixture = enum {
     select_task_cancel,
     select_channel,
     select_clobber,
+    select_lost_claim,
     zero_timer,
     remote_submit,
     close_inflight,
@@ -42,7 +54,6 @@ fn runtimeOpts() zio.RuntimeOptions {
     return .{
         .executors = .exact(2),
         .enable_main_executor = true,
-        .enable_task_migration = false,
         .thread_pool = .{ .max_threads = 0 },
         .stack_pool = .{
             .maximum_size = 8 * 1024 * 1024,
@@ -93,6 +104,7 @@ fn runNamed(rt: *zio.Runtime, fixture: Fixture) !void {
         .select_task_cancel => try selectTaskCancel(rt),
         .select_channel => try selectChannel(rt),
         .select_clobber => try selectClobber(rt),
+        .select_lost_claim => try selectLostClaim(rt),
         .zero_timer => try zeroTimer(rt),
         .remote_submit => try remoteSubmit(rt),
         .close_inflight => try closeInflight(rt),
@@ -145,7 +157,7 @@ const Race = struct {
 };
 
 fn raceDriver(r: *Race) !void {
-    const c = r.cq.timedWait(.{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
+    const c = r.cq.waitTimeout(.{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
         error.Timeout, error.Closed, error.Canceled => return,
     };
     _ = c;
@@ -178,7 +190,7 @@ fn sameTickRace(rt: *zio.Runtime) !void {
 const SelectPark = struct {
     cq: zio.CompletionQueue,
     io_timer: zio.ev.Timer,
-    cancel: zio.ResetEvent,
+    cancel: zio.Event,
 };
 
 fn selectDriver(p: *SelectPark) !void {
@@ -397,6 +409,59 @@ fn selectClobber(rt: *zio.Runtime) !void {
     }
 }
 
+/// A CQ completion that lands on a select another arm already won. The
+/// poster sets the Event arm, whose signal claims the select's winner word,
+/// then submits a zero-duration timer to the queue the select is still
+/// registered on. When the mux polls before the driver settles, the timer's
+/// `claimToRegistered` loses the winner word and must leave no deposit; the
+/// driver's `asyncCancelWait` on the CQ arm panics if it finds one. Without
+/// this fixture no schedule reached that check (measured: a mutant that
+/// latches a deposit on the lost path survived every other fixture and the
+/// native suite).
+const LostClaim = struct {
+    cq: zio.CompletionQueue,
+    timer: zio.ev.Timer,
+    event: zio.Event,
+};
+
+fn lostClaimDriver(l: *LostClaim) !void {
+    const result = zio.select(.{
+        .io = &l.cq,
+        .event = &l.event,
+    }) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    switch (result) {
+        .io => |r| _ = r catch {},
+        .event => {},
+    }
+}
+
+fn lostClaimPoster(l: *LostClaim) !void {
+    l.event.set();
+    try l.cq.submit(&l.timer.c);
+}
+
+fn selectLostClaim(rt: *zio.Runtime) !void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var l: LostClaim = .{
+            .cq = zio.CompletionQueue.init(),
+            .timer = zio.ev.Timer.init(.{ .duration = .fromNanoseconds(0) }),
+            .event = .init,
+        };
+        var d = try rt.spawn(lostClaimDriver, .{&l});
+        // Sleep, not yield: the driver must have registered both arms and
+        // parked before the poster exists. A yield can return here first,
+        // and the sweep's coop point can run the poster between the arms.
+        try zio.sleep(.fromMilliseconds(1));
+        var p = try rt.spawn(lostClaimPoster, .{&l});
+        p.join() catch {};
+        d.join() catch {};
+        l.cq.cancelAll(.discard);
+    }
+}
+
 fn zeroTimer(rt: *zio.Runtime) !void {
     _ = rt;
     var cq = zio.CompletionQueue.init();
@@ -421,7 +486,7 @@ fn remoteSubmit(rt: *zio.Runtime) !void {
 }
 
 fn raceDriverLong(r: *Race) !void {
-    const c = r.cq.timedWait(.{ .duration = .fromMilliseconds(100) }) catch |err| switch (err) {
+    const c = r.cq.waitTimeout(.{ .duration = .fromMilliseconds(100) }) catch |err| switch (err) {
         error.Timeout => return error.UnexpectedTimeout,
         error.Closed, error.Canceled => return err,
     };
@@ -577,7 +642,7 @@ fn ioSendAfterClose(rt: *zio.Runtime) !void {
     var send_store: [1]zio.os.iovec_const = undefined;
     var send_op = zio.ev.NetSend.init(fds[1], zio.ev.WriteBuf.fromSlice(payload, &send_store), .{});
     try cq.submit(&send_op.c);
-    const c = cq.timedWait(.{ .duration = .fromMilliseconds(100) }) catch |err| switch (err) {
+    const c = cq.waitTimeout(.{ .duration = .fromMilliseconds(100) }) catch |err| switch (err) {
         error.Timeout => return error.SendAfterCloseDeadlock,
         else => return err,
     };
@@ -611,7 +676,7 @@ fn ioCancelParked(rt: *zio.Runtime) !void {
 
 fn ioRecvDriver(r: *IoRace) !void {
     try r.cq.submit(&r.recv.c);
-    const c = r.cq.timedWait(.{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
+    const c = r.cq.waitTimeout(.{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
         error.Timeout, error.Closed, error.Canceled => return,
     };
     _ = c;
@@ -807,6 +872,14 @@ fn checkD5(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
         std.debug.print("D5 FAIL: simulated line does not name extra_logical_executors\n{s}\n", .{text});
         std.process.exit(1);
     }
+    // The port onto zio's pinned/work_stealing split: sim cannot run
+    // work_stealing (a compile error in zio's options), so the scope report
+    // must say migration is outside what this harness exercises.
+    const unsim_line = rest[0..line_end];
+    if (std.mem.indexOf(u8, unsim_line, "work_stealing (sim cannot run work_stealing)") == null) {
+        std.debug.print("D5 FAIL: unsimulated line does not name work_stealing (sim cannot run work_stealing)\n{s}\n", .{text});
+        std.process.exit(1);
+    }
     std.debug.print("{s}", .{text});
     std.debug.print("D5 PASS\n", .{});
 }
@@ -881,7 +954,7 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
     const needle: []const u8 = if (stale)
         "armTimer backdated"
     else if (omit)
-        "timedWait Timeout with a ready completion"
+        "waitTimeout Timeout with a ready completion"
     else {
         std.debug.print("MUTANT_NOT_COMPILED: rebuild with -Dsim-mutant=arm_timer_stale or omit_timeout_recheck\n", .{});
         std.process.exit(1);
@@ -1099,7 +1172,8 @@ pub fn main(init: std.process.Init) !void {
                 // on a timer fixture means the instrument did not fire.
                 if (fix == .zero_timer or fix == .same_tick_race or fix == .select_park or
                     fix == .select_generations or fix == .select_task_cancel or
-                    fix == .select_channel or fix == .select_clobber or fix == .io_mid_sleep)
+                    fix == .select_channel or fix == .select_clobber or fix == .select_lost_claim or
+                    fix == .io_mid_sleep)
                 {
                     std.debug.print("FAIL fixture {s}: zero events\n", .{@tagName(fix)});
                     std.process.exit(1);
