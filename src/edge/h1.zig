@@ -218,11 +218,9 @@ pub const H1Conn = struct {
     tls_to_actor_buf: []wire_pump.WireChunk = &.{},
     tls_write_ch_buf: []wire_pump.WireChunk = &.{},
     tls_ack_buf: []wire_pump.WriteCompletion = &.{},
-    tls_read_free_buf: []u32 = &.{},
     tls_to_actor: zio.Channel(wire_pump.WireChunk) = undefined,
     tls_write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
     tls_acks: zio.Channel(wire_pump.WriteCompletion) = undefined,
-    tls_read_free: std.Io.Queue(u32) = undefined,
     /// One write chunk: slab 0 is `tls_out`, and holding it is the token that
     /// says the TLS pump has not yet finished the previous write.
     tls_write_pool: slab_pool.SlabPool = undefined,
@@ -305,7 +303,6 @@ pub const H1Conn = struct {
         if (self.tls_to_actor_buf.len != 0) self.gpa.free(self.tls_to_actor_buf);
         if (self.tls_write_ch_buf.len != 0) self.gpa.free(self.tls_write_ch_buf);
         if (self.tls_ack_buf.len != 0) self.gpa.free(self.tls_ack_buf);
-        if (self.tls_read_free_buf.len != 0) self.gpa.free(self.tls_read_free_buf);
         if (self.tls_out.len != 0) self.tls_write_pool.deinit(self.gpa);
         self.* = undefined;
     }
@@ -445,14 +442,12 @@ fn startTlsPump(self: *H1Conn) !void {
     self.tls_to_actor_buf = try gpa.alloc(wire_pump.WireChunk, 1);
     self.tls_write_ch_buf = try gpa.alloc(wire_pump.WireChunk, 4);
     self.tls_ack_buf = try gpa.alloc(wire_pump.WriteCompletion, 4);
-    self.tls_read_free_buf = try gpa.alloc(u32, 1);
     self.tls_write_pool = try slab_pool.SlabPool.init(gpa, self.io, limits_mod.WIRE_CHUNK_SIZE, 1);
     self.tls_out = self.tls_write_pool.slabAt(0);
 
     self.tls_to_actor = .init(self.tls_to_actor_buf);
     self.tls_write_ch = .init(self.tls_write_ch_buf);
     self.tls_acks = .init(self.tls_ack_buf);
-    self.tls_read_free = .init(self.tls_read_free_buf);
     self.tls_req_ch = .init(&self.tls_req_buf);
     self.tls_ok_ch = .init(&self.tls_ok_buf);
 
@@ -472,7 +467,6 @@ fn startTlsPump(self: *H1Conn) !void {
         .gpa = gpa,
         .chunk_storage = self.tls_chunk_storage,
         .n_chunks = 1,
-        .read_free = &self.tls_read_free,
         .write_free = &self.tls_write_pool,
         .live_task_handlers = &self.tls_live_handlers,
     };

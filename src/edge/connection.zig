@@ -694,8 +694,8 @@ pub fn diagRekickSweep() u32 {
     for (diag_reg) |maybe_conn| {
         const conn = maybe_conn orelse continue;
         const site = conn.tls_pump_site.load(.acquire);
-        // No queue reads here: io_queue locks a std.Io.Mutex, which an OS
-        // thread outside the runtime must never take.
+        // No queue reads here: a channel read takes the channel's mutex, and
+        // this OS-thread sweep must not contend with the connection for it.
         const pump_state: u8 = if (diag_task_state_fn) |f| f(conn.tls_pump_task_h.load(.acquire)) else 0xff;
         const actor_state: u8 = if (diag_task_state_fn) |f| f(conn.actor_task_h.load(.acquire)) else 0xff;
         const pump_mark: u64 = if (diag_task_mark_fn) |f| f(conn.tls_pump_task_h.load(.acquire)) else 0;
@@ -1855,7 +1855,7 @@ pub const complete_receipt_capacity: usize = 4;
 
 /// Inbound `read_ch` chunks ingested on one actor turn before one
 /// `runPendingInline`. Matches receipt capacity so K requests can share
-/// one drain-turn. Do not size this with `io_queue.queued`.
+/// one drain-turn. Do not size this with `io_queue.chanLen`.
 pub const inbound_chunk_batch: usize = 4;
 
 /// Non-end `wait` writes (SSE `writeAll`) park while this stream's pending
@@ -2009,7 +2009,7 @@ pub const Connection = struct {
     /// Inbound chunks from the pump. A zio channel the actor selects on;
     /// capacity is the pool size + 1 so the EOF sentinel always fits.
     read_ch: zio.Channel(wire_pump.WireChunk) = undefined,
-    write_ch: std.Io.Queue(wire_pump.WireChunk) = undefined,
+    write_ch: zio.Channel(wire_pump.WireChunk) = undefined,
     /// The flag-producers' wake: capacity 1, `ring` is the only writer.
     /// `error.WouldBlock` on the ring means a wake is already pending. A
     /// buffered ring survives until the actor takes it, so there is no
@@ -2228,7 +2228,7 @@ pub const Connection = struct {
     /// Fixed inbound wire chunk pool.
     read_chunk_storage: []u8 = &.{},
     read_free_buf: []u32 = &.{},
-    read_free_ch: std.Io.Queue(u32) = undefined,
+    read_free_ch: zio.Channel(u32) = undefined,
     /// Write chunks, claimed lowest-free-bit. A FIFO free list rotated one
     /// in-flight chunk through all of them and faulted every chunk's pages on
     /// a connection that never had more than one write outstanding.
@@ -2661,10 +2661,9 @@ pub const Connection = struct {
         // Seed read/write-chunk free lists after channels are live.
         var i: u32 = 0;
         while (i < self.read_pool_n) : (i += 1) {
-            self.read_free_ch.putOneUncancelable(self.config.io, i) catch {
-                // Fresh queue capacity exactly matches the number of pool indices.
-                unreachable;
-            };
+            // Fresh channel capacity exactly matches the number of pool
+            // indices, and nothing has closed it yet.
+            self.read_free_ch.trySend(i) catch |err| std.debug.panic("read free list seed: {t} at index {d}", .{ err, i });
         }
         try self.session.emitServerPreface();
     }
@@ -2714,7 +2713,7 @@ pub const Connection = struct {
             self.handshake_held = false;
         }
         // Drain channels before their backing buffers are released.
-        while (io_queue.tryGet(wire_pump.WireChunk, &self.write_ch, io)) |chunk| {
+        while (io_queue.tryRecv(wire_pump.WireChunk, &self.write_ch)) |chunk| {
             if (chunk.pool_index) |idx| {
                 self.write_pool.releaseIndex(io, idx);
             } else if (chunk.bytes.len != 0) {
@@ -2726,10 +2725,9 @@ pub const Connection = struct {
         }
         while (io_queue.tryRecv(wire_pump.WireChunk, &self.read_ch)) |chunk| {
             if (chunk.pool_index) |idx| {
-                self.read_free_ch.putOneUncancelable(io, idx) catch {
-                    // Every queued read chunk owns one removed pool index.
-                    unreachable;
-                };
+                // Every queued read chunk owns one removed pool index, and the
+                // free list is never closed.
+                self.read_free_ch.trySend(idx) catch |err| std.debug.panic("read free list: {t} returning index {d}", .{ err, idx });
             } else if (chunk.bytes.len != 0) {
                 self.config.gpa.free(chunk.bytes);
             }
@@ -2841,7 +2839,7 @@ pub const Connection = struct {
                     wire_pump.diag_acks.applied_release.load(.acquire),
                     io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch),
                     self.held_ack_n,
-                    io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io),
+                    io_queue.chanLen(wire_pump.WireChunk, &self.write_ch),
                     io_queue.chanLen(wire_pump.WireChunk, &self.read_ch),
                 },
             );
@@ -2920,7 +2918,7 @@ pub const Connection = struct {
         if (self.handshake_held) return "handshake slot still held";
         if (!self.socket_closed.load(.acquire)) return "socket still open";
         if (io_queue.chanLen(wire_pump.WireChunk, &self.read_ch) != 0) return "read channel not empty";
-        if (io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) != 0) return "write channel not empty";
+        if (io_queue.chanLen(wire_pump.WireChunk, &self.write_ch) != 0) return "write channel not empty";
         if (self.tls_write_buf.len != 0 and io_queue.chanLen(wire_pump.WireChunk, &self.tls_write_ch) != 0) {
             return "tls write channel not empty";
         }
@@ -3484,11 +3482,10 @@ pub const Connection = struct {
         // (and can double-free payload bytes). Queued wire is released via
         // WritePump failDrain/ack or Connection.deinit after pumps join.
         // Writer queue closure already terminates the failed transport.
-        _ = io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, .{
-            .bytes = &.{},
-            .len = 0,
-        });
-        self.write_ch.close(self.config.io);
+        // The sentinel is put without waiting. A full queue already has
+        // chunks that wake the pump, and a closed one already ended it.
+        self.write_ch.trySend(.{ .bytes = &.{}, .len = 0 }) catch {};
+        self.write_ch.close(.graceful);
         if (self.tls_write_buf.len != 0) {
             // Graceful: buffered chunks carry pool indices and accounting
             // that the driver's failDrain (or deinit) must release exactly
@@ -4097,9 +4094,9 @@ pub const Connection = struct {
             }
             if (sw < min_win) min_win = sw;
         }
-        const write_q = io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io);
+        const write_q = io_queue.chanLen(wire_pump.WireChunk, &self.write_ch);
         const read_q = io_queue.chanLen(wire_pump.WireChunk, &self.read_ch);
-        const read_free_q = io_queue.queued(u32, &self.read_free_ch, self.config.io);
+        const read_free_q = io_queue.chanLen(u32, &self.read_free_ch);
         const write_free_q = self.write_pool.capacity - self.write_pool.rentedCount();
         const tls_write_empty = if (self.tls_write_buf.len != 0) self.tls_write_ch.isEmpty() else true;
         var receipts_ready: usize = 0;
@@ -4697,7 +4694,6 @@ pub const Connection = struct {
                 .gpa = gpa,
                 .chunk_storage = self.read_chunk_storage,
                 .n_chunks = self.read_pool_n,
-                .read_free = &self.read_free_ch,
                 .write_free = &self.write_pool,
                 .live_task_handlers = &self.live_task_handlers,
                 .test_delay_ms = if (comptime test_observe) test_write_delay_ms else 0,
@@ -5080,10 +5076,9 @@ pub const Connection = struct {
 
     fn recycleReadChunk(self: *Connection, chunk: wire_pump.WireChunk) void {
         if (chunk.pool_index) |idx| {
-            self.read_free_ch.putOneUncancelable(self.config.io, idx) catch {
-                // A received pooled chunk always owns one free-list vacancy.
-                unreachable;
-            };
+            // A received pooled chunk always owns one free-list vacancy, and
+            // the free list is never closed.
+            self.read_free_ch.trySend(idx) catch |err| std.debug.panic("read free list: {t} returning index {d}", .{ err, idx });
         } else if (chunk.bytes.len != 0) {
             self.config.gpa.free(chunk.bytes);
         }
@@ -5486,7 +5481,7 @@ pub const Connection = struct {
             std.debug.assert(self.tls_write_buf.len == 0);
         }
         self.write_queue_ending.store(true, .seq_cst);
-        self.write_ch.close(self.config.io);
+        self.write_ch.close(.graceful);
         if (self.tls_write_buf.len != 0) {
             self.tls_write_ch.close(.graceful);
         }
@@ -5503,8 +5498,9 @@ pub const Connection = struct {
     fn stopWritePump(self: *Connection, pump: ?*wire_pump.WritePump) void {
         self.write_queue_ending.store(true, .seq_cst);
         if (pump) |p| p.stop();
-        _ = self.write_ch.putUncancelable(self.config.io, &.{.{ .bytes = &.{}, .len = 0 }}, 0) catch {
-            // A closed writer queue already terminates the pump.
+        self.write_ch.trySend(.{ .bytes = &.{}, .len = 0 }) catch {
+            // Full: queued chunks already wake the pump. Closed: the closed
+            // writer queue already terminates it.
         };
     }
 
@@ -5722,7 +5718,7 @@ pub const Connection = struct {
         // teardown sentinel is not, so once the queue is ending the count is
         // read exactly (the flag is set before the sentinel goes in).
         if (!self.write_queue_ending.load(.acquire) and self.acks.owed.load(.acquire) + need <= capacity) return true;
-        return capacity - io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) >= need;
+        return capacity - io_queue.chanLen(wire_pump.WireChunk, &self.write_ch) >= need;
     }
 
     /// True when `write_ack_ch` can take the completions of every push one
@@ -5820,11 +5816,10 @@ pub const Connection = struct {
         }
 
         if (close_probe) {
-            // Racy read of the queue's byte count, without its mutex: a diag
-            // gauge, never a decision. Nonzero here means the socket shutdown
-            // below clips frames the Session already emitted (the GOAWAY race).
-            // Unit: ring bytes of queued WireChunk descriptors, not wire bytes.
-            const queued = self.write_ch.type_erased.len / @sizeOf(wire_pump.WireChunk);
+            // A diag gauge, never a decision. Nonzero here means the socket
+            // shutdown below clips frames the Session already emitted (the
+            // GOAWAY race). Unit: queued WireChunk descriptors, not wire bytes.
+            const queued = io_queue.chanLen(wire_pump.WireChunk, &self.write_ch);
             diagRawPrint("t1002 conn={x} shutdownHandlers_enter unflushed_chunks={d} parked={d}\n", .{ @intFromPtr(self), queued, close_probe_parked.load(.acquire) });
         }
         // On a `runBody` error, its defer has already closed the socket before
@@ -7465,12 +7460,13 @@ pub const Connection = struct {
         // connection fails closed instead of parking the task that holds
         // `session_mu`. A closed queue (the connection is going away) is a
         // failed write, as before.
-        if (io_queue.tryPut(wire_pump.WireChunk, &self.write_ch, self.config.io, chunk)) {
+        if (self.write_ch.trySend(chunk)) |_| {
             self.noteWireWrite(chunk.len);
             return;
+        } else |err| switch (err) {
+            error.Closed => return error.WriteFailed,
+            error.WouldBlock => {},
         }
-        // A put that fails with room left in the queue is a closed queue.
-        if (io_queue.queued(wire_pump.WireChunk, &self.write_ch, self.config.io) < self.write_ch_buf.len) return error.WriteFailed;
         // The teardown sentinel is uncounted, so a full queue after it is the
         // connection ending, not a gate that failed: no trap, no refusal.
         if (self.write_queue_ending.load(.seq_cst)) return error.WriteFailed;
@@ -9757,7 +9753,7 @@ pub const BenchHop = struct {
     /// and complete tickets so the actor path can `waitTicket` on an
     /// already-signaled slot. Readiness is the ticket event, not a count.
     fn drainLocalWrites(self: *BenchHop) void {
-        while (io_queue.tryGet(wire_pump.WireChunk, &self.conn.write_ch, self.conn.config.io)) |chunk| {
+        while (io_queue.tryRecv(wire_pump.WireChunk, &self.conn.write_ch)) |chunk| {
             // Applied here, with no pump and no channel: the completion is
             // received the moment the chunk is.
             if (wire_pump.postsCompletion(chunk)) self.conn.acks.sub();
@@ -9983,8 +9979,8 @@ test "teardown's sentinel fills the h2c write queue while a handler flushes: the
     const conn = &trap.hop.conn;
     const capacity = conn.write_ch_buf.len;
     const barrier: wire_pump.WireChunk = .{ .bytes = &.{}, .len = 0, .flush_barrier = true };
-    for (0..capacity - 1) |_| try std.testing.expect(io_queue.tryPut(wire_pump.WireChunk, &conn.write_ch, io, barrier));
-    defer while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, io)) |_| {};
+    for (0..capacity - 1) |_| try conn.write_ch.trySend(barrier);
+    defer while (io_queue.tryRecv(wire_pump.WireChunk, &conn.write_ch)) |_| {};
 
     // Before teardown: the queue has one slot and the ledger owes nothing, so
     // the gate says yes, and a barrier would fit.
@@ -9993,7 +9989,7 @@ test "teardown's sentinel fills the h2c write queue while a handler flushes: the
     // The handler checked the gate under the lock and has not pushed yet;
     // teardown runs now.
     conn.stopWritePump(null);
-    try std.testing.expectEqual(capacity, io_queue.queued(wire_pump.WireChunk, &conn.write_ch, io));
+    try std.testing.expectEqual(capacity, io_queue.chanLen(wire_pump.WireChunk, &conn.write_ch));
     try std.testing.expect(conn.write_queue_ending.load(.acquire));
     // The gate is exact now, so a new check does not let a barrier through...
     try std.testing.expect(!conn.h2cQueueRoom(1));
@@ -10021,8 +10017,8 @@ test "a push into a full h2c write queue fails the connection closed and never w
     test_allow_full_queue_push.store(true, .release);
     defer test_allow_full_queue_push.store(false, .release);
     const barrier: wire_pump.WireChunk = .{ .bytes = &.{}, .len = 0, .flush_barrier = true };
-    while (io_queue.tryPut(wire_pump.WireChunk, &conn.write_ch, io, barrier)) {}
-    defer while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, io)) |_| {};
+    while (conn.write_ch.trySend(barrier)) |_| {} else |_| {}
+    defer while (io_queue.tryRecv(wire_pump.WireChunk, &conn.write_ch)) |_| {};
 
     const refused_before = test_queue_push_refusals.load(.acquire);
     try std.testing.expectError(error.WriteFailed, conn.pushWriteChunk(barrier));
@@ -10086,7 +10082,7 @@ test "a full DATA frame is built in a write-pool chunk and reaches the pump with
 
     var full_frames: usize = 0;
     var body_off: usize = 0;
-    while (io_queue.tryGet(wire_pump.WireChunk, &hop.conn.write_ch, io)) |chunk| {
+    while (io_queue.tryRecv(wire_pump.WireChunk, &hop.conn.write_ch)) |chunk| {
         defer hop.completeLocalWrite(chunk);
         var off: usize = 0;
         while (off < chunk.len) {
@@ -10174,7 +10170,7 @@ const HopChunks = struct {
 
     fn take(hop: *BenchHop) HopChunks {
         var out: HopChunks = .{};
-        while (io_queue.tryGet(wire_pump.WireChunk, &hop.conn.write_ch, hop.conn.config.io)) |chunk| {
+        while (io_queue.tryRecv(wire_pump.WireChunk, &hop.conn.write_ch)) |chunk| {
             out.chunks[out.n] = chunk;
             out.n += 1;
             out.credit += chunk.outbound_release;
@@ -10352,7 +10348,7 @@ test "budget: an inline job waits for room and runs when it comes back, with no 
     try std.testing.expectEqual(@as(usize, 1), conn.inline_n);
     try expectBudget(conn, filler, 0);
     try std.testing.expect(test_inline_budget_gated.load(.monotonic) > gated_before);
-    try std.testing.expectEqual(@as(usize, 0), io_queue.queued(wire_pump.WireChunk, &conn.write_ch, io));
+    try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(wire_pump.WireChunk, &conn.write_ch));
 
     // Room returns: the job runs and its 100 bytes are the whole charge.
     conn.applyOutboundRelease(filler, .pending);
@@ -11146,7 +11142,7 @@ fn trapCollect(trap: *TrapHop, out: *TrapWire) !void {
             try conn.drainEmit();
         }
         var took = false;
-        while (io_queue.tryGet(wire_pump.WireChunk, &conn.write_ch, conn.config.io)) |chunk| {
+        while (io_queue.tryRecv(wire_pump.WireChunk, &conn.write_ch)) |chunk| {
             took = true;
             var rest = chunk.bytes[0..chunk.len];
             while (rest.len >= frame.FRAME_HEADER_LEN) {

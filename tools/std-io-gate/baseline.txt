@@ -1,5 +1,0 @@
-src/edge/connection.zig std.Io.Queue 2
-src/edge/h1.zig std.Io.Queue 1
-src/edge/io_queue.zig std.Io.Queue 3
-src/edge/tls.zig std.Io.Queue 2
-src/edge/wire_pump.zig std.Io.Queue 2

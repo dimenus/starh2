@@ -182,7 +182,7 @@ pub const ReadPump = struct {
     chunk_storage: []u8,
     n_chunks: u32,
     /// Free pool indices (actor returns after consume).
-    free_indices: *std.Io.Queue(u32),
+    free_indices: *zio.Channel(u32),
     /// Connection-owned count of spawned task handlers. Yield only while this
     /// is non-zero — oneshot-only must not donate on every read.
     live_task_handlers: *std.atomic.Value(usize),
@@ -193,8 +193,12 @@ pub const ReadPump = struct {
     read_failed: std.atomic.Value(bool) = .init(false),
 
     fn returnIndex(self: *ReadPump, idx: u32) void {
-        self.free_indices.putOneUncancelable(self.io, idx) catch {
-            // Queue closure means connection teardown owns the backing pool.
+        // The free list holds every index (capacity == `n_chunks`), and this
+        // index was taken from it, so it always has room: full is a broken
+        // invariant. A closed list means teardown owns the backing pool.
+        self.free_indices.trySend(idx) catch |err| switch (err) {
+            error.WouldBlock => std.debug.panic("read free list full returning index {d}", .{idx}),
+            error.Closed => {},
         };
     }
 
@@ -210,7 +214,7 @@ pub const ReadPump = struct {
         const chunk_size = limits_mod.WIRE_CHUNK_SIZE;
         var reader = self.stream.reader(self.io, &.{});
         while (!self.stopped.load(.acquire)) {
-            const idx = self.free_indices.getOne(self.io) catch return;
+            const idx = self.free_indices.receive() catch return;
             const off = @as(usize, idx) * chunk_size;
             const buf = self.chunk_storage[off..][0..chunk_size];
             var dest: [1][]u8 = .{buf};
@@ -372,7 +376,7 @@ pub const SocketWriter = struct {
 pub const WritePump = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
-    from_actor: *std.Io.Queue(WireChunk),
+    from_actor: *zio.Channel(WireChunk),
     /// Bytes the socket accepted, at every partial write (`SocketWriter`):
     /// the connection's write-byte clock reads it. Tests that drive a pump
     /// alone may leave the default.
@@ -453,7 +457,7 @@ pub const WritePump = struct {
     /// yet attached to any chunk.
     fn failDrain(self: *WritePump) void {
         // Transport failed: every remaining queued chunk must free + fail its ticket.
-        while (io_queue.tryGet(WireChunk, self.from_actor, self.io)) |chunk| {
+        while (io_queue.tryRecv(WireChunk, self.from_actor)) |chunk| {
             if (chunk.len == 0 and chunk.bytes.len == 0 and !chunk.flush_barrier) {
                 self.post(.{ .fail_all = true, .shutdown = false });
                 return;
@@ -480,7 +484,7 @@ pub const WritePump = struct {
             const first = if (carried) |chunk| blk: {
                 carried = null;
                 break :blk chunk;
-            } else self.from_actor.getOne(self.io) catch {
+            } else self.from_actor.receive() catch {
                 self.failDrain();
                 self.post(.{ .fail_all = true, .shutdown = true });
                 return;
@@ -513,7 +517,7 @@ pub const WritePump = struct {
             // attempted chunk per configured delay/failure boundary.
             if (self.test_delay_ms == 0 and self.test_fail_after == 0) {
                 while (count < max_batch) {
-                    const next = io_queue.tryGet(WireChunk, self.from_actor, self.io) orelse break;
+                    const next = io_queue.tryRecv(WireChunk, self.from_actor) orelse break;
                     if (next.len == 0 and next.bytes.len == 0) {
                         carried = next;
                         break;

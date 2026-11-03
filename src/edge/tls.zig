@@ -923,7 +923,6 @@ pub const Pump = struct {
     gpa: std.mem.Allocator,
     chunk_storage: []u8,
     n_chunks: u32,
-    read_free: *std.Io.Queue(u32),
     write_free: ?*slab_pool.SlabPool = null,
     live_task_handlers: *std.atomic.Value(usize),
     stopped: std.atomic.Value(bool) = .init(false),
@@ -1002,10 +1001,6 @@ pub const Pump = struct {
             error.WouldBlock => @panic("write ack channel over proven capacity"),
             error.Closed => {},
         };
-    }
-
-    fn returnReadIndex(self: *Pump, idx: u32) void {
-        self.read_free.putOneUncancelable(self.io, idx) catch {};
     }
 
     /// The peer will send nothing more (socket EOF, close_notify, or a read
@@ -1965,11 +1960,8 @@ test "a ClientHello split across records fails at once (tls.zig #36)" {
 }
 
 test "pump_trace moves on read_free-empty yield" {
-    var free_storage: [1]u32 = undefined;
-    var read_free = std.Io.Queue(u32).init(&free_storage);
     var pump: Pump = undefined;
     pump.io = std.testing.io;
-    pump.read_free = &read_free;
     pump.pending_read = null;
     pump.n_chunks = 0;
 
