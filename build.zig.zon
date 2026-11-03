@@ -4,12 +4,14 @@
     .fingerprint = 0x813a04b419058cf5,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // dimenus/zio fix/iouring-send-eagain: lalinsky/zio main c9cc793 plus
-        // the io_uring send -EAGAIN bridge, which is not merged upstream yet.
-        // Move back to lalinsky/zio once it is.
+        // dimenus/zio sim/dst-m2: fix/iouring-send-eagain (lalinsky/zio main
+        // c9cc793 plus the io_uring send -EAGAIN bridge, dbf1beb) plus the DST
+        // simulator and the select/CompletionQueue invariant checks, which
+        // panic in every build. Neither part is merged upstream yet; move back
+        // to lalinsky/zio once both are.
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#dbf1beb79cdcfb0bbe57839823104d8bdc82343a",
-            .hash = "zio-0.19.0-xHbVVPYzLgBGEz8P__YtqSzJ0whhX8mw9hP3Zg2Gdg6S",
+            .url = "git+https://github.com/dimenus/zio#2f727e3514e5b9abbb388420534c575347197f2b",
+            .hash = "zio-0.19.0-xHbVVK1aLwAGouxL29QMxC9pA1nNtObkIWjTAVD0FE-P",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.
