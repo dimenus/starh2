@@ -14,6 +14,7 @@
 //! an invitation to read until EOF.
 const std = @import("std");
 const builtin = @import("builtin");
+const zio = @import("zio");
 const request_mod = @import("../http/request.zig");
 const codec = @import("codec.zig");
 
@@ -147,11 +148,11 @@ pub const Server = struct {
         }) catch return error.ListenFailed;
         self.local_addr = self.listener.?.socket.address;
 
-        var accept_group: std.Io.Group = .init;
-        var connection_group: std.Io.Group = .init;
-        accept_group.concurrent(self.io, acceptLoop, .{ self, &connection_group }) catch {
-            accept_group.cancel(self.io);
-            connection_group.cancel(self.io);
+        var accept_group: zio.Group = .init;
+        var connection_group: zio.Group = .init;
+        accept_group.spawn(acceptLoop, .{ self, &connection_group }) catch {
+            accept_group.cancel();
+            connection_group.cancel();
             return error.TransportSetupFailed;
         };
 
@@ -164,14 +165,14 @@ pub const Server = struct {
         };
         self.shutdown_flag.store(true, .release);
         self.shutdown_event.set(self.io);
-        accept_group.cancel(self.io);
+        accept_group.cancel();
         self.closeListener();
 
         if (canceled) {
-            connection_group.cancel(self.io);
+            connection_group.cancel();
         } else {
-            connection_group.await(self.io) catch {
-                connection_group.cancel(self.io);
+            connection_group.wait() catch {
+                connection_group.cancel();
             };
         }
         if (canceled) return error.RuntimeShutdown;
@@ -236,7 +237,7 @@ pub const Server = struct {
         }
     }
 
-    fn acceptLoop(self: *Server, connection_group: *std.Io.Group) std.Io.Cancelable!void {
+    fn acceptLoop(self: *Server, connection_group: *zio.Group) std.Io.Cancelable!void {
         // Any exit that is not an explicit shutdown must wake `serve`.
         defer if (!self.shutdown_flag.load(.acquire)) {
             self.bind_state.store(.failed, .release);
@@ -258,7 +259,7 @@ pub const Server = struct {
                 stream.close(self.io);
                 continue;
             }
-            connection_group.concurrent(self.io, connEntry, .{ self, stream }) catch {
+            connection_group.spawn(connEntry, .{ self, stream }) catch {
                 _ = self.active_connections.fetchSub(1, .acq_rel);
                 stream.close(self.io);
                 continue;

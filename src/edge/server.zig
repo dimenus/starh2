@@ -522,19 +522,18 @@ pub const Server = struct {
             self.listeners_bound = i + 1;
         }
 
-        var accept_group: std.Io.Group = .init;
-        var connection_group: std.Io.Group = .init;
+        var accept_group: zio.Group = .init;
+        var connection_group: zio.Group = .init;
 
         // Spawned now, while spawning works (`CancelSignal`). No connection
         // exists yet, so its own failure needs no wait.
-        const conn_group = zio.Group.fromStd(&connection_group);
         var cancel: CancelSignal = .{};
-        var canceller = zio.spawn(cancelOnSignal, .{ conn_group, &cancel }) catch return error.TransportSetupFailed;
+        var canceller = zio.spawn(cancelOnSignal, .{ &connection_group, &cancel }) catch return error.TransportSetupFailed;
 
         for (self.endpoints, 0..) |endpoint, i| {
             const spawned = if (comptime test_hook.on) testFailAcceptSpawn(i) else false;
             const failed = spawned or blk: {
-                accept_group.concurrent(self.io, acceptLoop, .{ self, i, endpoint.mode(), &connection_group }) catch break :blk true;
+                accept_group.spawn(acceptLoop, .{ self, i, endpoint.mode(), &connection_group }) catch break :blk true;
                 break :blk false;
             };
             if (failed) {
@@ -542,10 +541,10 @@ pub const Server = struct {
                 // handlers may run: this exit waits for them like every
                 // other (`waitForHandlers`), so `serve` never returns under
                 // a running handler.
-                accept_group.cancel(self.io);
+                accept_group.cancel();
                 zio.beginShield();
                 defer zio.endShield();
-                self.waitForHandlers(conn_group, true, &cancel, &canceller);
+                self.waitForHandlers(&connection_group, true, &cancel, &canceller);
                 return error.TransportSetupFailed;
             }
         }
@@ -559,7 +558,7 @@ pub const Server = struct {
         };
         self.shutdown_flag.store(true, .release);
         self.shutdown_event.set();
-        accept_group.cancel(self.io);
+        accept_group.cancel();
         self.closeListeners();
 
         // From here on `serve` waits for every connection and every handler,
@@ -567,7 +566,7 @@ pub const Server = struct {
         // pending, and `serve` reports it (RuntimeShutdown) once it returns.
         zio.beginShield();
         defer zio.endShield();
-        self.waitForHandlers(conn_group, canceled, &cancel, &canceller);
+        self.waitForHandlers(&connection_group, canceled, &cancel, &canceller);
         if (canceled) return error.RuntimeShutdown;
     }
 
@@ -1071,7 +1070,7 @@ pub const Server = struct {
         self: *Server,
         endpoint_index: usize,
         mode: connection.Mode,
-        connection_group: *std.Io.Group,
+        connection_group: *zio.Group,
     ) std.Io.Cancelable!void {
         const listener = &self.listeners[endpoint_index];
         const endpoint = self.endpoints[endpoint_index];
@@ -1173,7 +1172,7 @@ pub const Server = struct {
                 if (b.reserve()) |ei| {
                     config.balancer = b;
                     config.exec_index = ei;
-                    if (zio.Group.fromStd(connection_group).spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config, slot, endpoint_index, proxied })) |_| {
+                    if (connection_group.spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config, slot, endpoint_index, proxied })) |_| {
                         b.notePlaced(ei, stream.socket.address.getPort());
                         continue;
                     } else |_| {
@@ -1188,12 +1187,12 @@ pub const Server = struct {
             // the same group and with the same fallback.
             if (comptime connection.placement_check) {
                 if (connection.probeConnPlacement()) |placement| {
-                    if (zio.Group.fromStd(connection_group).spawnInto(placement, connEntry, .{ self, stream, config, slot, endpoint_index, proxied })) |_| {
+                    if (connection_group.spawnInto(placement, connEntry, .{ self, stream, config, slot, endpoint_index, proxied })) |_| {
                         continue;
                     } else |_| {}
                 }
             }
-            connection_group.concurrent(self.io, connEntry, .{ self, stream, config, slot, endpoint_index, proxied }) catch {
+            connection_group.spawn(connEntry, .{ self, stream, config, slot, endpoint_index, proxied }) catch {
                 self.undoAccept(stream, admission, slot);
                 continue;
             };
