@@ -28,6 +28,10 @@
 //!   effect (the next frame, or the reset), within a bound: a handler that
 //!   exited would post its completion and wake the actor by that, and hide the
 //!   missing wake.
+//!   Each handler publishes the result of its last call (`idle_terminal`) at
+//!   the instruction after that call returns, and the row waits for it before
+//!   it judges anything. The client seeing a response says nothing about the
+//!   handler: it may not have resumed from its ticket wait yet.
 //! - The failure regression: a response refused while it is materialized (the
 //!   CONTINUATION of a large header block meets a full control pool) fails the
 //!   connection from the handler's task. The handler catches the error and
@@ -81,6 +85,7 @@ fn resetGlobals() void {
     obs_rst.store(false, .release);
     obs_missed.store(0, .release);
     ops_done.store(0, .release);
+    idle_terminal.store(terminal_not_returned, .release);
     obs_status.store(0, .release);
     obs_body_len.store(0, .release);
     park_missed.store(0, .release);
@@ -133,6 +138,10 @@ fn spinner(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anye
 /// gone quiet: by then the actor has finished its turn and is parked, so the
 /// handler's push is the only thing that can wake it.
 fn empty204(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try recordTerminal(empty204Ops(resp));
+}
+
+fn empty204Ops(resp: *starh2.Response) anyerror!void {
     try idleSleep();
     try resp.send(204, &.{}, "");
     opDone();
@@ -154,7 +163,52 @@ var obs_missed: std.atomic.Value(usize) = .init(0);
 /// Operations the handler was asked to do that returned success. A handler that
 /// takes an error path ends in `runHandlerJobBody`'s fallback 500, which the client
 /// would read as an END_STREAM; the row compares this count with the one it expects.
+/// Every increment comes before the handler publishes `idle_terminal`, so a row
+/// reads it only after it has acquired that record.
 var ops_done: std.atomic.Value(usize) = .init(0);
+
+/// How an idle handler's operations ended: the result of its last call, which is
+/// the call that failed or else its final operation. One word, stored once with
+/// `.release` by `recordTerminal` at the instruction after that call returns,
+/// before the handler can suspend again.
+///
+/// `terminal_not_returned` is not a result. It means the handler has not resumed
+/// from its last call yet (a ticket wait whose ack is posted but whose task has
+/// not run). The client can already hold the whole response in that state, so a
+/// row must wait for the record and must never read "not returned" as a failure
+/// of the call.
+var idle_terminal: std.atomic.Value(u32) = .init(terminal_not_returned);
+const terminal_not_returned: u32 = 0;
+const terminal_ok: u32 = 1;
+/// An error is stored as `terminal_err_base + @intFromError(err)`.
+const terminal_err_base: u32 = 2;
+
+const ErrorInt = @TypeOf(@intFromError(@as(anyerror, error.Unexpected)));
+
+fn recordTerminal(result: anyerror!void) anyerror!void {
+    const word: u32 = if (result) |_| terminal_ok else |err| terminal_err_base + @as(u32, @intFromError(err));
+    idle_terminal.store(word, .release);
+    return result;
+}
+
+fn terminalName(word: u32) []const u8 {
+    return switch (word) {
+        terminal_not_returned => "not_returned",
+        terminal_ok => "ok",
+        else => @errorName(@errorFromInt(@as(ErrorInt, @intCast(word - terminal_err_base)))),
+    };
+}
+
+/// Wait for the idle handler's record. Returns `terminal_not_returned` if it did
+/// not arrive within the bound; the row fails that by name, apart from errors.
+fn awaitTerminal() u32 {
+    const deadline = nowNs() + client_deadline_ns;
+    while (true) {
+        const word = idle_terminal.load(.acquire);
+        if (word != terminal_not_returned or nowNs() >= deadline) return word;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+}
 /// The first status the client decoded on stream 1 (0 if none), and the DATA bytes
 /// it read there. Written by the client thread, read after it is joined.
 var obs_status: std.atomic.Value(u16) = .init(0);
@@ -238,13 +292,22 @@ fn idleSleep() !void {
 }
 
 fn idleSendBody(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
-    try idleSleep();
-    try resp.send(200, &.{}, "hello");
-    opDone();
+    try recordTerminal(idleSendBodyOps(resp));
     awaitObs(&obs_end);
 }
 
+fn idleSendBodyOps(resp: *starh2.Response) anyerror!void {
+    try idleSleep();
+    try resp.send(200, &.{}, "hello");
+    opDone();
+}
+
 fn idleStartWriteEnd(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try recordTerminal(idleStartWriteEndOps(resp));
+    awaitObs(&obs_end);
+}
+
+fn idleStartWriteEndOps(resp: *starh2.Response) anyerror!void {
     try idleSleep();
     var body = try resp.start(200, &.{});
     opDone();
@@ -256,10 +319,14 @@ fn idleStartWriteEnd(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Resp
     try idleSleep();
     try body.finish();
     opDone();
-    awaitObs(&obs_end);
 }
 
 fn idleBareFlush(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try recordTerminal(idleBareFlushOps(resp));
+    awaitObs(&obs_end);
+}
+
+fn idleBareFlushOps(resp: *starh2.Response) anyerror!void {
     try idleSleep();
     var body = try resp.start(200, &.{});
     opDone();
@@ -270,10 +337,14 @@ fn idleBareFlush(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response
     try idleSleep();
     try body.finish();
     opDone();
-    awaitObs(&obs_end);
 }
 
 fn idleAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try recordTerminal(idleAbortOps(resp));
+    awaitObs(&obs_rst);
+}
+
+fn idleAbortOps(resp: *starh2.Response) anyerror!void {
     try idleSleep();
     var body = try resp.start(200, &.{});
     opDone();
@@ -281,7 +352,6 @@ fn idleAbort(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) an
     try idleSleep();
     try body.abort();
     opDone();
-    awaitObs(&obs_rst);
 }
 
 const wide_value_len = 7000;
@@ -802,11 +872,25 @@ fn runIdleOp(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, pat
     };
     const t = try std.Thread.spawn(.{}, clientMain, .{&c});
     joinClient(&c, t);
+    // The client is done, but the handler may not have resumed from its last
+    // call yet. Judge its record, never `ops_done` at this moment.
+    const terminal = awaitTerminal();
     const got_body = obs_body[0..obs_body_len.load(.acquire)];
-    std.debug.print("T3594-idle transport={s} path={s} ended={} reset={} status={d} body={s} ops={d} missed={d} client_err={s}\n", .{
-        @tagName(transport), path, c.ended[0], c.reset[0], obs_status.load(.acquire), got_body, ops_done.load(.acquire), obs_missed.load(.acquire), if (c.err) |e| @errorName(e) else "-",
+    std.debug.print("T3594-idle transport={s} path={s} terminal={s} ended={} reset={} status={d} body={s} ops={d} missed={d} client_err={s}\n", .{
+        @tagName(transport), path, terminalName(terminal), c.ended[0], c.reset[0], obs_status.load(.acquire), got_body, ops_done.load(.acquire), obs_missed.load(.acquire), if (c.err) |e| @errorName(e) else "-",
     });
     if (c.err) |e| return e;
+    switch (terminal) {
+        terminal_ok => {},
+        terminal_not_returned => {
+            std.debug.print("t3567: the handler on {s} did not return from its last call within {d} s of the client finishing (it had not resumed; this is not an error from the call)\n", .{ path, client_deadline_ns / std.time.ns_per_s });
+            return error.IdleHandlerNotReturned;
+        },
+        else => {
+            std.debug.print("t3567: the handler on {s} got error.{s} from its last call\n", .{ path, terminalName(terminal) });
+            return error.IdleHandlerCallFailed;
+        },
+    }
     try std.testing.expectEqual(want.ops, ops_done.load(.acquire));
     try std.testing.expectEqual(want.status, obs_status.load(.acquire));
     try std.testing.expectEqualStrings(want.body, got_body);
