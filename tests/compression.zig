@@ -242,7 +242,7 @@ fn runServer(
 ) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = routes,
         .tls = null,
         .limits = limits,
@@ -915,7 +915,7 @@ test "lifecycle: shutdown releases live encoder context" {
             // loop and reaches handler cancellation.
             lim.graceful_drain_timeout_ns = 10 * std.time.ns_per_ms;
             var server = try starh2.Server.init(gpa, rt.io(), .{
-                .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+                .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
                 .routes = &routes,
                 .tls = null,
                 .limits = lim,

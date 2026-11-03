@@ -13,7 +13,9 @@
 //!   source, an over-size header and a malformed one are closed. A header
 //!   that never finishes is held only to the preface deadline and only
 //!   inside its own cap.
-//! - `.none` on a Unix socket charges no client; the boot errors.
+//! - `.none` on a Unix socket charges no client; `.none` behind a proxy
+//!   that sends PROXY v2 strips the header, shows the handler the header's
+//!   source, and charges no client; the boot errors.
 //! - Orphans stay charged: a handler that outlives its connection keeps its
 //!   client, aggregate and server charges until it returns; only the
 //!   connection's own charge goes at teardown.
@@ -34,8 +36,8 @@
 //! `Server.deinit`, which checks that the table is empty (`Table.checkEmpty`)
 //! and logs an error otherwise, which fails the test.
 //!
-//! None of this compiles on d33e615: `Server.clients`, `client_identity` and
-//! `edge.accounts` are new.
+//! None of this compiles on d33e615: `Server.clients`, the endpoints'
+//! `client_identity` and `proxy_protocol`, and `edge.accounts` are new.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -196,7 +198,7 @@ const Rig = struct {
     cert: []u8 = &.{},
     key: []u8 = &.{},
 
-    fn start(self: *Rig, rt: *zio.Runtime, gpa: std.mem.Allocator, endpoints: []const starh2.EndpointConfig, identity: []const server_mod.ClientIdentity, limits: starh2.Limits, tls_on: bool) !void {
+    fn start(self: *Rig, rt: *zio.Runtime, gpa: std.mem.Allocator, endpoints: []const starh2.EndpointConfig, limits: starh2.Limits, tls_on: bool) !void {
         const io = rt.io();
         self.* = .{ .gpa = gpa, .server = undefined, .handle = undefined };
         var tls_cfg: ?starh2.TlsConfig = null;
@@ -210,7 +212,6 @@ const Rig = struct {
             .routes = &routes,
             .tls = tls_cfg,
             .limits = limits,
-            .client_identity = identity,
         });
         self.handle = try rt.spawn(starh2.Server.serve, .{ &self.server, gpa });
         try self.server.waitUntilListening(5 * std.time.ns_per_s);
@@ -367,9 +368,9 @@ fn plainIdentity(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     resetRoutes();
     var rig: Rig = undefined;
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp6("::1", 0) },
-    }, &.{}, testLimits(), false);
+        .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp6("::1", 0) } },
+    }, testLimits(), false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -421,6 +422,12 @@ test "identity: 127.0.0.1 and ::1 are two clients; the IPv6 one is its /64 and i
 
 const trusted_loopback = [_]proxy.Cidr{ .{ .addr = .{ .ip4 = .{ 127, 0, 0, 1 } }, .prefix_bits = 32 } };
 
+/// A TCP endpoint behind a PROXY v2 proxy at one of `trusted`, keyed by the
+/// header's source.
+fn ppTcp(address: starh2.EndpointAddress, trusted: []const proxy.Cidr) starh2.EndpointConfig.Tcp {
+    return .{ .address = address, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = trusted } } };
+}
+
 fn proxyH2(addr: zio.net.IpAddress, gpa: std.mem.Allocator, src: proxy.Source, path: []const u8) !zio.net.Stream {
     var hb: [64]u8 = undefined;
     var w = try h2Requests(gpa, path, 1);
@@ -435,11 +442,10 @@ fn proxyH2(addr: zio.net.IpAddress, gpa: std.mem.Allocator, src: proxy.Source, p
 fn proxyIdentity(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     resetRoutes();
     var rig: Rig = undefined;
-    const pp: server_mod.ClientIdentity = .{ .proxy_protocol = .{ .trusted = &trusted_loopback } };
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{ pp, pp }, testLimits(), false);
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+        .{ .h1c = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, testLimits(), false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -560,8 +566,8 @@ fn proxyTls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var limits = testLimits();
     limits.concurrent_tls_handshakes = 1;
     try rig.start(rt, gpa, &.{
-        .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{.{ .proxy_protocol = .{ .trusted = &trusted_loopback } }}, limits, true);
+        .{ .tls = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, limits, true);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -604,9 +610,9 @@ fn proxyRefusals(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var rig: Rig = undefined;
     const ten = [_]proxy.Cidr{try proxy.Cidr.parse("10.0.0.0/8")};
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{ .{ .proxy_protocol = .{ .trusted = &ten } }, .{ .proxy_protocol = .{ .trusted = &trusted_loopback } } }, testLimits(), false);
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &ten) },
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, testLimits(), false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -699,8 +705,8 @@ fn proxyStalled(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.preface_timeout_ns = 600 * ms;
     limits.proxy_header_waiters = 2;
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{.{ .proxy_protocol = .{ .trusted = &trusted_loopback } }}, limits, false);
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, limits, false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -755,7 +761,7 @@ fn noneOnUnix(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var path_buf: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/starh2-acct-{d}.sock", .{std.c.getpid()});
     var rig: Rig = undefined;
-    try rig.start(rt, gpa, &.{.{ .h2c_unix = path }}, &.{}, testLimits(), false);
+    try rig.start(rt, gpa, &.{.{ .h2c_unix = .{ .path = path } }}, testLimits(), false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -779,38 +785,94 @@ test "identity: a Unix socket endpoint is .none by default and charges no client
     try runIn(noneOnUnix);
 }
 
-test "identity: .proxy_protocol on TCP with no trusted source is a boot error" {
+/// `.none` behind a pooling L7 proxy that sends PROXY v2: the header is read
+/// and stripped, the handler sees the header's source, and no client is
+/// charged. The trusted check still runs first.
+fn noneBehindProxy(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetRoutes();
+    var rig: Rig = undefined;
+    const ten = [_]proxy.Cidr{try proxy.Cidr.parse("10.0.0.0/8")};
+    const l4 = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    try rig.start(rt, gpa, &.{
+        .{ .h2c_prior_knowledge = .{ .address = l4, .client_identity = .none, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } },
+        .{ .h1c = .{ .address = l4, .client_identity = .none, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } },
+        .{ .h2c_prior_knowledge = .{ .address = l4, .client_identity = .none, .proxy_protocol = .{ .v2 = .{ .trusted = &ten } } } },
+    }, testLimits(), false);
+    defer rig.stop();
+    // On any exit: let parked and shielded handlers return before the stop.
+    defer release.store(true, .release);
+    const h2_addr = try zio.net.IpAddress.parseIp4("127.0.0.1", rig.port(0));
+    const h1_addr = try zio.net.IpAddress.parseIp4("127.0.0.1", rig.port(1));
+    const untrusted_addr = try zio.net.IpAddress.parseIp4("127.0.0.1", rig.port(2));
+    const src4: [4]u8 = .{ 203, 0, 113, 9 };
+    const src6 = ip6("2001:db8:9::9");
+
+    const a = try proxyH2(h2_addr, gpa, .{ .peer = .{ .ip4 = src4 } }, "/park");
+    defer a.close();
+    const b = try proxyH2(h2_addr, gpa, .{ .peer = .{ .ip6 = src6 } }, "/hello");
+    defer b.close();
+    try readUntil(b, "ok", 3 * std.time.ns_per_s);
+    const c = try proxyH2(h2_addr, gpa, .local, "/hello");
+    defer c.close();
+    try readUntil(c, "ok", 3 * std.time.ns_per_s);
+    {
+        var hb: [64]u8 = undefined;
+        const s = try connect(h1_addr);
+        defer s.close();
+        try writeAll(s, proxyHeader(&hb, .{ .peer = .{ .ip4 = .{ 198, 51, 100, 9 } } }));
+        try writeAll(s, "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        try readUntil(s, "ok", 3 * std.time.ns_per_s);
+    }
+    try waitAtomic("handler started", &started, 1, 3 * std.time.ns_per_s);
+    try std.testing.expect(sawPeer(.{ .ip4 = src4 }));
+    // Charged to the connections and the server, and to no client: not the
+    // header's source, not the proxy, not LOCAL's infrastructure account.
+    const st = rig.server.clients.stats();
+    try std.testing.expectEqual(@as(usize, 0), st.live);
+    try std.testing.expectEqual(@as(u64, 0), st.inserts);
+    try std.testing.expectEqual(@as(usize, 1), rig.server.accounting.task_handlers.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), rig.server.proxy_header_failures.load(.acquire));
+    // From a source the endpoint does not trust: closed at accept. The close
+    // can come before the client's write, which then fails.
+    {
+        const u = try connect(untrusted_addr);
+        defer u.close();
+        var hb: [64]u8 = undefined;
+        writeAll(u, proxyHeader(&hb, .{ .peer = .{ .ip4 = src4 } })) catch {};
+        _ = try readToEof(u, 3 * std.time.ns_per_s);
+    }
+    try std.testing.expectEqual(@as(u64, 1), rig.server.proxy_untrusted.load(.acquire));
+    std.debug.print("accounts none behind PROXY: h2c (v4, v6, LOCAL) and h1c served, 0 inserts, untrusted closed\n", .{});
+    release.store(true, .release);
+    try waitAtomic("handler ended", &ended, 1, 3 * std.time.ns_per_s);
+}
+
+test "identity: .none behind a proxy that sends PROXY v2 strips the header and charges no client" {
+    try runIn(noneBehindProxy);
+}
+
+test "identity: the boot errors (PROXY with no trusted source, a PROXY source with no PROXY, .peer behind PROXY)" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const ep: starh2.EndpointConfig = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
-    try std.testing.expectError(error.ProxyProtocolUntrusted, starh2.Server.init(gpa, io, .{
-        .endpoints = &.{ep},
-        .routes = &routes,
-        .tls = null,
-        .client_identity = &.{.{ .proxy_protocol = .{ .trusted = &.{} } }},
-    }));
-    // One identity per endpoint or none at all.
-    try std.testing.expectError(error.InvalidConfig, starh2.Server.init(gpa, io, .{
-        .endpoints = &.{ ep, ep },
-        .routes = &routes,
-        .tls = null,
-        .client_identity = &.{.peer},
-    }));
-    // A trusted list on a Unix socket would look like it does something.
-    try std.testing.expectError(error.InvalidConfig, starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .h2c_unix = "/tmp/starh2-never-bound.sock" }},
-        .routes = &routes,
-        .tls = null,
-        .client_identity = &.{.{ .proxy_protocol = .{ .trusted = &trusted_loopback } }},
-    }));
-    // PROXY on a Unix socket with no list is allowed.
-    var ok = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .h2c_unix = "/tmp/starh2-never-bound.sock" }},
-        .routes = &routes,
-        .tls = null,
-        .client_identity = &.{.{ .proxy_protocol = .{ .trusted = &.{} } }},
-    });
-    ok.deinit(gpa);
+    const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const boot = struct {
+        fn init(ep: starh2.EndpointConfig) starh2.InitError!starh2.Server {
+            return starh2.Server.init(std.testing.allocator, std.testing.io, .{ .endpoints = &.{ep}, .routes = &routes, .tls = null });
+        }
+    };
+    // PROXY v2 on TCP from no trusted source: any client could name any
+    // address.
+    try std.testing.expectError(error.ProxyProtocolUntrusted, boot.init(.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &.{} } } } }));
+    try std.testing.expectError(error.ProxyProtocolUntrusted, boot.init(.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none, .proxy_protocol = .{ .v2 = .{ .trusted = &.{} } } } }));
+    // The PROXY source with no PROXY header to read it from.
+    try std.testing.expectError(error.ProxySourceWithoutProxyProtocol, boot.init(.{ .h1c = .{ .address = addr, .client_identity = .proxy_source } }));
+    try std.testing.expectError(error.ProxySourceWithoutProxyProtocol, boot.init(.{ .h2c_unix = .{ .path = "/tmp/starh2-never-bound.sock", .client_identity = .proxy_source } }));
+    // `.peer` behind PROXY: every client would be the proxy.
+    try std.testing.expectError(error.PeerIdentityBehindProxyProtocol, boot.init(.{ .h2c_prior_knowledge = .{ .address = addr, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } }));
+    // PROXY on a Unix socket takes no list, with either identity.
+    for ([_]starh2.edge.server.UnixClientIdentity{ .proxy_source, .none }) |id| {
+        var ok = try boot.init(.{ .h2c_unix = .{ .path = "/tmp/starh2-never-bound.sock", .client_identity = id, .proxy_protocol = .v2 } });
+        ok.deinit(gpa);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -820,9 +882,9 @@ fn orphanCharges(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     resetRoutes();
     var rig: Rig = undefined;
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp6("::1", 0) },
-        .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{}, testLimits(), false);
+        .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp6("::1", 0) } },
+        .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+    }, testLimits(), false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -895,11 +957,10 @@ fn heldCharges(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var rig: Rig = undefined;
     var limits = testLimits();
     limits.response_compression = true;
-    const pp: server_mod.ClientIdentity = .{ .proxy_protocol = .{ .trusted = &trusted_loopback } };
     try rig.start(rt, gpa, &.{
-        .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{ pp, pp }, limits, true);
+        .{ .tls = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, limits, true);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -998,8 +1059,8 @@ fn tableRoom(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     resetRoutes();
     var rig: Rig = undefined;
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{.{ .proxy_protocol = .{ .trusted = &trusted_loopback } }}, smallTableLimits(), false);
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, smallTableLimits(), false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -1032,8 +1093,8 @@ fn tableFull(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     resetRoutes();
     var rig: Rig = undefined;
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{.{ .proxy_protocol = .{ .trusted = &trusted_loopback } }}, smallTableLimits(), false);
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, smallTableLimits(), false);
     defer rig.stop();
     // On any exit: let parked and shielded handlers return before the stop.
     defer release.store(true, .release);
@@ -1088,7 +1149,7 @@ fn acceptLoopHolders(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 1;
     limits.max_endpoints = 8;
     var rig: Rig = undefined;
-    try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }, .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }, .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }, .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }, .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }, .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }, .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }, .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, &.{}, limits, false);
+    try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }, .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } } }, limits, false);
     defer rig.stop();
     var conns: [8]zio.net.Stream = undefined;
     var n: usize = 0;
@@ -1327,11 +1388,11 @@ fn soak(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var limits = testLimits();
     limits.graceful_drain_timeout_ns = 100 * ms;
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{ .peer, .peer, .peer, .{ .proxy_protocol = .{ .trusted = &trusted_loopback } } }, limits, true);
+        .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, limits, true);
     var stopped = false;
     defer if (!stopped) rig.stop();
     var stats: SoakStats = .{};
@@ -1525,16 +1586,15 @@ fn admissionRace(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: RaceKind) !void
     switch (kind) {
         .connection => {
             limits.max_connections = 1;
-            try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = ep4 }, .{ .h2c_prior_knowledge = ep4 } }, &.{}, limits, false);
+            try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = .{ .address = ep4 } }, .{ .h2c_prior_knowledge = .{ .address = ep4 } } }, limits, false);
         },
         .handshake => {
             limits.concurrent_tls_handshakes = 1;
-            try rig.start(rt, gpa, &.{ .{ .tls = ep4 }, .{ .tls = ep4 } }, &.{}, limits, true);
+            try rig.start(rt, gpa, &.{ .{ .tls = .{ .address = ep4 } }, .{ .tls = .{ .address = ep4 } } }, limits, true);
         },
         .proxy_waiter => {
             limits.proxy_header_waiters = 1;
-            const pp: server_mod.ClientIdentity = .{ .proxy_protocol = .{ .trusted = &trusted_loopback } };
-            try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = ep4 }, .{ .h2c_prior_knowledge = ep4 } }, &.{ pp, pp }, limits, false);
+            try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = ppTcp(ep4, &trusted_loopback) }, .{ .h2c_prior_knowledge = ppTcp(ep4, &trusted_loopback) } }, limits, false);
         },
     }
     var stopped = false;
@@ -1622,8 +1682,8 @@ test "identity: a trusted IPv6 range that holds every IPv4-mapped address is a b
     const wide = struct {
         fn boot(text: []const u8) ![]const u8 {
             const list = [_]proxy.Cidr{try proxy.Cidr.parse(text)};
-            const ep: starh2.EndpointConfig = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
-            if (starh2.Server.init(std.testing.allocator, std.testing.io, .{ .endpoints = &.{ep}, .routes = &routes, .tls = null, .client_identity = &.{.{ .proxy_protocol = .{ .trusted = &list } }} })) |srv| {
+            const ep: starh2.EndpointConfig = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &list } } } };
+            if (starh2.Server.init(std.testing.allocator, std.testing.io, .{ .endpoints = &.{ep}, .routes = &routes, .tls = null })) |srv| {
                 var s = srv;
                 s.deinit(std.testing.allocator);
                 return "booted";
@@ -1654,8 +1714,8 @@ fn mappedLiteralTrusted(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const lit = [_]proxy.Cidr{.{ .addr = .{ .ip6 = m }, .prefix_bits = 128 }};
     var rig: Rig = undefined;
     try rig.start(rt, gpa, &.{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-    }, &.{.{ .proxy_protocol = .{ .trusted = &lit } }}, testLimits(), false);
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &lit) },
+    }, testLimits(), false);
     defer rig.stop();
     const addr = try zio.net.IpAddress.parseIp4("127.0.0.1", rig.port(0));
     const s = try proxyH2(addr, gpa, .{ .peer = .{ .ip4 = .{ 203, 0, 113, 40 } } }, "/hello");

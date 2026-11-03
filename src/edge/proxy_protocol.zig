@@ -2,13 +2,16 @@
 //!
 //! # When the server reads it
 //!
-//! Only on an endpoint whose `client_identity` is `.proxy_protocol`, and only
-//! version 2 (the binary form; version 1 is text and is not accepted). Such an
-//! endpoint is for proxies that keep one upstream connection per client (an
-//! NLB, HAProxy or nginx `stream`, Envoy TCP proxy): the header names the
-//! client, and the connection is keyed to it. Behind an L7 proxy that pools
-//! connections, a header names whoever opened the pooled connection, so such
-//! a deployment uses `.none`.
+//! Only on an endpoint whose `proxy_protocol` is `.v2`, and only version 2
+//! (the binary form; version 1 is text and is not accepted). The framing is
+//! apart from the identity (`server.ClientIdentity`): every connection on such
+//! an endpoint starts with a header, which the server reads and strips. With
+//! `client_identity = .proxy_source`, for proxies that keep one upstream
+//! connection per client (an NLB, HAProxy or nginx `stream`, Envoy TCP proxy),
+//! the header names the client and the connection is keyed to it. Behind an
+//! L7 proxy that pools connections, a header names whoever opened the pooled
+//! connection, so such a deployment uses `.none`: the header is still
+//! stripped, and `Request.peer` is its source, but no client is charged.
 //!
 //! # The order at accept
 //!

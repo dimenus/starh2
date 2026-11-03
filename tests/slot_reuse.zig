@@ -199,10 +199,10 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             try tlsMaterial(io, gpa, cert, key);
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = cert.*, .private_key_pem = key.* };
         },
     }
@@ -868,13 +868,16 @@ fn runExhaustedProxy(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const trusted = [_]starh2.edge.proxy_protocol.Cidr{.{ .addr = .{ .ip4 = .{ 127, 0, 0, 1 } }, .prefix_bits = 32 }};
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{
-            .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-            .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+            .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+            .{ .h2c_prior_knowledge = .{
+                .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0),
+                .client_identity = .proxy_source,
+                .proxy_protocol = .{ .v2 = .{ .trusted = &trusted } },
+            } },
         },
         .routes = &routes,
         .tls = null,
         .limits = limits,
-        .client_identity = &.{ .peer, .{ .proxy_protocol = .{ .trusted = &trusted } } },
     });
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });

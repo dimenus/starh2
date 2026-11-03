@@ -420,11 +420,11 @@ fn runScenario(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, s
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
         },
     }
@@ -953,11 +953,11 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
         },
     }
@@ -1513,11 +1513,11 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
         },
     }
@@ -1747,11 +1747,11 @@ fn runOutlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !v
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
         },
     }
@@ -2037,11 +2037,11 @@ fn runH1Outlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: H1Transport
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h1c => endpoint = .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h1c => endpoint = .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
         },
     }
@@ -2282,11 +2282,11 @@ fn runH1BlockedWrite(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: H1Tran
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h1c => endpoint = .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h1c => endpoint = .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
         },
     }
@@ -2455,7 +2455,7 @@ fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void
         .complete_request_cap => {},
     }
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -2689,7 +2689,7 @@ fn runH1MultiChunk(rt: *zio.Runtime, gpa: std.mem.Allocator, trigger: H1MultiTri
     // and the client retries until the kernel accepts.
     const held_port: u16 = if (trigger == .canceled_serve) try wire_client.freeLoopbackPort() else 0;
     const held_addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", held_port);
-    const endpoints: []const starh2.EndpointConfig = if (trigger == .canceled_serve) &.{ .{ .tls = held_addr }, .{ .tls = addr } } else &.{.{ .tls = addr }};
+    const endpoints: []const starh2.EndpointConfig = if (trigger == .canceled_serve) &.{ .{ .tls = .{ .address = held_addr } }, .{ .tls = .{ .address = addr } } } else &.{.{ .tls = .{ .address = addr } }};
     var server = try starh2.Server.init(gpa, io, .{
         .endpoints = endpoints,
         .routes = &routes,
@@ -2849,7 +2849,7 @@ fn runH1Reset(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
     defer gpa.free(key_pem);
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
         .limits = starh2.Limits.defaults,

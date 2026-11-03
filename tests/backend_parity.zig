@@ -60,7 +60,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
         .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } },
     }};
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = listen_addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = listen_addr } }},
         .routes = &routes,
         .tls = null,
     });

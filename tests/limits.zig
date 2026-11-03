@@ -147,7 +147,7 @@ test "counting allocator: Server.init under published ceiling" {
     }};
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = &routes,
         .tls = null,
         .limits = lim,
@@ -212,7 +212,7 @@ test "fail-index iteration: Server.init fails closed" {
             continue;
         };
         var server = starh2.Server.init(gpa, rt.io(), .{
-            .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+            .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
             .routes = &routes,
             .tls = null,
             .limits = lim,
@@ -279,7 +279,7 @@ test "counting allocator peak under live hello stays under ceiling" {
     }};
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = &routes,
         .tls = null,
         .limits = lim,
@@ -423,7 +423,7 @@ test "h2c: a write queue smaller than one pop's reservation is rejected at boot 
 
     lim.inbound_wire_chunks_per_connection = min_slots - 1;
     try std.testing.expectError(error.InvalidConfig, starh2.Server.init(gpa, std.testing.io, .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = &.{},
         .tls = null,
         .limits = lim,
@@ -431,7 +431,7 @@ test "h2c: a write queue smaller than one pop's reservation is rejected at boot 
 
     lim.inbound_wire_chunks_per_connection = min_slots;
     var server = try starh2.Server.init(gpa, std.testing.io, .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = &.{},
         .tls = null,
         .limits = lim,

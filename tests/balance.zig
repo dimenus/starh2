@@ -143,7 +143,7 @@ fn runShutdownWaits(rt: *zio.Runtime, gpa: std.mem.Allocator, balance: bool, tar
     // second phase short so the test is quick either way.
     limits.graceful_drain_timeout_ns = 300 * std.time.ns_per_ms;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -251,7 +251,7 @@ fn runNarrowRuntime(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = &spot, .runFn = hangSse } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .balancer = &bal,
@@ -367,7 +367,7 @@ fn runH1Counted(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = &spot, .runFn = hangSse } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .balancer = &bal,
@@ -433,7 +433,7 @@ fn serveB(rt: *zio.Runtime, gpa: std.mem.Allocator, b: *ServerB) !void {
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = &b.spot, .runFn = hangSse } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .balancer = &bal,
@@ -482,7 +482,7 @@ fn runTwoRuntimes(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = &spot, .runFn = hangSse } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .balancer = &bal,

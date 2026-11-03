@@ -296,7 +296,7 @@ fn runShape(rt: *zio.Runtime, gpa: std.mem.Allocator, routes: []const starh2.Rou
     const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
     defer gpa.free(key_pem);
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = routes,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
         .limits = limits,

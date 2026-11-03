@@ -285,12 +285,12 @@ fn startServer(rt: *zio.Runtime, gpa: std.mem.Allocator, ep: Endpoint, limits: s
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (ep) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .h1c => endpoint = .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .h1c => endpoint = .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             run.cert = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             run.key = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
             tls_cfg = .{ .certificate_chain_pem = run.cert, .private_key_pem = run.key };
         },
     }
@@ -313,12 +313,12 @@ fn startServerAt(rt: *zio.Runtime, gpa: std.mem.Allocator, ep: Endpoint, limits:
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (ep) {
-        .h2c => endpoint = .{ .h2c_unix = path },
-        .h1c => endpoint = .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
+        .h2c => endpoint = .{ .h2c_unix = .{ .path = path } },
+        .h1c => endpoint = .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .tls => {
             run.cert = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             run.key = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls_unix = path };
+            endpoint = .{ .tls_unix = .{ .path = path } };
             tls_cfg = .{ .certificate_chain_pem = run.cert, .private_key_pem = run.key };
         },
     }
@@ -1318,10 +1318,10 @@ fn wbStart(rt: *zio.Runtime, gpa: std.mem.Allocator, t: WbTransport, limits: sta
     }
     const lo = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const endpoint: starh2.EndpointConfig = switch (t) {
-        .h2c_unix => .{ .h2c_unix = path },
-        .h2c_tcp => .{ .h2c_prior_knowledge = lo },
-        .tls_unix, .h1_tls_unix => .{ .tls_unix = path },
-        .h1c_tcp => .{ .h1c = lo },
+        .h2c_unix => .{ .h2c_unix = .{ .path = path } },
+        .h2c_tcp => .{ .h2c_prior_knowledge = .{ .address = lo } },
+        .tls_unix, .h1_tls_unix => .{ .tls_unix = .{ .path = path } },
+        .h1c_tcp => .{ .h1c = .{ .address = lo } },
     };
     run.server = try starh2.Server.init(gpa, io, .{
         .endpoints = &.{endpoint},
@@ -1878,7 +1878,7 @@ test "hardening: Server.init refuses max_connections above what RLIMIT_NOFILE al
     var limits = starh2.Limits.defaults;
     limits.max_connections = @intCast(@min(ceiling, 1 << 30));
     const got = starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1922,10 +1922,10 @@ fn runListenProtocol(rt: *zio.Runtime, gpa: std.mem.Allocator, _: Transport) !vo
         break :blk std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in6)) == 0;
     };
     var endpoints: [4]starh2.EndpointConfig = .{
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) },
-        .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp6("::1", 0) },
+        .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp6("::1", 0) } },
     };
     const n_endpoints: usize = if (has_v6) 4 else 3;
     var server = try starh2.Server.init(gpa, io, .{

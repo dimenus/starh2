@@ -282,7 +282,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, outbound_bytes: usize, case
     var limits = starh2.Limits.defaults;
     limits.outbound_bytes_per_connection = outbound_bytes;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,

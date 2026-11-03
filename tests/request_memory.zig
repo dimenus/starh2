@@ -338,7 +338,7 @@ fn Scenario(comptime run: fn (*starh2.Server, std.mem.Allocator, u16) anyerror!v
         fn serve(rt: *zio.Runtime, gpa: std.mem.Allocator, limits: starh2.Limits) !void {
             const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
             var server = try starh2.Server.init(gpa, rt.io(), .{
-                .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+                .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
                 .routes = &routes,
                 .tls = null,
                 .limits = limits,

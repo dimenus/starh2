@@ -171,7 +171,7 @@ fn runTlsQueued(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // by the handshake timeout.
     limits.preface_timeout_ns = 20 * std.time.ns_per_s;
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
         .limits = limits,
@@ -246,7 +246,7 @@ fn h1Limits() starh2.Limits {
 fn runH1Queued(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const io = rt.io();
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = h1Limits(),
@@ -297,7 +297,7 @@ test "admission: an h1c client queued behind a full connection limit is served w
 fn runStopWhileParked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const io = rt.io();
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = h1Limits(),

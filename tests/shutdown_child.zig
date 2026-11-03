@@ -77,7 +77,7 @@ fn runStuck(rt: *zio.Runtime) anyerror!void {
     limits.shutdown_cancel_grace_ns = grace_ms * std.time.ns_per_ms;
     limits.shutdown_report_interval_ns = interval_ms * std.time.ns_per_ms;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -135,7 +135,7 @@ const holder_routes = [_]starh2.Route{
 fn runDeinitLive(rt: *zio.Runtime) anyerror!void {
     const gpa = std.heap.page_allocator;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &holder_routes,
         .tls = null,
         .limits = .defaults,
@@ -163,7 +163,7 @@ fn runDeinitLive(rt: *zio.Runtime) anyerror!void {
 fn runDeinitIdle(rt: *zio.Runtime) anyerror!void {
     const gpa = std.heap.page_allocator;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &ok_routes,
         .tls = null,
         .limits = .defaults,
@@ -302,8 +302,8 @@ fn runAccountsQuarantine(_: *zio.Runtime) anyerror!void {
 fn runProxyTrustedRange(rt: *zio.Runtime) anyerror!void {
     const gpa = std.heap.page_allocator;
     const wide = [_]starh2.edge.proxy_protocol.Cidr{try starh2.edge.proxy_protocol.Cidr.parse("::/0")};
-    const ep: starh2.EndpointConfig = .{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) };
-    if (starh2.Server.init(gpa, rt.io(), .{ .endpoints = &.{ep}, .routes = &.{}, .tls = null, .client_identity = &.{.{ .proxy_protocol = .{ .trusted = &wide } }} })) |srv| {
+    const ep: starh2.EndpointConfig = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &wide } } } };
+    if (starh2.Server.init(gpa, rt.io(), .{ .endpoints = &.{ep}, .routes = &.{}, .tls = null })) |srv| {
         var s = srv;
         s.deinit(gpa);
         std.debug.print("child: trusted range ::/0 booted\n", .{});

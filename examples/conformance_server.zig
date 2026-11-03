@@ -235,11 +235,11 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, cpath, gpa, .limited(64 * 1024));
         key_pem = try std.Io.Dir.cwd().readFileAlloc(io, kpath, gpa, .limited(16 * 1024));
         tls_cfg = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem };
-        break :blk .{ .tls = addr };
+        break :blk .{ .tls = .{ .address = addr } };
     } else if (std.mem.eql(u8, args.mode, "h1c"))
-        .{ .h1c = addr }
+        .{ .h1c = .{ .address = addr } }
     else
-        .{ .h2c_prior_knowledge = addr };
+        .{ .h2c_prior_knowledge = .{ .address = addr } };
 
     var limits = starh2.Limits.defaults;
     limits.response_compression = true;

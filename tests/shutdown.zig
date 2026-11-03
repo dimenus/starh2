@@ -116,7 +116,7 @@ fn runCooperativeAcking(rt: *zio.Runtime, gpa: std.mem.Allocator, ack_pings: boo
     limits.graceful_drain_timeout_ns = drain_ms * ms;
     limits.shutdown_cancel_grace_ns = grace_ms * ms;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -246,7 +246,7 @@ fn waitRunning(want: usize) !void {
 /// end of an HTTP/2 drain (31 s with the defaults).
 fn runH1Cancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = .defaults,
@@ -300,7 +300,7 @@ fn runStartupFailure(rt: *zio.Runtime, gpa: std.mem.Allocator, h1: bool) !void {
     const port = try wire_client.freeLoopbackPort();
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", port);
     const addr1 = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
-    const endpoints: [2]starh2.EndpointConfig = if (h1) .{ .{ .h1c = addr }, .{ .h1c = addr1 } } else .{ .{ .h2c_prior_knowledge = addr }, .{ .h2c_prior_knowledge = addr1 } };
+    const endpoints: [2]starh2.EndpointConfig = if (h1) .{ .{ .h1c = .{ .address = addr } }, .{ .h1c = .{ .address = addr1 } } } else .{ .{ .h2c_prior_knowledge = .{ .address = addr } }, .{ .h2c_prior_knowledge = .{ .address = addr1 } } };
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &endpoints,
         .routes = &routes,
@@ -413,9 +413,9 @@ fn runCanceledServe(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: CancelKind) 
     }
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{switch (kind) {
-            .h1c => .{ .h1c = addr },
-            .h2c => .{ .h2c_prior_knowledge = addr },
-            .h1_tls => .{ .tls = addr },
+            .h1c => .{ .h1c = .{ .address = addr } },
+            .h2c => .{ .h2c_prior_knowledge = .{ .address = addr } },
+            .h1_tls => .{ .tls = .{ .address = addr } },
         }},
         .routes = &routes,
         .tls = if (kind == .h1_tls) .{ .certificate_chain_pem = cert, .private_key_pem = key } else null,
@@ -511,7 +511,7 @@ test "shutdown: a server with no handler left returns without a report" {
 
 fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = .defaults,

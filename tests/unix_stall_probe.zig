@@ -210,12 +210,12 @@ fn runProbe(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, vari
     const loopback = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const endpoint: starh2.EndpointConfig = switch (socket) {
         .unix => switch (transport) {
-            .h2c => .{ .h2c_unix = path },
-            .tls => .{ .tls_unix = path },
+            .h2c => .{ .h2c_unix = .{ .path = path } },
+            .tls => .{ .tls_unix = .{ .path = path } },
         },
         .tcp => switch (transport) {
-            .h2c => .{ .h2c_prior_knowledge = loopback },
-            .tls => .{ .tls = loopback },
+            .h2c => .{ .h2c_prior_knowledge = .{ .address = loopback } },
+            .tls => .{ .tls = .{ .address = loopback } },
         },
     };
     var server = try starh2.Server.init(gpa, io, .{ .endpoints = &.{endpoint}, .routes = &routes, .tls = tls_cfg, .limits = starh2.Limits.defaults });

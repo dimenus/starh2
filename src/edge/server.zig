@@ -48,52 +48,82 @@ pub const EndpointAddress = std.Io.net.IpAddress;
 ///   `Limits.client_ipv6_aggregate_prefix_bits` (/48 by default). An
 ///   IPv4-mapped address is IPv4. A peer whose address cannot be read is the
 ///   one shared unknown identity.
+/// - `.proxy_source`: the client a PROXY v2 header names, for a proxy that
+///   keeps one upstream connection per client (an NLB, HAProxy or nginx
+///   `stream`, Envoy TCP). Needs the endpoint's `proxy_protocol` on. A
+///   `LOCAL` header (a health check) is charged to the endpoint's one
+///   infrastructure account.
 /// - `.none`, the default on Unix socket endpoints: no client account, only
 ///   the connection's and the server's. The only honest setting behind an L7
-///   proxy that pools connections (an ALB, Cloudflare HTTP): one pooled
-///   upstream connection carries many users. Logged at boot.
-/// - `.proxy_protocol`: the client a PROXY v2 header names
-///   (`proxy_protocol.zig` has the protocol and the order at accept), for a
-///   proxy that keeps one upstream connection per client. A TCP endpoint
-///   needs a non-empty list of trusted proxy sources (`Server.init` fails
-///   with `ProxyProtocolUntrusted` otherwise), and a connection from any
-///   other source is closed at accept. A Unix socket endpoint takes no list.
+///   proxy that pools connections (an ALB, Cloudflare HTTP), with or without
+///   PROXY: one pooled upstream connection carries many users.
 ///
-/// No X-Forwarded-For: identity is needed at accept, before any HTTP.
+/// Every endpoint's identity and framing are logged at boot. No
+/// X-Forwarded-For: identity is needed at accept, before any HTTP.
 ///
-/// The failure mode of the default: `.peer` left on behind an L7 proxy makes
-/// every user one identity, and nothing at boot can see it.
-pub const ClientIdentity = union(enum) {
-    peer,
+/// The failure mode of the default: `.peer` left on behind an L7 proxy that
+/// sends no PROXY header makes every user one identity, and nothing at boot
+/// can see it. Behind one that does send it, `.peer` is a boot error
+/// (`PeerIdentityBehindProxyProtocol`).
+pub const ClientIdentity = enum { peer, proxy_source, none };
+
+/// A Unix socket peer has no address: its identity is the PROXY source or
+/// none.
+pub const UnixClientIdentity = enum {
     none,
-    proxy_protocol: ProxyProtocol,
+    proxy_source,
 
-    pub const ProxyProtocol = struct {
-        /// Proxy source ranges allowed to send a header. Copied at init.
-        trusted: []const proxy_protocol.Cidr,
-    };
-
-    fn name(self: ClientIdentity) []const u8 {
+    fn general(self: UnixClientIdentity) ClientIdentity {
         return switch (self) {
-            .peer => ".peer",
-            .none => ".none",
-            .proxy_protocol => ".proxy_protocol",
+            .none => .none,
+            .proxy_source => .proxy_source,
         };
     }
 };
 
+/// PROXY protocol v2 framing on a TCP endpoint (`proxy_protocol.zig` has the
+/// protocol and the order at accept): every connection starts with a header,
+/// which the server reads and strips, whatever the identity. Only from a
+/// non-empty list of trusted proxy sources (`Server.init` fails with
+/// `ProxyProtocolUntrusted` otherwise); a connection from any other source
+/// is closed at accept. The header waiters are capped server-wide
+/// (`Limits.proxy_header_waiters`).
+pub const ProxyProtocol = union(enum) {
+    off,
+    v2: struct {
+        /// Proxy source ranges allowed to send a header. Copied at init.
+        trusted: []const proxy_protocol.Cidr,
+    },
+};
+
+/// PROXY v2 framing on a Unix socket endpoint: no trusted list, since only
+/// the host reaches the socket.
+pub const UnixProxyProtocol = enum { off, v2 };
+
 pub const EndpointConfig = union(enum) {
-    tls: EndpointAddress,
-    h2c_prior_knowledge: EndpointAddress,
-    h1c: EndpointAddress,
+    tls: Tcp,
+    h2c_prior_knowledge: Tcp,
+    h1c: Tcp,
     /// TLS or h2c on a Unix stream socket at this path: for a proxy on the
     /// same host, and the transport the tests drive, whose fixed kernel
     /// buffers hold a stall (TCP loopback's do not on macOS). The server
     /// copies the path, binds it, and deletes the file when its listeners
     /// close. A file already there is not removed: the bind fails. At most
     /// `std.Io.net.UnixAddress.max_len` bytes (104 on macOS).
-    tls_unix: []const u8,
-    h2c_unix: []const u8,
+    tls_unix: Unix,
+    h2c_unix: Unix,
+
+    pub const Tcp = struct {
+        address: EndpointAddress,
+        client_identity: ClientIdentity = .peer,
+        proxy_protocol: ProxyProtocol = .off,
+    };
+
+    pub const Unix = struct {
+        path: []const u8,
+        client_identity: UnixClientIdentity = .none,
+        proxy_protocol: UnixProxyProtocol = .off,
+    };
 
     pub fn mode(ep: EndpointConfig) connection.Mode {
         return switch (ep) {
@@ -105,8 +135,35 @@ pub const EndpointConfig = union(enum) {
 
     fn unixPath(ep: EndpointConfig) ?[]const u8 {
         return switch (ep) {
-            .tls_unix, .h2c_unix => |p| p,
+            .tls_unix, .h2c_unix => |u| u.path,
             else => null,
+        };
+    }
+
+    fn clientIdentity(ep: EndpointConfig) ClientIdentity {
+        return switch (ep) {
+            .tls, .h2c_prior_knowledge, .h1c => |t| t.client_identity,
+            .tls_unix, .h2c_unix => |u| u.client_identity.general(),
+        };
+    }
+
+    /// PROXY v2 framing on: the header is read and stripped.
+    fn proxied(ep: EndpointConfig) bool {
+        return switch (ep) {
+            .tls, .h2c_prior_knowledge, .h1c => |t| t.proxy_protocol == .v2,
+            .tls_unix, .h2c_unix => |u| u.proxy_protocol == .v2,
+        };
+    }
+
+    /// The sources allowed to send a PROXY header; empty when framing is off
+    /// and on a Unix socket.
+    fn trusted(ep: EndpointConfig) []const proxy_protocol.Cidr {
+        return switch (ep) {
+            .tls, .h2c_prior_knowledge, .h1c => |t| switch (t.proxy_protocol) {
+                .off => &.{},
+                .v2 => |v| v.trusted,
+            },
+            .tls_unix, .h2c_unix => &.{},
         };
     }
 };
@@ -154,14 +211,21 @@ pub const InitError = error{
     InvalidCertificate,
     CertificateTooLarge,
     PrivateKeyTooLarge,
-    /// A TCP endpoint with `client_identity = .proxy_protocol` and no trusted
-    /// sources: any client could then name any address.
+    /// A TCP endpoint with `proxy_protocol = .v2` and no trusted sources: any
+    /// client could then name any address.
     ProxyProtocolUntrusted,
     /// A trusted PROXY source range that holds every IPv4-mapped address
     /// (`::ffff:0:0/96`) without being a mapped range itself, such as
     /// `::/0`: it would trust IPv4 sources it does not name. The log line
     /// names the range; list the IPv4 range or the mapped range instead.
     ProxyTrustedRangeHoldsIpv4,
+    /// `client_identity = .proxy_source` with `proxy_protocol` off: there is
+    /// no header to name the source.
+    ProxySourceWithoutProxyProtocol,
+    /// `client_identity = .peer` with `proxy_protocol = .v2` on TCP: the
+    /// socket peer is then the trusted proxy, so every client would be one
+    /// identity. Use `.proxy_source`, or `.none` behind a pooling proxy.
+    PeerIdentityBehindProxyProtocol,
 };
 
 pub const ServeError = error{
@@ -177,10 +241,6 @@ pub const ServerConfig = struct {
     routes: []const router_mod.Route,
     tls: ?TlsConfig,
     limits: limits_mod.Limits = .defaults,
-    /// Empty: every endpoint takes its transport's default (`.peer` on TCP,
-    /// `.none` on a Unix socket). Otherwise one per endpoint, in the same
-    /// order; any other length is `InvalidConfig`.
-    client_identity: []const ClientIdentity = &.{},
     /// Load-aware connection placement (pinned scheduling). The balancer
     /// belongs to the runtime this server runs on and may be shared by every
     /// server on it; it must outlive the server. See `balancer.zig`.
@@ -222,10 +282,7 @@ pub const Server = struct {
     /// The client accounts (`accounts.zig`): one record per client identity,
     /// and per IPv6 aggregate, that holds anything.
     clients: accounts.Table,
-    /// Each endpoint's identity mode, resolved at init (the defaults filled
-    /// in, trusted lists owned).
-    identities: []ClientIdentity,
-    /// Connections on `.proxy_protocol` endpoints accepted and not yet past
+    /// Connections on PROXY v2 endpoints accepted and not yet past
     /// their header (and, on TLS, not yet holding a handshake slot), against
     /// `Limits.proxy_header_waiters`.
     proxy_waiters: std.atomic.Value(usize) = .init(0),
@@ -294,16 +351,15 @@ pub const Server = struct {
         if (need_h2c) try config.limits.checkH2cWriteQueue();
         if (need_tls and config.tls == null) return error.InvalidConfig;
 
-        if (config.client_identity.len != 0 and config.client_identity.len != config.endpoints.len) return error.InvalidConfig;
-        for (config.client_identity, 0..) |ci, i| switch (ci) {
-            .proxy_protocol => |pp| {
-                const unix = config.endpoints[i].unixPath() != null;
-                if (!unix and pp.trusted.len == 0) return error.ProxyProtocolUntrusted;
-                // A list on a Unix socket would look like it does something.
-                if (unix and pp.trusted.len != 0) return error.InvalidConfig;
-            },
-            else => {},
-        };
+        for (config.endpoints) |ep| {
+            const unix = ep.unixPath() != null;
+            if (ep.proxied() and !unix and ep.trusted().len == 0) return error.ProxyProtocolUntrusted;
+            switch (ep.clientIdentity()) {
+                .proxy_source => if (!ep.proxied()) return error.ProxySourceWithoutProxyProtocol,
+                .peer => if (ep.proxied()) return error.PeerIdentityBehindProxyProtocol,
+                .none => {},
+            }
+        }
 
         var route_bytes: usize = 0;
         for (config.routes) |route| route_bytes += route.path.len;
@@ -329,16 +385,25 @@ pub const Server = struct {
 
         const endpoints = try gpa.dupe(EndpointConfig, config.endpoints);
         for (endpoints) |*ep| switch (ep.*) {
-            .tls_unix, .h2c_unix => |*p| p.* = &.{},
-            else => {},
+            .tls_unix, .h2c_unix => |*u| u.path = &.{},
+            .tls, .h2c_prior_knowledge, .h1c => |*t| switch (t.proxy_protocol) {
+                .off => {},
+                .v2 => |*v| v.trusted = &.{},
+            },
         };
         errdefer freeEndpoints(gpa, endpoints);
-        // The paths are the caller's: own a copy.
-        for (config.endpoints, endpoints) |src, *dst| switch (src) {
-            .tls_unix => |p| dst.* = .{ .tls_unix = try gpa.dupe(u8, p) },
-            .h2c_unix => |p| dst.* = .{ .h2c_unix = try gpa.dupe(u8, p) },
-            else => {},
+        // The paths and the trusted lists are the caller's: own a copy.
+        for (config.endpoints, endpoints, 0..) |src, *dst, i| switch (dst.*) {
+            .tls_unix, .h2c_unix => |*d| d.path = try gpa.dupe(u8, src.unixPath().?),
+            .tls, .h2c_prior_knowledge, .h1c => |*d| switch (d.proxy_protocol) {
+                .off => {},
+                .v2 => |*v| v.trusted = try ownTrusted(gpa, i, src.trusted()),
+            },
         };
+        for (endpoints, 0..) |ep, i| {
+            const framing: []const u8 = if (!ep.proxied()) "off" else if (ep.unixPath() != null) "v2 (Unix socket, no trusted list)" else "v2";
+            log.info("endpoint {d} ({s}): client_identity=.{s} proxy_protocol={s} trusted={d}", .{ i, @tagName(ep), @tagName(ep.clientIdentity()), framing, ep.trusted().len });
+        }
 
         var tls_acceptor: ?tls_edge.Acceptor = null;
         errdefer if (tls_acceptor) |*auth| auth.deinit();
@@ -400,25 +465,6 @@ pub const Server = struct {
         var clients = try accounts.Table.init(gpa, config.limits.clientTableRecords() catch return error.InvalidConfig, seed);
         errdefer clients.deinit(gpa);
 
-        const identities = try gpa.alloc(ClientIdentity, config.endpoints.len);
-        for (identities) |*ci| ci.* = .none;
-        errdefer freeIdentities(gpa, identities);
-        for (identities, config.endpoints, 0..) |*ci, ep, i| {
-            const want: ClientIdentity = if (config.client_identity.len != 0)
-                config.client_identity[i]
-            else if (ep.unixPath() != null) .none else .peer;
-            // The copy first, then the store: `ci.* = switch ... try` would
-            // write the `.proxy_protocol` tag into `ci.*` before the `try`,
-            // and a failed copy would leave `freeIdentities` an undefined
-            // slice to free.
-            const resolved: ClientIdentity = switch (want) {
-                .proxy_protocol => |pp| .{ .proxy_protocol = .{ .trusted = try ownTrusted(gpa, i, pp.trusted) } },
-                else => want,
-            };
-            ci.* = resolved;
-            log.info("endpoint {d} ({s}): client_identity={s}", .{ i, @tagName(ep), ci.name() });
-        }
-
         var self: Server = .{
             .gpa = gpa,
             .io = io,
@@ -435,7 +481,6 @@ pub const Server = struct {
                 .max_handshakes = config.limits.concurrent_tls_handshakes,
             },
             .clients = clients,
-            .identities = identities,
             .slabs = slabs,
             .requests = requests,
             .compression_pool = compression_pool,
@@ -470,8 +515,8 @@ pub const Server = struct {
 
         for (self.endpoints, 0..) |endpoint, i| {
             self.listeners[i] = switch (endpoint) {
-                .tls, .h2c_prior_knowledge, .h1c => |address| listenEndpoint(self.io, address, self.limits.listen_backlog),
-                .tls_unix, .h2c_unix => |path| listenUnix(self.io, path, self.limits.listen_backlog),
+                .tls, .h2c_prior_knowledge, .h1c => |t| listenEndpoint(self.io, t.address, self.limits.listen_backlog),
+                .tls_unix, .h2c_unix => |u| listenUnix(self.io, u.path, self.limits.listen_backlog),
             } catch return error.ListenFailed;
             self.local_addrs[i] = self.listeners[i].socket.address;
             self.listeners_bound = i + 1;
@@ -740,7 +785,7 @@ pub const Server = struct {
     }
 
     /// What one accept must take: the connection slot, and the handshake slot
-    /// (TLS) or the PROXY waiter slot (a `.proxy_protocol` endpoint, whose
+    /// (TLS) or the PROXY waiter slot (a PROXY v2 endpoint, whose
     /// TLS handshake slot comes after its header), charged to `charge`.
     const Admission = struct {
         mode: connection.Mode,
@@ -827,9 +872,9 @@ pub const Server = struct {
     /// returned; what its handlers still hold is charged through their links'
     /// own references.
     ///
-    /// `proxied`: a `.proxy_protocol` endpoint. Its PROXY header is read here
-    /// first (`takeProxyHeader`), and only then is the connection keyed and
-    /// charged to its client.
+    /// `proxied`: a PROXY v2 endpoint. Its header is read here first
+    /// (`takeProxyHeader`), and only then is the connection keyed and charged
+    /// to its client (`.proxy_source`), or to none (`.none`).
     fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig, slot: ?*conn_slot.ConnSlot, endpoint_index: usize, proxied: bool) std.Io.Cancelable!void {
         var cfg = config;
         defer self.clients.release(cfg.charge);
@@ -861,12 +906,13 @@ pub const Server = struct {
 
     const ProxyError = error{ Canceled, Failed };
 
-    /// A `.proxy_protocol` connection, on its own task: read its header by
-    /// the preface deadline, key it to the client the header names, charge
-    /// the connection to that client, and on TLS take its handshake slot by
-    /// the same deadline. The PROXY waiter slot is held until then. On any
-    /// failure the caller closes the connection; nothing is charged to a
-    /// client then.
+    /// A PROXY v2 connection, on its own task: read its header by the preface
+    /// deadline; with `.proxy_source`, key it to the client the header names
+    /// and charge the connection to that client (with `.none`, charge no
+    /// client); and on TLS take its handshake slot by the same deadline. The
+    /// PROXY waiter slot is held until then. `Request.peer` is the header's
+    /// source either way. On any failure the caller closes the connection;
+    /// nothing is charged to a client then.
     fn takeProxyHeader(self: *Server, stream: std.Io.net.Stream, cfg: *connection.ConnConfig, endpoint_index: usize, deadline_ns: u64) ProxyError!void {
         defer self.releaseProxyWaiter();
         const src = readProxyHeader(stream, self.limits.proxy_header_bytes, deadline_ns) catch |err| {
@@ -888,8 +934,14 @@ pub const Server = struct {
         };
         // The server's connection slot was taken at accept; the client's
         // charge is taken now that the client is known, and given back with
-        // the server's in `connEntry`.
-        const charge = (self.clients.acquire(keys) catch return error.Canceled) orelse return error.Failed;
+        // the server's in `connEntry`. `.none` (behind a pooling proxy) keys
+        // nothing: the header only strips and names.
+        const charge: accounts.Charge = switch (self.endpoints[endpoint_index].clientIdentity()) {
+            .proxy_source => (self.clients.acquire(keys) catch return error.Canceled) orelse return error.Failed,
+            .none => .none,
+            // A boot error (`PeerIdentityBehindProxyProtocol`).
+            .peer => unreachable,
+        };
         charge.add(.connections, 1);
         cfg.charge = charge;
         if (cfg.mode != .tls) return;
@@ -1022,9 +1074,10 @@ pub const Server = struct {
         connection_group: *std.Io.Group,
     ) std.Io.Cancelable!void {
         const listener = &self.listeners[endpoint_index];
-        const identity = self.identities[endpoint_index];
-        const proxied = identity == .proxy_protocol;
-        const unix = self.endpoints[endpoint_index].unixPath() != null;
+        const endpoint = self.endpoints[endpoint_index];
+        const identity = endpoint.clientIdentity();
+        const proxied = endpoint.proxied();
+        const unix = endpoint.unixPath() != null;
         var backoff: AcceptBackoff = .{};
         while (!self.shutdown_flag.load(.acquire)) {
             try self.awaitAdmission(.{ .mode = mode, .proxied = proxied, .charge = .none }, admissionRoom);
@@ -1046,12 +1099,22 @@ pub const Server = struct {
             // correct on every accepted socket.
             setTcpNoDelay(stream);
             // The socket peer, read once. It is the client for `.peer`, the
-            // proxy for `.proxy_protocol` (whose header then names the
-            // client), and what the handler sees for `.none`.
+            // proxy on a PROXY endpoint (whose header then names the
+            // client), and what the handler sees for `.none` without PROXY.
             const peer = connection.peerFromHandle(stream.socket.handle);
+            // The trusted check first, before any slot is taken or byte
+            // read: an untrusted source is closed, never keyed to its own
+            // address.
+            if (proxied and !unix and !proxy_protocol.trusted(endpoint.trusted(), peer)) {
+                _ = self.proxy_untrusted.fetchAdd(1, .monotonic);
+                self.proxy_log.note("connection from {f} to PROXY endpoint {d}: not a trusted source, closed", .{ fmtPeer(peer), endpoint_index });
+                stream.close(self.io);
+                continue;
+            }
             var charge: accounts.Charge = .none;
             switch (identity) {
-                .none => {},
+                // Keyed after the header (`takeProxyHeader`), or never.
+                .none, .proxy_source => {},
                 .peer => {
                     var keys_buf: [accounts.max_refs]accounts.Key = undefined;
                     const keys = accounts.keysFor(peer, self.limits.client_ipv6_aggregate_prefix_bits, &keys_buf);
@@ -1065,17 +1128,6 @@ pub const Server = struct {
                         stream.close(self.io);
                         continue;
                     };
-                },
-                .proxy_protocol => |pp| {
-                    // The trusted check first, before any slot is taken or
-                    // byte read: an untrusted source is closed, never keyed
-                    // to its own address.
-                    if (!unix and !proxy_protocol.trusted(pp.trusted, peer)) {
-                        _ = self.proxy_untrusted.fetchAdd(1, .monotonic);
-                        self.proxy_log.note("connection from {f} to PROXY endpoint {d}: not a trusted source, closed", .{ fmtPeer(peer), endpoint_index });
-                        stream.close(self.io);
-                        continue;
-                    }
                 },
             }
             const admission: Admission = .{ .mode = mode, .proxied = proxied, .charge = charge };
@@ -1257,7 +1309,6 @@ pub const Server = struct {
         // slot back.
         self.slots.deinit();
         self.clients.deinit(gpa);
-        freeIdentities(gpa, self.identities);
         if (self.tls_acceptor) |*auth| auth.deinit();
         self.* = undefined;
     }
@@ -1508,14 +1559,6 @@ fn ownTrusted(gpa: std.mem.Allocator, endpoint_index: usize, list: []const proxy
     return copy;
 }
 
-fn freeIdentities(gpa: std.mem.Allocator, identities: []ClientIdentity) void {
-    for (identities) |ci| switch (ci) {
-        .proxy_protocol => |pp| gpa.free(pp.trusted),
-        else => {},
-    };
-    gpa.free(identities);
-}
-
 /// Bind and listen one endpoint with an explicit accept-queue length.
 ///
 /// std.Io's `ListenOptions.kernel_backlog` defaults to 128, and zio's
@@ -1537,6 +1580,8 @@ fn freeEndpoints(gpa: std.mem.Allocator, endpoints: []EndpointConfig) void {
         if (ep.unixPath()) |p| {
             if (p.len != 0) gpa.free(p);
         }
+        const t = ep.trusted();
+        if (t.len != 0) gpa.free(t);
     }
     gpa.free(endpoints);
 }

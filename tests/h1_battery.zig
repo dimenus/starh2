@@ -595,7 +595,7 @@ fn serveBattery(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     lim.request_body_bytes = 1024;
     lim.h1_head_bytes = 1024;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,
@@ -800,7 +800,7 @@ fn runZeroAlloc(io: std.Io, gpa: std.mem.Allocator, _: starh2.EndpointAddress) !
     lim.request_body_bytes = 1024;
     lim.h1_head_bytes = 1024;
     var server = try starh2.Server.init(count.allocator(), io, .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,
@@ -1625,7 +1625,7 @@ fn runH2cRejectsH1(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const r = routes();
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = listen }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
     });
@@ -1655,7 +1655,7 @@ fn runParityH2(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const h2_listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const r = routes();
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{ .{ .h1c = h1_listen }, .{ .h2c_prior_knowledge = h2_listen } },
+        .endpoints = &.{ .{ .h1c = .{ .address = h1_listen } }, .{ .h2c_prior_knowledge = .{ .address = h2_listen } } },
         .routes = &r,
         .tls = null,
     });
@@ -1734,7 +1734,7 @@ fn runParityTaskPostBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const h2_listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const r = routes();
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{ .{ .h1c = h1_listen }, .{ .h2c_prior_knowledge = h2_listen } },
+        .endpoints = &.{ .{ .h1c = .{ .address = h1_listen } }, .{ .h2c_prior_knowledge = .{ .address = h2_listen } } },
         .routes = &r,
         .tls = null,
     });
@@ -1803,7 +1803,7 @@ fn runTlsSmallRecords(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const r = routes();
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .tls = listen }},
+        .endpoints = &.{.{ .tls = .{ .address = listen } }},
         .routes = &r,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
     });
@@ -1868,7 +1868,7 @@ fn openTlsServer(rt: *zio.Runtime, gpa: std.mem.Allocator) !struct {
     const server = try gpa.create(starh2.Server);
     errdefer gpa.destroy(server);
     server.* = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .tls = listen }},
+        .endpoints = &.{.{ .tls = .{ .address = listen } }},
         .routes = &r,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
     });
@@ -2073,7 +2073,7 @@ fn runBodyLargerThanRecv(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     lim.request_body_bytes = 8192;
     lim.h1_head_bytes = 1024;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,
@@ -2128,7 +2128,7 @@ fn runIdleReaped(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var lim = starh2.Limits.defaults;
     lim.field_block_timeout_ns = 200 * std.time.ns_per_ms;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,
@@ -2162,7 +2162,7 @@ fn runSlowLoris(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var lim = starh2.Limits.defaults;
     lim.field_block_timeout_ns = 200 * std.time.ns_per_ms;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,
@@ -2215,7 +2215,7 @@ fn runZeroAllocTls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var lim = starh2.Limits.defaults;
     lim.h1_head_bytes = 1024;
     var server = try starh2.Server.init(count.allocator(), rt.io(), .{
-        .endpoints = &.{.{ .tls = listen }},
+        .endpoints = &.{.{ .tls = .{ .address = listen } }},
         .routes = &r,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
         .limits = lim,
@@ -2265,7 +2265,7 @@ fn withBatteryServer(
     lim.request_body_bytes = 1024;
     lim.h1_head_bytes = 1024;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,
@@ -2321,7 +2321,7 @@ fn namedAbortMidUpload(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     lim.request_body_bytes = 1024;
     lim.h1_head_bytes = 1024;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,
@@ -2477,7 +2477,7 @@ fn namedExpect100BodyAfterContinue(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
     lim.outbound_bytes_per_connection = 4 * 1024 * 1024;
     lim.request_body_idle_timeout_ns = 5 * std.time.ns_per_s;
     var server = starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h1c = listen }},
+        .endpoints = &.{.{ .h1c = .{ .address = listen } }},
         .routes = &r,
         .tls = null,
         .limits = lim,

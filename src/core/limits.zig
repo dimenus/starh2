@@ -259,13 +259,13 @@ pub const Limits = struct {
     /// (a free tunnel allocation holds 65,536 /64s) holds no more than one
     /// address would. 1 to 63.
     client_ipv6_aggregate_prefix_bits: u8 = 48,
-    /// The longest PROXY v2 header a `.proxy_protocol` endpoint reads, the
+    /// The longest PROXY v2 header a PROXY endpoint reads (`proxy_protocol = .v2`), the
     /// fixed 16 bytes included. A header whose length field says more is
     /// closed unread (the field allows 64 KiB). At least
     /// `proxy_protocol.min_header_cap` (a UNIX address block); the rest is room
     /// for the TLVs a proxy adds, which are ignored.
     proxy_header_bytes: usize = 512,
-    /// Connections accepted on `.proxy_protocol` endpoints and not yet past
+    /// Connections accepted on PROXY endpoints and not yet past
     /// their header (on TLS, until they hold a handshake slot), server-wide.
     /// While it is full those accept loops park, as for the connection limit.
     /// Its own cap, not the handshake slots, because the handshake slot is

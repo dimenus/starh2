@@ -127,7 +127,7 @@ fn runServer(
     limits.max_streams_per_server = 256;
     limits.max_task_handlers = 256;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = routes,
         .tls = null,
         .limits = limits,
@@ -397,7 +397,7 @@ test "T4: deadline slack rounds the wait up, and never holds back a late handler
             limits.max_task_handlers = 256;
             limits.handler_deadline_slack_ns = t4_slack_ns;
             var server = try starh2.Server.init(a, runtime.io(), .{
-                .endpoints = &.{ .{ .h2c_prior_knowledge = addr }, .{ .h1c = addr } },
+                .endpoints = &.{ .{ .h2c_prior_knowledge = .{ .address = addr } }, .{ .h1c = .{ .address = addr } } },
                 .routes = &routes,
                 .tls = null,
                 .limits = limits,
@@ -486,7 +486,7 @@ test "T5: a deadline before zero returns at once on both wait paths (h2c and h1c
             limits.max_streams_per_server = 256;
             limits.max_task_handlers = 256;
             var server = try starh2.Server.init(a, runtime.io(), .{
-                .endpoints = &.{ .{ .h2c_prior_knowledge = addr }, .{ .h1c = addr } },
+                .endpoints = &.{ .{ .h2c_prior_knowledge = .{ .address = addr } }, .{ .h1c = .{ .address = addr } } },
                 .routes = &routes,
                 .tls = null,
                 .limits = limits,

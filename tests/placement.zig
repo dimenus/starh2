@@ -47,7 +47,7 @@ fn runH2cSsePlacement(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .{ .method = .GET, .path = "/sse", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hangSse } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = &routes,
         .tls = null,
     });

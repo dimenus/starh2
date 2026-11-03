@@ -61,7 +61,7 @@ fn runDrain(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var limits = starh2.Limits.defaults;
     limits.graceful_drain_timeout_ns = 300 * std.time.ns_per_ms;
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,

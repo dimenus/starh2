@@ -299,7 +299,7 @@ fn runShape(rt: *zio.Runtime, gpa: std.mem.Allocator, shape: Shape) !void {
     var limits = starh2.Limits.defaults;
     limits.max_streams_per_connection = stream_limit;
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .tls = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) }},
+        .endpoints = &.{.{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
         .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
         .limits = limits,

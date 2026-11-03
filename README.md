@@ -80,7 +80,7 @@ const ctx: u8 = 0;
 fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 8080);
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = addr }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
         .routes = &.{.{
             .method = .GET,
             .path = "/hello",
@@ -102,7 +102,7 @@ For TLS, swap the endpoint and supply PEM bytes:
 
 <!-- doctest: config -->
 ```zig
-.endpoints = &.{.{ .tls = addr }},
+.endpoints = &.{.{ .tls = .{ .address = addr } }},
 .tls = .{ .certificate_chain_pem = cert_pem, .private_key_pem = key_pem },
 ```
 
