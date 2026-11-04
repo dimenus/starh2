@@ -732,6 +732,18 @@ fn sseBroadcastHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Re
 // Streams take slots in arrival order, modulo `--fed-slots`. A slot's channel
 // holds one stamp, so a stream that falls behind sends the newest once, the
 // rule the broadcast arms follow.
+/// The bench's TLS handshake limit when `--tls-handshakes` is not given: 256,
+/// not the library's 128. Every bench connection is one client (127.0.0.1),
+/// and h2load opens its 50 TLS connections at once. At 128 the pressure mark
+/// is 32 handshakes in progress and one client's share 16 (t-3759 step 4), so
+/// handshakes 33 to 50 were closed at accept, as the design says for one
+/// address (the one-client-behind-NAT case), and those requests failed. At
+/// 256 the mark is 64, so `-c 50` never reaches pressure, while the endpoint
+/// stays `client_identity = .peer` and the bench still pays the per-client
+/// charge walk. The bench keeps h2load's shape (`-c 50`) so TLS numbers stay
+/// comparable with earlier runs.
+const bench_tls_handshakes = 256;
+
 const fed_max_slots = 1024;
 var g_fed_slots: u64 = 200;
 var g_fed_next: std.atomic.Value(u64) = .init(0);
@@ -802,8 +814,9 @@ const Args = struct {
     balance_rank: ?starh2.Balancer.Rank = null,
     placement_log: bool = false,
     allow_ptrace: bool = false,
-    /// Null keeps `Limits.defaults` for each. Connection-churn shapes (many
-    /// new TLS connections at once) need all three above their defaults.
+    /// Null keeps `Limits.defaults` for the first two, and `bench_tls_handshakes`
+    /// for the third. Connection-churn shapes (many new TLS connections at
+    /// once) need all three above their defaults.
     listen_backlog: ?u31 = null,
     max_connections: ?usize = null,
     tls_handshakes: ?usize = null,
@@ -1570,7 +1583,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     var limits: starh2.Limits = .defaults;
     if (args.listen_backlog) |v| limits.listen_backlog = v;
     if (args.max_connections) |v| limits.max_connections = v;
-    if (args.tls_handshakes) |v| limits.concurrent_tls_handshakes = v;
+    limits.concurrent_tls_handshakes = args.tls_handshakes orelse bench_tls_handshakes;
     if (args.request_bytes_per_connection) |v| limits.request_bytes_per_connection = v;
     if (args.request_bytes_per_server) |v| limits.request_bytes_per_server = v;
     if (args.request_arena_bytes) |v| limits.request_arena_bytes = v;

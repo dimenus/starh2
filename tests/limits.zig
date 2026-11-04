@@ -44,7 +44,8 @@ test "the connection budget must hold the whole write pool and one stream's cap 
     const pool_bytes = lim.inbound_wire_chunks_per_connection * starh2.core.limits.WIRE_CHUNK_SIZE;
     const enough = pool_bytes + lim.outbound_bytes_per_stream;
     lim.outbound_bytes_per_connection = enough;
-    lim.outbound_bytes_per_server = enough;
+    // A connection holds at most a client's share, an eighth of the server.
+    lim.outbound_bytes_per_server = enough * 8;
     _ = try lim.resourceUpperBound();
     lim.outbound_bytes_per_connection = enough - 1;
     try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
@@ -107,9 +108,10 @@ test "counting allocator: Server.init under published ceiling" {
         .outbound_bytes_per_stream = 4 * 1024,
         // The write pool (3 chunks) and one stream's cap must fit the budget.
         .outbound_bytes_per_connection = 64 * 1024,
-        .outbound_bytes_per_server = 128 * 1024,
-        .request_bytes_per_connection = 128 * 1024,
-        .request_bytes_per_server = 256 * 1024,
+        // Nested: arena <= connection <= server / 8 (a client's share).
+        .outbound_bytes_per_server = 512 * 1024,
+        .request_bytes_per_connection = 256 * 1024,
+        .request_bytes_per_server = 2 * 1024 * 1024,
         .request_arena_bytes = 256 * 1024,
         .request_pool_retain_bytes = 256 * 1024,
         .request_body_bytes = 1024,
@@ -167,9 +169,10 @@ test "fail-index iteration: Server.init fails closed" {
         .inbound_wire_chunks_per_connection = starh2.core.limits.H2C_MIN_WRITE_QUEUE_CHUNKS,
         .outbound_bytes_per_stream = 1024,
         .outbound_bytes_per_connection = 64 * 1024,
-        .outbound_bytes_per_server = 128 * 1024,
-        .request_bytes_per_connection = 128 * 1024,
-        .request_bytes_per_server = 256 * 1024,
+        // Nested: arena <= connection <= server / 8 (a client's share).
+        .outbound_bytes_per_server = 512 * 1024,
+        .request_bytes_per_connection = 256 * 1024,
+        .request_bytes_per_server = 2 * 1024 * 1024,
         .request_arena_bytes = 256 * 1024,
         .request_pool_retain_bytes = 256 * 1024,
         .request_body_bytes = 1024,
@@ -236,9 +239,10 @@ test "counting allocator peak under live hello stays under ceiling" {
         .outbound_bytes_per_stream = 4 * 1024,
         // The write pool (3 chunks) and one stream's cap must fit the budget.
         .outbound_bytes_per_connection = 64 * 1024,
-        .outbound_bytes_per_server = 128 * 1024,
-        .request_bytes_per_connection = 128 * 1024,
-        .request_bytes_per_server = 256 * 1024,
+        // Nested: arena <= connection <= server / 8 (a client's share).
+        .outbound_bytes_per_server = 512 * 1024,
+        .request_bytes_per_connection = 256 * 1024,
+        .request_bytes_per_server = 2 * 1024 * 1024,
         .request_arena_bytes = 256 * 1024,
         .request_pool_retain_bytes = 256 * 1024,
         .request_body_bytes = 1024,
@@ -397,7 +401,8 @@ test "raised request_body_bytes: publish concurrent body memory cost" {
     // A larger per-connection share is free: it is a slice of the pool.
     const S = lim.max_streams_per_connection;
     lim.request_bytes_per_connection = B * S; // 512 MiB
-    lim.request_bytes_per_server = @max(lim.request_bytes_per_server, lim.request_bytes_per_connection);
+    // A connection holds at most a client's share, an eighth of the server.
+    lim.request_bytes_per_server = @max(lim.request_bytes_per_server, lim.request_bytes_per_connection * 8);
     const full = try lim.resourceUpperBound();
     // Only the pool term moved, by exactly the cap that was raised.
     try std.testing.expectEqual(

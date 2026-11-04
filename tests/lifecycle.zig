@@ -1,4 +1,9 @@
 //! Lifecycle stress under DebugAllocator — must fail on leaks / nonzero counters.
+//!
+//! Every endpoint here is `client_identity = .none` (t-3759 step 4): these
+//! gates drive the server's own limits, set small, from the one loopback
+//! client, so a client's share (an eighth of each limit, refused under
+//! pressure) would refuse first, and on some interleavings only.
 const std = @import("std");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
@@ -177,7 +182,9 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.outbound_bytes_per_connection = 16 * 1024 * 1024;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        // One loopback client drives the server's own caps here, not a
+        // client's share: `.none` charges no client account.
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -329,7 +336,7 @@ fn runCompleteReceiptPipeline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 32;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -528,7 +535,7 @@ fn runSlotHeldByReceipt(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 8;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -623,7 +630,7 @@ fn runTaskSlotHeldAfterResponse(rt: *zio.Runtime, gpa: std.mem.Allocator) !void 
     limits.max_task_handlers = 8;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -717,7 +724,7 @@ fn runTaskWaitDuringCompleteBatch(rt: *zio.Runtime, gpa: std.mem.Allocator) !voi
         .{ .method = .GET, .path = "/slow", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = slowComplete } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = starh2.Limits.defaults,
@@ -793,7 +800,7 @@ fn runParkedEnd(rt: *zio.Runtime, gpa: std.mem.Allocator, how: ParkedEnd) !void 
     limits.max_task_handlers = 8;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -928,7 +935,9 @@ fn runCompleteWaitsForControlEntry(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
     limits.control_entries_per_connection = 4;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        // One loopback client drives the server's own caps here, not a
+        // client's share: `.none` charges no client account.
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1044,7 +1053,7 @@ fn runResetsEndHeadersState(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1132,7 +1141,7 @@ fn runResetDropsQueuedHeaders(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1235,7 +1244,7 @@ fn runRefusedWithoutRequestMemory(rt: *zio.Runtime, gpa: std.mem.Allocator) !voi
     limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1318,7 +1327,7 @@ fn runRequestMemoryFreedAtFinish(rt: *zio.Runtime, gpa: std.mem.Allocator) !void
     limits.max_task_handlers = 16;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1459,7 +1468,7 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1653,7 +1662,7 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -1747,9 +1756,10 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
         .outbound_bytes_per_stream = 4 * 1024,
         // The write pool (3 chunks) and one stream's cap must fit the budget.
         .outbound_bytes_per_connection = 64 * 1024,
-        .outbound_bytes_per_server = 64 * 1024,
-        .request_bytes_per_connection = 128 * 1024,
-        .request_bytes_per_server = 256 * 1024,
+        // Nested: arena <= connection <= server / 8 (a client's share).
+        .outbound_bytes_per_server = 512 * 1024,
+        .request_bytes_per_connection = 256 * 1024,
+        .request_bytes_per_server = 2 * 1024 * 1024,
         .request_arena_bytes = 256 * 1024,
         .request_pool_retain_bytes = 256 * 1024,
         .request_body_bytes = 1024,
@@ -1772,7 +1782,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
     }};
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -2148,7 +2158,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -2301,7 +2311,7 @@ fn runCapCrossingBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // kill of a genuinely slow reader is correct behaviour, not a regression.
     // The two regressions this gate guards are completion and ordering.
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -2431,7 +2441,7 @@ fn runPrefaceFirstFrame(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         .{ .method = .GET, .path = "/hello", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
     };
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
     });

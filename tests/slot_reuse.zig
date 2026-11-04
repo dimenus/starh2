@@ -199,10 +199,13 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        // Every client of this file is the one loopback address, and these
+        // gates are about the server's own limits: `.none`, so no client
+        // share refuses first.
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } },
         .tls => {
             try tlsMaterial(io, gpa, cert, key);
-            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } };
             tls_cfg = .{ .certificate_chain_pem = cert.*, .private_key_pem = key.* };
         },
     }

@@ -242,7 +242,9 @@ fn runServer(
 ) !void {
     const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        // The pool's own limits, from one loopback client: `.none`, so no
+        // client share refuses a context first.
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = routes,
         .tls = null,
         .limits = limits,

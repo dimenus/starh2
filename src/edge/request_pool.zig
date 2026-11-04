@@ -58,7 +58,8 @@
 //! in this order: the request's own (`arena_bytes`), the connection's
 //! (`ConnBudget`), and the server's (the resident counter above). Between the
 //! connection and the server it is also charged to the request's client
-//! accounts (`Arena.charge`, `accounts.zig`), which refuse nothing yet. Whichever
+//! accounts (`Arena.charge`, `accounts.zig`), which refuse a client over its
+//! share while the pool's held bytes are at the pressure mark. Whichever
 //! refuses is recorded in `Arena.refusal` as a `Reason`, and the edge maps it
 //! to a status: `request_cap` is a 500, the others a 503.
 //!
@@ -104,6 +105,10 @@ pub const Reason = enum(u8) {
     request_cap,
     /// The connection's requests would hold more than `request_bytes_per_connection`.
     connection_cap,
+    /// The request's client (or its IPv6 aggregate) would pass its share
+    /// while the pool's held bytes are at the pressure mark
+    /// (`accounts.Charge.add`).
+    client_share,
     /// The resident cap is reached and nothing can be reclaimed, or every
     /// block of the needed class is in use.
     server_cap,
@@ -115,7 +120,7 @@ pub const Reason = enum(u8) {
     pub fn status(self: Reason) u16 {
         return switch (self) {
             .request_cap => 500,
-            .connection_cap, .server_cap => 503,
+            .connection_cap, .client_share, .server_cap => 503,
         };
     }
 };
@@ -788,7 +793,11 @@ pub const Arena = struct {
             self.refuse(.connection_cap);
             return null;
         }
-        self.charge.add(.request_bytes, size);
+        if (!self.charge.add(.request_bytes, size, self.pool.held_bytes.load(.acquire))) {
+            self.unchargeConn(size);
+            self.refuse(.client_share);
+            return null;
+        }
         const blk = self.pool.take(class) orelse {
             self.charge.sub(.request_bytes, size);
             self.unchargeConn(size);

@@ -188,10 +188,12 @@ pub const Limits = struct {
     outbound_bytes_per_server: usize = 256 * 1024 * 1024,
     /// The most CLASS bytes (see `request_pool`) one connection's requests
     /// hold at once, headers and bodies and what handlers allocate. One
-    /// connection must not be able to take the whole pool. 64 MiB lets a
-    /// connection run 16 concurrent requests that each render 1 MiB bodies
+    /// connection must not be able to take the whole pool. At most the
+    /// client's share of `request_bytes_per_server` (an eighth), and at
+    /// least `request_arena_bytes` (checked at boot). 32 MiB lets a
+    /// connection run 8 concurrent requests that each render 1 MiB bodies
     /// (about 3 MiB each) with room to spare.
-    request_bytes_per_connection: usize = 64 * 1024 * 1024,
+    request_bytes_per_connection: usize = 32 * 1024 * 1024,
     /// The most RESIDENT bytes the request pool holds, in use or free. See
     /// `request_pool.RequestPool` for what counts and what is reclaimed.
     request_bytes_per_server: usize = 256 * 1024 * 1024,
@@ -450,6 +452,31 @@ pub const Limits = struct {
         return deadline_ns +| (slack - over);
     }
 
+    /// A byte resource's limits nest: one stream (or request) <= one
+    /// connection <= one client's share (`accounts.Share.of`, the server
+    /// limit / 8) <= the server. A connection limit above the client's share
+    /// could never be reached under pressure, and one above the server's
+    /// never at all.
+    fn checkNesting(stream: usize, conn: usize, server: usize) error{InvalidConfig}!void {
+        if (stream > conn) return error.InvalidConfig;
+        if (conn > accounts.Share.of(server).client) return error.InvalidConfig;
+    }
+
+    /// The share rule of every resource, from the server-wide limits
+    /// (`accounts.zig` has the rule). The request pool's limit is its
+    /// resident cap; its use is the bytes it holds.
+    pub fn shares(self: Limits) accounts.Shares {
+        var s: accounts.Shares = undefined;
+        s[@intFromEnum(accounts.Resource.connections)] = .of(self.max_connections);
+        s[@intFromEnum(accounts.Resource.handshakes)] = .of(self.concurrent_tls_handshakes);
+        s[@intFromEnum(accounts.Resource.streams)] = .of(self.max_streams_per_server);
+        s[@intFromEnum(accounts.Resource.task_handlers)] = .of(self.max_task_handlers);
+        s[@intFromEnum(accounts.Resource.request_bytes)] = .of(self.request_bytes_per_server);
+        s[@intFromEnum(accounts.Resource.outbound_bytes)] = .of(self.outbound_bytes_per_server);
+        s[@intFromEnum(accounts.Resource.compression)] = .of(self.compression_contexts_per_server);
+        return s;
+    }
+
     fn checkedMul(a: usize, b: usize) error{InvalidConfig}!usize {
         const r = @mulWithOverflow(a, b);
         if (r[1] != 0) return error.InvalidConfig;
@@ -635,11 +662,11 @@ pub const Limits = struct {
         if (self.response_header_fields == 0 or self.response_header_bytes == 0) return error.InvalidConfig;
         if (self.response_header_bytes > MAX_HEADER_FRAGMENTS * frame.DEFAULT_MAX_FRAME_SIZE) return error.InvalidConfig;
         if (self.outbound_bytes_per_stream == 0 or self.outbound_bytes_per_connection == 0) return error.InvalidConfig;
-        // The three ceilings must nest: stream <= connection <= server. An
-        // inverted pair makes the inner limit unreachable, so a handler would
-        // park forever on capacity that the outer limit already refused.
-        if (self.outbound_bytes_per_stream > self.outbound_bytes_per_connection) return error.InvalidConfig;
-        if (self.outbound_bytes_per_connection > self.outbound_bytes_per_server) return error.InvalidConfig;
+        // The four ceilings must nest: stream <= connection <= client share
+        // <= server (`checkNesting`). An inverted pair makes the inner limit
+        // unreachable, so a handler would park forever on capacity that the
+        // outer limit already refused.
+        try checkNesting(self.outbound_bytes_per_stream, self.outbound_bytes_per_connection, self.outbound_bytes_per_server);
         // A handler whose write finds the connection budget full PARKS; it
         // does not fail. That is only safe if a release can always come, and
         // a release comes from a write ack or a slow-consumer kill. Wire bytes
@@ -652,7 +679,9 @@ pub const Limits = struct {
         // the writer" would be a state, and nothing would end it.
         const write_pool_bytes = try checkedMul(self.inbound_wire_chunks_per_connection, WIRE_CHUNK_SIZE);
         if (try checkedAdd(write_pool_bytes, self.outbound_bytes_per_stream) > self.outbound_bytes_per_connection) return error.InvalidConfig;
-        if (self.request_bytes_per_connection > self.request_bytes_per_server) return error.InvalidConfig;
+        // The same nesting for request memory; one request's cap is its
+        // "stream" level.
+        try checkNesting(self.request_arena_bytes, self.request_bytes_per_connection, self.request_bytes_per_server);
         // The request pool's own shape: the arena cap is a power of two of at
         // least one block, and the server cap holds at least one request.
         try self.requestPoolConfig().check();
@@ -1124,6 +1153,26 @@ test "the request pool's limits that cannot work are refused at boot" {
     try std.testing.expectEqual(@as(usize, 64 * 1024), try d.firstBlockBytes());
 }
 
+test "byte limits nest: stream <= connection <= a client's share <= server" {
+    // The defaults nest, at the edge for request memory (32 MiB is exactly
+    // the client's share of 256 MiB).
+    _ = try Limits.defaults.resourceUpperBound();
+    try std.testing.expectEqual(Limits.defaults.request_bytes_per_connection, accounts.Share.of(Limits.defaults.request_bytes_per_server).client);
+    // One byte past each step is refused, for both byte resources.
+    var lim = Limits.defaults;
+    lim.request_bytes_per_connection += 1;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim = Limits.defaults;
+    lim.request_arena_bytes = lim.request_bytes_per_connection * 2;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim = Limits.defaults;
+    lim.outbound_bytes_per_connection = accounts.Share.of(lim.outbound_bytes_per_server).client + 1;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+    lim = Limits.defaults;
+    lim.outbound_bytes_per_stream = lim.outbound_bytes_per_connection + 1;
+    try std.testing.expectError(error.InvalidConfig, lim.resourceUpperBound());
+}
+
 test "the largest legal body fits the arena bound" {
     // The bound `bodyArenaBytes` rests on a claim about how an ArrayList grows
     // through the arena. Check it by doing it: for several body sizes, take the
@@ -1134,8 +1183,9 @@ test "the largest legal body fits the arena bound" {
         var lim = Limits.defaults;
         lim.request_body_bytes = body_bytes;
         lim.request_arena_bytes = try lim.bodyArenaBytes();
-        lim.request_bytes_per_server = @max(lim.request_bytes_per_server, lim.request_arena_bytes);
-        lim.request_bytes_per_connection = lim.request_bytes_per_server;
+        // Nested (`checkNesting`): arena <= connection <= server / 8.
+        lim.request_bytes_per_connection = @max(lim.request_bytes_per_connection, lim.request_arena_bytes);
+        lim.request_bytes_per_server = @max(lim.request_bytes_per_server, lim.request_bytes_per_connection * 8);
         _ = try lim.resourceUpperBound();
         var pool = try request_pool.RequestPool.init(lim.requestPoolConfig());
         defer pool.deinit();

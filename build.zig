@@ -877,6 +877,25 @@ pub fn build(b: *std.Build) void {
     const accounts_step = b.step("test-accounts", "Run the t-3759 step 3 gates (client accounts, client identity, PROXY v2, conservation soak)");
     accounts_step.dependOn(&run_accounts_tests.step);
 
+    const shares_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/shares.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_shares_tests = b.addRunArtifact(shares_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_shares_tests.setCwd(b.path("."));
+    const shares_step = b.step("test-shares", "Run the t-3759 step 4 gates (one attack per share-table row, the aggregate, the NAT case)");
+    shares_step.dependOn(&run_shares_tests.step);
+
     const shutdown_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/shutdown.zig"),
@@ -1030,6 +1049,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_admission_tests.step);
     test_step.dependOn(&run_hardening_tests.step);
     test_step.dependOn(&run_accounts_tests.step);
+    test_step.dependOn(&run_shares_tests.step);
     test_step.dependOn(shutdown_step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);

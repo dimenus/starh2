@@ -338,7 +338,10 @@ fn Scenario(comptime run: fn (*starh2.Server, std.mem.Allocator, u16) anyerror!v
         fn serve(rt: *zio.Runtime, gpa: std.mem.Allocator, limits: starh2.Limits) !void {
             const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
             var server = try starh2.Server.init(gpa, rt.io(), .{
-                .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+                // These scenarios test the request's, the connection's and
+                // the server's caps from one loopback client: `.none`, so no
+                // client share refuses first (`tests/shares.zig` has those).
+                .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
                 .routes = &routes,
                 .tls = null,
                 .limits = limits,
@@ -434,7 +437,8 @@ test "request cap: 500 before the response is committed, RST(INTERNAL_ERROR) aft
     var l = smallLimits();
     l.request_body_bytes = 1024;
     l.request_arena_bytes = 256 * 1024;
-    l.request_bytes_per_server = 4 * 1024 * 1024;
+    // Nested: arena <= connection <= server / 8.
+    l.request_bytes_per_server = 8 * 1024 * 1024;
     l.request_bytes_per_connection = 1024 * 1024;
     try runScenario(perRequestCap, l);
 }
@@ -480,33 +484,45 @@ const echo_indexed_block = [_]u8{
     0x80 | 62,
 };
 
+/// Holder connections in the server-cap scenario: each holds its first block
+/// and a 128 KiB block (192 KiB), and the limits nest (a connection holds at
+/// most an eighth of the server), so it takes several to fill the pool.
+const server_cap_holders = 10;
+
 fn serverCap(server: *starh2.Server, gpa: std.mem.Allocator, port: u16) !void {
-    // Two connections, so the server's cap and not the connection's is what
-    // refuses (the connection cap equals the server cap here).
-    var a_conn = try Client.open(gpa, port);
-    defer a_conn.deinit();
+    // Holders on connections of their own, so the server's cap and not a
+    // connection's is what refuses.
+    var holders: [server_cap_holders]Client = undefined;
+    var opened: usize = 0;
+    defer for (holders[0..opened]) |*h| h.deinit();
+    for (&holders) |*h| {
+        h.* = try Client.open(gpa, port);
+        opened += 1;
+    }
     var c = try Client.open(gpa, port);
     defer c.deinit();
+    var d = try Client.open(gpa, port);
+    defer d.deinit();
 
-    // A holds its first block and 100 KiB (a 128 KiB block): 192 KiB of the
-    // 256 KiB the pool may have resident.
-    try a_conn.get(1, "/hold100k");
-    try waitCount(&hold_started, 1);
+    // Each holder holds its first block and 100 KiB (a 128 KiB block):
+    // 10 x 192 KiB = 1,920 KiB of the 2 MiB the pool may have resident.
+    for (&holders) |*h| try h.get(1, "/hold100k");
+    try waitCount(&hold_started, server_cap_holders);
 
-    // The other connection's first block fits (256 KiB resident, the cap),
-    // but the 100 KiB it asks for next does not, and no free resident block
-    // can be reclaimed: the handler's allocation fails, before its response: a
-    // 503.
+    // C's first block fits (1,984 KiB resident), but the 100 KiB it asks for
+    // next does not, and no free resident block can be reclaimed: the
+    // handler's allocation fails, before its response: a 503.
     const handler_refused = try c.getAndAwait(1, "/take100k");
     try std.testing.expectEqual(@as(?u16, 503), handler_refused.status);
     try std.testing.expectEqual(@as(u64, 1), refused(server, .server_cap));
     try std.testing.expectEqual(@as(u64, 0), refused(server, .connection_cap));
 
-    // B takes the 64 KiB block that request gave back, and holds it. Now
-    // every resident block is in use.
+    // C takes the 64 KiB block that request gave back, and holds it, and D
+    // takes the last 64 KiB. Now every resident block is in use.
     try c.get(3, "/hold");
-    try waitCount(&hold_started, 2);
-    try std.testing.expectEqual(@as(usize, 256 * 1024), server.requests.snapshot().resident_bytes);
+    try d.get(1, "/hold");
+    try waitCount(&hold_started, server_cap_holders + 2);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), server.requests.snapshot().resident_bytes);
 
     // No block for a first block at all. The header block is still decoded,
     // into the connection's scratch, and it adds `x-token` to the table.
@@ -516,12 +532,16 @@ fn serverCap(server: *starh2.Server, gpa: std.mem.Allocator, port: u16) !void {
     try std.testing.expect(no_first_block.ended);
     try std.testing.expectEqual(@as(u64, 2), refused(server, .server_cap));
 
-    // A and B finish; their blocks come home.
+    // The holders finish; their blocks come home.
     hold_release.store(true, .release);
-    const a = try a_conn.await(1, 5_000);
+    for (&holders) |*h| {
+        const a = try h.await(1, 5_000);
+        try std.testing.expectEqual(@as(?u16, 200), a.status);
+    }
     const b = try c.await(3, 5_000);
-    try std.testing.expectEqual(@as(?u16, 200), a.status);
     try std.testing.expectEqual(@as(?u16, 200), b.status);
+    const dd = try d.await(1, 5_000);
+    try std.testing.expectEqual(@as(?u16, 200), dd.status);
 
     // The refused request's block advanced the table: this request names the
     // entry, and the handler sees the right value. If the table had been left
@@ -536,8 +556,9 @@ fn serverCap(server: *starh2.Server, gpa: std.mem.Allocator, port: u16) !void {
 test "server cap: a refused first block still decodes its header block, and answers 503" {
     var l = smallLimits();
     l.request_body_bytes = 1024;
+    l.max_connections = server_cap_holders + 4;
     l.request_arena_bytes = 256 * 1024;
-    l.request_bytes_per_server = 256 * 1024;
+    l.request_bytes_per_server = 2 * 1024 * 1024;
     l.request_bytes_per_connection = 256 * 1024;
     try runScenario(serverCap, l);
 }
@@ -557,33 +578,44 @@ fn connectionCap(server: *starh2.Server, gpa: std.mem.Allocator, port: u16) !voi
     var c = try Client.open(gpa, port);
     defer c.deinit();
 
-    // The connection may hold one 64 KiB block. A request's first block takes
-    // all of it, and a 64,000-byte body does not fit what is left of that
-    // block, so the append that needs a second block is refused. The stream is
-    // answered; nothing is torn down.
-    try c.post(1, 64_000, true);
-    const refused_body = try c.await(1, 5_000);
+    // The connection may hold 256 KiB, and one request as much (the limits
+    // nest: a request's cap is at most its connection's). One stream holds
+    // its first block and a 128 KiB block. The next one's first block takes
+    // the rest, and a 64,000-byte body does not fit what is left of that
+    // block, so the append that needs another block is refused by the
+    // connection, not by the request (which would hold 128 KiB). The stream
+    // is answered; nothing is torn down.
+    try c.get(1, "/hold100k");
+    try waitCount(&hold_started, 1);
+    try c.post(3, 64_000, true);
+    const refused_body = try c.await(3, 5_000);
     try std.testing.expectEqual(@as(?u16, 503), refused_body.status);
     try std.testing.expect(refused_body.ended);
     try std.testing.expectEqual(@as(u64, 1), refused(server, .connection_cap));
+    try std.testing.expectEqual(@as(u64, 0), refused(server, .request_cap));
     try std.testing.expect(c.goaway == null);
+    hold_release.store(true, .release);
+    const held_one = try c.await(1, 5_000);
+    try std.testing.expectEqual(@as(?u16, 200), held_one.status);
 
-    // The connection serves its next request, which takes the block again.
-    const next = try c.getAndAwait(3, "/hello");
+    // The connection serves its next request, which takes a block again.
+    const next = try c.getAndAwait(5, "/hello");
     try std.testing.expectEqual(@as(?u16, 200), next.status);
     // And a body that fits one block is accepted.
-    try c.post(5, 20_000, true);
-    const small = try c.await(5, 5_000);
+    try c.post(7, 20_000, true);
+    const small = try c.await(7, 5_000);
     try std.testing.expectEqual(@as(?u16, 200), small.status);
     try std.testing.expectEqual(@as(u64, 1), refused(server, .connection_cap));
 }
 
 test "connection cap: a refused body append answers the stream and the connection serves the next" {
     var l = smallLimits();
-    l.request_body_bytes = 64 * 1024;
-    l.request_arena_bytes = 512 * 1024;
+    // The smallest body limit that takes the 64,000-byte body, so the
+    // smallest arena (`bodyArenaBytes`: 256 KiB) and connection.
+    l.request_body_bytes = 64_000;
+    l.request_arena_bytes = 256 * 1024;
     l.request_bytes_per_server = 4 * 1024 * 1024;
-    l.request_bytes_per_connection = 64 * 1024;
+    l.request_bytes_per_connection = 256 * 1024;
     try runScenario(connectionCap, l);
 }
 
@@ -697,7 +729,8 @@ test "a header block that decodes to tens of megabytes is a 431 and takes no mor
     var l = smallLimits();
     l.request_body_bytes = 1024;
     l.request_arena_bytes = 256 * 1024;
-    l.request_bytes_per_server = 1024 * 1024;
+    // Nested: arena <= connection <= server / 8.
+    l.request_bytes_per_server = 2 * 1024 * 1024;
     l.request_bytes_per_connection = 256 * 1024;
     try runScenario(hpackBomb, l);
 }

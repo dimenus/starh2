@@ -1102,6 +1102,12 @@ pub const ConnConfig = struct {
     tls_leftover: []const u8 = &.{},
 };
 
+/// What an admission at accept found: room, a full server (the accept loop
+/// parks until a slot is released), or the client over its share under
+/// pressure (the connection is closed: one identity must never park the
+/// accept loop for everyone).
+pub const Admit = enum { ok, server_full, client_refused };
+
 /// Shared with Server: global stream/task-handler/memory/handshake admission,
 /// the server's account (`accounts.zig` has the charge rule).
 ///
@@ -1186,13 +1192,20 @@ pub const GlobalAccounting = struct {
 
     // Every charge below walks the holder's list (`accounts.Charge`: the
     // client, then the aggregate) and the server's counter last, and undoes
-    // the list in reverse when the server refuses. Every release gives back
-    // the server's counter, then the list. The connection's own account is
-    // the caller's (the Session's stream count, `ConnBudget`, the
-    // connection's outbound budget), charged before these.
+    // the list in reverse when the server refuses. The list itself refuses
+    // a client over its share while the server's count is at the pressure
+    // mark (`accounts.Charge.add`, which reads the count passed here and
+    // undoes its own entries); then nothing is charged and the call returns
+    // the refusal. Every release gives back the server's counter, then the
+    // list. The connection's own account is the caller's (the Session's
+    // stream count, `ConnBudget`, the connection's outbound budget), charged
+    // before these, and undone by the caller on either refusal. Each
+    // refusal reaches the client as the server's own refusal of the same
+    // resource does: REFUSED_STREAM (streams, HTTP/2 task handlers), 503
+    // (HTTP/1.1), the per-stream shed (outbound bytes).
 
     pub fn tryAdmitStream(self: *GlobalAccounting, c: accounts.Charge) bool {
-        c.add(.streams, 1);
+        if (!c.add(.streams, 1, self.active_streams.load(.acquire))) return false;
         while (true) {
             const cur = self.active_streams.load(.acquire);
             if (cur >= self.max_streams) {
@@ -1209,7 +1222,7 @@ pub const GlobalAccounting = struct {
     }
 
     pub fn tryReserveTaskHandler(self: *GlobalAccounting, c: accounts.Charge) bool {
-        c.add(.task_handlers, 1);
+        if (!c.add(.task_handlers, 1, self.task_handlers.load(.acquire))) return false;
         while (true) {
             const cur = self.task_handlers.load(.acquire);
             if (cur >= self.task_handler_capacity) {
@@ -1227,7 +1240,7 @@ pub const GlobalAccounting = struct {
 
     pub fn tryReserveOutbound(self: *GlobalAccounting, c: accounts.Charge, n: usize) bool {
         if (n == 0) return true;
-        c.add(.outbound_bytes, n);
+        if (!c.add(.outbound_bytes, n, self.outbound_bytes.load(.acquire))) return false;
         while (true) {
             const cur = self.outbound_bytes.load(.acquire);
             if (cur > self.max_outbound_bytes or self.max_outbound_bytes - cur < n) {
@@ -1244,21 +1257,28 @@ pub const GlobalAccounting = struct {
         c.sub(.outbound_bytes, n);
     }
 
-    pub fn tryAdmitHandshake(self: *GlobalAccounting, c: accounts.Charge) bool {
-        c.add(.handshakes, 1);
+    /// A handshake slot. `.server_full` parks the accept loop until a slot
+    /// is released; `.client_refused` (the client over its share under
+    /// pressure) closes the connection, so one identity never parks the loop
+    /// for everyone.
+    pub fn tryAdmitHandshake(self: *GlobalAccounting, c: accounts.Charge) Admit {
+        if (!c.add(.handshakes, 1, self.active_handshakes.load(.seq_cst))) return .client_refused;
         while (true) {
             const cur = self.active_handshakes.load(.seq_cst);
             if (cur >= self.max_handshakes) {
                 c.sub(.handshakes, 1);
-                return false;
+                return .server_full;
             }
-            if (self.active_handshakes.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) == null) return true;
+            if (self.active_handshakes.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) == null) return .ok;
         }
     }
 
+    /// The client's count goes back first, as for a connection
+    /// (`Server.giveBackConnection` says why): a parked accept loop admits
+    /// once it sees the server's slot free.
     pub fn releaseHandshake(self: *GlobalAccounting, c: accounts.Charge) void {
-        self.saturatingRelease(&self.active_handshakes, 1, "active_handshakes", .seq_cst);
         c.sub(.handshakes, 1);
+        self.saturatingRelease(&self.active_handshakes, 1, "active_handshakes", .seq_cst);
         self.wakeAdmission();
     }
 
@@ -8899,7 +8919,9 @@ pub const Connection = struct {
         const pool = self.config.compression_pool orelse {
             return .{ .compress = false, .add_vary = add_vary };
         };
-        hctx.charge.add(.compression, 1);
+        // Over the client's share under pressure: identity encoding, as for
+        // a pool with no context free.
+        if (!hctx.charge.add(.compression, 1, pool.liveCount())) return .{ .compress = false, .add_vary = add_vary };
         const enc = pool.tryAcquire() orelse {
             hctx.charge.sub(.compression, 1);
             return .{ .compress = false, .add_vary = add_vary };

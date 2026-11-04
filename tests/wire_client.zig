@@ -158,6 +158,35 @@ pub const Wire = struct {
         return self;
     }
 
+    /// `connect` to the IPv6 loopback, `::1`, on a server endpoint bound
+    /// there: a second client identity on one host (127.0.0.1 and ::1 are
+    /// two clients to `accounts.keysFor`).
+    pub fn connectIp6(gpa: std.mem.Allocator, transport: Transport, port: u16) !*Wire {
+        const fd = std.c.socket(std.c.AF.INET6, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        errdefer _ = std.c.close(fd);
+        var addr: std.c.sockaddr.in6 = .{
+            .port = std.mem.nativeToBig(u16, port),
+            .flowinfo = 0,
+            .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+            .scope_id = 0,
+        };
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in6)) != 0) return error.Connect;
+        const tv: std.c.timeval = .{ .sec = 1, .usec = 0 };
+        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(std.c.timeval));
+        const self = try gpa.create(Wire);
+        self.* = .{ .gpa = gpa, .transport = transport, .fd = fd, .oracle = .init(gpa, transport == .tls) };
+        return self;
+    }
+
+    /// `open` over `connectIp6`.
+    pub fn openIp6(gpa: std.mem.Allocator, transport: Transport, port: u16) !*Wire {
+        const self = try connectIp6(gpa, transport, port);
+        errdefer self.close();
+        try self.handshake();
+        return self;
+    }
+
     pub fn close(self: *Wire) void {
         _ = std.c.close(self.fd);
         self.plain.deinit(self.gpa);

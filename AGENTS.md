@@ -168,6 +168,14 @@ see `tools/README.md`.
   orphan stays charged to its client. `Server.deinit` logs an error, which
   fails a test, for any record left charged. `./zb build test-accounts` is the
   gate.
+- A client charge can be refused: while the server's own count of a resource
+  is at its pressure mark (1/4 of the limit), a client past its share (1/8,
+  an IPv6 /48 aggregate 1/4) is refused (`accounts.Charge.add`, which takes
+  the server's count and undoes its own entries). Every caller passes the
+  server's count read before its own charge, and undoes the connection's
+  account on refusal. A test that drives a server-wide limit from the one
+  loopback client sets `client_identity = .none`, or the share refuses
+  first. `./zb build test-shares` is the gate.
 
 ## TLS and allocation traps
 

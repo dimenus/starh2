@@ -1,5 +1,10 @@
 //! Exact live gates — H2 frame parser, bounded result channel, cause taxonomy.
 //! No vacuous ors; >cap capacity wait; credit-exact WINDOW_UPDATE.
+//!
+//! Every endpoint here is `client_identity = .none` (t-3759 step 4): with the
+//! small limits these gates use, one loopback client's share is a single
+//! connection, and a serial reconnect could be refused by it while the
+//! previous connection is still counted.
 const std = @import("std");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
@@ -291,7 +296,7 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -431,7 +436,7 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -518,7 +523,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -579,7 +584,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -634,7 +639,7 @@ fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -709,7 +714,7 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -780,7 +785,7 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+        .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,

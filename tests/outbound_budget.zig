@@ -128,11 +128,14 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        // Every client of this file is the one loopback address, and these
+        // gates are about the server's own limits: `.none`, so no client
+        // share refuses first.
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } },
         .tls => {
             cert.* = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key.* = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
-            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } };
+            endpoint = .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } };
             tls_cfg = .{ .certificate_chain_pem = cert.*, .private_key_pem = key.* };
         },
     }
@@ -595,10 +598,13 @@ test "exit: a parked writer whose connection ends leaves the queue and the budge
 // ---------------------------------------------------------------------------
 // The server cap.
 
-/// Two connections; the server may hold what ONE connection's budget allows.
-/// The first connection fills it. The second connection's writer is refused by
-/// the server cap: its stream is reset (after the pump runs again), it is not
-/// parked and not left hanging.
+/// The server may hold what `server_cap_fillers` connections' budgets allow
+/// (a connection's budget is at most an eighth of the server's, checked at
+/// boot). Those connections fill it. One more connection's writer is refused
+/// by the server cap: its stream is reset (after the pump runs again), it is
+/// not parked and not left hanging.
+const server_cap_fillers = 8;
+
 fn runServerCap(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {
     resetGlobals(.{ 64 * 1024, 64 * 1024, 64 * 1024, 0, 0 });
     var cert: []u8 = &.{};
@@ -608,7 +614,8 @@ fn runServerCap(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
         gpa.free(key);
     }
     const budget = 2 * stream_cap;
-    var server = try serverFor(rt, gpa, transport, limitsFor(budget, budget), &cert, &key);
+    const server_budget = server_cap_fillers * budget;
+    var server = try serverFor(rt, gpa, transport, limitsFor(budget, server_budget), &cert, &key);
     defer server.deinit(gpa);
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
     var serving = true;
@@ -624,21 +631,25 @@ fn runServerCap(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
     const waits_0 = conn_mod.test_budget_waits.load(.monotonic);
     const full_0 = conn_mod.test_ctrl_terminal_full.load(.monotonic);
 
-    var first: Client = .{ .gpa = gpa, .transport = transport, .port = server.localAddress(0).getPort(), .n = 2 };
-    first.handlers[0] = 0;
-    first.handlers[1] = 1;
-    first.expect_end = 0b11;
+    var first: [server_cap_fillers]Client = undefined;
+    var t1: [server_cap_fillers]std.Thread = undefined;
+    for (&first, &t1) |*f, *t| {
+        f.* = .{ .gpa = gpa, .transport = transport, .port = server.localAddress(0).getPort(), .n = 2 };
+        f.handlers[0] = 0;
+        f.handlers[1] = 1;
+        f.expect_end = 0b11;
+        t.* = try std.Thread.spawn(.{}, clientMain, .{f});
+    }
     var second: Client = .{ .gpa = gpa, .transport = transport, .port = server.localAddress(0).getPort(), .n = 1 };
     second.handlers[0] = 2;
     second.expect_end = 0b1;
-    const t1 = try std.Thread.spawn(.{}, clientMain, .{&first});
     const t2 = try std.Thread.spawn(.{}, clientMain, .{&second});
 
-    try waitStarted(3);
+    try waitStarted(2 * server_cap_fillers + 1);
     wire_pump.test_hold_writes.store(true, .release);
     gates[0].store(true, .release);
     gates[1].store(true, .release);
-    try waitReserved(&server, budget);
+    try waitReserved(&server, server_budget);
     gates[2].store(true, .release);
     const Ctx = struct { n: u64 };
     try waitFor("the server cap to refuse the second connection's write", Ctx{ .n = refusals_0 }, struct {
@@ -648,13 +659,15 @@ fn runServerCap(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
     }.f);
     // Refused, not parked.
     try std.testing.expectEqual(waits_0, conn_mod.test_budget_waits.load(.monotonic));
-    try std.testing.expectEqual(budget, reserved(&server));
+    try std.testing.expectEqual(server_budget, reserved(&server));
 
     wire_pump.test_hold_writes.store(false, .release);
-    try joinClient(&first, t1);
+    for (&first, t1) |*f, t| try joinClient(f, t);
     try joinClient(&second, t2);
-    try std.testing.expect(first.ended[0] and first.ended[1]);
-    try std.testing.expectEqual(@as(usize, 0), first.resets);
+    for (&first) |*f| {
+        try std.testing.expect(f.ended[0] and f.ended[1]);
+        try std.testing.expectEqual(@as(usize, 0), f.resets);
+    }
     try std.testing.expect(second.reset_stream[0]);
     try std.testing.expectEqual(@as(usize, 0), second.got[0]);
     try std.testing.expect(!ended_ok[2].load(.acquire));

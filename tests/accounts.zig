@@ -1113,7 +1113,7 @@ fn tableFull(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var filled: usize = 0;
     defer for (fill[0..filled]) |f| rig.server.clients.release(f);
     while (filled < want) : (filled += 1) {
-        fill[filled] = (try rig.server.clients.acquire(&.{v4Key(.{ 10, 99, 0, @intCast(filled) })})) orelse return error.TableFullTooEarly;
+        fill[filled] = (try rig.server.clients.acquire(&.{v4Key(.{ 10, 99, 0, @intCast(filled) })}, 0)) orelse return error.TableFullTooEarly;
     }
     try std.testing.expectEqual(cap - 1, rig.server.clients.stats().live);
     const c = try proxyH2(addr, gpa, .{ .peer = .{ .ip6 = ip6("2001:db8:c::1") } }, "/hello");
@@ -1476,6 +1476,8 @@ const RaceKind = enum { connection, handshake, proxy_waiter };
 const TlsHello = struct {
     gpa: std.mem.Allocator,
     port: u16,
+    /// Connect from `::1` (an endpoint bound there) instead of 127.0.0.1.
+    ip6: bool = false,
     ok: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
 
@@ -1485,7 +1487,7 @@ const TlsHello = struct {
     }
 
     fn body(self: *TlsHello) !void {
-        const w = try wire_client.Wire.connect(self.gpa, .tls, self.port);
+        const w = if (self.ip6) try wire_client.Wire.connectIp6(self.gpa, .tls, self.port) else try wire_client.Wire.connect(self.gpa, .tls, self.port);
         defer w.close();
         // The kernel completed the connect; the server reads the handshake
         // only once it admits the connection, which can be after `Wire`'s
@@ -1516,9 +1518,20 @@ const Answer = struct {
     }
 };
 
+/// The two contenders come from two clients, 127.0.0.1 on endpoint 0 and
+/// ::1 on endpoint 1: one client would be over its share of the one slot
+/// under pressure (`accounts.Charge.add`), and its loser closed instead of
+/// losing the server's slot, which is the race these tests are about. PROXY
+/// endpoints name their sources in the header, so they stay on 127.0.0.1.
+fn raceAddrs(kind: RaceKind, ports: [2]u16) ![2]zio.net.IpAddress {
+    if (kind == .proxy_waiter) return .{ try zio.net.IpAddress.parseIp4("127.0.0.1", ports[0]), try zio.net.IpAddress.parseIp4("127.0.0.1", ports[1]) };
+    return .{ try zio.net.IpAddress.parseIp4("127.0.0.1", ports[0]), try zio.net.IpAddress.parseIp6("::1", ports[1]) };
+}
+
 fn raceCycle(kind: RaceKind, gpa: std.mem.Allocator, ports: [2]u16) !void {
-    const a0 = try zio.net.IpAddress.parseIp4("127.0.0.1", ports[0]);
-    const a1 = try zio.net.IpAddress.parseIp4("127.0.0.1", ports[1]);
+    const addrs = try raceAddrs(kind, ports);
+    const a0 = addrs[0];
+    const a1 = addrs[1];
     var hb: [64]u8 = undefined;
     // X takes the one slot.
     const x = try connect(a0);
@@ -1537,7 +1550,7 @@ fn raceCycle(kind: RaceKind, gpa: std.mem.Allocator, ports: [2]u16) !void {
     zio.sleep(.fromMilliseconds(20)) catch {};
     if (kind == .handshake) {
         var y: TlsHello = .{ .gpa = gpa, .port = ports[0] };
-        var z: TlsHello = .{ .gpa = gpa, .port = ports[1] };
+        var z: TlsHello = .{ .gpa = gpa, .port = ports[1], .ip6 = true };
         var hy = try zio.spawnBlocking(TlsHello.run, .{&y});
         var hz = try zio.spawnBlocking(TlsHello.run, .{&z});
         zio.sleep(.fromMilliseconds(30)) catch {};
@@ -1583,14 +1596,15 @@ fn admissionRace(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: RaceKind) !void
     var limits = testLimits();
     limits.preface_timeout_ns = 3 * std.time.ns_per_s;
     const ep4 = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const ep6 = try starh2.EndpointAddress.parseIp6("::1", 0);
     switch (kind) {
         .connection => {
             limits.max_connections = 1;
-            try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = .{ .address = ep4 } }, .{ .h2c_prior_knowledge = .{ .address = ep4 } } }, limits, false);
+            try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = .{ .address = ep4 } }, .{ .h2c_prior_knowledge = .{ .address = ep6 } } }, limits, false);
         },
         .handshake => {
             limits.concurrent_tls_handshakes = 1;
-            try rig.start(rt, gpa, &.{ .{ .tls = .{ .address = ep4 } }, .{ .tls = .{ .address = ep4 } } }, limits, true);
+            try rig.start(rt, gpa, &.{ .{ .tls = .{ .address = ep4 } }, .{ .tls = .{ .address = ep6 } } }, limits, true);
         },
         .proxy_waiter => {
             limits.proxy_header_waiters = 1;
@@ -1614,8 +1628,9 @@ fn admissionRace(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: RaceKind) !void
     // The cancel path: stop while a loser is parked holding its stream.
     release.store(false, .release);
     started.store(0, .release);
-    const a0 = try zio.net.IpAddress.parseIp4("127.0.0.1", ports[0]);
-    const a1 = try zio.net.IpAddress.parseIp4("127.0.0.1", ports[1]);
+    const addrs = try raceAddrs(kind, ports);
+    const a0 = addrs[0];
+    const a1 = addrs[1];
     var parked_losers: usize = 0;
     var tries: usize = 0;
     while (parked_losers == 0 and tries < 60) : (tries += 1) {

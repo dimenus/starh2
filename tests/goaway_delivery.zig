@@ -2412,12 +2412,14 @@ const H1Exchange = struct {
     }
 };
 
+/// The 503 cases for request memory on HTTP/1.1 (a request whose copy, or a
+/// complete handler whose allocation, the memory refuses) are in
+/// `tests/shares.zig`: there the client's share refuses. The connection's own
+/// cap can no longer refuse on HTTP/1.1, which runs one request per
+/// connection: a request's cap is at most its connection's (`Limits`
+/// nesting), so the request's own cap (500) always comes first.
 const H1Refusal = enum {
     task_bound,
-    connection_memory,
-    /// A complete handler whose own allocation the connection's request
-    /// memory refuses: 503, as for a task handler (round 1, astra).
-    complete_connection_memory,
     /// A complete handler whose allocation passes its request's own cap:
     /// 500.
     complete_request_cap,
@@ -2451,11 +2453,13 @@ fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void
             limits.max_streams_per_server = 1;
             @field(limits, "cancellation_reaper_jobs") = 1;
         },
-        .connection_memory, .complete_connection_memory => limits.request_bytes_per_connection = try limits.firstBlockBytes(),
         .complete_request_cap => {},
     }
     var server = try starh2.Server.init(gpa, io, .{
-        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
+        // The server's own bounds, from the one loopback client: `.none`, so
+        // no client share refuses first (a task-handler bound of 1 is also a
+        // share of 1).
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } }},
         .routes = &routes,
         .tls = null,
         .limits = limits,
@@ -2495,41 +2499,17 @@ fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void
             try std.testing.expect(std.mem.startsWith(u8, second.text(), "HTTP/1.1 503"));
             try std.testing.expect(std.mem.indexOf(u8, second.text(), "connection: close") != null);
         },
-        .connection_memory => {
+        .complete_request_cap => {
             h1r_hold.store(false, .release);
-            // A body that fits `request_body_bytes` but not, with its first
-            // block, the connection's request memory.
-            const body_len = 100 * 1024;
-            const body = try gpa.alloc(u8, body_len);
-            defer gpa.free(body);
-            @memset(body, 'b');
-            const head = try std.fmt.allocPrint(gpa, "POST /hold HTTP/1.1\r\nHost: localhost\r\ncontent-length: {d}\r\n\r\n", .{body_len});
-            defer gpa.free(head);
-            const req = try std.mem.concat(gpa, u8, &.{ head, body });
-            defer gpa.free(req);
-            var c: H1Exchange = .{ .port = port, .req = req, .want = "connection: close\r\n\r\n" };
-            const t = try std.Thread.spawn(.{}, H1Exchange.main, .{&c});
-            while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-            t.join();
-            if (c.err) |err| return err;
-            std.debug.print("h1 refusal connection_memory: {s}\n", .{c.text()});
-            try std.testing.expect(std.mem.startsWith(u8, c.text(), "HTTP/1.1 503"));
-            try std.testing.expect(std.mem.indexOf(u8, c.text(), "connection: close") != null);
-            try std.testing.expectEqual(@as(usize, 0), h1r_running.load(.acquire));
-        },
-        .complete_connection_memory, .complete_request_cap => {
-            h1r_hold.store(false, .release);
-            // 100 KiB needs a second block the connection's memory cannot
-            // charge; twice the request's own cap no block class holds.
-            h1r_alloc = if (kind == .complete_connection_memory) 100 * 1024 else 2 * limits.request_arena_bytes;
+            // Twice the request's own cap: no block class holds it.
+            h1r_alloc = 2 * limits.request_arena_bytes;
             var c: H1Exchange = .{ .port = port, .req = "GET /alloc HTTP/1.1\r\nHost: localhost\r\n\r\n", .want = "connection: close\r\n\r\n" };
             const t = try std.Thread.spawn(.{}, H1Exchange.main, .{&c});
             while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
             t.join();
             if (c.err) |err| return err;
             std.debug.print("h1 refusal {s}: {s}\n", .{ @tagName(kind), c.text() });
-            const want = if (kind == .complete_connection_memory) "HTTP/1.1 503" else "HTTP/1.1 500";
-            try std.testing.expect(std.mem.startsWith(u8, c.text(), want));
+            try std.testing.expect(std.mem.startsWith(u8, c.text(), "HTTP/1.1 500"));
         },
     }
 }
@@ -2545,12 +2525,6 @@ fn h1RefusalCase(kind: H1Refusal) !void {
 
 test "h1 refusal: a task request past the task-handler bound is answered 503 and closed (t-3759)" {
     try h1RefusalCase(.task_bound);
-}
-test "h1 refusal: a request the connection's request memory cannot hold is answered 503 and closed (t-3759)" {
-    try h1RefusalCase(.connection_memory);
-}
-test "h1 refusal: a complete handler the connection's request memory refuses answers 503 (t-3759 round 1)" {
-    try h1RefusalCase(.complete_connection_memory);
 }
 test "h1 refusal: a complete handler over its request's own cap answers 500 (t-3759 round 1)" {
     try h1RefusalCase(.complete_request_cap);

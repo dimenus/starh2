@@ -14,9 +14,33 @@
 //!
 //! - A charge walks its list in order and the server's counter last; when the
 //!   server refuses, the walk is undone in reverse (`Charge.add` then
-//!   `Charge.sub`). A client account never refuses in this step: shares under
-//!   pressure are a later step, and they go in `Charge.add`, which then
-//!   returns whether it took the charge.
+//!   `Charge.sub`). A client account refuses too (shares, below): then
+//!   `Charge.add` undoes its own earlier entries and returns false, and the
+//!   caller undoes the connection's.
+//!
+//! # Shares under pressure
+//!
+//! For every resource the server has a limit L (`Shares.init`). Its pressure
+//! mark is L/4 of the server's use, read from the server's own counter, which
+//! the caller passes to `Charge.add` (`server_use`, read before the server's
+//! own charge). A client's share is L/8, an IPv6 aggregate's L/4; both round
+//! up, so no share is zero. Below the mark nothing is refused by share. At or
+//! above it, a charge that would take a client (or an aggregate) past its
+//! share is refused: the count is a bounded compare-and-swap, so the share
+//! itself is exact; only the mark is check-then-reserve (concurrent
+//! admissions can pass it by the number in flight, a byte charge by its own
+//! size).
+//!
+//! So one identity alone holds at most its cap, L/4 (it reaches the mark
+//! itself, and is then over its share), and a second identity is still
+//! admitted up to a full share. What this does not do, said plainly: it does
+//! not take back what an identity holds, and once one identity has pushed
+//! the server to the mark every other identity is held to its share for new
+//! work, even with 3/4 of the server free (a crowd behind one NAT is refused
+//! at that point). A refusal is counted per resource
+//! (`Table.share_refusals`) and logged at most once a second, naming the
+//! identity, its part of the server's use and the endpoint's mode
+//! (`Table.noteRefused`).
 //! - Release walks the same list. When a connection ends, its own charge is
 //!   released and the rest stay: an orphan handler's request bytes, its
 //!   task-handler token and its compression context stay charged to its
@@ -177,6 +201,33 @@ pub fn infrastructureKey(endpoint_index: u16) Key {
 /// Client, then aggregate. A route account is a later step.
 pub const max_refs = 2;
 
+/// One resource's share rule (see the file header).
+pub const Share = struct {
+    /// The most one client may hold of the resource while the server's use
+    /// is at or above `mark`: L/8, rounded up.
+    client: usize,
+    /// The same for an IPv6 aggregate: L/4, rounded up, so one /48 caps at
+    /// what one address caps at.
+    aggregate: usize,
+    /// The server's use at which shares apply: L/4, rounded up.
+    mark: usize,
+
+    pub fn of(server_limit: usize) Share {
+        return .{
+            .client = std.math.divCeil(usize, server_limit, 8) catch unreachable,
+            .aggregate = std.math.divCeil(usize, server_limit, 4) catch unreachable,
+            .mark = std.math.divCeil(usize, server_limit, 4) catch unreachable,
+        };
+    }
+};
+
+/// The share of every resource, from the server's limits (`Limits.shares`).
+pub const Shares = [resource_count]Share;
+
+/// Shares whose mark no use reaches: nothing is refused by share. For the
+/// unit tests and the child-process cases that build a table by hand.
+pub const unlimited: Shares = @splat(Share.of(std.math.maxInt(usize)));
+
 /// One record held by one party: its index in the slab, and the generation
 /// it had when the reference was taken.
 pub const Ref = struct {
@@ -191,8 +242,12 @@ pub const Ref = struct {
 /// copy is valid exactly as long as that holder keeps them.
 pub const Charge = struct {
     table: ?*Table = null,
+    /// The client first, then (IPv6) its aggregate: `keysFor`'s order, which
+    /// is how `add` tells which share applies.
     refs: [max_refs]Ref = undefined,
     len: u8 = 0,
+    /// The endpoint the holder came in on, for the refusal log line.
+    endpoint: u16 = 0,
 
     /// No client account: `.none` endpoints, and the unit tests that build a
     /// connection by hand.
@@ -202,15 +257,41 @@ pub const Charge = struct {
         return self.refs[0..self.len];
     }
 
-    /// Charge `n` of `res` to every account on the list, in order. Cannot
-    /// refuse in this step (see the file header).
-    pub fn add(self: Charge, res: Resource, n: usize) void {
-        if (self.len == 0 or n == 0) return;
+    /// Charge `n` of `res` to every account on the list, in order, each a
+    /// bounded compare-and-swap. `server_use` is the server's own count of
+    /// `res` now, before its own charge: at or above the resource's mark, an
+    /// account that would pass its share refuses. Then the entries this call
+    /// already charged are undone in reverse, the refusal is counted and
+    /// logged, and the result is false: the caller undoes the connection's
+    /// account and refuses. True when every account took it.
+    pub fn add(self: Charge, res: Resource, n: usize, server_use: usize) bool {
+        if (self.len == 0 or n == 0) return true;
         const t = self.table.?;
-        for (self.refs[0..self.len]) |r| {
+        const share = t.shares[@intFromEnum(res)];
+        const pressure = server_use >= share.mark;
+        // Which entries this call charged, so the undo skips one a stale
+        // reference made it skip.
+        var took: [max_refs]bool = @splat(false);
+        for (self.refs[0..self.len], 0..) |r, i| {
             const rec = t.record(r) orelse continue;
-            t.addAt(rec, r, res, n);
+            const bound: ?usize = if (!pressure) null else if (i == 0) share.client else share.aggregate;
+            switch (t.addAt(rec, r, res, n, bound)) {
+                .took => took[i] = true,
+                .stale => {},
+                .refused => |held| {
+                    var j = i;
+                    while (j > 0) {
+                        j -= 1;
+                        if (!took[j]) continue;
+                        const back = t.record(self.refs[j]) orelse continue;
+                        t.subAt(back, self.refs[j], res, n);
+                    }
+                    t.noteRefused(res, rec, held, server_use, self.endpoint);
+                    return false;
+                },
+            }
         }
+        return true;
     }
 
     /// Release `n` of `res` from every account on the list, in reverse.
@@ -319,11 +400,32 @@ pub const Table = struct {
     insert_failures: std.atomic.Value(u64) = .init(0),
     underflows: std.atomic.Value(u64) = .init(0),
     stale: std.atomic.Value(u64) = .init(0),
+    /// Read only after `init`.
+    shares: Shares,
+    /// Charges refused by share under pressure, per resource (`Charge.add`).
+    share_refusals: [resource_count]std.atomic.Value(u64) = @splat(.init(0)),
+    /// What the refusal line says about each endpoint (`setEndpointLabel`).
+    labels: [max_labels]Label = @splat(.{}),
+    refusal_log: RateLimitedLine = .{},
+
+    pub const max_labels = 64;
+
+    /// "endpoint 0 (h2c_prior_knowledge) client_identity=.peer", written by
+    /// the server at boot.
+    pub const Label = struct {
+        buf: [80]u8 = undefined,
+        len: u8 = 0,
+
+        pub fn text(self: *const Label) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
 
     /// `capacity` records, an index of at least twice as many entries, and a
     /// hash keyed by `seed` (the server draws it at boot, so a client cannot
-    /// pick keys that collide in a known pattern).
-    pub fn init(gpa: std.mem.Allocator, capacity: usize, seed: u64) error{OutOfMemory}!Table {
+    /// pick keys that collide in a known pattern). `shares` from the
+    /// server's limits (`Limits.shares`).
+    pub fn init(gpa: std.mem.Allocator, capacity: usize, seed: u64, shares: Shares) error{OutOfMemory}!Table {
         std.debug.assert(capacity > 0 and capacity < std.math.maxInt(u32));
         const records = try gpa.alloc(Record, capacity);
         errdefer gpa.free(records);
@@ -342,7 +444,34 @@ pub const Table = struct {
             .free = free,
             .free_len = capacity,
             .seed = seed,
+            .shares = shares,
         };
+    }
+
+    /// The text the refusal line uses for endpoint `i`. Boot only, before
+    /// any connection.
+    pub fn setEndpointLabel(self: *Table, i: usize, comptime fmt: []const u8, args: anytype) void {
+        std.debug.assert(i < max_labels);
+        const l = &self.labels[i];
+        // A label too long for the buffer is cut, never refused: it is text
+        // for a log line.
+        const written: []u8 = std.fmt.bufPrint(&l.buf, fmt, args) catch @as([]u8, &l.buf);
+        l.len = @intCast(written.len);
+    }
+
+    /// A charge refused by share (`Charge.add`): counted, and one warn line
+    /// at most a second for the whole server, naming the identity, what it
+    /// holds as a part of the server's use, and the endpoint. Lock-free: the
+    /// record is the refused holder's own, so its key does not change.
+    pub fn noteRefused(self: *Table, res: Resource, rec: *const Record, held: usize, server_use: usize, endpoint: u16) void {
+        _ = self.share_refusals[@intFromEnum(res)].fetchAdd(1, .monotonic);
+        const pct = if (server_use == 0) 0 else held * 100 / server_use;
+        const label: []const u8 = if (endpoint < max_labels) self.labels[endpoint].text() else "endpoint ?";
+        self.refusal_log.note("refused {f}: {d}% of {s} ({d} of the server's {d}, over its share under pressure), {s}", .{ fmtKey(rec.key), pct, @tagName(res), held, server_use, label });
+    }
+
+    pub fn shareRefusals(self: *const Table, res: Resource) u64 {
+        return self.share_refusals[@intFromEnum(res)].load(.acquire);
     }
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
@@ -365,10 +494,12 @@ pub const Table = struct {
     /// under one hold of the lock. Null when the slab cannot hold a new key:
     /// the references already taken are given back, the failure is counted,
     /// and the caller refuses the connection. Cancelable: the accept loop
-    /// calls it, and a cancel there is the server stopping.
-    pub fn acquire(self: *Table, keys: []const Key) std.Io.Cancelable!?Charge {
+    /// calls it, and a cancel there is the server stopping. `endpoint` is
+    /// the index of the endpoint the connection came in on (the refusal
+    /// line names it).
+    pub fn acquire(self: *Table, keys: []const Key, endpoint: u16) std.Io.Cancelable!?Charge {
         std.debug.assert(keys.len <= max_refs);
-        var c: Charge = .{ .table = self };
+        var c: Charge = .{ .table = self, .endpoint = endpoint };
         if (keys.len == 0) return .none;
         try self.mu.lock();
         defer self.mu.unlock();
@@ -529,14 +660,42 @@ pub const Table = struct {
     /// add landed on whatever the record holds now: it is taken back and
     /// counted (`stale`). Public so a test can order an acquire between the
     /// check and this step.
-    pub fn addAt(self: *Table, rec: *Record, r: Ref, res: Resource, n: usize) void {
+    ///
+    /// `bound`, when not null, is the share: the add is a compare-and-swap
+    /// that refuses when the count would pass it, and returns the count it
+    /// found. A refusal is checked against the generation too, so a stale
+    /// reference is never refused on another key's count.
+    pub fn addAt(self: *Table, rec: *Record, r: Ref, res: Resource, n: usize, bound: ?usize) AddResult {
         const c = &rec.counts[@intFromEnum(res)];
-        _ = c.fetchAdd(n, .seq_cst);
+        if (bound) |b| {
+            var cur = c.load(.seq_cst);
+            while (true) {
+                if (cur > b or b - cur < n) {
+                    const g = Record.generationOf(rec.word.load(.seq_cst));
+                    if (g == r.generation) return .{ .refused = cur };
+                    self.noteStale(r, g);
+                    return .stale;
+                }
+                cur = c.cmpxchgWeak(cur, cur + n, .seq_cst, .seq_cst) orelse break;
+            }
+        } else {
+            _ = c.fetchAdd(n, .seq_cst);
+        }
         const g = Record.generationOf(rec.word.load(.seq_cst));
-        if (g == r.generation) return;
+        if (g == r.generation) return .took;
         _ = c.fetchSub(n, .seq_cst);
         self.noteStale(r, g);
+        return .stale;
     }
+
+    pub const AddResult = union(enum) {
+        took,
+        /// The reference was stale (counted): nothing is charged, and the
+        /// caller skips this record, as for a failed `record`.
+        stale,
+        /// Over the share under pressure: the count found.
+        refused: usize,
+    };
 
     /// `Charge.sub`'s step after the check: subtract unless it would go below
     /// zero, then read the generation again. A stale subtraction is put back
@@ -750,6 +909,30 @@ pub const Table = struct {
 
 const log = std.log.scoped(.starh2);
 
+/// One warn line at most a second, with the count of the ones held back: a
+/// client that is refused under an attack must not become a flood of lines.
+pub const RateLimitedLine = struct {
+    last_ns: std.atomic.Value(u64) = .init(0),
+    held: std.atomic.Value(u64) = .init(0),
+
+    const interval_ns = std.time.ns_per_s;
+
+    pub fn note(self: *RateLimitedLine, comptime fmt: []const u8, args: anytype) void {
+        const now = zio.Timestamp.now(.monotonic).toNanoseconds();
+        const last = self.last_ns.load(.monotonic);
+        if (last != 0 and now -% last < interval_ns) {
+            _ = self.held.fetchAdd(1, .monotonic);
+            return;
+        }
+        if (self.last_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) {
+            _ = self.held.fetchAdd(1, .monotonic);
+            return;
+        }
+        const held = self.held.swap(0, .monotonic);
+        log.warn(fmt ++ " ({d} more since the last report)", args ++ .{held});
+    }
+};
+
 pub fn fmtKey(k: Key) std.fmt.Alt(Key, formatKey) {
     return .{ .data = k };
 }
@@ -809,17 +992,17 @@ test "keysFor: IPv4 per address, IPv6 by /64 plus the aggregate prefix" {
 
 test "Table: one record per key, removed with its last reference, reused with a new generation" {
     const gpa = std.testing.allocator;
-    var t = try Table.init(gpa, 4, 0x1234);
+    var t = try Table.init(gpa, 4, 0x1234, unlimited);
     defer t.deinit(gpa);
     var out: [max_refs]Key = undefined;
     const k = keysFor(.{ .ip4 = .{ 1, 2, 3, 4 } }, 48, &out);
-    const c1 = (try t.acquire(k)).?;
-    const c2 = (try t.acquire(k)).?;
+    const c1 = (try t.acquire(k, 0)).?;
+    const c2 = (try t.acquire(k, 0)).?;
     try std.testing.expectEqual(c1.refs[0].index, c2.refs[0].index);
     try std.testing.expectEqual(@as(u32, 2), t.lookup(k[0]).?.holders);
     t.retain(c1);
     try std.testing.expectEqual(@as(u32, 3), t.lookup(k[0]).?.holders);
-    c1.add(.streams, 3);
+    try std.testing.expect(c1.add(.streams, 3, 0));
     c2.sub(.streams, 3);
     t.release(c1);
     t.release(c2);
@@ -830,7 +1013,7 @@ test "Table: one record per key, removed with its last reference, reused with a 
     // The same record comes back for the next key, one generation on.
     var out2: [max_refs]Key = undefined;
     const k2 = keysFor(.{ .ip4 = .{ 5, 6, 7, 8 } }, 48, &out2);
-    const c3 = (try t.acquire(k2)).?;
+    const c3 = (try t.acquire(k2, 0)).?;
     try std.testing.expectEqual(c1.refs[0].index, c3.refs[0].index);
     try std.testing.expectEqual(g1 + 1, c3.refs[0].generation);
     t.release(c3);
@@ -841,18 +1024,53 @@ test "Table: one record per key, removed with its last reference, reused with a 
     try std.testing.expect(t.checkEmpty());
 }
 
+test "Charge.add: shares apply only at the mark; an aggregate's refusal undoes the client's charge" {
+    const gpa = std.testing.allocator;
+    var shares: Shares = unlimited;
+    // L = 16: client share 2, aggregate share 4, mark 4.
+    shares[@intFromEnum(Resource.streams)] = .of(16);
+    var t = try Table.init(gpa, 8, 3, shares);
+    defer t.deinit(gpa);
+    var o1: [max_refs]Key = undefined;
+    var o2: [max_refs]Key = undefined;
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
+    var b = a;
+    b[7] = 2; // another /64 in the same /48
+    const ca = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1), 0)).?;
+    const cb = (try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2), 0)).?;
+    // Below the mark nothing is refused, past any share.
+    for (0..3) |_| try std.testing.expect(ca.add(.streams, 1, 0));
+    // At the mark: /64 a holds 3 > its share.
+    try std.testing.expect(!ca.add(.streams, 1, 4));
+    // /64 b has room in its share, but the aggregate holds 3 of 4: one more
+    // fits, the next is refused by the aggregate and b's charge is undone.
+    try std.testing.expect(cb.add(.streams, 1, 4));
+    try std.testing.expect(!cb.add(.streams, 1, 5));
+    try std.testing.expectEqual(@as(usize, 1), t.lookup(o2[0]).?.count(.streams));
+    try std.testing.expectEqual(@as(usize, 4), t.lookup(o1[1]).?.count(.streams));
+    try std.testing.expectEqual(@as(u64, 2), t.shareRefusals(.streams));
+    // A byte-sized charge is refused when it would pass the share, not
+    // only when the share is already passed.
+    try std.testing.expect(!cb.add(.streams, 2, 4));
+    for (0..3) |_| ca.sub(.streams, 1);
+    cb.sub(.streams, 1);
+    t.release(ca);
+    t.release(cb);
+    try std.testing.expect(t.checkEmpty());
+}
+
 test "Table: a full slab refuses the insert and gives back what it took" {
     const gpa = std.testing.allocator;
-    var t = try Table.init(gpa, 2, 7);
+    var t = try Table.init(gpa, 2, 7, unlimited);
     defer t.deinit(gpa);
     var o1: [max_refs]Key = undefined;
     const a: [16]u8 = .{ 0x20, 0x01, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
     // Two records: the /64 and the /48.
-    const c1 = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1))).?;
+    const c1 = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1), 0)).?;
     var o2: [max_refs]Key = undefined;
     var b = a;
     b[7] = 2; // same /48, a new /64: the slab is full
-    try std.testing.expect((try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2))) == null);
+    try std.testing.expect((try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2), 0)) == null);
     try std.testing.expectEqual(@as(u32, 1), t.lookup(o1[1]).?.holders);
     try std.testing.expectEqual(@as(u64, 1), t.stats().insert_failures);
     t.release(c1);
@@ -862,14 +1080,14 @@ test "Table: a full slab refuses the insert and gives back what it took" {
 test "Table: backward-shift deletion keeps every remaining key reachable" {
     const gpa = std.testing.allocator;
     // A small index and many keys, so probe chains wrap and overlap.
-    var t = try Table.init(gpa, 24, 99);
+    var t = try Table.init(gpa, 24, 99, unlimited);
     defer t.deinit(gpa);
     var charges: [24]Charge = undefined;
     var keys: [24]Key = undefined;
     for (&charges, &keys, 0..) |*c, *k, i| {
         var o: [max_refs]Key = undefined;
         k.* = keysFor(.{ .ip4 = .{ 10, 0, @intCast(i / 256), @intCast(i % 256) } }, 48, &o)[0];
-        c.* = (try t.acquire(&.{k.*})).?;
+        c.* = (try t.acquire(&.{k.*}, 0)).?;
     }
     // Remove every third, then check every other is still found.
     var gone: [24]bool = @splat(false);

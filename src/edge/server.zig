@@ -462,8 +462,12 @@ pub const Server = struct {
         // Keyed at boot, so a client cannot aim keys at one probe chain.
         var seed: u64 = undefined;
         zio.random(std.mem.asBytes(&seed));
-        var clients = try accounts.Table.init(gpa, config.limits.clientTableRecords() catch return error.InvalidConfig, seed);
+        var clients = try accounts.Table.init(gpa, config.limits.clientTableRecords() catch return error.InvalidConfig, seed, config.limits.shares());
         errdefer clients.deinit(gpa);
+        if (endpoints.len > accounts.Table.max_labels) return error.InvalidConfig;
+        for (endpoints, 0..) |ep, i| {
+            clients.setEndpointLabel(i, "endpoint {d} ({s}) client_identity=.{s}", .{ i, @tagName(ep), @tagName(ep.clientIdentity()) });
+        }
 
         var self: Server = .{
             .gpa = gpa,
@@ -734,15 +738,17 @@ pub const Server = struct {
     }
 
     /// The connection's charge: its client accounts (`c`), then the server.
-    fn tryAdmitConnection(self: *Server, c: accounts.Charge) bool {
-        c.add(.connections, 1);
+    /// `.client_refused` when the client is over its share under pressure
+    /// (`accounts.Charge.add`): the caller closes the connection.
+    fn tryAdmitConnection(self: *Server, c: accounts.Charge) connection.Admit {
+        if (!c.add(.connections, 1, self.active_connections.load(.seq_cst))) return .client_refused;
         while (true) {
             const current = self.active_connections.load(.seq_cst);
             if (current >= self.limits.max_connections) {
                 c.sub(.connections, 1);
-                return false;
+                return .server_full;
             }
-            if (self.active_connections.cmpxchgWeak(current, current + 1, .seq_cst, .seq_cst) == null) return true;
+            if (self.active_connections.cmpxchgWeak(current, current + 1, .seq_cst, .seq_cst) == null) return .ok;
         }
     }
 
@@ -755,9 +761,15 @@ pub const Server = struct {
     /// `admission_mu` (`admitAccepted` inside `awaitAdmission`'s loop):
     /// `wakeAdmission` takes that mutex, which is not recursive, so the
     /// accept loop would wait on itself for ever, uncancelably.
+    ///
+    /// The client's count goes back before the server's, the reverse of the
+    /// other releases. An accept loop admits only once it sees the server's
+    /// slot free (`admissionRoom`), so by then the client's count must
+    /// already be down: the other way round, a client that reconnects at
+    /// once is refused by its share for the connection it just ended.
     fn giveBackConnection(self: *Server, c: accounts.Charge) void {
-        self.accounting.saturatingRelease(&self.active_connections, 1, "active_connections", .seq_cst);
         c.sub(.connections, 1);
+        self.accounting.saturatingRelease(&self.active_connections, 1, "active_connections", .seq_cst);
     }
 
     fn tryAdmitProxyWaiter(self: *Server) bool {
@@ -794,64 +806,82 @@ pub const Server = struct {
 
     /// Every limit an accept on this endpoint must pass has room. Checked
     /// before `accept`, so a full server leaves new connections in the
-    /// kernel's listen queue.
-    fn admissionRoom(self: *Server, a: Admission, locked: bool) bool {
+    /// kernel's listen queue. Never `.client_refused`: no client is known
+    /// before the accept.
+    fn admissionRoom(self: *Server, a: Admission, locked: bool) connection.Admit {
         _ = locked;
-        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) return false;
-        if (a.proxied) return self.proxy_waiters.load(.seq_cst) < self.limits.proxy_header_waiters;
-        if (a.mode == .tls and self.accounting.active_handshakes.load(.seq_cst) >= self.accounting.max_handshakes) return false;
-        return true;
+        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) return .server_full;
+        if (a.proxied) return if (self.proxy_waiters.load(.seq_cst) < self.limits.proxy_header_waiters) .ok else .server_full;
+        if (a.mode == .tls and self.accounting.active_handshakes.load(.seq_cst) >= self.accounting.max_handshakes) return .server_full;
+        return .ok;
     }
 
     /// Take the connection slot and the second slot `admissionRoom` names:
-    /// all or none.
-    fn admitAccepted(self: *Server, a: Admission, locked: bool) bool {
-        const ok = admit: {
-            if (!self.tryAdmitConnection(a.charge)) break :admit false;
+    /// all or none. A full server parks the loop; a client over its share
+    /// under pressure, on either slot, is refused (the caller closes it).
+    fn admitAccepted(self: *Server, a: Admission, locked: bool) connection.Admit {
+        const got: connection.Admit = admit: {
+            const conn = self.tryAdmitConnection(a.charge);
+            if (conn != .ok) break :admit conn;
             if (a.proxied) {
-                if (self.tryAdmitProxyWaiter()) break :admit true;
+                if (self.tryAdmitProxyWaiter()) break :admit .ok;
                 self.undoConnection(a.charge, locked);
-                break :admit false;
+                break :admit .server_full;
             }
-            if (a.mode == .tls and !self.accounting.tryAdmitHandshake(a.charge)) {
-                self.undoConnection(a.charge, locked);
-                break :admit false;
+            if (a.mode == .tls) {
+                const hs = self.accounting.tryAdmitHandshake(a.charge);
+                if (hs != .ok) {
+                    self.undoConnection(a.charge, locked);
+                    break :admit hs;
+                }
             }
-            break :admit true;
+            break :admit .ok;
         };
-        if (!ok and comptime connection.test_observe) _ = test_admit_refused.fetchAdd(1, .monotonic);
-        return ok;
+        if (got == .server_full and comptime connection.test_observe) _ = test_admit_refused.fetchAdd(1, .monotonic);
+        return got;
     }
 
     /// A proxied TLS connection past its header: its handshake slot.
-    fn admitHandshake(self: *Server, a: Admission, locked: bool) bool {
+    fn admitHandshake(self: *Server, a: Admission, locked: bool) connection.Admit {
         _ = locked;
         return self.accounting.tryAdmitHandshake(a.charge);
     }
 
-    fn awaitHandshakeSlot(self: *Server, a: Admission) std.Io.Cancelable!void {
+    fn awaitHandshakeSlot(self: *Server, a: Admission) std.Io.Cancelable!bool {
         return self.awaitAdmission(a, admitHandshake);
     }
 
-    /// Park until `ready` holds. A release of any admission slot wakes it
-    /// (`GlobalAccounting.wakeAdmission`); the ordering argument is on
-    /// `GlobalAccounting.admission_waiters`. Server stop cancels the accept
-    /// group, which ends the wait with `error.Canceled`. `ready` is told
-    /// whether it runs under `admission_mu`, so an undo inside it does not
-    /// take the mutex again.
+    /// Park while `ready` finds the server full. A release of any admission
+    /// slot wakes it (`GlobalAccounting.wakeAdmission`); the ordering
+    /// argument is on `GlobalAccounting.admission_waiters`. Server stop
+    /// cancels the accept group, which ends the wait with `error.Canceled`.
+    /// `ready` is told whether it runs under `admission_mu`, so an undo
+    /// inside it does not take the mutex again. True when admitted; false
+    /// when `ready` refused the client (over its share under pressure), which
+    /// never waits: one identity must not park the loop for everyone.
     fn awaitAdmission(
         self: *Server,
         a: Admission,
-        comptime ready: fn (*Server, Admission, bool) bool,
-    ) std.Io.Cancelable!void {
-        if (ready(self, a, false)) return;
+        comptime ready: fn (*Server, Admission, bool) connection.Admit,
+    ) std.Io.Cancelable!bool {
+        switch (ready(self, a, false)) {
+            .ok => return true,
+            .client_refused => return false,
+            .server_full => {},
+        }
         const acct = &self.accounting;
         try acct.admission_mu.lock();
         defer acct.admission_mu.unlock();
         _ = acct.admission_waiters.fetchAdd(1, .seq_cst);
         defer _ = acct.admission_waiters.fetchSub(1, .seq_cst);
         if (comptime connection.test_observe) _ = test_admission_waits.fetchAdd(1, .monotonic);
-        while (!ready(self, a, true)) try acct.admission_cond.wait(&acct.admission_mu);
+        while (true) {
+            switch (ready(self, a, true)) {
+                .ok => return true,
+                .client_refused => return false,
+                .server_full => try acct.admission_cond.wait(&acct.admission_mu),
+            }
+        }
     }
 
     /// `slot` is null exactly for h1c, which keeps its own buffers.
@@ -936,21 +966,33 @@ pub const Server = struct {
         // the server's in `connEntry`. `.none` (behind a pooling proxy) keys
         // nothing: the header only strips and names.
         const charge: accounts.Charge = switch (self.endpoints[endpoint_index].clientIdentity()) {
-            .proxy_source => (self.clients.acquire(keys) catch return error.Canceled) orelse return error.Failed,
+            .proxy_source => (self.clients.acquire(keys, @intCast(endpoint_index)) catch return error.Canceled) orelse return error.Failed,
             .none => .none,
             // A boot error (`PeerIdentityBehindProxyProtocol`).
             .peer => unreachable,
         };
-        charge.add(.connections, 1);
+        // The server's count already holds this connection (taken at
+        // accept), so its use before this connection is one less: the same
+        // reading the plain path makes before its server charge.
+        if (!charge.add(.connections, 1, self.active_connections.load(.seq_cst) -| 1)) {
+            // Over its share under pressure: closed after the header. The
+            // server's slot goes back in `connEntry` (its charge is still
+            // `.none`, so no client count is given back there).
+            self.clients.release(charge);
+            return error.Failed;
+        }
         cfg.charge = charge;
         if (cfg.mode != .tls) return;
         const a: Admission = .{ .mode = .tls, .proxied = true, .charge = charge };
-        zio.withTimeout(.{ .deadline = .fromNanoseconds(deadline_ns) }, awaitHandshakeSlot, .{ self, a }) catch |err| {
+        const admitted = zio.withTimeout(.{ .deadline = .fromNanoseconds(deadline_ns) }, awaitHandshakeSlot, .{ self, a }) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             _ = self.proxy_header_failures.fetchAdd(1, .monotonic);
             self.proxy_log.note("connection from {f} (PROXY) found no TLS handshake slot by the preface deadline; closed", .{fmtPeer(cfg.peer)});
             return error.Failed;
         };
+        // Over its handshake share under pressure: closed (`Charge.add`
+        // counted and logged it).
+        if (!admitted) return error.Failed;
         cfg.handshake_held = true;
     }
 
@@ -1079,7 +1121,7 @@ pub const Server = struct {
         const unix = endpoint.unixPath() != null;
         var backoff: AcceptBackoff = .{};
         while (!self.shutdown_flag.load(.acquire)) {
-            try self.awaitAdmission(.{ .mode = mode, .proxied = proxied, .charge = .none }, admissionRoom);
+            _ = try self.awaitAdmission(.{ .mode = mode, .proxied = proxied, .charge = .none }, admissionRoom);
             connection.probeNote(.accept);
             const stream = listener.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -1117,7 +1159,7 @@ pub const Server = struct {
                 .peer => {
                     var keys_buf: [accounts.max_refs]accounts.Key = undefined;
                     const keys = accounts.keysFor(peer, self.limits.client_ipv6_aggregate_prefix_bits, &keys_buf);
-                    charge = (self.clients.acquire(keys) catch |err| {
+                    charge = (self.clients.acquire(keys, @intCast(endpoint_index)) catch |err| {
                         stream.close(self.io);
                         return err;
                     }) orelse {
@@ -1130,11 +1172,19 @@ pub const Server = struct {
                 },
             }
             const admission: Admission = .{ .mode = mode, .proxied = proxied, .charge = charge };
-            self.awaitAdmission(admission, admitAccepted) catch |err| {
+            const admitted = self.awaitAdmission(admission, admitAccepted) catch |err| {
                 self.clients.release(charge);
                 stream.close(self.io);
                 return err;
             };
+            if (!admitted) {
+                // Over a share under pressure (connections, or the
+                // handshakes in progress): closed at accept, counted and
+                // logged by `Charge.add`; nothing is held.
+                self.clients.release(charge);
+                stream.close(self.io);
+                continue;
+            }
             // A proxied TLS connection takes its handshake slot after its
             // header (`takeProxyHeader`).
             const handshake_held = mode == .tls and !proxied;
