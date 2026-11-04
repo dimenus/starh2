@@ -1,7 +1,12 @@
 //! std-io-gate: this repository does not use the std.Io CONCURRENCY API.
 //! zio owns concurrency here. Use the zio primitive, or ask Ryan first.
 //!
-//!   std-io-gate <repo-root>
+//!   std-io-gate [--skip <dir>]... <repo-root>
+//!
+//! `--skip` names a directory that is not code, by path: `build.zig` passes
+//! the build's own cache and install directories, because `--cache-dir` and
+//! `--prefix` can put them inside the tree under any name, and a cache is
+//! written while the scan reads it. A skip outside the root is ignored.
 //!
 //! Exit 0: no finding. Exit 1: at least one finding, each printed as
 //! `path:line:col: <rule>: <name>` with the source line under it. Exit 3: the
@@ -500,8 +505,24 @@ pub fn main(init: std.process.Init) !u8 {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer args.deinit();
     _ = args.next();
-    const root_path = args.next() orelse {
-        std.debug.print("usage: std-io-gate <repo-root>\n", .{});
+    var skip_args: std.ArrayList([]const u8) = .empty;
+    defer skip_args.deinit(gpa);
+    var root_arg: ?[]const u8 = null;
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--skip")) {
+            try skip_args.append(gpa, args.next() orelse {
+                std.debug.print("std-io-gate FATAL: --skip needs a directory\n", .{});
+                return 3;
+            });
+        } else if (root_arg == null) {
+            root_arg = a;
+        } else {
+            std.debug.print("std-io-gate FATAL: unexpected argument {s}\n", .{a});
+            return 3;
+        }
+    }
+    const root_path = root_arg orelse {
+        std.debug.print("usage: std-io-gate [--skip <dir>]... <repo-root>\n", .{});
         return 3;
     };
 
@@ -515,12 +536,29 @@ pub fn main(init: std.process.Init) !u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Each skip as a path relative to the root, compared with the walk's
+    // entry paths. Real paths on both sides, so a symlinked or relative
+    // spelling of the same directory still matches.
+    const root_real = try std.Io.Dir.cwd().realPathFileAlloc(io, root_path, arena);
+    var skip_rel: std.ArrayList([]const u8) = .empty;
+    for (skip_args.items) |sk| {
+        const real = std.Io.Dir.cwd().realPathFileAlloc(io, sk, arena) catch continue; // not created yet: nothing to scan
+        if (real.len > root_real.len and std.mem.startsWith(u8, real, root_real) and real[root_real.len] == std.fs.path.sep) {
+            const rel = real[root_real.len + 1 ..];
+            try skip_rel.append(arena, rel);
+            std.debug.print("std-io-gate: skipping build directory {s}\n", .{rel});
+        } else if (std.mem.eql(u8, real, root_real)) {
+            std.debug.print("std-io-gate FATAL: --skip {s} is the root itself\n", .{sk});
+            return 3;
+        }
+    }
+
     var files: std.ArrayList([]const u8) = .empty;
     var walker = try root.walkSelectively(gpa);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
         switch (entry.kind) {
-            .directory => if (!skipped(entry.basename)) try walker.enter(io, entry),
+            .directory => if (!skipped(entry.basename) and !contains(skip_rel.items, entry.path)) try walker.enter(io, entry),
             // A symlinked file is read through the link; a symlinked
             // directory is not entered (no cycles), so say so.
             .file, .sym_link => if (std.mem.endsWith(u8, entry.basename, ".zig")) {

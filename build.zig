@@ -1503,6 +1503,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const std_io_gate_run = b.addRunArtifact(std_io_gate_exe);
+    // The build's own directories are not code, whatever `--cache-dir` and
+    // `--prefix` named them, and the cache is written during the scan.
+    std_io_gate_run.addArg("--skip");
+    std_io_gate_run.addDirectoryArg(.cache_root);
+    std_io_gate_run.addArg("--skip");
+    std_io_gate_run.addDirectoryArg(.{ .relative = .{ .base = .global_cache } });
+    std_io_gate_run.addArg("--skip");
+    std_io_gate_run.addDirectoryArg(.{ .relative = .{ .base = .install_prefix } });
     std_io_gate_run.addArg(".");
     std_io_gate_run.setCwd(b.path("."));
     std_io_gate_run.has_side_effects = true;
