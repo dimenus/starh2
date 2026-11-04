@@ -78,7 +78,7 @@ Directional observations, in that light:
 - `-c 10` produces `not-started` with migration on and off.
 - `-n 1000000 -c 50 -m 10 -t 4` with migration off produced `not-started` in 3
   of 3 rounds. This is the cheapest deterministic reproducer of that class.
-- The plaintext zio-only three-task example under `tools/zio-migration-repro/`
+- The plaintext zio-only three-task example under `tools/zio-migration-repro/` (removed after ea6ae7c; see that commit)
   stays green under both scheduler settings.
 
 ## Accelerator

@@ -152,7 +152,7 @@ pristine pin still builds. Re-apply by hand when reproducing task tags.
 
 ## Fourth round: the standalone repro is RED (same day, later)
 
-`tools/zio-wedge-repro` (37c79cc) reproduces the defect class with no
+`tools/zio-wedge-repro` (removed after ea6ae7c; see that commit) (37c79cc) reproduces the defect class with no
 starh2 code, seconds per run. The unlock: clients must be RAW OS THREADS;
 in-runtime zio clients keep the executors busy and mask the window. The
 window is an idle runtime with executors parked in kevent.
@@ -179,11 +179,11 @@ made runnable (an accept completion, a fresh spawn, a futexWake) is never
 run while the executors sit parked. starh2's own churn usually rescues the
 stranded task, which is why the in-app rate is low and why any periodic
 task produced the trickle. The upstream report should come from Ryan and
-can ship `tools/zio-wedge-repro` verbatim with the rates table.
+can ship `tools/zio-wedge-repro` (removed after ea6ae7c; see that commit) verbatim with the rates table.
 
 ## RETRACTION of the fourth round's standalone-repro claims (2026-08-19, later)
 
-The red repro was a HARNESS ANTI-PATTERN, not a zio bug. zio-wedge-repro
+The red repro was a HARNESS ANTI-PATTERN, not a zio bug. zio-wedge-repro (removed after ea6ae7c; see that commit)
 called std.Thread.spawn/join per round from inside a zio task. An OS join
 blocks the executor thread outright; a socket is pinned to the loop that
 registered it (zio #582 documents the placement rule), so the listen

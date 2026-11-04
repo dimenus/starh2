@@ -151,7 +151,7 @@ canary. t-761.
 
 ### The plaintext zio reproducer
 
-The zio-only three-task example under `tools/zio-migration-repro/` stays green.
+The zio-only three-task example under `tools/zio-migration-repro/` (removed after ea6ae7c; see that commit) stays green.
 Do not report it upstream as a reproducer.
 
 ## The instrument
