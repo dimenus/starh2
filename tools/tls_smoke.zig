@@ -48,6 +48,7 @@
 //! expires. This gate therefore proves the TLS DATA path, not certificate
 //! verification.
 const std = @import("std");
+const zio = @import("zio");
 
 /// The outbound per-stream cap this gate must cross to be meaningful. It
 /// mirrors `Limits.outbound_bytes_per_stream`.
@@ -164,17 +165,8 @@ fn awaitReadyPort(io: std.Io, child: *std.process.Child) !u16 {
 /// turn a HANG into a failure, so it is generous without being useless.
 const SHUTDOWN_BOUND_NS: u64 = 10 * std.time.ns_per_s;
 
-const Shutdown = union(enum) {
-    exited: std.process.Child.WaitError!std.process.Child.Term,
-    timer: std.Io.Cancelable!void,
-};
-
 fn waitChild(child: *std.process.Child, io: std.Io) std.process.Child.WaitError!std.process.Child.Term {
     return child.wait(io);
-}
-
-fn waitTimer(timeout: std.Io.Timeout, io: std.Io) std.Io.Cancelable!void {
-    return timeout.sleep(io);
 }
 
 /// Require the server to STOP, not merely to answer.
@@ -190,23 +182,16 @@ fn requireCleanShutdown(io: std.Io, child: *std.process.Child, reaped: *bool) vo
     std.posix.kill(pid, std.posix.SIG.TERM) catch
         abort("could not signal the server to stop", .{});
 
-    var buf: [2]Shutdown = undefined;
-    var select = std.Io.Select(Shutdown).init(io, &buf);
-    select.concurrent(.exited, waitChild, .{ child, io }) catch
+    // The wait runs on its own zio task, raced against an absolute deadline
+    // (a `.duration` armed from task code can fire early on a busy loop,
+    // t-3653).
+    var wait = zio.spawn(waitChild, .{ child, io }) catch
         abort("could not wait on the server process", .{});
-    const timeout: std.Io.Timeout = .{ .duration = .{
-        .raw = .fromNanoseconds(@intCast(SHUTDOWN_BOUND_NS)),
-        .clock = .awake,
-    } };
-    select.concurrent(.timer, waitTimer, .{ timeout, io }) catch
-        abort("could not arm the shutdown deadline", .{});
-
-    const selected = select.await() catch abort("shutdown wait was canceled", .{});
-    // Cancel the losing branch BEFORE anything else. On the timeout path the
-    // loser is `waitChild`, still blocked inside `child.wait`, and `abort`
-    // kills the child — killing a process another task is waiting on, from a
-    // context that still holds the select, deadlocks. Cancel, then abort.
-    select.cancelDiscard();
+    defer wait.cancel();
+    const selected = zio.select(.{
+        .exited = &wait,
+        .timer = zio.Timeout.fromNanoseconds(SHUTDOWN_BOUND_NS).toDeadline(),
+    }) catch abort("shutdown wait was canceled", .{});
     switch (selected) {
         .exited => |result| {
             const term = result catch abort("waiting on the server failed", .{});
@@ -218,10 +203,19 @@ fn requireCleanShutdown(io: std.Io, child: *std.process.Child, reaped: *bool) vo
                 else => abort("server did not exit cleanly on SIGTERM: {any}", .{term}),
             }
         },
-        .timer => abort(
-            "server did not stop within {d}s of SIGTERM — a handler is stranded, so shutdown cannot complete",
-            .{SHUTDOWN_BOUND_NS / std.time.ns_per_s},
-        ),
+        .timer => {
+            // Kill and reap here, on the wait task that is still waiting, so
+            // `abort` is left no pid to kill: a reaped pid can belong to
+            // another process by then.
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            _ = wait.join() catch {};
+            reaped.* = true;
+            g_pid = null;
+            abort(
+                "server did not stop within {d}s of SIGTERM — a handler is stranded, so shutdown cannot complete",
+                .{SHUTDOWN_BOUND_NS / std.time.ns_per_s},
+            );
+        },
     }
 }
 
@@ -266,8 +260,17 @@ fn expectOk(gpa: std.mem.Allocator, f: Fetch, path: []const u8, round: usize) vo
 }
 
 pub fn main(init: std.process.Init) !void {
+    // The driver runs on a zio runtime, not on `init.io`: zio owns
+    // concurrency in this repository, tools included, and the bounded child
+    // wait below races a zio task against a deadline.
+    const rt = try zio.Runtime.init(init.gpa, .{});
+    defer rt.deinit();
+    var task = try rt.spawn(mainTask, .{ init, rt.io() });
+    try task.join();
+}
+
+fn mainTask(init: std.process.Init, io: std.Io) !void {
     const gpa = init.gpa;
-    const io = init.io;
 
     // Config strings live for the whole run, so an arena frees them in one
     // step and leaves the string-literal defaults untouched. Without it the

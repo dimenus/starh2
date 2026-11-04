@@ -4,6 +4,7 @@
 //! curl ABORTS. Zero connections is an error. SIGTERM with an open SSE stream
 //! must stop the server.
 const std = @import("std");
+const zio = @import("zio");
 
 var g_pid: ?std.process.Child.Id = null;
 
@@ -106,24 +107,45 @@ fn assertCurlReuse(res: std.process.RunResult, site: []const u8) void {
     }
 }
 
+fn waitChild(child: *std.process.Child, io: std.Io) std.process.Child.WaitError!std.process.Child.Term {
+    return child.wait(io);
+}
+
+/// `child.wait`, bounded by `timeout_ns`. The wait runs on its own zio task,
+/// raced against an absolute deadline (a `.duration` armed from task code can
+/// fire early on a busy loop, t-3653). Past the deadline the child gets
+/// SIGKILL and the same task reaps it, so the result is the kill's term and a
+/// wait is never canceled half way.
 fn waitChildBounded(child: *std.process.Child, io: std.Io, timeout_ns: u64) !std.process.Child.Term {
     const pid = child.id orelse return error.AlreadyGone;
-    const Wd = struct {
-        fn run(p: std.process.Child.Id, inner: std.Io, ns: u64) void {
-            inner.sleep(.fromNanoseconds(ns), .awake) catch return;
-            std.posix.kill(p, std.posix.SIG.KILL) catch {};
-        }
-    };
-    var wd = io.concurrent(Wd.run, .{ pid, io, timeout_ns }) catch
-        abort("watchdog spawn failed — unbounded wait is not a result", .{});
-    const term = try child.wait(io);
-    wd.cancel(io);
-    return term;
+    var wait = zio.spawn(waitChild, .{ child, io }) catch
+        abort("wait task spawn failed — unbounded wait is not a result", .{});
+    defer wait.cancel();
+    const winner = try zio.select(.{
+        .exited = &wait,
+        .timer = zio.Timeout.fromNanoseconds(timeout_ns).toDeadline(),
+    });
+    switch (winner) {
+        .exited => |term| return term,
+        .timer => {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            return wait.join();
+        },
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
+    // The driver runs on a zio runtime, not on `init.io`: zio owns
+    // concurrency in this repository, tools included, and the bounded child
+    // wait below races a zio task against a deadline.
+    const rt = try zio.Runtime.init(init.gpa, .{});
+    defer rt.deinit();
+    var task = try rt.spawn(mainTask, .{ init, rt.io() });
+    try task.join();
+}
+
+fn mainTask(init: std.process.Init, io: std.Io) !void {
     const gpa = init.gpa;
-    const io = init.io;
     try requireCurl(gpa, io);
 
     var bin: []const u8 = "";

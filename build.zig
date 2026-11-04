@@ -1346,6 +1346,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/tls_smoke.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "zio", .module = zio_dep.module("zio") }},
         }),
     });
     const tls_smoke_run = b.addRunArtifact(tls_smoke_exe);
@@ -1364,6 +1365,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/h1_smoke.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "zio", .module = zio_dep.module("zio") }},
         }),
     });
     const h1_smoke_run = b.addRunArtifact(h1_smoke_exe);
@@ -1381,6 +1383,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/h1_go_smoke.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "zio", .module = zio_dep.module("zio") }},
         }),
     });
     const h1_go_smoke_run = b.addRunArtifact(h1_go_smoke_exe);
@@ -1629,6 +1632,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/tsan/runner.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "zio", .module = zio_dep.module("zio") }},
         }),
     });
     {

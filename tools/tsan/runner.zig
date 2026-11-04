@@ -31,6 +31,7 @@
 //! TSan is Linux first. Zig builds its runtime from source for the target;
 //! see the lane's commit message for which systems were measured.
 const std = @import("std");
+const zio = @import("zio");
 
 const tsan_report_exit: u8 = 66;
 
@@ -62,8 +63,17 @@ const RunResult = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    // The driver runs on a zio runtime, not on `init.io`: zio owns
+    // concurrency in this repository, tools included, and the bounded child
+    // wait below races a zio task against a deadline.
+    const rt = try zio.Runtime.init(init.gpa, .{});
+    defer rt.deinit();
+    var task = try rt.spawn(mainTask, .{ init, rt.io() });
+    try task.join();
+}
+
+fn mainTask(init: std.process.Init, io: std.Io) !void {
     const gpa = init.arena.allocator();
-    const io = init.io;
 
     var suppressions: []const u8 = "";
     var log_root: []const u8 = "";
@@ -231,6 +241,10 @@ fn checkSuppressions(gpa: std.mem.Allocator, io: std.Io, path: []const u8) usize
     return entries;
 }
 
+fn waitChild(child: *std.process.Child, io: std.Io) std.process.Child.WaitError!std.process.Child.Term {
+    return child.wait(io);
+}
+
 fn runOne(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -254,18 +268,25 @@ fn runOne(
     }) catch |err| abort("spawn {s} ({s}): {t}", .{ bin.name, bin.path, err });
     const pid = child.id orelse abort("spawn {s}: no pid", .{bin.name});
 
-    var timed_out: std.atomic.Value(bool) = .init(false);
-    const Wd = struct {
-        fn watch(p: std.process.Child.Id, inner: std.Io, ns: u64, flag: *std.atomic.Value(bool)) void {
-            inner.sleep(.fromNanoseconds(ns), .awake) catch return;
-            flag.store(true, .release);
-            std.posix.kill(p, std.posix.SIG.KILL) catch {};
-        }
-    };
-    var wd = io.concurrent(Wd.watch, .{ pid, io, timeout_s * std.time.ns_per_s, &timed_out }) catch
-        abort("watchdog spawn failed; an unbounded run is not a result", .{});
-    const term = child.wait(io) catch |err| abort("wait {s}: {t}", .{ bin.name, err });
-    wd.cancel(io);
+    // The wait runs on its own zio task, raced against an absolute deadline
+    // (a `.duration` armed from task code can fire early on a busy loop,
+    // t-3653). Past it the binary gets SIGKILL and the same task reaps it.
+    var timed_out = false;
+    var wait = zio.spawn(waitChild, .{ &child, io }) catch
+        abort("wait task spawn failed; an unbounded run is not a result", .{});
+    defer wait.cancel();
+    const winner = zio.select(.{
+        .exited = &wait,
+        .timer = zio.Timeout.fromSeconds(timeout_s).toDeadline(),
+    }) catch |err| abort("wait {s}: {t}", .{ bin.name, err });
+    const term = switch (winner) {
+        .exited => |r| r,
+        .timer => blk: {
+            timed_out = true;
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+            break :blk wait.join();
+        },
+    } catch |err| abort("wait {s}: {t}", .{ bin.name, err });
     log_file.close(io);
     const secs = nsToSecs(start.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds);
 
@@ -275,7 +296,7 @@ fn runOne(
         .run = run,
         .secs = secs,
         .term = term,
-        .timed_out = timed_out.load(.acquire),
+        .timed_out = timed_out,
         .reports = std.mem.count(u8, log, "WARNING: ThreadSanitizer:"),
         .passed = passedCount(log),
         .log_path = log_path,
