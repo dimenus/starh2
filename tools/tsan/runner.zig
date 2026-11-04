@@ -381,7 +381,12 @@ fn frameString(gpa: std.mem.Allocator, t: []const u8) ![]const u8 {
     const path = rest[sp2 + 1 ..];
     try out.appendSlice(gpa, func);
     try out.append(gpa, ' ');
-    if (std.mem.indexOf(u8, path, "/zig-pkg/")) |i| {
+    // macOS symbolization often has no file: `<null>:66282264`, where the
+    // number differs per report and means nothing, so it would split one
+    // site into many signatures.
+    if (std.mem.startsWith(u8, path, "<null>")) {
+        try out.appendSlice(gpa, "<null>");
+    } else if (std.mem.indexOf(u8, path, "/zig-pkg/")) |i| {
         const pkg = path[i + "/zig-pkg/".len ..];
         if (std.mem.indexOfScalar(u8, pkg, '/')) |slash| {
             const dash = std.mem.indexOfScalar(u8, pkg[0..slash], '-') orelse slash;
