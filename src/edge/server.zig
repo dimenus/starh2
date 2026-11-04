@@ -231,6 +231,11 @@ pub const InitError = error{
     /// More PROXY endpoints than `Limits.proxy_header_waiters`: each needs a
     /// floor of at least one header waiter of its own.
     ProxyWaitersBelowEndpoints,
+    /// A route's share override (`router.Route.share`) above the server's
+    /// limit of that resource. The log line names the route.
+    RouteShareAboveServerLimit,
+    /// A share override on a complete route, which has no route account.
+    RouteShareOnCompleteRoute,
 };
 
 /// Which PROXY header waiter slot a connection holds (`Server.proxy_floor`).
@@ -371,6 +376,8 @@ pub const Server = struct {
         _ = try config.limits.resourceUpperBound();
         if (config.endpoints.len == 0 or config.endpoints.len > config.limits.max_endpoints) return error.InvalidConfig;
         if (config.routes.len > config.limits.max_routes) return error.InvalidConfig;
+        // `router.Found.route` is a u32.
+        if (config.routes.len > std.math.maxInt(u32) - 1) return error.InvalidConfig;
 
         var need_tls = false;
         var need_h2c = false;
@@ -419,8 +426,13 @@ pub const Server = struct {
                 .prefix = route.prefix,
                 .handler = route.handler,
                 .max_request_body_bytes = route.max_request_body_bytes,
+                .share = route.share,
             };
         }
+        // The route accounts, from the same list the router matches against,
+        // so a route index is always a slot of the table.
+        var route_accounts = try accounts.RouteTable.init(gpa, routes, config.limits.routeLimits());
+        errdefer route_accounts.deinit(gpa);
 
         const endpoints = try gpa.dupe(EndpointConfig, config.endpoints);
         for (endpoints) |*ep| switch (ep.*) {
@@ -523,6 +535,7 @@ pub const Server = struct {
                 .task_handler_capacity = config.limits.max_task_handlers,
                 .max_outbound_bytes = config.limits.outbound_bytes_per_server,
                 .max_handshakes = config.limits.concurrent_tls_handshakes,
+                .routes = route_accounts,
             },
             .clients = clients,
             .slabs = slabs,
@@ -646,9 +659,10 @@ pub const Server = struct {
     /// nor makes it spin (a delivered error.Canceled would come back from
     /// every sleep; zio's `checkCancel` delivers none under a shield).
     ///
-    /// Reports are `warn` lines (`log`), counted in `shutdown_reports`.
-    /// Counts per route are not available: nothing accounts handlers per
-    /// route yet, so the report says how many and that per route is missing.
+    /// Reports are `warn` lines (`log`), counted in `shutdown_reports`. The
+    /// cancel reports name the task routes that still hold handlers, with
+    /// their counts (`accounts.RouteTable.writeHeld`); a 404 or 405 handler
+    /// has no route, so a total can be more than the routes' sum.
     ///
     /// With one executor and a handler that never yields, this task never
     /// runs again and nothing is reported; only a watchdog on an OS thread
@@ -770,10 +784,14 @@ pub const Server = struct {
         const asked = self.accounting.shutdown_cancel_asked.load(.acquire);
         if (n == 1) self.shutdown_report_asked.store(asked, .release);
         const since_ms = (monoNs() -| t0) / std.time.ns_per_ms;
+        var route_buf: [512]u8 = undefined;
+        var rw: std.Io.Writer = .fixed(&route_buf);
+        self.accounting.routes.writeHeld(&rw);
+        const per_route = rw.buffered();
         switch (phase) {
-            .cancel => log.warn("shutdown report {d}: after {d} ms (drain deadline {d} ms) every connection has asked its handlers to cancel, {d} task handlers in all; still running: {d} ({d} of them handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, since_ms, drain_ns / std.time.ns_per_ms, asked, handlers, orphans, conns }),
-            .cancel_group => log.warn("shutdown report {d}: serve was canceled or failed to start, and every connection is being cancelled now; still running: {d} task handlers ({d} of them handlers whose connection ended), {d} connections; counts per route are not available (no per-route accounts)", .{ n, handlers, orphans, conns }),
-            .cancel_backstop => log.warn("shutdown report {d}: the drain deadline passed ({d} ms) with {d} of {d} connections not yet at their cancel step, so not every handler has been asked to cancel; still running: {d} task handlers ({d} of them handlers whose connection ended); counts per route are not available (no per-route accounts)", .{ n, since_ms, conns -| self.accounting.shutdown_cancelled.load(.acquire), conns, handlers, orphans }),
+            .cancel => log.warn("shutdown report {d}: after {d} ms (drain deadline {d} ms) every connection has asked its handlers to cancel, {d} task handlers in all; still running: {d} ({d} of them handlers whose connection ended), {d} connections; per task route: {s}", .{ n, since_ms, drain_ns / std.time.ns_per_ms, asked, handlers, orphans, conns, per_route }),
+            .cancel_group => log.warn("shutdown report {d}: serve was canceled or failed to start, and every connection is being cancelled now; still running: {d} task handlers ({d} of them handlers whose connection ended), {d} connections; per task route: {s}", .{ n, handlers, orphans, conns, per_route }),
+            .cancel_backstop => log.warn("shutdown report {d}: the drain deadline passed ({d} ms) with {d} of {d} connections not yet at their cancel step, so not every handler has been asked to cancel; still running: {d} task handlers ({d} of them handlers whose connection ended); per task route: {s}", .{ n, since_ms, conns -| self.accounting.shutdown_cancelled.load(.acquire), conns, handlers, orphans, per_route }),
             .grace => log.warn("shutdown report {d}: {d} task handlers ({d} orphaned), {d} connections still running {d} ms after shutdown, past the cancel grace of {d} ms; serve keeps waiting and reports every {d} ms", .{ n, handlers, orphans, conns, since_ms, self.limits.shutdown_cancel_grace_ns / std.time.ns_per_ms, self.limits.shutdown_report_interval_ns / std.time.ns_per_ms }),
             .interval => log.warn("shutdown report {d}: still waiting {d} ms after shutdown for {d} task handlers ({d} orphaned), {d} connections", .{ n, since_ms, handlers, orphans, conns }),
         }
@@ -795,7 +813,7 @@ pub const Server = struct {
     /// `.client_refused` when the client is over its share under pressure
     /// (`accounts.Charge.add`): the caller closes the connection.
     fn tryAdmitConnection(self: *Server, c: accounts.Charge) connection.Admit {
-        if (!c.add(.connections, 1, self.active_connections.load(.seq_cst))) return .client_refused;
+        if (c.add(.connections, 1, self.active_connections.load(.seq_cst)) != .took) return .client_refused;
         while (true) {
             const current = self.active_connections.load(.seq_cst);
             if (current >= self.limits.max_connections) {
@@ -1061,7 +1079,7 @@ pub const Server = struct {
         // The server's count already holds this connection (taken at
         // accept), so its use before this connection is one less: the same
         // reading the plain path makes before its server charge.
-        if (!charge.add(.connections, 1, self.active_connections.load(.seq_cst) -| 1)) {
+        if (charge.add(.connections, 1, self.active_connections.load(.seq_cst) -| 1) != .took) {
             // Over its share under pressure: closed after the header. The
             // server's slot goes back in `connEntry` (its charge is still
             // `.none`, so no client count is given back there).
@@ -1429,6 +1447,9 @@ pub const Server = struct {
         // free. With `serve` returned and the counters above at zero, a
         // record left is a release some path forgot.
         if (!self.clients.checkEmpty()) live = true;
+        // The same for the task routes' accounts: an orphan that returned
+        // gave its route back too.
+        if (!self.accounting.routes.checkEmpty()) live = true;
         if (live) {
             log.err("Server.deinit with work still counted (serve has not returned?): freeing nothing, leaking the server", .{});
             return;
@@ -1449,6 +1470,7 @@ pub const Server = struct {
         // slot back.
         self.slots.deinit();
         self.clients.deinit(gpa);
+        self.accounting.routes.deinit(gpa);
         if (self.tls_acceptor) |*auth| auth.deinit();
         self.* = undefined;
     }

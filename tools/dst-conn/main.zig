@@ -778,6 +778,7 @@ fn runSeed(gpa: std.mem.Allocator, seed: u64, verbose: bool) !Outcome {
             .task_handler_capacity = limits.max_task_handlers,
             .max_outbound_bytes = limits.outbound_bytes_per_server,
             .max_handshakes = limits.concurrent_tls_handshakes,
+            .routes = try starh2.edge.accounts.RouteTable.init(gpa, &routes, limits.routeLimits()),
         },
         .pool = try SlotPool.init(gpa, 1, try limits.slotBootBytes(.h2c)),
         .limits = limits,
@@ -785,6 +786,7 @@ fn runSeed(gpa: std.mem.Allocator, seed: u64, verbose: bool) !Outcome {
     defer rig.pool.deinit();
     defer rig.requests.deinit();
     defer rig.slabs.deinit(gpa);
+    defer rig.accounting.routes.deinit(gpa);
 
     const fds = zio.sim.pipePair();
     run.server_fd = fds[0];

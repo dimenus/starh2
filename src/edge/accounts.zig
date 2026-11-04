@@ -6,7 +6,8 @@
 //! A resource is charged from the moment it is taken until it is really
 //! released, to every party that holds it. The parties of one charge are a
 //! small fixed list taken at admission, in a fixed order: the connection, the
-//! client, the client's aggregate (IPv6 only), then the server. The
+//! client, the client's aggregate (IPv6 only), the task route (a request
+//! link's charge only, `RouteTable`), then the server. The
 //! connection's and the server's accounts are the counters that already exist
 //! (`ConnBudget`, the connection's outbound budget, the Session's stream count,
 //! `GlobalAccounting`); this file holds the other two, as records in one
@@ -128,9 +129,20 @@
 //! records. An insert that finds the slab full with no rate-only record to
 //! evict fails; the caller refuses that connection and counts it
 //! (`insert_failures`). Nothing is ever admitted uncounted.
+//!
+//! # Route accounts
+//!
+//! A task route is an account too, between the aggregate and the server in
+//! the charge order (`RouteTable`, below). It holds three resources: the
+//! route's task handlers, orphans included, the request-pool bytes they
+//! hold, and their compression contexts. Routes are known at boot, so their
+//! records are a fixed array sized from the task routes: no index, no lock,
+//! no generation, no holder count. A link's `Charge` names its route
+//! (`Charge.route`), so `add` and `sub` walk it with the client records.
 const std = @import("std");
 const zio = @import("zio");
 const request = @import("../http/request.zig");
+const router = @import("../http/router.zig");
 
 pub const Resource = enum(u8) {
     connections,
@@ -222,7 +234,8 @@ pub fn infrastructureKey(endpoint_index: u16) Key {
     return k;
 }
 
-/// Client, then aggregate. A route account is a later step.
+/// Client, then aggregate. The route account is not a table record: a
+/// charge names it apart (`Charge.route`).
 pub const max_refs = 2;
 
 /// One resource's share rule (see the file header).
@@ -335,6 +348,10 @@ pub const Charge = struct {
     len: u8 = 0,
     /// The endpoint the holder came in on, for the refusal log line.
     endpoint: u16 = 0,
+    /// The task route a request link was dispatched to, after the client
+    /// records in the charge order. Only a link's charge names one
+    /// (`withRoute`, at dispatch): a connection's charge has no route.
+    route: ?RouteRef = null,
 
     /// No client account: `.none` endpoints, and the unit tests that build a
     /// connection by hand.
@@ -344,47 +361,79 @@ pub const Charge = struct {
         return self.refs[0..self.len];
     }
 
-    /// Charge `n` of `res` to every account on the list, in order, each a
-    /// bounded compare-and-swap. `server_use` is the server's own count of
-    /// `res` now, before its own charge: at or above the resource's mark, an
-    /// account that would pass its share refuses. Then the entries this call
-    /// already charged are undone in reverse, the refusal is counted and
-    /// logged, and the result is false: the caller undoes the connection's
-    /// account and refuses. True when every account took it.
-    pub fn add(self: Charge, res: Resource, n: usize, server_use: usize) bool {
-        if (self.len == 0 or n == 0) return true;
-        const t = self.table.?;
-        const share = t.shares[@intFromEnum(res)];
-        const pressure = server_use >= share.mark;
+    /// This charge with its route: a request link's, at dispatch.
+    pub fn withRoute(self: Charge, route: ?RouteRef) Charge {
+        std.debug.assert(self.route == null);
+        var c = self;
+        c.route = route;
+        return c;
+    }
+
+    /// Who refused a charge (`add`). The caller answers by it: a route
+    /// refusal is a 503 on both protocols, never REFUSED_STREAM, since a
+    /// client may retry that by itself and the route is still broken.
+    pub const Outcome = enum { took, client_refused, route_refused };
+
+    /// Charge `n` of `res` to every account on the list, in order (the
+    /// client, the aggregate, the route), each a bounded compare-and-swap.
+    /// `server_use` is the server's own count of `res` now, before its own
+    /// charge: at or above the resource's mark, an account that would pass
+    /// its share refuses. Then the entries this call already charged are
+    /// undone in reverse, the refusal is counted and logged, and the result
+    /// says who refused: the caller undoes the connection's account and
+    /// refuses. `.took` when every account took it.
+    pub fn add(self: Charge, res: Resource, n: usize, server_use: usize) Outcome {
+        if (n == 0) return .took;
         // Which entries this call charged, so the undo skips one a stale
         // reference made it skip.
         var took: [max_refs]bool = @splat(false);
-        for (self.refs[0..self.len], 0..) |r, i| {
-            const rec = t.record(r) orelse continue;
-            const bound: ?usize = if (!pressure) null else if (i == 0) share.client else share.aggregate;
-            switch (t.addAt(rec, r, res, n, bound)) {
-                .took => took[i] = true,
-                .stale => {},
-                .refused => |held| {
-                    var j = i;
-                    while (j > 0) {
-                        j -= 1;
-                        if (!took[j]) continue;
-                        const back = t.record(self.refs[j]) orelse continue;
-                        t.subAt(back, self.refs[j], res, n);
-                    }
-                    t.noteRefused(res, rec, held, server_use, self.endpoint);
-                    return false;
-                },
+        if (self.len != 0) {
+            const t = self.table.?;
+            const share = t.shares[@intFromEnum(res)];
+            const pressure = server_use >= share.mark;
+            for (self.refs[0..self.len], 0..) |r, i| {
+                const rec = t.record(r) orelse continue;
+                const bound: ?usize = if (!pressure) null else if (i == 0) share.client else share.aggregate;
+                switch (t.addAt(rec, r, res, n, bound)) {
+                    .took => took[i] = true,
+                    .stale => {},
+                    .refused => |held| {
+                        self.undoClients(&took, i, res, n);
+                        t.noteRefused(res, rec, held, server_use, self.endpoint);
+                        return .client_refused;
+                    },
+                }
             }
         }
-        return true;
+        if (self.route) |rt| {
+            if (!rt.add(res, n, server_use)) {
+                self.undoClients(&took, self.len, res, n);
+                return .route_refused;
+            }
+        }
+        return .took;
     }
 
-    /// Release `n` of `res` from every account on the list, in reverse.
-    /// A release below zero is refused for that account (`Table.underflows`).
+    /// The undo of `add`: the client entries before `upto` that it charged,
+    /// in reverse.
+    fn undoClients(self: Charge, took: *const [max_refs]bool, upto: usize, res: Resource, n: usize) void {
+        const t = self.table orelse return;
+        var j = upto;
+        while (j > 0) {
+            j -= 1;
+            if (!took[j]) continue;
+            const back = t.record(self.refs[j]) orelse continue;
+            t.subAt(back, self.refs[j], res, n);
+        }
+    }
+
+    /// Release `n` of `res` from every account on the list, in reverse: the
+    /// route, then the aggregate and the client. A release below zero is
+    /// refused for that account (`Table.underflows`, `RouteTable.underflows`).
     pub fn sub(self: Charge, res: Resource, n: usize) void {
-        if (self.len == 0 or n == 0) return;
+        if (n == 0) return;
+        if (self.route) |rt| rt.sub(res, n);
+        if (self.len == 0) return;
         const t = self.table.?;
         var i = self.len;
         while (i > 0) {
@@ -392,6 +441,292 @@ pub const Charge = struct {
             const rec = t.record(self.refs[i]) orelse continue;
             t.subAt(rec, self.refs[i], res, n);
         }
+    }
+};
+
+/// The resources a route account holds, a subset of `Resource`.
+pub const RouteResource = enum(u2) {
+    task_handlers,
+    request_bytes,
+    compression,
+
+    pub const count = 3;
+
+    /// The route resource `res` is, or null: a route holds nothing else
+    /// (connections, handshakes, streams and outbound bytes are a
+    /// connection's).
+    pub fn of(res: Resource) ?RouteResource {
+        return switch (res) {
+            .task_handlers => .task_handlers,
+            .request_bytes => .request_bytes,
+            .compression => .compression,
+            .connections, .handshakes, .streams, .outbound_bytes => null,
+        };
+    }
+
+    pub fn resource(self: RouteResource) Resource {
+        return switch (self) {
+            .task_handlers => .task_handlers,
+            .request_bytes => .request_bytes,
+            .compression => .compression,
+        };
+    }
+};
+
+/// The server's limit of each route resource, by `RouteResource`
+/// (`Limits.routeLimits`).
+pub const RouteLimits = [RouteResource.count]usize;
+
+/// One task route's account. Its counts are charged at dispatch and held
+/// until the handler returns, orphan included.
+pub const RouteRecord = struct {
+    counts: [RouteResource.count]std.atomic.Value(usize) = @splat(.init(0)),
+    /// The most the route may hold of each resource while the server's use of
+    /// it is at or above its mark. Read only after `init`.
+    shares: [RouteResource.count]usize = @splat(0),
+    /// Charges refused by this route's share, by resource.
+    refusals: [RouteResource.count]std.atomic.Value(u64) = @splat(.init(0)),
+    /// "GET /path" (a prefix route ends with `*`), for the refusal line.
+    label: Table.Label = .{},
+
+    pub fn count(self: *const RouteRecord, res: RouteResource) usize {
+        return self.counts[@intFromEnum(res)].load(.acquire);
+    }
+};
+
+/// A link's route account: the table and the record (`RouteTable.ref`).
+pub const RouteRef = struct {
+    table: *RouteTable,
+    index: u32,
+
+    fn rec(self: RouteRef) *RouteRecord {
+        return &self.table.records[self.index];
+    }
+
+    /// The route's step of `Charge.add`, and the whole of it for bytes a
+    /// request already holds when it is dispatched (its header lease): those
+    /// are charged to its client and the server already, and to the route
+    /// only once the route is known. A bounded compare-and-swap at or above
+    /// the resource's mark, so the share is exact; the mark is
+    /// check-then-reserve, as for a client. False when the share refused:
+    /// counted and logged here. True for a resource a route does not hold.
+    pub fn add(self: RouteRef, res: Resource, n: usize, server_use: usize) bool {
+        const rr = RouteResource.of(res) orelse return true;
+        if (n == 0) return true;
+        const t = self.table;
+        const r = self.rec();
+        const c = &r.counts[@intFromEnum(rr)];
+        if (server_use < t.marks[@intFromEnum(rr)]) {
+            _ = c.fetchAdd(n, .acq_rel);
+            return true;
+        }
+        const share = r.shares[@intFromEnum(rr)];
+        var cur = c.load(.acquire);
+        while (true) {
+            if (cur > share or share - cur < n) {
+                t.noteRefused(self.index, rr, server_use);
+                return false;
+            }
+            cur = c.cmpxchgWeak(cur, cur + n, .acq_rel, .acquire) orelse return true;
+        }
+    }
+
+    /// Give back `n` of `res`. Below zero is refused: the count stays, and
+    /// the event is counted (`RouteTable.underflows`) and logged.
+    pub fn sub(self: RouteRef, res: Resource, n: usize) void {
+        const rr = RouteResource.of(res) orelse return;
+        if (n == 0) return;
+        const c = &self.rec().counts[@intFromEnum(rr)];
+        var cur = c.load(.acquire);
+        while (true) {
+            if (cur < n) {
+                const total = self.table.underflows.fetchAdd(1, .monotonic) + 1;
+                log.err("route account underflow: a release of {d} from {s} of {s} found {d}; refused, count kept ({d} refused so far)", .{ n, @tagName(rr), self.rec().label.text(), cur, total });
+                return;
+            }
+            cur = c.cmpxchgWeak(cur, cur - n, .acq_rel, .acquire) orelse return;
+        }
+    }
+};
+
+/// The task routes' accounts (t-3759 step 5), part of the server's
+/// `GlobalAccounting`.
+///
+/// # The rule
+///
+/// A task route holds, from dispatch until its handler returns (an orphan
+/// included): one task handler, the request-pool bytes the request's arena
+/// holds (the header lease's bytes charged at dispatch, every later block as
+/// it is taken), and the compression context its response uses. While the
+/// server's use of one of these is at or above that resource's pressure mark
+/// (1/4 of the server limit, the same mark the client shares use), a charge
+/// that would take the route past its share is refused: the task handler or
+/// its bytes with a 503 on HTTP/2 and HTTP/1.1 alike, the compression context
+/// with identity encoding. Below the mark nothing is refused by a route's
+/// share: a healthy busy route is never capped while the server has room. So
+/// a broken route can reach about the mark before refusal starts, and the
+/// rest of the server stays for every other route.
+///
+/// # Shares
+///
+/// A route's share of each resource is the server's limit over the number
+/// of task routes, rounded up, or the route's own override
+/// (`router.Route.share`). An override above the server's limit is a boot
+/// error; a share below a client's share is logged at boot (a client alone
+/// could then hold more of that resource than the route it calls may).
+///
+/// # The server-wide token stays
+///
+/// The route charge sits beside the server's own limits, it does not replace
+/// them: `GlobalAccounting.task_handlers` is still the hard ceiling of live
+/// task handlers, orphans included, and the request pool's cap still bounds
+/// its bytes.
+pub const RouteTable = struct {
+    /// One per task route, in route order.
+    records: []RouteRecord = &.{},
+    /// By route index (`router.Found.route`): the route's record, or
+    /// `no_record` for a complete route, which has no account.
+    of_route: []u32 = &.{},
+    /// The server's pressure mark of each route resource. Read only after
+    /// `init`.
+    marks: [RouteResource.count]usize = @splat(std.math.maxInt(usize)),
+    underflows: std.atomic.Value(u64) = .init(0),
+    refusal_log: RateLimitedLine = .{},
+
+    pub const no_record = std.math.maxInt(u32);
+
+    /// No routes: a test connection built by hand with no task route.
+    pub const empty: RouteTable = .{};
+
+    pub const InitError = error{ OutOfMemory, RouteShareAboveServerLimit, RouteShareOnCompleteRoute };
+
+    /// One record per task route of `routes`, with its share of every route
+    /// resource of `limits`; see the type's doc for the rule and the boot
+    /// checks.
+    pub fn init(gpa: std.mem.Allocator, routes: []const router.Route, limits: RouteLimits) InitError!RouteTable {
+        var task_routes: usize = 0;
+        for (routes) |r| {
+            switch (r.handler) {
+                .task => task_routes += 1,
+                .complete => if (!r.share.isDefault()) return error.RouteShareOnCompleteRoute,
+            }
+        }
+        const of_route = try gpa.alloc(u32, routes.len);
+        errdefer gpa.free(of_route);
+        const records = try gpa.alloc(RouteRecord, task_routes);
+        errdefer gpa.free(records);
+        var marks: [RouteResource.count]usize = undefined;
+        for (&marks, limits) |*m, l| m.* = Share.of(l).mark;
+        var next: u32 = 0;
+        for (routes, of_route) |r, *slot| {
+            if (r.handler != .task) {
+                slot.* = no_record;
+                continue;
+            }
+            slot.* = next;
+            const rec = &records[next];
+            rec.* = .{};
+            const l = &rec.label;
+            const written: []u8 = std.fmt.bufPrint(&l.buf, "{s} {s}{s}", .{ @tagName(r.method), r.path, if (r.prefix) "*" else "" }) catch @as([]u8, &l.buf);
+            l.len = @intCast(written.len);
+            const overrides: [RouteResource.count]?usize = .{ r.share.task_handlers, r.share.request_bytes, r.share.compression };
+            for (overrides, limits, 0..) |o, server_limit, ri| {
+                const share = o orelse defaultShare(server_limit, task_routes);
+                if (share > server_limit) {
+                    log.err("route {s}: its {s} share {d} is above the server's limit {d}", .{ l.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), share, server_limit });
+                    return error.RouteShareAboveServerLimit;
+                }
+                const client = Share.of(server_limit).client;
+                if (share < client) log.warn("route {s}: its {s} share {d} is below a client's share {d}: one client may hold more of it than this route", .{ l.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), share, client });
+                rec.shares[ri] = share;
+            }
+            next += 1;
+        }
+        return .{ .records = records, .of_route = of_route, .marks = marks };
+    }
+
+    /// The default share: the server's limit over the task routes, rounded
+    /// up, so no share is zero.
+    pub fn defaultShare(server_limit: usize, task_routes: usize) usize {
+        std.debug.assert(task_routes > 0);
+        return std.math.divCeil(usize, server_limit, task_routes) catch unreachable;
+    }
+
+    pub fn deinit(self: *RouteTable, gpa: std.mem.Allocator) void {
+        gpa.free(self.records);
+        gpa.free(self.of_route);
+        self.* = undefined;
+    }
+
+    /// The account of route `route` (`router.Found.route`), or null for a
+    /// complete route. A route index this table was not built from is a
+    /// broken invariant (the router and the table come from one route
+    /// list), never a route with no account.
+    pub fn ref(self: *RouteTable, route: u32) ?RouteRef {
+        if (route >= self.of_route.len) std.debug.panic("route {d} has no slot in the route accounts ({d} routes)", .{ route, self.of_route.len });
+        const i = self.of_route[route];
+        if (i == no_record) return null;
+        return .{ .table = self, .index = i };
+    }
+
+    /// The record of route `route`, for tests and the refusal line.
+    pub fn recordOf(self: *RouteTable, route: u32) ?*RouteRecord {
+        const r = self.ref(route) orelse return null;
+        return r.rec();
+    }
+
+    fn noteRefused(self: *RouteTable, index: u32, res: RouteResource, server_use: usize) void {
+        const r = &self.records[index];
+        _ = r.refusals[@intFromEnum(res)].fetchAdd(1, .monotonic);
+        self.refusal_log.note("refused route {s}: {s} over its share under pressure; route holds task_handlers {d} of {d}, request_bytes {d} of {d}, compression {d} of {d}; the server's {s} {d} (mark {d})", .{
+            r.label.text(),
+            @tagName(res),
+            r.count(.task_handlers),
+            r.shares[@intFromEnum(RouteResource.task_handlers)],
+            r.count(.request_bytes),
+            r.shares[@intFromEnum(RouteResource.request_bytes)],
+            r.count(.compression),
+            r.shares[@intFromEnum(RouteResource.compression)],
+            @tagName(res),
+            server_use,
+            self.marks[@intFromEnum(res)],
+        });
+    }
+
+    /// "GET /stuck 3, POST /upload 1": every task route that holds a task
+    /// handler now, with its count, or "none". Cut, never refused, when `w`
+    /// is full: it is text for a log line.
+    pub fn writeHeld(self: *const RouteTable, w: *std.Io.Writer) void {
+        var any = false;
+        for (self.records) |*r| {
+            const n = r.count(.task_handlers);
+            if (n == 0) continue;
+            w.print("{s}{s} {d}", .{ if (any) ", " else "", r.label.text(), n }) catch return;
+            any = true;
+        }
+        if (!any) w.writeAll("none") catch {};
+    }
+
+    /// Every route count zero and no underflow over the server's life, or
+    /// log what is not. `Server.deinit` calls it after `serve` returned, so
+    /// every test that ends a server checks the route accounts too, orphans
+    /// included (`serve` waits for them).
+    pub fn checkEmpty(self: *const RouteTable) bool {
+        var clean = true;
+        for (self.records) |*r| {
+            for (&r.counts, 0..) |*c, ri| {
+                const v = c.load(.acquire);
+                if (v == 0) continue;
+                clean = false;
+                log.err("route account still charged at deinit: {s} {s} = {d}", .{ r.label.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), v });
+            }
+        }
+        const u = self.underflows.load(.acquire);
+        if (u != 0) {
+            clean = false;
+            log.err("route accounts: {d} refused releases over the server's life", .{u});
+        }
+        return clean;
     }
 };
 
@@ -1237,7 +1572,7 @@ test "Table: one record per key, removed with its last reference, reused with a 
     try std.testing.expectEqual(@as(u32, 2), t.lookup(k[0]).?.holders);
     t.retain(c1);
     try std.testing.expectEqual(@as(u32, 3), t.lookup(k[0]).?.holders);
-    try std.testing.expect(c1.add(.streams, 3, 0));
+    try std.testing.expectEqual(Charge.Outcome.took, c1.add(.streams, 3, 0));
     c2.sub(.streams, 3);
     t.release(c1);
     t.release(c2);
@@ -1274,19 +1609,19 @@ test "Charge.add: shares apply only at the mark; an aggregate's refusal undoes t
     const ca = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1), 0, null)).charge;
     const cb = (try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2), 0, null)).charge;
     // Below the mark nothing is refused, past any share.
-    for (0..3) |_| try std.testing.expect(ca.add(.streams, 1, 0));
+    for (0..3) |_| try std.testing.expectEqual(Charge.Outcome.took, ca.add(.streams, 1, 0));
     // At the mark: /64 a holds 3 > its share.
-    try std.testing.expect(!ca.add(.streams, 1, 4));
+    try std.testing.expectEqual(Charge.Outcome.client_refused, ca.add(.streams, 1, 4));
     // /64 b has room in its share, but the aggregate holds 3 of 4: one more
     // fits, the next is refused by the aggregate and b's charge is undone.
-    try std.testing.expect(cb.add(.streams, 1, 4));
-    try std.testing.expect(!cb.add(.streams, 1, 5));
+    try std.testing.expectEqual(Charge.Outcome.took, cb.add(.streams, 1, 4));
+    try std.testing.expectEqual(Charge.Outcome.client_refused, cb.add(.streams, 1, 5));
     try std.testing.expectEqual(@as(usize, 1), t.lookup(o2[0]).?.count(.streams));
     try std.testing.expectEqual(@as(usize, 4), t.lookup(o1[1]).?.count(.streams));
     try std.testing.expectEqual(@as(u64, 2), t.shareRefusals(.streams));
     // A byte-sized charge is refused when it would pass the share, not
     // only when the share is already passed.
-    try std.testing.expect(!cb.add(.streams, 2, 4));
+    try std.testing.expectEqual(Charge.Outcome.client_refused, cb.add(.streams, 2, 4));
     for (0..3) |_| ca.sub(.streams, 1);
     cb.sub(.streams, 1);
     t.release(ca);
@@ -1481,4 +1816,97 @@ test "Table: the last holder's release moves the generation in the same step" {
     // The last: no holder, and the next generation in the same word, so no
     // reference to generation 5 can match it even for an instant.
     try std.testing.expectEqual(w(6, 0), dropWord(w(5, 1)));
+}
+
+fn testTaskRoutes(comptime n: usize, out: *[n + 1]router.Route) []const router.Route {
+    const H = struct {
+        fn task(_: *anyopaque, _: *const request.Request, _: *@import("../http/response.zig").Response) anyerror!void {}
+        fn complete(_: *anyopaque, _: *const request.Request, _: *@import("../http/response.zig").CompleteResponse) anyerror!void {}
+        var dummy: u8 = 0;
+    };
+    for (out[0..n]) |*r| r.* = .{ .method = .GET, .path = "/t", .handler = .{ .task = .{ .ptr = &H.dummy, .runFn = H.task } } };
+    // A complete route counts for nothing.
+    out[n] = .{ .method = .GET, .path = "/c", .handler = .{ .complete = .{ .ptr = &H.dummy, .runFn = H.complete } } };
+    return out;
+}
+
+test "RouteTable: the default share is the server's limit over the task routes, rounded up (1, 2 and 8 task routes)" {
+    const gpa = std.testing.allocator;
+    const limits: RouteLimits = .{ 4096, 256 * 1024 * 1024, 128 };
+    inline for (.{ 1, 2, 8 }) |n| {
+        var buf: [n + 1]router.Route = undefined;
+        const routes = testTaskRoutes(n, &buf);
+        var t = try RouteTable.init(gpa, routes, limits);
+        defer t.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, n), t.records.len);
+        for (0..n) |i| {
+            const rec = t.recordOf(@intCast(i)).?;
+            try std.testing.expectEqual(@as(usize, 4096 / n), rec.shares[@intFromEnum(RouteResource.task_handlers)]);
+            try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024 / n), rec.shares[@intFromEnum(RouteResource.request_bytes)]);
+            try std.testing.expectEqual(@as(usize, 128 / n), rec.shares[@intFromEnum(RouteResource.compression)]);
+        }
+        // The complete route has no account.
+        try std.testing.expect(t.ref(@intCast(n)) == null);
+    }
+    // Rounded up: 3 task routes of 128 contexts get 43 each, never 42.
+    var buf3: [4]router.Route = undefined;
+    var t3 = try RouteTable.init(gpa, testTaskRoutes(3, &buf3), limits);
+    defer t3.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 43), t3.recordOf(0).?.shares[@intFromEnum(RouteResource.compression)]);
+    try std.testing.expectEqual(@as(usize, 1366), t3.recordOf(0).?.shares[@intFromEnum(RouteResource.task_handlers)]);
+}
+
+test "RouteTable: an override replaces the default for that resource only" {
+    const gpa = std.testing.allocator;
+    var buf: [3]router.Route = undefined;
+    const routes = testTaskRoutes(2, &buf);
+    buf[0].share = .{ .task_handlers = 4096 };
+    var t = try RouteTable.init(gpa, routes, .{ 4096, 1024, 128 });
+    defer t.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 4096), t.recordOf(0).?.shares[@intFromEnum(RouteResource.task_handlers)]);
+    try std.testing.expectEqual(@as(usize, 512), t.recordOf(0).?.shares[@intFromEnum(RouteResource.request_bytes)]);
+    try std.testing.expectEqual(@as(usize, 2048), t.recordOf(1).?.shares[@intFromEnum(RouteResource.task_handlers)]);
+    // An override on a complete route cannot mean anything.
+    buf[2].share = .{ .compression = 1 };
+    try std.testing.expectError(error.RouteShareOnCompleteRoute, RouteTable.init(gpa, routes, .{ 4096, 1024, 128 }));
+}
+
+test "Charge.add: a route over its share is refused only at the mark, and its refusal undoes the client's charge" {
+    const gpa = std.testing.allocator;
+    var buf: [3]router.Route = undefined;
+    // L = 16 task handlers, two task routes: each a share of 8, the mark 4.
+    var rt = try RouteTable.init(gpa, testTaskRoutes(2, &buf), .{ 16, 1024, 16 });
+    defer rt.deinit(gpa);
+    var t = try Table.init(gpa, 4, 7, Rules.unlimited);
+    defer t.deinit(gpa);
+    var o: [max_refs]Key = undefined;
+    const k = keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &o);
+    const conn = (try t.acquire(k, 0, null)).charge;
+    const c = conn.withRoute(rt.ref(0));
+    // Below the mark: past the route's share, nothing is refused.
+    for (0..10) |_| try std.testing.expectEqual(Charge.Outcome.took, c.add(.task_handlers, 1, 0));
+    try std.testing.expectEqual(@as(usize, 10), rt.recordOf(0).?.count(.task_handlers));
+    // At the mark the route holds 10 > 8: refused, and the client's charge of
+    // this call is undone.
+    try std.testing.expectEqual(Charge.Outcome.route_refused, c.add(.task_handlers, 1, 4));
+    try std.testing.expectEqual(@as(usize, 10), t.lookup(k[0]).?.count(.task_handlers));
+    try std.testing.expectEqual(@as(usize, 10), rt.recordOf(0).?.count(.task_handlers));
+    try std.testing.expectEqual(@as(u64, 1), rt.recordOf(0).?.refusals[@intFromEnum(RouteResource.task_handlers)].load(.acquire));
+    // The other route has its whole share at the mark.
+    const c1 = conn.withRoute(rt.ref(1));
+    for (0..8) |_| try std.testing.expectEqual(Charge.Outcome.took, c1.add(.task_handlers, 1, 4));
+    try std.testing.expectEqual(Charge.Outcome.route_refused, c1.add(.task_handlers, 1, 4));
+    // A byte charge is refused when it would pass the share.
+    try std.testing.expectEqual(Charge.Outcome.took, c1.add(.request_bytes, 500, 300));
+    try std.testing.expectEqual(Charge.Outcome.route_refused, c1.add(.request_bytes, 13, 300));
+    // A resource a route does not hold passes through it.
+    try std.testing.expectEqual(Charge.Outcome.took, c1.add(.streams, 1, 1 << 30));
+    c1.sub(.streams, 1);
+    // Release walks the route too.
+    for (0..10) |_| c.sub(.task_handlers, 1);
+    for (0..8) |_| c1.sub(.task_handlers, 1);
+    c1.sub(.request_bytes, 500);
+    try std.testing.expect(rt.checkEmpty());
+    t.release(conn);
+    try std.testing.expect(t.checkEmpty());
 }

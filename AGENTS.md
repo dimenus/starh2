@@ -183,6 +183,18 @@ see `tools/README.md`.
   in the table with no holder (`rate_only`): `stats().live == 0` is "nothing
   held", and a rate-only record is not a leak. `./zb build test-shares` is
   the gate.
+- A task route is an account too (`accounts.RouteTable`, in
+  `GlobalAccounting.routes`), between the aggregate and the server: a
+  link's charge names it (`Charge.route`, set at dispatch from
+  `router.Found.route`), and the link's task-handler token, request bytes
+  and compression context are charged to it until the handler returns,
+  orphans included. While the server's count is at its mark, a route past
+  its share (the server limit over the task routes, or `Route.share`) is
+  refused: 503 on both protocols, never REFUSED_STREAM; identity encoding.
+  A test that drives a server-wide limit or a client share from one route
+  among several gives its routes the whole server
+  (`tests/route_share.zig`), or the route refuses first. `./zb build
+  test-routes` is the gate.
 
 ## TLS and allocation traps
 

@@ -379,12 +379,14 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
             .task_handler_capacity = starh2.Limits.defaults.max_task_handlers,
             .max_outbound_bytes = starh2.Limits.defaults.outbound_bytes_per_server,
             .max_handshakes = starh2.Limits.defaults.concurrent_tls_handshakes,
+            .routes = try starh2.edge.accounts.RouteTable.init(gpa, &routes, starh2.Limits.defaults.routeLimits()),
         },
         .pool = undefined,
         .limits = starh2.Limits.defaults,
     };
     defer rig.slabs.deinit(gpa);
     defer rig.requests.deinit();
+    defer rig.accounting.routes.deinit(gpa);
     rig.pool = try starh2.edge.conn_slot.SlotPool.init(gpa, 1, try rig.limits.slotBootBytes(.h2c));
     defer rig.pool.deinit();
 

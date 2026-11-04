@@ -55,10 +55,35 @@ pub const Route = struct {
     /// and H2 413s on Content-Length and on DATA past this cap without
     /// retaining the overflow. Null uses `Limits.request_body_bytes`.
     max_request_body_bytes: ?usize = null,
+    /// This route's share of the server, task routes only (t-3759 step 5,
+    /// `accounts.RouteTable` has the rule). Null for a resource takes the
+    /// default, the server's limit over the number of task routes.
+    share: RouteShare = .{},
+};
+
+/// A task route's share of each resource its handlers hold, overriding the
+/// default (`accounts.RouteTable`). Each is at most the server's limit of
+/// that resource, or `Server.init` fails; one below a client's share is
+/// logged at boot. A complete route has no route account, so an override on
+/// one is a boot error.
+pub const RouteShare = struct {
+    /// Task handlers, orphans included.
+    task_handlers: ?usize = null,
+    /// Request-pool bytes the route's handlers hold, by block class.
+    request_bytes: ?usize = null,
+    /// Brotli encoder contexts.
+    compression: ?usize = null,
+
+    pub fn isDefault(self: RouteShare) bool {
+        return self.task_handlers == null and self.request_bytes == null and self.compression == null;
+    }
 };
 
 pub const Found = struct {
     handler: Handler,
+    /// The matched route's index in `Router.routes`: the key of its route
+    /// account (`accounts.RouteTable.ref`).
+    route: u32,
     /// Bytes of the request path after a matched prefix; empty for exact matches.
     path_remainder: []const u8 = "",
     max_request_body_bytes: ?usize = null,
@@ -78,7 +103,7 @@ pub const Router = struct {
         var path_exists = false;
         var allowed: [8]request.Method = undefined;
         var allowed_len: usize = 0;
-        for (self.routes) |r| {
+        for (self.routes, 0..) |r, i| {
             if (r.prefix) continue;
             if (std.mem.eql(u8, r.path, path)) {
                 path_exists = true;
@@ -88,6 +113,7 @@ pub const Router = struct {
                 }
                 if (r.method == method) return .{ .found = .{
                     .handler = r.handler,
+                    .route = @intCast(i),
                     .max_request_body_bytes = r.max_request_body_bytes,
                 } };
             }
@@ -99,7 +125,7 @@ pub const Router = struct {
         var best: ?Found = null;
         var prefix_path_exists = false;
         allowed_len = 0;
-        for (self.routes) |r| {
+        for (self.routes, 0..) |r, i| {
             if (!r.prefix) continue;
             if (!std.mem.startsWith(u8, path, r.path)) continue;
             prefix_path_exists = true;
@@ -122,6 +148,7 @@ pub const Router = struct {
                 best_len = r.path.len;
                 best = .{
                     .handler = r.handler,
+                    .route = @intCast(i),
                     .path_remainder = path[r.path.len..],
                     .max_request_body_bytes = r.max_request_body_bytes,
                 };
@@ -166,11 +193,17 @@ test "prefix match yields remainder; exact wins over prefix" {
     };
     const r: Router = .{ .routes = &routes };
     switch (r.match(.GET, "/v1/tasks/special")) {
-        .found => |f| try std.testing.expectEqual(@as(usize, 0), f.path_remainder.len),
+        .found => |f| {
+            try std.testing.expectEqual(@as(usize, 0), f.path_remainder.len);
+            try std.testing.expectEqual(@as(u32, 0), f.route);
+        },
         else => return error.ExpectedExact,
     }
     switch (r.match(.GET, "/v1/tasks/abc")) {
-        .found => |f| try std.testing.expectEqualStrings("abc", f.path_remainder),
+        .found => |f| {
+            try std.testing.expectEqualStrings("abc", f.path_remainder);
+            try std.testing.expectEqual(@as(u32, 1), f.route);
+        },
         else => return error.ExpectedPrefix,
     }
     switch (r.match(.DELETE, "/v1/tasks/abc")) {

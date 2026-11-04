@@ -1032,6 +1032,25 @@ pub fn build(b: *std.Build) void {
     const shares_step = b.step("test-shares", "Run the t-3759 step 4 gates (one attack per share-table row, the aggregate, the NAT case)");
     shares_step.dependOn(&run_shares_tests.step);
 
+    const routes_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/routes.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_routes_tests = b.addRunArtifact(routes_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_routes_tests.setCwd(b.path("."));
+    const routes_step = b.step("test-routes", "Run the t-3759 step 5 gates (route shares under pressure: the broken route, the hot route at idle, bytes, compression, boot)");
+    routes_step.dependOn(&run_routes_tests.step);
+
     const shutdown_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/shutdown.zig"),
@@ -1068,6 +1087,7 @@ pub fn build(b: *std.Build) void {
     run_shutdown_stuck.addArg("stuck");
     run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "shutdown report 1: after" });
     run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "every connection has asked its handlers to cancel, 1 task handlers in all; still running: 1 (" });
+    run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "per task route: GET /stuck 1" });
     run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "shutdown report 2: 1 task handlers" });
     run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "shutdown report 4: still waiting" });
     run_shutdown_stuck.addCheck(.{ .expect_stderr_match = "child: serve still waiting for the stuck handler" });
@@ -1148,6 +1168,26 @@ pub fn build(b: *std.Build) void {
     run_accounts_generation_wrap.has_side_effects = true;
     shutdown_step.dependOn(&run_accounts_generation_wrap.step);
     accounts_step.dependOn(&run_accounts_generation_wrap.step);
+    const run_route_share_boot = b.addRunArtifact(shutdown_child);
+    run_route_share_boot.addArg("route-share-boot");
+    run_route_share_boot.addCheck(.{ .expect_stderr_match = "route GET /1: its task_handlers share 456 is below a client's share 512: one client may hold more of it than this route" });
+    run_route_share_boot.addCheck(.{ .expect_stderr_match = "route GET /9: its compression share 15 is below a client's share 16" });
+    run_route_share_boot.addCheck(.{ .expect_stderr_match = "route POST /upload: its request_bytes share 268435457 is above the server's limit 268435456" });
+    run_route_share_boot.addCheck(.{ .expect_stderr_match = "child: route share boot nine=456 over=RouteShareAboveServerLimit" });
+    run_route_share_boot.expectExitCode(0);
+    run_route_share_boot.has_side_effects = true;
+    shutdown_step.dependOn(&run_route_share_boot.step);
+    routes_step.dependOn(&run_route_share_boot.step);
+    const run_route_underflow = b.addRunArtifact(shutdown_child);
+    run_route_underflow.addArg("route-underflow");
+    run_route_underflow.addCheck(.{ .expect_stderr_match = "route account underflow: a release of 1 from task_handlers of GET /r found 0; refused, count kept (1 refused so far)" });
+    run_route_underflow.addCheck(.{ .expect_stderr_match = "route account underflow: a release of 2 from compression of GET /r found 0; refused, count kept (2 refused so far)" });
+    run_route_underflow.addCheck(.{ .expect_stderr_match = "route accounts: 2 refused releases over the server's life" });
+    run_route_underflow.addCheck(.{ .expect_stderr_match = "child: route underflow task_handlers=0 compression=0 underflows=2 clean=false" });
+    run_route_underflow.expectExitCode(0);
+    run_route_underflow.has_side_effects = true;
+    shutdown_step.dependOn(&run_route_underflow.step);
+    routes_step.dependOn(&run_route_underflow.step);
 
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1186,6 +1226,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_hardening_tests.step);
     test_step.dependOn(&run_accounts_tests.step);
     test_step.dependOn(&run_shares_tests.step);
+    test_step.dependOn(&run_routes_tests.step);
     test_step.dependOn(shutdown_step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);

@@ -39,6 +39,7 @@ const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 const wire_client = @import("wire_client.zig");
 const serve_deadline = @import("serve_deadline.zig");
+const route_share = @import("route_share.zig");
 
 const accounts = starh2.edge.accounts;
 const proxy = starh2.edge.proxy_protocol;
@@ -177,9 +178,12 @@ const Rig = struct {
             if (self.cert.len != 0) gpa.free(self.cert);
             if (self.key.len != 0) gpa.free(self.key);
         }
+        // The client shares are under test, not the route shares
+        // (`tests/routes.zig`): every route may hold the whole server.
+        const whole = route_share.wholeServer(routes.len, routes, limits);
         self.server = try starh2.Server.init(gpa, io, .{
             .endpoints = endpoints,
-            .routes = &routes,
+            .routes = &whole,
             .tls = tls_cfg,
             .limits = limits,
         });

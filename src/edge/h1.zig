@@ -41,6 +41,7 @@ const parser = @import("../http1/parser.zig");
 const connection = @import("connection.zig");
 const tls_edge = @import("tls.zig");
 const request_pool = @import("request_pool.zig");
+const accounts = @import("accounts.zig");
 const test_hook = @import("test_hook.zig");
 const wire_pump = @import("wire_pump.zig");
 const limits_mod = @import("../core/wire_const.zig");
@@ -1109,6 +1110,7 @@ fn releaseStream(self: *H1Conn) void {
 /// cap that refused (`request_pool.Reason.status`).
 fn newLink(
     self: *H1Conn,
+    charge: accounts.Charge,
     method: request.Method,
     matched: router_mod.Match,
     body: []const u8,
@@ -1117,7 +1119,9 @@ fn newLink(
     query: []const u8,
     authority: []const u8,
 ) union(enum) { link: *H1Link, refused: u16 } {
-    var arena = request_pool.Arena.init(self.pool, &self.request_budget, self.config.charge);
+    // The arena is made at dispatch, when the route is known, so every block
+    // is charged to the route as it is taken (`charge` names it).
+    var arena = request_pool.Arena.init(self.pool, &self.request_budget, charge);
     const link = arena.allocator().create(H1Link) catch {
         const status = (arena.refusal orelse request_pool.Reason.server_cap).status();
         arena.release();
@@ -1126,7 +1130,7 @@ fn newLink(
     link.* = .{
         .core = .{
             .arena = arena,
-            .charge = self.config.charge,
+            .charge = charge,
             .accounting = self.config.accounting,
             .balancer = self.config.balancer,
             .exec_index = self.config.exec_index,
@@ -1229,10 +1233,20 @@ fn dispatch(
         else => true,
     };
 
+    // A task route's account (`accounts.RouteTable`), after the client
+    // records in the link's charge. A complete route, a 404 and a 405 have
+    // none.
+    const route: ?accounts.RouteRef = switch (matched) {
+        .found => |f| if (f.handler == .task) (if (self.config.accounting) |a| a.routes.ref(f.route) else null) else null,
+        else => null,
+    };
+    const charge = self.config.charge.withRoute(route);
+
     var token = false;
     if (!complete_inline) {
         if (self.config.accounting) |a| {
-            if (!a.tryReserveTaskHandler(self.config.charge)) {
+            // Every refusal is a 503 here: HTTP/1.1 has no REFUSED_STREAM.
+            if (a.tryReserveTaskHandler(charge) != .ok) {
                 releaseStream(self);
                 try writeError(self, 503);
                 self.want_close = true;
@@ -1241,11 +1255,11 @@ fn dispatch(
             token = true;
         }
     }
-    const link = switch (newLink(self, method, matched, body, headers, path, query, authority)) {
+    const link = switch (newLink(self, charge, method, matched, body, headers, path, query, authority)) {
         .link => |l| l,
         .refused => |status| {
             if (token) {
-                if (self.config.accounting) |a| a.releaseTaskHandler(self.config.charge);
+                if (self.config.accounting) |a| a.releaseTaskHandler(charge);
             }
             releaseStream(self);
             try writeError(self, status);

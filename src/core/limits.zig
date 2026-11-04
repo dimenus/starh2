@@ -510,6 +510,13 @@ pub const Limits = struct {
         return s;
     }
 
+    /// The server's limit of each resource a task route holds, by
+    /// `accounts.RouteResource`: what route shares divide
+    /// (`accounts.RouteTable.init`).
+    pub fn routeLimits(self: Limits) accounts.RouteLimits {
+        return .{ self.max_task_handlers, self.request_bytes_per_server, self.compression_contexts_per_server };
+    }
+
     fn checkedMul(a: usize, b: usize) error{InvalidConfig}!usize {
         const r = @mulWithOverflow(a, b);
         if (r[1] != 0) return error.InvalidConfig;
@@ -793,9 +800,11 @@ pub const Limits = struct {
         const h1_per_conn = try checkedAdd(try checkedMul(self.h1_head_bytes, 3), try checkedMul(self.request_body_bytes, 2));
         const per_conn = try checkedAdd(terms.slot_boot, try checkedAdd(terms.on_demand_conn, h1_per_conn));
 
+        // Each route, its slot in the route accounts, and (a task route) its
+        // record (`accounts.RouteTable`).
         terms.routes = try checkedAdd(
             self.max_route_path_bytes,
-            try checkedMul(self.max_routes, bound.ROUTE_SIZE),
+            try checkedMul(self.max_routes, bound.ROUTE_SIZE + @sizeOf(u32) + @sizeOf(accounts.RouteRecord)),
         );
         terms.certs = try checkedAdd(self.certificate_chain_bytes, self.private_key_bytes);
         terms.conn_slots = try checkedMul(

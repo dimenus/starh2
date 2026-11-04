@@ -30,6 +30,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
+const route_share = @import("route_share.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -139,9 +140,12 @@ fn serverFor(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, lim
             tls_cfg = .{ .certificate_chain_pem = cert.*, .private_key_pem = key.* };
         },
     }
+    // The server's own outbound caps, from one route at a time: no route
+    // share refuses first (`tests/routes.zig` has those).
+    const whole = route_share.wholeServer(routes.len, routes, limits);
     return starh2.Server.init(gpa, io, .{
         .endpoints = &.{endpoint},
-        .routes = &routes,
+        .routes = &whole,
         .tls = tls_cfg,
         .limits = limits,
     });

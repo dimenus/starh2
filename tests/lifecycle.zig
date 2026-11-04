@@ -9,6 +9,7 @@ const std = @import("std");
 const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
+const route_share = @import("route_share.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -185,11 +186,13 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     // The write pool (512 chunks) and one stream's cap must fit the budget.
     limits.outbound_bytes_per_connection = 16 * 1024 * 1024;
 
+    // One loopback client and one route drive the server's own caps here,
+    // not a client's or a route's share: `.none` charges no client account,
+    // and every route may hold the whole server.
+    const whole = route_share.wholeServer(routes.len, routes, limits);
     var server = try starh2.Server.init(gpa, rt.io(), .{
-        // One loopback client drives the server's own caps here, not a
-        // client's share: `.none` charges no client account.
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
-        .routes = &routes,
+        .routes = &whole,
         .tls = null,
         .limits = limits,
     });

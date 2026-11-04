@@ -109,6 +109,9 @@ pub const Reason = enum(u8) {
     /// while the pool's held bytes are at the pressure mark
     /// (`accounts.Charge.add`).
     client_share,
+    /// The request's task route would pass its share while the pool's held
+    /// bytes are at the pressure mark (`accounts.RouteTable`).
+    route_share,
     /// The resident cap is reached and nothing can be reclaimed, or every
     /// block of the needed class is in use.
     server_cap,
@@ -120,7 +123,7 @@ pub const Reason = enum(u8) {
     pub fn status(self: Reason) u16 {
         return switch (self) {
             .request_cap => 500,
-            .connection_cap, .client_share, .server_cap => 503,
+            .connection_cap, .client_share, .route_share, .server_cap => 503,
         };
     }
 };
@@ -793,10 +796,18 @@ pub const Arena = struct {
             self.refuse(.connection_cap);
             return null;
         }
-        if (!self.charge.add(.request_bytes, size, self.pool.held_bytes.load(.acquire))) {
-            self.unchargeConn(size);
-            self.refuse(.client_share);
-            return null;
+        switch (self.charge.add(.request_bytes, size, self.pool.held_bytes.load(.acquire))) {
+            .took => {},
+            .client_refused => {
+                self.unchargeConn(size);
+                self.refuse(.client_share);
+                return null;
+            },
+            .route_refused => {
+                self.unchargeConn(size);
+                self.refuse(.route_share);
+                return null;
+            },
         }
         const blk = self.pool.take(class) orelse {
             self.charge.sub(.request_bytes, size);

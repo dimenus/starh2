@@ -29,6 +29,14 @@
 //! - `accounts-quarantine`: a record whose last reference goes with two counts
 //!   not zero is quarantined once, and one log line names both counts. On
 //!   8eb220f it counted two quarantines.
+//! - `route-share-boot`: a route whose default share is below a client's
+//!   share is logged at boot (nine task routes: 4096 / 9 rounds to 456
+//!   task handlers, below 512) and boots; a route whose override is above
+//!   the server's limit fails `Server.init` with
+//!   `RouteShareAboveServerLimit` and a line naming it. Both log, so a test
+//!   process cannot check them.
+//! - `route-underflow`: a route account released at zero is refused, counted
+//!   and logged, and the count stays at zero.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -212,7 +220,7 @@ fn okClient(port: u16, ok: *std.atomic.Value(bool), done: *std.atomic.Value(bool
 }
 
 fn runUnderflow(_: *zio.Runtime) anyerror!void {
-    var a: starh2.edge.connection.GlobalAccounting = .{ .max_streams = 1, .task_handler_capacity = 1, .max_outbound_bytes = 1, .max_handshakes = 1 };
+    var a: starh2.edge.connection.GlobalAccounting = .{ .max_streams = 1, .task_handler_capacity = 1, .max_outbound_bytes = 1, .max_handshakes = 1, .routes = .empty };
     a.releaseStream(.none);
     a.releaseOutbound(.none, 7);
     std.debug.print("child: active_streams={d} outbound_bytes={d} underflows={d}\n", .{ a.active_streams.load(.acquire), a.outbound_bytes.load(.acquire), a.underflows.load(.acquire) });
@@ -372,6 +380,47 @@ fn runAccountsGenerationWrap(_: *zio.Runtime) anyerror!void {
     if (t.lookup(k2[0]) != null) t.release(b.?);
 }
 
+fn routeOk(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    try resp.send(200, &.{}, "ok");
+}
+
+fn runRouteShareBoot(rt: *zio.Runtime) anyerror!void {
+    const gpa = std.heap.page_allocator;
+    const a4 = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const eps = [_]starh2.EndpointConfig{.{ .h2c_prior_knowledge = .{ .address = a4 } }};
+    var nine: [9]starh2.Route = undefined;
+    const paths = [_][]const u8{ "/1", "/2", "/3", "/4", "/5", "/6", "/7", "/8", "/9" };
+    for (&nine, paths) |*r, p| r.* = .{ .method = .GET, .path = p, .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } } };
+    var s = try starh2.Server.init(gpa, rt.io(), .{ .endpoints = &eps, .routes = &nine, .tls = null });
+    const share = s.accounting.routes.recordOf(0).?.shares[0];
+    s.deinit(gpa);
+    var over = [_]starh2.Route{
+        .{ .method = .POST, .path = "/upload", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } }, .share = .{ .request_bytes = starh2.Limits.defaults.request_bytes_per_server + 1 } },
+        .{ .method = .GET, .path = "/ok", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } } },
+    };
+    const err = if (starh2.Server.init(gpa, rt.io(), .{ .endpoints = &eps, .routes = &over, .tls = null })) |srv| blk: {
+        var x = srv;
+        x.deinit(gpa);
+        break :blk error.Booted;
+    } else |e| e;
+    std.debug.print("child: route share boot nine={d} over={s}\n", .{ share, @errorName(err) });
+}
+
+fn runRouteUnderflow(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    const one_route = [_]starh2.Route{.{ .method = .GET, .path = "/r", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } } }};
+    var t = try accounts.RouteTable.init(gpa, &one_route, .{ 8, 8, 8 });
+    defer t.deinit(gpa);
+    const r = t.ref(0).?;
+    try std.testing.expect(r.add(.task_handlers, 1, 0));
+    r.sub(.task_handlers, 1);
+    r.sub(.task_handlers, 1);
+    const c: accounts.Charge = accounts.Charge.none.withRoute(r);
+    c.sub(.compression, 2);
+    std.debug.print("child: route underflow task_handlers={d} compression={d} underflows={d} clean={}\n", .{ r.table.records[0].count(.task_handlers), r.table.records[0].count(.compression), t.underflows.load(.acquire), t.checkEmpty() });
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.next();
@@ -397,6 +446,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runAccountsChargeRace, .{rt})
     else if (std.mem.eql(u8, case, "accounts-generation-wrap"))
         try rt.spawn(runAccountsGenerationWrap, .{rt})
+    else if (std.mem.eql(u8, case, "route-share-boot"))
+        try rt.spawn(runRouteShareBoot, .{rt})
+    else if (std.mem.eql(u8, case, "route-underflow"))
+        try rt.spawn(runRouteUnderflow, .{rt})
     else
         return error.UnknownCase;
     try h.join();

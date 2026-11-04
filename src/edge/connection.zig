@@ -1129,6 +1129,11 @@ pub const GlobalAccounting = struct {
     /// included.
     task_handlers: std.atomic.Value(usize) = .init(0),
     task_handler_capacity: usize,
+    /// The task routes' accounts (`accounts.RouteTable`), built from the same
+    /// route list as the connections' router. A link's charge names its
+    /// route there (`accounts.Charge.route`); this token stays the hard
+    /// ceiling beside them.
+    routes: accounts.RouteTable,
     /// Task handlers still running after their connection ended
     /// (`LinkCore.orphan`: `Connection.orphanSlot`, `h1.endHandler`).
     /// `Server.serve` waits for zero before it returns, because such a
@@ -1205,7 +1210,7 @@ pub const GlobalAccounting = struct {
     // (HTTP/1.1), the per-stream shed (outbound bytes).
 
     pub fn tryAdmitStream(self: *GlobalAccounting, c: accounts.Charge) bool {
-        if (!c.add(.streams, 1, self.active_streams.load(.acquire))) return false;
+        if (c.add(.streams, 1, self.active_streams.load(.acquire)) != .took) return false;
         while (true) {
             const cur = self.active_streams.load(.acquire);
             if (cur >= self.max_streams) {
@@ -1221,17 +1226,29 @@ pub const GlobalAccounting = struct {
         c.sub(.streams, 1);
     }
 
-    pub fn tryReserveTaskHandler(self: *GlobalAccounting, c: accounts.Charge) bool {
-        if (!c.add(.task_handlers, 1, self.task_handlers.load(.acquire))) return false;
+    /// A task handler's token. `c` is the link's charge, with its route:
+    /// client, aggregate, route, then this server-wide token, the hard
+    /// ceiling. `.client_refused` and `.server_full` answer REFUSED_STREAM on
+    /// HTTP/2; `.route_refused` answers 503 on both protocols, because a
+    /// client may retry a REFUSED_STREAM by itself and the route is still
+    /// broken (HTTP/1.1 answers 503 to all three).
+    pub fn tryReserveTaskHandler(self: *GlobalAccounting, c: accounts.Charge) TaskAdmit {
+        switch (c.add(.task_handlers, 1, self.task_handlers.load(.acquire))) {
+            .took => {},
+            .client_refused => return .client_refused,
+            .route_refused => return .route_refused,
+        }
         while (true) {
             const cur = self.task_handlers.load(.acquire);
             if (cur >= self.task_handler_capacity) {
                 c.sub(.task_handlers, 1);
-                return false;
+                return .server_full;
             }
-            if (self.task_handlers.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
+            if (self.task_handlers.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return .ok;
         }
     }
+
+    pub const TaskAdmit = enum { ok, client_refused, route_refused, server_full };
 
     pub fn releaseTaskHandler(self: *GlobalAccounting, c: accounts.Charge) void {
         self.saturatingRelease(&self.task_handlers, 1, "task_handlers", .acq_rel);
@@ -1240,7 +1257,7 @@ pub const GlobalAccounting = struct {
 
     pub fn tryReserveOutbound(self: *GlobalAccounting, c: accounts.Charge, n: usize) bool {
         if (n == 0) return true;
-        if (!c.add(.outbound_bytes, n, self.outbound_bytes.load(.acquire))) return false;
+        if (c.add(.outbound_bytes, n, self.outbound_bytes.load(.acquire)) != .took) return false;
         while (true) {
             const cur = self.outbound_bytes.load(.acquire);
             if (cur > self.max_outbound_bytes or self.max_outbound_bytes - cur < n) {
@@ -1262,7 +1279,7 @@ pub const GlobalAccounting = struct {
     /// pressure) closes the connection, so one identity never parks the loop
     /// for everyone.
     pub fn tryAdmitHandshake(self: *GlobalAccounting, c: accounts.Charge) Admit {
-        if (!c.add(.handshakes, 1, self.active_handshakes.load(.seq_cst))) return .client_refused;
+        if (c.add(.handshakes, 1, self.active_handshakes.load(.seq_cst)) != .took) return .client_refused;
         while (true) {
             const cur = self.active_handshakes.load(.seq_cst);
             if (cur >= self.max_handshakes) {
@@ -7924,14 +7941,20 @@ pub const Connection = struct {
     ///    task token.
     /// 2. Reserve a server-wide task token for a task handler (and 404/405,
     ///    which spawn). The link holds it until it is freed, which bounds live
-    ///    task handlers server-wide, orphaned ones included.
-    /// 3. Claim a handler slot.
+    ///    task handlers server-wide, orphaned ones included. A task route's
+    ///    account takes it too (`accounts.RouteTable`), between the client
+    ///    and the server.
+    /// 3. Claim a handler slot, then charge the request's leased bytes to
+    ///    its task route (known only now).
     /// 4. Build the link; `Response` points at the link, never at the slot.
     /// 5. Increment the live counters, then spawn a task handler or queue a
     ///    complete handler to run on the actor after this lock drops.
     ///
     /// Each failure step undoes the step before it and answers the peer with
-    /// REFUSED_STREAM, which is retryable, rather than dropping the request.
+    /// REFUSED_STREAM, which is retryable, rather than dropping the request;
+    /// a task route over its share is answered 503 instead (with
+    /// INTERNAL_ERROR if that answer cannot be sent), because a client may
+    /// retry a REFUSED_STREAM by itself and the route is still broken.
     ///
     /// A spawn failure for a *task* handler refuses the stream: running it on
     /// the actor would park ingest for as long as that handler blocks (SSE).
@@ -8020,14 +8043,26 @@ pub const Connection = struct {
     }
 
     fn refuseForMemory(self: *Connection, d: session_mod.DispatchRequest, refusal: ?request_pool.Reason) bool {
-        const status = (refusal orelse request_pool.Reason.server_cap).status();
-        // The code that says what the status says: a 503 (the server's or the
-        // connection's memory) is safe to retry, which REFUSED_STREAM tells
-        // the client (RFC 9113 section 8.7); a 500 (the request's own cap) is
-        // not. It replaces the response if the edge refuses it later.
-        const code: frame.ErrorCode = if (status == 503) .refused_stream else .internal_error;
+        const reason = refusal orelse request_pool.Reason.server_cap;
+        const status = reason.status();
+        // The code that says what the status says: a 503 (the server's, the
+        // connection's or the client's memory) is safe to retry, which
+        // REFUSED_STREAM tells the client (RFC 9113 section 8.7); a 500 (the
+        // request's own cap) is not, and neither is a route over its share:
+        // the route is still broken, and a client retries a REFUSED_STREAM
+        // by itself. It replaces the response if the edge refuses it later.
+        const code: frame.ErrorCode = if (status == 503 and reason != .route_share) .refused_stream else .internal_error;
+        self.answerRefusal(d.stream_id, status, code);
+        std.debug.assert(self.releaseSlot(d.stream_id));
+        return true;
+    }
+
+    /// Answer a request refused before any handler ran: `status` with no
+    /// body, or, if the edge refuses that response, an RST with `code`.
+    /// Queued as intents; the next drain sends them.
+    fn answerRefusal(self: *Connection, stream_id: u31, status: u16, code: frame.ErrorCode) void {
         self.session.applyCommand(.{ .refuse_request = .{
-            .stream_id = d.stream_id,
+            .stream_id = stream_id,
             .status = status,
             .reset_code = code,
         } }) catch {
@@ -8037,10 +8072,8 @@ pub const Connection = struct {
             // An RST takes its frame from the terminal store, which always
             // has room for one per stream (`Limits.terminalFrames`), with the
             // same code.
-            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = code } }) catch {};
+            self.session.applyCommand(.{ .reset_stream = .{ .stream_id = stream_id, .code = code } }) catch {};
         };
-        std.debug.assert(self.releaseSlot(d.stream_id));
-        return true;
     }
 
     /// The body of `dispatch`. Returns false, with `d` still the caller's,
@@ -8059,17 +8092,36 @@ pub const Connection = struct {
             else => false,
         };
 
+        // A task route's account (`accounts.RouteTable`): the link's charge
+        // names it, after the client records, so the token, the request's
+        // bytes and its compression context are charged to it too. A complete
+        // route, a 404 and a 405 have none.
+        const route: ?accounts.RouteRef = switch (classified) {
+            .found => |f| if (f.handler == .task) (if (self.config.accounting) |acct| acct.routes.ref(f.route) else null) else null,
+            else => null,
+        };
+        const charge = self.config.charge.withRoute(route);
+
         var token_reserved = false;
         if (!complete_inline) {
             if (self.config.accounting) |acct| {
-                if (!acct.tryReserveTaskHandler(self.config.charge)) {
-                    // Queued, not processed: this can run inside
-                    // `materializeIntents`, whose batch a nested drain would
-                    // overwrite. That loop, or the caller's, sends it.
-                    self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
-                    return true;
+                switch (acct.tryReserveTaskHandler(charge)) {
+                    .ok => token_reserved = true,
+                    .client_refused, .server_full => {
+                        // Queued, not processed: this can run inside
+                        // `materializeIntents`, whose batch a nested drain
+                        // would overwrite. That loop, or the caller's, sends
+                        // it.
+                        self.session.applyCommand(.{ .reset_stream = .{ .stream_id = d.stream_id, .code = .refused_stream } }) catch {};
+                        return true;
+                    },
+                    // No slot was taken: the answer only, and `d` goes back
+                    // with the defer above.
+                    .route_refused => {
+                        self.answerRefusal(d.stream_id, 503, .internal_error);
+                        return true;
+                    },
                 }
-                token_reserved = true;
             }
         }
         // `defer`, not `errdefer`: the no-slot return below carries no error,
@@ -8078,7 +8130,7 @@ pub const Connection = struct {
         // fresh token when it resumes. The link takes ownership where
         // `link.core.task_token` is set.
         defer if (token_reserved) {
-            if (self.config.accounting) |acct| acct.releaseTaskHandler(self.config.charge);
+            if (self.config.accounting) |acct| acct.releaseTaskHandler(charge);
         };
 
         const slot = self.allocSlot(d.stream_id) orelse {
@@ -8091,6 +8143,20 @@ pub const Connection = struct {
         // invariant, and its strings would be memory nobody owns.
         const lease = self.findLease(d.stream_id) orelse
             std.debug.panic("dispatch of stream {d} without request memory", .{d.stream_id});
+        // The route is known only now, so the bytes the header lease already
+        // holds (charged to the connection, the client and the server when
+        // each block was taken) are charged to the route here, and refused
+        // here: a 503. From then on the arena charges the route with every
+        // block it takes and gives it back with every block it returns, an
+        // orphan's included.
+        if (route) |r| {
+            if (!r.add(.request_bytes, lease.arena.held, lease.arena.pool.held_bytes.load(.acquire))) {
+                lease.arena.refusal = .route_share;
+                lease.arena.pool.noteRefusal(.route_share);
+                return self.refuseDispatchForMemory(d, lease);
+            }
+            lease.arena.charge = lease.arena.charge.withRoute(r);
+        }
 
         if (comptime test_observe) {
             if (test_fail_dispatch_alloc.load(.acquire)) {
@@ -8106,7 +8172,7 @@ pub const Connection = struct {
         link.* = .{
             .core = .{
                 .arena = lease.arena,
-                .charge = self.config.charge,
+                .charge = charge,
                 .accounting = self.config.accounting,
                 .balancer = self.config.balancer,
                 .exec_index = self.config.exec_index,
@@ -8956,9 +9022,9 @@ pub const Connection = struct {
         const pool = self.config.compression_pool orelse {
             return .{ .compress = false, .add_vary = add_vary };
         };
-        // Over the client's share under pressure: identity encoding, as for
-        // a pool with no context free.
-        if (!hctx.charge.add(.compression, 1, pool.liveCount())) return .{ .compress = false, .add_vary = add_vary };
+        // Over the client's share, or a task route's, under pressure:
+        // identity encoding, as for a pool with no context free.
+        if (hctx.charge.add(.compression, 1, pool.liveCount()) != .took) return .{ .compress = false, .add_vary = add_vary };
         const enc = pool.tryAcquire() orelse {
             hctx.charge.sub(.compression, 1);
             return .{ .compress = false, .add_vary = add_vary };
@@ -10520,7 +10586,7 @@ test "budget queue: a head refused by the SERVER cap is woken to fail, not left 
     defer trap.close();
     const conn = &trap.hop.conn;
     defer endFakeWaiters(conn);
-    var acct: GlobalAccounting = .{ .max_streams = 8, .task_handler_capacity = 8, .max_outbound_bytes = 160, .max_handshakes = 1 };
+    var acct: GlobalAccounting = .{ .max_streams = 8, .task_handler_capacity = 8, .max_outbound_bytes = 160, .max_handshakes = 1, .routes = .empty };
     conn.config.accounting = &acct;
     conn.config.limits.outbound_bytes_per_connection = 100;
 

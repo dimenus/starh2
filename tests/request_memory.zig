@@ -17,6 +17,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
+const route_share = @import("route_share.zig");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
 
@@ -339,12 +340,15 @@ fn Scenario(comptime run: fn (*starh2.Server, std.mem.Allocator, u16) anyerror!v
     return struct {
         fn serve(rt: *zio.Runtime, gpa: std.mem.Allocator, limits: starh2.Limits) !void {
             const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+            // These scenarios test the request's, the connection's and the
+            // server's caps from one loopback client and one route: `.none`
+            // and whole-server route shares, so no client or route share
+            // refuses first (`tests/shares.zig` and `tests/routes.zig` have
+            // those).
+            const whole = route_share.wholeServer(routes.len, routes, limits);
             var server = try starh2.Server.init(gpa, rt.io(), .{
-                // These scenarios test the request's, the connection's and
-                // the server's caps from one loopback client: `.none`, so no
-                // client share refuses first (`tests/shares.zig` has those).
                 .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
-                .routes = &routes,
+                .routes = &whole,
                 .tls = null,
                 .limits = limits,
             });
