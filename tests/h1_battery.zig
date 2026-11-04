@@ -1,6 +1,8 @@
 //! HTTP/1.1 edge-channel battery. Fixtures live in testdata/h1/.
 //! Every category prints `category=<name> fixtures=<n>` and a zero count fails (I8).
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
@@ -793,7 +795,7 @@ const CountGpa = struct {
 };
 
 fn runZeroAlloc(io: std.Io, gpa: std.mem.Allocator, _: starh2.EndpointAddress) !void {
-    var count: CountGpa = .{ .parent = std.heap.page_allocator };
+    var count: CountGpa = .{ .parent = tsan_allocator.pageAllocator() };
     const listen = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const r = routes();
     var lim = starh2.Limits.defaults;
@@ -1182,8 +1184,8 @@ fn runClientAbort(io: std.Io, gpa: std.mem.Allocator, addr: starh2.EndpointAddre
     var reader = stream.reader(io, &rb);
     var writer = stream.writer(io, &wb);
     try writeReq(&writer.interface, "GET /sse-abort HTTP/1.1\r\nHost: h\r\n\r\n");
-    const head_bytes = try readUntilHead(&reader.interface, std.testing.allocator);
-    defer std.testing.allocator.free(head_bytes);
+    const head_bytes = try readUntilHead(&reader.interface, tsan_allocator.allocator());
+    defer tsan_allocator.allocator().free(head_bytes);
     stream.close(io);
     var waits: usize = 0;
     while (!abort_seen.load(.acquire) and waits < 50) : (waits += 1) {
@@ -1465,9 +1467,9 @@ fn runZio(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "h1.battery fixtures whole and byte-at-a-time" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runZio, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runZio, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -1484,7 +1486,7 @@ test "h1.parity.request_table" {
 }
 
 test "h1.limits.zero_alloc_steady" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
     const Job = struct {
         fn run(runtime: *zio.Runtime, gpa: std.mem.Allocator) !void {
@@ -1492,7 +1494,7 @@ test "h1.limits.zero_alloc_steady" {
             try runZeroAllocTls(runtime, gpa);
         }
     };
-    var handle = try rt.spawn(Job.run, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(Job.run, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -1529,9 +1531,9 @@ test "h1.accept.absolute_form" {
 }
 
 test "h1.keepalive.tls_task_post_reuses" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runTlsTaskPostReuses, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runTlsTaskPostReuses, .{ rt, tsan_allocator.allocator() });
     handle.join() catch |err| {
         std.debug.print("h1.keepalive.tls_task_post_reuses failed: {s}\n", .{@errorName(err)});
         return err;
@@ -1539,23 +1541,23 @@ test "h1.keepalive.tls_task_post_reuses" {
 }
 
 test "h1.alpn.both_offered prefers h2" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runAlpnBoth, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runAlpnBoth, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.alpn.h1_only" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runAlpnH1Only, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runAlpnH1Only, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.alpn.none_offered" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runAlpnNone, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runAlpnNone, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -1615,9 +1617,9 @@ test "h1.limits.resource_upper_bound" {
 }
 
 test "h1.alpn.h2c_unchanged" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runH2cRejectsH1, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runH2cRejectsH1, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -1720,9 +1722,9 @@ fn runParityH2(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "h1.parity.request_table wire h1 vs h2" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runParityH2, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runParityH2, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -1789,9 +1791,9 @@ fn runParityTaskPostBody(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "h1.parity.task_post_body wire h1 vs h2" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runParityTaskPostBody, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runParityTaskPostBody, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -1847,9 +1849,9 @@ fn runTlsSmallRecords(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "h1.shape.tls_small_records" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runTlsSmallRecords, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runTlsSmallRecords, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -2205,7 +2207,7 @@ fn runSlowLoris(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 fn runZeroAllocTls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
-    var count: CountGpa = .{ .parent = std.heap.page_allocator };
+    var count: CountGpa = .{ .parent = tsan_allocator.pageAllocator() };
     const cert_pem = try std.Io.Dir.cwd().readFileAlloc(rt.io(), "testdata/cert.pem", gpa, .limited(64 * 1024));
     defer gpa.free(cert_pem);
     const key_pem = try std.Io.Dir.cwd().readFileAlloc(rt.io(), "testdata/key.pem", gpa, .limited(64 * 1024));
@@ -2248,9 +2250,9 @@ fn runZeroAllocTls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "h1.frame.body_larger_than_recv_buffer" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runBodyLargerThanRecv, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runBodyLargerThanRecv, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -2349,30 +2351,30 @@ fn namedTaskPostReuses(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "h1.frame.early_second_request" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedEarlySecond, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedEarlySecond, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.sse.occupies_connection" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedOccupy, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedOccupy, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.keepalive.idle_reaped" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runIdleReaped, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runIdleReaped, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.keepalive.task_post_reuses" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedTaskPostReuses, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedTaskPostReuses, .{ rt, tsan_allocator.allocator() });
     handle.join() catch |err| {
         std.debug.print("h1.keepalive.task_post_reuses failed: {s}\n", .{@errorName(err)});
         return err;
@@ -2380,9 +2382,9 @@ test "h1.keepalive.task_post_reuses" {
 }
 
 test "h1.keepalive.task_post_reuses_large" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedTaskPostReusesLarge, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedTaskPostReusesLarge, .{ rt, tsan_allocator.allocator() });
     handle.join() catch |err| {
         std.debug.print("h1.keepalive.task_post_reuses_large failed: {s}\n", .{@errorName(err)});
         return err;
@@ -2390,30 +2392,30 @@ test "h1.keepalive.task_post_reuses_large" {
 }
 
 test "h1.limits.slow_loris" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(runSlowLoris, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(runSlowLoris, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.shape.abort_mid_upload" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedAbortMidUpload, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedAbortMidUpload, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.shape.unread_body_closes" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedUnreadBodyCloses, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedUnreadBodyCloses, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
 test "h1.shape.slow_handler" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedSlowHandler, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedSlowHandler, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }
 
@@ -2503,8 +2505,8 @@ fn namedExpect100BodyAfterContinue(rt: *zio.Runtime, gpa: std.mem.Allocator) !vo
 }
 
 test "h1.accept.expect_100_body_after_continue" {
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    var rt = try zio.Runtime.init(tsan_allocator.allocator(), .{});
     defer rt.deinit();
-    var handle = try rt.spawn(namedExpect100BodyAfterContinue, .{ rt, std.testing.allocator });
+    var handle = try rt.spawn(namedExpect100BodyAfterContinue, .{ rt, tsan_allocator.allocator() });
     try handle.join();
 }

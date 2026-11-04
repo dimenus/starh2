@@ -18,6 +18,8 @@
 //! the fix) TSan reports it in every run of this test; against `2f727e3` it
 //! does not.
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 
 const per_round = 200_000;
@@ -41,7 +43,7 @@ fn churn(n: usize) !void {
 }
 
 test "bug2: group tasks that finish on the other executor while the spawner is in registerTask" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     for (0..rounds) |r| {
         const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
         defer rt.deinit();

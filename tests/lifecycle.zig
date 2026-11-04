@@ -5,6 +5,8 @@
 //! client, so a client's share (an eighth of each limit, refused under
 //! pressure) would refuse first, and on some interleavings only.
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
@@ -1635,7 +1637,7 @@ test "lifecycle: DebugAllocator canary detects intentional leak" {
         }
     };
 
-    var canary: Canary = .{ .parent = std.heap.page_allocator };
+    var canary: Canary = .{ .parent = tsan_allocator.pageAllocator() };
     const gpa = canary.allocator();
     const leaked = try gpa.alloc(u8, 32);
     try std.testing.expect(canary.live != 0); // detector fires
@@ -1751,7 +1753,7 @@ fn failIndexHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Res
 }
 
 fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutcome {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+    var failing = std.testing.FailingAllocator.init(tsan_allocator.allocator(), .{ .fail_index = fail_index });
     const gpa = failing.allocator();
     const limits = starh2.Limits{
         .max_connections = 1,
@@ -1813,8 +1815,8 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
     };
     zio.sleep(.fromMilliseconds(20)) catch {};
 
-    const request_bytes = try h2c.buildClientPost(std.testing.allocator, "/fail-index", fail_index_body);
-    defer std.testing.allocator.free(request_bytes);
+    const request_bytes = try h2c.buildClientPost(tsan_allocator.allocator(), "/fail-index", fail_index_body);
+    defer tsan_allocator.allocator().free(request_bytes);
     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
     var response_ok = false;
     if (peer.connect(.{})) |stream_value| {
@@ -1851,7 +1853,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
 }
 
 test "lifecycle: every public Server allocation failure unwinds cleanly" {
-    const rt = try zio.Runtime.init(std.testing.allocator, .{
+    const rt = try zio.Runtime.init(tsan_allocator.allocator(), .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         // FailingAllocator is deliberately not thread-safe. One executor makes
         // fail-index ordering deterministic while still exercising task unwind.
@@ -1909,13 +1911,13 @@ test "regression: stream map drops closed streams (bounded history)" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(tsan_allocator.allocator(), tsan_allocator.allocator(), .defaults);
     defer session.deinit();
     // free intents
     {
         const intents = session.drainIntents();
         for (intents) |*it| switch (it.*) {
-            .outbound_frame => |f| std.testing.allocator.free(f.payload),
+            .outbound_frame => |f| tsan_allocator.allocator().free(f.payload),
             else => {},
         };
         // intent_drain scratch — do not free slice
@@ -1927,19 +1929,19 @@ test "regression: stream map drops closed streams (bounded history)" {
         .{ .name = ":path", .value = "/hello" },
         .{ .name = ":authority", .value = "localhost" },
     };
-    const block = try hpack.Encoder.encode(std.testing.allocator, &fields);
-    defer std.testing.allocator.free(block);
+    const block = try hpack.Encoder.encode(tsan_allocator.allocator(), &fields);
+    defer tsan_allocator.allocator().free(block);
 
     var sid: u31 = 1;
     var n: usize = 0;
     while (n < 2000) : (n += 1) {
         var wire: std.ArrayList(u8) = .empty;
-        defer wire.deinit(std.testing.allocator);
+        defer wire.deinit(tsan_allocator.allocator());
         if (n == 0) {
-            try wire.appendSlice(std.testing.allocator, frame.CLIENT_PREFACE);
+            try wire.appendSlice(tsan_allocator.allocator(), frame.CLIENT_PREFACE);
             var sbuf: [9]u8 = undefined;
             const sn = try frame.Serializer.settingsFrame(&sbuf, false, &.{});
-            try wire.appendSlice(std.testing.allocator, sbuf[0..sn]);
+            try wire.appendSlice(tsan_allocator.allocator(), sbuf[0..sn]);
         }
         var hdr_buf: [frame.FRAME_HEADER_LEN]u8 = undefined;
         const fh = frame.FrameHeader{
@@ -1949,8 +1951,8 @@ test "regression: stream map drops closed streams (bounded history)" {
             .stream_id = sid,
         };
         fh.encode(&hdr_buf);
-        try wire.appendSlice(std.testing.allocator, &hdr_buf);
-        try wire.appendSlice(std.testing.allocator, block);
+        try wire.appendSlice(tsan_allocator.allocator(), &hdr_buf);
+        try wire.appendSlice(tsan_allocator.allocator(), block);
         try session.ingest(wire.items);
         const intents = session.drainIntents();
         var respond_sid: ?u31 = null;
@@ -1958,13 +1960,13 @@ test "regression: stream map drops closed streams (bounded history)" {
             switch (it.*) {
                 .dispatch_request => |d| {
                     respond_sid = d.stream_id;
-                    starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.headers);
-                    std.testing.allocator.free(d.headers);
-                    starh2.core.hpack.HeaderField.freeOwnedSlice(std.testing.allocator, d.trailers);
-                    if (d.trailers.len != 0) std.testing.allocator.free(d.trailers);
-                    if (d.body.len != 0) std.testing.allocator.free(d.body);
+                    starh2.core.hpack.HeaderField.freeOwnedSlice(tsan_allocator.allocator(), d.headers);
+                    tsan_allocator.allocator().free(d.headers);
+                    starh2.core.hpack.HeaderField.freeOwnedSlice(tsan_allocator.allocator(), d.trailers);
+                    if (d.trailers.len != 0) tsan_allocator.allocator().free(d.trailers);
+                    if (d.body.len != 0) tsan_allocator.allocator().free(d.body);
                 },
-                .outbound_frame => |f| std.testing.allocator.free(f.payload),
+                .outbound_frame => |f| tsan_allocator.allocator().free(f.payload),
                 else => {},
             }
         }
@@ -1979,7 +1981,7 @@ test "regression: stream map drops closed streams (bounded history)" {
         {
             const more = session.drainIntents();
             for (more) |*it| switch (it.*) {
-                .outbound_frame => |f| std.testing.allocator.free(f.payload),
+                .outbound_frame => |f| tsan_allocator.allocator().free(f.payload),
                 else => {},
             };
         }
@@ -1992,12 +1994,12 @@ test "regression: stream map drops closed streams (bounded history)" {
 test "rates: SETTINGS flood trips ENHANCE_YOUR_CALM" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
-    var session = try session_mod.Session.init(std.testing.allocator, std.testing.allocator, .defaults);
+    var session = try session_mod.Session.init(tsan_allocator.allocator(), tsan_allocator.allocator(), .defaults);
     defer session.deinit();
     {
         const intents = session.drainIntents();
         for (intents) |*it| switch (it.*) {
-            .outbound_frame => |f| std.testing.allocator.free(f.payload),
+            .outbound_frame => |f| tsan_allocator.allocator().free(f.payload),
             else => {},
         };
         // intent_drain scratch — do not free slice
@@ -2023,7 +2025,7 @@ test "rates: SETTINGS flood trips ENHANCE_YOUR_CALM" {
     }
     const intents = session.drainIntents();
     for (intents) |*it| switch (it.*) {
-        .outbound_frame => |f| std.testing.allocator.free(f.payload),
+        .outbound_frame => |f| tsan_allocator.allocator().free(f.payload),
         else => {},
     };
     // intent_drain scratch — do not free slice
@@ -2050,7 +2052,7 @@ test "rates: completed HEADERS do not trip ENHANCE_YOUR_CALM" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     drainSessionIntents(gpa, &session);
@@ -2096,7 +2098,7 @@ test "rates: RST flood trips ENHANCE_YOUR_CALM" {
     const session_mod = starh2.core.session;
     const frame = starh2.core.frame;
     const hpack = starh2.core.hpack;
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     var session = try session_mod.Session.init(gpa, gpa, .defaults);
     defer session.deinit();
     drainSessionIntents(gpa, &session);

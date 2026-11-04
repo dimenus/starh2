@@ -11,6 +11,8 @@
 //! while the slot is held, and is served after the first client leaves. The
 //! third gate stops the server while the accept loop is parked.
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
@@ -225,7 +227,7 @@ fn runTlsQueued(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "admission: a TLS client queued behind a full handshake limit is served when a slot frees" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var handle = try rt.spawn(runTlsQueued, .{ rt, gpa });
@@ -284,7 +286,7 @@ fn runH1Queued(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "admission: an h1c client queued behind a full connection limit is served when a slot frees" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var handle = try rt.spawn(runH1Queued, .{ rt, gpa });
@@ -344,7 +346,7 @@ fn runStopWhileParked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "admission: stopping the server while the accept loop waits for a slot returns promptly" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var handle = try rt.spawn(runStopWhileParked, .{ rt, gpa });

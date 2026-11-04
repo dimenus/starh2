@@ -23,6 +23,8 @@
 //! The client is a blocking raw-socket client on its own thread, as in
 //! `goaway_delivery.zig`, so it sees exactly what the socket carries.
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
@@ -262,7 +264,7 @@ fn runReuse(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, endi
 }
 
 fn runReuseCase(transport: Transport, ending: Ending) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runReuse, .{ rt, gpa, transport, ending });
@@ -447,7 +449,7 @@ fn rigConnection(rig: *Rig, stream: std.Io.net.Stream, slot: *starh2.edge.conn_s
 }
 
 test "slot reuse: h2c after a cancel behaves like a fresh slot" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runCancel, .{ rt, gpa });
@@ -669,7 +671,7 @@ fn runBootCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Transport)
 }
 
 fn runBootCallsCase(transport: Transport) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runBootCalls, .{ rt, gpa, transport });
@@ -735,7 +737,7 @@ fn runDirty(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: conn_mod.DirtyKind, 
 }
 
 fn runDirtyCase(kind: conn_mod.DirtyKind, leaks: usize) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runDirty, .{ rt, gpa, kind, leaks });
@@ -841,7 +843,7 @@ fn runExhausted(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
 }
 
 fn runExhaustedCase(transport: Transport) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runExhausted, .{ rt, gpa, transport });
@@ -918,7 +920,7 @@ fn runExhaustedProxy(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "slots: a PROXY endpoint with every slot quarantined refuses the connection and gives its header-waiter slot back" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runExhaustedProxy, .{ rt, gpa });
@@ -1012,7 +1014,7 @@ fn runShutdown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "slots: shutdown with slots in use and slots free returns and frees every slot once" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runShutdown, .{ rt, gpa });
@@ -1150,7 +1152,7 @@ fn runRequestMemoryCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: T
 }
 
 fn runRequestMemoryCallsCase(transport: Transport) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runRequestMemoryCalls, .{ rt, gpa, transport });
@@ -1455,7 +1457,7 @@ fn runHttp2PathCalls(rt: *zio.Runtime, real: std.mem.Allocator, transport: Trans
 }
 
 fn runHttp2PathCallsCase(transport: Transport) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runHttp2PathCalls, .{ rt, gpa, transport });

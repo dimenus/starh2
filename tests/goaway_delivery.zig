@@ -8,6 +8,8 @@
 //! scenario ends with "read until the server closes", so a frame after the
 //! GOAWAY, or a server that never closes, fails too.
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
 const wire_client = @import("wire_client.zig");
@@ -578,7 +580,7 @@ fn newRuntime(gpa: std.mem.Allocator) !*zio.Runtime {
 }
 
 fn runCase(transport: Transport, scenario: Scenario, label: []const u8) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runScenario, .{ rt, gpa, transport, scenario, label });
@@ -1190,7 +1192,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
 }
 
 fn runStalledCase(transport: Transport, stall: Stall, check_kind: StalledCheck, label: []const u8) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runStalled, .{ rt, gpa, transport, stall, check_kind, label });
@@ -1640,7 +1642,7 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
 }
 
 fn runIdleCase(transport: Transport, case: IdleCase, label: []const u8) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runIdle, .{ rt, gpa, transport, case, label });
@@ -1837,7 +1839,7 @@ fn outliveCase(transport: Transport, mode: OutliveMode) !void {
     outlive_mode = mode;
     outlive_started.store(false, .release);
     outlive_done.store(false, .release);
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runOutlive, .{ rt, gpa, transport });
@@ -2016,7 +2018,7 @@ const H1OutliveClient = struct {
     }
 
     fn run(c: *H1OutliveClient) !void {
-        const gpa = std.heap.page_allocator;
+        const gpa = tsan_allocator.pageAllocator();
         const w = try Wire.openAlpn(gpa, h1WireTransport(c.transport), c.port, null, "http/1.1");
         defer w.close();
         var buf: [512]u8 = undefined;
@@ -2048,7 +2050,7 @@ const H1OkClient = struct {
     }
 
     fn run(c: *H1OkClient) !void {
-        const gpa = std.heap.page_allocator;
+        const gpa = tsan_allocator.pageAllocator();
         const w = try Wire.openAlpn(gpa, h1WireTransport(c.transport), c.port, null, "http/1.1");
         defer w.close();
         try w.send("GET /ok HTTP/1.1\r\nHost: localhost\r\nconnection: close\r\n\r\n");
@@ -2196,7 +2198,7 @@ fn h1OutliveCase(transport: H1Transport, trigger: H1Trigger, mode: H1OutliveMode
     h1o_late_closed.store(false, .release);
     h1o_late_cause.store(0, .release);
     h1o_request.store(0, .release);
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runH1Outlive, .{ rt, gpa, transport, trigger });
@@ -2300,7 +2302,7 @@ const H1StalledClient = struct {
     }
 
     fn run(c: *H1StalledClient) !void {
-        const gpa = std.heap.page_allocator;
+        const gpa = tsan_allocator.pageAllocator();
         const w = try Wire.openAlpn(gpa, h1WireTransport(c.transport), c.port, 4096, "http/1.1");
         defer w.close();
         try w.send("GET /flood HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -2381,7 +2383,7 @@ fn h1BlockedWriteCase(transport: H1Transport) !void {
     h1w_done.store(false, .release);
     h1w_closed.store(false, .release);
     h1w_cause.store(0, .release);
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runH1BlockedWrite, .{ rt, gpa, transport });
@@ -2435,7 +2437,7 @@ const H1Exchange = struct {
     }
 
     fn run(c: *H1Exchange) !void {
-        const w = try Wire.openAlpn(std.heap.page_allocator, .h2c, c.port, null, "http/1.1");
+        const w = try Wire.openAlpn(tsan_allocator.pageAllocator(), .h2c, c.port, null, "http/1.1");
         defer w.close();
         try w.send(c.req);
         h1ReadUntil(w, c.want, nowNs() + client_deadline_ns) catch |err| switch (err) {
@@ -2560,7 +2562,7 @@ fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void
 
 fn h1RefusalCase(kind: H1Refusal) !void {
     h1r_running.store(0, .release);
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runH1Refusal, .{ rt, gpa, kind });
@@ -2656,7 +2658,7 @@ const H1Drainer = struct {
     fn run(c: *H1Drainer) !void {
         const deadline = nowNs() + 5 * std.time.ns_per_s;
         const w = while (true) {
-            break Wire.openAlpn(std.heap.page_allocator, .tls, c.port, null, "http/1.1") catch |err| switch (err) {
+            break Wire.openAlpn(tsan_allocator.pageAllocator(), .tls, c.port, null, "http/1.1") catch |err| switch (err) {
                 error.Connect => {
                     if (!c.connect_retry or nowNs() >= deadline) return err;
                     const t: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
@@ -2788,7 +2790,7 @@ fn runH1MultiChunk(rt: *zio.Runtime, gpa: std.mem.Allocator, trigger: H1MultiTri
 }
 
 fn h1MultiChunkCase(trigger: H1MultiTrigger) !void {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     var tally: H1MultiTally = .{};
     for (0..h1m_rounds) |_| {
         const rt = try newRuntime(gpa);
@@ -2844,7 +2846,7 @@ const H1Resetter = struct {
 
     fn run(c: *H1Resetter) !void {
         for (0..h1x_rounds) |i| {
-            const w = try Wire.openAlpn(std.heap.page_allocator, .tls, c.port, null, "http/1.1");
+            const w = try Wire.openAlpn(tsan_allocator.pageAllocator(), .tls, c.port, null, "http/1.1");
             defer w.close();
             try w.send("GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n");
             // Even rounds: reset once the head is in, with the body still
@@ -2911,7 +2913,7 @@ fn runH1Reset(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "h1 tls: clients that reset during a response do not crash the server (t-3759 round 2)" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try newRuntime(gpa);
     defer rt.deinit();
     var h = try rt.spawn(runH1Reset, .{ rt, gpa });

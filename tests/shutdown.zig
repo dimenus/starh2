@@ -6,6 +6,8 @@
 //! a child process, `tests/shutdown_child.zig`, which `build.zig` runs and
 //! checks; so do `deinit` on a live server and an accounting underflow.
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const starh2 = @import("starh2");
 const h2c = @import("starh2_h2_client");
@@ -78,7 +80,7 @@ const Client = struct {
     }
 
     fn run(c: *Client) !void {
-        const gpa = std.heap.page_allocator;
+        const gpa = tsan_allocator.pageAllocator();
         const w = if (c.connect_retry) try openRetry(gpa, c.port) else try Wire.open(gpa, .h2c, c.port);
         defer w.close();
         var req = try h2c.buildClientPrefaceAndSettings(gpa);
@@ -166,7 +168,7 @@ fn runCooperativeAcking(rt: *zio.Runtime, gpa: std.mem.Allocator, ack_pings: boo
 }
 
 test "shutdown: a cooperative handler ends within the grace, the cancel report counts it, and serve returns" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runCooperative, .{ rt, gpa });
@@ -174,7 +176,7 @@ test "shutdown: a cooperative handler ends within the grace, the cancel report c
 }
 
 test "shutdown: with a client that answers the drain PING, the cancel report still comes when the cancel does" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runCooperativeAcking, .{ rt, gpa, true });
@@ -281,7 +283,7 @@ fn runH1Cancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "shutdown: an HTTP/1.1 handler cancelled at shutdown is reported then, not at the end of the drain" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runH1Cancel, .{ rt, gpa });
@@ -355,7 +357,7 @@ fn runStartupFailure(rt: *zio.Runtime, gpa: std.mem.Allocator, h1: bool) !void {
 }
 
 test "shutdown: a startup failure with a handler already running waits for it like any other exit" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runStartupFailure, .{ rt, gpa, false });
@@ -363,7 +365,7 @@ test "shutdown: a startup failure with a handler already running waits for it li
 }
 
 test "shutdown: an HTTP/1.1 startup failure with a handler already running waits for it" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runStartupFailure, .{ rt, gpa, true });
@@ -392,7 +394,7 @@ const H1TlsLinger = struct {
     }
 
     fn open(c: *H1TlsLinger) !void {
-        const w = try Wire.connect(std.heap.page_allocator, .tls, c.port);
+        const w = try Wire.connect(tsan_allocator.pageAllocator(), .tls, c.port);
         errdefer w.close();
         w.alpn = "http/1.1";
         try w.handshake();
@@ -478,7 +480,7 @@ fn runCanceledServe(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: CancelKind) 
 }
 
 test "shutdown: a canceled serve waits for a running HTTP/1.1 handler and reports it" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runCanceledServe, .{ rt, gpa, CancelKind.h1c });
@@ -486,7 +488,7 @@ test "shutdown: a canceled serve waits for a running HTTP/1.1 handler and report
 }
 
 test "shutdown: a canceled serve waits for a running HTTP/2 handler and reports it" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runCanceledServe, .{ rt, gpa, CancelKind.h2c });
@@ -494,7 +496,7 @@ test "shutdown: a canceled serve waits for a running HTTP/2 handler and reports 
 }
 
 test "shutdown: a canceled serve waits for a running HTTP/1.1-over-TLS handler and reports it" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runCanceledServe, .{ rt, gpa, CancelKind.h1_tls });
@@ -502,7 +504,7 @@ test "shutdown: a canceled serve waits for a running HTTP/1.1-over-TLS handler a
 }
 
 test "shutdown: a server with no handler left returns without a report" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     var h = try rt.spawn(runIdle, .{ rt, gpa });

@@ -10,6 +10,8 @@
 //! Under work_stealing the same scenarios run, but the placement is `.auto` by
 //! design and the check is compiled out, so those builds assert that instead.
 const std = @import("std");
+/// Under ThreadSanitizer, allocators that never call `mremap` (t-3837).
+const tsan_allocator = @import("tsan_allocator.zig");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
 const starh2 = @import("starh2");
@@ -106,7 +108,7 @@ fn assertWorkStealingRefusesLocal() !void {
 }
 
 test "placement: an h2c connection's pumps and SSE handlers run on the actor's executor" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         .executors = .exact(2),
@@ -256,7 +258,7 @@ fn runH1HandlerPlacement(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "placement: HTTP/1.1 handler jobs spawn on the connection's placement, and the connection's end cancels them" {
-    const gpa = std.testing.allocator;
+    const gpa = tsan_allocator.allocator();
     const rt = try zio.Runtime.init(gpa, .{
         .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         .executors = .exact(2),
