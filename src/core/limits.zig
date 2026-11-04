@@ -273,6 +273,21 @@ pub const Limits = struct {
     /// Its own cap, not the handshake slots, because the handshake slot is
     /// taken only once the header is read.
     proxy_header_waiters: usize = 64,
+    /// The start buckets of every client identity (`accounts.zig`, "Start
+    /// buckets"): connection starts on every endpoint, TLS handshake starts
+    /// on TLS endpoints. `burst` at once, then one token every `refill_ns`
+    /// (62.5 ms: 16 a second). An empty bucket refuses (the connection is
+    /// closed at accept) only while its resource is at its pressure mark: the
+    /// connections, or the handshakes in progress. Neither may be 0.
+    connection_start_burst: u32 = 128,
+    connection_start_refill_ns: u64 = std.time.ns_per_s / 16,
+    handshake_start_burst: u32 = 128,
+    handshake_start_refill_ns: u64 = std.time.ns_per_s / 16,
+    /// Client-table records kept beyond the parties that can hold one, for
+    /// rate-only records (`clientTableRecords`): how many idle identities'
+    /// start buckets the table keeps while it is otherwise full. Past it the
+    /// rate-only record that refills soonest is reused for a new key.
+    client_rate_records: usize = 1_024,
     decoded_header_bytes: usize = 32 * 1024,
     compressed_header_bytes: usize = 64 * 1024,
     header_fields: usize = 100,
@@ -462,6 +477,15 @@ pub const Limits = struct {
         if (conn > accounts.Share.of(server).client) return error.InvalidConfig;
     }
 
+    /// The client table's rules: the shares and the two start buckets.
+    pub fn accountRules(self: Limits) accounts.Rules {
+        return .{
+            .shares = self.shares(),
+            .connection_start = .{ .burst = self.connection_start_burst, .interval_ns = self.connection_start_refill_ns },
+            .handshake_start = .{ .burst = self.handshake_start_burst, .interval_ns = self.handshake_start_refill_ns },
+        };
+    }
+
     /// The share rule of every resource, from the server-wide limits
     /// (`accounts.zig` has the rule). The request pool's limit is its
     /// resident cap; its use is the bytes it holds.
@@ -644,11 +668,13 @@ pub const Limits = struct {
     /// holding those records, one connection per loop), as many records as
     /// one party's charge can name (`accounts.max_refs`: an IPv6 client is
     /// its /64 and its aggregate). Admitted and waiting parties alone can
-    /// then never fill the table. A later step adds a reserve for rate-only
-    /// records. An insert that still fails (records a bug left quarantined,
-    /// or slots retired) refuses its connection (`accounts.Table.acquire`).
+    /// then never fill the table. On top, `client_rate_records` identities
+    /// kept for their start buckets alone (rate-only records, evictable). An
+    /// insert that still fails (records a bug left quarantined, or slots
+    /// retired) refuses its connection (`accounts.Table.acquire`).
     pub fn clientTableRecords(self: Limits) error{InvalidConfig}!usize {
-        const parties = try checkedAdd(try checkedAdd(self.max_connections, self.max_endpoints), try checkedAdd(self.concurrent_tls_handshakes, self.max_task_handlers));
+        const holders = try checkedAdd(try checkedAdd(self.max_connections, self.max_endpoints), try checkedAdd(self.concurrent_tls_handshakes, self.max_task_handlers));
+        const parties = try checkedAdd(holders, self.client_rate_records);
         const n = try checkedMul(parties, accounts.max_refs);
         if (n == 0 or n >= std.math.maxInt(u32) / 2) return error.InvalidConfig;
         return n;
@@ -730,6 +756,12 @@ pub const Limits = struct {
         if (self.client_ipv6_aggregate_prefix_bits == 0 or self.client_ipv6_aggregate_prefix_bits >= 64) return error.InvalidConfig;
         if (self.proxy_header_bytes < proxy_protocol.min_header_cap or self.proxy_header_bytes > proxy_protocol.fixed_bytes + std.math.maxInt(u16)) return error.InvalidConfig;
         if (self.proxy_header_waiters == 0) return error.InvalidConfig;
+        // A bucket's whole span (`burst` refills) must fit the clock's u64.
+        for ([_]u32{ self.connection_start_burst, self.handshake_start_burst }, [_]u64{ self.connection_start_refill_ns, self.handshake_start_refill_ns }) |burst, refill| {
+            if (burst == 0 or refill == 0) return error.InvalidConfig;
+            _ = try checkedMul(burst, refill);
+            if (burst * refill > std.math.maxInt(u64) / 4) return error.InvalidConfig;
+        }
 
         var terms: Terms = .{};
 
@@ -1219,8 +1251,9 @@ test "clientTableRecords counts every party that can hold records, accept loops 
     l.concurrent_tls_handshakes = 1;
     l.max_task_handlers = 1;
     l.max_endpoints = 4;
+    l.client_rate_records = 5;
     // Connections, handshakes, task handlers, and one accept loop per
-    // endpoint holding the records of a connection it waits to admit; each
-    // party up to max_refs records.
-    try std.testing.expectEqual(@as(usize, (3 + 1 + 1 + 4) * accounts.max_refs), try l.clientTableRecords());
+    // endpoint holding the records of a connection it waits to admit, then
+    // the rate-only reserve; each up to max_refs records.
+    try std.testing.expectEqual(@as(usize, (3 + 1 + 1 + 4 + 5) * accounts.max_refs), try l.clientTableRecords());
 }

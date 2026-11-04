@@ -1052,6 +1052,8 @@ fn smallTableLimits() starh2.Limits {
     limits.concurrent_tls_handshakes = 1;
     limits.max_task_handlers = 1;
     limits.max_endpoints = 1;
+    // No rate-only reserve: these tests count the parties' records.
+    limits.client_rate_records = 0;
     return limits;
 }
 
@@ -1113,7 +1115,10 @@ fn tableFull(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var filled: usize = 0;
     defer for (fill[0..filled]) |f| rig.server.clients.release(f);
     while (filled < want) : (filled += 1) {
-        fill[filled] = (try rig.server.clients.acquire(&.{v4Key(.{ 10, 99, 0, @intCast(filled) })}, 0)) orelse return error.TableFullTooEarly;
+        fill[filled] = switch (try rig.server.clients.acquire(&.{v4Key(.{ 10, 99, 0, @intCast(filled) })}, 0, null)) {
+            .charge => |ch| ch,
+            else => return error.TableFullTooEarly,
+        };
     }
     try std.testing.expectEqual(cap - 1, rig.server.clients.stats().live);
     const c = try proxyH2(addr, gpa, .{ .peer = .{ .ip6 = ip6("2001:db8:c::1") } }, "/hello");
@@ -1387,6 +1392,11 @@ fn soak(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var rig: Rig = undefined;
     var limits = testLimits();
     limits.graceful_drain_timeout_ns = 100 * ms;
+    // Buckets that refill at once, so no record stays for its rate state
+    // and every key leaves the table between rounds: the same key is removed
+    // and inserted again. `soakRefusals` keeps them.
+    limits.connection_start_refill_ns = 1;
+    limits.handshake_start_refill_ns = 1;
     try rig.start(rt, gpa, &.{
         .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
         .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
@@ -1453,6 +1463,84 @@ fn soak(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
 test "soak: h2c, TLS, HTTP/1.1 and PROXY churn with resets, GOAWAYs and shutdown leaves every account at zero" {
     try runIn(soak);
+}
+
+/// The soak again, with limits tight enough that the shares and the start
+/// buckets refuse all the time (t-3759 step 4): one loopback client is over
+/// its share of connections, streams and task handlers under pressure, and
+/// its connection-start bucket runs dry. A refusal is a client error here,
+/// so none is counted against the server; what must hold is conservation:
+/// nothing live or quarantined, no underflow, no stale reference, and every
+/// insert either removed or kept as a rate-only record. The instrument must
+/// fire: the run fails if any of those refusals did not happen.
+fn soakRefusals(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetRoutes();
+    var rig: Rig = undefined;
+    var limits = testLimits();
+    limits.graceful_drain_timeout_ns = 100 * ms;
+    // Share 2, mark 4.
+    limits.max_connections = 16;
+    // Share 2, mark 3.
+    limits.max_streams_per_server = 24;
+    limits.max_task_handlers = 24;
+    limits.concurrent_tls_handshakes = 8;
+    limits.connection_start_burst = 6;
+    limits.connection_start_refill_ns = 40 * ms;
+    try rig.start(rt, gpa, &.{
+        .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
+    }, limits, true);
+    var stopped = false;
+    defer if (!stopped) rig.stop();
+    var stats: SoakStats = .{};
+    const seed: u64 = @truncate(nowNs());
+    std.debug.print("accounts refusal soak: seed {d}\n", .{seed});
+    var ctx: SoakCtx = .{ .gpa = gpa, .ports = .{ rig.port(0), rig.port(1), rig.port(2), rig.port(3) }, .stats = &stats, .seed = seed, .lifetimes = 6 };
+    for (0..3) |round| {
+        ctx.seed = seed +% round;
+        try soakRound(rt, &ctx, 16);
+        try waitUntil("quiet after a round", &rig, quiet, 10 * std.time.ns_per_s);
+    }
+    ctx.seed = seed +% 99;
+    var last = try zio.spawn(soakRound, .{ rt, &ctx, 16 });
+    zio.sleep(.fromMilliseconds(60)) catch {};
+    rig.server.requestShutdown();
+    serve_deadline.join(&rig.server, &rig.handle);
+    last.join() catch {};
+    const st = rig.server.clients.stats();
+    const t = &rig.server.clients;
+    std.debug.print("accounts refusal soak: {d} connections, {d} client errors; refused by share: {d} connections, {d} handshakes, {d} streams, {d} task handlers; by bucket: {d} connection starts, {d} handshake starts; table: {d} inserts, {d} removals, {d} rate-only, {d} evictions, {d} live, {d} quarantined, {d} underflows, {d} stale\n", .{
+        stats.connections.load(.acquire),  stats.errors.load(.acquire),
+        t.shareRefusals(.connections),     t.shareRefusals(.handshakes),
+        t.shareRefusals(.streams),         t.shareRefusals(.task_handlers),
+        st.rate_refusals[0],               st.rate_refusals[1],
+        st.inserts,                        st.removals,
+        st.rate_only,                      st.evictions,
+        st.live,                           st.quarantined,
+        st.underflows,                     st.stale,
+    });
+    stats.printErrors();
+    // The instrument fired: every refusal kind this soak is built to drive.
+    try std.testing.expect(stats.connections.load(.acquire) > 300);
+    try std.testing.expect(t.shareRefusals(.connections) > 0);
+    try std.testing.expect(t.shareRefusals(.streams) + t.shareRefusals(.task_handlers) > 0);
+    try std.testing.expect(st.rate_refusals[0] > 0);
+    // Conservation.
+    try std.testing.expectEqual(@as(usize, 0), st.live);
+    try std.testing.expectEqual(@as(usize, 0), st.quarantined);
+    try std.testing.expectEqual(st.inserts, st.removals + st.rate_only);
+    try std.testing.expectEqual(@as(u64, 0), st.underflows);
+    try std.testing.expectEqual(@as(u64, 0), st.stale);
+    stopped = true;
+    rig.server.deinit(gpa);
+    gpa.free(rig.cert);
+    gpa.free(rig.key);
+}
+
+test "soak: the same churn under shares and start buckets that refuse all the time leaves every account at zero" {
+    try runIn(soakRefusals);
 }
 
 // ---------------------------------------------------------------------------

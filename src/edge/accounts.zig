@@ -99,11 +99,35 @@
 //!   zero is refused (the count stays), counted in `underflows` and logged,
 //!   and nothing is removed on the strength of it.
 //!
+//! # Start buckets and rate-only records
+//!
+//! Two token buckets per record, both kept as a theoretical arrival time
+//! (GCRA): connection starts, on every endpoint, and TLS handshake starts, on
+//! TLS endpoints (`Rules.connection_start`, `handshake_start`: burst 128,
+//! 16 a second by default). The connection-start bucket covers h2c and
+//! HTTP/1.1 too, because the per-connection frame buckets renew with each new
+//! connection. A start always takes a token when there is one; an empty
+//! bucket refuses only while the resource's server use is at its pressure
+//! mark (connections, or handshakes in progress), as a share does. The client
+//! and, for IPv6, the aggregate each have both buckets, so one /48 starts
+//! connections no faster than one address. Buckets change only under the
+//! lock, in `acquire`, where every start takes its references.
+//!
+//! A bucket must outlive its client's charges: if the record went with its
+//! last holder, a client that reconnects serially would get its burst back
+//! every time. So a record whose last holder leaves while a bucket is not yet
+//! full stays in the index as a rate-only record: no holder, no charge, its
+//! generation moved as for any removal (no old reference matches it), its
+//! buckets kept. A start that finds it takes it back. A rate-only record is
+//! evictable: when the slab is full, the one whose buckets are full soonest
+//! (the oldest refill time) is taken for the new key (`evictions`).
+//!
 //! # Capacity
 //!
-//! `Limits.clientTableRecords`. An insert that finds the slab full fails; the
-//! caller refuses that connection and counts it (`insert_failures`). Nothing
-//! is ever admitted uncounted.
+//! `Limits.clientTableRecords`, which includes a reserve for rate-only
+//! records. An insert that finds the slab full with no rate-only record to
+//! evict fails; the caller refuses that connection and counts it
+//! (`insert_failures`). Nothing is ever admitted uncounted.
 const std = @import("std");
 const zio = @import("zio");
 const request = @import("../http/request.zig");
@@ -228,6 +252,69 @@ pub const Shares = [resource_count]Share;
 /// unit tests and the child-process cases that build a table by hand.
 pub const unlimited: Shares = @splat(Share.of(std.math.maxInt(usize)));
 
+/// A start bucket: `burst` starts at once, then one every `interval_ns`.
+pub const Bucket = struct {
+    burst: u64,
+    interval_ns: u64,
+
+    /// The arrival time a start at `now` leaves, when the bucket has a token
+    /// for it (GCRA: the bucket is full again at `tat`, and a start
+    /// conforms while `tat` stays within `burst` intervals of now).
+    fn take(self: Bucket, tat: u64, now: u64) ?u64 {
+        const next = @max(tat, now) + self.interval_ns;
+        if (next - now > self.burst * self.interval_ns) return null;
+        return next;
+    }
+};
+
+pub const BucketKind = enum(u1) { connection_start, handshake_start };
+
+/// Everything the table refuses by: the shares, and the two start buckets
+/// (`Limits.accountRules`).
+pub const Rules = struct {
+    shares: Shares,
+    connection_start: Bucket,
+    handshake_start: Bucket,
+
+    /// Nothing refused: for the unit tests and the child-process cases.
+    pub const unlimited: Rules = .{
+        .shares = accounts_unlimited,
+        .connection_start = .{ .burst = std.math.maxInt(u32), .interval_ns = 1 },
+        .handshake_start = .{ .burst = std.math.maxInt(u32), .interval_ns = 1 },
+    };
+
+    fn bucket(self: *const Rules, kind: BucketKind) Bucket {
+        return switch (kind) {
+            .connection_start => self.connection_start,
+            .handshake_start => self.handshake_start,
+        };
+    }
+};
+
+const accounts_unlimited = unlimited;
+
+/// A connection start, for `Table.acquire`: when, and which buckets refuse
+/// now. A key acquired without one (a test) touches no bucket.
+pub const Start = struct {
+    now_ns: u64,
+    /// The server's connections, before this one: the pressure reading for
+    /// the connection-start bucket, and the refusal line's.
+    connections: usize,
+    /// TLS endpoints only: the server's handshakes in progress, before this
+    /// one. Null where no handshake starts.
+    handshakes: ?usize,
+};
+
+pub const Acquired = union(enum) {
+    charge: Charge,
+    /// The slab holds no free record and no rate-only one (counted in
+    /// `insert_failures`).
+    table_full,
+    /// A start bucket was empty under pressure (counted in `rate_refusals`,
+    /// logged).
+    rate_limited,
+};
+
 /// One record held by one party: its index in the slab, and the generation
 /// it had when the reference was taken.
 pub const Ref = struct {
@@ -317,11 +404,18 @@ pub const Record = struct {
     /// Under the lock.
     key: Key = undefined,
     state: State = .free,
+    /// The start buckets' theoretical arrival times (`Bucket.take`), by
+    /// `BucketKind`. Under the lock. Reset when the record is freed.
+    tat: [2]u64 = .{ 0, 0 },
 
     pub const State = enum(u8) {
         free,
         /// In the index.
         live,
+        /// In the index with no holder and no charge: only its start buckets
+        /// are not yet full again. Taken back by the next start of its key,
+        /// or evicted for another key when the slab is full.
+        rate_only,
         /// Its last reference went while a count was not zero: out of the
         /// index and never reused, so `checkEmpty` reports it.
         quarantined,
@@ -336,6 +430,11 @@ pub const Record = struct {
 
     fn holdersOf(w: u64) u32 {
         return @truncate(w);
+    }
+
+    /// When both buckets are full again.
+    fn refilledAt(self: *const Record) u64 {
+        return @max(self.tat[0], self.tat[1]);
     }
 
     pub fn generation(self: *const Record) u32 {
@@ -363,6 +462,12 @@ pub const Stats = struct {
     insert_failures: u64,
     underflows: u64,
     stale: u64,
+    /// Records kept only for their start buckets.
+    rate_only: usize,
+    /// Rate-only records taken for another key because the slab was full.
+    evictions: u64,
+    /// Starts refused by an empty bucket under pressure, by `BucketKind`.
+    rate_refusals: [2]u64,
 };
 
 /// The one generation no `Ref` carries: a record that reaches it is retired.
@@ -393,17 +498,24 @@ pub const Table = struct {
     live: usize = 0,
     quarantined: usize = 0,
     retired: usize = 0,
+    rate_only: usize = 0,
     inserts: u64 = 0,
     reuses: u64 = 0,
+    /// Records that left the index (a rate-only record when it is evicted).
     removals: u64 = 0,
+    evictions: u64 = 0,
     /// Atomic, not under the lock.
     insert_failures: std.atomic.Value(u64) = .init(0),
     underflows: std.atomic.Value(u64) = .init(0),
     stale: std.atomic.Value(u64) = .init(0),
     /// Read only after `init`.
     shares: Shares,
+    rules: Rules,
     /// Charges refused by share under pressure, per resource (`Charge.add`).
     share_refusals: [resource_count]std.atomic.Value(u64) = @splat(.init(0)),
+    /// Starts refused by a bucket, by `BucketKind`. Atomic for readers; only
+    /// written under the lock.
+    rate_refusals: [2]std.atomic.Value(u64) = @splat(.init(0)),
     /// What the refusal line says about each endpoint (`setEndpointLabel`).
     labels: [max_labels]Label = @splat(.{}),
     refusal_log: RateLimitedLine = .{},
@@ -423,9 +535,9 @@ pub const Table = struct {
 
     /// `capacity` records, an index of at least twice as many entries, and a
     /// hash keyed by `seed` (the server draws it at boot, so a client cannot
-    /// pick keys that collide in a known pattern). `shares` from the
-    /// server's limits (`Limits.shares`).
-    pub fn init(gpa: std.mem.Allocator, capacity: usize, seed: u64, shares: Shares) error{OutOfMemory}!Table {
+    /// pick keys that collide in a known pattern). `rules` from the
+    /// server's limits (`Limits.accountRules`).
+    pub fn init(gpa: std.mem.Allocator, capacity: usize, seed: u64, rules: Rules) error{OutOfMemory}!Table {
         std.debug.assert(capacity > 0 and capacity < std.math.maxInt(u32));
         const records = try gpa.alloc(Record, capacity);
         errdefer gpa.free(records);
@@ -444,7 +556,8 @@ pub const Table = struct {
             .free = free,
             .free_len = capacity,
             .seed = seed,
-            .shares = shares,
+            .shares = rules.shares,
+            .rules = rules,
         };
     }
 
@@ -491,28 +604,32 @@ pub const Table = struct {
     }
 
     /// Look up or insert every key in `keys` and take one reference on each,
-    /// under one hold of the lock. Null when the slab cannot hold a new key:
-    /// the references already taken are given back, the failure is counted,
-    /// and the caller refuses the connection. Cancelable: the accept loop
-    /// calls it, and a cancel there is the server stopping. `endpoint` is
-    /// the index of the endpoint the connection came in on (the refusal
+    /// under one hold of the lock. `.table_full` when the slab cannot hold a
+    /// new key: the references already taken are given back, the failure is
+    /// counted, and the caller refuses the connection. Cancelable: the accept
+    /// loop calls it, and a cancel there is the server stopping. `endpoint`
+    /// is the index of the endpoint the connection came in on (the refusal
     /// line names it).
-    pub fn acquire(self: *Table, keys: []const Key, endpoint: u16) std.Io.Cancelable!?Charge {
+    ///
+    /// `start`, for a connection start: every record's start buckets take a
+    /// token for it, all or none. A bucket with none refuses while its
+    /// resource is at its pressure mark: then the references go back (a
+    /// record that had no other holder goes back to rate-only, its buckets
+    /// unchanged), the refusal is counted and logged, and the result is
+    /// `.rate_limited`; the caller closes the connection. With no pressure an
+    /// empty bucket admits and stays empty. Null: no bucket is touched.
+    pub fn acquire(self: *Table, keys: []const Key, endpoint: u16, start: ?Start) std.Io.Cancelable!Acquired {
         std.debug.assert(keys.len <= max_refs);
         var c: Charge = .{ .table = self, .endpoint = endpoint };
-        if (keys.len == 0) return .none;
+        if (keys.len == 0) return .{ .charge = .none };
         try self.mu.lock();
         defer self.mu.unlock();
         for (keys) |k| {
-            const i = self.find(k) orelse self.insert(k) orelse {
-                // Undo in reverse, under the same hold of the lock.
-                while (c.len > 0) {
-                    c.len -= 1;
-                    self.dropLocked(c.refs[c.len]);
-                }
+            const i = self.find(k) orelse self.insert(k, keys) orelse {
+                self.dropAllLocked(&c);
                 _ = self.insert_failures.fetchAdd(1, .monotonic);
                 log.warn("client table full ({d} records): connection refused", .{self.records.len});
-                return null;
+                return .table_full;
             };
             const rec = &self.records[i];
             // Under the lock the generation cannot change (it changes only
@@ -521,10 +638,63 @@ pub const Table = struct {
             const w = rec.word.fetchAdd(1, .acq_rel);
             std.debug.assert(Record.holdersOf(w) < std.math.maxInt(u32));
             std.debug.assert(Record.generationOf(w) != retired_generation);
+            if (rec.state == .rate_only) {
+                std.debug.assert(Record.holdersOf(w) == 0);
+                rec.state = .live;
+                self.rate_only -= 1;
+                self.live += 1;
+            }
             c.refs[c.len] = .{ .index = i, .generation = Record.generationOf(w) };
             c.len += 1;
         }
-        return c;
+        const st = start orelse return .{ .charge = c };
+        // Every bucket of every record, before any moves: all or none.
+        var next: [max_refs][2]?u64 = @splat(.{ null, null });
+        for (c.slice(), 0..) |r, ri| {
+            const rec = &self.records[r.index];
+            inline for (.{ BucketKind.connection_start, BucketKind.handshake_start }) |kind| {
+                const used: ?usize = switch (kind) {
+                    .connection_start => st.connections,
+                    .handshake_start => st.handshakes,
+                };
+                if (used) |u| {
+                    const res: Resource = if (kind == .connection_start) .connections else .handshakes;
+                    const t = self.rules.bucket(kind).take(rec.tat[@intFromEnum(kind)], st.now_ns);
+                    if (t == null and u >= self.shares[@intFromEnum(res)].mark) {
+                        _ = self.rate_refusals[@intFromEnum(kind)].fetchAdd(1, .monotonic);
+                        self.noteRateRefused(kind, rec, u, endpoint);
+                        self.dropAllLocked(&c);
+                        return .rate_limited;
+                    }
+                    next[ri][@intFromEnum(kind)] = t;
+                }
+            }
+        }
+        for (c.slice(), 0..) |r, ri| {
+            const rec = &self.records[r.index];
+            for (next[ri], 0..) |t, k| {
+                if (t) |v| rec.tat[k] = v;
+            }
+        }
+        return .{ .charge = c };
+    }
+
+    /// Under the lock: give back every reference `c` holds, in reverse.
+    fn dropAllLocked(self: *Table, c: *Charge) void {
+        while (c.len > 0) {
+            c.len -= 1;
+            self.dropLocked(c.refs[c.len]);
+        }
+    }
+
+    /// Under the lock, so the key is stable: a start refused by its bucket.
+    fn noteRateRefused(self: *Table, kind: BucketKind, rec: *const Record, server_use: usize, endpoint: u16) void {
+        const b = self.rules.bucket(kind);
+        const res: Resource = if (kind == .connection_start) .connections else .handshakes;
+        const held = rec.counts[@intFromEnum(res)].load(.monotonic);
+        const pct = if (server_use == 0) 0 else held * 100 / server_use;
+        const label: []const u8 = if (endpoint < max_labels) self.labels[endpoint].text() else "endpoint ?";
+        self.refusal_log.note("refused {f}: {s}s over its rate (burst {d}, one every {d} ms) under pressure, {d}% of {s} ({d} of the server's {d}), {s}", .{ fmtKey(rec.key), @tagName(kind), b.burst, b.interval_ns / std.time.ns_per_ms, pct, @tagName(res), held, server_use, label });
     }
 
     /// One more reference on every record of `c`, for a new holder (a request
@@ -613,9 +783,7 @@ pub const Table = struct {
         // The generation matched and a holder was there, so the record is in
         // the index: every exit from it moves the generation.
         std.debug.assert(rec.state == .live);
-        self.removeIndex(r.index);
         self.live -= 1;
-        self.removals += 1;
         // `seq_cst` with the word above and with `addAt`'s add and re-read:
         // a stale charge either lands before this read (and quarantines the
         // record, loudly) or reads the moved generation and takes itself
@@ -624,6 +792,15 @@ pub const Table = struct {
         for (&rec.counts) |*count| {
             if (count.load(.seq_cst) != 0) left += 1;
         }
+        // Nothing charged, a generation still to hand out, and a start
+        // bucket not yet full: keep it for its buckets (the file header).
+        if (left == 0 and Record.generationOf(dropWord(cur)) != retired_generation and rec.refilledAt() > nowNs()) {
+            rec.state = .rate_only;
+            self.rate_only += 1;
+            return;
+        }
+        self.removeIndex(r.index);
+        self.removals += 1;
         if (left != 0) {
             // A release some path forgot: keep the evidence. One record, one
             // quarantine, whatever the number of counts left.
@@ -647,9 +824,46 @@ pub const Table = struct {
             log.warn("client table: record {d} retired: its generation would wrap ({d} retired, {d} of {d} records left to use)", .{ r.index, self.retired, self.records.len - self.retired - self.quarantined, self.records.len });
             return;
         }
+        self.freeLocked(r.index);
+    }
+
+    fn freeLocked(self: *Table, i: u32) void {
+        const rec = &self.records[i];
         rec.state = .free;
-        self.free[self.free_len] = r.index;
+        rec.tat = .{ 0, 0 };
+        self.free[self.free_len] = i;
         self.free_len += 1;
+    }
+
+    /// Under the lock, with no free record: the rate-only record whose
+    /// buckets are full soonest leaves the index and is freed. False when
+    /// there is none. A scan of the slab, made only when it is full.
+    ///
+    /// Never one of `keep`, the keys of the charge being acquired: a new
+    /// /64's insert would otherwise evict its own /48's rate-only record,
+    /// and the /48 would come back with a fresh bucket, so a /48 could
+    /// regain its burst by rotating /64s.
+    fn evictLocked(self: *Table, keep: []const Key) bool {
+        var best: ?u32 = null;
+        var best_at: u64 = std.math.maxInt(u64);
+        scan: for (self.records, 0..) |*rec, i| {
+            if (rec.state != .rate_only) continue;
+            for (keep) |k| {
+                if (rec.key.eql(k)) continue :scan;
+            }
+            if (rec.refilledAt() < best_at) {
+                best_at = rec.refilledAt();
+                best = @intCast(i);
+            }
+        }
+        const i = best orelse return false;
+        std.debug.assert(self.records[i].holders() == 0);
+        self.removeIndex(i);
+        self.rate_only -= 1;
+        self.removals += 1;
+        self.evictions += 1;
+        self.freeLocked(i);
+        return true;
     }
 
     /// The record `r` names, or null when its generation is not the record's:
@@ -759,9 +973,11 @@ pub const Table = struct {
         }
     }
 
-    /// A free record for `k`, in the index; null when none is free.
-    fn insert(self: *Table, k: Key) ?u32 {
-        if (self.free_len == 0) return null;
+    /// A free record for `k`, in the index; null when none is free and no
+    /// rate-only record other than one of `keep` (the charge's own keys) can
+    /// be evicted.
+    fn insert(self: *Table, k: Key, keep: []const Key) ?u32 {
+        if (self.free_len == 0 and !self.evictLocked(keep)) return null;
         self.free_len -= 1;
         const i = self.free[self.free_len];
         const rec = &self.records[i];
@@ -813,8 +1029,9 @@ pub const Table = struct {
         defer self.mu.unlock();
         var clean = true;
         for (self.records, 0..) |*rec, i| {
-            // A retired record holds nothing: it is only never reused.
-            if (rec.state == .free or rec.state == .retired) continue;
+            // A retired record holds nothing: it is only never reused. A
+            // rate-only one holds no charge and no holder, only its buckets.
+            if (rec.state == .free or rec.state == .retired or rec.state == .rate_only) continue;
             clean = false;
             log.err("client account still {s} at deinit: record {d} {f}, {d} holders", .{ @tagName(rec.state), i, fmtKey(rec.key), rec.holders() });
             for (&rec.counts, 0..) |*count, ri| {
@@ -823,7 +1040,7 @@ pub const Table = struct {
             }
         }
         for (self.index) |e| {
-            if (e != 0) clean = false;
+            if (e != 0 and self.records[e - 1].state != .rate_only) clean = false;
         }
         if (!clean) log.err("client table not empty at deinit: {d} live, {d} quarantined", .{ self.live, self.quarantined });
         if (self.underflows.load(.acquire) != 0) {
@@ -850,6 +1067,9 @@ pub const Table = struct {
             .insert_failures = self.insert_failures.load(.acquire),
             .underflows = self.underflows.load(.acquire),
             .stale = self.stale.load(.acquire),
+            .rate_only = self.rate_only,
+            .evictions = self.evictions,
+            .rate_refusals = .{ self.rate_refusals[0].load(.acquire), self.rate_refusals[1].load(.acquire) },
         };
     }
 
@@ -874,7 +1094,7 @@ pub const Table = struct {
         defer self.mu.unlock();
         var n: usize = 0;
         for (self.records, 0..) |*rec, i| {
-            if (rec.state == .free or rec.state == .retired) continue;
+            if (rec.state == .free or rec.state == .retired or rec.state == .rate_only) continue;
             if (n == out.len) break;
             out[n] = .{
                 .key = rec.key,
@@ -889,12 +1109,14 @@ pub const Table = struct {
         return out[0..n];
     }
 
-    /// The live record for `k`, if any (`snapshot` filtered by key).
+    /// The live record for `k`, if any (`snapshot` filtered by key). A
+    /// rate-only record holds nothing, so it is not one (`rateOnly`).
     pub fn lookup(self: *Table, k: Key) ?Entry {
         self.mu.lockUncancelable();
         defer self.mu.unlock();
         const i = self.find(k) orelse return null;
         const rec = &self.records[i];
+        if (rec.state != .live) return null;
         var e: Entry = .{
             .key = rec.key,
             .index = i,
@@ -905,9 +1127,22 @@ pub const Table = struct {
         for (&rec.counts, &e.counts) |*c, *o| o.* = c.load(.acquire);
         return e;
     }
+
+    /// Whether `k` has a rate-only record: no holder, no charge, only start
+    /// buckets not yet full again.
+    pub fn rateOnly(self: *Table, k: Key) bool {
+        self.mu.lockUncancelable();
+        defer self.mu.unlock();
+        const i = self.find(k) orelse return false;
+        return self.records[i].state == .rate_only;
+    }
 };
 
 const log = std.log.scoped(.starh2);
+
+fn nowNs() u64 {
+    return zio.Timestamp.now(.monotonic).toNanoseconds();
+}
 
 /// One warn line at most a second, with the count of the ones held back: a
 /// client that is refused under an attack must not become a flood of lines.
@@ -992,12 +1227,12 @@ test "keysFor: IPv4 per address, IPv6 by /64 plus the aggregate prefix" {
 
 test "Table: one record per key, removed with its last reference, reused with a new generation" {
     const gpa = std.testing.allocator;
-    var t = try Table.init(gpa, 4, 0x1234, unlimited);
+    var t = try Table.init(gpa, 4, 0x1234, Rules.unlimited);
     defer t.deinit(gpa);
     var out: [max_refs]Key = undefined;
     const k = keysFor(.{ .ip4 = .{ 1, 2, 3, 4 } }, 48, &out);
-    const c1 = (try t.acquire(k, 0)).?;
-    const c2 = (try t.acquire(k, 0)).?;
+    const c1 = (try t.acquire(k, 0, null)).charge;
+    const c2 = (try t.acquire(k, 0, null)).charge;
     try std.testing.expectEqual(c1.refs[0].index, c2.refs[0].index);
     try std.testing.expectEqual(@as(u32, 2), t.lookup(k[0]).?.holders);
     t.retain(c1);
@@ -1013,7 +1248,7 @@ test "Table: one record per key, removed with its last reference, reused with a 
     // The same record comes back for the next key, one generation on.
     var out2: [max_refs]Key = undefined;
     const k2 = keysFor(.{ .ip4 = .{ 5, 6, 7, 8 } }, 48, &out2);
-    const c3 = (try t.acquire(k2, 0)).?;
+    const c3 = (try t.acquire(k2, 0, null)).charge;
     try std.testing.expectEqual(c1.refs[0].index, c3.refs[0].index);
     try std.testing.expectEqual(g1 + 1, c3.refs[0].generation);
     t.release(c3);
@@ -1029,15 +1264,15 @@ test "Charge.add: shares apply only at the mark; an aggregate's refusal undoes t
     var shares: Shares = unlimited;
     // L = 16: client share 2, aggregate share 4, mark 4.
     shares[@intFromEnum(Resource.streams)] = .of(16);
-    var t = try Table.init(gpa, 8, 3, shares);
+    var t = try Table.init(gpa, 8, 3, .{ .shares = shares, .connection_start = Rules.unlimited.connection_start, .handshake_start = Rules.unlimited.handshake_start });
     defer t.deinit(gpa);
     var o1: [max_refs]Key = undefined;
     var o2: [max_refs]Key = undefined;
     const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
     var b = a;
     b[7] = 2; // another /64 in the same /48
-    const ca = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1), 0)).?;
-    const cb = (try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2), 0)).?;
+    const ca = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1), 0, null)).charge;
+    const cb = (try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2), 0, null)).charge;
     // Below the mark nothing is refused, past any share.
     for (0..3) |_| try std.testing.expect(ca.add(.streams, 1, 0));
     // At the mark: /64 a holds 3 > its share.
@@ -1059,18 +1294,148 @@ test "Charge.add: shares apply only at the mark; an aggregate's refusal undoes t
     try std.testing.expect(t.checkEmpty());
 }
 
+fn bucketRules(burst: u64, interval_ns: u64) Rules {
+    var r = Rules.unlimited;
+    // L = 4: the connections' mark is 1.
+    r.shares[@intFromEnum(Resource.connections)] = .of(4);
+    r.shares[@intFromEnum(Resource.handshakes)] = .of(4);
+    r.connection_start = .{ .burst = burst, .interval_ns = interval_ns };
+    r.handshake_start = .{ .burst = burst, .interval_ns = interval_ns };
+    return r;
+}
+
+test "start bucket: a serial reconnect keeps its bucket in a rate-only record and does not regain its burst" {
+    const gpa = std.testing.allocator;
+    var t = try Table.init(gpa, 4, 5, bucketRules(3, std.time.ns_per_s));
+    defer t.deinit(gpa);
+    var o: [max_refs]Key = undefined;
+    const k = keysFor(.{ .ip4 = .{ 10, 1, 1, 1 } }, 48, &o);
+    // The release path reads the real clock: the starts are dated on it.
+    const now = nowNs();
+    // Under pressure (one connection held, the mark is 1): three starts,
+    // each released before the next, then refused.
+    for (0..3) |i| {
+        const got = try t.acquire(k, 0, .{ .now_ns = now + i, .connections = 1, .handshakes = null });
+        t.release(got.charge);
+        try std.testing.expect(t.rateOnly(k[0]));
+        try std.testing.expect(t.lookup(k[0]) == null);
+    }
+    try std.testing.expect((try t.acquire(k, 0, .{ .now_ns = now + 3, .connections = 1, .handshakes = null })) == .rate_limited);
+    // With no pressure an empty bucket admits.
+    const idle = try t.acquire(k, 0, .{ .now_ns = now + 4, .connections = 0, .handshakes = null });
+    t.release(idle.charge);
+    // One interval later one token is back, and only one.
+    const later = try t.acquire(k, 0, .{ .now_ns = now + std.time.ns_per_s + 5, .connections = 1, .handshakes = null });
+    t.release(later.charge);
+    try std.testing.expect((try t.acquire(k, 0, .{ .now_ns = now + std.time.ns_per_s + 6, .connections = 1, .handshakes = null })) == .rate_limited);
+    // The handshake bucket is its own, on its own pressure.
+    const tls = try t.acquire(k, 0, .{ .now_ns = now + std.time.ns_per_s + 7, .connections = 0, .handshakes = 1 });
+    t.release(tls.charge);
+    const s = t.stats();
+    try std.testing.expectEqual(@as(u64, 2), s.rate_refusals[@intFromEnum(BucketKind.connection_start)]);
+    try std.testing.expectEqual(@as(u64, 1), s.inserts);
+    try std.testing.expectEqual(@as(usize, 1), s.rate_only);
+    try std.testing.expectEqual(@as(usize, 0), s.live);
+    // A rate-only record is not a leak.
+    try std.testing.expect(t.checkEmpty());
+}
+
+test "start bucket: a full slab evicts the rate-only record that refills soonest, never one with a holder" {
+    const gpa = std.testing.allocator;
+    var t = try Table.init(gpa, 3, 6, bucketRules(4, std.time.ns_per_s));
+    defer t.deinit(gpa);
+    const now = nowNs();
+    var keys: [5][max_refs]Key = undefined;
+    var k: [5][]const Key = undefined;
+    for (&keys, &k, 0..) |*o, *kk, i| kk.* = keysFor(.{ .ip4 = .{ 10, 2, 0, @intCast(i) } }, 48, o);
+    // 0 starts three times (refills last), 1 once (refills first), 2 holds.
+    for (0..3) |i| t.release((try t.acquire(k[0], 0, .{ .now_ns = now + i, .connections = 0, .handshakes = null })).charge);
+    t.release((try t.acquire(k[1], 0, .{ .now_ns = now + 3, .connections = 0, .handshakes = null })).charge);
+    const held = (try t.acquire(k[2], 0, .{ .now_ns = now + 4, .connections = 0, .handshakes = null })).charge;
+    // The slab is full: 3 takes 1's record, then 4 takes 0's.
+    const c3 = (try t.acquire(k[3], 0, .{ .now_ns = now + 5, .connections = 0, .handshakes = null })).charge;
+    try std.testing.expect(t.rateOnly(k[0][0]));
+    try std.testing.expect(!t.rateOnly(k[1][0]));
+    const c4 = (try t.acquire(k[4], 0, .{ .now_ns = now + 6, .connections = 0, .handshakes = null })).charge;
+    try std.testing.expect(!t.rateOnly(k[0][0]));
+    // Nothing left to evict: every record has a holder.
+    var o5: [max_refs]Key = undefined;
+    try std.testing.expect((try t.acquire(keysFor(.{ .ip4 = .{ 10, 2, 0, 9 } }, 48, &o5), 0, null)) == .table_full);
+    const s = t.stats();
+    try std.testing.expectEqual(@as(u64, 2), s.evictions);
+    try std.testing.expectEqual(@as(u64, 1), s.insert_failures);
+    t.release(held);
+    t.release(c3);
+    t.release(c4);
+    try std.testing.expect(t.checkEmpty());
+}
+
+test "start bucket: a record evicted for a new key gives the new key a full bucket" {
+    const gpa = std.testing.allocator;
+    var t = try Table.init(gpa, 1, 8, bucketRules(1, std.time.ns_per_s));
+    defer t.deinit(gpa);
+    const now = nowNs();
+    var oa: [max_refs]Key = undefined;
+    var ob: [max_refs]Key = undefined;
+    const ka = keysFor(.{ .ip4 = .{ 10, 3, 0, 1 } }, 48, &oa);
+    const kb = keysFor(.{ .ip4 = .{ 10, 3, 0, 2 } }, 48, &ob);
+    // A spends its one token and leaves a rate-only record, the only one.
+    t.release((try t.acquire(ka, 0, .{ .now_ns = now, .connections = 0, .handshakes = null })).charge);
+    try std.testing.expect(t.rateOnly(ka[0]));
+    // B takes that record, under pressure: its own bucket is full.
+    const got = try t.acquire(kb, 0, .{ .now_ns = now + 1, .connections = 1, .handshakes = null });
+    try std.testing.expect(got == .charge);
+    try std.testing.expectEqual(@as(u64, 1), t.stats().evictions);
+    t.release(got.charge);
+    try std.testing.expect(t.checkEmpty());
+}
+
+test "start bucket: a new /64 never evicts its own /48's rate-only record (a /48 cannot rotate /64s for a fresh burst)" {
+    const gpa = std.testing.allocator;
+    // Three records; a burst of one that does not refill during the test.
+    var t = try Table.init(gpa, 3, 9, bucketRules(1, 600 * std.time.ns_per_s));
+    defer t.deinit(gpa);
+    const now = nowNs();
+    const idle: Start = .{ .now_ns = now, .connections = 0, .handshakes = null };
+    var ox: [max_refs]Key = undefined;
+    var oy: [max_refs]Key = undefined;
+    var o1: [max_refs]Key = undefined;
+    var o2: [max_refs]Key = undefined;
+    const g1: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0x30, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
+    var g2 = g1;
+    g2[7] = 2; // another /64 of the same /48
+    // X holds a record for the whole test, so the slab stays full.
+    const x = (try t.acquire(keysFor(.{ .ip4 = .{ 10, 4, 0, 1 } }, 48, &ox), 0, idle)).charge;
+    // The first /64 starts once: its /64 and its /48 spend their one token
+    // and stay rate-only.
+    t.release((try t.acquire(keysFor(.{ .ip6 = g1 }, 48, &o1), 0, idle)).charge);
+    // Y needs a record: the slab is full, and the first /64's record (it
+    // refills no later than the /48's, and comes first) is evicted. Y then
+    // leaves its own rate-only record, refilling after the /48's.
+    t.release((try t.acquire(keysFor(.{ .ip4 = .{ 10, 4, 0, 2 } }, 48, &oy), 0, .{ .now_ns = now + 1, .connections = 0, .handshakes = null })).charge);
+    try std.testing.expect(t.rateOnly(o1[1]));
+    // A second /64 of the /48, under pressure. Its /64 needs a record, and
+    // the /48's rate-only record refills soonest: evicting it would give the
+    // /48 a fresh bucket. Its token is spent: refused.
+    const got = try t.acquire(keysFor(.{ .ip6 = g2 }, 48, &o2), 0, .{ .now_ns = now + 2, .connections = 1, .handshakes = null });
+    try std.testing.expect(got == .rate_limited);
+    try std.testing.expect(t.rateOnly(o1[1]));
+    t.release(x);
+    try std.testing.expect(t.checkEmpty());
+}
+
 test "Table: a full slab refuses the insert and gives back what it took" {
     const gpa = std.testing.allocator;
-    var t = try Table.init(gpa, 2, 7, unlimited);
+    var t = try Table.init(gpa, 2, 7, Rules.unlimited);
     defer t.deinit(gpa);
     var o1: [max_refs]Key = undefined;
     const a: [16]u8 = .{ 0x20, 0x01, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
     // Two records: the /64 and the /48.
-    const c1 = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1), 0)).?;
+    const c1 = (try t.acquire(keysFor(.{ .ip6 = a }, 48, &o1), 0, null)).charge;
     var o2: [max_refs]Key = undefined;
     var b = a;
     b[7] = 2; // same /48, a new /64: the slab is full
-    try std.testing.expect((try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2), 0)) == null);
+    try std.testing.expect((try t.acquire(keysFor(.{ .ip6 = b }, 48, &o2), 0, null)) == .table_full);
     try std.testing.expectEqual(@as(u32, 1), t.lookup(o1[1]).?.holders);
     try std.testing.expectEqual(@as(u64, 1), t.stats().insert_failures);
     t.release(c1);
@@ -1080,14 +1445,14 @@ test "Table: a full slab refuses the insert and gives back what it took" {
 test "Table: backward-shift deletion keeps every remaining key reachable" {
     const gpa = std.testing.allocator;
     // A small index and many keys, so probe chains wrap and overlap.
-    var t = try Table.init(gpa, 24, 99, unlimited);
+    var t = try Table.init(gpa, 24, 99, Rules.unlimited);
     defer t.deinit(gpa);
     var charges: [24]Charge = undefined;
     var keys: [24]Key = undefined;
     for (&charges, &keys, 0..) |*c, *k, i| {
         var o: [max_refs]Key = undefined;
         k.* = keysFor(.{ .ip4 = .{ 10, 0, @intCast(i / 256), @intCast(i % 256) } }, 48, &o)[0];
-        c.* = (try t.acquire(&.{k.*}, 0)).?;
+        c.* = (try t.acquire(&.{k.*}, 0, null)).charge;
     }
     // Remove every third, then check every other is still found.
     var gone: [24]bool = @splat(false);

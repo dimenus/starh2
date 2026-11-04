@@ -1546,3 +1546,409 @@ test "share connections (PROXY v2): a source over its share is closed after its 
         }
     }.f);
 }
+
+// ---------------------------------------------------------------------------
+// The start buckets (connection starts on every endpoint, TLS handshake
+// starts), and the rate-only records that keep them.
+
+fn rateRefusals(rig: *Rig, kind: u1) u64 {
+    if (comptime !@hasField(accounts.Stats, "rate_refusals")) return 0;
+    return rig.server.clients.stats().rate_refusals[kind];
+}
+
+fn rateOnly(rig: *Rig, k: accounts.Key) bool {
+    if (comptime !@hasDecl(accounts.Table, "rateOnly")) return false;
+    return rig.server.clients.rateOnly(k);
+}
+
+/// Wait, off a zio task, until the server's connections are `n` again (the
+/// last one closed and released).
+fn waitConnections(server: *starh2.Server, n: usize) void {
+    const deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (server.active_connections.load(.acquire) != n and nowNs() < deadline) osSleepMs(2);
+}
+
+const Reconnect = struct {
+    admitted: usize = 0,
+    refused: usize = 0,
+    /// Times the record was found rate-only between two starts: the bucket
+    /// outlived the connection.
+    rate_only_seen: usize = 0,
+};
+
+/// `n` connections from 127.0.0.1, one at a time: each admitted one is
+/// closed and released before the next starts.
+fn reconnectSerial(rig: *Rig, conns: *Conns, tr: Tr, n: usize, base: usize, out: *Reconnect) void {
+    for (0..n) |_| {
+        const ok = connAttempt(conns, tr, rig.port(0), false) catch false;
+        if (ok) out.admitted += 1 else out.refused += 1;
+        conns.closeAll();
+        waitConnections(&rig.server, base);
+        // Until its handler's link lets go too: then the record has no
+        // holder, and only its bucket can keep it.
+        const deadline = nowNs() + 2 * std.time.ns_per_s;
+        while (rig.server.clients.lookup(attacker) != null and nowNs() < deadline) osSleepMs(2);
+        if (rateOnly(rig, attacker)) out.rate_only_seen += 1;
+    }
+}
+
+fn reconnectRow(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
+    resetRoutes();
+    var limits = testLimits();
+    // Connections: share 2, mark 4. A connection-start burst of 4 that
+    // refills one a minute, so none comes back during the test.
+    limits.max_connections = 16;
+    limits.connection_start_burst = 4;
+    limits.connection_start_refill_ns = 60 * std.time.ns_per_s;
+    var rig: Rig = undefined;
+    try rig.startPair(rt, gpa, tr, limits);
+    defer rig.stop();
+    var a: Conns = .{ .gpa = gpa };
+    var d: Conns = .{ .gpa = gpa };
+    defer {
+        release.store(true, .release);
+        a.closeAll();
+        d.closeAll();
+    }
+    // Pressure: ::1 holds its cap, 4, so the server is at the mark.
+    var hold: Tally = .{};
+    try blocking(connSerial, .{ &d, tr, rig.port(1), true, 4, &hold });
+    try expectExactly("::1 holding the mark", hold.admitted, 4);
+    const r0 = rateRefusals(&rig, 0);
+    // 127.0.0.1 reconnects serially, six times: never more than one
+    // connection, always under its share, so only the bucket can refuse.
+    var busy: Reconnect = .{};
+    try blocking(reconnectSerial, .{ &rig, &a, tr, 6, 4, &busy });
+    const refused_busy = rateRefusals(&rig, 0) - r0;
+    // No pressure: the empty bucket admits.
+    try blocking(Conns.closeAll, .{&d});
+    try waitFor("::1 gone", &rig.server, struct {
+        fn f(s: *starh2.Server) bool {
+            return s.active_connections.load(.acquire) == 0;
+        }
+    }.f, 5 * std.time.ns_per_s);
+    var idle: Reconnect = .{};
+    try blocking(reconnectSerial, .{ &rig, &a, tr, 3, 0, &idle });
+    std.debug.print("shares connection starts {s}: under pressure 127.0.0.1 reconnected serially 6 times: {d} admitted, {d} closed at accept (burst 4), record rate-only between starts {d} times; then at idle {d} of 3 admitted; rate refusals {d}\n", .{ @tagName(tr), busy.admitted, busy.refused, busy.rate_only_seen, idle.admitted, refused_busy });
+    try expectExactly("serial reconnects admitted under pressure", busy.admitted, 4);
+    try expectExactly("serial reconnects refused under pressure", busy.refused, 2);
+    try expectExactly("rate refusals", refused_busy, 2);
+    try expectAtMost("rate-only between starts (at least five)", 5, busy.rate_only_seen);
+    try expectExactly("reconnects admitted at idle", idle.admitted, 3);
+}
+
+fn reconnectH2c(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return reconnectRow(rt, gpa, .h2c);
+}
+fn reconnectTls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return reconnectRow(rt, gpa, .tls);
+}
+fn reconnectH1c(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return reconnectRow(rt, gpa, .h1c);
+}
+
+test "bucket connection starts (h2c): a serial reconnect does not regain its burst; only under pressure" {
+    try runIn(reconnectH2c);
+}
+test "bucket connection starts (TLS): a serial reconnect does not regain its burst; only under pressure" {
+    try runIn(reconnectTls);
+}
+test "bucket connection starts (HTTP/1.1): a serial reconnect does not regain its burst; only under pressure" {
+    try runIn(reconnectH1c);
+}
+
+/// TLS handshake starts: their own bucket, on the handshakes' pressure. ::1
+/// holds four handshakes open (the mark of 16); the connections are far from
+/// theirs, so only the handshake bucket can refuse.
+fn handshakeStarts(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetRoutes();
+    var limits = testLimits();
+    limits.concurrent_tls_handshakes = 16;
+    limits.preface_timeout_ns = 20 * std.time.ns_per_s;
+    limits.handshake_start_burst = 4;
+    limits.handshake_start_refill_ns = 60 * std.time.ns_per_s;
+    var rig: Rig = undefined;
+    try rig.startPair(rt, gpa, .tls, limits);
+    defer rig.stop();
+    var a: Conns = .{ .gpa = gpa };
+    var d: Conns = .{ .gpa = gpa };
+    defer {
+        release.store(true, .release);
+        a.closeAll();
+        d.closeAll();
+    }
+    var hold: Tally = .{};
+    try blocking(hsSerial, .{ &d, rig.port(1), true, 4, &hold });
+    try expectExactly("::1 handshakes held", hold.admitted, 4);
+    const r0 = rateRefusals(&rig, 1);
+    var busy: Reconnect = .{};
+    try blocking(reconnectSerial, .{ &rig, &a, .tls, 6, 4, &busy });
+    const refused = rateRefusals(&rig, 1) - r0;
+    try blocking(Conns.closeAll, .{&d});
+    try waitFor("::1 handshakes gone", &rig.server, struct {
+        fn f(s: *starh2.Server) bool {
+            return s.active_connections.load(.acquire) == 0;
+        }
+    }.f, 5 * std.time.ns_per_s);
+    var idle: Reconnect = .{};
+    try blocking(reconnectSerial, .{ &rig, &a, .tls, 3, 0, &idle });
+    std.debug.print("shares handshake starts TLS: with 4 handshakes held by ::1, 127.0.0.1 shook hands 6 times serially: {d} admitted, {d} closed at accept (burst 4); then {d} of 3 with none held; handshake-start refusals {d}, connection-start refusals {d}\n", .{ busy.admitted, busy.refused, idle.admitted, refused, rateRefusals(&rig, 0) });
+    try expectExactly("handshakes admitted under handshake pressure", busy.admitted, 4);
+    try expectExactly("handshake-start refusals", refused, 2);
+    try expectExactly("handshakes admitted with none held", idle.admitted, 3);
+    try expectExactly("connection-start refusals", @intCast(rateRefusals(&rig, 0)), 0);
+}
+
+test "bucket TLS handshake starts: their own bucket, refused only while the handshakes are at their mark" {
+    try runIn(handshakeStarts);
+}
+
+/// The rate-only records under churn: a table with a reserve of two
+/// identities, and twenty identities that each connect once. Rate-only
+/// records are evicted, the one that refills soonest first, so the client
+/// whose bucket is emptiest keeps it, and no connection is refused at the
+/// table. On a PROXY endpoint, so every identity is a header.
+fn evictionChurn(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetRoutes();
+    var limits = testLimits();
+    // Connections: mark 1, so the one holder below is pressure.
+    limits.max_connections = 2;
+    limits.concurrent_tls_handshakes = 1;
+    limits.max_task_handlers = 1;
+    limits.max_endpoints = 1;
+    limits.client_rate_records = 2;
+    limits.connection_start_burst = 2;
+    limits.connection_start_refill_ns = 600 * std.time.ns_per_s;
+    var rig: Rig = undefined;
+    const ep = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    try rig.start(rt, gpa, &.{.{ .h2c_prior_knowledge = .{ .address = ep, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } }}, limits, false);
+    defer rig.stop();
+    var h: Conns = .{ .gpa = gpa };
+    var a: Conns = .{ .gpa = gpa };
+    defer {
+        release.store(true, .release);
+        h.closeAll();
+        a.closeAll();
+    }
+    const Churn = struct {
+        fn one(r: *Rig, c: *Conns, src: Peer) bool {
+            const ok = proxyAttempt(c, r.port(0), src) catch false;
+            c.closeAll();
+            waitConnections(&r.server, 1);
+            return ok;
+        }
+        fn run(r: *Rig, c: *Conns, x: Peer, out: *[3]usize) void {
+            // X spends its burst of two, then is refused.
+            for (0..3) |_| out[0] += @intFromBool(one(r, c, x));
+            // Twenty others, once each.
+            for (0..20) |i| out[1] += @intFromBool(one(r, c, .{ .ip4 = .{ 192, 0, 2, @intCast(100 + i) } }));
+            // X again: its bucket was kept through the churn.
+            for (0..2) |_| out[2] += @intFromBool(one(r, c, x));
+        }
+    };
+    var held: Tally = .{};
+    try blocking(proxySerial, .{ &h, rig.port(0), Peer{ .ip4 = .{ 203, 0, 113, 1 } }, 1, &held });
+    try expectExactly("the holder", held.admitted, 1);
+    var got: [3]usize = .{ 0, 0, 0 };
+    try blocking(Churn.run, .{ &rig, &a, Peer{ .ip4 = .{ 198, 51, 100, 1 } }, &got });
+    const st = rig.server.clients.stats();
+    const records = rig.server.clients.records.len;
+    const evictions: u64 = if (@hasField(accounts.Stats, "evictions")) st.evictions else 0;
+    std.debug.print("shares rate-only churn: a table of {d} records; 198.51.100.1 admitted {d} of 3, twenty others {d} of 20, then 198.51.100.1 {d} of 2; evictions {d}, insert failures {d}\n", .{ records, got[0], got[1], got[2], evictions, st.insert_failures });
+    try expectExactly("198.51.100.1 before the churn", got[0], 2);
+    try expectExactly("the twenty", got[1], 20);
+    try expectExactly("198.51.100.1 after the churn", got[2], 0);
+    try expectExactly("insert failures", @intCast(st.insert_failures), 0);
+    try std.testing.expect(evictions > 0);
+}
+
+test "bucket rate-only records: churn evicts the record that refills soonest, and keeps the emptiest bucket" {
+    try runIn(evictionChurn);
+}
+
+/// On a PROXY endpoint the connection is counted at accept, before its
+/// header names its client, so the start's pressure reading leaves the
+/// connection itself out. At three connections held of a mark of four, a
+/// source whose bucket is empty is still below the mark and admitted; at
+/// four it is refused.
+fn proxyStartReading(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetRoutes();
+    var limits = testLimits();
+    // Connections: share 2, mark 4. A burst of one.
+    limits.max_connections = 16;
+    limits.connection_start_burst = 1;
+    limits.connection_start_refill_ns = 600 * std.time.ns_per_s;
+    var rig: Rig = undefined;
+    const ep = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    try rig.start(rt, gpa, &.{.{ .h2c_prior_knowledge = .{ .address = ep, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } }}, limits, false);
+    defer rig.stop();
+    var h: Conns = .{ .gpa = gpa };
+    var x: Conns = .{ .gpa = gpa };
+    defer {
+        release.store(true, .release);
+        h.closeAll();
+        x.closeAll();
+    }
+    const src: Peer = .{ .ip4 = .{ 198, 51, 100, 30 } };
+    const Once = struct {
+        fn run(r: *Rig, c: *Conns, p: Peer, held: usize, out: *bool) void {
+            out.* = proxyAttempt(c, r.port(0), p) catch false;
+            c.closeAll();
+            waitConnections(&r.server, held);
+        }
+    };
+    // Three held below the mark (another source, admitted freely).
+    var hold: Tally = .{};
+    try blocking(proxySerial, .{ &h, rig.port(0), Peer{ .ip4 = .{ 203, 0, 113, 40 } }, 3, &hold });
+    try expectExactly("held below the mark", hold.admitted, 3);
+    var first = false;
+    var second = false;
+    var third = false;
+    try blocking(Once.run, .{ &rig, &x, src, 3, &first });
+    // Its bucket is empty now; the server holds 3, below the mark.
+    try blocking(Once.run, .{ &rig, &x, src, 3, &second });
+    // A fourth held: at the mark.
+    try blocking(proxySerial, .{ &h, rig.port(0), Peer{ .ip4 = .{ 203, 0, 113, 40 } }, 1, &hold });
+    try blocking(Once.run, .{ &rig, &x, src, 4, &third });
+    std.debug.print("shares PROXY start reading: burst 1; with 3 held 198.51.100.30 admitted {} then {} (empty bucket, below the mark); with 4 held {}; rate refusals {d}\n", .{ first, second, third, rateRefusals(&rig, 0) });
+    try std.testing.expect(first);
+    try std.testing.expect(second);
+    try std.testing.expect(!third);
+}
+
+test "bucket connection starts (PROXY v2): the pressure reading leaves out the connection counted at accept" {
+    try runIn(proxyStartReading);
+}
+
+/// The /48 aggregate has its own start buckets: one /48 starts no faster
+/// than one address, however many /64s it rotates through. Under pressure
+/// from another identity, five /64s of one /48 start once each, serially
+/// (each closed and released before the next): every /64's own bucket is
+/// full, so only the aggregate's can refuse the fifth.
+const AggStart = enum { connection, handshake };
+
+fn aggregateStarts(rt: *zio.Runtime, gpa: std.mem.Allocator, which: AggStart) !void {
+    resetRoutes();
+    var limits = testLimits();
+    // Connections: mark 4 of 16; handshakes in progress: mark 4 of 16.
+    limits.max_connections = 16;
+    limits.concurrent_tls_handshakes = 16;
+    limits.preface_timeout_ns = 20 * std.time.ns_per_s;
+    switch (which) {
+        .connection => {
+            limits.connection_start_burst = 4;
+            limits.connection_start_refill_ns = 600 * std.time.ns_per_s;
+        },
+        .handshake => {
+            limits.handshake_start_burst = 4;
+            limits.handshake_start_refill_ns = 600 * std.time.ns_per_s;
+        },
+    }
+    var rig: Rig = undefined;
+    const ep = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const tcp: starh2.EndpointConfig.Tcp = .{ .address = ep, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } };
+    const endpoint: starh2.EndpointConfig = if (which == .connection) .{ .h2c_prior_knowledge = tcp } else .{ .tls = tcp };
+    try rig.start(rt, gpa, &.{endpoint}, limits, which == .handshake);
+    defer rig.stop();
+    var h: Conns = .{ .gpa = gpa };
+    var x: Conns = .{ .gpa = gpa };
+    defer {
+        release.store(true, .release);
+        h.closeAll();
+        x.closeAll();
+    }
+    const holder: Peer = .{ .ip4 = .{ 203, 0, 113, 60 } };
+    // Pressure from another identity: four connections (connection starts)
+    // or four handshakes held open, past their headers with no ClientHello
+    // (handshake starts). Each is admitted below the mark.
+    switch (which) {
+        .connection => {
+            var held: Tally = .{};
+            try blocking(proxySerial, .{ &h, rig.port(0), holder, 4, &held });
+            try expectExactly("connections held by another identity", held.admitted, 4);
+        },
+        .handshake => {
+            const Hold = struct {
+                /// A PROXY TLS connection past its header with no ClientHello:
+                /// it holds a handshake in progress.
+                fn run(c: *Conns, port: u16, src: Peer) void {
+                    const fd = rawConnect(false, port) catch return;
+                    c.addRaw(fd);
+                    var buf: [proxy.fixed_bytes + 64]u8 = undefined;
+                    const n = proxy.encode(&buf, .{ .peer = src });
+                    _ = rawSend(fd, buf[0..n]);
+                }
+            };
+            for (0..4) |_| try blocking(Hold.run, .{ &h, rig.port(0), holder });
+            try waitFor("four handshakes held by another identity", &rig.server, struct {
+                fn f(srv: *starh2.Server) bool {
+                    return srv.accounting.active_handshakes.load(.acquire) == 4;
+                }
+            }.f, 3 * std.time.ns_per_s);
+        },
+    }
+    const Starts = struct {
+        /// One start from `src`: a PROXY h2c connection served past its header,
+        /// or a PROXY TLS connection whose handshake completed. Closed after,
+        /// and released before the next.
+        fn one(r: *Rig, c: *Conns, w: AggStart, src: Peer) bool {
+            const ok = switch (w) {
+                .connection => proxyAttempt(c, r.port(0), src) catch false,
+                .handshake => tls: {
+                    const wire = Wire.connect(c.gpa, .tls, r.port(0)) catch break :tls false;
+                    defer wire.close();
+                    var buf: [proxy.fixed_bytes + 64]u8 = undefined;
+                    const n = proxy.encode(&buf, .{ .peer = src });
+                    wire.sendRaw(buf[0..n]) catch break :tls false;
+                    wire.handshake() catch break :tls false;
+                    break :tls true;
+                },
+            };
+            c.closeAll();
+            switch (w) {
+                .connection => waitConnections(&r.server, 4),
+                .handshake => {
+                    const deadline = nowNs() + 3 * std.time.ns_per_s;
+                    while ((r.server.active_connections.load(.acquire) != 4 or r.server.accounting.active_handshakes.load(.acquire) != 4) and nowNs() < deadline) osSleepMs(2);
+                },
+            }
+            return ok;
+        }
+        fn run(r: *Rig, c: *Conns, w: AggStart, out: *[5]bool) void {
+            for (out, 0..) |*o, i| {
+                var a = ip6("2001:db8:40::9");
+                a[7] = @intCast(i + 1); // 2001:db8:40:N::9, one /64 each, one /48
+                o.* = one(r, c, w, .{ .ip6 = a });
+            }
+        }
+    };
+    const kind: u1 = if (which == .connection) 0 else 1;
+    const r0 = rateRefusals(&rig, kind);
+    var got: [5]bool = @splat(false);
+    try blocking(Starts.run, .{ &rig, &x, which, &got });
+    const refused = rateRefusals(&rig, kind) - r0;
+    std.debug.print("shares {s} starts, IPv6 aggregate: five /64s of 2001:db8:40::/48 under pressure, burst 4: admitted {any}; rate refusals {d}\n", .{ @tagName(which), got, refused });
+    for (got[0..4]) |ok| try std.testing.expect(ok);
+    try std.testing.expect(!got[4]);
+    try expectExactly("rate refusals (the aggregate's bucket)", @intCast(refused), 1);
+    // Conservation: the holders let go, nothing left charged.
+    try letGo(&rig, &.{ &h, &x });
+    const st = rig.server.clients.stats();
+    try expectExactly("underflows", @intCast(st.underflows), 0);
+    try expectExactly("stale references", @intCast(st.stale), 0);
+    try expectExactly("quarantined records", st.quarantined, 0);
+}
+
+fn aggregateConnectionStarts(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return aggregateStarts(rt, gpa, .connection);
+}
+fn aggregateHandshakeStarts(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return aggregateStarts(rt, gpa, .handshake);
+}
+
+test "bucket connection starts (PROXY v2): five /64s of one /48 share the /48's bucket" {
+    try runIn(aggregateConnectionStarts);
+}
+test "bucket TLS handshake starts (PROXY v2): five /64s of one /48 share the /48's bucket" {
+    try runIn(aggregateHandshakeStarts);
+}

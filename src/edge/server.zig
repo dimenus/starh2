@@ -462,7 +462,7 @@ pub const Server = struct {
         // Keyed at boot, so a client cannot aim keys at one probe chain.
         var seed: u64 = undefined;
         zio.random(std.mem.asBytes(&seed));
-        var clients = try accounts.Table.init(gpa, config.limits.clientTableRecords() catch return error.InvalidConfig, seed, config.limits.shares());
+        var clients = try accounts.Table.init(gpa, config.limits.clientTableRecords() catch return error.InvalidConfig, seed, config.limits.accountRules());
         errdefer clients.deinit(gpa);
         if (endpoints.len > accounts.Table.max_labels) return error.InvalidConfig;
         for (endpoints, 0..) |ep, i| {
@@ -737,6 +737,18 @@ pub const Server = struct {
         }
     }
 
+    /// A connection start for the client table's buckets (`accounts.Start`):
+    /// now, and the server's connections and (TLS) handshakes in progress
+    /// before this connection. `own` is how many of the connection count are
+    /// this connection's already (a PROXY connection is counted at accept).
+    fn startNow(self: *Server, mode: connection.Mode, own: usize) accounts.Start {
+        return .{
+            .now_ns = monoNs(),
+            .connections = self.active_connections.load(.seq_cst) -| own,
+            .handshakes = if (mode == .tls) self.accounting.active_handshakes.load(.seq_cst) else null,
+        };
+    }
+
     /// The connection's charge: its client accounts (`c`), then the server.
     /// `.client_refused` when the client is over its share under pressure
     /// (`accounts.Charge.add`): the caller closes the connection.
@@ -966,7 +978,13 @@ pub const Server = struct {
         // the server's in `connEntry`. `.none` (behind a pooling proxy) keys
         // nothing: the header only strips and names.
         const charge: accounts.Charge = switch (self.endpoints[endpoint_index].clientIdentity()) {
-            .proxy_source => (self.clients.acquire(keys, @intCast(endpoint_index)) catch return error.Canceled) orelse return error.Failed,
+            // The server's count already holds this connection (taken at
+            // accept): the start reads it without it.
+            .proxy_source => switch (self.clients.acquire(keys, @intCast(endpoint_index), self.startNow(cfg.mode, 1)) catch return error.Canceled) {
+                .charge => |c| c,
+                // Counted (and a rate refusal logged) by the table: closed.
+                .table_full, .rate_limited => return error.Failed,
+            },
             .none => .none,
             // A boot error (`PeerIdentityBehindProxyProtocol`).
             .peer => unreachable,
@@ -1159,16 +1177,20 @@ pub const Server = struct {
                 .peer => {
                     var keys_buf: [accounts.max_refs]accounts.Key = undefined;
                     const keys = accounts.keysFor(peer, self.limits.client_ipv6_aggregate_prefix_bits, &keys_buf);
-                    charge = (self.clients.acquire(keys, @intCast(endpoint_index)) catch |err| {
+                    switch (self.clients.acquire(keys, @intCast(endpoint_index), self.startNow(mode, 0)) catch |err| {
                         stream.close(self.io);
                         return err;
-                    }) orelse {
-                        // The table is full: refused and counted
-                        // (`accounts.Table.insert_failures`), never admitted
-                        // uncounted.
-                        stream.close(self.io);
-                        continue;
-                    };
+                    }) {
+                        .charge => |c| charge = c,
+                        // The table is full, or a start bucket is empty
+                        // under pressure: refused and counted
+                        // (`accounts.Table.insert_failures`,
+                        // `rate_refusals`), never admitted uncounted.
+                        .table_full, .rate_limited => {
+                            stream.close(self.io);
+                            continue;
+                        },
+                    }
                 },
             }
             const admission: Admission = .{ .mode = mode, .proxied = proxied, .charge = charge };

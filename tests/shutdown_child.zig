@@ -221,10 +221,10 @@ fn runUnderflow(_: *zio.Runtime) anyerror!void {
 fn runAccountsUnderflow(_: *zio.Runtime) anyerror!void {
     const accounts = starh2.edge.accounts;
     const gpa = std.heap.page_allocator;
-    var t = try accounts.Table.init(gpa, 2, 7, accounts.unlimited);
+    var t = try accounts.Table.init(gpa, 2, 7, accounts.Rules.unlimited);
     defer t.deinit(gpa);
     var kb: [accounts.max_refs]accounts.Key = undefined;
-    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &kb), 0)).?;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &kb), 0, null)).charge;
     _ = a.add(.streams, 1, 0);
     a.sub(.streams, 1);
     // The double release of the charge.
@@ -235,10 +235,10 @@ fn runAccountsUnderflow(_: *zio.Runtime) anyerror!void {
     // Both records are still there to take: freed once, not twice.
     var k2: [accounts.max_refs]accounts.Key = undefined;
     var k3: [accounts.max_refs]accounts.Key = undefined;
-    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &k2), 0)).?;
-    const c = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 3 } }, 48, &k3), 0)).?;
+    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &k2), 0, null)).charge;
+    const c = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 3 } }, 48, &k3), 0, null)).charge;
     var k4: [accounts.max_refs]accounts.Key = undefined;
-    const full = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 4 } }, 48, &k4), 0)) == null;
+    const full = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 4 } }, 48, &k4), 0, null)) == .table_full;
     _ = b.add(.streams, 1, 0);
     // `a`'s record now holds 10.0.0.2 (or 10.0.0.3): a release through the
     // stale reference is refused and leaves the new key's counts alone.
@@ -255,10 +255,10 @@ fn runAccountsUnderflow(_: *zio.Runtime) anyerror!void {
 fn runAccountsReleaseRace(_: *zio.Runtime) anyerror!void {
     const accounts = starh2.edge.accounts;
     const gpa = std.heap.page_allocator;
-    var t = try accounts.Table.init(gpa, 2, 7, accounts.unlimited);
+    var t = try accounts.Table.init(gpa, 2, 7, accounts.Rules.unlimited);
     defer t.deinit(gpa);
     var ka: [accounts.max_refs]accounts.Key = undefined;
-    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka), 0)).?;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka), 0, null)).charge;
     // Two releases of `a`'s one reference race: both read one holder, so
     // both take the locked path (`Table.release`). The first wins the lock
     // and removes the record; an acquire then takes the lock before the
@@ -266,7 +266,7 @@ fn runAccountsReleaseRace(_: *zio.Runtime) anyerror!void {
     // locked step. The steps, in that order:
     t.release(a);
     var kb: [accounts.max_refs]accounts.Key = undefined;
-    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &kb), 0)).?;
+    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &kb), 0, null)).charge;
     const same_record = b.refs[0].index == a.refs[0].index;
     t.releaseLast(a.refs[0]);
     const after_locked = if (t.lookup(kb[0])) |e| e.holders else 0;
@@ -287,10 +287,10 @@ fn runAccountsReleaseRace(_: *zio.Runtime) anyerror!void {
 fn runAccountsQuarantine(_: *zio.Runtime) anyerror!void {
     const accounts = starh2.edge.accounts;
     const gpa = std.heap.page_allocator;
-    var t = try accounts.Table.init(gpa, 2, 7, accounts.unlimited);
+    var t = try accounts.Table.init(gpa, 2, 7, accounts.Rules.unlimited);
     defer t.deinit(gpa);
     var ka: [accounts.max_refs]accounts.Key = undefined;
-    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka), 0)).?;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka), 0, null)).charge;
     // Two counts a path forgot to release: one record, quarantined once.
     _ = a.add(.streams, 1, 0);
     _ = a.add(.connections, 1, 0);
@@ -313,10 +313,10 @@ fn runProxyTrustedRange(rt: *zio.Runtime) anyerror!void {
 fn runAccountsChargeRace(_: *zio.Runtime) anyerror!void {
     const accounts = starh2.edge.accounts;
     const gpa = std.heap.page_allocator;
-    var t = try accounts.Table.init(gpa, 1, 7, accounts.unlimited);
+    var t = try accounts.Table.init(gpa, 1, 7, accounts.Rules.unlimited);
     defer t.deinit(gpa);
     var ka: [accounts.max_refs]accounts.Key = undefined;
-    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka), 0)).?;
+    const a = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &ka), 0, null)).charge;
     // A charge through `a` checks its record's generation (`Charge.add` and
     // `sub` do that first) while `a` still holds it. Then `a` is released,
     // and an acquire reuses the record for a new key, before the charge's
@@ -324,7 +324,7 @@ fn runAccountsChargeRace(_: *zio.Runtime) anyerror!void {
     const rec = t.record(a.refs[0]).?;
     t.release(a);
     var kb: [accounts.max_refs]accounts.Key = undefined;
-    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &kb), 0)).?;
+    const b = (try t.acquire(accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &kb), 0, null)).charge;
     const same_record = b.refs[0].index == a.refs[0].index;
     _ = b.add(.request_bytes, 10, 0);
     _ = t.addAt(rec, a.refs[0], .streams, 5, null);
@@ -341,24 +341,30 @@ fn runAccountsChargeRace(_: *zio.Runtime) anyerror!void {
 fn runAccountsGenerationWrap(_: *zio.Runtime) anyerror!void {
     const accounts = starh2.edge.accounts;
     const gpa = std.heap.page_allocator;
-    var t = try accounts.Table.init(gpa, 1, 7, accounts.unlimited);
+    var t = try accounts.Table.init(gpa, 1, 7, accounts.Rules.unlimited);
     defer t.deinit(gpa);
     var k1: [accounts.max_refs]accounts.Key = undefined;
     const key1 = accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &k1);
     // The oldest reference to the one record: generation 0.
-    const a0 = (try t.acquire(key1, 0)).?;
+    const a0 = (try t.acquire(key1, 0, null)).charge;
     t.release(a0);
     // Two removals short of 2^32: then cycle the record until it can no
     // longer be taken, at most three times.
     t.forceGenerationForTest(0, std.math.maxInt(u32) - 2);
     var cycles: usize = 0;
     while (cycles < 3) : (cycles += 1) {
-        const c = (try t.acquire(key1, 0)) orelse break;
+        const c = switch (try t.acquire(key1, 0, null)) {
+            .charge => |ch| ch,
+            else => break,
+        };
         t.release(c);
     }
     var k2: [accounts.max_refs]accounts.Key = undefined;
     const key2 = accounts.keysFor(.{ .ip4 = .{ 10, 0, 0, 2 } }, 48, &k2);
-    const b = try t.acquire(key2, 0);
+    const b: ?accounts.Charge = switch (try t.acquire(key2, 0, null)) {
+        .charge => |ch| ch,
+        else => null,
+    };
     // The generation-0 reference, given back again: it must never match.
     t.release(a0);
     const s = t.stats();

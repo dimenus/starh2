@@ -175,7 +175,11 @@ see `tools/README.md`.
   server's count read before its own charge, and undoes the connection's
   account on refusal. A test that drives a server-wide limit from the one
   loopback client sets `client_identity = .none`, or the share refuses
-  first. `./zb build test-shares` is the gate.
+  first. A connection start also takes a token from its client's start
+  buckets (`Table.acquire`), and a record whose bucket is not yet full stays
+  in the table with no holder (`rate_only`): `stats().live == 0` is "nothing
+  held", and a rate-only record is not a leak. `./zb build test-shares` is
+  the gate.
 
 ## TLS and allocation traps
 
