@@ -540,15 +540,14 @@ const AesGcmCtx = struct {
     }
 };
 
-const TaskCtx = struct {
-    io: std.Io,
-};
+/// No state: the op is one zio spawn and one join.
+const TaskCtx = struct {};
 
 fn emptyTask() void {}
 
-fn taskLifecycleOp(ctx: *TaskCtx) !usize {
-    var handle = try ctx.io.concurrent(emptyTask, .{});
-    handle.await(ctx.io);
+fn taskLifecycleOp(_: *TaskCtx) !usize {
+    var handle = try zio.spawn(emptyTask, .{});
+    handle.join();
     return 1;
 }
 
@@ -556,7 +555,6 @@ fn taskLifecycleOp(ctx: *TaskCtx) !usize {
 const ticket_slot_n = 256 + 256;
 
 const TicketCtx = struct {
-    io: std.Io,
     storage: [ticket_slot_n]ticket_table.TicketWait = undefined,
     table: ticket_table.TicketTable = undefined,
 
@@ -613,9 +611,9 @@ fn ticketParkedWakeOp(ctx: *TicketCtx) !usize {
         .slot = a[1],
         .ticket = a[0],
     };
-    var handle = try ctx.io.concurrent(completeTicketTask, .{&work});
+    var handle = try zio.spawn(completeTicketTask, .{&work});
     try ctx.table.wait(a[1], null);
-    handle.await(ctx.io);
+    handle.join();
     return 1;
 }
 
@@ -781,11 +779,11 @@ fn runBenchmarks(rt: *zio.Runtime, cfg: Config) !void {
     printRow("AES-GCM 300B packed", cfg.iterations, aes300_stats, 0, 0);
 
     const task_iterations = @max(@as(usize, 1_000), cfg.iterations / 100);
-    var task: TaskCtx = .{ .io = io };
+    var task: TaskCtx = .{};
     const task_stats = try benchmark(io, task_iterations, cfg.rounds, &task, taskLifecycleOp);
     printRow("empty task spawn + await", task_iterations, task_stats, null, null);
 
-    var tickets: TicketCtx = .{ .io = io };
+    var tickets: TicketCtx = .{};
     tickets.init();
     const ticket_one_stats = try benchmark(io, cfg.iterations, cfg.rounds, &tickets, ticketOneSignaledOp);
     printRow("ticket 1 already-signaled", cfg.iterations, ticket_one_stats, 0, 0);

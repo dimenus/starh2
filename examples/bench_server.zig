@@ -674,8 +674,8 @@ fn cadenceResetHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Co
 // If this arm lifts the per-connection number, the timers were the cost. If it
 // does not move, the serialization is.
 var g_io: std.Io = undefined;
-var g_bc_mutex: std.Io.Mutex = .init;
-var g_bc_cond: std.Io.Condition = .init;
+var g_bc_mutex: zio.Mutex = .init;
+var g_bc_cond: zio.Condition = .init;
 var g_bc_seq: u64 = 0;
 var g_bc_ts: i128 = 0;
 
@@ -688,11 +688,11 @@ fn tickerTask() !void {
             try zio.sleep(.fromNanoseconds(@intCast(next - now_ns)));
         }
         next += interval_ns;
-        try g_bc_mutex.lock(g_io);
+        try g_bc_mutex.lock();
         g_bc_seq += 1;
         g_bc_ts = zio.Timestamp.now(.realtime).toNanoseconds();
-        g_bc_mutex.unlock(g_io);
-        g_bc_cond.broadcast(g_io);
+        g_bc_mutex.unlock();
+        g_bc_cond.broadcast();
     }
 }
 
@@ -700,21 +700,21 @@ fn sseBroadcastHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Re
     var body = try resp.startSse(&.{});
     var buf: [64]u8 = undefined;
 
-    try g_bc_mutex.lock(g_io);
+    try g_bc_mutex.lock();
     var seen: u64 = g_bc_seq;
-    g_bc_mutex.unlock(g_io);
+    g_bc_mutex.unlock();
 
     while (true) {
-        try g_bc_mutex.lock(g_io);
+        try g_bc_mutex.lock();
         while (g_bc_seq == seen) {
-            g_bc_cond.wait(g_io, &g_bc_mutex) catch {
-                g_bc_mutex.unlock(g_io);
+            g_bc_cond.wait(&g_bc_mutex) catch {
+                g_bc_mutex.unlock();
                 return error.Canceled;
             };
         }
         seen = g_bc_seq;
         const ts = g_bc_ts;
-        g_bc_mutex.unlock(g_io);
+        g_bc_mutex.unlock();
 
         const ev = try std.fmt.bufPrint(&buf, "data: {d}\n\n", .{ts});
         body.writeAll(ev) catch break;
