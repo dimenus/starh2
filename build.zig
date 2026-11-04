@@ -1492,12 +1492,33 @@ pub fn build(b: *std.Build) void {
     // `Event.set` on an already-set event neither wakes nor re-synchronizes a
     // waiter that already returned, which makes a following plain field read
     // a data race (t-1802). Reach for zio, or ask before adding one.
-    const std_io_gate_run = b.addSystemCommand(&.{ "bash", "tools/std-io-gate/gate.sh" });
+    // tools/std-io-gate/gate.zig has the rules, and what a token scan cannot
+    // see. It is built for the host, so a cross `-Dtarget` still runs it.
+    const std_io_gate_exe = b.addExecutable(.{
+        .name = "std-io-gate",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/std-io-gate/gate.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const std_io_gate_run = b.addRunArtifact(std_io_gate_exe);
     std_io_gate_run.addArg(".");
     std_io_gate_run.setCwd(b.path("."));
     std_io_gate_run.has_side_effects = true;
     std_io_gate_run.stdio = .inherit;
-    const std_io_gate_step = b.step("std-io-gate", "Fail on any new std.Io concurrency abstraction; zio owns concurrency here");
+    // The scanner's own tests: every hole it closes, planted, must be found.
+    const std_io_gate_tests = b.addTest(.{
+        .name = "std-io-gate-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/std-io-gate/gate.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const std_io_gate_tests_run = b.addRunArtifact(std_io_gate_tests);
+    const std_io_gate_step = b.step("std-io-gate", "Fail on any std.Io concurrency use anywhere in the repo; zio owns concurrency here");
+    std_io_gate_step.dependOn(&std_io_gate_tests_run.step);
     std_io_gate_step.dependOn(&std_io_gate_run.step);
 
     // The session_mu gate. A handler's release of `session_mu` is what wakes
@@ -1693,7 +1714,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + DST transport witness + every release target + zio DST gate (dst-zio) + connection DST gate (dst-conn) + every artifact a named step or the install step compiles");
-    ci_step.dependOn(&std_io_gate_run.step);
+    ci_step.dependOn(std_io_gate_step);
     ci_step.dependOn(&session_mu_gate_run.step);
     ci_step.dependOn(&dst_transport_run.step);
     ci_step.dependOn(test_step);
@@ -1775,7 +1796,7 @@ const MacosSdkSelection = struct {
     rejected_higher: []const []const u8 = &.{},
     /// Fail-closed message for native macOS compiles. Null means no guard.
     /// This is a Step, not `std.process.fatal`: an environment condition must
-    /// not kill `--help` or `std-io-gate`.
+    /// not kill `--help` or `session-mu-gate`.
     guard_msg: ?[]const u8 = null,
 };
 
@@ -1816,7 +1837,7 @@ fn applyMacosSdkLibc(
     // Configure-time fatal: a build.zig programming error. We produced a libc
     // file and then found nobody to give it to. An environment condition
     // (unreadable SDK, no usable SDK) is a Step, not a fatal, so --help and
-    // std-io-gate still run.
+    // session-mu-gate still run.
     if (n == 0) {
         std.process.fatal(
             "macOS SDK workaround: libc file generated but 0 Compile steps received it",

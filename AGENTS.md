@@ -88,7 +88,7 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ./zb build tls-smoke # TLS edge: fresh curl connections + clean shutdown
 ./zb build h1-smoke  # HTTP/1.1 edge: curl --http1.1 against tls, curl against h1c, SSE, SIGTERM
 ./zb build h1-go-smoke  # HTTP/1.1 Go net/http oracle: keep-alive reuse and Expect 100-continue; ABORTS if go is missing
-./zb build std-io-gate  # fails on any NEW std.Io concurrency abstraction; prints files and lines scanned
+./zb build std-io-gate  # fails on any std.Io concurrency use in any .zig file outside zig-pkg and build caches; prints files and lines scanned; runs in ci
 ./zb build session-mu-gate  # fails on session_mu used outside lockSession/unlockSession, or a doorbell send outside ring; runs in ci
 ./zb build dst-transport  # HTTP/1.1 TLS transport witness: control passes, the no-h1AckSink mutant must fail UnconsumedTlsAck and replay identically; runs in ci
 ```
@@ -121,7 +121,8 @@ see `tools/README.md`.
   Use the zio primitive, or ask Ryan first.** `std.Io` itself is the vtable zio
   implements, so `io: std.Io` is correct; `std.Io.Cancelable` is an error set.
   The ban is `Event`, `Queue`, `Group`, `Future`, `Select`, `Mutex`,
-  `Condition`, `Semaphore`. Each differs from the zio primitive under it in a
+  `Condition`, `Semaphore`, `io.async`, `io.concurrent` and the rest listed in
+  `tools/std-io-gate/gate.zig`, in tests and tools as well as `src/`. Each differs from the zio primitive under it in a
   way that has already cost a defect: `Select.cancelDiscard` discarded bytes
   already read off the socket (t-1760); `Future.cancel` is request PLUS
   mandatory await, so a task that cancels with it blocks forever on a handler in an
@@ -129,8 +130,9 @@ see `tools/README.md`.
   returns at once (t-1802); `Event.set` on an already-set event neither wakes
   nor re-synchronizes a waiter that already returned, so a plain field read
   after it is a data race (t-1802). `./zb build std-io-gate` enforces this and
-  runs inside `ci`; `tools/std-io-gate/baseline.txt` is the measured remaining
-  set, not a budget, and it ratchets in both directions.
+  runs inside `ci`. It allows nothing: there is no baseline. A finding the
+  scan cannot resolve (a receiver it cannot follow) fails too; rewrite the
+  code so the scan can see it is not std.Io.
 - `Session` is the deterministic protocol authority. `Connection` serializes
   Session access with `session_mu`; handlers communicate through commands.
   Take and release it only through `lockSession`, `lockSessionUncancelable` and
