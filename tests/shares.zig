@@ -247,6 +247,12 @@ fn ip6(text: []const u8) [16]u8 {
 const attacker = v4Key(.{ 127, 0, 0, 1 });
 const defender = v6Key(ip6("::1"));
 
+/// Set a `Limits` field this commit added, so the file still compiles
+/// against 42c65d8, where the field does not exist (and the test fails).
+fn setLimit(l: *starh2.Limits, comptime name: []const u8, v: anytype) void {
+    if (comptime @hasField(starh2.Limits, name)) @field(l, name) = v;
+}
+
 fn testLimits() starh2.Limits {
     var l = starh2.Limits.defaults;
     l.graceful_drain_timeout_ns = 300 * ms;
@@ -1598,8 +1604,8 @@ fn reconnectRow(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
     // Connections: share 2, mark 4. A connection-start burst of 4 that
     // refills one a minute, so none comes back during the test.
     limits.max_connections = 16;
-    limits.connection_start_burst = 4;
-    limits.connection_start_refill_ns = 60 * std.time.ns_per_s;
+    setLimit(&limits, "connection_start_burst", 4);
+    setLimit(&limits, "connection_start_refill_ns", 60 * std.time.ns_per_s);
     var rig: Rig = undefined;
     try rig.startPair(rt, gpa, tr, limits);
     defer rig.stop();
@@ -1665,8 +1671,8 @@ fn handshakeStarts(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var limits = testLimits();
     limits.concurrent_tls_handshakes = 16;
     limits.preface_timeout_ns = 20 * std.time.ns_per_s;
-    limits.handshake_start_burst = 4;
-    limits.handshake_start_refill_ns = 60 * std.time.ns_per_s;
+    setLimit(&limits, "handshake_start_burst", 4);
+    setLimit(&limits, "handshake_start_refill_ns", 60 * std.time.ns_per_s);
     var rig: Rig = undefined;
     try rig.startPair(rt, gpa, .tls, limits);
     defer rig.stop();
@@ -1716,9 +1722,9 @@ fn evictionChurn(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.concurrent_tls_handshakes = 1;
     limits.max_task_handlers = 1;
     limits.max_endpoints = 1;
-    limits.client_rate_records = 2;
-    limits.connection_start_burst = 2;
-    limits.connection_start_refill_ns = 600 * std.time.ns_per_s;
+    setLimit(&limits, "client_rate_records", 2);
+    setLimit(&limits, "connection_start_burst", 2);
+    setLimit(&limits, "connection_start_refill_ns", 600 * std.time.ns_per_s);
     var rig: Rig = undefined;
     const ep = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     try rig.start(rt, gpa, &.{.{ .h2c_prior_knowledge = .{ .address = ep, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } }}, limits, false);
@@ -1776,8 +1782,8 @@ fn proxyStartReading(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var limits = testLimits();
     // Connections: share 2, mark 4. A burst of one.
     limits.max_connections = 16;
-    limits.connection_start_burst = 1;
-    limits.connection_start_refill_ns = 600 * std.time.ns_per_s;
+    setLimit(&limits, "connection_start_burst", 1);
+    setLimit(&limits, "connection_start_refill_ns", 600 * std.time.ns_per_s);
     var rig: Rig = undefined;
     const ep = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     try rig.start(rt, gpa, &.{.{ .h2c_prior_knowledge = .{ .address = ep, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } }}, limits, false);
@@ -1836,12 +1842,12 @@ fn aggregateStarts(rt: *zio.Runtime, gpa: std.mem.Allocator, which: AggStart) !v
     limits.preface_timeout_ns = 20 * std.time.ns_per_s;
     switch (which) {
         .connection => {
-            limits.connection_start_burst = 4;
-            limits.connection_start_refill_ns = 600 * std.time.ns_per_s;
+            setLimit(&limits, "connection_start_burst", 4);
+            setLimit(&limits, "connection_start_refill_ns", 600 * std.time.ns_per_s);
         },
         .handshake => {
-            limits.handshake_start_burst = 4;
-            limits.handshake_start_refill_ns = 600 * std.time.ns_per_s;
+            setLimit(&limits, "handshake_start_burst", 4);
+            setLimit(&limits, "handshake_start_refill_ns", 600 * std.time.ns_per_s);
         },
     }
     var rig: Rig = undefined;
@@ -1951,4 +1957,221 @@ test "bucket connection starts (PROXY v2): five /64s of one /48 share the /48's 
 }
 test "bucket TLS handshake starts (PROXY v2): five /64s of one /48 share the /48's bucket" {
     try runIn(aggregateHandshakeStarts);
+}
+
+// ---------------------------------------------------------------------------
+// The PROXY header waiters: a floor per PROXY endpoint and a shared pool,
+// and a header deadline of their own (t-3820).
+
+fn waiterCount(server: *starh2.Server) usize {
+    if (comptime @hasDecl(starh2.Server, "proxyWaiters")) return server.proxyWaiters();
+    return @field(server, "proxy_waiters").load(.acquire);
+}
+
+/// A raw connection to a PROXY endpoint that sends its header (or, with
+/// `src` null, only the first bytes of one) and then nothing.
+fn proxyRaw(conns: *Conns, port: u16, src: ?Peer) !void {
+    const fd = try rawConnect(false, port);
+    conns.addRaw(fd);
+    var buf: [proxy.fixed_bytes + 64]u8 = undefined;
+    if (src) |p| {
+        const n = proxy.encode(&buf, .{ .peer = p });
+        _ = rawSend(fd, buf[0..n]);
+    } else {
+        _ = rawSend(fd, proxy.signature[0..6]);
+    }
+}
+
+fn proxyRawMany(conns: *Conns, port: u16, n: usize, first: u8) void {
+    for (0..n) |i| proxyRaw(conns, port, Peer{ .ip4 = .{ 192, 0, 2, first + @as(u8, @intCast(i)) } }) catch {};
+}
+
+fn waitWaiters(server: *starh2.Server, n: usize) void {
+    const deadline = nowNs() + 3 * std.time.ns_per_s;
+    while (waiterCount(server) < n and nowNs() < deadline) osSleepMs(5);
+    // Let the rest that could still arrive arrive.
+    osSleepMs(150);
+}
+
+fn proxyTlsRig(rig: *Rig, rt: *zio.Runtime, gpa: std.mem.Allocator, limits: starh2.Limits, endpoints: usize) !void {
+    const ep = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const one: starh2.EndpointConfig = .{ .tls = .{ .address = ep, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } };
+    const eps = [_]starh2.EndpointConfig{ one, one };
+    try rig.start(rt, gpa, eps[0..endpoints], limits, true);
+}
+
+/// Two TLS PROXY endpoints and one handshake slot, held. A TLS PROXY
+/// connection keeps its waiter slot until it gets a handshake slot, so every
+/// header that arrives on endpoint 0 holds a waiter. With 8 waiters over two
+/// endpoints each has a floor of 2 and 4 are shared: endpoint 0 takes its
+/// floor and the shared 4 (the pool absorbs its burst), and parks; endpoint
+/// 1 still gets its floor. With one cap for all (42c65d8), endpoint 0 takes
+/// all 8 and endpoint 1 parks.
+fn proxyFloors(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetRoutes();
+    var limits = testLimits();
+    limits.proxy_header_waiters = 8;
+    limits.concurrent_tls_handshakes = 1;
+    limits.preface_timeout_ns = 20 * std.time.ns_per_s;
+    if (@hasField(starh2.Limits, "proxy_header_timeout_ns")) @field(limits, "proxy_header_timeout_ns") = 5 * std.time.ns_per_s;
+    var rig: Rig = undefined;
+    try proxyTlsRig(&rig, rt, gpa, limits, 2);
+    defer rig.stop();
+    var c: Conns = .{ .gpa = gpa };
+    defer c.closeAll();
+    // The holder: past its header, it holds the one handshake slot and
+    // sends no ClientHello.
+    try blocking(proxyRaw, .{ &c, rig.port(0), Peer{ .ip4 = .{ 192, 0, 2, 1 } } });
+    try waitFor("the holder's handshake slot", &rig.server, struct {
+        fn f(s: *starh2.Server) bool {
+            return s.accounting.active_handshakes.load(.acquire) == 1 and waiterCount(s) == 0;
+        }
+    }.f, 3 * std.time.ns_per_s);
+    // Endpoint 0's burst: ten headers.
+    try blocking(proxyRawMany, .{ &c, rig.port(0), 10, 10 });
+    try blocking(waitWaiters, .{ &rig.server, 6 });
+    const after0 = waiterCount(&rig.server);
+    // Endpoint 1: three headers.
+    try blocking(proxyRawMany, .{ &c, rig.port(1), 3, 40 });
+    try blocking(waitWaiters, .{ &rig.server, after0 + 2 });
+    const after1 = waiterCount(&rig.server);
+    var floor0: usize = 0;
+    var floor1: usize = 0;
+    var shared: usize = 0;
+    if (comptime @hasDecl(starh2.Server, "proxyFloorUsed")) {
+        floor0 = rig.server.proxyFloorUsed(0);
+        floor1 = rig.server.proxyFloorUsed(1);
+        shared = rig.server.proxy_shared_used.load(.acquire);
+    }
+    std.debug.print("shares PROXY floors: endpoint 0's burst of 10 holds {d} waiters (floor {d}, shared {d}); then endpoint 1 adds {d} (its floor {d}); {d} of 8 in all\n", .{ after0, floor0, shared, after1 - after0, floor1, after1 });
+    try expectExactly("endpoint 0's waiters (its floor and the pool)", after0, 6);
+    try expectExactly("endpoint 1's waiters during endpoint 0's stall", after1 - after0, 2);
+    try expectExactly("endpoint 0's floor", floor0, 2);
+    try expectExactly("the shared pool", shared, 4);
+    try expectExactly("endpoint 1's floor", floor1, 2);
+}
+
+test "PROXY waiters: a stalled TLS PROXY endpoint at its floor does not park a second one; the shared pool absorbs its burst" {
+    try runIn(proxyFloors);
+}
+
+/// The header deadline is the header's alone. One handshake slot, a header
+/// deadline of 600 ms and a preface deadline of 1,500 ms. A header that never
+/// completes is closed at the header deadline. W, accepted at t0, sends its
+/// complete header at about 500 ms, while H (accepted at 400 ms, its header
+/// at once) holds the slot in a handshake that runs to about 1,900 ms. So W
+/// waits for the slot past its header deadline (the lower bound: open at
+/// 1,000 ms), and is closed at its preface deadline, 1,500 ms from its
+/// accept, with nothing left charged: before H lets the slot go, so a wait
+/// with no deadline (which would hand W the slot at 1,900 ms and close it at
+/// about 3,400) fails.
+fn proxyHeaderDeadline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    resetRoutes();
+    var limits = testLimits();
+    limits.concurrent_tls_handshakes = 1;
+    limits.preface_timeout_ns = 1500 * ms;
+    setLimit(&limits, "proxy_header_timeout_ns", 600 * ms);
+    var rig: Rig = undefined;
+    try proxyTlsRig(&rig, rt, gpa, limits, 1);
+    defer rig.stop();
+    const Stalled = struct {
+        fn run(port: u16, closed_ms: *?u64) void {
+            const t0 = nowNs();
+            const fd = rawConnect(false, port) catch return;
+            defer _ = std.c.close(fd);
+            _ = rawSend(fd, proxy.signature[0..6]);
+            var r: Raw = .{};
+            rawRead(fd, 2500, &r);
+            if (r.closed) closed_ms.* = (nowNs() - t0) / ms;
+        }
+    };
+    const Waiter = struct {
+        server: *starh2.Server,
+        port: u16,
+        closed_ms: ?u64 = null,
+        holder_held: bool = false,
+        released_ms: ?u64 = null,
+
+        fn send(fd: std.c.fd_t, src: Peer) void {
+            var buf: [proxy.fixed_bytes + 64]u8 = undefined;
+            const n = proxy.encode(&buf, .{ .peer = src });
+            _ = rawSend(fd, buf[0..n]);
+        }
+
+        fn run(self: *@This()) void {
+            const t0 = nowNs();
+            const w = rawConnect(false, self.port) catch return;
+            defer _ = std.c.close(w);
+            osSleepMs(400);
+            // H: past its header at once, it takes the one slot and sends no
+            // ClientHello, so it holds the slot to its own handshake deadline.
+            const h = rawConnect(false, self.port) catch return;
+            defer _ = std.c.close(h);
+            send(h, .{ .ip4 = .{ 192, 0, 2, 1 } });
+            const until = nowNs() + 300 * ms;
+            while (self.server.accounting.active_handshakes.load(.acquire) != 1 and nowNs() < until) osSleepMs(2);
+            self.holder_held = self.server.accounting.active_handshakes.load(.acquire) == 1;
+            const at = t0 + 500 * ms;
+            if (nowNs() < at) osSleepMs((at - nowNs()) / ms);
+            send(w, .{ .ip4 = .{ 192, 0, 2, 2 } });
+            var r: Raw = .{};
+            rawRead(w, 2500 - (nowNs() - t0) / ms, &r);
+            if (!r.closed) return;
+            self.closed_ms = (nowNs() - t0) / ms;
+            // Nothing of W's left: no waiter slot, no client record.
+            const deadline = nowNs() + 500 * ms;
+            while (nowNs() < deadline) {
+                if (waiterCount(self.server) == 0 and self.server.clients.lookup(v4Key(.{ 192, 0, 2, 2 })) == null) {
+                    self.released_ms = (nowNs() - t0) / ms;
+                    return;
+                }
+                osSleepMs(2);
+            }
+        }
+    };
+    var stalled: ?u64 = null;
+    var waiter: Waiter = .{ .server = &rig.server, .port = rig.port(0) };
+    var hs = try zio.spawnBlocking(Stalled.run, .{ rig.port(0), &stalled });
+    var hw = try zio.spawnBlocking(Waiter.run, .{&waiter});
+    hs.join();
+    hw.join();
+    std.debug.print("shares PROXY header deadline 600 ms, preface 1500 ms: a stalled header closed at {?d} ms; a complete header waiting for the handshake slot (held by another to about 1,900 ms: {}) closed at {?d} ms from its accept, its waiter slot and client charge gone at {?d} ms\n", .{ stalled, waiter.holder_held, waiter.closed_ms, waiter.released_ms });
+    try std.testing.expect(waiter.holder_held);
+    try std.testing.expect(stalled != null);
+    try expectAtMost("the header deadline before the stalled close (ms)", 600, stalled.? + 5);
+    try expectAtMost("the stalled header's close (ms)", stalled.?, 900);
+    try std.testing.expect(waiter.closed_ms != null);
+    // Open past its header deadline, waiting for the slot...
+    try expectAtMost("the waiting header's close, at least (ms)", 1400, waiter.closed_ms.?);
+    // ...and closed at its preface deadline, before the holder lets go.
+    try expectAtMost("the waiting header's close (ms)", waiter.closed_ms.?, 1800);
+    try std.testing.expect(waiter.released_ms != null);
+}
+
+test "PROXY waiters: the header deadline is the header's own; the wait for a TLS handshake slot keeps the preface deadline" {
+    try runIn(proxyHeaderDeadline);
+}
+
+test "PROXY waiters: more PROXY endpoints than waiters, and a header deadline past the preface's, are boot errors" {
+    if (comptime !@hasField(starh2.Limits, "proxy_header_timeout_ns")) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const ep = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    const pp: starh2.EndpointConfig = .{ .h2c_prior_knowledge = .{ .address = ep, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } };
+    var limits = testLimits();
+    limits.proxy_header_waiters = 1;
+    try std.testing.expectError(error.ProxyWaitersBelowEndpoints, starh2.Server.init(gpa, rt.io(), .{ .endpoints = &.{ pp, pp }, .routes = &routes, .tls = null, .limits = limits }));
+    limits = testLimits();
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns + 1;
+    try std.testing.expectError(error.InvalidConfig, starh2.Server.init(gpa, rt.io(), .{ .endpoints = &.{pp}, .routes = &routes, .tls = null, .limits = limits }));
+    limits.proxy_header_timeout_ns = 0;
+    try std.testing.expectError(error.InvalidConfig, starh2.Server.init(gpa, rt.io(), .{ .endpoints = &.{pp}, .routes = &routes, .tls = null, .limits = limits }));
+    // Two endpoints and two waiters: a floor of one each, none shared.
+    limits = testLimits();
+    limits.proxy_header_waiters = 2;
+    var s = try starh2.Server.init(gpa, rt.io(), .{ .endpoints = &.{ pp, pp }, .routes = &routes, .tls = null, .limits = limits });
+    defer s.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), s.proxy_floor);
+    try std.testing.expectEqual(@as(usize, 0), s.proxy_shared);
 }

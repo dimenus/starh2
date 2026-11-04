@@ -79,6 +79,8 @@ fn runHandshakeTimeout(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     };
     var limits = starh2.Limits.defaults;
     limits.preface_timeout_ns = handshake_timeout_ns;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
     var server = try starh2.Server.init(gpa, io, .{
         .endpoints = &.{.{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
@@ -179,6 +181,8 @@ fn runFragmentedHello(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     };
     var limits = starh2.Limits.defaults;
     limits.preface_timeout_ns = frag_timeout_ns;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
     var server = try starh2.Server.init(gpa, io, .{
         .endpoints = &.{.{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,
@@ -288,6 +292,8 @@ fn runHandshakeAlerts(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     };
     var limits = starh2.Limits.defaults;
     limits.preface_timeout_ns = frag_timeout_ns;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
     var server = try starh2.Server.init(gpa, io, .{
         .endpoints = &.{.{ .tls = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } }},
         .routes = &routes,

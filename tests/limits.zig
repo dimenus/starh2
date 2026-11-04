@@ -256,6 +256,7 @@ test "counting allocator peak under live hello stays under ceiling" {
         .max_route_path_bytes = 1024,
         .graceful_drain_timeout_ns = 200 * std.time.ns_per_ms,
         .preface_timeout_ns = 500 * std.time.ns_per_ms,
+        .proxy_header_timeout_ns = 500 * std.time.ns_per_ms,
     };
     const ceiling = try lim.resourceUpperBound();
 

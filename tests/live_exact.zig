@@ -294,6 +294,8 @@ fn runExactBigBody(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.outbound_bytes_per_connection = 512 * 1024;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -434,6 +436,8 @@ fn runExactCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !vo
     limits.outbound_bytes_per_connection = 512 * 1024;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -521,6 +525,8 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     limits.outbound_bytes_per_connection = 512 * 1024;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -582,6 +588,8 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -637,6 +645,8 @@ fn runExactWriteFail(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 16;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -712,6 +722,8 @@ fn runExactSlowConsumer(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.response_min_rate_grace_ns = 80 * std.time.ns_per_ms;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -783,6 +795,8 @@ fn runExactShutdownBlocked(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.outbound_bytes_per_stream = 128 * 1024;
     limits.graceful_drain_timeout_ns = 100 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},

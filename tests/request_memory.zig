@@ -330,6 +330,8 @@ fn smallLimits() starh2.Limits {
     l.max_task_handlers = 32;
     l.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     l.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    l.proxy_header_timeout_ns = l.preface_timeout_ns;
     return l;
 }
 

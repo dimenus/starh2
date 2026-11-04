@@ -269,10 +269,19 @@ pub const Limits = struct {
     proxy_header_bytes: usize = 512,
     /// Connections accepted on PROXY endpoints and not yet past
     /// their header (on TLS, until they hold a handshake slot), server-wide.
-    /// While it is full those accept loops park, as for the connection limit.
-    /// Its own cap, not the handshake slots, because the handshake slot is
-    /// taken only once the header is read.
+    /// Each PROXY endpoint has a floor of max(1, this / 2N) of its own (N
+    /// PROXY endpoints) and the rest is shared (`Server.proxy_floor`); while
+    /// an endpoint's floor and the shared rest are full its accept loop
+    /// parks, as for the connection limit. Its own cap, not the handshake
+    /// slots, because the handshake slot is taken only once the header is
+    /// read. At least the number of PROXY endpoints (`Server.init`).
     proxy_header_waiters: usize = 64,
+    /// How long a PROXY connection has, from its accept, to deliver its
+    /// header; over it the connection is closed. Only the header: a TLS
+    /// PROXY connection then waits for its handshake slot until the preface
+    /// deadline, also counted from the accept. Not 0, and not later than
+    /// `preface_timeout_ns`.
+    proxy_header_timeout_ns: u64 = 5 * std.time.ns_per_s,
     /// The start buckets of every client identity (`accounts.zig`, "Start
     /// buckets"): connection starts on every endpoint, TLS handshake starts
     /// on TLS endpoints. `burst` at once, then one token every `refill_ns`
@@ -756,6 +765,7 @@ pub const Limits = struct {
         if (self.client_ipv6_aggregate_prefix_bits == 0 or self.client_ipv6_aggregate_prefix_bits >= 64) return error.InvalidConfig;
         if (self.proxy_header_bytes < proxy_protocol.min_header_cap or self.proxy_header_bytes > proxy_protocol.fixed_bytes + std.math.maxInt(u16)) return error.InvalidConfig;
         if (self.proxy_header_waiters == 0) return error.InvalidConfig;
+        if (self.proxy_header_timeout_ns == 0 or self.proxy_header_timeout_ns > self.preface_timeout_ns) return error.InvalidConfig;
         // A bucket's whole span (`burst` refills) must fit the clock's u64.
         for ([_]u32{ self.connection_start_burst, self.handshake_start_burst }, [_]u64{ self.connection_start_refill_ns, self.handshake_start_refill_ns }) |burst, refill| {
             if (burst == 0 or refill == 0) return error.InvalidConfig;

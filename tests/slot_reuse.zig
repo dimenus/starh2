@@ -907,7 +907,7 @@ fn runExhaustedProxy(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try std.testing.expect(r.closed);
     }
     const give_up = nowNs() + client_deadline_ns;
-    while (server.active_connections.load(.acquire) != 0 or server.proxy_waiters.load(.acquire) != 0) {
+    while (server.active_connections.load(.acquire) != 0 or server.proxyWaiters() != 0) {
         if (nowNs() >= give_up) return error.RefusalNeverReleased;
         zio.sleep(.fromMilliseconds(5)) catch {};
     }

@@ -176,6 +176,8 @@ fn runLifecycleStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 256;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
     limits.inbound_wire_chunks_per_connection = 512;
     limits.outbound_bytes_per_stream = 64 * 1024;
     // The write pool (512 chunks) and one stream's cap must fit the budget.
@@ -1466,6 +1468,8 @@ fn runWriteFailStress(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 16;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -1660,6 +1664,8 @@ fn runGlobalCapStorm(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 4;
     limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},
@@ -1774,6 +1780,7 @@ fn runFailIndexLifecycleCase(rt: *zio.Runtime, fail_index: usize) !FailIndexOutc
         .max_route_path_bytes = 128,
         .graceful_drain_timeout_ns = 100 * std.time.ns_per_ms,
         .preface_timeout_ns = 300 * std.time.ns_per_ms,
+        .proxy_header_timeout_ns = 300 * std.time.ns_per_ms,
     };
     const routes = [_]starh2.Route{.{
         .method = .POST,
@@ -2156,6 +2163,8 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
     limits.response_min_rate_grace_ns = 30 * std.time.ns_per_s;
     limits.graceful_drain_timeout_ns = 500 * std.time.ns_per_ms;
     limits.preface_timeout_ns = 500 * std.time.ns_per_ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
 
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr, .client_identity = .none } }},

@@ -86,8 +86,10 @@ pub const UnixClientIdentity = enum {
 /// which the server reads and strips, whatever the identity. Only from a
 /// non-empty list of trusted proxy sources (`Server.init` fails with
 /// `ProxyProtocolUntrusted` otherwise); a connection from any other source
-/// is closed at accept. The header waiters are capped server-wide
-/// (`Limits.proxy_header_waiters`).
+/// is closed at accept. The connections waiting for their header are bounded
+/// by `Limits.proxy_header_waiters`, split into a floor per PROXY endpoint and
+/// a shared pool (`Server.proxy_floor`), and each has
+/// `Limits.proxy_header_timeout_ns` from its accept to deliver the header.
 pub const ProxyProtocol = union(enum) {
     off,
     v2: struct {
@@ -226,6 +228,19 @@ pub const InitError = error{
     /// socket peer is then the trusted proxy, so every client would be one
     /// identity. Use `.proxy_source`, or `.none` behind a pooling proxy.
     PeerIdentityBehindProxyProtocol,
+    /// More PROXY endpoints than `Limits.proxy_header_waiters`: each needs a
+    /// floor of at least one header waiter of its own.
+    ProxyWaitersBelowEndpoints,
+};
+
+/// Which PROXY header waiter slot a connection holds (`Server.proxy_floor`).
+pub const ProxySlot = enum { floor, shared };
+
+/// A PROXY v2 connection on its way to its header: its waiter slot, and when
+/// it was accepted, on the awake clock (both its deadlines count from there).
+const ProxyWait = struct {
+    slot: ProxySlot,
+    accepted_ns: u64,
 };
 
 pub const ServeError = error{
@@ -282,10 +297,26 @@ pub const Server = struct {
     /// The client accounts (`accounts.zig`): one record per client identity,
     /// and per IPv6 aggregate, that holds anything.
     clients: accounts.Table,
-    /// Connections on PROXY v2 endpoints accepted and not yet past
-    /// their header (and, on TLS, not yet holding a handshake slot), against
-    /// `Limits.proxy_header_waiters`.
-    proxy_waiters: std.atomic.Value(usize) = .init(0),
+    /// Connections on PROXY v2 endpoints accepted and not yet past their
+    /// header (and, on TLS, not yet holding a handshake slot). One ceiling
+    /// for the server, `Limits.proxy_header_waiters` (W), split at boot over
+    /// the N PROXY endpoints: each has a floor of its own, `proxy_floor` =
+    /// max(1, W / 2N), and the rest, `proxy_shared`, is one pool any of them
+    /// takes from once its floor is full. No endpoint takes another's floor.
+    /// While an endpoint's floor and the pool are both full its accept loop
+    /// parks (no close).
+    ///
+    /// Why floors: a TLS PROXY connection keeps its waiter slot until a
+    /// handshake slot is free, so handshake load on one PROXY endpoint fills
+    /// any one shared cap and parks every other PROXY endpoint. A floor
+    /// bounds what one endpoint's stall takes from the others; the pool
+    /// absorbs one endpoint's burst. A stalled trusted proxy can still fill
+    /// its own floor and the pool; the log names it.
+    proxy_floor: usize = 0,
+    proxy_shared: usize = 0,
+    /// Floor slots in use, by endpoint index (non-PROXY endpoints stay 0).
+    proxy_floor_used: [accounts.Table.max_labels]std.atomic.Value(usize) = @splat(.init(0)),
+    proxy_shared_used: std.atomic.Value(usize) = .init(0),
     /// Connections closed at accept because their source is not on the
     /// endpoint's trusted list.
     proxy_untrusted: std.atomic.Value(u64) = .init(0),
@@ -351,6 +382,14 @@ pub const Server = struct {
         if (need_h2c) try config.limits.checkH2cWriteQueue();
         if (need_tls and config.tls == null) return error.InvalidConfig;
 
+        // The PROXY header waiters: a floor per PROXY endpoint, and the rest
+        // shared (`Server.proxy_floor`).
+        var proxy_endpoints: usize = 0;
+        for (config.endpoints) |ep| proxy_endpoints += @intFromBool(ep.proxied());
+        if (proxy_endpoints > config.limits.proxy_header_waiters) return error.ProxyWaitersBelowEndpoints;
+        const proxy_floor: usize = if (proxy_endpoints == 0) 0 else @max(1, config.limits.proxy_header_waiters / (2 * proxy_endpoints));
+        const proxy_shared: usize = config.limits.proxy_header_waiters - proxy_endpoints * proxy_floor;
+
         for (config.endpoints) |ep| {
             const unix = ep.unixPath() != null;
             if (ep.proxied() and !unix and ep.trusted().len == 0) return error.ProxyProtocolUntrusted;
@@ -404,6 +443,7 @@ pub const Server = struct {
             const framing: []const u8 = if (!ep.proxied()) "off" else if (ep.unixPath() != null) "v2 (Unix socket, no trusted list)" else "v2";
             log.info("endpoint {d} ({s}): client_identity=.{s} proxy_protocol={s} trusted={d}", .{ i, @tagName(ep), @tagName(ep.clientIdentity()), framing, ep.trusted().len });
         }
+        if (proxy_endpoints != 0) log.info("PROXY header waiters: {d}, a floor of {d} for each of {d} PROXY endpoints and {d} shared; header deadline {d} ms", .{ config.limits.proxy_header_waiters, proxy_floor, proxy_endpoints, proxy_shared, config.limits.proxy_header_timeout_ns / std.time.ns_per_ms });
 
         var tls_acceptor: ?tls_edge.Acceptor = null;
         errdefer if (tls_acceptor) |*auth| auth.deinit();
@@ -490,6 +530,8 @@ pub const Server = struct {
             .compression_pool = compression_pool,
             .balancer = config.balancer,
             .slots = slots,
+            .proxy_floor = proxy_floor,
+            .proxy_shared = proxy_shared,
         };
         self.router = .{ .routes = self.routes };
         return self;
@@ -784,17 +826,31 @@ pub const Server = struct {
         self.accounting.saturatingRelease(&self.active_connections, 1, "active_connections", .seq_cst);
     }
 
-    fn tryAdmitProxyWaiter(self: *Server) bool {
-        while (true) {
-            const cur = self.proxy_waiters.load(.seq_cst);
-            if (cur >= self.limits.proxy_header_waiters) return false;
-            if (self.proxy_waiters.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) == null) return true;
-        }
+    /// A header waiter slot for a connection on PROXY endpoint `i`: its own
+    /// floor first, then the shared pool. Null when both are full.
+    fn tryAdmitProxyWaiter(self: *Server, i: usize) ?ProxySlot {
+        if (boundedIncrement(&self.proxy_floor_used[i], self.proxy_floor)) return .floor;
+        if (boundedIncrement(&self.proxy_shared_used, self.proxy_shared)) return .shared;
+        return null;
     }
 
-    fn releaseProxyWaiter(self: *Server) void {
-        self.accounting.saturatingRelease(&self.proxy_waiters, 1, "proxy_waiters", .seq_cst);
+    fn releaseProxyWaiter(self: *Server, i: usize, slot: ProxySlot) void {
+        switch (slot) {
+            .floor => self.accounting.saturatingRelease(&self.proxy_floor_used[i], 1, "proxy_floor_used", .seq_cst),
+            .shared => self.accounting.saturatingRelease(&self.proxy_shared_used, 1, "proxy_shared_used", .seq_cst),
+        }
         self.accounting.wakeAdmission();
+    }
+
+    /// Every PROXY header waiter slot in use, floors and pool.
+    pub fn proxyWaiters(self: *const Server) usize {
+        var n = self.proxy_shared_used.load(.acquire);
+        for (&self.proxy_floor_used) |*f| n += f.load(.acquire);
+        return n;
+    }
+
+    pub fn proxyFloorUsed(self: *const Server, i: usize) usize {
+        return self.proxy_floor_used[i].load(.acquire);
     }
 
     /// Give back what `admitAccepted` took before it was refused. Outside
@@ -814,6 +870,10 @@ pub const Server = struct {
         mode: connection.Mode,
         proxied: bool,
         charge: accounts.Charge,
+        endpoint: usize,
+        /// Where `admitAccepted` says which PROXY waiter slot it took; null
+        /// for the other predicates.
+        proxy_slot: ?*ProxySlot,
     };
 
     /// Every limit an accept on this endpoint must pass has room. Checked
@@ -823,7 +883,11 @@ pub const Server = struct {
     fn admissionRoom(self: *Server, a: Admission, locked: bool) connection.Admit {
         _ = locked;
         if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) return .server_full;
-        if (a.proxied) return if (self.proxy_waiters.load(.seq_cst) < self.limits.proxy_header_waiters) .ok else .server_full;
+        if (a.proxied) {
+            const room = self.proxy_floor_used[a.endpoint].load(.seq_cst) < self.proxy_floor or
+                self.proxy_shared_used.load(.seq_cst) < self.proxy_shared;
+            return if (room) .ok else .server_full;
+        }
         if (a.mode == .tls and self.accounting.active_handshakes.load(.seq_cst) >= self.accounting.max_handshakes) return .server_full;
         return .ok;
     }
@@ -836,7 +900,10 @@ pub const Server = struct {
             const conn = self.tryAdmitConnection(a.charge);
             if (conn != .ok) break :admit conn;
             if (a.proxied) {
-                if (self.tryAdmitProxyWaiter()) break :admit .ok;
+                if (self.tryAdmitProxyWaiter(a.endpoint)) |ps| {
+                    a.proxy_slot.?.* = ps;
+                    break :admit .ok;
+                }
                 self.undoConnection(a.charge, locked);
                 break :admit .server_full;
             }
@@ -916,7 +983,7 @@ pub const Server = struct {
     /// `proxied`: a PROXY v2 endpoint. Its header is read here first
     /// (`takeProxyHeader`), and only then is the connection keyed and charged
     /// to its client (`.proxy_source`), or to none (`.none`).
-    fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig, slot: ?*conn_slot.ConnSlot, endpoint_index: usize, proxied: bool) std.Io.Cancelable!void {
+    fn connEntry(self: *Server, stream: std.Io.net.Stream, config: connection.ConnConfig, slot: ?*conn_slot.ConnSlot, endpoint_index: usize, proxy: ?ProxyWait) std.Io.Cancelable!void {
         var cfg = config;
         defer self.clients.release(cfg.charge);
         var slot_back = slot == null;
@@ -932,9 +999,8 @@ pub const Server = struct {
             slot_back = true;
         };
         connection.probeNote(.conn_entry);
-        if (proxied) {
-            const deadline_ns = awakeNs() +| self.limits.preface_timeout_ns;
-            self.takeProxyHeader(stream, &cfg, endpoint_index, deadline_ns) catch |err| {
+        if (proxy) |pw| {
+            self.takeProxyHeader(stream, &cfg, endpoint_index, pw) catch |err| {
                 stream.close(cfg.io);
                 if (err == error.Canceled) return error.Canceled;
                 return;
@@ -947,16 +1013,19 @@ pub const Server = struct {
 
     const ProxyError = error{ Canceled, Failed };
 
-    /// A PROXY v2 connection, on its own task: read its header by the preface
-    /// deadline; with `.proxy_source`, key it to the client the header names
-    /// and charge the connection to that client (with `.none`, charge no
-    /// client); and on TLS take its handshake slot by the same deadline. The
-    /// PROXY waiter slot is held until then. `Request.peer` is the header's
-    /// source either way. On any failure the caller closes the connection;
-    /// nothing is charged to a client then.
-    fn takeProxyHeader(self: *Server, stream: std.Io.net.Stream, cfg: *connection.ConnConfig, endpoint_index: usize, deadline_ns: u64) ProxyError!void {
-        defer self.releaseProxyWaiter();
-        const src = readProxyHeader(stream, self.limits.proxy_header_bytes, deadline_ns) catch |err| {
+    /// A PROXY v2 connection, on its own task: read its header by its own
+    /// deadline (`Limits.proxy_header_timeout_ns` from the accept); with
+    /// `.proxy_source`, key it to the client the header names and charge the
+    /// connection to that client (with `.none`, charge no client); and on TLS
+    /// take its handshake slot by the preface deadline, also from the accept.
+    /// The PROXY waiter slot is held until then. `Request.peer` is the
+    /// header's source either way. On any failure the caller closes the
+    /// connection; nothing is charged to a client then.
+    fn takeProxyHeader(self: *Server, stream: std.Io.net.Stream, cfg: *connection.ConnConfig, endpoint_index: usize, pw: ProxyWait) ProxyError!void {
+        defer self.releaseProxyWaiter(endpoint_index, pw.slot);
+        const header_deadline_ns = pw.accepted_ns +| self.limits.proxy_header_timeout_ns;
+        const slot_deadline_ns = pw.accepted_ns +| self.limits.preface_timeout_ns;
+        const src = readProxyHeader(stream, self.limits.proxy_header_bytes, header_deadline_ns) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             _ = self.proxy_header_failures.fetchAdd(1, .monotonic);
             self.proxy_log.note("PROXY header from {f} failed ({s}); connection closed", .{ fmtPeer(cfg.peer), @errorName(err) });
@@ -1001,8 +1070,8 @@ pub const Server = struct {
         }
         cfg.charge = charge;
         if (cfg.mode != .tls) return;
-        const a: Admission = .{ .mode = .tls, .proxied = true, .charge = charge };
-        const admitted = zio.withTimeout(.{ .deadline = .fromNanoseconds(deadline_ns) }, awaitHandshakeSlot, .{ self, a }) catch |err| {
+        const a: Admission = .{ .mode = .tls, .proxied = true, .charge = charge, .endpoint = endpoint_index, .proxy_slot = null };
+        const admitted = zio.withTimeout(.{ .deadline = .fromNanoseconds(slot_deadline_ns) }, awaitHandshakeSlot, .{ self, a }) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             _ = self.proxy_header_failures.fetchAdd(1, .monotonic);
             self.proxy_log.note("connection from {f} (PROXY) found no TLS handshake slot by the preface deadline; closed", .{fmtPeer(cfg.peer)});
@@ -1139,7 +1208,7 @@ pub const Server = struct {
         const unix = endpoint.unixPath() != null;
         var backoff: AcceptBackoff = .{};
         while (!self.shutdown_flag.load(.acquire)) {
-            _ = try self.awaitAdmission(.{ .mode = mode, .proxied = proxied, .charge = .none }, admissionRoom);
+            _ = try self.awaitAdmission(.{ .mode = mode, .proxied = proxied, .charge = .none, .endpoint = endpoint_index, .proxy_slot = null }, admissionRoom);
             connection.probeNote(.accept);
             const stream = listener.accept(self.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -1151,6 +1220,8 @@ pub const Server = struct {
                 },
             };
             backoff.ok();
+            // A PROXY connection's deadlines count from here.
+            const accepted_ns = awakeNs();
             // HTTP/2 writes small frames. Linux leaves Nagle on, so a frame can
             // sit until the peer's delayed ACK (~40 ms). That was nachos h2c at
             // 21k req/s with p99 glued to 42.01 ms while TLS (larger records)
@@ -1193,7 +1264,8 @@ pub const Server = struct {
                     }
                 },
             }
-            const admission: Admission = .{ .mode = mode, .proxied = proxied, .charge = charge };
+            var proxy_slot: ProxySlot = undefined;
+            const admission: Admission = .{ .mode = mode, .proxied = proxied, .charge = charge, .endpoint = endpoint_index, .proxy_slot = &proxy_slot };
             const admitted = self.awaitAdmission(admission, admitAccepted) catch |err| {
                 self.clients.release(charge);
                 stream.close(self.io);
@@ -1218,6 +1290,7 @@ pub const Server = struct {
                 self.undoAccept(stream, admission, null);
                 continue;
             };
+            const proxy_wait: ?ProxyWait = if (proxied) .{ .slot = proxy_slot, .accepted_ns = accepted_ns } else null;
             var config: connection.ConnConfig = .{
                 .io = self.io,
                 .mode = mode,
@@ -1244,7 +1317,7 @@ pub const Server = struct {
                 if (b.reserve()) |ei| {
                     config.balancer = b;
                     config.exec_index = ei;
-                    if (connection_group.spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config, slot, endpoint_index, proxied })) |_| {
+                    if (connection_group.spawnInto(.{ .executor = ei }, connEntry, .{ self, stream, config, slot, endpoint_index, proxy_wait })) |_| {
                         b.notePlaced(ei, stream.socket.address.getPort());
                         continue;
                     } else |_| {
@@ -1259,12 +1332,12 @@ pub const Server = struct {
             // the same group and with the same fallback.
             if (comptime connection.placement_check) {
                 if (connection.probeConnPlacement()) |placement| {
-                    if (connection_group.spawnInto(placement, connEntry, .{ self, stream, config, slot, endpoint_index, proxied })) |_| {
+                    if (connection_group.spawnInto(placement, connEntry, .{ self, stream, config, slot, endpoint_index, proxy_wait })) |_| {
                         continue;
                     } else |_| {}
                 }
             }
-            connection_group.spawn(connEntry, .{ self, stream, config, slot, endpoint_index, proxied }) catch {
+            connection_group.spawn(connEntry, .{ self, stream, config, slot, endpoint_index, proxy_wait }) catch {
                 self.undoAccept(stream, admission, slot);
                 continue;
             };
@@ -1277,7 +1350,7 @@ pub const Server = struct {
     /// client's references go last.
     fn undoAccept(self: *Server, stream: std.Io.net.Stream, a: Admission, slot: ?*conn_slot.ConnSlot) void {
         if (a.proxied) {
-            self.releaseProxyWaiter();
+            self.releaseProxyWaiter(a.endpoint, a.proxy_slot.?.*);
         } else if (a.mode == .tls) {
             self.accounting.releaseHandshake(a.charge);
         }
@@ -1351,7 +1424,7 @@ pub const Server = struct {
         if (self.compression_pool) |*pool| {
             live = checkZero("compression contexts", pool.liveCount()) or live;
         }
-        live = checkZero("proxy_waiters", self.proxy_waiters.load(.acquire)) or live;
+        live = checkZero("PROXY header waiters", self.proxyWaiters()) or live;
         // Conservation: every client account back to zero and every record
         // free. With `serve` returned and the counters above at zero, a
         // record left is a release some path forgot.
@@ -1493,6 +1566,15 @@ fn checkZero(comptime name: []const u8, value: usize) bool {
     if (value == 0) return false;
     log.err("Server.deinit: " ++ name ++ " is {d}, expected 0", .{value});
     return true;
+}
+
+/// Add one to `counter` unless it is at `cap`. True when it did.
+fn boundedIncrement(counter: *std.atomic.Value(usize), cap: usize) bool {
+    var cur = counter.load(.seq_cst);
+    while (cur < cap) {
+        cur = counter.cmpxchgWeak(cur, cur + 1, .seq_cst, .seq_cst) orelse return true;
+    }
+    return false;
 }
 
 fn monoNs() u64 {

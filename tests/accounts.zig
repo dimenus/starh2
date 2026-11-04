@@ -512,7 +512,7 @@ fn proxyIdentity(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expect(sawPeer(.{ .ip6 = a1 }));
     try std.testing.expect(sawPeer(.{ .ip4 = .{ 198, 51, 100, 4 } }));
     try std.testing.expect(sawPeer(.{ .ip4 = .{ 127, 0, 0, 1 } }));
-    try std.testing.expectEqual(@as(usize, 0), rig.server.proxy_waiters.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), rig.server.proxyWaiters());
     std.debug.print("accounts proxy: 6 records (v4, two /64, /48, LOCAL, h1)\n", .{});
 
     release.store(true, .release);
@@ -677,7 +677,7 @@ var waiters_max: std.atomic.Value(usize) = .init(0);
 
 fn sampleWaiters(server: *starh2.Server, stop: *std.atomic.Value(bool)) void {
     while (!stop.load(.acquire)) {
-        const n = server.proxy_waiters.load(.acquire);
+        const n = server.proxyWaiters();
         _ = waiters_max.fetchMax(n, .acq_rel);
         zio.sleep(.fromMilliseconds(1)) catch return;
     }
@@ -703,6 +703,8 @@ fn proxyStalled(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var rig: Rig = undefined;
     var limits = testLimits();
     limits.preface_timeout_ns = 600 * ms;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
     limits.proxy_header_waiters = 2;
     try rig.start(rt, gpa, &.{
         .{ .h2c_prior_knowledge = ppTcp(try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), &trusted_loopback) },
@@ -725,7 +727,7 @@ fn proxyStalled(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     }
     // Only two are inside the cap; the third waits in the listen queue.
     zio.sleep(.fromMilliseconds(300)) catch {};
-    try std.testing.expectEqual(@as(usize, 2), rig.server.proxy_waiters.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), rig.server.proxyWaiters());
     try std.testing.expectEqual(@as(usize, 2), rig.server.active_connections.load(.acquire));
     for (&tasks) |*t| t.join();
     stop_sampler.store(true, .release);
@@ -1616,11 +1618,31 @@ fn raceAddrs(kind: RaceKind, ports: [2]u16) ![2]zio.net.IpAddress {
     return .{ try zio.net.IpAddress.parseIp4("127.0.0.1", ports[0]), try zio.net.IpAddress.parseIp6("::1", ports[1]) };
 }
 
-fn raceCycle(kind: RaceKind, gpa: std.mem.Allocator, ports: [2]u16) !void {
+fn raceCycle(kind: RaceKind, gpa: std.mem.Allocator, ports: [2]u16, server: *starh2.Server) !void {
     const addrs = try raceAddrs(kind, ports);
     const a0 = addrs[0];
     const a1 = addrs[1];
     var hb: [64]u8 = undefined;
+    var floors: [2]zio.net.Stream = undefined;
+    var floors_n: usize = 0;
+    defer for (floors[0..floors_n]) |f| f.close();
+    // A PROXY waiter slot is taken at accept. Each PROXY endpoint has a floor
+    // of one and one slot is shared (`Server.proxy_floor`): stalled headers
+    // hold both floors first, so X, the next on endpoint 0, holds the shared
+    // one, which Y and Z then race for.
+    if (kind == .proxy_waiter) {
+        for ([_]zio.net.IpAddress{ a0, a1 }) |addr| {
+            const f = try connect(addr);
+            floors[floors_n] = f;
+            floors_n += 1;
+            try writeAll(f, proxy.signature[0..6]);
+        }
+        try waitUntil("both floors held", server, struct {
+            fn f(srv: *starh2.Server) bool {
+                return srv.proxyWaiters() == 2;
+            }
+        }.f, 3 * std.time.ns_per_s);
+    }
     // X takes the one slot.
     const x = try connect(a0);
     switch (kind) {
@@ -1683,6 +1705,8 @@ fn admissionRace(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: RaceKind) !void
     var rig: Rig = undefined;
     var limits = testLimits();
     limits.preface_timeout_ns = 3 * std.time.ns_per_s;
+    // The PROXY header deadline may not be later (`Limits`).
+    limits.proxy_header_timeout_ns = limits.preface_timeout_ns;
     const ep4 = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
     const ep6 = try starh2.EndpointAddress.parseIp6("::1", 0);
     switch (kind) {
@@ -1695,7 +1719,8 @@ fn admissionRace(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: RaceKind) !void
             try rig.start(rt, gpa, &.{ .{ .tls = .{ .address = ep4 } }, .{ .tls = .{ .address = ep6 } } }, limits, true);
         },
         .proxy_waiter => {
-            limits.proxy_header_waiters = 1;
+            // Two PROXY endpoints: a floor of one each, one shared.
+            limits.proxy_header_waiters = 3;
             try rig.start(rt, gpa, &.{ .{ .h2c_prior_knowledge = ppTcp(ep4, &trusted_loopback) }, .{ .h2c_prior_knowledge = ppTcp(ep4, &trusted_loopback) } }, limits, false);
         },
     }
@@ -1706,7 +1731,7 @@ fn admissionRace(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: RaceKind) !void
     const before = server_mod.test_admit_refused.load(.acquire);
     var cycles: usize = 0;
     while (cycles < 60 and server_mod.test_admit_refused.load(.acquire) - before < 3) : (cycles += 1) {
-        try raceCycle(kind, gpa, ports);
+        try raceCycle(kind, gpa, ports, &rig.server);
     }
     const refused = server_mod.test_admit_refused.load(.acquire) - before;
     std.debug.print("accounts race {s}: {d} admissions refused and undone in {d} cycles\n", .{ @tagName(kind), refused, cycles });
