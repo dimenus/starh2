@@ -4036,7 +4036,13 @@ pub const Connection = struct {
     /// idle, test canary).
     /// Handler deadlines are handler-owned zio timed waits and never appear
     /// in the actor's park timer.
+    ///
+    /// Caller holds `session_mu`: the Session and FairScheduler clocks read
+    /// here are written by handler tasks under it (`writeCb` ->
+    /// `enqueueDataBytes` starts a stream's stall clock). See
+    /// `parkDeadlineNs` for why the lock alone keeps the park timer current.
     fn nextDeadlineNs(self: *Connection) ?u64 {
+        self.assertSessionHeld("nextDeadlineNs");
         // While closing, the other deadlines are not enforced (the loop does
         // not run them), and an overdue one would make `waitForActivity`
         // return at once on every turn.
@@ -4072,6 +4078,28 @@ pub const Connection = struct {
             if (next == null or deadline < next.?) next = deadline;
         }
         return next;
+    }
+
+    /// The deadline the actor parks on, read under `session_mu` immediately
+    /// before the park. Actor only.
+    ///
+    /// Why here and not in the turn's main lock block: the actor still changes
+    /// the scheduler after that block, with no ring. `runPendingInline` runs
+    /// complete handlers on the actor, and their DATA can stay pending on a
+    /// closed window, which starts a stall clock. A deadline computed in the
+    /// main block would not have it, and the actor could park with no timer.
+    ///
+    /// Why the value cannot go stale while parked: after this unlock the actor
+    /// changes nothing before its select. Any later change to a deadline is a
+    /// handler task's, made under `session_mu`, and that task's
+    /// `unlockSession` rings the doorbell. The doorbell is a branch of the
+    /// select, and a ring holds until taken, so the actor wakes and its next
+    /// turn reads the moved deadline here again.
+    fn parkDeadlineNs(self: *Connection) ?u64 {
+        self.lockSessionUncancelable();
+        defer self.unlockSession();
+        if (diag_park) self.traceParkSnapshot();
+        return self.nextDeadlineNs();
     }
 
     fn traceParkSnapshot(self: *Connection) void {
@@ -4367,14 +4395,13 @@ pub const Connection = struct {
         const io = self.config.io;
         self.actor_site.store(2, .release);
         defer self.actor_site.store(1, .release);
-        if (diag_park) self.traceParkSnapshot();
         if (comptime test_observe) {
             if (test_hold_before_actor_wait.swap(false, .acq_rel)) {
                 test_actor_waiting.set();
                 try test_release_actor_wait.wait();
             }
         }
-        const timeout: zio.Timeout = if (self.nextDeadlineNs()) |deadline_ns| blk: {
+        const timeout: zio.Timeout = if (self.parkDeadlineNs()) |deadline_ns| blk: {
             const now = nowNs(io);
             if (deadline_ns <= now) return null;
             break :blk .{ .duration = .fromNanoseconds(deadline_ns - now) };

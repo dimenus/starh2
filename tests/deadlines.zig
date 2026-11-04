@@ -522,3 +522,136 @@ test "T5: a deadline before zero returns at once on both wait paths (h2c and h1c
     }.f, .{ rt, gpa });
     try handle.join();
 }
+
+// T6: a handler's write moves the actor's park deadline, and the parked actor
+// wakes at the moved deadline. The actor parks with only the connection idle
+// timer armed (30 s). Then a task handler writes DATA that the peer's zero
+// window holds, which starts the stream's response-rate clock
+// (`Limits.response_min_rate_grace_ns`, 300 ms here). The actor reads its park
+// deadline under `session_mu` (`Connection.parkDeadlineNs`), so it learns of
+// the new clock only because the handler's `unlockSession` rings the doorbell
+// and the next turn recomputes. If either half is missing, the stream is
+// reset at the idle timer instead, 30 s later, and the kill misses its window.
+const t6_grace_ns: u64 = 300 * std.time.ns_per_ms;
+var t6_write_ns: std.atomic.Value(u64) = .init(0);
+var t6_killed_ns: std.atomic.Value(u64) = .init(0);
+var t6_handler_err: std.atomic.Value(u8) = .init(0);
+
+fn t6WriteThenFlush(body: *starh2.Body) starh2.ResponseError!void {
+    try body.writeAll("data: held-by-the-window\n\n");
+    try body.flush();
+}
+
+fn sseLateWrite(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    var body = try resp.startSse(&.{});
+    try body.flush();
+    // The precondition, read from the actor's own park gauge: the actor sits
+    // in its select, so the only way it can learn of the write below is a
+    // wake. Twice, 50 ms apart, so a turn that is merely passing through the
+    // select does not count.
+    const conn_mod = starh2.edge.connection;
+    if (comptime @TypeOf(conn_mod.test_actors_in_select) != void) {
+        const give_up = t4NowNs(resp.io) + 5 * std.time.ns_per_s;
+        while (true) {
+            if (conn_mod.test_actors_in_select.load(.acquire) == 1) {
+                try zio.sleep(.fromMilliseconds(50));
+                if (conn_mod.test_actors_in_select.load(.acquire) == 1) break;
+            }
+            if (t4NowNs(resp.io) >= give_up) {
+                t6_handler_err.store(1, .release);
+                return error.ActorNeverParked;
+            }
+            try zio.sleep(.fromMilliseconds(5));
+        }
+    } else {
+        try zio.sleep(.fromMilliseconds(300));
+    }
+    t6_write_ns.store(t4NowNs(resp.io), .release);
+    t6WriteThenFlush(&body) catch |err| {
+        if (err == error.SlowConsumer) {
+            t6_killed_ns.store(t4NowNs(resp.io), .release);
+        } else t6_handler_err.store(3, .release);
+        return err;
+    };
+    // The window is zero: a flush that succeeds means the bytes left without
+    // credit.
+    t6_handler_err.store(4, .release);
+}
+
+test "T6: a handler write that starts a response-rate clock wakes the parked actor at its deadline" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{
+        .executors = .exact(2),
+    });
+    defer rt.deinit();
+    var handle = try rt.spawn(struct {
+        fn f(runtime: *zio.Runtime, a: std.mem.Allocator) !void {
+            const routes = [_]starh2.Route{
+                .{ .method = .GET, .path = "/late", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = sseLateWrite } } },
+            };
+            const addr = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+            var limits = starh2.Limits.defaults;
+            limits.response_min_rate_grace_ns = t6_grace_ns;
+            limits.connection_idle_timeout_ns = 30 * std.time.ns_per_s;
+            var server = try starh2.Server.init(a, runtime.io(), .{
+                .endpoints = &.{.{ .h2c_prior_knowledge = .{ .address = addr } }},
+                .routes = &routes,
+                .tls = null,
+                .limits = limits,
+            });
+            defer server.deinit(a);
+            var serve_handle = try runtime.spawn(starh2.Server.serve, .{ &server, a });
+            defer {
+                server.requestShutdown();
+                serve_deadline.join(&server, &serve_handle);
+            }
+            try server.waitUntilListening(5 * std.time.ns_per_s);
+
+            t6_write_ns.store(0, .release);
+            t6_killed_ns.store(0, .release);
+            t6_handler_err.store(0, .release);
+            const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
+            var stream = try peer.connect(.{});
+            defer stream.close();
+            // Every stream window is zero, so the handler's DATA waits on the
+            // peer from its first byte.
+            const hello = try h2c.buildClientHelloWindow(a, "/late", 1, 0, .empty);
+            defer a.free(hello);
+            try writeAllStream(stream, hello);
+
+            var cap = try Capture.init(a);
+            defer cap.deinit();
+            var buf: [16 * 1024]u8 = undefined;
+            const give_up = t4NowNs(runtime.io()) + 10 * std.time.ns_per_s;
+            while (!cap.saw_rst) {
+                if (t6_handler_err.load(.acquire) != 0) break;
+                if (t4NowNs(runtime.io()) >= give_up) break;
+                const n = stream.read(&buf, .{ .duration = .fromMilliseconds(20) }) catch |err| switch (err) {
+                    error.Timeout => 0,
+                    else => return err,
+                };
+                if (n > 0) try cap.ingest(buf[0..n]);
+            }
+            try std.testing.expectEqual(@as(u8, 0), t6_handler_err.load(.acquire));
+            const write_ns = t6_write_ns.load(.acquire);
+            try std.testing.expect(write_ns != 0);
+            if (!cap.saw_rst) return error.NoResetWithinTenSeconds;
+            // The handler's SlowConsumer is stamped after the reset is
+            // queued; wait for it, it is a few ms behind.
+            const stamp_by = t4NowNs(runtime.io()) + 2 * std.time.ns_per_s;
+            while (t6_killed_ns.load(.acquire) == 0 and t4NowNs(runtime.io()) < stamp_by) {
+                zio.sleep(.fromMilliseconds(5)) catch {};
+            }
+            const killed_ns = t6_killed_ns.load(.acquire);
+            if (killed_ns == 0) return error.HandlerNeverSawSlowConsumer;
+            const killed_ms = (killed_ns - write_ns) / std.time.ns_per_ms;
+            std.debug.print("T6: stream reset {d} ms after the handler's write (grace {d} ms, idle timer 30000 ms)\n", .{ killed_ms, t6_grace_ns / std.time.ns_per_ms });
+            // The clock starts at the actor's pop after the write, so never
+            // before the grace. The ceiling is far below the 30 s idle timer
+            // that is the only other wake, and allows a loaded machine.
+            try std.testing.expect(killed_ns - write_ns >= t6_grace_ns);
+            try std.testing.expect(killed_ms <= t6_grace_ns / std.time.ns_per_ms + 1500);
+        }
+    }.f, .{ rt, gpa });
+    try handle.join();
+}
