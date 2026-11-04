@@ -24,27 +24,22 @@ fn handleInject(_: *anyopaque, _: *const starh2.Request, reply: *starh2.http1.Re
     try reply.send(200, &.{.{ .name = "x-evil", .value = "a\r\nX-Injected: 1" }}, "ok");
 }
 
-const ReadRace = union(enum) {
-    byte: std.Io.Reader.Error!u8,
-    timeout: std.Io.Cancelable!void,
-};
-
 fn takeOne(reader: *std.Io.Reader) std.Io.Reader.Error!u8 {
     return reader.takeByte();
 }
 
-fn sleepNs(io: std.Io, timeout_ns: u64) std.Io.Cancelable!void {
-    return io.sleep(.fromNanoseconds(timeout_ns), .awake);
-}
-
-fn expectEofSoon(io: std.Io, reader: *std.Io.Reader, timeout_ns: u64) !void {
-    var result_buffer: [2]ReadRace = undefined;
-    var select = std.Io.Select(ReadRace).init(io, &result_buffer);
-    try select.concurrent(.byte, takeOne, .{reader});
-    try select.concurrent(.timeout, sleepNs, .{ io, timeout_ns });
-    const selected = try select.await();
-    select.cancelDiscard();
-    switch (selected) {
+/// The read runs on its own task, raced against an absolute deadline (a
+/// `.duration` armed from task code can fire early on a busy loop, t-3653).
+/// The loser is canceled; the read's result is not needed when the deadline
+/// wins, because the test fails then.
+fn expectEofSoon(reader: *std.Io.Reader, timeout_ns: u64) !void {
+    var byte = try zio.spawn(takeOne, .{reader});
+    defer byte.cancel();
+    const winner = try zio.select(.{
+        .byte = &byte,
+        .timeout = zio.Timeout.fromNanoseconds(timeout_ns).toDeadline(),
+    });
+    switch (winner) {
         .byte => |result| {
             if (result) |_| {
                 return error.ExpectedEof;
@@ -53,10 +48,7 @@ fn expectEofSoon(io: std.Io, reader: *std.Io.Reader, timeout_ns: u64) !void {
                 else => return err,
             }
         },
-        .timeout => |result| {
-            try result;
-            return error.CloseDidNotArrive;
-        },
+        .timeout => return error.CloseDidNotArrive,
     }
 }
 
@@ -88,8 +80,8 @@ fn runContentLengthWithoutEof(io: std.Io, gpa: std.mem.Allocator) !void {
             lio.sleep(.fromSeconds(30), .awake) catch {};
         }
     };
-    var stub_future = try io.concurrent(stub.run, .{ io, &listener });
-    defer stub_future.cancel(io) catch {};
+    var stub_task = try zio.spawn(stub.run, .{ io, &listener });
+    defer stub_task.cancel();
 
     const started = std.Io.Clock.awake.now(io).nanoseconds;
     var resp = try starh2.http1.get(io, gpa, dest, "127.0.0.1", "/v1/tasks/t-7");
@@ -117,8 +109,8 @@ fn runMissingLengthFailsClosed(io: std.Io, gpa: std.mem.Allocator) !void {
             lio.sleep(.fromSeconds(30), .awake) catch {};
         }
     };
-    var stub_future = try io.concurrent(stub.run, .{ io, &listener });
-    defer stub_future.cancel(io) catch {};
+    var stub_task = try zio.spawn(stub.run, .{ io, &listener });
+    defer stub_task.cancel();
 
     const started = std.Io.Clock.awake.now(io).nanoseconds;
     try std.testing.expectError(error.MissingContentLength, starh2.http1.get(io, gpa, dest, "127.0.0.1", "/"));
@@ -129,11 +121,11 @@ fn runMissingLengthFailsClosed(io: std.Io, gpa: std.mem.Allocator) !void {
 fn runCloseActuallyCloses(io: std.Io, gpa: std.mem.Allocator) !void {
     var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleTask });
     defer server.deinit(gpa);
-    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serve_task = try zio.spawn(starh2.http1.Server.serve, .{&server});
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {};
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
 
@@ -151,21 +143,21 @@ fn runCloseActuallyCloses(io: std.Io, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("task-7", resp.body);
     try std.testing.expect(resp.connection_close);
-    try expectEofSoon(io, &reader.interface, 250 * std.time.ns_per_ms);
+    try expectEofSoon(&reader.interface, 250 * std.time.ns_per_ms);
 
     server.requestShutdown();
-    try serve_future.await(io);
+    try serve_task.join();
     serving = false;
 }
 
 fn runOneshotGet(io: std.Io, gpa: std.mem.Allocator) !void {
     var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleTask });
     defer server.deinit(gpa);
-    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serve_task = try zio.spawn(starh2.http1.Server.serve, .{&server});
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {};
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
 
@@ -176,7 +168,7 @@ fn runOneshotGet(io: std.Io, gpa: std.mem.Allocator) !void {
     try std.testing.expect(resp.connection_close);
 
     server.requestShutdown();
-    try serve_future.await(io);
+    try serve_task.join();
     serving = false;
 }
 
@@ -189,11 +181,11 @@ fn runHugeHeadersRejected(io: std.Io, gpa: std.mem.Allocator) !void {
         .limits = limits,
     });
     defer server.deinit(gpa);
-    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serve_task = try zio.spawn(starh2.http1.Server.serve, .{&server});
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {};
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
 
@@ -215,18 +207,18 @@ fn runHugeHeadersRejected(io: std.Io, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u16, 431), resp.status);
 
     server.requestShutdown();
-    try serve_future.await(io);
+    try serve_task.join();
     serving = false;
 }
 
 fn runPostMissingLengthRejected(io: std.Io, gpa: std.mem.Allocator) !void {
     var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleEcho });
     defer server.deinit(gpa);
-    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serve_task = try zio.spawn(starh2.http1.Server.serve, .{&server});
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {};
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
 
@@ -244,18 +236,18 @@ fn runPostMissingLengthRejected(io: std.Io, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u16, 411), resp.status);
 
     server.requestShutdown();
-    try serve_future.await(io);
+    try serve_task.join();
     serving = false;
 }
 
 fn runInjectedHeaderIs500(io: std.Io, gpa: std.mem.Allocator) !void {
     var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleInject });
     defer server.deinit(gpa);
-    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serve_task = try zio.spawn(starh2.http1.Server.serve, .{&server});
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {};
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
 
@@ -274,18 +266,18 @@ fn runInjectedHeaderIs500(io: std.Io, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("", resp.body);
 
     server.requestShutdown();
-    try serve_future.await(io);
+    try serve_task.join();
     serving = false;
 }
 
 fn runAcceptFatalUnblocksServe(io: std.Io, gpa: std.mem.Allocator) !void {
     var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleTask });
     defer server.deinit(gpa);
-    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serve_task = try zio.spawn(starh2.http1.Server.serve, .{&server});
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {};
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
     server.next_accept_fault.store(2, .release);
@@ -295,7 +287,7 @@ fn runAcceptFatalUnblocksServe(io: std.Io, gpa: std.mem.Allocator) !void {
     }
 
     const started = std.Io.Clock.awake.now(io).nanoseconds;
-    try std.testing.expectError(error.AcceptFailed, serve_future.await(io));
+    try std.testing.expectError(error.AcceptFailed, serve_task.join());
     serving = false;
     const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
     try std.testing.expect(elapsed < 500 * std.time.ns_per_ms);
@@ -305,11 +297,11 @@ fn runAcceptFatalUnblocksServe(io: std.Io, gpa: std.mem.Allocator) !void {
 fn runAcceptResourceBackoffStillServes(io: std.Io, gpa: std.mem.Allocator) !void {
     var server = try startServer(io, gpa, .{ .ptr = @constCast(&dummy), .runFn = handleTask });
     defer server.deinit(gpa);
-    var serve_future = try io.concurrent(starh2.http1.Server.serve, .{&server});
+    var serve_task = try zio.spawn(starh2.http1.Server.serve, .{&server});
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {};
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
     server.next_accept_fault.store(1, .release);
@@ -324,7 +316,7 @@ fn runAcceptResourceBackoffStillServes(io: std.Io, gpa: std.mem.Allocator) !void
     try std.testing.expectEqualStrings("task-7", second.body);
 
     server.requestShutdown();
-    try serve_future.await(io);
+    try serve_task.join();
     serving = false;
 }
 

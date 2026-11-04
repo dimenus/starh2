@@ -10,37 +10,31 @@ fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse
     try resp.send(200, &.{}, response_body);
 }
 
-const ReadRace = union(enum) {
-    read: std.Io.Reader.Error!usize,
-    timeout: std.Io.Cancelable!void,
-};
-
 fn readSome(reader: *std.Io.net.Stream.Reader, buffer: []u8) std.Io.Reader.Error!usize {
     var dest: [1][]u8 = .{buffer};
     return reader.interface.readVec(&dest);
 }
 
-fn timeout(io: std.Io, timeout_ns: u64) std.Io.Cancelable!void {
-    return io.sleep(.fromNanoseconds(timeout_ns), .awake);
-}
-
-fn readUntilBody(io: std.Io, reader: *std.Io.net.Stream.Reader, elapsed_limit_ns: u64) !void {
+/// Each read runs on its own task, raced against an absolute deadline (a
+/// `.duration` armed from task code can fire early on a busy loop, t-3653).
+/// When the deadline wins the read is canceled and the test fails, so no
+/// read result is ever thrown away on a path that goes on reading.
+fn readUntilBody(reader: *std.Io.net.Stream.Reader, elapsed_limit_ns: u64) !void {
     var response: [16 * 1024]u8 = undefined;
     var used: usize = 0;
     while (used < response.len) {
-        var result_buffer: [2]ReadRace = undefined;
-        var select = std.Io.Select(ReadRace).init(io, &result_buffer);
-        try select.concurrent(.read, readSome, .{ reader, response[used..] });
-        try select.concurrent(.timeout, timeout, .{ io, elapsed_limit_ns });
-        const selected = try select.await();
-        select.cancelDiscard();
-        switch (selected) {
+        var read = try zio.spawn(readSome, .{ reader, response[used..] });
+        defer read.cancel();
+        const winner = try zio.select(.{
+            .read = &read,
+            .timeout = zio.Timeout.fromNanoseconds(elapsed_limit_ns).toDeadline(),
+        });
+        switch (winner) {
             .read => |result| {
                 used += try result;
                 if (std.mem.indexOf(u8, response[0..used], response_body) != null) return;
             },
-            .timeout => |result| {
-                try result;
+            .timeout => {
                 std.debug.print("response timeout after {d} bytes: {any}\n", .{ used, response[0..used] });
                 return error.ResponseTimeout;
             },
@@ -66,13 +60,12 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
     });
     defer server.deinit(gpa);
 
-    var serve_future = try io.concurrent(starh2.Server.serve, .{ &server, gpa });
+    var serve_task = try zio.spawn(starh2.Server.serve, .{ &server, gpa });
     var serving = true;
     defer if (serving) {
         server.requestShutdown();
-        serve_future.cancel(io) catch {
-            // The test is already failing; cancellation exists only to release server resources.
-        };
+        // The test is already failing; cancellation exists only to release server resources.
+        serve_task.cancel();
     };
     try server.waitUntilListening(2 * std.time.ns_per_s);
 
@@ -112,7 +105,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
         starh2.edge.connection.test_release_actor_wait.set();
         try writer.interface.writeAll(headers.items);
         try writer.interface.flush();
-        try readUntilBody(io, &reader, 250 * std.time.ns_per_ms);
+        try readUntilBody(&reader, 250 * std.time.ns_per_ms);
         const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
         try std.testing.expect(elapsed < 250 * std.time.ns_per_ms);
     } else {
@@ -120,7 +113,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
         defer gpa.free(request);
         try writer.interface.writeAll(request);
         try writer.interface.flush();
-        readUntilBody(io, &reader, 2 * std.time.ns_per_s) catch |err| {
+        readUntilBody(&reader, 2 * std.time.ns_per_s) catch |err| {
             std.debug.print("parity read failed: active={d} boot={} sends={d} sched={d} live={d} writer_fail={}\n", .{
                 server.active_connections.load(.acquire),
                 starh2.edge.connection.test_boot_ready.load(.acquire),
@@ -136,7 +129,7 @@ fn runRealH2(io: std.Io, gpa: std.mem.Allocator, wakeup_gate: bool) !void {
     try std.testing.expectEqual(@as(usize, 0), server.accounting.task_handlers.load(.acquire));
 
     server.requestShutdown();
-    try serve_future.await(io);
+    try serve_task.join();
     serving = false;
 }
 
