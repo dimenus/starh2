@@ -7,8 +7,9 @@
 # the ones made while it ran, and exits 3 if any of them came from an
 # executable that does not match REGEX. A test case that is meant to die calls
 # `tests/no_core.zig` `expectDeath()` first, so `./zb build ci` should leave
-# none (t-3882). `--allow zio-dst` excuses the zio fork's mutant gate, which
-# aborts on purpose and is fixed in the fork (t-3872).
+# none (t-3882). `tools/zio-dst` calls it too, in its D4 children and its
+# mutant children, so `ci` should pass with no `--allow` at all (t-3872).
+# `--allow` remains for a command outside the tree whose deaths are known.
 #
 # It refuses to answer without coredumpctl: a check that cannot see the dumps
 # must not read as a pass. COMMAND's own exit status is printed and returned

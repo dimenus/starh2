@@ -8,6 +8,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const harness_options = @import("harness_options");
+const no_core = @import("no_core");
 
 /// zio reads its compile-time configuration from the root module. Sim on,
 /// pinned scheduling (sim does not simulate task migration), and the mutant
@@ -1029,7 +1030,7 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
     while (seed <= 1000) : (seed += 1) {
         const seed_s = std.fmt.bufPrint(&buf, "{d}", .{seed}) catch unreachable;
         const res = try std.process.run(gpa, io, .{
-            .argv = &.{ exe, "--run", "same_tick_race", "--seed", seed_s },
+            .argv = &.{ exe, "--run", "same_tick_race", "--seed", seed_s, "--expect-death" },
         });
         defer gpa.free(res.stdout);
         defer gpa.free(res.stderr);
@@ -1059,7 +1060,7 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
 
         std.debug.print("MUTANT_FIRED SEED={d} TRACE_HASH={x:0>16} PANIC={s}\n", .{ seed, h1.?, msg1 });
         const res2 = try std.process.run(gpa, io, .{
-            .argv = &.{ exe, "--run", "same_tick_race", "--seed", seed_s },
+            .argv = &.{ exe, "--run", "same_tick_race", "--seed", seed_s, "--expect-death" },
         });
         defer gpa.free(res2.stdout);
         defer gpa.free(res2.stderr);
@@ -1097,6 +1098,8 @@ fn armMutant(gpa: std.mem.Allocator, io: std.Io, exe: []const u8) !void {
 }
 
 fn armD4Inner(kind: []const u8) noreturn {
+    // Every kind ends in a sim panic: that death is what D4 checks.
+    no_core.expectDeath();
     zio.sim.begin(1);
     zio.sim.printScope();
     if (std.mem.eql(u8, kind, "clock")) {
@@ -1149,6 +1152,7 @@ pub fn main(init: std.process.Init) !void {
     var run_one: ?Fixture = null;
     var seed: u64 = 1;
     var arm_d4_inner: ?[]const u8 = null;
+    var expect_death = false;
 
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--d1")) {
@@ -1181,6 +1185,11 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("bad --seed {s}\n", .{s});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, a, "--expect-death")) {
+            // Passed by `--arm-mutant` to its `--run` children, whose mutant
+            // is meant to panic. A `--run` started by hand keeps its core
+            // limits, so a real crash there still leaves a core.
+            expect_death = true;
         } else if (std.mem.eql(u8, a, "--arm-d4-inner")) {
             arm_d4_inner = args.next() orelse {
                 std.debug.print("--arm-d4-inner needs clock|futex|io\n", .{});
@@ -1194,6 +1203,7 @@ pub fn main(init: std.process.Init) !void {
                 \\  --run <fixture> --seed N
                 \\  --arm-mutant          validity (needs -Dsim-mutant=arm_timer_stale)
                 \\  --arm-d4-inner clock|futex|io
+                \\  --expect-death        with --run: this run is meant to die, so write no core
                 \\
             , .{});
             return;
@@ -1203,9 +1213,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (expect_death and run_one == null) {
+        std.debug.print("--expect-death needs --run\n", .{});
+        std.process.exit(2);
+    }
     if (arm_d4_inner) |kind| armD4Inner(kind);
 
     if (run_one) |fix| {
+        if (expect_death) no_core.expectDeath();
         std.debug.print("SEED={d}\n", .{seed});
         const out = try runFixture(gpa, seed, fix, true);
         printRun(seed, fix, out);

@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zio", .module = zio.module("zio") },
                 .{ .name = "harness_options", .module = harness_options.createModule() },
+                // starh2's own helper, so the harness and the test suite share
+                // one rule for a process that is meant to die. This package
+                // is only built from inside the starh2 tree (its `zb` is
+                // `../../zb` too).
+                .{ .name = "no_core", .module = b.createModule(.{ .root_source_file = b.path("../../tests/no_core.zig") }) },
             },
         }),
     });

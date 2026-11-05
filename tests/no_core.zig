@@ -6,6 +6,9 @@
 //! Only the dying case calls it: the same binary's other cases keep the
 //! limits they were started with, so a real crash in them still leaves its
 //! core. A case left off a binary's list dumps (noise), it is never silenced.
+//!
+//! `tools/zio-dst` imports this file too (its `build.zig`): its D4 children
+//! and the `--run` children of `--arm-mutant` die on purpose.
 const std = @import("std");
 const builtin = @import("builtin");
 
