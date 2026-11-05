@@ -22,15 +22,22 @@
 //! for 8 MiB (8 streams of 1 MiB, the windows opened), which fills the
 //! server's socket buffer and parks its sends. Then each half-closes and never
 //! reads. A thread samples this process's `iou-wrk` threads every 2 ms and
-//! counts the ones whose `wchan` is not the idle wait (`io_wq_worker`) or
-//! running (`0`): those are blocked, in practice in `wait_woken` under the
-//! socket send.
+//! counts the ones whose `wchan` is not the idle wait or running (`0`):
+//! those are blocked, in practice in `wait_woken` under the socket send. The
+//! idle wait is the worker's main function: `io_wq_worker` since Linux 6.4,
+//! `io_wqe_worker` before it (renamed by "io-wq: Drop struct io_wqe",
+//! eb47943f2238). Every distinct `wchan` seen is printed, so a name this list
+//! does not know shows up as blocked and in the line.
 //!
-//! The second check must see at least one blocked worker, or it proves
-//! nothing: a kernel without the defect, another zio backend, or a probe
-//! that did not park a send all look like "no worker". Then the test SKIPS
-//! and says why, after the first check; it never passes the bound without
-//! having seen the defect fire.
+//! The bound check must see the defect fire, or it proves nothing:
+//! - zio's Linux `auto` backend falls back to epoll when ring setup fails.
+//!   epoll has no io-wq, so the test FAILS then, saying so, before the probe.
+//! - On io_uring, no `iou-wrk` thread at all also FAILS. The sampler may be
+//!   blind, and a blind sampler must not pass; if instead the kernel no longer
+//!   hands these sends to io-wq (the fix t-3863 tracks), this test has done
+//!   its job and should be retired, which a failure makes someone do.
+//! - On io_uring, workers seen but none ever blocked SKIPS and says why: a
+//!   kernel that still uses io-wq for other work but not for these sends.
 //!
 //! Linux only: io-wq is io_uring's.
 const std = @import("std");
@@ -77,11 +84,48 @@ const Seen = struct {
     /// Last sample with a blocked worker, ns after the half-close; null if none.
     last_blocked_ns: ?u64 = null,
     samples: usize = 0,
+    /// Every distinct `wchan` of an `iou-wrk` thread, in any sample.
+    wchans: [max_wchans][32]u8 = undefined,
+    wchan_lens: [max_wchans]u8 = undefined,
+    wchan_n: usize = 0,
+    /// A distinct value past `max_wchans`, or one longer than 32 bytes: the
+    /// list is not complete.
+    wchan_more: bool = false,
+
+    const max_wchans = 8;
+
+    fn noteWchan(self: *Seen, w: []const u8) void {
+        for (self.wchans[0..self.wchan_n], self.wchan_lens[0..self.wchan_n]) |*have, len| {
+            if (std.mem.eql(u8, have[0..len], w)) return;
+        }
+        if (self.wchan_n == max_wchans or w.len > 32) {
+            self.wchan_more = true;
+            return;
+        }
+        @memcpy(self.wchans[self.wchan_n][0..w.len], w);
+        self.wchan_lens[self.wchan_n] = @intCast(w.len);
+        self.wchan_n += 1;
+    }
+
+    fn printWchans(self: *const Seen) void {
+        for (self.wchans[0..self.wchan_n], self.wchan_lens[0..self.wchan_n], 0..) |*have, len, i| {
+            std.debug.print("{s}{s}", .{ if (i == 0) "" else ",", have[0..len] });
+        }
+        if (self.wchan_more) std.debug.print(",(more)", .{});
+    }
 };
 
-/// Blocked `iou-wrk` threads of this process now, and all of them.
-fn sampleWorkers() struct { workers: usize, blocked: usize } {
-    var out: @TypeOf(sampleWorkers()) = .{ .workers = 0, .blocked = 0 };
+/// The idle wait of an io-wq worker (see the file comment), or running.
+fn workerNotBlocked(wchan: []const u8) bool {
+    return std.mem.eql(u8, wchan, "io_wq_worker") or
+        std.mem.eql(u8, wchan, "io_wqe_worker") or
+        std.mem.eql(u8, wchan, "0");
+}
+
+/// Blocked `iou-wrk` threads of this process now, and all of them. Each
+/// worker's `wchan` is noted in `seen`.
+fn sampleWorkers(seen: *Seen) struct { workers: usize, blocked: usize } {
+    var out: @TypeOf(sampleWorkers(seen)) = .{ .workers = 0, .blocked = 0 };
     const dir = std.c.opendir("/proc/self/task") orelse return out;
     defer _ = std.c.closedir(dir);
     var path: [64]u8 = undefined;
@@ -93,7 +137,8 @@ fn sampleWorkers() struct { workers: usize, blocked: usize } {
         if (!std.mem.startsWith(u8, comm, "iou-wrk")) continue;
         out.workers += 1;
         const wchan = readSmall(&path, &buf, name, "wchan") orelse continue;
-        if (!std.mem.eql(u8, wchan, "io_wq_worker") and !std.mem.eql(u8, wchan, "0")) out.blocked += 1;
+        seen.noteWchan(wchan);
+        if (!workerNotBlocked(wchan)) out.blocked += 1;
     }
     return out;
 }
@@ -152,7 +197,7 @@ fn attack(gpa: std.mem.Allocator, port: u16, seen: *Seen) !void {
     };
     var t = nowNs() + 1500 * ms;
     while (nowNs() < t) {
-        seen.blocked_before = @max(seen.blocked_before, sampleWorkers().blocked);
+        seen.blocked_before = @max(seen.blocked_before, sampleWorkers(seen).blocked);
         osSleepMs(2);
     }
 
@@ -161,7 +206,7 @@ fn attack(gpa: std.mem.Allocator, port: u16, seen: *Seen) !void {
     const t0 = nowNs();
     t = t0 + watch_ns;
     while (nowNs() < t) {
-        const s = sampleWorkers();
+        const s = sampleWorkers(seen);
         seen.samples += 1;
         seen.workers_max = @max(seen.workers_max, s.workers);
         seen.blocked_max = @max(seen.blocked_max, s.blocked);
@@ -193,15 +238,25 @@ fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
 
+    // The engine zio's Linux backend chose at run time: `auto` falls back to
+    // epoll when io_uring ring setup fails, and epoll has no io-wq.
+    const engine = rt.main_executor.loop.backend.selectedEngine();
+    if (engine != .io_uring) {
+        std.debug.print("T3887 FAIL: zio runs the {s} engine, not io_uring (ring setup failed on this host, or a forced backend); this test needs io_uring to see io-wq at all\n", .{@tagName(engine)});
+        return error.NotIoUring;
+    }
+
     var seen: Seen = .{};
     var h = try zio.spawnBlocking(attack, .{ gpa, server.localAddress(0).getPort(), &seen });
     try h.join();
     const live_after = server.active_connections.load(.acquire);
 
-    std.debug.print("T3887 connections={d} samples={d} workers_max={d} blocked_before={d} blocked_max={d} last_blocked_ms={?d} live_after_watch={d}\n", .{
-        connections,                                    seen.samples, seen.workers_max, seen.blocked_before, seen.blocked_max,
+    std.debug.print("T3887 engine={s} connections={d} samples={d} workers_max={d} blocked_before={d} blocked_max={d} last_blocked_ms={?d} live_after_watch={d} wchans=", .{
+        @tagName(engine),                               connections, seen.samples, seen.workers_max, seen.blocked_before, seen.blocked_max,
         if (seen.last_blocked_ns) |n| n / ms else null, live_after,
     });
+    seen.printWchans();
+    std.debug.print("\n", .{});
     // A send blocks in io-wq only after the peer's FIN; before it, none may.
     try std.testing.expectEqual(@as(usize, 0), seen.blocked_before);
     // The server ended every half-closed connection, whatever the kernel did.
@@ -209,8 +264,12 @@ fn run(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         std.debug.print("T3887 FAIL: {d} of {d} half-closed connections still live {d} ms after the half-close\n", .{ live_after, connections, watch_ns / ms });
         return error.HalfClosedConnectionsLive;
     }
+    if (seen.workers_max == 0) {
+        std.debug.print("T3887 FAIL: io_uring, but no iou-wrk thread in any sample: the sampler is blind, or this kernel no longer hands these sends to io-wq (then retire this test, t-3863)\n", .{});
+        return error.NoIoWqWorkerSeen;
+    }
     if (seen.blocked_max == 0) {
-        std.debug.print("T3887 SKIP: no io-wq worker was ever blocked, so the bound is untested here (a kernel without the defect, a non-io_uring zio backend, or a send that never parked)\n", .{});
+        std.debug.print("T3887 SKIP: io_uring with io-wq workers, but none ever blocked: this kernel does not hand these sends to io-wq, so the bound is untested here\n", .{});
         return error.SkipZigTest;
     }
     if (seen.last_blocked_ns.? > bound_ns) {
