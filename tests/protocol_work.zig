@@ -1162,3 +1162,195 @@ test "a parked request that no slot frees for is answered 503 after the wait lim
 test "a parked request that no slot frees for is answered 503 after the wait limit, and its lease released once (TLS)" {
     try runIn(parkedWait, 2, .tls);
 }
+
+// ---------------------------------------------------------------------------
+// 5. Frames that cross our own RST_STREAM.
+
+/// One raw frame.
+fn appendFrame(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), typ: u8, flags: u8, sid: u31, payload: []const u8) !void {
+    var h: [9]u8 = undefined;
+    std.mem.writeInt(u24, h[0..3], @intCast(payload.len), .big);
+    h[3] = typ;
+    h[4] = flags;
+    std.mem.writeInt(u32, h[5..9], sid, .big);
+    try buf.appendSlice(gpa, &h);
+    try buf.appendSlice(gpa, payload);
+}
+
+/// A trailer block, `x-trailer: one`, as a literal WITH incremental indexing:
+/// it adds entry 62 to the server's HPACK table, so a server that drops the
+/// block without decoding it is out of step at the next block that uses 62.
+const trailer_block = "\x40\x09x-trailer\x03one";
+/// GET / that refers to entry 62: `:method GET`, `:scheme http`, `:path /`,
+/// `:authority localhost` (literal, not indexed), then index 62.
+const get_using_62 = "\x82\x86\x84\x01\x09localhost\xbe";
+
+const END_STREAM: u8 = 0x1;
+const END_HEADERS: u8 = 0x4;
+
+const Cross = enum {
+    /// The trailers go after the client has read the 413 and the RST: they
+    /// crossed the RST on the wire.
+    after_rst,
+    /// The same, the trailers in a HEADERS and a CONTINUATION.
+    after_rst_fragmented,
+    /// The trailer HEADERS (no END_HEADERS) goes with the body, so the
+    /// server resets the stream while its header block is open; the
+    /// CONTINUATION follows the RST.
+    reset_mid_block,
+};
+
+fn crossClient(gpa: std.mem.Allocator, tr: Transport, port: u16, how: Cross, r: *RefusedResult) void {
+    crossInner(gpa, tr, port, how, r) catch |err| {
+        r.err = err;
+    };
+}
+
+fn crossInner(gpa: std.mem.Allocator, tr: Transport, port: u16, how: Cross, r: *RefusedResult) !void {
+    const w = try openQuick(gpa, tr, port);
+    defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
+    var req = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer req.deinit(gpa);
+    try h2c.appendHeadersExtra(gpa, &req, 1, "POST", "/up", false, &.{});
+    const chunk: [16_000]u8 = @splat('x');
+    try h2c.appendData(gpa, &req, 1, &chunk, false);
+    try h2c.appendData(gpa, &req, 1, &chunk, false);
+    const split = 5;
+    if (how == .reset_mid_block) try appendFrame(gpa, &req, 0x1, END_STREAM, 1, trailer_block[0..split]);
+    try w.sendUnchecked(req.items);
+    const deadline = nowNs() + 2 * std.time.ns_per_s;
+    while (nowNs() < deadline and (r.seen.status[0] == null or r.seen.rst[0] == null) and !r.seen.closed) try readFor(w, &dec, &r.seen, 20);
+    req.clearRetainingCapacity();
+    switch (how) {
+        .after_rst => try appendFrame(gpa, &req, 0x1, END_STREAM | END_HEADERS, 1, trailer_block),
+        .after_rst_fragmented => {
+            try appendFrame(gpa, &req, 0x1, END_STREAM, 1, trailer_block[0..split]);
+            try appendFrame(gpa, &req, 0x9, END_HEADERS, 1, trailer_block[split..]);
+        },
+        .reset_mid_block => try appendFrame(gpa, &req, 0x9, END_HEADERS, 1, trailer_block[split..]),
+    }
+    try appendFrame(gpa, &req, 0x1, END_STREAM | END_HEADERS, 3, get_using_62);
+    try w.sendUnchecked(req.items);
+    while (nowNs() < deadline + std.time.ns_per_s and r.seen.status[1] == null and !r.seen.closed and !r.seen.goaway) try readFor(w, &dec, &r.seen, 20);
+    try readFor(w, &dec, &r.seen, 100);
+}
+
+/// Trailers that cross the RST_STREAM NO_ERROR the server sends after a 413
+/// (RFC 9113 section 5.1: frames on a stream this side reset are discarded,
+/// not a connection error). They are decoded (the next request uses the
+/// table entry they add) and dropped: the next request is answered 200, the
+/// upload's stream gets one 413 and one RST, and the connection stays up.
+fn crossRst(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: Cross) !void {
+    var rig: Rig = undefined;
+    var limits = testLimits();
+    limits.request_body_bytes = 16 * kib;
+    try rig.start(rt, gpa, tr, limits);
+    defer rig.stop();
+    var r: RefusedResult = .{};
+    try blocking(crossClient, .{ gpa, tr, rig.port(), how, &r });
+    std.debug.print("protocol work trailers crossing the RST ({s}, {s}): upload status {?d} (HEADERS {d}), rst {?d} x{d}; next request (uses the trailers' HPACK entry): status {?d}; GOAWAY {} code {d}, closed {}; err {?}\n", .{
+        @tagName(tr), @tagName(how), r.seen.status[0], r.seen.headers[0], r.seen.rst[0], r.seen.rst_n[0], r.seen.status[1], r.seen.goaway, r.seen.goaway_code, r.seen.closed, r.err,
+    });
+    try std.testing.expect(r.err == null);
+    try expectExactly("the upload's status", r.seen.status[0] orelse 0, 413);
+    try expectExactly("the upload's answers", r.seen.headers[0], 1);
+    try expectExactly("the upload's RSTs", r.seen.rst_n[0], 1);
+    try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);
+    try std.testing.expect(!r.seen.goaway and !r.seen.closed);
+}
+
+fn crossAfterRst(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return crossRst(rt, gpa, tr, .after_rst);
+}
+fn crossAfterRstFragmented(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return crossRst(rt, gpa, tr, .after_rst_fragmented);
+}
+fn crossResetMidBlock(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return crossRst(rt, gpa, tr, .reset_mid_block);
+}
+
+test "trailers that cross the RST after a 413 are decoded and dropped; the connection stays up (h2c)" {
+    try runIn(crossAfterRst, 2, .h2c);
+}
+test "trailers that cross the RST after a 413 are decoded and dropped; the connection stays up (TLS)" {
+    try runIn(crossAfterRst, 2, .tls);
+}
+test "fragmented trailers that cross the RST after a 413 are decoded and dropped (h2c)" {
+    try runIn(crossAfterRstFragmented, 2, .h2c);
+}
+test "fragmented trailers that cross the RST after a 413 are decoded and dropped (TLS)" {
+    try runIn(crossAfterRstFragmented, 2, .tls);
+}
+test "a stream reset inside its open trailer block gets one RST, and the block is decoded and dropped (h2c)" {
+    try runIn(crossResetMidBlock, 2, .h2c);
+}
+test "a stream reset inside its open trailer block gets one RST, and the block is decoded and dropped (TLS)" {
+    try runIn(crossResetMidBlock, 2, .tls);
+}
+
+const PeerClosed = enum {
+    /// The client reset stream 1 itself, then sends HEADERS on it.
+    peer_reset,
+    /// Stream 1 ended both ways (a 200), then the client sends HEADERS on it.
+    ended,
+};
+
+fn peerClosedClient(gpa: std.mem.Allocator, tr: Transport, port: u16, how: PeerClosed, r: *RefusedResult) void {
+    peerClosedInner(gpa, tr, port, how, r) catch |err| {
+        r.err = err;
+    };
+}
+
+fn peerClosedInner(gpa: std.mem.Allocator, tr: Transport, port: u16, how: PeerClosed, r: *RefusedResult) !void {
+    const w = try openQuick(gpa, tr, port);
+    defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
+    var req = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer req.deinit(gpa);
+    const deadline = nowNs() + 2 * std.time.ns_per_s;
+    switch (how) {
+        .peer_reset => {
+            try h2c.appendHeadersExtra(gpa, &req, 1, "POST", "/up", false, &.{});
+            try h2c.appendRst(gpa, &req, 1);
+            try w.sendUnchecked(req.items);
+            try readFor(w, &dec, &r.seen, 100);
+        },
+        .ended => {
+            try h2c.appendHeaders(gpa, &req, 1, "/", true);
+            try w.sendUnchecked(req.items);
+            while (nowNs() < deadline and r.seen.status[0] == null and !r.seen.closed) try readFor(w, &dec, &r.seen, 20);
+        },
+    }
+    req.clearRetainingCapacity();
+    try appendFrame(gpa, &req, 0x1, END_STREAM | END_HEADERS, 1, trailer_block);
+    try w.sendUnchecked(req.items);
+    while (nowNs() < deadline + std.time.ns_per_s and !r.seen.goaway and !r.seen.closed) try readFor(w, &dec, &r.seen, 20);
+}
+
+/// HEADERS on a stream the PEER closed (its own RST, or both ends ended) is
+/// still a connection error: STREAM_CLOSED (RFC 9113 section 5.1, h2spec
+/// 5.1/12). Only a stream this side reset discards it.
+fn peerClosedHeaders(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, testLimits());
+    defer rig.stop();
+    inline for (.{ PeerClosed.peer_reset, PeerClosed.ended }) |how| {
+        var r: RefusedResult = .{};
+        try blocking(peerClosedClient, .{ gpa, tr, rig.port(), how, &r });
+        std.debug.print("protocol work HEADERS on a stream the peer closed ({s}, {s}): GOAWAY {} code {d}; err {?}\n", .{ @tagName(tr), @tagName(how), r.seen.goaway, r.seen.goaway_code, r.err });
+        try std.testing.expect(r.err == null);
+        try std.testing.expect(r.seen.goaway);
+        try expectExactly("the GOAWAY code (STREAM_CLOSED)", r.seen.goaway_code, @intFromEnum(frame.ErrorCode.stream_closed));
+    }
+}
+
+test "HEADERS on a stream the peer reset or ended is still a connection error STREAM_CLOSED (h2c)" {
+    try runIn(peerClosedHeaders, 2, .h2c);
+}
+test "HEADERS on a stream the peer reset or ended is still a connection error STREAM_CLOSED (TLS)" {
+    try runIn(peerClosedHeaders, 2, .tls);
+}
