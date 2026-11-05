@@ -169,8 +169,12 @@ const Flood = struct {
     elapsed_ms: u64 = 0,
     answered_frames: usize = 0,
     answered_ms: u64 = 0,
+    /// The `:status` of the answer on the flooded stream.
+    answered_status: ?u16 = null,
     /// `one_byte_on`: the stream's RST, which does not stop the flood.
     rst_code: ?u32 = null,
+    /// RST_STREAM frames on the flooded stream.
+    rst_n: usize = 0,
     rst_ms: u64 = 0,
     rst_frames: usize = 0,
     rst_after_answer: bool = false,
@@ -218,6 +222,8 @@ fn floodClient(gpa: std.mem.Allocator, tr: Transport, port: u16, kind: FloodKind
 fn floodInner(gpa: std.mem.Allocator, tr: Transport, port: u16, kind: FloodKind, limit_ms: u64, r: *Flood) !void {
     const w = try openQuick(gpa, tr, port);
     defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
     var pre = try h2c.buildClientPrefaceAndSettings(gpa);
     defer pre.deinit(gpa);
     try h2c.appendHeadersExtra(gpa, &pre, 1, "POST", "/up", false, &.{});
@@ -257,6 +263,7 @@ fn floodInner(gpa: std.mem.Allocator, tr: Transport, port: u16, kind: FloodKind,
                     return;
                 },
                 0x3 => if (s.sid == 1 and kind == .one_byte_on) {
+                    r.rst_n += 1;
                     if (r.rst_code == null) {
                         r.rst_code = if (p.len >= 4) std.mem.readInt(u32, p[0..4], .big) else 0;
                         r.rst_ms = (nowNs() - t0) / ms;
@@ -270,6 +277,7 @@ fn floodInner(gpa: std.mem.Allocator, tr: Transport, port: u16, kind: FloodKind,
                     return;
                 },
                 0x1 => if (s.sid == 1 and kind != .closed_stream and s.flags & 1 != 0) {
+                    if (r.answered_status == null) r.answered_status = try statusOf(&dec, p);
                     if (kind == .one_byte_on) {
                         if (r.end == .none) {
                             r.end = .answered;
@@ -331,7 +339,7 @@ fn bodylessFloods(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void
         try blocking(floodClient, .{ gpa, tr, rig.port(), kind, 5_000, &r });
         var ok = false;
         try blocking(goodGet, .{ gpa, tr, rig.port(), &ok });
-        std.debug.print("protocol work flood ({s}) {s}: ended {s} code {d} after {d} ms and {d} frames sent; a second client served: {}; err {?}\n", .{ @tagName(tr), @tagName(kind), @tagName(r.end), r.code, r.elapsed_ms, r.frames, ok, r.err });
+        std.debug.print("protocol work flood ({s}) {s}: ended {s} code {d} after {d} ms and {d} frames sent; a second client served 200: {}; err {?}\n", .{ @tagName(tr), @tagName(kind), @tagName(r.end), r.code, r.elapsed_ms, r.frames, ok, r.err });
         try std.testing.expect(r.err == null);
         try expectExactly("the flood's end (goaway)", @intFromEnum(r.end), @intFromEnum(End.goaway));
         try expectExactly("the GOAWAY code (ENHANCE_YOUR_CALM)", r.code, @intFromEnum(frame.ErrorCode.enhance_your_calm));
@@ -369,6 +377,7 @@ fn oneByteFlood(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     std.debug.print("protocol work 1-byte flood ({s}, one executor): ended {s} after {d} ms; {d} frames ({d} body bytes) sent before the end was read, about {d} ns a frame; the body cap is {d} bytes; err {?}\n", .{ @tagName(tr), @tagName(r.end), r.elapsed_ms, r.frames, r.body_bytes, per_frame_ns, limits.request_body_bytes, r.err });
     try std.testing.expect(r.err == null);
     try expectExactly("the stream's end (answered: a 413)", @intFromEnum(r.end), @intFromEnum(End.answered));
+    try expectExactly("the answer's status", r.answered_status orelse 0, 413);
     try std.testing.expect(r.body_bytes > limits.request_body_bytes);
 }
 
@@ -396,7 +405,9 @@ fn floodAfterAnswer(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !vo
     });
     try std.testing.expect(r.err == null);
     try std.testing.expect(r.answered_frames != 0);
+    try expectExactly("the answer's status", r.answered_status orelse 0, 413);
     try expectExactly("the stream's reset code (NO_ERROR)", r.rst_code orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the stream's RSTs", r.rst_n, 1);
     try std.testing.expect(r.rst_after_answer);
     try expectExactly("the flood's end (goaway)", @intFromEnum(r.end), @intFromEnum(End.goaway));
     try expectExactly("the GOAWAY code (ENHANCE_YOUR_CALM)", r.code, @intFromEnum(frame.ErrorCode.enhance_your_calm));
@@ -411,6 +422,10 @@ test "a 1-byte DATA flood that goes on after its 413 meets RST_STREAM NO_ERROR, 
 
 const RefusedResult = struct {
     seen: Seen = .{},
+    /// `heldRefusedInner`: the upload's answer and RSTs read while the
+    /// server's drain was held (none, if the hold engaged).
+    held_headers: u8 = 0,
+    held_rst: u8 = 0,
     err: ?anyerror = null,
 };
 
@@ -461,6 +476,7 @@ fn refusedUpload(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void 
     try expectExactly("the upload's status", r.seen.status[0] orelse 0, 413);
     try expectExactly("the upload's answers", r.seen.headers[0], 1);
     try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the upload's RSTs", r.seen.rst_n[0], 1);
     try std.testing.expect(r.seen.rst_after_headers[0]);
     try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);
     try std.testing.expect(!r.seen.goaway and !r.seen.closed);
@@ -498,7 +514,11 @@ fn heldRefusedInner(gpa: std.mem.Allocator, tr: Transport, port: u16, r: *Refuse
     try h2c.appendData(gpa, &req, 1, &chunk, false);
     try h2c.appendData(gpa, &req, 1, &chunk, false);
     try w.sendUnchecked(req.items);
-    osSleepMs(200);
+    // While the drain is held the server ingests the upload and queues its
+    // 413; nothing of it may reach the client.
+    try readFor(w, &dec, &r.seen, 200);
+    r.held_headers = r.seen.headers[0];
+    r.held_rst = r.seen.rst_n[0];
     holdEmit(false);
     // Something to wake the actor: the next request.
     req.clearRetainingCapacity();
@@ -515,7 +535,24 @@ fn heldRefusedClient(gpa: std.mem.Allocator, tr: Transport, port: u16, r: *Refus
     };
 }
 
+fn holdCompiledIn() bool {
+    return @hasDecl(conn_mod, "test_hold_emit") and @TypeOf(conn_mod.test_hold_emit) != void;
+}
+
+/// Turns in which the reset sweep found a 413 still queued (observe builds).
+fn resetWaited() usize {
+    if (comptime !@hasDecl(conn_mod, "test_reset_waited_on_response") or @TypeOf(conn_mod.test_reset_waited_on_response) == void) return 0;
+    return conn_mod.test_reset_waited_on_response.load(.acquire);
+}
+
 fn heldRefusedUpload(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    // Without the hold this would be `refusedUpload` again, passing without
+    // testing the case it names.
+    if (comptime !holdCompiledIn()) {
+        std.debug.print("protocol work refused upload, drain held ({s}): SKIPPED: connection.test_hold_emit is compiled out (build without -Dobserve)\n", .{@tagName(tr)});
+        return error.SkipZigTest;
+    }
+    const waited0 = resetWaited();
     var rig: Rig = undefined;
     var limits = testLimits();
     limits.request_body_bytes = 16 * kib;
@@ -524,12 +561,22 @@ fn heldRefusedUpload(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !v
     defer holdEmit(false);
     var r: RefusedResult = .{};
     try blocking(heldRefusedClient, .{ gpa, tr, rig.port(), &r });
-    std.debug.print("protocol work refused upload, drain held ({s}): status {?d} (HEADERS {d}), then rst {?d}; next request: status {?d}; GOAWAY {} closed {}; err {?}\n", .{
-        @tagName(tr), r.seen.status[0], r.seen.headers[0], r.seen.rst[0], r.seen.status[1], r.seen.goaway, r.seen.closed, r.err,
+    const waited = resetWaited() - waited0;
+    std.debug.print("protocol work refused upload, drain held ({s}): during the hold HEADERS {d} RST {d}, reset sweeps that found the 413 queued {d}; then status {?d} (HEADERS {d}), rst {?d} x{d}; next request: status {?d}; GOAWAY {} closed {}; err {?}\n", .{
+        @tagName(tr), r.held_headers, r.held_rst, waited, r.seen.status[0], r.seen.headers[0], r.seen.rst[0], r.seen.rst_n[0], r.seen.status[1], r.seen.goaway, r.seen.closed, r.err,
     });
     try std.testing.expect(r.err == null);
+    // The hold engaged: nothing came while it held, and the sweep saw the
+    // 413 still in the scheduler at least once.
+    try expectExactly("the upload's HEADERS during the hold", r.held_headers, 0);
+    try expectExactly("the upload's RSTs during the hold", r.held_rst, 0);
+    if (waited == 0) {
+        std.debug.print("protocol work refused upload, drain held: the reset sweep never found the 413 queued\n", .{});
+        return error.HoldNotEngaged;
+    }
     try expectExactly("the upload's status", r.seen.status[0] orelse 0, 413);
     try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the upload's RSTs", r.seen.rst_n[0], 1);
     try std.testing.expect(r.seen.rst_after_headers[0]);
     try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);
 }
@@ -549,6 +596,8 @@ fn goodGet(gpa: std.mem.Allocator, tr: Transport, port: u16, ok: *bool) void {
 fn goodGetInner(gpa: std.mem.Allocator, tr: Transport, port: u16) !bool {
     const w = try Wire.open(gpa, tr, port);
     defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
     var pre = try h2c.buildClientPrefaceAndSettings(gpa);
     defer pre.deinit(gpa);
     try h2c.appendHeaders(gpa, &pre, 1, "/", true);
@@ -556,8 +605,20 @@ fn goodGetInner(gpa: std.mem.Allocator, tr: Transport, port: u16) !bool {
     const deadline = nowNs() + 3 * std.time.ns_per_s;
     while (true) {
         const s = (w.next(deadline) catch return false) orelse return false;
-        if (s.sid == 1 and (s.ftype == 0x0 or s.ftype == 0x1) and s.flags & 1 != 0) return true;
+        // The 200's HEADERS; "hello" follows it.
+        if (s.sid == 1 and s.ftype == 0x1) return (try statusOf(&dec, w.last_payload.items)) == 200;
     }
+}
+
+/// The `:status` of one response HEADERS (the server's encoder keeps no
+/// dynamic table, so each block decodes alone).
+fn statusOf(dec: *hpack.Decoder, header_block: []const u8) !?u16 {
+    const decoded = try dec.decode(header_block, 100, 32 * 1024, 256, 8 * 1024);
+    defer dec.freeResult(decoded);
+    for (decoded.fields) |f| {
+        if (std.mem.eql(u8, f.name, ":status")) return std.fmt.parseInt(u16, f.value, 10) catch null;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +832,8 @@ const Seen = struct {
     headers: [32]u8 = @splat(0),
     /// The stream's RST came after a HEADERS on it.
     rst_after_headers: [32]bool = @splat(false),
+    /// RST_STREAM frames by stream id: `rst` keeps only the last code.
+    rst_n: [32]u8 = @splat(0),
 };
 
 fn readFor(w: *Wire, dec: *hpack.Decoder, seen: *Seen, for_ms: u64) !void {
@@ -799,6 +862,7 @@ fn readFor(w: *Wire, dec: *hpack.Decoder, seen: *Seen, for_ms: u64) !void {
             },
             0x3 => if (i < seen.rst.len and p.len >= 4) {
                 seen.rst[i] = std.mem.readInt(u32, p[0..4], .big);
+                seen.rst_n[i] +|= 1;
                 seen.rst_after_headers[i] = seen.headers[i] != 0;
             },
             0x7 => {

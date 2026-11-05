@@ -61,10 +61,6 @@ pub const Stream = struct {
     request_body_cap: ?usize = null,
     /// Exactly one early HTTP response frameset has been emitted.
     early_response_sent: bool = false,
-    /// The early response ended the stream on our side while the peer's
-    /// body was still open: once that response has left the scheduler, the
-    /// stream is reset with NO_ERROR (`Session.resetAnsweredStreams`).
-    reset_after_response: bool = false,
     /// Concurrent active_streams credit already released for this stream.
     concurrency_released: bool = false,
 

@@ -410,6 +410,9 @@ pub var test_ack_bound_refusals: test_hook.Hook(std.atomic.Value(usize)) = if (t
 /// queued stay in the scheduler (a reset can then arrive before them).
 /// Compiled out unless `test_observe`.
 pub var test_hold_emit: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
+/// Test-only: actor turns whose reset sweep (`Session.resetAnsweredStreams`)
+/// left a stream waiting because its early response was still queued.
+pub var test_reset_waited_on_response: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Test-only: stash a complete-batch write ack on the actor instead of
 /// applying it. Separate from `test_hold_completion_drain`, which parks
 /// `completion_ch`. Must not park the actor on the release event — that
@@ -4990,6 +4993,9 @@ pub const Connection = struct {
                         break :blk true;
                     };
                     if (reset) try self.materializeAndDrain();
+                    if (comptime test_observe) {
+                        if (self.session.reset_after_response_n != 0) _ = test_reset_waited_on_response.fetchAdd(1, .monotonic);
+                    }
                 }
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
 
@@ -13026,4 +13032,54 @@ test "a call after the link's gate closed fails without touching the connection 
     link.core.terminal.setCause(.{ .peer_reset = .cancel });
     try std.testing.expectError(error.PeerReset, Connection.writeCb(ctx, 1, "late", false, true, true));
     try std.testing.expectEqual(@as(u32, 0), link.core.gate.inside());
+}
+
+test "the oldest parked request's wait limit is an actor deadline: since_ns + connection_idle_timeout_ns, none at 0" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    inline for (.{ 500 * std.time.ns_per_ms, 0 }) |limit_ns| {
+        var lim = limits_mod.Limits.defaults;
+        lim.connection_idle_timeout_ns = limit_ns;
+        const bytes = try lim.slotBootBytes(.h2c);
+        const buffer = try gpa.alignedAlloc(u8, .fromByteUnits(boot_plan.slot_align), bytes);
+        defer gpa.free(buffer);
+        var slabs = try slab_pool.SlabPool.init(gpa, io, lim.outbound_bytes_per_stream, 8);
+        defer slabs.deinit(gpa);
+        var requests = try testRequestPool();
+        defer requests.deinit();
+        const pair = try SocketPair.open(io);
+        defer pair.peer.close(io);
+        var fba: std.heap.FixedBufferAllocator = .init(buffer);
+        // Booted in place: `finishBoot` keeps pointers into the struct.
+        var conn = try Connection.init(fba.allocator(), pair.accepted, .{
+            .io = io,
+            .mode = .h2c,
+            .charge = .none,
+            .peer = .unknown,
+            .limits = lim,
+            .router = .{ .routes = &.{} },
+            .tls_acceptor = null,
+            .gpa = gpa,
+            .slab_pool = &slabs,
+            .request_pool = &requests,
+        });
+        try conn.finishBoot();
+        defer conn.quiesce();
+        // One parked request that began to wait at a fixed instant long past
+        // (1 ns on the awake clock): its deadline is the earliest one.
+        conn.parked[0] = .{ .d = undefined, .since_ns = 1 };
+        conn.parked_head = 0;
+        conn.parked_len = 1;
+        defer conn.parked_len = 0;
+        // No actor runs here: the lock's bookkeeping alone, without the
+        // doorbell an unlock rings.
+        conn.session_held = true;
+        const next = conn.nextDeadlineNs();
+        conn.session_held = false;
+        if (limit_ns == 0) {
+            try std.testing.expectEqual(@as(?u64, null), next);
+        } else {
+            try std.testing.expectEqual(@as(?u64, 1 + limit_ns), next);
+        }
+    }
 }

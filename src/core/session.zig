@@ -366,9 +366,9 @@ pub const Session = struct {
     stale_ids_lent: if (std.debug.runtime_safety) bool else void = if (std.debug.runtime_safety) false else {},
     credit_len: usize = 0,
     credit_all: bool = false,
-    /// Streams that may have `Stream.reset_after_response` set: at least as
-    /// many as do. A stream that leaves the map first takes its flag with it;
-    /// `resetAnsweredStreams` counts again.
+    /// Streams that may be answered early with their body still open (see
+    /// `answeredEarly`): at least as many as are. A stream that leaves the
+    /// map first is simply not found; `resetAnsweredStreams` counts again.
     reset_after_response_n: u32 = 0,
     tombstones: std.ArrayList(Tombstone),
     tombstone_next: usize = 0,
@@ -1116,7 +1116,7 @@ pub const Session = struct {
     /// stream, which the non-DATA frame bucket charges (`chargeRate`).
     ///
     /// The edge calls this after its drain. A stream whose response is still
-    /// queued (`response_queued` true) keeps its flag for a later drain: a
+    /// queued (`response_queued` true) waits for a later drain: a
     /// local reset drops a stream's queued HEADERS
     /// (`FairScheduler.forgetStream`), and RST_STREAM is a terminal control
     /// that goes ahead of them. Returns whether a reset was queued.
@@ -1127,17 +1127,26 @@ pub const Session = struct {
         defer self.returnOpenStreamIds();
         for (self.openStreamIds()) |sid| {
             const s = self.streams.getPtr(sid) orelse continue;
-            if (!s.reset_after_response) continue;
+            if (!answeredEarly(s)) continue;
             if (response_queued(ctx, sid)) {
                 waiting += 1;
                 continue;
             }
-            s.reset_after_response = false;
+            // The reset takes the stream out of the map, so it is not found
+            // here again.
             try self.emitRst(sid, .no_error);
             reset = true;
         }
         self.reset_after_response_n = waiting;
         return reset;
+    }
+
+    /// Answered early (`emitEarlyReject`) and the peer's body still open: our
+    /// side ended with the early response, the peer's has not. A stream in
+    /// this state leaves it only by leaving the map (our reset, the peer's
+    /// END_STREAM, the peer's reset), so it needs no flag of its own.
+    fn answeredEarly(s: *const stream_mod.Stream) bool {
+        return s.early_response_sent and s.state == .half_closed_local;
     }
 
     /// The ids of the streams still open, copied out of the map, for a
@@ -2195,10 +2204,7 @@ pub const Session = struct {
         // The peer is still sending a body nobody will read. Once the
         // response is on its way, ask it to stop (`resetAnsweredStreams`).
         if (self.streams.getPtr(stream_id)) |after| {
-            if (after.state == .half_closed_local) {
-                after.reset_after_response = true;
-                self.reset_after_response_n += 1;
-            }
+            if (answeredEarly(after)) self.reset_after_response_n += 1;
         }
     }
 
