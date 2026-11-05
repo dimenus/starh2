@@ -11803,8 +11803,13 @@ fn expectRouteRefusalReset(which: RouteRefusal, path: RefusalPath) !void {
     try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
     try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.internal_error)), seen.rst_code);
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
-    // Conservation: the preloaded charges go back, and then nothing is left.
+    // Conservation: the refusal took nothing and gave nothing back, so the
+    // server's token count and the route's are exactly what the test
+    // preloaded. Read before they are reset: a reset first would hide a
+    // token the refusal leaked or released twice.
     if (which == .token) {
+        try std.testing.expectEqual(@as(usize, 2), acct.task_handlers.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), rec.count(.task_handlers));
         r.sub(.task_handlers, 1);
         acct.task_handlers.store(0, .release);
     }
