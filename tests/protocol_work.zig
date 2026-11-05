@@ -1019,8 +1019,8 @@ fn waitClient(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, r: *WaitResult) 
 
 /// Three slots, all held by handlers that ignore cancel, and all three of
 /// their streams reset: nothing is open. 7 parks, and nothing else happens.
-/// It must be answered 503 once it has waited the limit (up to twice it),
-/// not before, and its lease must come back; then the slots free, and 7 is
+/// It must be answered 503 once it has waited the limit, not before and not
+/// a limit later, and its lease must come back; then the slots free, and 7 is
 /// not answered again.
 fn waitInner(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, r: *WaitResult) !void {
     const w = try openQuick(gpa, tr, rig.port());
@@ -1075,8 +1075,8 @@ fn parkedWait(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     try expectExactly("7's status", r.seen.status[3] orelse 0, 503);
     try expectExactly("7's answers", r.seen.headers[3], 1);
     try std.testing.expect(r.seen.rst[3] == null);
-    if (r.ms_to_answer < wait_limit_ms or r.ms_to_answer > 2 * wait_limit_ms + 300) {
-        std.debug.print("protocol work parked wait: answered after {d} ms, want {d} to {d}\n", .{ r.ms_to_answer, wait_limit_ms, 2 * wait_limit_ms + 300 });
+    if (r.ms_to_answer < wait_limit_ms or r.ms_to_answer > wait_limit_ms + 300) {
+        std.debug.print("protocol work parked wait: answered after {d} ms, want {d} to {d}\n", .{ r.ms_to_answer, wait_limit_ms, wait_limit_ms + 300 });
         return error.WrongWait;
     }
     try expectExactly("request pool after the 503", r.held_after, 3 * block);

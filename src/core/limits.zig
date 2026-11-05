@@ -438,7 +438,7 @@ pub const Limits = struct {
     /// It is also the longest an HTTP/2 request may wait for a handler slot
     /// (`Connection.parked`): a request whose slots stay held by handlers that
     /// do not return is a stream on which nothing happens. Then it is answered
-    /// 503, up to twice this late. 0 lets it wait until a slot frees.
+    /// 503. 0 lets it wait until a slot frees.
     connection_idle_timeout_ns: u64 = 75 * std.time.ns_per_s,
     /// How long a connection that has decided to close (a connection error, or
     /// the end of a graceful drain) waits for its last queued frames, the

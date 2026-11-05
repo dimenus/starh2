@@ -2107,10 +2107,9 @@ pub const Connection = struct {
     /// (`dispatchParked`): every slot is held by a handler whose stream has
     /// ended and which has not returned (a handler can be asked to cancel,
     /// never forced), and the connection's idle rule never fires while the
-    /// parked stream is open. The answer can come up to twice that late: no
-    /// timer of its own is armed, and the idle wake of the turn that parked
-    /// it, or of any later turn, is what checks it. A connection that is going
-    /// away has no idle wake; its graceful drain deadline bounds the wait.
+    /// parked stream is open. The oldest request's deadline is one of the
+    /// actor's park deadlines (`nextDeadlineNs`), so the answer comes when it
+    /// is due, on a connection that is going away as well.
     parked: []Parked,
     parked_head: usize = 0,
     parked_len: usize = 0,
@@ -4132,6 +4131,14 @@ pub const Connection = struct {
         if (self.grace_deadline) |deadline| {
             const ns: u64 = @intCast(deadline.nanoseconds);
             if (next == null or ns < next.?) next = ns;
+        }
+        // The oldest parked request's wait limit (`parked`). An absolute
+        // deadline, like the others here: a wake that comes a little early
+        // parks again until it, where the idle wake below would move a whole
+        // limit on.
+        if (self.parked_len != 0 and self.config.limits.connection_idle_timeout_ns != 0) {
+            const deadline = self.parked[self.parked_head].since_ns +| self.config.limits.connection_idle_timeout_ns;
+            if (next == null or deadline < next.?) next = deadline;
         }
         const idle_limit_ns = self.config.limits.connection_idle_timeout_ns;
         if (idle_limit_ns != 0 and !self.going_away) {
