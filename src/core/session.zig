@@ -1927,6 +1927,17 @@ pub const Session = struct {
             try self.failConnection(.protocol_error);
             return;
         }
+        // The peer already ended its side (half-closed remote): RFC 9113
+        // section 5.1 makes this DATA a stream error STREAM_CLOSED. Checked
+        // before any body work, because the request may be dispatched: its
+        // memory then belongs to its handler's link, and the body allocator
+        // has none for it. The connection credit it took comes back as for
+        // DATA on a closed stream.
+        if (s.state != .open and s.state != .half_closed_local) {
+            try self.emitRst(hdr.stream_id, .stream_closed);
+            try self.replenishConnWindow();
+            return;
+        }
         // A DATA that delivers no body byte (empty, or all padding, whose
         // credit the server gives straight back) is free to repeat, so it is
         // charged to the non-DATA bucket (`chargeRate`). Except with
@@ -4874,4 +4885,39 @@ test "DATA on a closed stream takes a non-DATA token: past the bucket's burst th
     try std.testing.expect(session.terminal == .goaway);
     try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, session.terminal.goaway.code);
     freeTestIntents(gpa, session.drainIntents());
+}
+
+test "DATA on a half-closed (remote) stream is RST STREAM_CLOSED before any body work, and its connection credit comes back" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    freeTestIntents(gpa, session.drainIntents());
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    const body: [16_000]u8 = @splat('x');
+    // 300 requests, each ended by its HEADERS, each followed by 16,000 bytes
+    // of DATA: 4.8 MB, more than the 4 MiB connection window. Without the
+    // credit back, the connection fails FLOW_CONTROL_ERROR part way.
+    var sid: u31 = 1;
+    var resets: usize = 0;
+    while (sid < 600) : (sid += 2) {
+        wire.clearRetainingCapacity();
+        try appendTestRequest(gpa, &wire, sid, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "http" },
+            .{ .name = ":path", .value = "/" },
+            .{ .name = ":authority", .value = "localhost" },
+        }, true);
+        var h: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        (frame.FrameHeader{ .length = body.len, .type = .data, .flags = .{}, .stream_id = sid }).encode(&h);
+        try wire.appendSlice(gpa, &h);
+        try wire.appendSlice(gpa, &body);
+        try session.ingest(wire.items);
+        resets += countTerminalIntents(gpa, &session).rst;
+        if (session.terminal != .none) break;
+    }
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expectEqual(@as(usize, 300), resets);
 }

@@ -1460,3 +1460,98 @@ test "HEADERS on a stream the peer reset or ended is still a connection error ST
 test "HEADERS on a stream the peer reset or ended is still a connection error STREAM_CLOSED (TLS)" {
     try runIn(peerClosedHeaders, 2, .tls);
 }
+
+// ---------------------------------------------------------------------------
+// 6. DATA on a stream whose request has ended (half-closed remote).
+
+const LateData = enum { empty, body };
+
+const LateResult = struct {
+    seen: Seen = .{},
+    /// Handlers ended before the client let them go.
+    ended_before_release: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn lateClient(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, how: LateData, r: *LateResult) void {
+    lateInner(gpa, tr, rig, how, r) catch |err| {
+        r.err = err;
+    };
+}
+
+/// GET /stuck with END_STREAM: the request is dispatched and its handler
+/// holds the response. Then a DATA on that stream, which RFC 9113 section
+/// 5.1 makes a stream error STREAM_CLOSED. Then a GET / on stream 3.
+fn lateInner(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, how: LateData, r: *LateResult) !void {
+    const w = try openQuick(gpa, tr, rig.port());
+    defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
+    var req = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer req.deinit(gpa);
+    try h2c.appendHeaders(gpa, &req, 1, "/stuck", true);
+    try w.sendUnchecked(req.items);
+    if (!waitStarted(1, 3_000)) return error.HandlerNotStarted;
+    req.clearRetainingCapacity();
+    switch (how) {
+        .empty => try h2c.appendData(gpa, &req, 1, &.{}, false),
+        .body => try h2c.appendData(gpa, &req, 1, "late body", false),
+    }
+    try w.sendUnchecked(req.items);
+    try readFor(w, &dec, &r.seen, 200);
+    req.clearRetainingCapacity();
+    try h2c.appendHeaders(gpa, &req, 3, "/", true);
+    try w.sendUnchecked(req.items);
+    const deadline = nowNs() + 2 * std.time.ns_per_s;
+    while (nowNs() < deadline and r.seen.status[1] == null and !r.seen.closed and !r.seen.goaway) try readFor(w, &dec, &r.seen, 20);
+    r.ended_before_release = ended.load(.acquire);
+}
+
+fn lateData(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: LateData) !void {
+    resetHandlers();
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, testLimits());
+    defer rig.stop();
+    var r: LateResult = .{};
+    try blocking(lateClient, .{ gpa, tr, &rig, how, &r });
+    // Let the held handler go; it must return on its own.
+    release.store(true, .release);
+    const d = nowNs() + 3 * std.time.ns_per_s;
+    while (rig.server.accounting.task_handlers.load(.acquire) != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
+    std.debug.print("protocol work late DATA ({s}, {s}): stream 1 rst {?d} x{d}, HEADERS {d}; handlers ended before release {d}, after {d}; next request status {?d}; GOAWAY {} code {d} closed {}; task handlers {d}, pool {d}; err {?}\n", .{
+        @tagName(tr),        @tagName(how),     r.seen.rst[0],                                         r.seen.rst_n[0],        r.seen.headers[0],
+        r.ended_before_release, ended.load(.acquire), r.seen.status[1], r.seen.goaway, r.seen.goaway_code, r.seen.closed, rig.server.accounting.task_handlers.load(.acquire), rig.server.requests.held_bytes.load(.acquire), r.err,
+    });
+    try std.testing.expect(r.err == null);
+    try expectExactly("stream 1's RSTs", r.seen.rst_n[0], 1);
+    try expectExactly("stream 1's reset code (STREAM_CLOSED)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.stream_closed));
+    try expectExactly("handlers ended before the release", r.ended_before_release, 0);
+    try expectExactly("handlers ended after the release", ended.load(.acquire), 1);
+    try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);
+    try std.testing.expect(!r.seen.goaway and !r.seen.closed);
+    try expectExactly("task handlers", rig.server.accounting.task_handlers.load(.acquire), 0);
+    try expectExactly("request pool", rig.server.requests.held_bytes.load(.acquire), 0);
+    try expectExactly("server underflows", rig.server.accounting.underflows.load(.acquire), 0);
+    try expectExactly("client table underflows", rig.server.clients.stats().underflows, 0);
+    if (comptime @hasDecl(accounts, "RouteTable")) try expectExactly("route underflows", rig.server.accounting.routes.underflows.load(.acquire), 0);
+}
+
+fn lateEmpty(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return lateData(rt, gpa, tr, .empty);
+}
+fn lateBody(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return lateData(rt, gpa, tr, .body);
+}
+
+test "an empty DATA on a dispatched request's stream is RST STREAM_CLOSED, and nothing else is harmed (h2c)" {
+    try runIn(lateEmpty, 2, .h2c);
+}
+test "an empty DATA on a dispatched request's stream is RST STREAM_CLOSED, and nothing else is harmed (TLS)" {
+    try runIn(lateEmpty, 2, .tls);
+}
+test "a DATA with a body on a dispatched request's stream is RST STREAM_CLOSED, and nothing else is harmed (h2c)" {
+    try runIn(lateBody, 2, .h2c);
+}
+test "a DATA with a body on a dispatched request's stream is RST STREAM_CLOSED, and nothing else is harmed (TLS)" {
+    try runIn(lateBody, 2, .tls);
+}
