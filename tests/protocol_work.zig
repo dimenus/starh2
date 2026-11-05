@@ -1,7 +1,8 @@
 //! Protocol work that holds nothing (t-3759 step 6), on real sockets, h2c and
 //! TLS: DATA that delivers no body to a live stream is charged to the non-DATA
 //! frame bucket; a 1-byte DATA flood and what bounds it; a browser-like load;
-//! padding and the body minimum rate.
+//! padding and the body minimum rate. A parked request whose stream is reset
+//! gives its lease back at once.
 //!
 //! Each test prints the counters that show its defence fired, so an attack
 //! that never engaged shows as a zero, not as a quiet pass. Every server ends
@@ -556,4 +557,243 @@ test "a padded body does not satisfy the body minimum rate; the same bytes as bo
 }
 test "a padded body does not satisfy the body minimum rate; the same bytes as body do (TLS)" {
     try runIn(padding, 2, .tls);
+}
+
+// ---------------------------------------------------------------------------
+// 3. Parked leases released on RST.
+
+fn parkedReleased() u64 {
+    if (comptime !@hasDecl(conn_mod, "parked_released_on_rst")) return 0;
+    return conn_mod.parked_released_on_rst.load(.acquire);
+}
+
+
+fn waitStarted(n: usize, timeout_ms: u64) bool {
+    const deadline = nowNs() + timeout_ms * ms;
+    while (started.load(.acquire) < n) {
+        if (nowNs() >= deadline) return false;
+        osSleepMs(1);
+    }
+    return true;
+}
+
+fn osSleepMs(n: u64) void {
+    const t: std.c.timespec = .{ .sec = @intCast(n / 1000), .nsec = @intCast((n % 1000) * ms) };
+    _ = std.c.nanosleep(&t, null);
+}
+
+/// What one connection saw, frame by frame.
+const Seen = struct {
+    goaway: bool = false,
+    goaway_code: u32 = 0,
+    closed: bool = false,
+    /// Final answers by stream id (odd ids up to 63).
+    status: [32]?u16 = @splat(null),
+    rst: [32]?u32 = @splat(null),
+};
+
+fn readFor(w: *Wire, dec: *hpack.Decoder, seen: *Seen, for_ms: u64) !void {
+    const deadline = nowNs() + for_ms * ms;
+    while (!seen.closed and nowNs() < deadline) {
+        const s = w.next(deadline) catch |err| switch (err) {
+            error.Deadline, error.WouldBlock => return,
+            else => {
+                seen.closed = true;
+                return;
+            },
+        } orelse {
+            seen.closed = true;
+            return;
+        };
+        const p = w.last_payload.items;
+        const i: usize = if (s.sid == 0) 0 else (s.sid - 1) / 2;
+        switch (s.ftype) {
+            0x1 => {
+                const decoded = try dec.decode(p, 100, 32 * 1024, 256, 8 * 1024);
+                defer dec.freeResult(decoded);
+                for (decoded.fields) |f| {
+                    if (i < seen.status.len and std.mem.eql(u8, f.name, ":status")) seen.status[i] = std.fmt.parseInt(u16, f.value, 10) catch null;
+                }
+            },
+            0x3 => if (i < seen.rst.len and p.len >= 4) {
+                seen.rst[i] = std.mem.readInt(u32, p[0..4], .big);
+            },
+            0x7 => {
+                seen.goaway = true;
+                seen.goaway_code = if (p.len >= 8) std.mem.readInt(u32, p[4..8], .big) else 0;
+            },
+            else => {},
+        }
+    }
+}
+
+fn sendGets(gpa: std.mem.Allocator, w: *Wire, sids: []const u31) !void {
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    for (sids) |sid| try h2c.appendHeaders(gpa, &req, sid, "/stuck", true);
+    try w.sendUnchecked(req.items);
+}
+
+fn sendRsts(gpa: std.mem.Allocator, w: *Wire, sids: []const u31) !void {
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    for (sids) |sid| try h2c.appendRst(gpa, &req, sid);
+    try w.sendUnchecked(req.items);
+}
+
+const kib = 1024;
+const block = 64 * kib;
+
+/// 3 slots, and a connection whose request memory holds 5 first blocks: 3
+/// running requests and 2 parked fill it.
+fn parkLimits() starh2.Limits {
+    var l = testLimits();
+    l.max_streams_per_connection = 3;
+    l.request_bytes_per_server = 4 * 1024 * kib;
+    l.request_bytes_per_connection = 5 * block;
+    l.request_arena_bytes = 4 * block;
+    l.request_body_bytes = 64 * kib - 64;
+    l.request_pool_retain_bytes = l.request_bytes_per_server;
+    return l;
+}
+
+const ParkResult = struct {
+    /// Request-pool bytes: 3 running and 2 parked (7, then 9).
+    held_full: usize = 0,
+    /// Just after 9, parked behind 7 (which is still waiting), was reset;
+    /// no slot has freed.
+    held_after_rst: usize = 0,
+    ms_to_release: u64 = 0,
+    client_after_rst: usize = 0,
+    route_after_rst: usize = 0,
+    ended_before_release: usize = 0,
+    /// After 11 parked in 9's place; after 11 was reset too; after 13 parked.
+    held_11: usize = 0,
+    held_after_11: usize = 0,
+    held_13: usize = 0,
+    late: Seen = .{},
+    err: ?anyerror = null,
+};
+
+fn parkClient(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, r: *ParkResult) void {
+    parkInner(gpa, tr, rig, r) catch |err| {
+        r.err = err;
+    };
+}
+
+fn heldIs(rig: *Rig, want: usize, timeout_ms: u64) bool {
+    const deadline = nowNs() + timeout_ms * ms;
+    while (rig.server.requests.held_bytes.load(.acquire) != want) {
+        if (nowNs() >= deadline) return false;
+        osSleepMs(1);
+    }
+    return true;
+}
+
+fn clientBytes(rig: *Rig) usize {
+    var buf: [accounts.max_refs]accounts.Key = undefined;
+    const k = accounts.keysFor(.{ .ip4 = .{ 127, 0, 0, 1 } }, 48, &buf)[0];
+    const e = rig.server.clients.lookup(k) orelse return 0;
+    return e.count(.request_bytes);
+}
+
+fn routeBytes(rig: *Rig) usize {
+    if (comptime !@hasDecl(accounts, "RouteTable")) return 0;
+    const rec = rig.server.accounting.routes.recordOf(1) orelse return 0;
+    return rec.count(.request_bytes);
+}
+
+/// Three slots, all held by handlers that ignore cancel; two of their
+/// streams reset, so two streams are free and no slot is. 7 and 9 park.
+/// Reset 9, which waits behind 7 (the actor's per-turn sweep of the queue,
+/// `dispatchParked`, stops at the first request still waiting, so before this
+/// step 9's memory stayed until a slot freed): its lease must come back at
+/// once. Then 11 parks in its place and is reset too, and 13 parks: the
+/// queue (one place per slot) must have room, so neither reset request may
+/// still be in it. Then the slots free: 5, 7 and 13 are answered, 9 and 11
+/// never.
+fn parkInner(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, r: *ParkResult) !void {
+    const w = try openQuick(gpa, tr, rig.port());
+    defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
+    var pre = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer pre.deinit(gpa);
+    try w.sendUnchecked(pre.items);
+    try sendGets(gpa, w, &.{ 1, 3, 5 });
+    if (!waitStarted(3, 3_000)) return error.HandlersNotStarted;
+    try sendRsts(gpa, w, &.{ 1, 3 });
+    try sendGets(gpa, w, &.{ 7, 9 });
+    if (!heldIs(rig, 5 * block, 2_000)) {
+        std.debug.print("protocol work parked lease: the pool holds {d} bytes with 3 running and 2 parked, want {d}\n", .{ rig.server.requests.held_bytes.load(.acquire), 5 * block });
+        return error.ParkedNotLeased;
+    }
+    r.held_full = rig.server.requests.held_bytes.load(.acquire);
+    const t0 = nowNs();
+    try sendRsts(gpa, w, &.{9});
+    _ = heldIs(rig, 4 * block, 1_000);
+    r.ms_to_release = (nowNs() - t0) / ms;
+    r.held_after_rst = rig.server.requests.held_bytes.load(.acquire);
+    r.client_after_rst = clientBytes(rig);
+    r.route_after_rst = routeBytes(rig);
+    r.ended_before_release = ended.load(.acquire);
+    // The connection's own budget has room again: 11 parks, not refused.
+    try sendGets(gpa, w, &.{11});
+    _ = heldIs(rig, 5 * block, 1_000);
+    r.held_11 = rig.server.requests.held_bytes.load(.acquire);
+    try sendRsts(gpa, w, &.{11});
+    _ = heldIs(rig, 4 * block, 1_000);
+    r.held_after_11 = rig.server.requests.held_bytes.load(.acquire);
+    try sendGets(gpa, w, &.{13});
+    _ = heldIs(rig, 5 * block, 1_000);
+    r.held_13 = rig.server.requests.held_bytes.load(.acquire);
+    try readFor(w, &dec, &r.late, 200);
+    // Now free the slots: the running handlers return, and the parked ones
+    // run (and return at once).
+    release.store(true, .release);
+    const deadline = nowNs() + 3 * std.time.ns_per_s;
+    while (nowNs() < deadline and (r.late.status[2] == null or r.late.status[3] == null or r.late.status[6] == null)) try readFor(w, &dec, &r.late, 50);
+}
+
+fn parkedLease(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    resetHandlers();
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, parkLimits());
+    defer rig.stop();
+    const p0 = parkedReleased();
+    var r: ParkResult = .{};
+    try blocking(parkClient, .{ gpa, tr, &rig, &r });
+    const d = nowNs() + 3 * std.time.ns_per_s;
+    while (rig.server.accounting.task_handlers.load(.acquire) != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
+    std.debug.print("protocol work parked lease ({s}): 3 running (2 of their streams reset) + 7 and 9 parked hold {d} KiB; 9 reset behind 7: {d} KiB {d} ms later, with {d} handlers ended (client {d} KiB, route {d} KiB); 11 parks: {d} KiB; 11 reset: {d} KiB; 13 parks: {d} KiB; released on RST {d}; answers 5:{?d} 7:{?d} 13:{?d} (9 and 11 never: {?d} {?d}, resets {?d} {?d}); err {?}\n", .{
+        @tagName(tr),             r.held_full / kib,       r.held_after_rst / kib, r.ms_to_release, r.ended_before_release,
+        r.client_after_rst / kib, r.route_after_rst / kib, r.held_11 / kib,        r.held_after_11 / kib,
+        r.held_13 / kib,          parkedReleased() - p0,   r.late.status[2],       r.late.status[3],
+        r.late.status[6],         r.late.status[4],        r.late.status[5],       r.late.rst[4],
+        r.late.rst[6],            r.err,
+    });
+    try std.testing.expect(r.err == null);
+    try expectExactly("request pool with 3 running and 2 parked", r.held_full, 5 * block);
+    try expectExactly("request pool after 9 was reset", r.held_after_rst, 4 * block);
+    try expectExactly("client bytes after the reset", r.client_after_rst, 4 * block);
+    try expectExactly("route bytes after the reset (the running ones only)", r.route_after_rst, 3 * block);
+    try expectExactly("handlers ended before the release", r.ended_before_release, 0);
+    try expectExactly("request pool after 11 parked", r.held_11, 5 * block);
+    try expectExactly("request pool after 11 was reset", r.held_after_11, 4 * block);
+    try expectExactly("request pool after 13 parked", r.held_13, 5 * block);
+    try expectExactly("parked leases released on RST", parkedReleased() - p0, 2);
+    for ([_]usize{ 2, 3, 6 }) |i| try expectExactly("an answer", r.late.status[i] orelse 0, 200);
+    try std.testing.expect(r.late.status[4] == null and r.late.status[5] == null);
+    // Nothing released twice.
+    try expectExactly("task handlers", rig.server.accounting.task_handlers.load(.acquire), 0);
+    try expectExactly("server underflows", rig.server.accounting.underflows.load(.acquire), 0);
+    try expectExactly("client table underflows", rig.server.clients.stats().underflows, 0);
+    if (comptime @hasDecl(accounts, "RouteTable")) try expectExactly("route underflows", rig.server.accounting.routes.underflows.load(.acquire), 0);
+}
+
+test "a parked request whose stream is reset gives its lease back at once, before any slot frees, and only once (h2c)" {
+    try runIn(parkedLease, 2, .h2c);
+}
+test "a parked request whose stream is reset gives its lease back at once, before any slot frees, and only once (TLS)" {
+    try runIn(parkedLease, 2, .tls);
 }

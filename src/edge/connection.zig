@@ -1885,6 +1885,10 @@ fn dropLinkRef(link: *StreamLink) void {
 /// Test-only: links freed, all connections.
 pub var test_links_freed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 
+/// Process-wide: parked requests whose lease went back when their stream was
+/// reset (`Connection.releaseParkedStream`). Tests and an operator read it.
+pub var parked_released_on_rst: std.atomic.Value(u64) = .init(0);
+
 /// Complete-handler drain turns that may await their wire receipts at once.
 /// Independent of the deeper WritePump queue. 2 serialized the 8-worker
 /// mixed oneshot pipe (inline skipped while full); 4 is the occupancy ABA.
@@ -5455,6 +5459,30 @@ pub const Connection = struct {
         self.requestHandlerCancel(i);
     }
 
+    /// Release the lease of a parked request whose stream was reset, at
+    /// once, and take it out of the park queue, so the slot-free path
+    /// (`dispatchParked`) never sees it: released exactly once. A parked
+    /// request holds no token, no slot and no route charge (all taken at
+    /// dispatch), only its request memory.
+    fn releaseParkedStream(self: *Connection, stream_id: u31) void {
+        var k: usize = 0;
+        while (k < self.parked_len) : (k += 1) {
+            const at = (self.parked_head + k) % self.parked.len;
+            if (self.parked[at].stream_id != stream_id) continue;
+            const d = self.parked[at];
+            // Close the gap: every later entry moves one place forward, so
+            // the queue keeps its order.
+            var j = k;
+            while (j + 1 < self.parked_len) : (j += 1) {
+                self.parked[(self.parked_head + j) % self.parked.len] = self.parked[(self.parked_head + j + 1) % self.parked.len];
+            }
+            self.parked_len -= 1;
+            self.releaseDispatchRequest(d);
+            _ = parked_released_on_rst.fetchAdd(1, .monotonic);
+            return;
+        }
+    }
+
     /// Ask slot `i`'s handler task to cancel, and return at once. A complete
     /// handler (no task) and a task that already ended are left alone; a
     /// cancel to a finished task is a no-op in zio (`Executor.scheduleTask`).
@@ -7149,6 +7177,9 @@ pub const Connection = struct {
         else
             .{ .peer_reset = r.code };
         self.cancelHandler(r.stream_id, cause);
+        // A request still parked behind full slots gives its memory back
+        // now, not when a slot frees.
+        self.releaseParkedStream(r.stream_id);
     }
 
     /// A RST frame that cannot be queued has already tombstoned the stream.
