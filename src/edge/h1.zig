@@ -206,6 +206,12 @@ pub const H1Conn = struct {
     /// shutting down (`GlobalAccounting.shutdown_cancelled`).
     shutdown_cancel_counted: bool = false,
     want_close: bool = false,
+    /// The connection is ending before it read all the client sent for the
+    /// current request: answered at its head (a refusal, a 413 before the
+    /// body, a parse reject), a body that timed out, or a streaming route
+    /// whose body the handler may not have read. The close lingers
+    /// (`lingerNeeded`).
+    input_unread: bool = false,
     finished: bool = false,
     no_payload: bool = false,
     resp_status: u16 = 0,
@@ -563,8 +569,75 @@ fn runLoop(self: *H1Conn) !void {
         self.pending_len = 0;
     }
     std.debug.assert(self.link == null);
+    if (!shutdownRequested(self) and lingerNeeded(self)) linger(self);
     self.stream.shutdown(self.io, .both) catch {};
 }
+
+/// Lingering close (RFC 9112 section 9.6). A close with unread input in the
+/// socket makes the kernel send a RST, and a RST can destroy the response the
+/// client has not read yet (Linux: the close above with input left resets the
+/// connection; measured, t-3883). So when the client has, or may have, sent
+/// more than was read, the connection first half-closes (the response then
+/// ends with a FIN), reads and discards, and closes on the client's EOF, an
+/// error, `linger_idle_ns` with no data, or `linger_total_ns` in all. It keeps
+/// its slot and its charges meanwhile: it is still a connection. Reads during
+/// the linger are discarded, never parsed.
+///
+/// nginx's shape (`ngx_http_set_lingering_close`: read and discard), Go's
+/// time scale (`closeWriteAndWait` waits 500 ms), and shorter than nginx's 5 s
+/// idle and 30 s total on purpose: a client that trickles bytes must not hold
+/// a slot for long. Fixed: no `Limits` field means the same thing
+/// (`close_flush_timeout_ns` bounds our own last write, not the peer's input).
+pub const linger_idle_ns: u64 = 500 * std.time.ns_per_ms;
+pub const linger_total_ns: u64 = 2 * std.time.ns_per_s;
+
+/// Whether the client has, or may have, input this connection did not read:
+/// the current request was not read to its end (`input_unread`, a partial
+/// head included), bytes read and not consumed (a pipelined request), or bytes waiting
+/// in the socket (FIONREAD; ciphertext on TLS). Not after the client's own
+/// end of stream: then nothing more comes.
+fn lingerNeeded(self: *H1Conn) bool {
+    if (self.tls != null) {
+        const pump = self.tls_t.running() orelse return false;
+        if (pump.inbound_eof) return false;
+        if (pump.pending_read != null or pump.pending_cipher != null) return true;
+    } else {
+        if (self.recv_eof) return false;
+        if (self.recv_pending.len != 0) return true;
+    }
+    if (self.input_unread or self.carry_len != 0) return true;
+    var queued: c_int = 0;
+    if (std.c.ioctl(self.stream.socket.handle, fionread, &queued) == 0 and queued > 0) return true;
+    return false;
+}
+
+/// FIONREAD: Linux's from std; Darwin's is `_IOR('f', 127, int)`, which std
+/// does not define for it.
+const fionread: c_int = switch (@import("builtin").os.tag) {
+    .linux => @intCast(std.os.linux.T.FIONREAD),
+    .macos, .ios, .tvos, .watchos, .visionos => 0x4004667f,
+    else => @compileError("h1 lingering close: FIONREAD for this OS"),
+};
+
+/// Half-close, then read and discard until the client's EOF, an error, or a
+/// bound. The response is flushed before this runs (every write path flushes
+/// before `serveOne` returns), so the FIN comes after it.
+fn linger(self: *H1Conn) void {
+    _ = linger_started.fetchAdd(1, .monotonic);
+    self.stream.shutdown(self.io, .send) catch return;
+    self.carry_len = 0;
+    const end_ns = nowNs(self.io) +| linger_total_ns;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const now = nowNs(self.io);
+        if (now >= end_ns) return;
+        const n = (readSome(self, &buf, @min(now +| linger_idle_ns, end_ns)) catch return) orelse return;
+        if (n == 0) return;
+    }
+}
+
+/// HTTP/1.1 closes that lingered, process-wide (tests, an operator).
+pub var linger_started: std.atomic.Value(u64) = .init(0);
 
 fn shutdownRequested(self: *H1Conn) bool {
     if (self.config.shutdown_flag) |f| {
@@ -591,12 +664,17 @@ fn requestBodyCap(matched: router_mod.Match, fallback: usize) usize {
 }
 
 fn serveOne(self: *H1Conn) !bool {
-    const parsed = try readHead(self) orelse return false;
+    const parsed = try readHead(self) orelse {
+        // A head that never completed: the client may still be sending it.
+        if (self.acc.filled != 0) self.input_unread = true;
+        return false;
+    };
     switch (parsed) {
         .http09 => {
             return false;
         },
         .reject => |st| {
+            self.input_unread = true;
             try writeError(self, st);
             if (test_channel_mutation == .m4_keep_after_400 and st == 400) return true;
             return false;
@@ -610,6 +688,7 @@ fn serveOne(self: *H1Conn) !bool {
             const matched = self.config.router.match(method, head.path);
             const body_cap = requestBodyCap(matched, self.config.limits.request_body_bytes);
             if (head.content_length > body_cap) {
+                self.input_unread = true;
                 try writeError(self, 413);
                 return false;
             }
@@ -622,21 +701,27 @@ fn serveOne(self: *H1Conn) !bool {
             var body: []const u8 = &.{};
             if (skipRequestBody(matched)) {
                 // Streaming contract: handler starts after the head.
-                if (head.content_length != 0) self.want_close = true;
+                if (head.content_length != 0) {
+                    self.want_close = true;
+                    self.input_unread = true;
+                }
             } else {
                 body = readBody(self, head) catch |err| switch (err) {
                     error.BodyTimeout => {
                         // Nothing final was sent (a 100 Continue is interim),
                         // so the client can be told why before the close.
+                        self.input_unread = true;
                         writeError(self, 408) catch {};
                         return false;
                     },
                     else => return err,
                 } orelse {
+                    self.input_unread = true;
                     try writeError(self, 413);
                     return false;
                 };
                 if (body.len > body_cap) {
+                    self.input_unread = true;
                     try writeError(self, 413);
                     return false;
                 }

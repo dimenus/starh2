@@ -1051,6 +1051,25 @@ pub fn build(b: *std.Build) void {
     const protocol_work_step = b.step("test-protocol-work", "Run the t-3759 step 6 gates (bodyless DATA floods, the 1-byte flood, a browser-like load, padding, parked leases released on RST, the parked wait limit, RST_STREAM NO_ERROR after an early response)");
     protocol_work_step.dependOn(&run_protocol_work_tests.step);
 
+    const h1_linger_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/h1_linger.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_h1_linger_tests = b.addRunArtifact(h1_linger_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_h1_linger_tests.setCwd(b.path("."));
+    const h1_linger_step = b.step("test-h1-linger", "Run the HTTP/1.1 lingering-close gates (t-3883): no RST over a refused body, the idle and total bounds, no linger without unread input");
+    h1_linger_step.dependOn(&run_h1_linger_tests.step);
+
     const routes_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/routes.zig"),
@@ -1264,6 +1283,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_shares_tests.step);
     test_step.dependOn(&run_routes_tests.step);
     test_step.dependOn(&run_protocol_work_tests.step);
+    test_step.dependOn(&run_h1_linger_tests.step);
     test_step.dependOn(shutdown_step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);
