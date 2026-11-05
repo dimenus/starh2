@@ -1,12 +1,12 @@
 {
   "zig": "0.17.0",
   "zio": {
-    "tag": "none. lalinsky/zio main be65431 (2026-10-23).",
-    "repo": "https://github.com/lalinsky/zio",
-    "commit": "be65431ba2f9aa91232cac89a3e76b4480d15689",
-    "hash": "zio-0.19.0-xHbVVOZILQDHwvSkKoyueGl29__yoF4DRzNDIEzjgprv",
+    "tag": "none. dimenus/zio sim/dst-m3 3d50bb6, on lalinsky/zio main cd0befa (2026-11-05).",
+    "repo": "https://github.com/dimenus/zio",
+    "commit": "3d50bb64f829bd1d24d27fae3986d5fad20002eb",
+    "hash": "zio-0.19.0-xHbVVKIbMADD3Z24pfz1Jf08CFqiVAWhiLpbDEgA7ole",
     "scheduling": "-Dzio-scheduling, default work_stealing, passed to every zio dependency in build.zig",
-    "fork_patches": "none."
+    "fork_patches": "the io_uring send -EAGAIN bridge (lalinsky/zio PR #863, not merged); the DST simulator and the select/CompletionQueue invariant checks; two ThreadSanitizer race fixes (Waiter's tag, the work-stealing ring's slots)."
   },
   "datastar-sdk.zig": {
     "commit": "0c1f91f3d82ecd1dad3c53b9450db12623fc3408"

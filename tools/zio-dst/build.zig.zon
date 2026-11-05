@@ -4,13 +4,12 @@
     .fingerprint = 0x6e270d0db05b332f,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // dimenus/zio sim/dst-m2: the sim line ported onto starh2's zio pin
-        // (dbf1beb). The hash is of `git archive d8ac2fd`, which hashes the
-        // same as a GitHub fetch of that commit (both checked when the pin
-        // moved to it).
+        // The same zio commit as starh2's own pin (../../build.zig.zon).
+        // The hash is of a prefix-less `git archive 3d50bb6`; for d8ac2fd that
+        // method gave the same hash as a GitHub fetch.
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#d8ac2fdd40d53f101b5b807f11fc3b3ae2af4fac",
-            .hash = "zio-0.19.0-xHbVVIakLwCojwesQxrQP9UCPevbc-ydBYHtz-hs91wj",
+            .url = "git+https://github.com/dimenus/zio#3d50bb64f829bd1d24d27fae3986d5fad20002eb",
+            .hash = "zio-0.19.0-xHbVVKIbMADD3Z24pfz1Jf08CFqiVAWhiLpbDEgA7ole",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },

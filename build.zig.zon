@@ -4,14 +4,19 @@
     .fingerprint = 0x813a04b419058cf5,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // dimenus/zio sim/dst-m2: fix/iouring-send-eagain (lalinsky/zio main
-        // c9cc793 plus the io_uring send -EAGAIN bridge, dbf1beb) plus the DST
-        // simulator and the select/CompletionQueue invariant checks, which
-        // panic in every build. Neither part is merged upstream yet; move back
-        // to lalinsky/zio once both are.
+        // dimenus/zio sim/dst-m3: lalinsky/zio main cd0befa plus three parts
+        // upstream does not carry:
+        // - the io_uring send -EAGAIN bridge (wait for writability, then
+        //   resend). Upstream will not merge it (PR #863). It stays until the
+        //   kernel fix for -EAGAIN on an io_uring send ships on the machines
+        //   we run, or upstream zio adds its own workaround.
+        // - the DST simulator and the select/CompletionQueue invariant
+        //   checks, which panic in every build.
+        // - two ThreadSanitizer race fixes (a Debug copy of a tagged union
+        //   read across threads; the work-stealing ring's slots).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#d8ac2fdd40d53f101b5b807f11fc3b3ae2af4fac",
-            .hash = "zio-0.19.0-xHbVVIakLwCojwesQxrQP9UCPevbc-ydBYHtz-hs91wj",
+            .url = "git+https://github.com/dimenus/zio#3d50bb64f829bd1d24d27fae3986d5fad20002eb",
+            .hash = "zio-0.19.0-xHbVVKIbMADD3Z24pfz1Jf08CFqiVAWhiLpbDEgA7ole",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.
