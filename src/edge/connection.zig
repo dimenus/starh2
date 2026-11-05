@@ -3967,6 +3967,35 @@ pub const Connection = struct {
     /// goes on, and the closing phase writes it. Otherwise the error is the
     /// connection's end, returned to `run`, whose teardown releases the
     /// scheduler.
+    /// Queue the Session's intents, then emit what the scheduler holds. The
+    /// actor turn's tail, under `session_mu`.
+    fn materializeAndDrain(self: *Connection) !void {
+        diagActor(self, .lk_materialize);
+        self.materializeIntents() catch {
+            // Terminal enqueue failure sets writer_failed inside
+            // materializeIntents. Ordinary PoolFull is per-stream.
+            self.failClosedOnIntentError();
+        };
+        diagActor(self, .lk_drain_emit);
+        self.drainEmit() catch |err| {
+            // A cancel is not a write failure: leave as `error.Canceled`.
+            if (err == error.Canceled) return err;
+            // Fail-closed: Session may already be debited — terminate connection.
+            // A frame that failed after its flow-control debit cannot
+            // be retried and cannot be un-debited, so the connection's
+            // window state no longer matches the peer's. The only
+            // correct move left is to close.
+            self.noteServerClose("loop_drain_catch", err);
+            self.writer_failed.store(true, .release);
+            self.handleWriterFailed();
+        };
+    }
+
+    fn schedHoldsHeaders(ctx: *anyopaque, stream_id: u31) bool {
+        const self: *Connection = @ptrCast(@alignCast(ctx));
+        return self.sched.holdsHeaders(stream_id);
+    }
+
     fn sessionErrorExit(self: *Connection, err: anyerror, comptime site: []const u8) anyerror!void {
         self.assertSessionHeld("sessionErrorExit");
         self.materializeIntents() catch self.failClosedOnIntentError();
@@ -4944,25 +4973,17 @@ pub const Connection = struct {
                         self.checkConnectionIdle(now) catch |err| try self.sessionErrorExit(err, "connection_idle_error");
                     }
                 }
-                diagActor(self, .lk_materialize);
-                self.materializeIntents() catch {
-                    // Terminal enqueue failure sets writer_failed inside
-                    // materializeIntents. Ordinary PoolFull is per-stream.
-                    self.failClosedOnIntentError();
-                };
-                diagActor(self, .lk_drain_emit);
-                self.drainEmit() catch |err| {
-                    // A cancel is not a write failure: leave as `error.Canceled`.
-                    if (err == error.Canceled) return err;
-                    // Fail-closed: Session may already be debited — terminate connection.
-                    // A frame that failed after its flow-control debit cannot
-                    // be retried and cannot be un-debited, so the connection's
-                    // window state no longer matches the peer's. The only
-                    // correct move left is to close.
-                    self.noteServerClose("loop_drain_catch", err);
-                    self.writer_failed.store(true, .release);
-                    self.handleWriterFailed();
-                };
+                try self.materializeAndDrain();
+                // A stream answered early whose response has now left the
+                // scheduler is reset with NO_ERROR, behind that response, in
+                // this turn (`Session.resetAnsweredStreams`).
+                if (self.closing_deadline_ns == null and self.session.reset_after_response_n != 0) {
+                    const reset = self.session.resetAnsweredStreams(self, schedHoldsHeaders) catch |err| blk: {
+                        try self.sessionErrorExit(err, "answered_reset_error");
+                        break :blk true;
+                    };
+                    if (reset) try self.materializeAndDrain();
+                }
                 if (self.writer_failed.load(.acquire)) self.handleWriterFailed();
 
                 // Both checks stay INSIDE this lock. `drainEmit` above can

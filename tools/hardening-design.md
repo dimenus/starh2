@@ -199,8 +199,10 @@ HEADERS and DATA are exempt from the frame rate limits (`rates.zig:121-129`).
   (`session.zig:1605-1618`). Padding is charged to flow control like the
   payload (`session.zig:1579-1582`), so it is not free, but it never counts as
   body progress.
-- Tiny non-empty DATA is bounded by the body minimum rate below, not by a
-  bucket; a test shows the cost of a 1-byte DATA flood on one executor.
+- Tiny non-empty DATA is not charged to a bucket: it delivers body, so the
+  body cap ends the stream with a 413. The server then resets the stream with
+  NO_ERROR (RFC 9113 section 8.1), so DATA after that is DATA on a closed
+  stream, which the bucket charges.
 - The bucket sizes are checked against a browser loading a Datastar page.
 
 ## Route shares

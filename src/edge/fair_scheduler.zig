@@ -699,6 +699,16 @@ pub const FairScheduler = struct {
         self.dropQueuedHeaders(stream_id);
     }
 
+    /// A HEADERS frame of `stream_id` still waits in the ordinary queue.
+    /// Rare path (`Session.resetAnsweredStreams`): a scan of the queue.
+    pub fn holdsHeaders(self: *const FairScheduler, stream_id: u31) bool {
+        var k: usize = 0;
+        while (k < self.ordinary_len) : (k += 1) {
+            if (headersStream(self.ordinary_q[(self.ordinary_head + k) % self.ordinary_q.len].payload) == stream_id) return true;
+        }
+        return false;
+    }
+
     /// Only HEADERS: they are what opens a response, and the only control a
     /// handler queues for its stream. RST_STREAM is terminal-class and must
     /// still go. Order of everything kept is unchanged.

@@ -366,6 +366,10 @@ pub const Session = struct {
     stale_ids_lent: if (std.debug.runtime_safety) bool else void = if (std.debug.runtime_safety) false else {},
     credit_len: usize = 0,
     credit_all: bool = false,
+    /// Streams that may have `Stream.reset_after_response` set: at least as
+    /// many as do. A stream that leaves the map first takes its flag with it;
+    /// `resetAnsweredStreams` counts again.
+    reset_after_response_n: u32 = 0,
     tombstones: std.ArrayList(Tombstone),
     tombstone_next: usize = 0,
     /// Fixed-capacity intent ring — enqueue fails before ownership transfer when full.
@@ -1100,6 +1104,40 @@ pub const Session = struct {
             for (self.openStreamIds()) |sid| try self.emitRst(sid, .cancel);
         }
         try self.failConnectionWith(.no_error, self.last_processed_stream);
+    }
+
+    /// RFC 9113 section 8.1: a server that sent a complete response before
+    /// the request ended may ask the client to stop sending the request with
+    /// RST_STREAM NO_ERROR, sent after the response. Here that is a stream
+    /// answered early (413, 414, 431, or a memory refusal) while its body was
+    /// still open. Without the reset the stream stays open on the peer's side
+    /// for as long as the peer sends, and every DATA it sends is discarded
+    /// at the cost of a frame each; after it, that DATA is DATA on a closed
+    /// stream, which the non-DATA frame bucket charges (`chargeRate`).
+    ///
+    /// The edge calls this after its drain. A stream whose response is still
+    /// queued (`response_queued` true) keeps its flag for a later drain: a
+    /// local reset drops a stream's queued HEADERS
+    /// (`FairScheduler.forgetStream`), and RST_STREAM is a terminal control
+    /// that goes ahead of them. Returns whether a reset was queued.
+    pub fn resetAnsweredStreams(self: *Session, ctx: *anyopaque, response_queued: *const fn (*anyopaque, u31) bool) !bool {
+        if (self.reset_after_response_n == 0) return false;
+        var waiting: u32 = 0;
+        var reset = false;
+        defer self.returnOpenStreamIds();
+        for (self.openStreamIds()) |sid| {
+            const s = self.streams.getPtr(sid) orelse continue;
+            if (!s.reset_after_response) continue;
+            if (response_queued(ctx, sid)) {
+                waiting += 1;
+                continue;
+            }
+            s.reset_after_response = false;
+            try self.emitRst(sid, .no_error);
+            reset = true;
+        }
+        self.reset_after_response_n = waiting;
+        return reset;
     }
 
     /// The ids of the streams still open, copied out of the map, for a
@@ -1876,11 +1914,11 @@ pub const Session = struct {
         }
         s.window.debitRecv(total) catch unreachable;
 
-        // An early-rejected stream (413/414/431) keeps consuming and discarding
-        // its DATA until the peer sends END_STREAM. The server cannot stop the
-        // peer mid-body without a RST, and a RST would race the 413 response
-        // that explains the refusal. So the bytes are charged to flow control,
-        // counted, and dropped — never retained and never dispatched.
+        // An early-rejected stream (413/414/431) discards its DATA: the bytes
+        // are charged to flow control, counted, and dropped, never retained
+        // and never dispatched. That lasts until the peer sends END_STREAM or
+        // the RST_STREAM NO_ERROR that follows the response goes out
+        // (`resetAnsweredStreams`); DATA after that is DATA on a closed stream.
         if (s.early_status == null and !s.refused_before_dispatch and s.headers_done) {
             var body = self.pending_bodies.getPtr(hdr.stream_id) orelse blk: {
                 putBounded(&self.pending_bodies, hdr.stream_id, std.ArrayList(u8).empty);
@@ -2151,9 +2189,17 @@ pub const Session = struct {
             // No frame buffer for the response: the stream is reset instead,
             // as when the edge refuses it (`resetRefusedHeaders`). An RST
             // always has room (`Limits.terminalFrames`).
-            error.OutOfMemory => try self.emitRst(stream_id, .internal_error),
+            error.OutOfMemory => return self.emitRst(stream_id, .internal_error),
             else => return err,
         };
+        // The peer is still sending a body nobody will read. Once the
+        // response is on its way, ask it to stop (`resetAnsweredStreams`).
+        if (self.streams.getPtr(stream_id)) |after| {
+            if (after.state == .half_closed_local) {
+                after.reset_after_response = true;
+                self.reset_after_response_n += 1;
+            }
+        }
     }
 
     fn isTombstoned(self: *const Session, id: u31) bool {
