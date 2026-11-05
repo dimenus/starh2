@@ -612,10 +612,14 @@ fn goodGetInner(gpa: std.mem.Allocator, tr: Transport, port: u16) !bool {
     try h2c.appendHeaders(gpa, &pre, 1, "/", true);
     try w.send(pre.items);
     const deadline = nowNs() + 3 * std.time.ns_per_s;
+    var status: ?u16 = null;
     while (true) {
         const s = (w.next(deadline) catch return false) orelse return false;
-        // The 200's HEADERS; "hello" follows it.
-        if (s.sid == 1 and s.ftype == 0x1) return (try statusOf(&dec, w.last_payload.items)) == 200;
+        if (s.sid != 1) continue;
+        if (s.ftype == 0x1) status = try statusOf(&dec, w.last_payload.items);
+        // Served is a 200 that ENDS: its HEADERS, then "hello" with
+        // END_STREAM. A response that stalls or loses its body is not.
+        if ((s.ftype == 0x0 or s.ftype == 0x1) and s.flags & 1 != 0) return status == 200;
     }
 }
 

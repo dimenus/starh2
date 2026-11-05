@@ -1268,8 +1268,9 @@ pub const Session = struct {
     ///   admitted (`target` = `.new`), or a stream whose final HEADERS the
     ///   edge refused (`.refused_end`, from that frame's obligation). Any other
     ///   absent id is closed for the peer, tombstone or not (a delayed reset of
-    ///   a stream that ended long ago). The RST of a refusal tombstones the id,
-    ///   and a second refusal of it is a connection error in `onHeaders`.
+    ///   a stream that ended long ago). The RST of a refusal tombstones the id
+    ///   as reset by this side, so a later HEADERS on it is decoded, dropped
+    ///   and charged to the non-DATA bucket (`onHeaders`), and owes no RST.
     /// - Once `terminal` is set the GOAWAY already covers every stream, and
     ///   more RSTs would only use the room the final GOAWAY was kept.
     fn rstOwed(self: *Session, stream_id: u31, target: RstTarget) bool {
