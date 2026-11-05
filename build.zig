@@ -1070,6 +1070,25 @@ pub fn build(b: *std.Build) void {
     const h1_linger_step = b.step("test-h1-linger", "Run the HTTP/1.1 lingering-close gates (t-3883): no RST over a refused body, the idle and total bounds, no linger without unread input");
     h1_linger_step.dependOn(&run_h1_linger_tests.step);
 
+    const iowq_bound_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/iowq_bound.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_iowq_bound_tests = b.addRunArtifact(iowq_bound_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_iowq_bound_tests.setCwd(b.path("."));
+    const iowq_bound_step = b.step("test-iowq-bound", "Run the io-wq bound gate (t-3887, Linux io_uring): half-closed TLS HTTP/2 clients that never read hold no kernel thread past the bound");
+    iowq_bound_step.dependOn(&run_iowq_bound_tests.step);
+
     const routes_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/routes.zig"),
@@ -1284,6 +1303,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_routes_tests.step);
     test_step.dependOn(&run_protocol_work_tests.step);
     test_step.dependOn(&run_h1_linger_tests.step);
+    test_step.dependOn(&run_iowq_bound_tests.step);
     test_step.dependOn(shutdown_step);
     test_step.dependOn(&run_slot_reuse_tests.step);
     test_step.dependOn(&run_request_memory_tests.step);
