@@ -584,6 +584,25 @@ fn letGo(rig: *Rig, conns: []const *Conns) !void {
             return srv.accounting.task_handlers.load(.acquire) == 0 and srv.accounting.orphaned_handlers.load(.acquire) == 0;
         }
     }.f, 10 * std.time.ns_per_s);
+    // A link gives the server's token back before its route's
+    // (`GlobalAccounting.releaseTaskHandler`: the reverse of the charge
+    // order), so the server reading zero does not mean the route does yet.
+    // Its arena and its encoder go back earlier (`dropLink`,
+    // `finishHandlerJob`), but every count of every route is waited for, so
+    // no order of releases can make this read early. Without failing here:
+    // `expectRoutesEmpty` then names any count still left.
+    settle(rig, routesQuiet, 3 * std.time.ns_per_s);
+}
+
+fn routesQuiet(rig: *Rig) bool {
+    if (comptime !has_routes) return true;
+    const n: u32 = @intCast(rig.server.routes.len);
+    for (0..n) |i| {
+        inline for (.{ Res.task_handlers, Res.request_bytes, Res.compression }) |res| {
+            if (rig.routeCount(@intCast(i), res) != 0) return false;
+        }
+    }
+    return true;
 }
 
 /// Every route count back to zero, and no route release refused.
@@ -691,6 +710,94 @@ test "route broken route (TLS): orphans from many sources are refused 503 at the
 }
 test "route broken route (HTTP/1.1): orphans from many sources are refused 503 at the route's share; a second route is served throughout" {
     try runIn(brokenH1c);
+}
+
+/// IPv6 source `i` (1..8): its own /64, two /64s per /48
+/// (2001:db8:J:i::5 with J = (i + 1) / 2).
+fn source6(i: usize) [16]u8 {
+    var a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5 };
+    a[5] = @intCast((i + 1) / 2);
+    a[7] = @intCast(i);
+    return a;
+}
+
+fn clientCount(rig: *Rig, key: accounts.Key) usize {
+    const e = rig.server.clients.lookup(key) orelse return 0;
+    return e.count(.task_handlers);
+}
+
+/// The broken route attacked from IPv6 sources: each charge names a /64 and
+/// its /48 aggregate. Eight /64s in four /48s send five requests each, as in
+/// `brokenRoute`: 32 admitted, 8 refused by the route. The route's refusal
+/// must undo the /64's charge and the /48's alike: after the attack each /64
+/// holds exactly what its source was admitted, and each /48 the sum of its
+/// two /64s. Neither share binds (a /64 holds at most 5 of its 8, a /48 at
+/// most 10 of its 16).
+fn brokenRoute6(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
+    resetHandlers();
+    var limits = testLimits();
+    limits.max_task_handlers = 64;
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, &broken_routes, limits);
+    defer rig.stop();
+    var a: Conns = .{ .gpa = gpa };
+    defer {
+        release.store(true, .release);
+        a.closeAll();
+    }
+    var per: [8]Tally = @splat(.{});
+    for (&per, 1..) |*t, i| {
+        try blocking(attempts, .{ &a, tr, rig.port(), Peer{ .ip6 = source6(i) }, "/stuck", no_headers, 5, t, null });
+        try blocking(Conns.closeAll, .{&a});
+    }
+    settle(&rig.server, orphansAre(32).f, 5 * std.time.ns_per_s);
+    var admitted: usize = 0;
+    var refused: usize = 0;
+    var bad: usize = 0;
+    for (per, 1..) |t, i| {
+        admitted += t.admitted;
+        refused += t.refused_503;
+        var buf: [accounts.max_refs]accounts.Key = undefined;
+        const keys = accounts.keysFor(.{ .ip6 = source6(i) }, 48, &buf);
+        const on64 = clientCount(&rig, keys[0]);
+        std.debug.print("routes broken route IPv6 ({s}): source {d}: admitted {d}, 503 {d}; its /64 holds {d}", .{ @tagName(tr), i, t.admitted, t.refused_503, on64 });
+        if (on64 != t.admitted) bad += 1;
+        if (i % 2 == 0) {
+            const on48 = clientCount(&rig, keys[1]);
+            const want48 = per[i - 2].admitted + t.admitted;
+            std.debug.print("; its /48 holds {d} (its two /64s were admitted {d})", .{ on48, want48 });
+            if (on48 != want48) bad += 1;
+        }
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("routes broken route IPv6 ({s}): {d} admitted, {d} answered 503; route refusals {d}, client share refusals {d}; {d} accounts off\n", .{ @tagName(tr), admitted, refused, rig.routeRefusals(0, .task_handlers), rig.clientRefusals(.task_handlers), bad });
+    try expectExactly("admitted", admitted, 32);
+    try expectExactly("answered 503", refused, 8);
+    try expectExactly("route refusals", rig.routeRefusals(0, .task_handlers), 8);
+    try expectExactly("client share refusals", rig.clientRefusals(.task_handlers), 0);
+    try expectExactly("client and aggregate accounts that do not match what was admitted", bad, 0);
+    try letGo(&rig, &.{&a});
+    try expectRoutesEmpty(&rig, broken_routes.len);
+}
+
+fn broken6H2c(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return brokenRoute6(rt, gpa, .h2c);
+}
+fn broken6Tls(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return brokenRoute6(rt, gpa, .tls);
+}
+fn broken6H1c(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    return brokenRoute6(rt, gpa, .h1c);
+}
+
+test "route broken route, IPv6 sources (h2c): a route refusal undoes the /64 and its /48 aggregate" {
+    try runIn(broken6H2c);
+}
+test "route broken route, IPv6 sources (TLS): a route refusal undoes the /64 and its /48 aggregate" {
+    try runIn(broken6Tls);
+}
+test "route broken route, IPv6 sources (HTTP/1.1): a route refusal undoes the /64 and its /48 aggregate" {
+    try runIn(broken6H1c);
 }
 
 // ---------------------------------------------------------------------------

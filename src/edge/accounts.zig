@@ -1910,3 +1910,43 @@ test "Charge.add: a route over its share is refused only at the mark, and its re
     t.release(conn);
     try std.testing.expect(t.checkEmpty());
 }
+
+test "Charge.add: a route refusal from an IPv6 client undoes both the /64 and the /48 aggregate" {
+    const gpa = std.testing.allocator;
+    var buf: [2]router.Route = undefined;
+    // L = 16 task handlers, one task route: its share is 16 by default, so
+    // an override of 2 binds first; the mark is 4. The client's share (2)
+    // and the aggregate's (4) are never reached here.
+    const routes = testTaskRoutes(1, &buf);
+    buf[0].share = .{ .task_handlers = 2 };
+    var rt = try RouteTable.init(gpa, routes, .{ 16, 1024, 16 });
+    defer rt.deinit(gpa);
+    var shares: Shares = unlimited;
+    shares[@intFromEnum(Resource.task_handlers)] = .of(16);
+    var t = try Table.init(gpa, 8, 9, .{ .shares = shares, .connection_start = Rules.unlimited.connection_start, .handshake_start = Rules.unlimited.handshake_start });
+    defer t.deinit(gpa);
+    const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 7, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
+    var b = a;
+    b[7] = 2; // another /64 of the same /48
+    var oa: [max_refs]Key = undefined;
+    var ob: [max_refs]Key = undefined;
+    const ka = keysFor(.{ .ip6 = a }, 48, &oa);
+    const kb = keysFor(.{ .ip6 = b }, 48, &ob);
+    const ca = ((try t.acquire(ka, 0, null)).charge).withRoute(rt.ref(0));
+    const cb = ((try t.acquire(kb, 0, null)).charge).withRoute(rt.ref(0));
+    // Each /64 takes one: the route holds its share, 2.
+    try std.testing.expectEqual(Charge.Outcome.took, ca.add(.task_handlers, 1, 4));
+    try std.testing.expectEqual(Charge.Outcome.took, cb.add(.task_handlers, 1, 4));
+    // At the mark the route refuses the next, from /64 b: the /64 and the
+    // aggregate it charged first are both undone.
+    try std.testing.expectEqual(Charge.Outcome.route_refused, cb.add(.task_handlers, 1, 4));
+    try std.testing.expectEqual(@as(usize, 1), t.lookup(kb[0]).?.count(.task_handlers));
+    try std.testing.expectEqual(@as(usize, 2), t.lookup(kb[1]).?.count(.task_handlers));
+    try std.testing.expectEqual(@as(usize, 2), rt.recordOf(0).?.count(.task_handlers));
+    ca.sub(.task_handlers, 1);
+    cb.sub(.task_handlers, 1);
+    try std.testing.expect(rt.checkEmpty());
+    t.release(ca);
+    t.release(cb);
+    try std.testing.expect(t.checkEmpty());
+}

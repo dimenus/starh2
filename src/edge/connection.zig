@@ -11735,6 +11735,100 @@ fn expectDispatchRefusalReset(request_cap: bool, path: RefusalPath, want: frame.
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
 }
 
+fn hopTaskNeverRuns(_: *anyopaque, _: *const request.Request, _: *response.Response) anyerror!void {
+    @panic("a request its route refused ran its handler");
+}
+
+/// Which route refusal: the task handler (at the token), or the bytes the
+/// header lease holds (at dispatch, after the slot is claimed).
+const RouteRefusal = enum { token, bytes };
+
+/// A task route over its share under pressure answers 503; when that
+/// response cannot be sent (no frame for it, or the edge's full ordinary
+/// share refuses its HEADERS), the stream is reset with INTERNAL_ERROR, never
+/// REFUSED_STREAM: a client may retry a REFUSED_STREAM by itself, and the
+/// route is still broken. Then nothing is left charged: the route, the
+/// server's token and streams, and no release refused.
+fn expectRouteRefusalReset(which: RouteRefusal, path: RefusalPath) !void {
+    const gpa = std.testing.allocator;
+    var routes = [_]router_mod.Route{.{
+        .method = .GET,
+        .path = "/",
+        .handler = .{ .task = .{ .ptr = undefined, .runFn = hopTaskNeverRuns } },
+    }};
+    // 8 task handlers (the mark 2) and 4 request bytes (the mark 1, so the
+    // lease's own block is pressure), one task route. Its share of the
+    // refused resource is 1.
+    switch (which) {
+        .token => routes[0].share = .{ .task_handlers = 1 },
+        .bytes => routes[0].share = .{ .request_bytes = 1 },
+    }
+    var acct: GlobalAccounting = .{
+        .max_streams = 8,
+        .task_handler_capacity = 8,
+        .max_outbound_bytes = 1 << 20,
+        .max_handshakes = 1,
+        .routes = try accounts.RouteTable.init(gpa, &routes, .{ 8, 4, 8 }),
+    };
+    defer acct.routes.deinit(gpa);
+    const rec = acct.routes.recordOf(0).?;
+    const r = acct.routes.ref(0).?;
+    if (which == .token) {
+        // The route already holds its share, and the server is at the mark.
+        try std.testing.expect(r.add(.task_handlers, 1, 0));
+        acct.task_handlers.store(2, .release);
+    }
+    var trap: TrapHop = undefined;
+    try openTrapHopWith(&trap, gpa, std.testing.io, &routes, limits_mod.Limits.defaults, &acct);
+    defer trap.close();
+    const conn = &trap.hop.conn;
+    try trap.hop.preparePreface();
+    var pinned: usize = 0;
+    switch (path) {
+        .no_frame => conn.session.stream_hooks.?.rentFrame = rentNoOrdinary,
+        .share_full => {
+            while (conn.sched.ctrl.tryReserveOrdinary(1)) pinned += 1;
+        },
+    }
+    var req: [frame.FRAME_HEADER_LEN + 3]u8 = undefined;
+    try trapIngest(conn, hopRequestFrame(&req, 1));
+    conn.sched.ctrl.release(pinned, pinned);
+    try std.testing.expect(conn.session.terminal == .none);
+    try std.testing.expectEqual(@as(usize, 0), conn.countInUseSlots());
+    var seen: TrapWire = .{ .rst_per_sid = .init(gpa) };
+    defer seen.deinit();
+    try trapCollect(&trap, &seen);
+    const res: accounts.RouteResource = if (which == .token) .task_handlers else .request_bytes;
+    try std.testing.expectEqual(@as(u64, 1), rec.refusals[@intFromEnum(res)].load(.acquire));
+    try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.internal_error)), seen.rst_code);
+    try std.testing.expectEqual(@as(usize, 0), seen.goaways);
+    // Conservation: the preloaded charges go back, and then nothing is left.
+    if (which == .token) {
+        r.sub(.task_handlers, 1);
+        acct.task_handlers.store(0, .release);
+    }
+    try std.testing.expectEqual(@as(usize, 0), acct.task_handlers.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), acct.underflows.load(.acquire));
+    try std.testing.expect(acct.routes.checkEmpty());
+}
+
+test "a route refused at its task handler, with no frame for its 503, is reset with INTERNAL_ERROR, not REFUSED_STREAM" {
+    try expectRouteRefusalReset(.token, .no_frame);
+}
+
+test "a route refused at its task handler, whose 503 the full ordinary share refuses, is reset with INTERNAL_ERROR, not REFUSED_STREAM" {
+    try expectRouteRefusalReset(.token, .share_full);
+}
+
+test "a route refused at its lease's bytes, with no frame for its 503, is reset with INTERNAL_ERROR, not REFUSED_STREAM" {
+    try expectRouteRefusalReset(.bytes, .no_frame);
+}
+
+test "a route refused at its lease's bytes, whose 503 the full ordinary share refuses, is reset with INTERNAL_ERROR, not REFUSED_STREAM" {
+    try expectRouteRefusalReset(.bytes, .share_full);
+}
+
 test "a request refused for want of job memory, with no frame for its response, is reset instead of left open: a 503 (server's memory) with REFUSED_STREAM (t-3562)" {
     try expectDispatchRefusalReset(false, .no_frame, .refused_stream);
 }
@@ -12008,6 +12102,12 @@ fn openTrapHopRoutes(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: 
 }
 
 fn openTrapHopLimits(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: []const router_mod.Route, limits: limits_mod.Limits) !void {
+    return openTrapHopWith(out, gpa, io, routes, limits, null);
+}
+
+/// `openTrapHopLimits` with the server's accounting, for a test of a
+/// refusal by share (the caller owns `accounting` and its route table).
+fn openTrapHopWith(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: []const router_mod.Route, limits: limits_mod.Limits, accounting: ?*GlobalAccounting) !void {
     out.gpa = gpa;
     out.io = io;
     out.slabs = try slab_pool.SlabPool.init(gpa, io, limits_mod.Limits.defaults.outbound_bytes_per_stream, 8);
@@ -12036,6 +12136,7 @@ fn openTrapHopLimits(out: *TrapHop, gpa: std.mem.Allocator, io: std.Io, routes: 
         .limits = limits,
         .router = .{ .routes = routes },
         .gpa = gpa,
+        .accounting = accounting,
         .slab_pool = &out.slabs,
         .request_pool = &out.requests,
     }) catch |err| {
