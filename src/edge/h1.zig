@@ -210,7 +210,7 @@ pub const H1Conn = struct {
     /// current request: answered at its head (a refusal, a 413 before the
     /// body, a parse reject), a body that timed out, or a streaming route
     /// whose body the handler may not have read. The close lingers
-    /// (`lingerNeeded`).
+    /// (`lingerReason`).
     input_unread: bool = false,
     finished: bool = false,
     no_payload: bool = false,
@@ -569,7 +569,9 @@ fn runLoop(self: *H1Conn) !void {
         self.pending_len = 0;
     }
     std.debug.assert(self.link == null);
-    if (!shutdownRequested(self) and lingerNeeded(self)) linger(self);
+    if (!shutdownRequested(self)) {
+        if (lingerReason(self)) |why| linger(self, why);
+    }
     self.stream.shutdown(self.io, .both) catch {};
 }
 
@@ -591,24 +593,51 @@ fn runLoop(self: *H1Conn) !void {
 pub const linger_idle_ns: u64 = 500 * std.time.ns_per_ms;
 pub const linger_total_ns: u64 = 2 * std.time.ns_per_s;
 
-/// Whether the client has, or may have, input this connection did not read:
-/// the current request was not read to its end (`input_unread`, a partial
-/// head included), bytes read and not consumed (a pipelined request), or bytes waiting
-/// in the socket (FIONREAD; ciphertext on TLS). Not after the client's own
-/// end of stream: then nothing more comes.
-fn lingerNeeded(self: *H1Conn) bool {
+/// Why a close lingers. Counted per reason (`linger_reasons`), so a test can
+/// tell which condition fired.
+pub const LingerReason = enum(u2) {
+    /// The current request was not read to its end (`input_unread`, a
+    /// partial head included).
+    request_unread,
+    /// Bytes read and not consumed: the carry buffer (a pipelined request),
+    /// the h1c receive buffer, TLS plaintext or ciphertext in the pump.
+    unconsumed,
+    /// Bytes waiting in the socket, read by nothing yet (FIONREAD).
+    queued,
+    /// FIONREAD failed: it cannot say there is nothing, so the close lingers
+    /// (at most `linger_idle_ns` lost) rather than risk a RST.
+    queued_unknown,
+};
+
+/// Whether, and why, the client has or may have input this connection did
+/// not read. Null when it has none, and after the client's own end of stream
+/// (EOF, TLS close_notify): then nothing more comes.
+fn lingerReason(self: *H1Conn) ?LingerReason {
+    // The client's own end of stream first: then nothing more comes. The
+    // reasons after it are in order of how specific they are; more than one
+    // can hold, and any one lingers.
+    var unconsumed = self.carry_len != 0;
     if (self.tls != null) {
-        const pump = self.tls_t.running() orelse return false;
-        if (pump.inbound_eof) return false;
-        if (pump.pending_read != null or pump.pending_cipher != null) return true;
+        const pump = self.tls_t.running() orelse return null;
+        if (pump.inbound_eof) return null;
+        if (pump.pending_read != null or pump.pending_cipher != null) unconsumed = true;
     } else {
-        if (self.recv_eof) return false;
-        if (self.recv_pending.len != 0) return true;
+        if (self.recv_eof) return null;
+        if (self.recv_pending.len != 0) unconsumed = true;
     }
-    if (self.input_unread or self.carry_len != 0) return true;
+    if (self.input_unread) return .request_unread;
+    if (unconsumed) return .unconsumed;
+    const queued = queuedInput(self.stream.socket.handle) orelse return .queued_unknown;
+    if (queued > 0) return .queued;
+    return null;
+}
+
+/// Bytes queued for reading on socket `fd` (FIONREAD), or null when the
+/// ioctl fails.
+fn queuedInput(fd: std.posix.fd_t) ?usize {
     var queued: c_int = 0;
-    if (std.c.ioctl(self.stream.socket.handle, fionread, &queued) == 0 and queued > 0) return true;
-    return false;
+    if (std.c.ioctl(fd, fionread, &queued) != 0) return null;
+    return @intCast(@max(queued, 0));
 }
 
 /// FIONREAD: Linux's from std; Darwin's is `_IOR('f', 127, int)`, which std
@@ -621,23 +650,32 @@ const fionread: c_int = switch (@import("builtin").os.tag) {
 
 /// Half-close, then read and discard until the client's EOF, an error, or a
 /// bound. The response is flushed before this runs (every write path flushes
-/// before `serveOne` returns), so the FIN comes after it.
-fn linger(self: *H1Conn) void {
+/// before `serveOne` returns), so the FIN comes after it; on TLS the pump
+/// must hold nothing unsent, or the half-close would cut the response.
+fn linger(self: *H1Conn, why: LingerReason) void {
     _ = linger_started.fetchAdd(1, .monotonic);
+    _ = linger_reasons[@intFromEnum(why)].fetchAdd(1, .monotonic);
+    if (self.tls != null) {
+        if (self.tls_t.running()) |pump| std.debug.assert(pump.writesDrained());
+    }
     self.stream.shutdown(self.io, .send) catch return;
-    self.carry_len = 0;
     const end_ns = nowNs(self.io) +| linger_total_ns;
     var buf: [4096]u8 = undefined;
     while (true) {
         const now = nowNs(self.io);
         if (now >= end_ns) return;
+        // Any error ends the linger, `error.Canceled` (the server shutting
+        // down) included: `runLoop` asserted `link == null` before it, so no
+        // handler is left to unwind, and the close follows either way.
         const n = (readSome(self, &buf, @min(now +| linger_idle_ns, end_ns)) catch return) orelse return;
         if (n == 0) return;
     }
 }
 
-/// HTTP/1.1 closes that lingered, process-wide (tests, an operator).
+/// HTTP/1.1 closes that lingered, process-wide (tests, an operator), and why
+/// (indexed by `LingerReason`).
 pub var linger_started: std.atomic.Value(u64) = .init(0);
+pub var linger_reasons: [4]std.atomic.Value(u64) = @splat(.init(0));
 
 fn shutdownRequested(self: *H1Conn) bool {
     if (self.config.shutdown_flag) |f| {
@@ -2198,4 +2236,37 @@ test "a write from a task that is not the actor never takes the actor's TLS path
     conn.tls_req_ch.close(.immediate);
     conn.tls_ok_ch.close(.immediate);
     try std.testing.expectError(error.ConnectionClosed, writeRaw(&conn, "a chunk"));
+}
+
+test "FIONREAD counts the bytes a TCP socket holds unread (the lingering close's backstop, t-3883)" {
+    // A loopback pair through a listener, raw libc: what `queuedInput` reads
+    // is the kernel's count for a real TCP socket on this OS.
+    const listener = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    try std.testing.expect(listener >= 0);
+    defer _ = std.c.close(listener);
+    var addr: std.c.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.bind(listener, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.listen(listener, 1));
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(listener, @ptrCast(&addr), &len));
+    const client = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    try std.testing.expect(client >= 0);
+    defer _ = std.c.close(client);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.connect(client, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)));
+    const server = std.c.accept(listener, null, null);
+    try std.testing.expect(server >= 0);
+    defer _ = std.c.close(server);
+
+    try std.testing.expectEqual(@as(?usize, 0), queuedInput(server));
+    const bytes: [1000]u8 = @splat('q');
+    try std.testing.expectEqual(@as(isize, bytes.len), std.c.send(client, &bytes, bytes.len, 0));
+    // Loopback delivers before send returns on both OSes; allow a moment.
+    var waited: usize = 0;
+    while (queuedInput(server).? < bytes.len and waited < 1000) : (waited += 1) {
+        const t: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.c.nanosleep(&t, null);
+    }
+    try std.testing.expectEqual(@as(?usize, bytes.len), queuedInput(server));
+    // A closed descriptor: the ioctl fails, and the caller is told so.
+    try std.testing.expectEqual(@as(?usize, null), queuedInput(-1));
 }

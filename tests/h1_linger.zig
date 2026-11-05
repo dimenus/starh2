@@ -30,8 +30,19 @@ fn upload(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteRespo
     try resp.send(200, &.{}, try std.fmt.bufPrint(&buf, "{d}", .{req.body.len}));
 }
 
+/// Holds the connection's actor for 150 ms: a complete handler runs inline on
+/// it, so for that time nothing the client sends is read. A blocking sleep on
+/// purpose, here and nowhere else: it is the only way to leave input in the
+/// socket with every buffer of the server empty (the FIONREAD case).
+fn busy(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    const t: std.c.timespec = .{ .sec = 0, .nsec = 150 * ms };
+    _ = std.c.nanosleep(&t, null);
+    try resp.send(200, &.{}, "busy");
+}
+
 const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = hello } } },
+    .{ .method = .GET, .path = "/busy", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = busy } } },
     .{ .method = .POST, .path = "/up", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = upload } } },
 };
 
@@ -95,6 +106,36 @@ fn runIn(comptime f: anytype, tr: Transport) !void {
 fn blocking(comptime f: anytype, args: anytype) !void {
     var h = try zio.spawnBlocking(f, args);
     return h.join();
+}
+
+const h1 = starh2.edge.h1;
+const Reason = h1.LingerReason;
+
+/// The process-wide linger counters, read before and after a case.
+const Lingers = struct {
+    started: u64,
+    reasons: [4]u64,
+
+    fn now() Lingers {
+        var r: Lingers = .{ .started = h1.linger_started.load(.acquire), .reasons = undefined };
+        for (&r.reasons, 0..) |*v, i| v.* = h1.linger_reasons[i].load(.acquire);
+        return r;
+    }
+
+    fn since(after: Lingers, before: Lingers) Lingers {
+        var r: Lingers = .{ .started = after.started - before.started, .reasons = undefined };
+        for (&r.reasons, 0..) |*v, i| v.* = after.reasons[i] - before.reasons[i];
+        return r;
+    }
+
+    fn of(self: Lingers, why: Reason) u64 {
+        return self.reasons[@intFromEnum(why)];
+    }
+};
+
+fn expectLinger(l: Lingers, started: u64, why: ?Reason) !void {
+    try expectExactly("lingered closes", l.started, started);
+    if (why) |w| try expectExactly("lingered closes for the expected reason", l.of(w), started);
 }
 
 fn expectExactly(comptime what: []const u8, got: anytype, want: anytype) !void {
@@ -168,6 +209,8 @@ const Read = struct {
     timed_out: bool = false,
     /// When the response was complete (`nowNs`).
     complete_ns: u64 = 0,
+    /// Bytes read past the first response before the connection's end.
+    after: usize = 0,
 };
 
 fn contentLength(head: []const u8) ?usize {
@@ -206,6 +249,7 @@ fn readResponse(w: *Wire, r: *Read, deadline: u64, to_end: bool) !void {
         };
         if (!more) {
             if (w.reset) r.reset = true else r.eof = true;
+            if (r.complete) r.after = w.plain.items.len - r.bytes;
             return;
         }
     }
@@ -267,10 +311,12 @@ fn rstCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     var rig: Rig = undefined;
     try rig.start(rt, gpa, tr);
     defer rig.stop();
+    const l0 = Lingers.now();
     var r: Bulk = .{};
     try blocking(bulkClient, .{ gpa, tr, rig.port(), &r });
     const d = nowNs() + 5 * std.time.ns_per_s;
     while (rig.connections() != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
+    const l = Lingers.now().since(l0);
     std.debug.print("h1 linger RST case ({s}): body bytes sent {d} in 300 ms, send error {?}; SO_ERROR after {d}; read {d} bytes, status {d}, complete {}; then eof {} reset {} timed out {} after {d} ms; connections now {d}; err {?}\n", .{
         @tagName(tr), r.sent,          r.send_err,       r.so_error,  r.read.bytes, r.read.status, r.read.complete,
         r.read.eof,   r.read.reset,    r.read.timed_out, r.end_ms,    rig.connections(), r.err,
@@ -284,6 +330,12 @@ fn rstCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     try expectWithin("the EOF after the client stopped sending", r.end_ms, 0, 150);
     try expectExactly("SO_ERROR", r.so_error, 0);
     try std.testing.expect(r.send_err == null);
+    // The drain ran: far more than the socket buffers hold went through.
+    if (r.sent < 4 * 1024 * 1024) {
+        std.debug.print("h1 linger: only {d} body bytes sent in 300 ms; the drain did not run\n", .{r.sent});
+        return error.NoDrain;
+    }
+    try expectLinger(l, 1, .request_unread);
     try expectConserved(&rig);
 }
 
@@ -366,10 +418,12 @@ fn boundCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: After
     var rig: Rig = undefined;
     try rig.start(rt, gpa, tr);
     defer rig.stop();
+    const l0 = Lingers.now();
     var r: Bound = .{};
     try blocking(boundClient, .{ gpa, tr, &rig, how, &r });
-    std.debug.print("h1 linger {s} ({s}): status {d}; slot held 200 ms in: {d}; closed {} {d} ms after the response; err {?}\n", .{
-        @tagName(how), @tagName(tr), r.read.status, r.held_at_200ms, r.closed, r.closed_ms, r.err,
+    const l = Lingers.now().since(l0);
+    std.debug.print("h1 linger {s} ({s}): status {d}; slot held 200 ms in: {d}; closed {} {d} ms after the response; lingered {d}; err {?}\n", .{
+        @tagName(how), @tagName(tr), r.read.status, r.held_at_200ms, r.closed, r.closed_ms, l.started, r.err,
     });
     try std.testing.expect(r.err == null);
     try std.testing.expect(r.closed);
@@ -378,11 +432,13 @@ fn boundCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: After
             try expectExactly("the status", r.read.status, 413);
             try expectExactly("connections 200 ms in", r.held_at_200ms, 1);
             try expectWithin("a trickling client's close", r.closed_ms, 1800, 2600);
+            try expectLinger(l, 1, .request_unread);
         },
         .silent => {
             try expectExactly("the status", r.read.status, 413);
             try expectExactly("connections 200 ms in", r.held_at_200ms, 1);
             try expectWithin("a silent client's close", r.closed_ms, 400, 900);
+            try expectLinger(l, 1, .request_unread);
         },
         .client_close => {
             try expectExactly("the status", r.read.status, 413);
@@ -391,6 +447,7 @@ fn boundCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: After
         .no_unread => {
             try expectExactly("the status", r.read.status, 200);
             try expectWithin("a close with no unread input", r.closed_ms, 0, 150);
+            try expectLinger(l, 0, null);
         },
     }
     try expectConserved(&rig);
@@ -439,4 +496,109 @@ test "a Connection: close request read whole closes at once, with no linger (h1c
 }
 test "a Connection: close request read whole closes at once, with no linger (TLS)" {
     try runIn(noUnread, .tls);
+}
+
+// ---------------------------------------------------------------------------
+// 3. The other reasons: a pipelined request, a parse reject, input left in
+//    the socket.
+
+const Other = enum {
+    /// Two requests in one write, the first with `Connection: close`: the
+    /// second is read and never served (bytes read, not consumed).
+    pipelined,
+    /// A head the parser rejects (400): the rest of the request is unread.
+    reject,
+    /// `/busy` with `Connection: close`, then 64 KiB more while the actor is
+    /// held: on h1c the bytes wait in the socket, read by nothing (FIONREAD).
+    queued,
+};
+
+const OtherResult = struct {
+    read: Read = .{},
+    send_err: ?std.c.E = null,
+    err: ?anyerror = null,
+};
+
+fn otherClient(gpa: std.mem.Allocator, tr: Transport, port: u16, how: Other, r: *OtherResult) void {
+    otherInner(gpa, tr, port, how, r) catch |err| {
+        r.err = err;
+    };
+}
+
+fn otherInner(gpa: std.mem.Allocator, tr: Transport, port: u16, how: Other, r: *OtherResult) !void {
+    const w = try open(gpa, tr, port);
+    defer w.close();
+    switch (how) {
+        .pipelined => r.send_err = sendOnce(w, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        .reject => r.send_err = sendOnce(w, "GET / HTTP/1.1\r\nHost: localhost\r\nno colon here\r\n\r\n"),
+        .queued => {
+            r.send_err = sendOnce(w, "GET /busy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            osSleepMs(30);
+            const more: [64 * 1024]u8 = @splat('q');
+            if (r.send_err == null) r.send_err = sendOnce(w, &more);
+        },
+    }
+    try readResponse(w, &r.read, nowNs() + 5 * std.time.ns_per_s, true);
+}
+
+fn otherCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: Other) !void {
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr);
+    defer rig.stop();
+    const l0 = Lingers.now();
+    var r: OtherResult = .{};
+    try blocking(otherClient, .{ gpa, tr, rig.port(), how, &r });
+    const d = nowNs() + 5 * std.time.ns_per_s;
+    while (rig.connections() != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
+    const l = Lingers.now().since(l0);
+    std.debug.print("h1 linger {s} ({s}): status {d}, complete {}, bytes {d}; then eof {} reset {}; send error {?}; lingered {d} (request_unread {d}, unconsumed {d}, queued {d}, queued_unknown {d}); err {?}\n", .{
+        @tagName(how), @tagName(tr), r.read.status, r.read.complete, r.read.bytes, r.read.eof, r.read.reset, r.send_err, l.started,
+        l.of(.request_unread), l.of(.unconsumed), l.of(.queued), l.of(.queued_unknown), r.err,
+    });
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(r.send_err == null);
+    try expectExactly("the status", r.read.status, @as(u16, if (how == .reject) 400 else 200));
+    try std.testing.expect(r.read.complete);
+    try std.testing.expect(r.read.eof and !r.read.reset);
+    // One response only: the pipelined second request is never served.
+    try expectExactly("bytes after the first response", r.read.after, 0);
+    try expectLinger(l, 1, switch (how) {
+        .pipelined => .unconsumed,
+        .reject => .request_unread,
+        // On h1c nothing reads while the actor is held, so the bytes are
+        // only in the socket: FIONREAD is the one witness. On TLS, writing
+        // the response drives the pump, which takes the waiting ciphertext
+        // into its own buffer, so the same input is `unconsumed` there.
+        .queued => if (tr == .h2c) .queued else .unconsumed,
+    });
+    try expectConserved(&rig);
+}
+
+fn pipelined(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return otherCase(rt, gpa, tr, .pipelined);
+}
+fn reject(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return otherCase(rt, gpa, tr, .reject);
+}
+fn queued(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    return otherCase(rt, gpa, tr, .queued);
+}
+
+test "a pipelined request behind Connection: close is read, not served, and the close lingers (h1c)" {
+    try runIn(pipelined, .h2c);
+}
+test "a pipelined request behind Connection: close is read, not served, and the close lingers (TLS)" {
+    try runIn(pipelined, .tls);
+}
+test "a parse reject answers 400 and the close lingers over the unread rest (h1c)" {
+    try runIn(reject, .h2c);
+}
+test "a parse reject answers 400 and the close lingers over the unread rest (TLS)" {
+    try runIn(reject, .tls);
+}
+test "input left in the socket while the actor was busy makes the close linger, through FIONREAD (h1c)" {
+    try runIn(queued, .h2c);
+}
+test "input left in the socket while the actor was busy makes the close linger, through FIONREAD (TLS)" {
+    try runIn(queued, .tls);
 }
