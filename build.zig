@@ -1188,6 +1188,22 @@ pub fn build(b: *std.Build) void {
     run_route_underflow.has_side_effects = true;
     shutdown_step.dependOn(&run_route_underflow.step);
     routes_step.dependOn(&run_route_underflow.step);
+    const run_route_table_mismatch = b.addRunArtifact(shutdown_child);
+    run_route_table_mismatch.addArg("route-table-mismatch");
+    run_route_table_mismatch.addCheck(.{ .expect_stderr_match = "child: route table built from its list: true, from the other: false" });
+    run_route_table_mismatch.addCheck(.{ .expect_stderr_match = "route accounts: a route of a list of 2 routes, but the table was built from another list of 2" });
+    run_route_table_mismatch.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+    run_route_table_mismatch.has_side_effects = true;
+    shutdown_step.dependOn(&run_route_table_mismatch.step);
+    routes_step.dependOn(&run_route_table_mismatch.step);
+    const run_route_table_not_task = b.addRunArtifact(shutdown_child);
+    run_route_table_not_task.addArg("route-table-not-task");
+    run_route_table_not_task.addCheck(.{ .expect_stderr_match = "child: route 0 is record 0" });
+    run_route_table_not_task.addCheck(.{ .expect_stderr_match = "route accounts: route 1 of 2 is not a task route" });
+    run_route_table_not_task.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+    run_route_table_not_task.has_side_effects = true;
+    shutdown_step.dependOn(&run_route_table_not_task.step);
+    routes_step.dependOn(&run_route_table_not_task.step);
 
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{

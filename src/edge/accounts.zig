@@ -590,6 +590,12 @@ pub const RouteTable = struct {
     /// The server's pressure mark of each route resource. Read only after
     /// `init`.
     marks: [RouteResource.count]usize = @splat(std.math.maxInt(usize)),
+    /// The route list this table was built from: `ref` takes the list the
+    /// caller's route index came from and refuses any other, so a router and
+    /// a table built from two lists cannot meet silently, whatever their
+    /// lengths or layouts. Borrowed: the owner of the list (`Server`, a test
+    /// rig) keeps it for as long as the table.
+    built_from: []const router.Route = &.{},
     underflows: std.atomic.Value(u64) = .init(0),
     refusal_log: RateLimitedLine = .{},
 
@@ -642,7 +648,7 @@ pub const RouteTable = struct {
             }
             next += 1;
         }
-        return .{ .records = records, .of_route = of_route, .marks = marks };
+        return .{ .records = records, .of_route = of_route, .marks = marks, .built_from = routes };
     }
 
     /// The default share: the server's limit over the task routes, rounded
@@ -658,21 +664,33 @@ pub const RouteTable = struct {
         self.* = undefined;
     }
 
-    /// The account of route `route` (`router.Found.route`), or null for a
-    /// complete route. A route index this table was not built from is a
-    /// broken invariant (the router and the table come from one route
-    /// list), never a route with no account.
-    pub fn ref(self: *RouteTable, route: u32) ?RouteRef {
-        if (route >= self.of_route.len) std.debug.panic("route {d} has no slot in the route accounts ({d} routes)", .{ route, self.of_route.len });
+    /// Whether `routes` is the list this table was built from: the same
+    /// slice, not an equal one.
+    pub fn builtFrom(self: *const RouteTable, routes: []const router.Route) bool {
+        return routes.ptr == self.built_from.ptr and routes.len == self.built_from.len;
+    }
+
+    /// The account of task route `route` (`router.Found.route`) of `routes`,
+    /// the router's list. A list this table was not built from, or a route
+    /// of it that is not a task route, is a broken invariant (the router and
+    /// the table come from one list, and only a task route is charged), so
+    /// it panics: two lists of one length but another layout would
+    /// otherwise charge the wrong route, or none, silently.
+    pub fn ref(self: *RouteTable, routes: []const router.Route, route: u32) RouteRef {
+        if (!self.builtFrom(routes)) std.debug.panic("route accounts: a route of a list of {d} routes, but the table was built from another list of {d}", .{ routes.len, self.built_from.len });
+        if (route >= routes.len or routes[route].handler != .task) std.debug.panic("route accounts: route {d} of {d} is not a task route", .{ route, routes.len });
         const i = self.of_route[route];
-        if (i == no_record) return null;
+        std.debug.assert(i != no_record);
         return .{ .table = self, .index = i };
     }
 
-    /// The record of route `route`, for tests and the refusal line.
+    /// The record of route `route`, or null for a complete route: for tests
+    /// and the shutdown report.
     pub fn recordOf(self: *RouteTable, route: u32) ?*RouteRecord {
-        const r = self.ref(route) orelse return null;
-        return r.rec();
+        if (route >= self.of_route.len) return null;
+        const i = self.of_route[route];
+        if (i == no_record) return null;
+        return &self.records[i];
     }
 
     fn noteRefused(self: *RouteTable, index: u32, res: RouteResource, server_use: usize) void {
@@ -1846,7 +1864,8 @@ test "RouteTable: the default share is the server's limit over the task routes, 
             try std.testing.expectEqual(@as(usize, 128 / n), rec.shares[@intFromEnum(RouteResource.compression)]);
         }
         // The complete route has no account.
-        try std.testing.expect(t.ref(@intCast(n)) == null);
+        try std.testing.expect(t.recordOf(@intCast(n)) == null);
+        try std.testing.expect(t.builtFrom(routes));
     }
     // Rounded up: 3 task routes of 128 contexts get 43 each, never 42.
     var buf3: [4]router.Route = undefined;
@@ -1875,14 +1894,15 @@ test "Charge.add: a route over its share is refused only at the mark, and its re
     const gpa = std.testing.allocator;
     var buf: [3]router.Route = undefined;
     // L = 16 task handlers, two task routes: each a share of 8, the mark 4.
-    var rt = try RouteTable.init(gpa, testTaskRoutes(2, &buf), .{ 16, 1024, 16 });
+    const routes_list = testTaskRoutes(2, &buf);
+    var rt = try RouteTable.init(gpa, routes_list, .{ 16, 1024, 16 });
     defer rt.deinit(gpa);
     var t = try Table.init(gpa, 4, 7, Rules.unlimited);
     defer t.deinit(gpa);
     var o: [max_refs]Key = undefined;
     const k = keysFor(.{ .ip4 = .{ 10, 0, 0, 1 } }, 48, &o);
     const conn = (try t.acquire(k, 0, null)).charge;
-    const c = conn.withRoute(rt.ref(0));
+    const c = conn.withRoute(rt.ref(routes_list, 0));
     // Below the mark: past the route's share, nothing is refused.
     for (0..10) |_| try std.testing.expectEqual(Charge.Outcome.took, c.add(.task_handlers, 1, 0));
     try std.testing.expectEqual(@as(usize, 10), rt.recordOf(0).?.count(.task_handlers));
@@ -1893,7 +1913,7 @@ test "Charge.add: a route over its share is refused only at the mark, and its re
     try std.testing.expectEqual(@as(usize, 10), rt.recordOf(0).?.count(.task_handlers));
     try std.testing.expectEqual(@as(u64, 1), rt.recordOf(0).?.refusals[@intFromEnum(RouteResource.task_handlers)].load(.acquire));
     // The other route has its whole share at the mark.
-    const c1 = conn.withRoute(rt.ref(1));
+    const c1 = conn.withRoute(rt.ref(routes_list, 1));
     for (0..8) |_| try std.testing.expectEqual(Charge.Outcome.took, c1.add(.task_handlers, 1, 4));
     try std.testing.expectEqual(Charge.Outcome.route_refused, c1.add(.task_handlers, 1, 4));
     // A byte charge is refused when it would pass the share.
@@ -1932,8 +1952,8 @@ test "Charge.add: a route refusal from an IPv6 client undoes both the /64 and th
     var ob: [max_refs]Key = undefined;
     const ka = keysFor(.{ .ip6 = a }, 48, &oa);
     const kb = keysFor(.{ .ip6 = b }, 48, &ob);
-    const ca = ((try t.acquire(ka, 0, null)).charge).withRoute(rt.ref(0));
-    const cb = ((try t.acquire(kb, 0, null)).charge).withRoute(rt.ref(0));
+    const ca = ((try t.acquire(ka, 0, null)).charge).withRoute(rt.ref(routes, 0));
+    const cb = ((try t.acquire(kb, 0, null)).charge).withRoute(rt.ref(routes, 0));
     // Each /64 takes one: the route holds its share, 2.
     try std.testing.expectEqual(Charge.Outcome.took, ca.add(.task_handlers, 1, 4));
     try std.testing.expectEqual(Charge.Outcome.took, cb.add(.task_handlers, 1, 4));
@@ -1949,4 +1969,24 @@ test "Charge.add: a route refusal from an IPv6 client undoes both the /64 and th
     t.release(ca);
     t.release(cb);
     try std.testing.expect(t.checkEmpty());
+}
+
+test "RouteTable: ref takes only the list the table was built from, not another of the same length" {
+    const gpa = std.testing.allocator;
+    var a: [3]router.Route = undefined;
+    var b: [3]router.Route = undefined;
+    const la = testTaskRoutes(2, &a);
+    // The same length, another layout: the complete route first.
+    const lb = testTaskRoutes(2, &b);
+    std.mem.swap(router.Route, &b[0], &b[2]);
+    var t = try RouteTable.init(gpa, la, .{ 16, 1024, 16 });
+    defer t.deinit(gpa);
+    try std.testing.expect(t.builtFrom(la));
+    try std.testing.expect(!t.builtFrom(lb));
+    // An equal copy is another list too: what is checked is the list itself.
+    var c = a;
+    try std.testing.expect(!t.builtFrom(&c));
+    try std.testing.expectEqual(@as(u32, 1), t.ref(la, 1).index);
+    // (`ref` with `lb`, or with a complete route of `la`, panics:
+    // `shutdown_child route-table-mismatch`.)
 }

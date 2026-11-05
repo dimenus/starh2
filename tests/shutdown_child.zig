@@ -37,6 +37,11 @@
 //!   process cannot check them.
 //! - `route-underflow`: a route account released at zero is refused, counted
 //!   and logged, and the count stays at zero.
+//! - `route-table-mismatch`: a route table asked for a route of another list
+//!   of the same length panics (the process ends on SIGABRT) instead of
+//!   charging the record the index names in its own list.
+//! - `route-table-not-task`: the right list, but a complete route of it:
+//!   `ref` panics with its own message, in every build.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -406,13 +411,46 @@ fn runRouteShareBoot(rt: *zio.Runtime) anyerror!void {
     std.debug.print("child: route share boot nine={d} over={s}\n", .{ share, @errorName(err) });
 }
 
+/// A route table asked for a route of a list it was not built from, of the
+/// same length: it must panic, not charge whatever record that index names.
+fn runRouteTableMismatch(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    const task: starh2.Handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } };
+    const complete: starh2.Handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = okHandler } };
+    const built = [_]starh2.Route{ .{ .method = .GET, .path = "/a", .handler = task }, .{ .method = .GET, .path = "/b", .handler = complete } };
+    const other = [_]starh2.Route{ .{ .method = .GET, .path = "/b", .handler = complete }, .{ .method = .GET, .path = "/a", .handler = task } };
+    var t = try accounts.RouteTable.init(gpa, &built, .{ 8, 8, 8 });
+    defer t.deinit(gpa);
+    std.debug.print("child: route table built from its list: {}, from the other: {}\n", .{ t.builtFrom(&built), t.builtFrom(&other) });
+    // Route 1 is a task route of `other` and the complete route of `built`.
+    const r = t.ref(&other, 1);
+    std.debug.print("child: ref of another list returned record {d}\n", .{r.index});
+}
+
+/// The right list, but a complete route of it: no account, so `ref` must
+/// panic in every build (an assert alone would vanish in ReleaseFast and
+/// read past the records).
+fn runRouteTableNotTask(_: *zio.Runtime) anyerror!void {
+    const accounts = starh2.edge.accounts;
+    const gpa = std.heap.page_allocator;
+    const task: starh2.Handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } };
+    const complete: starh2.Handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = okHandler } };
+    const built = [_]starh2.Route{ .{ .method = .GET, .path = "/a", .handler = task }, .{ .method = .GET, .path = "/b", .handler = complete } };
+    var t = try accounts.RouteTable.init(gpa, &built, .{ 8, 8, 8 });
+    defer t.deinit(gpa);
+    std.debug.print("child: route 0 is record {d}\n", .{t.ref(&built, 0).index});
+    const r = t.ref(&built, 1);
+    std.debug.print("child: ref of a complete route returned record {d}\n", .{r.index});
+}
+
 fn runRouteUnderflow(_: *zio.Runtime) anyerror!void {
     const accounts = starh2.edge.accounts;
     const gpa = std.heap.page_allocator;
     const one_route = [_]starh2.Route{.{ .method = .GET, .path = "/r", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } } }};
     var t = try accounts.RouteTable.init(gpa, &one_route, .{ 8, 8, 8 });
     defer t.deinit(gpa);
-    const r = t.ref(0).?;
+    const r = t.ref(&one_route, 0);
     try std.testing.expect(r.add(.task_handlers, 1, 0));
     r.sub(.task_handlers, 1);
     r.sub(.task_handlers, 1);
@@ -450,6 +488,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runRouteShareBoot, .{rt})
     else if (std.mem.eql(u8, case, "route-underflow"))
         try rt.spawn(runRouteUnderflow, .{rt})
+    else if (std.mem.eql(u8, case, "route-table-mismatch"))
+        try rt.spawn(runRouteTableMismatch, .{rt})
+    else if (std.mem.eql(u8, case, "route-table-not-task"))
+        try rt.spawn(runRouteTableNotTask, .{rt})
     else
         return error.UnknownCase;
     try h.join();

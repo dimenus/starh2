@@ -1237,7 +1237,7 @@ fn dispatch(
     // records in the link's charge. A complete route, a 404 and a 405 have
     // none.
     const route: ?accounts.RouteRef = switch (matched) {
-        .found => |f| if (f.handler == .task) (if (self.config.accounting) |a| a.routes.ref(f.route) else null) else null,
+        .found => |f| if (f.handler == .task) (if (self.config.accounting) |a| a.routes.ref(self.config.router.routes, f.route) else null) else null,
         else => null,
     };
     const charge = self.config.charge.withRoute(route);

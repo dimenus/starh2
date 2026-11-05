@@ -8097,7 +8097,7 @@ pub const Connection = struct {
         // bytes and its compression context are charged to it too. A complete
         // route, a 404 and a 405 have none.
         const route: ?accounts.RouteRef = switch (classified) {
-            .found => |f| if (f.handler == .task) (if (self.config.accounting) |acct| acct.routes.ref(f.route) else null) else null,
+            .found => |f| if (f.handler == .task) (if (self.config.accounting) |acct| acct.routes.ref(self.config.router.routes, f.route) else null) else null,
             else => null,
         };
         const charge = self.config.charge.withRoute(route);
@@ -11772,7 +11772,7 @@ fn expectRouteRefusalReset(which: RouteRefusal, path: RefusalPath) !void {
     };
     defer acct.routes.deinit(gpa);
     const rec = acct.routes.recordOf(0).?;
-    const r = acct.routes.ref(0).?;
+    const r = acct.routes.ref(&routes, 0);
     if (which == .token) {
         // The route already holds its share, and the server is at the mark.
         try std.testing.expect(r.add(.task_handlers, 1, 0));
