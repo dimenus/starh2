@@ -1048,7 +1048,7 @@ pub fn build(b: *std.Build) void {
     const run_protocol_work_tests = b.addRunArtifact(protocol_work_tests);
     // Reads testdata/cert.pem and key.pem relative to the repo root.
     run_protocol_work_tests.setCwd(b.path("."));
-    const protocol_work_step = b.step("test-protocol-work", "Run the t-3759 step 6 gates (bodyless DATA floods, the 1-byte flood, a browser-like load, padding, parked leases released on RST)");
+    const protocol_work_step = b.step("test-protocol-work", "Run the t-3759 step 6 gates (bodyless DATA floods, the 1-byte flood, a browser-like load, padding, parked leases released on RST, the parked wait limit)");
     protocol_work_step.dependOn(&run_protocol_work_tests.step);
 
     const routes_tests = b.addTest(.{

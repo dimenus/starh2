@@ -590,6 +590,8 @@ const Seen = struct {
     /// Final answers by stream id (odd ids up to 63).
     status: [32]?u16 = @splat(null),
     rst: [32]?u32 = @splat(null),
+    /// HEADERS frames by stream id: one answer is 1.
+    headers: [32]u8 = @splat(0),
 };
 
 fn readFor(w: *Wire, dec: *hpack.Decoder, seen: *Seen, for_ms: u64) !void {
@@ -609,6 +611,7 @@ fn readFor(w: *Wire, dec: *hpack.Decoder, seen: *Seen, for_ms: u64) !void {
         const i: usize = if (s.sid == 0) 0 else (s.sid - 1) / 2;
         switch (s.ftype) {
             0x1 => {
+                if (i < seen.headers.len) seen.headers[i] +|= 1;
                 const decoded = try dec.decode(p, 100, 32 * 1024, 256, 8 * 1024);
                 defer dec.freeResult(decoded);
                 for (decoded.fields) |f| {
@@ -796,4 +799,122 @@ test "a parked request whose stream is reset gives its lease back at once, befor
 }
 test "a parked request whose stream is reset gives its lease back at once, before any slot frees, and only once (TLS)" {
     try runIn(parkedLease, 2, .tls);
+}
+
+// ---------------------------------------------------------------------------
+// 4. A parked request that no slot frees for.
+
+fn parkedExpired() u64 {
+    if (comptime !@hasDecl(conn_mod, "parked_expired")) return 0;
+    return conn_mod.parked_expired.load(.acquire);
+}
+
+const wait_limit_ms = 500;
+
+/// `parkLimits`, with a short idle timeout: the longest a request may wait
+/// for a slot.
+fn waitLimits() starh2.Limits {
+    var l = parkLimits();
+    l.connection_idle_timeout_ns = wait_limit_ms * ms;
+    return l;
+}
+
+const WaitResult = struct {
+    held_parked: usize = 0,
+    /// From 7's HEADERS to its answer, or to giving up.
+    ms_to_answer: u64 = 0,
+    held_after: usize = 0,
+    client_after: usize = 0,
+    route_after: usize = 0,
+    ended_before_release: usize = 0,
+    seen: Seen = .{},
+    err: ?anyerror = null,
+};
+
+fn waitClient(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, r: *WaitResult) void {
+    waitInner(gpa, tr, rig, r) catch |err| {
+        r.err = err;
+    };
+}
+
+/// Three slots, all held by handlers that ignore cancel, and all three of
+/// their streams reset: nothing is open. 7 parks, and nothing else happens.
+/// It must be answered 503 once it has waited the limit (up to twice it),
+/// not before, and its lease must come back; then the slots free, and 7 is
+/// not answered again.
+fn waitInner(gpa: std.mem.Allocator, tr: Transport, rig: *Rig, r: *WaitResult) !void {
+    const w = try openQuick(gpa, tr, rig.port());
+    defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
+    var pre = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer pre.deinit(gpa);
+    try w.sendUnchecked(pre.items);
+    try sendGets(gpa, w, &.{ 1, 3, 5 });
+    if (!waitStarted(3, 3_000)) return error.HandlersNotStarted;
+    try sendRsts(gpa, w, &.{ 1, 3, 5 });
+    try sendGets(gpa, w, &.{7});
+    const t0 = nowNs();
+    if (!heldIs(rig, 4 * block, 2_000)) {
+        std.debug.print("protocol work parked wait: the pool holds {d} bytes with 3 running and 1 parked, want {d}\n", .{ rig.server.requests.held_bytes.load(.acquire), 4 * block });
+        return error.ParkedNotLeased;
+    }
+    r.held_parked = rig.server.requests.held_bytes.load(.acquire);
+    const deadline = t0 + 4 * wait_limit_ms * ms;
+    while (nowNs() < deadline and r.seen.headers[3] == 0 and r.seen.rst[3] == null and !r.seen.closed) try readFor(w, &dec, &r.seen, 20);
+    r.ms_to_answer = (nowNs() - t0) / ms;
+    _ = heldIs(rig, 3 * block, 1_000);
+    r.held_after = rig.server.requests.held_bytes.load(.acquire);
+    r.client_after = clientBytes(rig);
+    r.route_after = routeBytes(rig);
+    r.ended_before_release = ended.load(.acquire);
+    // Free the slots: nothing may run 7 now, or release it again.
+    release.store(true, .release);
+    _ = heldIs(rig, 0, 2_000);
+    try readFor(w, &dec, &r.seen, 200);
+}
+
+fn parkedWait(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    resetHandlers();
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, waitLimits());
+    defer rig.stop();
+    const e0 = parkedExpired();
+    const p0 = parkedReleased();
+    var r: WaitResult = .{};
+    try blocking(waitClient, .{ gpa, tr, &rig, &r });
+    const d = nowNs() + 3 * std.time.ns_per_s;
+    while (rig.server.accounting.task_handlers.load(.acquire) != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
+    std.debug.print("protocol work parked wait ({s}): 3 slots held by handlers that ignore cancel, every stream reset, 7 parked ({d} KiB held), wait limit {d} ms: 7 got status {?d} (HEADERS {d}, rst {?d}) {d} ms after it was sent; then {d} KiB held (client {d} KiB, route {d} KiB), {d} handlers ended; expired {d}, released on RST {d}; err {?}\n", .{
+        @tagName(tr),     r.held_parked / kib, wait_limit_ms,          r.seen.status[3],            r.seen.headers[3],
+        r.seen.rst[3],    r.ms_to_answer,      r.held_after / kib,     r.client_after / kib,        r.route_after / kib,
+        r.ended_before_release, parkedExpired() - e0, parkedReleased() - p0, r.err,
+    });
+    try std.testing.expect(r.err == null);
+    try expectExactly("request pool with 3 running and 1 parked", r.held_parked, 4 * block);
+    try expectExactly("7's status", r.seen.status[3] orelse 0, 503);
+    try expectExactly("7's answers", r.seen.headers[3], 1);
+    try std.testing.expect(r.seen.rst[3] == null);
+    if (r.ms_to_answer < wait_limit_ms or r.ms_to_answer > 2 * wait_limit_ms + 300) {
+        std.debug.print("protocol work parked wait: answered after {d} ms, want {d} to {d}\n", .{ r.ms_to_answer, wait_limit_ms, 2 * wait_limit_ms + 300 });
+        return error.WrongWait;
+    }
+    try expectExactly("request pool after the 503", r.held_after, 3 * block);
+    try expectExactly("client bytes after the 503", r.client_after, 3 * block);
+    try expectExactly("route bytes after the 503 (the running ones only)", r.route_after, 3 * block);
+    try expectExactly("handlers ended before the release", r.ended_before_release, 0);
+    try expectExactly("parked requests expired", parkedExpired() - e0, 1);
+    try expectExactly("parked leases released on RST", parkedReleased() - p0, 0);
+    try expectExactly("task handlers", rig.server.accounting.task_handlers.load(.acquire), 0);
+    try expectExactly("request pool at the end", rig.server.requests.held_bytes.load(.acquire), 0);
+    try expectExactly("server underflows", rig.server.accounting.underflows.load(.acquire), 0);
+    try expectExactly("client table underflows", rig.server.clients.stats().underflows, 0);
+    if (comptime @hasDecl(accounts, "RouteTable")) try expectExactly("route underflows", rig.server.accounting.routes.underflows.load(.acquire), 0);
+}
+
+test "a parked request that no slot frees for is answered 503 after the wait limit, and its lease released once (h2c)" {
+    try runIn(parkedWait, 2, .h2c);
+}
+test "a parked request that no slot frees for is answered 503 after the wait limit, and its lease released once (TLS)" {
+    try runIn(parkedWait, 2, .tls);
 }

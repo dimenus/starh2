@@ -230,12 +230,10 @@ warns when a route's share is below the client share.
 A handler keeps its slot until it returns; there are
 `max_streams_per_connection` slots and a park queue of the same size. Changes:
 
-- As soon as every slot holds a handler whose stream has ended, send GOAWAY
-  ENHANCE_YOUR_CALM: parked requests on that connection can never run. One
-  counter: slots whose stream ended while the handler runs (up in
-  `cancelHandler` and stream close, down in `finishHandlerJob`).
 - A parked request whose stream is reset releases its lease when the RST
   arrives, not when a slot frees (`dispatchParked`, `connection.zig:7645-7648`).
+- A parked request that no slot frees for is answered 503 after
+  `connection_idle_timeout_ns`, and its lease released.
 
 ## Admission and overload
 
@@ -353,8 +351,8 @@ series bisects; pushed together when the last is done.
 3. Account records, the client table, client identity, PROXY protocol v2.
 4. Shares under pressure; the connection-start and handshake buckets.
 5. Route shares; the spike folded in with its charges.
-6. Empty and closed-stream DATA in the frame bucket; the running-handler
-   GOAWAY; parked leases released on RST.
+6. Empty and closed-stream DATA in the frame bucket; parked leases released
+   on RST; the parked wait limit.
 7. HTTP/1.1 onto links and the request pool; reaper deleted.
 8. Pressure-scaled idle timeouts.
 9. Observability; the executor watchdog (after the zio-fork task).

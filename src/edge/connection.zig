@@ -1889,6 +1889,16 @@ pub var test_links_freed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hoo
 /// reset (`Connection.releaseParkedStream`). Tests and an operator read it.
 pub var parked_released_on_rst: std.atomic.Value(u64) = .init(0);
 
+/// Process-wide: parked requests answered 503 because no slot freed within
+/// `Limits.connection_idle_timeout_ns` (`Connection.dispatchParked`).
+pub var parked_expired: std.atomic.Value(u64) = .init(0);
+
+/// A request in the park queue, and when it began to wait.
+const Parked = struct {
+    d: session_mod.DispatchRequest,
+    since_ns: u64,
+};
+
 /// Complete-handler drain turns that may await their wire receipts at once.
 /// Independent of the deeper WritePump queue. 2 serialized the 8-worker
 /// mixed oneshot pipe (inline skipped while full); 4 is the occupancy ABA.
@@ -2089,8 +2099,19 @@ pub const Connection = struct {
     /// for a stream inside the advertised limit. Such a request waits here
     /// instead of being refused. A parked request is an open stream, so the
     /// stream limit bounds this queue; the slots are never written before
-    /// use.
-    parked: []session_mod.DispatchRequest,
+    /// use. Oldest first by `since_ns` too: a request goes in at the tail, and
+    /// one that cannot run goes back at the head.
+    ///
+    /// A request waits at most `Limits.connection_idle_timeout_ns` (0: no
+    /// limit). Then it is answered 503 and its lease released
+    /// (`dispatchParked`): every slot is held by a handler whose stream has
+    /// ended and which has not returned (a handler can be asked to cancel,
+    /// never forced), and the connection's idle rule never fires while the
+    /// parked stream is open. The answer can come up to twice that late: no
+    /// timer of its own is armed, and the idle wake of the turn that parked
+    /// it, or of any later turn, is what checks it. A connection that is going
+    /// away has no idle wake; its graceful drain deadline bounds the wait.
+    parked: []Parked,
     parked_head: usize = 0,
     parked_len: usize = 0,
     /// This connection is ending through the graceful path, because the server is
@@ -2416,7 +2437,7 @@ pub const Connection = struct {
         try plan.array(u32, try LeaseIndex.slotCount(leases_n)); // lease_index.slots
         try plan.array(u32, leases_n); // lease_index.free
         try plan.array(u8, try limits.hpackScratchBytes()); // hpack_scratch
-        try plan.array(session_mod.DispatchRequest, max_streams); // parked
+        try plan.array(Parked, max_streams); // parked
         try plan.array(?zio.JoinHandle(void), max_streams);
         try plan.array(u31, max_streams); // completion_ch_buf
         try plan.array(wire_pump.WriteCompletion, ack_n);
@@ -2549,7 +2570,7 @@ pub const Connection = struct {
         errdefer boot.free(lease_free);
         const hpack_scratch = try boot.alloc(u8, try config.limits.hpackScratchBytes());
         errdefer boot.free(hpack_scratch);
-        const parked = try boot.alloc(session_mod.DispatchRequest, config.limits.max_streams_per_connection);
+        const parked = try boot.alloc(Parked, config.limits.max_streams_per_connection);
         errdefer boot.free(parked);
         const handler_joins = try boot.alloc(?zio.JoinHandle(void), config.limits.max_streams_per_connection);
         errdefer boot.free(handler_joins);
@@ -4917,7 +4938,7 @@ pub const Connection = struct {
                         // the TLS stall snapshot: pending=10, tomb_rst=10, pend_slots=0.
                         // Slots freed since the last turn go to parked requests before
                         // any new one, so a waiting request is not overtaken.
-                        self.dispatchParked() catch |err| try self.sessionErrorExit(err, "dispatch_parked_error");
+                        self.dispatchParked(now) catch |err| try self.sessionErrorExit(err, "dispatch_parked_error");
                         // After the kills above, which can end the last stream,
                         // and before the emit, so a first GOAWAY goes out this turn.
                         self.checkConnectionIdle(now) catch |err| try self.sessionErrorExit(err, "connection_idle_error");
@@ -5468,8 +5489,8 @@ pub const Connection = struct {
         var k: usize = 0;
         while (k < self.parked_len) : (k += 1) {
             const at = (self.parked_head + k) % self.parked.len;
-            if (self.parked[at].stream_id != stream_id) continue;
-            const d = self.parked[at];
+            if (self.parked[at].d.stream_id != stream_id) continue;
+            const d = self.parked[at].d;
             // Close the gap: every later entry moves one place forward, so
             // the queue keeps its order.
             var j = k;
@@ -8017,30 +8038,42 @@ pub const Connection = struct {
             self.releaseDispatchRequest(d);
             return;
         }
-        self.parked[(self.parked_head + self.parked_len) % self.parked.len] = d;
+        self.parked[(self.parked_head + self.parked_len) % self.parked.len] = .{ .d = d, .since_ns = nowNs(self.config.io) };
         self.parked_len += 1;
     }
 
     /// Dispatch parked requests, oldest first, while slots are free. A stream
     /// the peer reset while it waited is no longer in Session; its request is
-    /// dropped instead of run. Actor-only, under `session_mu`.
-    fn dispatchParked(self: *Connection) anyerror!void {
+    /// dropped instead of run. A request that still finds no slot after
+    /// waiting `Limits.connection_idle_timeout_ns` is answered 503 and
+    /// dropped (see `parked`); the queue is oldest first, so the requests that
+    /// have waited that long are at its head. Actor-only, under `session_mu`.
+    fn dispatchParked(self: *Connection, now: u64) anyerror!void {
         self.assertSessionHeld("dispatchParked");
+        const limit_ns = self.config.limits.connection_idle_timeout_ns;
         while (self.parked_len != 0) {
-            const d = self.parked[self.parked_head];
-            if (self.session.streams.get(d.stream_id) == null) {
+            const p = self.parked[self.parked_head];
+            if (self.session.streams.get(p.d.stream_id) == null) {
                 self.popParked();
-                self.releaseDispatchRequest(d);
+                self.releaseDispatchRequest(p.d);
                 continue;
             }
             // Pop first: on an error tryDispatch has already released `d`.
             self.popParked();
-            if (!try self.tryDispatch(d)) {
-                self.parked_head = (self.parked_head + self.parked.len - 1) % self.parked.len;
-                self.parked[self.parked_head] = d;
-                self.parked_len += 1;
-                return;
+            if (try self.tryDispatch(p.d)) continue;
+            if (limit_ns != 0 and now -| p.since_ns >= limit_ns) {
+                // 503 with REFUSED_STREAM if the answer cannot be sent: the
+                // request was never run, so a retry, on another connection,
+                // is safe.
+                self.answerRefusal(p.d.stream_id, 503, .refused_stream);
+                self.releaseDispatchRequest(p.d);
+                _ = parked_expired.fetchAdd(1, .monotonic);
+                continue;
             }
+            self.parked_head = (self.parked_head + self.parked.len - 1) % self.parked.len;
+            self.parked[self.parked_head] = p;
+            self.parked_len += 1;
+            return;
         }
     }
 
@@ -8053,7 +8086,7 @@ pub const Connection = struct {
     /// Release every parked request without running it. Teardown only.
     fn releaseParked(self: *Connection) void {
         while (self.parked_len != 0) {
-            const d = self.parked[self.parked_head];
+            const d = self.parked[self.parked_head].d;
             self.popParked();
             self.releaseDispatchRequest(d);
         }
