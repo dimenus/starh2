@@ -62,13 +62,144 @@ var started: std.atomic.Value(usize) = .init(0);
 /// `/hold` handlers that ran at all, counted before their first allocation.
 var entered: std.atomic.Value(usize) = .init(0);
 var ended: std.atomic.Value(usize) = .init(0);
+/// `/stuck` handlers past `resp.start`: holding their slot until `release`.
+var holding: std.atomic.Value(usize) = .init(0);
 var grown: std.atomic.Value(usize) = .init(0);
 var grow_refused: std.atomic.Value(usize) = .init(0);
 
+// ---------------------------------------------------------------------------
+// A per-request timeline (t-3876): what each client saw and what the server
+// did, keyed by an `x-id` header the client sends.
+
+const trace_max = 64;
+const ClientSaw = enum(u8) { none, status, timeout, eof, err };
+const ClientTrace = struct {
+    src: Peer = .unknown,
+    /// A request to the broken route, `/stuck` (not the defender's `/ok`).
+    stuck: bool = false,
+    sent_ns: u64 = 0,
+    saw: ClientSaw = .none,
+    status: u16 = 0,
+    errno: i32 = 0,
+    bytes: usize = 0,
+    rst: ?u32 = null,
+    at_ns: u64 = 0,
+    /// The route's task handlers right after the answer was read.
+    route_then: usize = 0,
+};
+var trace_t0: u64 = 0;
+var trace_next: usize = 0;
+var client_trace: [trace_max]ClientTrace = @splat(.{});
+var trace_rig: ?*Rig = null;
+var srv_entered_ns: [trace_max]std.atomic.Value(u64) = @splat(.init(0));
+var srv_start_err: [trace_max]std.atomic.Value(u16) = @splat(.init(0));
+var srv_flush_err: [trace_max]std.atomic.Value(u16) = @splat(.init(0));
+var srv_ended_ns: [trace_max]std.atomic.Value(u64) = @splat(.init(0));
+
+fn resetTrace() void {
+    trace_t0 = nowNs();
+    trace_next = 0;
+    client_trace = @splat(.{});
+    for (0..trace_max) |i| {
+        srv_entered_ns[i].store(0, .release);
+        srv_start_err[i].store(0, .release);
+        srv_flush_err[i].store(0, .release);
+        srv_ended_ns[i].store(0, .release);
+    }
+}
+
+fn traceMs(t: u64) u64 {
+    return if (t == 0) 0 else (t -| trace_t0) / ms;
+}
+
+fn reqId(req: *const starh2.Request) ?usize {
+    for (req.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-id")) {
+            const id = std.fmt.parseInt(usize, h.value, 10) catch return null;
+            return if (id < trace_max) id else null;
+        }
+    }
+    return null;
+}
+
+/// Every request of the run, client view and server view, side by side.
+fn printTimeline(label: []const u8) void {
+    std.debug.print("routes timeline ({s}): {d} requests\n", .{ label, trace_next });
+    for (client_trace[0..trace_next], 0..) |c, i| {
+        const start_err = srv_start_err[i].load(.acquire);
+        const flush_err = srv_flush_err[i].load(.acquire);
+        std.debug.print("  id {d:>2} src {f}: sent {d} ms; client {s} status {d} errno {d} bytes {d} rst {?d} at {d} ms, route then {d}; server entered {d} ms, start {s}, flush {s}, ended {d} ms\n", .{
+            i,                                         fmtPeer(c.src),              traceMs(c.sent_ns),
+            @tagName(c.saw),                           c.status,                    c.errno,
+            c.bytes,                                   c.rst,                       traceMs(c.at_ns),
+            c.route_then,                              traceMs(srv_entered_ns[i].load(.acquire)),
+            if (start_err == 0) "ok" else @errorName(@errorFromInt(start_err)),
+            if (flush_err == 0) "ok" else @errorName(@errorFromInt(flush_err)),
+            traceMs(srv_ended_ns[i].load(.acquire)),
+        });
+    }
+}
+
+/// Each `/stuck` request, classified by what happened on both sides: a
+/// client's 200 must be a handler that entered, got past `resp.start` and
+/// still runs; a 503 must be a request whose handler never entered.
+/// Anything else is a mismatch.
+const PerRequest = struct {
+    stuck: usize = 0,
+    held: usize = 0,
+    refused: usize = 0,
+    start_failed: usize = 0,
+    mismatches: usize = 0,
+};
+
+fn perRequest() PerRequest {
+    var r: PerRequest = .{};
+    for (client_trace[0..trace_next], 0..) |c, i| {
+        if (!c.stuck) continue;
+        r.stuck += 1;
+        const entered_ns = srv_entered_ns[i].load(.acquire);
+        const start_err = srv_start_err[i].load(.acquire);
+        const ended_ns = srv_ended_ns[i].load(.acquire);
+        if (start_err != 0) r.start_failed += 1;
+        if (c.saw == .status and c.status == 200 and entered_ns != 0 and start_err == 0 and ended_ns == 0) {
+            r.held += 1;
+        } else if (c.saw == .status and c.status == 503 and entered_ns == 0) {
+            r.refused += 1;
+        } else r.mismatches += 1;
+    }
+    return r;
+}
+
+/// Before a source's connections close: every request the client saw
+/// answered 200 has a handler past `resp.start`. A handler can still be inside
+/// `start` after its head reached the client: its socket write is a race of
+/// the send and a timeout timer, and the wait ends one loop turn after the
+/// send, when the timer's cancel is processed. A close in that turn was seen
+/// to end `start` with ConnectionClosed; the handler then returns, its route
+/// charge goes back, and the next source is admitted in its place (t-3876).
+/// The server is right; the test closed too soon.
+///
+/// It runs on a zio task, so it waits with `zio.sleep`: a blocking sleep here
+/// stops this executor's loop, and a handler whose write waits on that loop
+/// does not get past `start` until the sleep ends (t-3878).
+fn awaitHolding(admitted: usize) !void {
+    const deadline = nowNs() + 2 * std.time.ns_per_s;
+    while (holding.load(.acquire) < admitted) {
+        if (nowNs() >= deadline) {
+            std.debug.print("routes: {d} handlers past resp.start, but the clients saw {d} admitted\n", .{ holding.load(.acquire), admitted });
+            printTimeline("awaiting handlers");
+            return error.HandlersNotHolding;
+        }
+        zio.sleep(.fromMilliseconds(1)) catch {};
+    }
+}
+
 fn resetHandlers() void {
+    resetTrace();
     release.store(false, .release);
     grow.store(false, .release);
     started.store(0, .release);
+    holding.store(0, .release);
     entered.store(0, .release);
     ended.store(0, .release);
     grown.store(0, .release);
@@ -95,10 +226,19 @@ fn holdShielded(comptime on_grow: ?fn (*const starh2.Request) void, req: *const 
 /// The broken route: answers its head at once (so the client can tell it
 /// was admitted from a 503), then never returns until `release`.
 fn stuck(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    const id = reqId(req);
+    if (id) |i| srv_entered_ns[i].store(nowNs(), .release);
     _ = started.fetchAdd(1, .acq_rel);
     defer _ = ended.fetchAdd(1, .acq_rel);
-    var body = try resp.start(200, &.{});
-    body.flush() catch {};
+    defer if (id) |i| srv_ended_ns[i].store(nowNs(), .release);
+    var body = resp.start(200, &.{}) catch |err| {
+        if (id) |i| srv_start_err[i].store(@intFromError(err), .release);
+        return err;
+    };
+    _ = holding.fetchAdd(1, .acq_rel);
+    body.flush() catch |err| {
+        if (id) |i| srv_flush_err[i].store(@intFromError(err), .release);
+    };
     holdShielded(null, req);
     body.finish() catch {};
 }
@@ -437,6 +577,29 @@ fn rawSend(fd: std.c.fd_t, bytes: []const u8) bool {
     return true;
 }
 
+/// What the client read on `fd` within `for_ms`: a status line, or the
+/// connection's end (EOF, an error), or nothing.
+const RawAnswer = struct { saw: ClientSaw, status: u16 = 0, errno: i32 = 0, bytes: usize = 0 };
+
+fn rawAnswer(fd: std.c.fd_t, for_ms: u64) RawAnswer {
+    var got: [64]u8 = undefined;
+    var len: usize = 0;
+    const deadline = nowNs() + for_ms * ms;
+    while (len < 12) {
+        const left = deadline -| nowNs();
+        if (left == 0) return .{ .saw = .timeout, .bytes = len };
+        var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        const r = std.c.poll(&pfd, 1, @intCast(@max(1, left / ms)));
+        if (r <= 0) continue;
+        const n = std.c.recv(fd, got[len..].ptr, got.len - len, 0);
+        if (n == 0) return .{ .saw = .eof, .bytes = len };
+        if (n < 0) return .{ .saw = .err, .errno = @intFromEnum(std.posix.errno(n)), .bytes = len };
+        len += @intCast(n);
+    }
+    if (!std.mem.startsWith(u8, got[0..len], "HTTP/1.1 ")) return .{ .saw = .status, .status = 0, .bytes = len };
+    return .{ .saw = .status, .status = std.fmt.parseInt(u16, got[9..12], 10) catch 0, .bytes = len };
+}
+
 /// The status of the first response on `fd` within `for_ms`, or null.
 fn rawStatus(fd: std.c.fd_t, for_ms: u64) ?u16 {
     var got: [64]u8 = undefined;
@@ -523,9 +686,30 @@ fn attemptsInner(conns: *Conns, tr: Tr, port: u16, src: Peer, path: []const u8, 
         .h2c, .tls => {
             const h = conns.addH2(try H2.open(conns.gpa, tr, port, src));
             var sids: [H2.max_streams]u31 = undefined;
-            for (sids[0..n]) |*s| s.* = try h.get(conns.gpa, path, extra);
+            var ids: [H2.max_streams]?usize = @splat(null);
+            for (sids[0..n], 0..) |*s, k| {
+                var with_id: [16]hpack.HeaderField = undefined;
+                var id_buf: [8]u8 = undefined;
+                const id = traceBegin(src, path);
+                ids[k] = id;
+                for (extra, 0..) |f, j| with_id[j] = f;
+                var m = extra.len;
+                if (id) |i| {
+                    with_id[m] = .{ .name = "x-id", .value = try std.fmt.bufPrint(&id_buf, "{d}", .{i}) };
+                    m += 1;
+                }
+                s.* = try h.get(conns.gpa, path, with_id[0..m]);
+            }
             try h.pollFor(sids[0..n], 2000);
-            for (sids[0..n]) |s| {
+            for (sids[0..n], 0..) |s, k| {
+                if (ids[k]) |i| {
+                    const st = h.status[H2.slot(s)];
+                    client_trace[i].saw = if (st != null) .status else .none;
+                    client_trace[i].status = st orelse 0;
+                    client_trace[i].rst = h.rst[H2.slot(s)];
+                    client_trace[i].at_ns = nowNs();
+                    client_trace[i].route_then = if (trace_rig) |r| r.routeCount(0, .task_handlers) else 0;
+                }
                 out.note(h.status[H2.slot(s)], h.rst[H2.slot(s)]);
                 if (brotli) |b| {
                     if (h.brotli[H2.slot(s)]) b.* += 1;
@@ -536,13 +720,38 @@ fn attemptsInner(conns: *Conns, tr: Tr, port: u16, src: Peer, path: []const u8, 
             for (0..n) |_| {
                 const fd = try rawProxied(port, src);
                 conns.addRaw(fd);
+                const id = traceBegin(src, path);
                 var req_buf: [256]u8 = undefined;
-                const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{path});
+                const req = if (id) |i|
+                    try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: localhost\r\nx-id: {d}\r\n\r\n", .{ path, i })
+                else
+                    try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{path});
                 _ = rawSend(fd, req);
-                out.note(rawStatus(fd, 2000), null);
+                const a = rawAnswer(fd, 2000);
+                if (id) |i| {
+                    client_trace[i].saw = a.saw;
+                    client_trace[i].status = a.status;
+                    client_trace[i].errno = a.errno;
+                    client_trace[i].bytes = a.bytes;
+                    client_trace[i].at_ns = nowNs();
+                    client_trace[i].route_then = if (trace_rig) |r| r.routeCount(0, .task_handlers) else 0;
+                }
+                out.note(if (a.saw == .status) a.status else null, null);
             }
         },
     }
+}
+
+/// The next request id for `src`, while tracing a run (`trace_rig` set) and
+/// ids remain; its send time is now.
+fn traceBegin(src: Peer, path: []const u8) ?usize {
+    if (trace_rig == null or trace_next >= trace_max) return null;
+    const i = trace_next;
+    trace_next += 1;
+    client_trace[i].src = src;
+    client_trace[i].stuck = std.mem.eql(u8, path, "/stuck");
+    client_trace[i].sent_ns = nowNs();
+    return i;
 }
 
 /// One request to `/ok` from the defender on a connection of its own,
@@ -641,6 +850,8 @@ fn brokenRoute(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
     var rig: Rig = undefined;
     try rig.start(rt, gpa, tr, &broken_routes, limits);
     defer rig.stop();
+    trace_rig = &rig;
+    defer trace_rig = null;
     var a: Conns = .{ .gpa = gpa };
     defer {
         release.store(true, .release);
@@ -650,6 +861,7 @@ fn brokenRoute(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
     var defended: usize = 0;
     for (1..9) |i| {
         try blocking(attempts, .{ &a, tr, rig.port(), source(@intCast(i)), "/stuck", no_headers, 5, &tally, null });
+        try awaitHolding(tally.admitted);
         try blocking(Conns.closeAll, .{&a});
         var ok_now = false;
         try blocking(servedInto, .{ gpa, tr, rig.port(), &ok_now });
@@ -678,6 +890,11 @@ fn brokenRoute(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
         defended,
         after,
     });
+    const pr = perRequest();
+    std.debug.print("routes broken route ({s}): per request: {d} to the broken route, {d} answered 200 with a handler past start and still running, {d} answered 503 with no handler, {d} mismatches; handlers whose start failed {d}\n", .{ @tagName(tr), pr.stuck, pr.held, pr.refused, pr.mismatches, pr.start_failed });
+    if (pr.mismatches != 0 or tally.admitted != 32 or tally.refused_503 != 8 or tally.other != 0 or held != 32 or rig.routeRefusals(0, .task_handlers) != 8) printTimeline(@tagName(tr));
+    try expectExactly("requests whose two sides disagree", pr.mismatches, 0);
+    try expectExactly("requests to the broken route", pr.stuck, 40);
     try expectExactly("orphans", rig.server.accounting.orphaned_handlers.load(.acquire), 32);
     try expectExactly("admitted to the broken route", tally.admitted, 32);
     try expectExactly("answered 503", tally.refused_503, 8);
@@ -740,14 +957,19 @@ fn brokenRoute6(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
     var rig: Rig = undefined;
     try rig.start(rt, gpa, tr, &broken_routes, limits);
     defer rig.stop();
+    trace_rig = &rig;
+    defer trace_rig = null;
     var a: Conns = .{ .gpa = gpa };
     defer {
         release.store(true, .release);
         a.closeAll();
     }
     var per: [8]Tally = @splat(.{});
+    var admitted_so_far: usize = 0;
     for (&per, 1..) |*t, i| {
         try blocking(attempts, .{ &a, tr, rig.port(), Peer{ .ip6 = source6(i) }, "/stuck", no_headers, 5, t, null });
+        admitted_so_far += t.admitted;
+        try awaitHolding(admitted_so_far);
         try blocking(Conns.closeAll, .{&a});
     }
     settle(&rig.server, orphansAre(32).f, 5 * std.time.ns_per_s);
@@ -771,6 +993,11 @@ fn brokenRoute6(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
         std.debug.print("\n", .{});
     }
     std.debug.print("routes broken route IPv6 ({s}): {d} admitted, {d} answered 503; route refusals {d}, client share refusals {d}; {d} accounts off\n", .{ @tagName(tr), admitted, refused, rig.routeRefusals(0, .task_handlers), rig.clientRefusals(.task_handlers), bad });
+    const pr = perRequest();
+    std.debug.print("routes broken route IPv6 ({s}): per request: {d} to the broken route, {d} answered 200 with a handler past start and still running, {d} answered 503 with no handler, {d} mismatches; handlers whose start failed {d}\n", .{ @tagName(tr), pr.stuck, pr.held, pr.refused, pr.mismatches, pr.start_failed });
+    if (pr.mismatches != 0 or admitted != 32 or refused != 8 or bad != 0 or rig.routeRefusals(0, .task_handlers) != 8) printTimeline(@tagName(tr));
+    try expectExactly("requests whose two sides disagree", pr.mismatches, 0);
+    try expectExactly("requests to the broken route", pr.stuck, 40);
     try expectExactly("admitted", admitted, 32);
     try expectExactly("answered 503", refused, 8);
     try expectExactly("route refusals", rig.routeRefusals(0, .task_handlers), 8);
@@ -1219,3 +1446,4 @@ fn bootShares(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 test "route boot: the default share with 1, 2 and 8 task routes, an override, and no override on a complete route" {
     try runIn(bootShares);
 }
+
