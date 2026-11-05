@@ -33,8 +33,9 @@
 //!   share is logged at boot (nine task routes: 4096 / 9 rounds to 456
 //!   task handlers, below 512) and boots; a route whose override is above
 //!   the server's limit fails `Server.init` with
-//!   `RouteShareAboveServerLimit` and a line naming it. Both log, so a test
-//!   process cannot check them.
+//!   `RouteShareAboveServerLimit` and a line naming it; an override of 0
+//!   fails it with `RouteShareZero` and a line naming it. They log, so a
+//!   test process cannot check them.
 //! - `route-underflow`: a route account released at zero is refused, counted
 //!   and logged, and the count stays at zero.
 //! - `route-table-mismatch`: a route table asked for a route of another list
@@ -408,7 +409,15 @@ fn runRouteShareBoot(rt: *zio.Runtime) anyerror!void {
         x.deinit(gpa);
         break :blk error.Booted;
     } else |e| e;
-    std.debug.print("child: route share boot nine={d} over={s}\n", .{ share, @errorName(err) });
+    var zero = [_]starh2.Route{
+        .{ .method = .GET, .path = "/off", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = routeOk } }, .share = .{ .compression = 0 } },
+    };
+    const zero_err = if (starh2.Server.init(gpa, rt.io(), .{ .endpoints = &eps, .routes = &zero, .tls = null })) |srv| blk: {
+        var x = srv;
+        x.deinit(gpa);
+        break :blk error.Booted;
+    } else |e| e;
+    std.debug.print("child: route share boot nine={d} over={s} zero={s}\n", .{ share, @errorName(err), @errorName(zero_err) });
 }
 
 /// A route table asked for a route of a list it was not built from, of the

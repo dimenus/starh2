@@ -571,8 +571,8 @@ pub const RouteRef = struct {
 ///
 /// A route's share of each resource is the server's limit over the number
 /// of task routes, rounded up, or the route's own override
-/// (`router.Route.share`). An override above the server's limit is a boot
-/// error; a share below a client's share is logged at boot (a client alone
+/// (`router.Route.share`). An override of 0, or one above the server's
+/// limit, is a boot error; a share below a client's share is logged at boot (a client alone
 /// could then hold more of that resource than the route it calls may).
 ///
 /// # The server-wide token stays
@@ -604,7 +604,7 @@ pub const RouteTable = struct {
     /// No routes: a test connection built by hand with no task route.
     pub const empty: RouteTable = .{};
 
-    pub const InitError = error{ OutOfMemory, RouteShareAboveServerLimit, RouteShareOnCompleteRoute };
+    pub const InitError = error{ OutOfMemory, RouteShareZero, RouteShareAboveServerLimit, RouteShareOnCompleteRoute };
 
     /// One record per task route of `routes`, with its share of every route
     /// resource of `limits`; see the type's doc for the rule and the boot
@@ -637,6 +637,15 @@ pub const RouteTable = struct {
             l.len = @intCast(written.len);
             const overrides: [RouteResource.count]?usize = .{ r.share.task_handlers, r.share.request_bytes, r.share.compression };
             for (overrides, limits, 0..) |o, server_limit, ri| {
+                // An override of 0 would refuse every charge of the route
+                // whenever the server is at its mark, which is a route turned
+                // off under pressure, not a share; the default is never 0.
+                if (o) |v| {
+                    if (v == 0) {
+                        log.err("route {s}: its {s} share is 0: the route would be refused everything under pressure", .{ l.text(), @tagName(@as(RouteResource, @enumFromInt(ri))) });
+                        return error.RouteShareZero;
+                    }
+                }
                 const share = o orelse defaultShare(server_limit, task_routes);
                 if (share > server_limit) {
                     log.err("route {s}: its {s} share {d} is above the server's limit {d}", .{ l.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), share, server_limit });

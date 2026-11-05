@@ -1173,7 +1173,8 @@ pub fn build(b: *std.Build) void {
     run_route_share_boot.addCheck(.{ .expect_stderr_match = "route GET /1: its task_handlers share 456 is below a client's share 512: one client may hold more of it than this route" });
     run_route_share_boot.addCheck(.{ .expect_stderr_match = "route GET /9: its compression share 15 is below a client's share 16" });
     run_route_share_boot.addCheck(.{ .expect_stderr_match = "route POST /upload: its request_bytes share 268435457 is above the server's limit 268435456" });
-    run_route_share_boot.addCheck(.{ .expect_stderr_match = "child: route share boot nine=456 over=RouteShareAboveServerLimit" });
+    run_route_share_boot.addCheck(.{ .expect_stderr_match = "route GET /off: its compression share is 0: the route would be refused everything under pressure" });
+    run_route_share_boot.addCheck(.{ .expect_stderr_match = "child: route share boot nine=456 over=RouteShareAboveServerLimit zero=RouteShareZero" });
     run_route_share_boot.expectExitCode(0);
     run_route_share_boot.has_side_effects = true;
     shutdown_step.dependOn(&run_route_share_boot.step);

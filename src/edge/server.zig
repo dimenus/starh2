@@ -236,6 +236,9 @@ pub const InitError = error{
     RouteShareAboveServerLimit,
     /// A share override on a complete route, which has no route account.
     RouteShareOnCompleteRoute,
+    /// A route's share override of 0: it would refuse the route everything
+    /// whenever the server is at its pressure mark. The log line names it.
+    RouteShareZero,
 };
 
 /// Which PROXY header waiter slot a connection holds (`Server.proxy_floor`).
