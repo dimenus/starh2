@@ -193,12 +193,12 @@ HEADERS and DATA are exempt from the frame rate limits (`rates.zig:121-129`).
 - No HEADERS bucket: one would refuse `h2load -c 1 -m 100`. A HEADERS that
   opens a stream is paid for by stream turnover; refused ones already feed the
   refusal-flood path (`rstOwed` → ENHANCE_YOUR_CALM).
-- DATA that delivers no body to a live stream is charged to the existing
-  "other non-DATA" bucket (10,000 burst, 1,000/s): zero-length DATA, and DATA
-  on a closed stream, which today only replenishes connection credit
-  (`session.zig:1605-1618`). Padding is charged to flow control like the
-  payload (`session.zig:1579-1582`), so it is not free, but it never counts as
-  body progress.
+- A DATA frame that delivers no body byte is charged to the existing "other
+  non-DATA" bucket (10,000 burst, 1,000/s): an empty DATA, a DATA that is all
+  padding, and any DATA on a closed stream. One exemption: an empty DATA with
+  END_STREAM on a live stream ends its stream, so stream turnover bounds it,
+  as it bounds HEADERS. Padding is charged to flow control like the payload,
+  and it never counts as body progress.
 - Tiny non-empty DATA is not charged to a bucket: it delivers body, so the
   body cap ends the stream with a 413. The server then resets the stream with
   NO_ERROR (RFC 9113 section 8.1), so DATA after that is DATA on a closed

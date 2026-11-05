@@ -1927,11 +1927,13 @@ pub const Session = struct {
             try self.failConnection(.protocol_error);
             return;
         }
-        // A zero-length DATA pays no flow control and delivers no body: free
-        // to repeat, so it is charged to the non-DATA bucket (`chargeRate`),
-        // END_STREAM or not. A DATA that is all padding pays its padding in
-        // flow control, and is not charged there.
-        if (payload.len == 0) self.delivers_nothing = true;
+        // A DATA that delivers no body byte (empty, or all padding, whose
+        // credit the server gives straight back) is free to repeat, so it is
+        // charged to the non-DATA bucket (`chargeRate`). Except with
+        // END_STREAM: that one ends its stream, so stream turnover bounds it,
+        // as it bounds HEADERS, and real clients end every request body that
+        // way; charging it would be a rate limit on requests.
+        if (data.len == 0 and !hdr.flags.end_stream) self.delivers_nothing = true;
         if (s.window.recv - @as(i32, s.window_owed) < total) {
             try self.emitRst(hdr.stream_id, .flow_control_error);
             return;
@@ -4748,7 +4750,7 @@ test "a zero-length DATA on a live stream takes a non-DATA token: past the bucke
     freeTestIntents(gpa, session.drainIntents());
 }
 
-test "DATA that carries a body byte, or only padding, takes no non-DATA token: both pay flow control" {
+test "DATA that carries a body byte takes no non-DATA token; DATA that is all padding takes one" {
     const gpa = std.testing.allocator;
     var session = try Session.init(gpa, gpa, .defaults);
     defer session.deinit();
@@ -4764,8 +4766,44 @@ test "DATA that carries a body byte, or only padding, takes no non-DATA token: b
     const before = rl.non_data.tokens;
     for (0..500) |_| {
         try ingestDataFrame(&session, 1, "b", false);
-        // A pad length of 3 and three bytes of padding: no body at all.
+        freeTestIntents(gpa, session.drainIntents());
+    }
+    try std.testing.expectEqual(before, rl.non_data.tokens);
+    // A pad length of 3 and three bytes of padding: no body at all. Its
+    // credit comes straight back, so it is as free as an empty DATA.
+    for (0..100) |_| {
         try ingestDataFrame(&session, 1, &.{ 3, 0, 0, 0 }, true);
+        freeTestIntents(gpa, session.drainIntents());
+    }
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expectEqual(before - 100, rl.non_data.tokens);
+}
+
+test "an empty DATA with END_STREAM takes no non-DATA token: stream turnover bounds it" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    freeTestIntents(gpa, session.drainIntents());
+    const before = rl.non_data.tokens;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var sid: u31 = 1;
+    while (sid < 200) : (sid += 2) {
+        wire.clearRetainingCapacity();
+        try appendTestRequest(gpa, &wire, sid, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "http" },
+            .{ .name = ":path", .value = "/up" },
+            .{ .name = ":authority", .value = "localhost" },
+        }, false);
+        var end: [frame.FRAME_HEADER_LEN]u8 = undefined;
+        (frame.FrameHeader{ .length = 0, .type = .data, .flags = .{ .end_stream = true }, .stream_id = sid }).encode(&end);
+        try wire.appendSlice(gpa, &end);
+        try session.ingest(wire.items);
         freeTestIntents(gpa, session.drainIntents());
     }
     try std.testing.expect(session.terminal == .none);

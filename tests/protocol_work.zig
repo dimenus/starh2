@@ -188,6 +188,9 @@ const FloodKind = enum {
     closed_stream,
     /// 1-byte DATA on a live stream, as fast as flow control allows.
     one_byte,
+    /// DATA that is all padding (the pad length byte, no padding, no body) on
+    /// a live stream: it pays one byte of flow control and delivers nothing.
+    all_padding,
     /// `one_byte`, going on after the server answers the stream and after it
     /// resets it (then within the connection's credit only, as on a closed
     /// stream).
@@ -302,6 +305,12 @@ fn floodInner(gpa: std.mem.Allocator, tr: Transport, port: u16, kind: FloodKind,
         while (n < 2048) : (n += 1) {
             switch (kind) {
                 .empty => try h2c.appendData(gpa, &batch, 1, &.{}, false),
+                .all_padding => {
+                    if (cr.conn < 1 or cr.stream < 1) break;
+                    try appendFrame(gpa, &batch, 0x0, PADDED, 1, &.{0});
+                    cr.conn -= 1;
+                    cr.stream -= 1;
+                },
                 .closed_stream, .one_byte, .one_byte_on => {
                     const stream_closed = kind == .closed_stream or r.rst_code != null;
                     if (cr.conn < 1 or (!stream_closed and cr.stream < 1)) break;
@@ -334,7 +343,7 @@ fn bodylessFloods(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void
     var rig: Rig = undefined;
     try rig.start(rt, gpa, tr, testLimits());
     defer rig.stop();
-    inline for (.{ FloodKind.empty, FloodKind.closed_stream }) |kind| {
+    inline for (.{ FloodKind.empty, FloodKind.all_padding, FloodKind.closed_stream }) |kind| {
         var r: Flood = .{};
         try blocking(floodClient, .{ gpa, tr, rig.port(), kind, 5_000, &r });
         var ok = false;
@@ -619,6 +628,102 @@ fn statusOf(dec: *hpack.Decoder, header_block: []const u8) !?u16 {
         if (std.mem.eql(u8, f.name, ":status")) return std.fmt.parseInt(u16, f.value, 10) catch null;
     }
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// Requests that end their body with an empty END_STREAM DATA, sustained.
+
+const run_requests = 20_000;
+const run_batch = 100;
+
+const RunResult = struct {
+    sent: usize = 0,
+    ok: usize = 0,
+    not_ok: usize = 0,
+    goaway: bool = false,
+    goaway_code: u32 = 0,
+    elapsed_ms: u64 = 0,
+    err: ?anyerror = null,
+};
+
+fn runClient(gpa: std.mem.Allocator, tr: Transport, port: u16, r: *RunResult) void {
+    runInner(gpa, tr, port, r) catch |err| {
+        r.err = err;
+    };
+}
+
+/// POST /up with an empty body: HEADERS without END_STREAM, then a
+/// zero-length DATA with END_STREAM, as several real clients end every
+/// request. Batches of 100 on one connection, each answered before the next.
+fn runInner(gpa: std.mem.Allocator, tr: Transport, port: u16, r: *RunResult) !void {
+    const w = try Wire.open(gpa, tr, port);
+    defer w.close();
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
+    var pre = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer pre.deinit(gpa);
+    try w.send(pre.items);
+    const t0 = nowNs();
+    var sid: u31 = 1;
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    while (r.sent < run_requests) {
+        req.clearRetainingCapacity();
+        const first = sid;
+        for (0..run_batch) |_| {
+            try h2c.appendHeadersExtra(gpa, &req, sid, "POST", "/up", false, &.{});
+            try h2c.appendData(gpa, &req, sid, &.{}, true);
+            sid += 2;
+        }
+        try w.send(req.items);
+        r.sent += run_batch;
+        var done: usize = 0;
+        const deadline = nowNs() + 5 * std.time.ns_per_s;
+        while (done < run_batch) {
+            const s = (try w.next(deadline)) orelse return error.Closed;
+            if (s.ftype == 0x7) {
+                r.goaway = true;
+                const p = w.last_payload.items;
+                r.goaway_code = if (p.len >= 8) std.mem.readInt(u32, p[4..8], .big) else 0;
+                r.elapsed_ms = (nowNs() - t0) / ms;
+                return;
+            }
+            if (s.sid >= first and s.ftype == 0x1) {
+                done += 1;
+                if ((try statusOf(&dec, w.last_payload.items)) == 200) r.ok += 1 else r.not_ok += 1;
+            }
+        }
+    }
+    r.elapsed_ms = (nowNs() - t0) / ms;
+}
+
+/// 20,000 such requests on one connection, as fast as they are answered:
+/// above the bucket's 1,000 a second and past its 10,000 burst. An empty
+/// END_STREAM DATA on a live stream is not charged, so none meets the bucket.
+fn endStreamRun(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, testLimits());
+    defer rig.stop();
+    var r: RunResult = .{};
+    try blocking(runClient, .{ gpa, tr, rig.port(), &r });
+    const per_s = if (r.elapsed_ms == 0) 0 else r.ok * 1000 / r.elapsed_ms;
+    std.debug.print("protocol work empty END_STREAM run ({s}): {d} requests sent on one connection, {d} answered 200, {d} otherwise, in {d} ms ({d} a second); GOAWAY {} code {d}; err {?}\n", .{ @tagName(tr), r.sent, r.ok, r.not_ok, r.elapsed_ms, per_s, r.goaway, r.goaway_code, r.err });
+    try std.testing.expect(r.err == null);
+    try std.testing.expect(!r.goaway);
+    try expectExactly("requests answered 200", r.ok, run_requests);
+    // The run must be one the old rule refuses: more than the burst plus
+    // what the bucket refills (1,000 a second) while it runs.
+    if (r.ok <= 10_000 + 1_000 * r.elapsed_ms / 1000) {
+        std.debug.print("protocol work empty END_STREAM run: too slow to test the rule ({d} a second)\n", .{per_s});
+        return error.RunTooSlow;
+    }
+}
+
+test "20,000 requests ending in an empty END_STREAM DATA, well above 1,000 a second on one connection, get no GOAWAY (h2c)" {
+    try runIn(endStreamRun, 2, .h2c);
+}
+test "20,000 requests ending in an empty END_STREAM DATA, well above 1,000 a second on one connection, get no GOAWAY (TLS)" {
+    try runIn(endStreamRun, 2, .tls);
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1292,7 @@ const get_using_62 = "\x82\x86\x84\x01\x09localhost\xbe";
 
 const END_STREAM: u8 = 0x1;
 const END_HEADERS: u8 = 0x4;
+const PADDED: u8 = 0x8;
 
 const Cross = enum {
     /// The trailers go after the client has read the 413 and the RST: they
