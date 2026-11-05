@@ -46,6 +46,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
+const no_core = @import("no_core.zig");
 const h2c = @import("starh2_h2_client");
 const wire_client = @import("wire_client.zig");
 
@@ -472,6 +473,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.next();
     const case = it.next() orelse return error.NoCase;
+    // The cases that end in a panic, which is what `build.zig` checks (their
+    // stderr, no exit code): they write no core. The others exit 0.
+    const dying = [_][]const u8{ "route-table-mismatch", "route-table-not-task" };
+    for (dying) |d| {
+        if (std.mem.eql(u8, case, d)) no_core.expectDeath();
+    }
     const rt = try zio.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(2) });
     var h = if (std.mem.eql(u8, case, "stuck"))
         try rt.spawn(runStuck, .{rt})

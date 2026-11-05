@@ -3,6 +3,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
+const no_core = @import("no_core.zig");
 
 pub fn main(init: std.process.Init.Minimal) void {
     var it = std.process.Args.Iterator.init(init.args);
@@ -11,6 +12,12 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.print("usage: teardown-traps double-finalize | sweep-lock | sweep-lock-session | unlocked-sweep | conservation | deinit-live | error-path-freeze | r158-parked\n", .{});
         std.process.exit(2);
     };
+    // The cases that end in a panic, which is what `build.zig` checks (their
+    // stderr, no exit code): they write no core. The others exit 0.
+    const dying = [_][]const u8{ "double-finalize", "sweep-lock", "sweep-lock-session", "unlocked-sweep", "conservation", "deinit-live" };
+    for (dying) |d| {
+        if (std.mem.eql(u8, which, d)) no_core.expectDeath();
+    }
     const gpa = std.heap.page_allocator;
     const rt = zio.Runtime.init(gpa, .{}) catch std.process.exit(3);
     if (std.mem.eql(u8, which, "double-finalize")) {
