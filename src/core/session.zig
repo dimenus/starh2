@@ -418,6 +418,11 @@ pub const Session = struct {
     stream_hooks: ?StreamHooks = null,
     /// Edge-owned rate limiter + clock snapshot. Null → rates disabled.
     rate_limiter: ?*rates_mod.RateLimiter = null,
+    /// Set by `onData` for the frame being handled when it delivers no body to
+    /// a live stream (a zero-length DATA, or DATA on a closed stream), and
+    /// read by `chargeRate` for that same frame; `handleFrame` clears it
+    /// first.
+    data_without_body: bool = false,
     edge_now_ns: u64 = 0,
     /// Wall-clock start of unfinished field block (0 = idle).
     field_block_started_ns: u64 = 0,
@@ -1336,6 +1341,7 @@ pub const Session = struct {
         const hdr = ev.header;
         const payload = ev.payload.bytes();
         const already_terminal = self.terminal != .none;
+        self.data_without_body = false;
 
         if (!self.received_peer_settings) {
             if (hdr.type != .settings or hdr.flags.ack()) {
@@ -1436,9 +1442,13 @@ pub const Session = struct {
         if (already_terminal) return;
         if (self.terminal != .none) return;
         if (self.rate_limiter) |rl| {
-            if (!rl.admit(typ, self.edge_now_ns)) {
-                try self.failConnection(.enhance_your_calm);
-            }
+            // DATA is exempt (`RateLimiter.admit`) unless it delivered no body
+            // to a live stream: then it pays the shared non-DATA bucket.
+            const ok = if (typ == .data)
+                !self.data_without_body or rl.admitBodylessData(self.edge_now_ns)
+            else
+                rl.admit(typ, self.edge_now_ns);
+            if (!ok) try self.failConnection(.enhance_your_calm);
         }
     }
 
@@ -1839,6 +1849,11 @@ pub const Session = struct {
                 // connection. Replenish at the usual threshold so a large body
                 // sent into a dead stream cannot strand the whole window.
                 if (close_probe_fn) |probe| probe(.{ .session = @intFromPtr(self), .site = .data_on_closed_ignored, .code = .no_error, .stream_id = hdr.stream_id });
+                // It delivers nothing and pays only credit the server gives
+                // straight back: it is charged to the non-DATA bucket
+                // (`chargeRate`), so a flood of it is bounded like any other
+                // frame that holds nothing.
+                self.data_without_body = true;
                 try self.replenishConnWindow();
                 return;
             }
@@ -1850,6 +1865,11 @@ pub const Session = struct {
             try self.failConnection(.protocol_error);
             return;
         }
+        // A zero-length DATA pays no flow control and delivers no body: free
+        // to repeat, so it is charged to the non-DATA bucket (`chargeRate`),
+        // END_STREAM or not. A DATA that is all padding pays its padding in
+        // flow control, and is not charged there.
+        if (payload.len == 0) self.data_without_body = true;
         if (s.window.recv - @as(i32, s.window_owed) < total) {
             try self.emitRst(hdr.stream_id, .flow_control_error);
             return;
@@ -4589,4 +4609,105 @@ test "a body waiting on credit the server queued but has not written does not ex
     session.edge_now_ns = 116 * s_ns;
     try session.checkIdleDeadlines(session.edge_now_ns);
     try std.testing.expectEqual(@as(usize, 1), countTerminalIntents(gpa, &session).rst);
+}
+
+/// A POST on stream 1 whose body is still open.
+fn openTestUpload(session: *Session, gpa: std.mem.Allocator) !void {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try appendTestRequest(gpa, &wire, 1, &.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/up" },
+        .{ .name = ":authority", .value = "localhost" },
+    }, false);
+    try session.ingest(wire.items);
+    try std.testing.expect(session.terminal == .none);
+}
+
+/// One DATA frame on `sid`: `payload` as given, padded when `padded`.
+fn ingestDataFrame(session: *Session, sid: u31, payload: []const u8, padded: bool) !void {
+    var buf: [frame.FRAME_HEADER_LEN + 256]u8 = undefined;
+    (frame.FrameHeader{ .length = @intCast(payload.len), .type = .data, .flags = .{ .padded = padded }, .stream_id = sid }).encode(buf[0..frame.FRAME_HEADER_LEN]);
+    @memcpy(buf[frame.FRAME_HEADER_LEN..][0..payload.len], payload);
+    try session.ingest(buf[0 .. frame.FRAME_HEADER_LEN + payload.len]);
+}
+
+test "a zero-length DATA on a live stream takes a non-DATA token: past the bucket's burst the connection ends ENHANCE_YOUR_CALM" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    // One frozen instant: the bucket does not refill.
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    try openTestUpload(&session, gpa);
+    freeTestIntents(gpa, session.drainIntents());
+    const before = rl.non_data.tokens;
+    for (0..100) |_| try ingestDataFrame(&session, 1, &.{}, false);
+    try std.testing.expectEqual(before - 100, rl.non_data.tokens);
+    // The rest of the burst, then one more.
+    while (rl.non_data.tokens >= 1.0) try ingestDataFrame(&session, 1, &.{}, false);
+    try std.testing.expect(session.terminal == .none);
+    try ingestDataFrame(&session, 1, &.{}, false);
+    try std.testing.expect(session.terminal == .goaway);
+    try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, session.terminal.goaway.code);
+    freeTestIntents(gpa, session.drainIntents());
+}
+
+test "DATA that carries a body byte, or only padding, takes no non-DATA token: both pay flow control" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    try openTestUpload(&session, gpa);
+    freeTestIntents(gpa, session.drainIntents());
+    // One zero-length DATA first: it takes its token, and what it marked is
+    // its own, not the frames after it.
+    try ingestDataFrame(&session, 1, &.{}, false);
+    const before = rl.non_data.tokens;
+    for (0..500) |_| {
+        try ingestDataFrame(&session, 1, "b", false);
+        // A pad length of 3 and three bytes of padding: no body at all.
+        try ingestDataFrame(&session, 1, &.{ 3, 0, 0, 0 }, true);
+        freeTestIntents(gpa, session.drainIntents());
+    }
+    try std.testing.expect(session.terminal == .none);
+    try std.testing.expectEqual(before, rl.non_data.tokens);
+}
+
+test "DATA on a closed stream takes a non-DATA token: past the bucket's burst the connection ends ENHANCE_YOUR_CALM" {
+    const gpa = std.testing.allocator;
+    var session = try Session.init(gpa, gpa, .defaults);
+    defer session.deinit();
+    var rl: rates_mod.RateLimiter = .{};
+    session.rate_limiter = &rl;
+    session.edge_now_ns = 1;
+    try ingestPrefaceAndSettings(&session, gpa);
+    try openTestUpload(&session, gpa);
+    // The peer resets the stream: it is closed (a tombstone), not idle.
+    var rst: [13]u8 = undefined;
+    const rn = try frame.Serializer.rstStream(&rst, 1, .cancel);
+    try session.ingest(rst[0..rn]);
+    try std.testing.expect(session.streams.get(1) == null);
+    freeTestIntents(gpa, session.drainIntents());
+    const before = rl.non_data.tokens;
+    for (0..100) |_| {
+        try ingestDataFrame(&session, 1, "late", false);
+        freeTestIntents(gpa, session.drainIntents());
+    }
+    try std.testing.expectEqual(before - 100, rl.non_data.tokens);
+    while (rl.non_data.tokens >= 1.0) {
+        try ingestDataFrame(&session, 1, "late", false);
+        freeTestIntents(gpa, session.drainIntents());
+    }
+    try std.testing.expect(session.terminal == .none);
+    try ingestDataFrame(&session, 1, "late", false);
+    try std.testing.expect(session.terminal == .goaway);
+    try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, session.terminal.goaway.code);
+    freeTestIntents(gpa, session.drainIntents());
 }

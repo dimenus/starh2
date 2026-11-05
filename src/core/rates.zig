@@ -114,9 +114,12 @@ pub const RateLimiter = struct {
     /// shared bucket stops a peer that spreads the same total volume across
     /// several types to stay under each individual limit.
     ///
-    /// DATA is exempt and takes no token. DATA already pays flow control, so a
-    /// peer cannot repeat it for free. A token charge here would let the rate
-    /// limiter refuse a legitimate large upload.
+    /// DATA is exempt here and takes no token. DATA that carries body bytes
+    /// already pays flow control, so a peer cannot repeat it for free, and a
+    /// token charge would let the rate limiter refuse a legitimate large
+    /// upload. DATA that delivers no body to a live stream is not free work
+    /// that pays for itself: the Session charges it with
+    /// `admitBodylessData`.
     ///
     /// HEADERS is exempt the same way. A completed request takes a stream slot
     /// and releases it; concurrency (`max_streams_per_connection`) bounds
@@ -145,6 +148,17 @@ pub const RateLimiter = struct {
             .window_update => return self.window_update.tryTake(now_ns),
             else => return self.non_data.tryTake(now_ns),
         }
+    }
+
+    /// A DATA frame that delivers no body to a live stream: a zero-length DATA
+    /// (it pays no flow control at all), or DATA on a stream already closed
+    /// (it only replenishes connection credit). It takes a token from the
+    /// shared `non_data` bucket, as any other frame that costs the server
+    /// work and holds nothing; false: the caller answers as for that bucket,
+    /// GOAWAY ENHANCE_YOUR_CALM. A DATA that is all padding is not one: it
+    /// pays flow control for its padding (`Session.onData`).
+    pub fn admitBodylessData(self: *RateLimiter, now_ns: u64) bool {
+        return self.non_data.tryTake(now_ns);
     }
 
     /// An ack of `typ` (SETTINGS or PING) is owed: it keeps its token.
