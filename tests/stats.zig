@@ -16,15 +16,24 @@
 //! share). Each test checks the exact delta it caused, and a gauge while the
 //! resource is held.
 //!
-//! HTTP/1.1 over zio streams from the test's own tasks: a held request is a
+//! The stream and task bounds are tested on HTTP/1.1 and HTTP/2 (h2c): the
+//! counters sit in the admission functions both protocols call. A last test
+//! makes a PROXY v2 TLS connection, which already holds a connection slot,
+//! wait for a handshake slot while the server is at `max_connections`: only
+//! the accept loop's wait counts, not that one.
+//!
+//! Clients are zio streams on the test's own tasks: a held request is a
 //! `/hold` whose handler waits for `release`.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
 const serve_deadline = @import("serve_deadline.zig");
 const route_share = @import("route_share.zig");
+const h2c = @import("starh2_h2_client");
 
 const accounts = starh2.edge.accounts;
+const proxy = starh2.edge.proxy_protocol;
+const hpack = starh2.core.hpack;
 const ms = std.time.ns_per_ms;
 const dummy: u8 = 0;
 
@@ -56,18 +65,34 @@ const Rig = struct {
     server: starh2.Server,
     handle: zio.JoinHandle(starh2.ServeError!void),
     routes: [routes.len]starh2.Route = routes,
+    cert: []u8 = &.{},
+    key: []u8 = &.{},
 
     /// `whole_server`: every task route may hold the whole server, so no
     /// route share refuses before a server bound (`tests/route_share.zig`).
-    fn start(self: *Rig, rt: *zio.Runtime, gpa: std.mem.Allocator, limits: starh2.Limits, identity: starh2.edge.server.ClientIdentity, whole_server: bool) !void {
+    fn start(self: *Rig, rt: *zio.Runtime, gpa: std.mem.Allocator, limits: starh2.Limits, ep: Ep, whole_server: bool) !void {
         release.store(false, .release);
         started.store(0, .release);
         self.* = .{ .gpa = gpa, .server = undefined, .handle = undefined };
         if (whole_server) self.routes = route_share.wholeServer(routes.len, routes, limits);
+        const a = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+        var tls_cfg: ?starh2.TlsConfig = null;
+        if (ep == .tls_proxy) {
+            const io = rt.io();
+            self.cert = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
+            self.key = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
+            tls_cfg = .{ .certificate_chain_pem = self.cert, .private_key_pem = self.key };
+        }
+        const endpoint: starh2.EndpointConfig = switch (ep) {
+            .h1c_none => .{ .h1c = .{ .address = a, .client_identity = .none } },
+            .h1c_peer => .{ .h1c = .{ .address = a, .client_identity = .peer } },
+            .h2c => .{ .h2c_prior_knowledge = .{ .address = a, .client_identity = .none } },
+            .tls_proxy => .{ .tls = .{ .address = a, .client_identity = .proxy_source, .proxy_protocol = .{ .v2 = .{ .trusted = &trusted_loopback } } } },
+        };
         self.server = try starh2.Server.init(gpa, rt.io(), .{
-            .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = identity } }},
+            .endpoints = &.{endpoint},
             .routes = &self.routes,
-            .tls = null,
+            .tls = tls_cfg,
             .limits = limits,
         });
         self.handle = try rt.spawn(starh2.Server.serve, .{ &self.server, gpa });
@@ -79,6 +104,8 @@ const Rig = struct {
         self.server.requestShutdown();
         serve_deadline.join(&self.server, &self.handle);
         self.server.deinit(self.gpa);
+        if (self.cert.len != 0) self.gpa.free(self.cert);
+        if (self.key.len != 0) self.gpa.free(self.key);
     }
 
     fn connect(self: *Rig) !zio.net.Stream {
@@ -86,6 +113,87 @@ const Rig = struct {
         return peer.connect(.{});
     }
 };
+
+const Ep = enum { h1c_none, h1c_peer, h2c, tls_proxy };
+const Proto = enum { h1c, h2c };
+
+const trusted_loopback = [_]proxy.Cidr{.{ .addr = .{ .ip4 = .{ 127, 0, 0, 1 } }, .prefix_bits = 32 }};
+
+fn writeAll(stream: zio.net.Stream, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try stream.write(bytes[off..], .none);
+}
+
+/// GET `path` on a new connection's first request (HTTP/2: stream 1).
+fn request(gpa: std.mem.Allocator, stream: zio.net.Stream, p: Proto, path: []const u8) !void {
+    switch (p) {
+        .h1c => try sendGet(stream, path),
+        .h2c => {
+            var req = try h2c.buildClientPrefaceAndSettings(gpa);
+            defer req.deinit(gpa);
+            try h2c.appendHeaders(gpa, &req, 1, path, true);
+            try writeAll(stream, req.items);
+        },
+    }
+}
+
+/// How the server answered that request.
+const Answer = union(enum) { status: u16, rst: u32, closed };
+
+fn answer(gpa: std.mem.Allocator, stream: zio.net.Stream, p: Proto, timeout_ms: u64) !Answer {
+    switch (p) {
+        .h1c => return if (try readStatus(stream, timeout_ms)) |st| .{ .status = st } else .closed,
+        .h2c => return h2Answer(gpa, stream, timeout_ms),
+    }
+}
+
+/// Stream 1's HEADERS status or RST_STREAM code; other frames are skipped.
+fn h2Answer(gpa: std.mem.Allocator, stream: zio.net.Stream, timeout_ms: u64) !Answer {
+    var dec = try hpack.Decoder.init(gpa);
+    defer dec.deinit();
+    var buf: [64 * 1024]u8 = undefined;
+    var n: usize = 0;
+    const deadline = nowNs() + timeout_ms * ms;
+    while (true) {
+        while (n >= 9) {
+            const len = (@as(usize, buf[0]) << 16) | (@as(usize, buf[1]) << 8) | buf[2];
+            if (n < 9 + len) break;
+            const ftype = buf[3];
+            const sid = std.mem.readInt(u32, buf[5..9], .big) & 0x7fff_ffff;
+            const payload = buf[9 .. 9 + len];
+            if (sid == 1 and ftype == 0x3 and len >= 4) return .{ .rst = std.mem.readInt(u32, payload[0..4], .big) };
+            if (sid == 1 and ftype == 0x1) {
+                const decoded = try dec.decode(payload, 100, 32 * 1024, 256, 8 * 1024);
+                defer dec.freeResult(decoded);
+                for (decoded.fields) |f| {
+                    if (std.mem.eql(u8, f.name, ":status")) return .{ .status = try std.fmt.parseInt(u16, f.value, 10) };
+                }
+                return error.NoStatus;
+            }
+            std.mem.copyForwards(u8, buf[0 .. n - 9 - len], buf[9 + len .. n]);
+            n -= 9 + len;
+        }
+        if (nowNs() >= deadline) return error.NoResponse;
+        if (n == buf.len) return error.FrameTooLarge;
+        const got = stream.read(buf[n..], .{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
+            error.Timeout => continue,
+            error.ConnectionResetByPeer => return .closed,
+            else => return err,
+        };
+        if (got == 0) return .closed;
+        n += got;
+    }
+}
+
+/// A refusal of a request by a server bound: 503, or on HTTP/2 a
+/// REFUSED_STREAM reset (the session refuses some before any HEADERS).
+fn isRefusal(a: Answer) bool {
+    return switch (a) {
+        .status => |st| st == 503,
+        .rst => |code| code == 0x7,
+        .closed => false,
+    };
+}
 
 fn sendGet(stream: zio.net.Stream, path: []const u8) !void {
     var buf: [128]u8 = undefined;
@@ -132,36 +240,40 @@ fn expectDelta(comptime what: []const u8, before: u64, after: u64, want: u64) !v
 // ---------------------------------------------------------------------------
 // The three new counters.
 
-fn streamBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+fn streamBound(rt: *zio.Runtime, gpa: std.mem.Allocator, p: Proto) !void {
     var limits = starh2.Limits.defaults;
     limits.max_streams_per_server = 1;
     limits.max_streams_per_connection = 1;
     limits.graceful_drain_timeout_ns = 200 * ms;
     var rig: Rig = undefined;
-    try rig.start(rt, gpa, limits, .none, true);
+    try rig.start(rt, gpa, limits, if (p == .h1c) .h1c_none else .h2c, true);
     defer rig.stop();
     const before = rig.server.stats();
 
     const first = try rig.connect();
     defer first.close();
-    try sendGet(first, "/hold");
+    try request(gpa, first, p, "/hold");
     try waitStarted(1);
     try std.testing.expectEqual(@as(usize, 1), rig.server.stats().active_streams);
 
     const second = try rig.connect();
     defer second.close();
-    try sendGet(second, "/hello");
-    try std.testing.expectEqual(@as(?u16, 503), try readStatus(second, 5000));
+    try request(gpa, second, p, "/hello");
+    const got = try answer(gpa, second, p, 5000);
+    if (!isRefusal(got)) {
+        std.debug.print("stats: stream bound ({t}): answered {any}, want 503 or REFUSED_STREAM\n", .{ p, got });
+        return error.NotRefused;
+    }
     const after = rig.server.stats();
     try expectDelta("stream_bound_refusals", before.stream_bound_refusals, after.stream_bound_refusals, 1);
     try expectDelta("task_bound_refusals", before.task_bound_refusals, after.task_bound_refusals, 0);
 
     release.store(true, .release);
-    try std.testing.expectEqual(@as(?u16, 200), try readStatus(first, 5000));
-    std.debug.print("stats: stream bound: 503, stream_bound_refusals {d} -> {d}\n", .{ before.stream_bound_refusals, after.stream_bound_refusals });
+    try std.testing.expectEqual(Answer{ .status = 200 }, try answer(gpa, first, p, 5000));
+    std.debug.print("stats: stream bound ({t}): {any}, stream_bound_refusals {d} -> {d}\n", .{ p, got, before.stream_bound_refusals, after.stream_bound_refusals });
 }
 
-fn taskBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+fn taskBound(rt: *zio.Runtime, gpa: std.mem.Allocator, p: Proto) !void {
     var limits = starh2.Limits.defaults;
     // Two task routes, each allowed the whole server: the server's bound is
     // reached only by both together. (One route holding everything is
@@ -169,14 +281,14 @@ fn taskBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 2;
     limits.graceful_drain_timeout_ns = 200 * ms;
     var rig: Rig = undefined;
-    try rig.start(rt, gpa, limits, .none, true);
+    try rig.start(rt, gpa, limits, if (p == .h1c) .h1c_none else .h2c, true);
     defer rig.stop();
     const before = rig.server.stats();
 
     var held: [2]zio.net.Stream = undefined;
     for (&held, [_][]const u8{ "/hold", "/hold2" }, 0..) |*s, path, i| {
         s.* = try rig.connect();
-        try sendGet(s.*, path);
+        try request(gpa, s.*, p, path);
         try waitStarted(i + 1);
     }
     defer for (held) |s| s.close();
@@ -184,8 +296,12 @@ fn taskBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     const third = try rig.connect();
     defer third.close();
-    try sendGet(third, "/hold");
-    try std.testing.expectEqual(@as(?u16, 503), try readStatus(third, 5000));
+    try request(gpa, third, p, "/hold");
+    const got = try answer(gpa, third, p, 5000);
+    if (!isRefusal(got)) {
+        std.debug.print("stats: task bound ({t}): answered {any}, want 503 or REFUSED_STREAM\n", .{ p, got });
+        return error.NotRefused;
+    }
     const after = rig.server.stats();
     const rr = @backingInt(accounts.RouteResource.task_handlers);
     try expectDelta("task_bound_refusals", before.task_bound_refusals, after.task_bound_refusals, 1);
@@ -193,8 +309,8 @@ fn taskBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try expectDelta("stream_bound_refusals", before.stream_bound_refusals, after.stream_bound_refusals, 0);
 
     release.store(true, .release);
-    for (held) |s| try std.testing.expectEqual(@as(?u16, 200), try readStatus(s, 5000));
-    std.debug.print("stats: task bound: 503, task_bound_refusals {d} -> {d}\n", .{ before.task_bound_refusals, after.task_bound_refusals });
+    for (held) |s| try std.testing.expectEqual(Answer{ .status = 200 }, try answer(gpa, s, p, 5000));
+    std.debug.print("stats: task bound ({t}): {any}, task_bound_refusals {d} -> {d}\n", .{ p, got, before.task_bound_refusals, after.task_bound_refusals });
 }
 
 fn connectionBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
@@ -202,7 +318,7 @@ fn connectionBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 1;
     limits.graceful_drain_timeout_ns = 200 * ms;
     var rig: Rig = undefined;
-    try rig.start(rt, gpa, limits, .none, true);
+    try rig.start(rt, gpa, limits, .h1c_none, true);
     defer rig.stop();
     const before = rig.server.stats();
 
@@ -237,12 +353,12 @@ fn connectionBound(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     std.debug.print("stats: connection bound: the server full twice, the queued connection served; connection_bound_waits {d} -> {d}\n", .{ before.connection_bound_waits, after.connection_bound_waits });
 }
 
-/// Until `accept_loops_waiting` is `want`.
+/// Until `admission_waiters` is `want`.
 fn waitStat(comptime what: []const u8, rig: *Rig, want: usize) !void {
     const deadline = nowNs() + 5 * std.time.ns_per_s;
-    while (rig.server.stats().accept_loops_waiting != want) {
+    while (rig.server.stats().admission_waiters != want) {
         if (nowNs() >= deadline) {
-            std.debug.print("stats: {s}: accept_loops_waiting {d}, want {d}\n", .{ what, rig.server.stats().accept_loops_waiting, want });
+            std.debug.print("stats: {s}: admission_waiters {d}, want {d}\n", .{ what, rig.server.stats().admission_waiters, want });
             return error.StateNotReached;
         }
         zio.sleep(.fromMilliseconds(2)) catch {};
@@ -258,7 +374,7 @@ fn clientShare(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_connections = 8;
     limits.graceful_drain_timeout_ns = 200 * ms;
     var rig: Rig = undefined;
-    try rig.start(rt, gpa, limits, .peer, true);
+    try rig.start(rt, gpa, limits, .h1c_peer, true);
     defer rig.stop();
     const res = @backingInt(accounts.Resource.connections);
     const before = rig.server.stats();
@@ -273,7 +389,11 @@ fn clientShare(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 2), rig.server.stats().connections);
     const third = try rig.connect();
     defer third.close();
-    try sendGet(third, "/hello");
+    // Refused at accept: the server may have closed it before this write.
+    sendGet(third, "/hello") catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => {},
+        else => return err,
+    };
     // Refused at accept: closed unanswered.
     try std.testing.expectEqual(@as(?u16, null), try readStatus(third, 5000));
     const after = rig.server.stats();
@@ -289,7 +409,7 @@ fn routeShare(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     limits.max_task_handlers = 4;
     limits.graceful_drain_timeout_ns = 200 * ms;
     var rig: Rig = undefined;
-    try rig.start(rt, gpa, limits, .none, false);
+    try rig.start(rt, gpa, limits, .h1c_none, false);
     defer rig.stop();
     const res = @backingInt(accounts.RouteResource.task_handlers);
     const before = rig.server.stats();
@@ -313,6 +433,53 @@ fn routeShare(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     std.debug.print("stats: route share: third /hold 503, route_share_refusals[task_handlers] {d} -> {d}\n", .{ before.route_share_refusals[res], after.route_share_refusals[res] });
 }
 
+/// A PROXY v2 TLS connection waits for a handshake slot after its header,
+/// holding a connection slot, while the server is at `max_connections`. Only
+/// the accept loop's wait (the server full) counts as a connection-bound
+/// wait; the handshake wait does not.
+fn handshakeWait(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var limits = starh2.Limits.defaults;
+    limits.max_connections = 2;
+    limits.concurrent_tls_handshakes = 1;
+    limits.graceful_drain_timeout_ns = 200 * ms;
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, limits, .tls_proxy, true);
+    defer rig.stop();
+    const before = rig.server.stats();
+    var hb: [64]u8 = undefined;
+
+    // A: its header, then nothing: it holds the only handshake slot.
+    const a = try rig.connect();
+    defer a.close();
+    try writeAll(a, hb[0..proxy.encode(&hb, .{ .peer = .{ .ip4 = .{ 203, 0, 113, 7 } } })]);
+    const deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (rig.server.stats().active_handshakes != 1) {
+        if (nowNs() >= deadline) return error.HandshakeSlotNeverTaken;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    // B: admitted (the server now at max_connections), its header read, then
+    // it waits for a handshake slot. The accept loop waits for room too.
+    const b = try rig.connect();
+    defer b.close();
+    try writeAll(b, hb[0..proxy.encode(&hb, .{ .peer = .{ .ip4 = .{ 203, 0, 113, 8 } } })]);
+    try waitStat("the accept loop and B waiting", &rig, 2);
+    zio.sleep(.fromMilliseconds(50)) catch {};
+    const after = rig.server.stats();
+    try std.testing.expectEqual(@as(usize, 2), after.connections);
+    try std.testing.expectEqual(@as(usize, 1), after.active_handshakes);
+    // One wait for the connection bound (the accept loop), none for B.
+    try expectDelta("connection_bound_waits (the accept loop only, not the handshake wait)", before.connection_bound_waits, after.connection_bound_waits, 1);
+    std.debug.print("stats: handshake wait at max_connections: admission_waiters {d}, connection_bound_waits {d} -> {d}\n", .{ after.admission_waiters, before.connection_bound_waits, after.connection_bound_waits });
+}
+
+fn runProto(comptime f: anytype, p: Proto) !void {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    var h = try rt.spawn(f, .{ rt, gpa, p });
+    try h.join();
+}
+
 fn runIn(comptime f: anytype) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -321,12 +488,24 @@ fn runIn(comptime f: anytype) !void {
     try h.join();
 }
 
-test "stats: a request past the server's stream bound counts stream_bound_refusals (t-3759 step 9b)" {
-    try runIn(streamBound);
+test "stats: a request past the server's stream bound counts stream_bound_refusals, HTTP/1.1 (t-3759 step 9b)" {
+    try runProto(streamBound, .h1c);
 }
 
-test "stats: a task request past the server's task-handler bound counts task_bound_refusals (t-3759 step 9b)" {
-    try runIn(taskBound);
+test "stats: a request past the server's stream bound counts stream_bound_refusals, HTTP/2 (t-3759 step 9b)" {
+    try runProto(streamBound, .h2c);
+}
+
+test "stats: a task request past the server's task-handler bound counts task_bound_refusals, HTTP/1.1 (t-3759 step 9b)" {
+    try runProto(taskBound, .h1c);
+}
+
+test "stats: a task request past the server's task-handler bound counts task_bound_refusals, HTTP/2 (t-3759 step 9b)" {
+    try runProto(taskBound, .h2c);
+}
+
+test "stats: a PROXY TLS connection waiting for a handshake slot at max_connections is not a connection-bound wait (t-3759 step 9b)" {
+    try runIn(handshakeWait);
 }
 
 test "stats: each time the server reaches max_connections counts connection_bound_waits, and a queued connection is served later (t-3759 step 9b)" {

@@ -1144,22 +1144,21 @@ fn statsHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Complet
     const s = server.stats();
     const buf = try req.arena.alloc(u8, 4 * 1024);
     var w: std.Io.Writer = .fixed(buf);
-    try w.print("{{\"connections\":{d},\"active_streams\":{d},\"task_handlers\":{d},\"orphaned_handlers\":{d},\"outbound_bytes\":{d},\"active_handshakes\":{d},\"accept_loops_waiting\":{d}", .{ s.connections, s.active_streams, s.task_handlers, s.orphaned_handlers, s.outbound_bytes, s.active_handshakes, s.accept_loops_waiting });
-    try w.print(",\"request_pool\":{{\"resident\":{d},\"held\":{d},\"refused\":{{\"request_cap\":{d},\"connection_cap\":{d},\"server_cap\":{d}}}}}", .{
-        s.request_pool.resident_bytes,
-        s.request_pool.held_bytes,
-        s.request_pool.refused[@backingInt(starh2.edge.request_pool.Reason.request_cap)],
-        s.request_pool.refused[@backingInt(starh2.edge.request_pool.Reason.connection_cap)],
-        s.request_pool.refused[@backingInt(starh2.edge.request_pool.Reason.server_cap)],
-    });
+    try w.print("{{\"connections\":{d},\"active_streams\":{d},\"task_handlers\":{d},\"orphaned_handlers\":{d},\"outbound_bytes\":{d},\"active_handshakes\":{d},\"admission_waiters\":{d}", .{ s.connections, s.active_streams, s.task_handlers, s.orphaned_handlers, s.outbound_bytes, s.active_handshakes, s.admission_waiters });
+    try w.print(",\"request_pool\":{{\"resident\":{d},\"held\":{d},\"refused\":{{", .{ s.request_pool.resident_bytes, s.request_pool.held_bytes });
+    // Every reason, by name, so a new one shows up here by itself.
+    for (s.request_pool.refused, 0..) |v, i| {
+        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.request_pool.Reason, @fromBackingInt(@intCast(i)))), v });
+    }
+    try w.writeAll("}}");
     try w.writeAll(",\"client_share_refusals\":{");
     for (s.client_share_refusals, 0..) |v, i| {
-        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.accounts.Resource, @enumFromInt(i))), v });
+        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.accounts.Resource, @fromBackingInt(@intCast(i)))), v });
     }
     try w.print("}},\"client_rate_refusals\":{{\"connection_start\":{d},\"handshake_start\":{d}}},\"client_table_full\":{d}", .{ s.client_rate_refusals[0], s.client_rate_refusals[1], s.client_table_full });
     try w.writeAll(",\"route_share_refusals\":{");
     for (s.route_share_refusals, 0..) |v, i| {
-        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.accounts.RouteResource, @enumFromInt(i))), v });
+        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.accounts.RouteResource, @fromBackingInt(@intCast(i)))), v });
     }
     try w.print("}},\"stream_bound_refusals\":{d},\"task_bound_refusals\":{d},\"connection_bound_waits\":{d},\"proxy_untrusted\":{d},\"proxy_header_failures\":{d},\"accept_errors\":{d}}}\n", .{ s.stream_bound_refusals, s.task_bound_refusals, s.connection_bound_waits, s.proxy_untrusted, s.proxy_header_failures, s.accept_errors });
     try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());

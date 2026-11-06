@@ -924,50 +924,67 @@ pub const Server = struct {
     /// before `accept`, so a full server leaves new connections in the
     /// kernel's listen queue. Never `.client_refused`: no client is known
     /// before the accept.
-    fn admissionRoom(self: *Server, a: Admission, locked: bool) connection.Admit {
+    fn admissionRoom(self: *Server, a: Admission, locked: bool) Ready {
         _ = locked;
-        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) return .server_full;
+        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) return .full_connections;
         if (a.proxied) {
             const room = self.proxy_floor_used[a.endpoint].load(.seq_cst) < self.proxy_floor or
                 self.proxy_shared_used.load(.seq_cst) < self.proxy_shared;
-            return if (room) .ok else .server_full;
+            return if (room) .ok else .full_other;
         }
-        if (a.mode == .tls and self.accounting.active_handshakes.load(.seq_cst) >= self.accounting.max_handshakes) return .server_full;
+        if (a.mode == .tls and self.accounting.active_handshakes.load(.seq_cst) >= self.accounting.max_handshakes) return .full_other;
         return .ok;
+    }
+
+    /// What an admission predicate (`awaitAdmission`'s `ready`) found: room,
+    /// the client over its share, or the server full, and for which slot:
+    /// `max_connections` itself, or another (a handshake or PROXY header
+    /// slot). Said by the predicate that refused, not re-read afterwards,
+    /// so `connection_bound_waits` counts only the connection bound.
+    const Ready = enum { ok, client_refused, full_connections, full_other };
+
+    fn readyOf(admit: connection.Admit, full: Ready) Ready {
+        return switch (admit) {
+            .ok => .ok,
+            .client_refused => .client_refused,
+            .server_full => full,
+        };
     }
 
     /// Take the connection slot and the second slot `admissionRoom` names:
     /// all or none. A full server parks the loop; a client over its share
     /// under pressure, on either slot, is refused (the caller closes it).
-    fn admitAccepted(self: *Server, a: Admission, locked: bool) connection.Admit {
-        const got: connection.Admit = admit: {
+    fn admitAccepted(self: *Server, a: Admission, locked: bool) Ready {
+        const got: Ready = admit: {
             const conn = self.tryAdmitConnection(a.charge);
-            if (conn != .ok) break :admit conn;
+            if (conn != .ok) break :admit readyOf(conn, .full_connections);
             if (a.proxied) {
                 if (self.tryAdmitProxyWaiter(a.endpoint)) |ps| {
                     a.proxy_slot.?.* = ps;
                     break :admit .ok;
                 }
                 self.undoConnection(a.charge, locked);
-                break :admit .server_full;
+                break :admit .full_other;
             }
             if (a.mode == .tls) {
                 const hs = self.accounting.tryAdmitHandshake(a.charge);
                 if (hs != .ok) {
                     self.undoConnection(a.charge, locked);
-                    break :admit hs;
+                    break :admit readyOf(hs, .full_other);
                 }
             }
             break :admit .ok;
         };
-        if (got == .server_full and comptime connection.test_observe) _ = test_admit_refused.fetchAdd(1, .monotonic);
+        if ((got == .full_connections or got == .full_other) and comptime connection.test_observe) _ = test_admit_refused.fetchAdd(1, .monotonic);
         return got;
     }
 
-    /// A proxied TLS connection past its header: its handshake slot.
-    fn admitHandshake(self: *Server, a: Admission, locked: bool) connection.Admit {
+    /// A proxied TLS connection past its header: its handshake slot. It
+    /// already holds its connection slot, so this is never the connection
+    /// bound.
+    fn admitHandshake(self: *Server, a: Admission, locked: bool) Ready {
         _ = locked;
-        return self.accounting.tryAdmitHandshake(a.charge);
+        return readyOf(self.accounting.tryAdmitHandshake(a.charge), .full_other);
     }
 
     fn awaitHandshakeSlot(self: *Server, a: Admission) std.Io.Cancelable!bool {
@@ -985,16 +1002,14 @@ pub const Server = struct {
     fn awaitAdmission(
         self: *Server,
         a: Admission,
-        comptime ready: fn (*Server, Admission, bool) connection.Admit,
+        comptime ready: fn (*Server, Admission, bool) Ready,
     ) std.Io.Cancelable!bool {
         switch (ready(self, a, false)) {
             .ok => return true,
             .client_refused => return false,
-            .server_full => {},
-        }
-        // Full for `max_connections`, not for a handshake or PROXY slot.
-        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) {
-            _ = self.connection_bound_waits.fetchAdd(1, .monotonic);
+            // The connection bound refused this first check: one wait.
+            .full_connections => _ = self.connection_bound_waits.fetchAdd(1, .monotonic),
+            .full_other => {},
         }
         const acct = &self.accounting;
         try acct.admission_mu.lock();
@@ -1006,7 +1021,7 @@ pub const Server = struct {
             switch (ready(self, a, true)) {
                 .ok => return true,
                 .client_refused => return false,
-                .server_full => try acct.admission_cond.wait(&acct.admission_mu),
+                .full_connections, .full_other => try acct.admission_cond.wait(&acct.admission_mu),
             }
         }
     }
@@ -1430,13 +1445,17 @@ pub const Server = struct {
         outbound_bytes: usize,
         /// TLS handshakes in progress, against `concurrent_tls_handshakes`.
         active_handshakes: usize,
-        /// Accept loops waiting now for room (`max_connections`, a handshake
-        /// slot or a PROXY header slot).
-        accept_loops_waiting: usize,
+        /// Waiting now for admission (`GlobalAccounting.admission_waiters`):
+        /// accept loops waiting for room (`max_connections`, a TLS handshake
+        /// slot, a PROXY header slot), and PROXY v2 TLS connections that
+        /// already hold a connection slot, waiting for a handshake slot
+        /// after their header.
+        admission_waiters: usize,
         /// The request pool: bytes resident and held (now and their highs),
         /// per block class, and its refusals by reason (`refused`, indexed
         /// by `request_pool.Reason`: a request over its own cap, its
-        /// connection's, the server's).
+        /// connection's, its client's share, its route's share, the
+        /// server's).
         request_pool: request_pool.Snapshot,
 
         // Refused since the server started (counts only grow).
@@ -1473,10 +1492,13 @@ pub const Server = struct {
         accept_errors: u64,
     };
 
-    /// The server's counters, now. Each field is read from its own atomic,
-    /// one after another, with no lock: the struct is not one consistent
-    /// instant. Two fields can disagree by the work done while they were
-    /// read (a connection counted in one gauge and not yet in another). Safe
+    /// The server's counters, now. Each counter is read from its own
+    /// atomic, one after another, with no lock: the struct is not one
+    /// consistent instant. Two fields can disagree by the work done while
+    /// they were read (a connection counted in one gauge and not yet in
+    /// another). Besides the atomics it reads plain fields that are fixed
+    /// after `init`: the request pool's class sizes and count
+    /// (`RequestPool.snapshot`) and the route table's slice of records. Safe
     /// from any thread, also while `serve` runs; it takes no lock and
     /// allocates nothing.
     pub fn stats(self: *const Server) Stats {
@@ -1493,7 +1515,7 @@ pub const Server = struct {
             .orphaned_handlers = self.accounting.orphaned_handlers.load(.monotonic),
             .outbound_bytes = self.accounting.outbound_bytes.load(.monotonic),
             .active_handshakes = self.accounting.active_handshakes.load(.monotonic),
-            .accept_loops_waiting = self.accounting.admission_waiters.load(.monotonic),
+            .admission_waiters = self.accounting.admission_waiters.load(.monotonic),
             .request_pool = self.requests.snapshot(),
             .client_share_refusals = share,
             .client_rate_refusals = .{ self.clients.rate_refusals[0].load(.monotonic), self.clients.rate_refusals[1].load(.monotonic) },

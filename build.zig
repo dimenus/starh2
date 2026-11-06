@@ -1058,6 +1058,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
                 .{ .name = "zio", .module = zio_dep.module("zio") },
             },
         }),
