@@ -1168,6 +1168,7 @@ const wait_limit_ms = 500;
 fn waitLimits() starh2.Limits {
     var l = parkLimits();
     l.connection_idle_timeout_ns = wait_limit_ms * ms;
+    l.connection_idle_timeout_under_pressure_ns = l.connection_idle_timeout_ns;
     return l;
 }
 

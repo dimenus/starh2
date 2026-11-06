@@ -440,6 +440,22 @@ pub const Limits = struct {
     /// do not return is a stream on which nothing happens. Then it is answered
     /// 503. 0 lets it wait until a slot frees.
     connection_idle_timeout_ns: u64 = 75 * std.time.ns_per_s,
+    /// The HTTP/2 idle limit for a connection that starts to have nothing to
+    /// do while the server is under connection pressure: its connections at
+    /// or above the pressure mark of the connection share, L/4 of
+    /// `max_connections` (`accounts.Share`). The connection reads the count
+    /// once, when its idle wait starts, and keeps the limit it chose for that
+    /// whole wait (`Connection.checkConnectionIdle`). Must be non-zero, and
+    /// not above `connection_idle_timeout_ns` when that is on; with that off
+    /// (0), no connection is closed for being idle, under pressure or not.
+    ///
+    /// The mark is low (a quarter of the server), so this is a moderate cut,
+    /// not an emergency one: 10 s is the normal HTTP/2 idle timeout of some
+    /// servers (h2o), so clients already live with it, and an idle
+    /// connection then holds its slot for 10 s instead of 75. HTTP/1.1 does
+    /// not use it: its wait for the next request is `field_block_timeout_ns`,
+    /// 5 s, already shorter.
+    connection_idle_timeout_under_pressure_ns: u64 = 10 * std.time.ns_per_s,
     /// How long a connection that has decided to close (a connection error, or
     /// the end of a graceful drain) waits for its last queued frames, the
     /// GOAWAY above all, to reach the socket (RFC 9113 section 5.4.1). A frame
@@ -778,6 +794,10 @@ pub const Limits = struct {
         if (self.proxy_header_bytes < proxy_protocol.min_header_cap or self.proxy_header_bytes > proxy_protocol.fixed_bytes + std.math.maxInt(u16)) return error.InvalidConfig;
         if (self.proxy_header_waiters == 0) return error.InvalidConfig;
         if (self.proxy_header_timeout_ns == 0 or self.proxy_header_timeout_ns > self.preface_timeout_ns) return error.InvalidConfig;
+        // A pressure limit longer than the normal one would make pressure
+        // keep idle connections longer.
+        if (self.connection_idle_timeout_under_pressure_ns == 0) return error.InvalidConfig;
+        if (self.connection_idle_timeout_ns != 0 and self.connection_idle_timeout_under_pressure_ns > self.connection_idle_timeout_ns) return error.InvalidConfig;
         // A bucket's whole span (`burst` refills) must fit the clock's u64.
         for ([_]u32{ self.connection_start_burst, self.handshake_start_burst }, [_]u64{ self.connection_start_refill_ns, self.handshake_start_refill_ns }) |burst, refill| {
             if (burst == 0 or refill == 0) return error.InvalidConfig;
@@ -1057,6 +1077,25 @@ test "h1_body term moves allocator_bytes with request_body_bytes" {
     const bigger = try more.resourceUpperBound();
     try std.testing.expect(bigger.terms.h1_body > base.terms.h1_body);
     try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
+}
+
+test "the idle limit under pressure is non-zero and not above the normal one (t-3759 step 8)" {
+    _ = try Limits.defaults.resourceUpperBound();
+    var l = Limits.defaults;
+    l.connection_idle_timeout_under_pressure_ns = 0;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    l = Limits.defaults;
+    l.connection_idle_timeout_under_pressure_ns = l.connection_idle_timeout_ns + 1;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    l.connection_idle_timeout_under_pressure_ns = l.connection_idle_timeout_ns;
+    _ = try l.resourceUpperBound();
+    // Idle closing off: the pressure limit is unused, any non-zero value.
+    l.connection_idle_timeout_ns = 0;
+    l.connection_idle_timeout_under_pressure_ns = 1;
+    _ = try l.resourceUpperBound();
+    // HTTP/1.1 does not use the pressure limit because, by default, its wait
+    // for the next request is already no longer.
+    try std.testing.expect(Limits.defaults.field_block_timeout_ns <= Limits.defaults.connection_idle_timeout_under_pressure_ns);
 }
 
 test "rejects a zero listen backlog" {

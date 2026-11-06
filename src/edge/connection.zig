@@ -1078,6 +1078,11 @@ pub const ConnConfig = struct {
     shutdown_event: ?*zio.Event = null,
     /// Server-wide stream and task-handler admission (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
+    /// The server's live connections (`Server.active_connections`), the
+    /// pressure reading of the connection share. An HTTP/2 connection reads
+    /// it once when an idle wait starts (`Connection.idleLimitNs`). Null in
+    /// unit tests with no server: never under pressure.
+    server_connections: ?*const std.atomic.Value(usize) = null,
     /// The client accounts this connection is charged to, and holds one
     /// reference on (`accounts.Table.acquire`, at accept or after the PROXY
     /// header), until its task ends (`Server.connEntry`). `.none` on an
@@ -2122,6 +2127,9 @@ pub const Connection = struct {
     /// When this connection last began to have nothing to do; null while it has
     /// work, or with the idle timeout off (`checkConnectionIdle`).
     idle_since_ns: ?u64 = null,
+    /// The idle limit chosen when `idle_since_ns` was set (`idleLimitNs`).
+    /// Read only while `idle_since_ns` is set.
+    idle_limit_ns: u64 = 0,
     /// `session.highest_peer_stream` at the last idle check. A request can open
     /// and end between two checks, and that is still activity.
     idle_seen_stream: u31 = 0,
@@ -4150,7 +4158,7 @@ pub const Connection = struct {
             // handler's response drains after the check, and the peer is not
             // reading, so no write completes. It must not stay open for ever
             // because of that.
-            const deadline = (self.idle_since_ns orelse nowNs(self.config.io)) +| idle_limit_ns;
+            const deadline = if (self.idle_since_ns) |since| since +| self.idle_limit_ns else nowNs(self.config.io) +| idle_limit_ns;
             if (next == null or deadline < next.?) next = deadline;
         }
         const canary_tick: u64 = if (comptime test_observe) test_polling_canary_tick_ns.load(.acquire) else 0;
@@ -6141,11 +6149,31 @@ pub const Connection = struct {
         }
         if (new_stream or self.idle_since_ns == null) {
             self.idle_since_ns = now;
+            self.idle_limit_ns = self.idleLimitNs();
             return;
         }
-        if (now -% self.idle_since_ns.? < limit_ns) return;
+        if (now -% self.idle_since_ns.? < self.idle_limit_ns) return;
         self.noteServerClose("connection_idle", null);
         try self.beginGraceful();
+    }
+
+    /// The limit for an idle wait that starts now: the short one
+    /// (`Limits.connection_idle_timeout_under_pressure_ns`) when the server's
+    /// connections are at or above the connection share's pressure mark, the
+    /// same reading and mark the client shares use (`accounts.Charge.add`),
+    /// else `connection_idle_timeout_ns`. Read once per idle wait, never
+    /// again during it: no timer, no wake and no polling for pressure. So a
+    /// connection that went idle before pressure started keeps its normal
+    /// deadline, at most `connection_idle_timeout_ns` (75 s by default),
+    /// and pressure only shortens the waits that start under it. That tail
+    /// is accepted: it is bounded, and the connections that hold it are the
+    /// ones that were already there.
+    fn idleLimitNs(self: *const Connection) u64 {
+        const limits = self.config.limits;
+        const conns = self.config.server_connections orelse return limits.connection_idle_timeout_ns;
+        const mark = accounts.Share.of(limits.max_connections).mark;
+        if (conns.load(.acquire) >= mark) return limits.connection_idle_timeout_under_pressure_ns;
+        return limits.connection_idle_timeout_ns;
     }
 
     fn finishGraceful(self: *Connection) !void {

@@ -1032,6 +1032,25 @@ pub fn build(b: *std.Build) void {
     const shares_step = b.step("test-shares", "Run the t-3759 step 4 gates (one attack per share-table row, the aggregate, the NAT case)");
     shares_step.dependOn(&run_shares_tests.step);
 
+    const idle_pressure_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/idle_pressure.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_idle_pressure_tests = b.addRunArtifact(idle_pressure_tests);
+    // Reads testdata/cert.pem and key.pem relative to the repo root.
+    run_idle_pressure_tests.setCwd(b.path("."));
+    const idle_pressure_step = b.step("test-idle-pressure", "Run the t-3759 step 8 gates (idle limit under connection pressure: h2c, TLS h2; HTTP/1.1's wait for the next request on h1c and TLS)");
+    idle_pressure_step.dependOn(&run_idle_pressure_tests.step);
+
     const protocol_work_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/protocol_work.zig"),
@@ -1300,6 +1319,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_hardening_tests.step);
     test_step.dependOn(&run_accounts_tests.step);
     test_step.dependOn(&run_shares_tests.step);
+    test_step.dependOn(&run_idle_pressure_tests.step);
     test_step.dependOn(&run_routes_tests.step);
     test_step.dependOn(&run_protocol_work_tests.step);
     test_step.dependOn(&run_h1_linger_tests.step);

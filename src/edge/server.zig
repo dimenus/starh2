@@ -1322,6 +1322,7 @@ pub const Server = struct {
                 .shutdown_flag = &self.shutdown_flag,
                 .shutdown_event = &self.shutdown_event,
                 .accounting = &self.accounting,
+                .server_connections = &self.active_connections,
                 .charge = charge,
                 .peer = peer,
                 .slab_pool = &self.slabs,
