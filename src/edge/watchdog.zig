@@ -29,6 +29,7 @@
 //! `stop` (which joins) runs when `serve` returns, after every handler has
 //! ended, so the thread never outlives the route table or the runtime.
 const std = @import("std");
+const builtin = @import("builtin");
 const zio = @import("zio");
 const router = @import("../http/router.zig");
 const test_hook = @import("test_hook.zig");
@@ -45,12 +46,13 @@ pub var test_reports: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on
 pub var test_last_label: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Watchdogs that did not start because their runtime had one.
 pub var test_second_refused: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
-/// In a build with the test hooks (every Debug test), a report is logged as
-/// an error, and the test runner fails the test it happens in: a test that
-/// holds an executor for the watchdog's limit (a join, a blocking read or
-/// sleep on an executor thread, t-3899) fails, wherever it is, with no grep
-/// to keep up to date. A test that stalls an executor on purpose
-/// (`tests/watchdog.zig`) sets this false. Production builds log a warning.
+/// In a test binary (`builtin.is_test`) with the test hooks on (every Debug
+/// test), a report is logged as an error, and the test runner fails the test
+/// it happens in: a test that holds an executor for the watchdog's limit (a
+/// join, a blocking read or sleep on an executor thread, t-3899) fails,
+/// wherever it is, with no grep to keep up to date. A test that stalls an
+/// executor on purpose (`tests/watchdog.zig`) sets this false. Everything
+/// else, a Debug application included, logs a warning.
 pub var test_reports_fail: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(true) else {};
 
 // ---------------------------------------------------------------------------
@@ -265,11 +267,13 @@ const Reporter = struct {
     }
 };
 
-/// A warning, or an error in a test build that has not opted out
-/// (`test_reports_fail`).
+/// A warning; an error in a test binary that has not opted out
+/// (`test_reports_fail`). `test_hook.on` alone is not enough: it is also on
+/// in a Debug build of an application, which must not log its stalls as
+/// errors.
 fn say(comptime fmt: []const u8, args: anytype) void {
-    if (comptime test_hook.on) {
-        if (test_reports_fail.load(.acquire)) return log.err(fmt ++ " (an error in a test build: a test must not hold an executor)", args);
+    if (comptime builtin.is_test and test_hook.on) {
+        if (test_reports_fail.load(.acquire)) return log.err(fmt ++ " (an error in a test binary: a test must not hold an executor)", args);
     }
     log.warn(fmt, args);
 }
