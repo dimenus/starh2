@@ -686,7 +686,13 @@ pub fn build(b: *std.Build) void {
     const tls_preface_step = b.step("test-tls-preface", "Run the TLS server-preface-first gates");
     tls_preface_step.dependOn(&run_tls_preface_tests.step);
 
+    // A run of only some tests of the steps that take it (the 0.17 test
+    // runner takes no filter at run time): `./zb build test-hardening
+    // -Dtest-filter=tail`. Steps without it ignore it.
+    const test_filter = b.option([]const u8, "test-filter", "test-hardening and test-goaway-delivery: only the tests whose name contains this");
+    const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
     const goaway_delivery_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/goaway_delivery.zig"),
             .target = target,
@@ -976,6 +982,7 @@ pub fn build(b: *std.Build) void {
     admission_step.dependOn(&run_admission_tests.step);
 
     const hardening_tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/hardening.zig"),
             .target = target,
