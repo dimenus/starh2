@@ -454,11 +454,13 @@ pub const Limits = struct {
     /// `write_byte_timeout_ns` after the idle wait starts (135 s by default).
     /// The wait starts at the first check after the last stream ended
     /// (`Connection.idle_since_ns`): at once when something wakes the
-    /// connection then, and up to this limit later when nothing does (the
-    /// fallback wake in `Connection.nextDeadlineNs`). So from the last
-    /// stream's end the worst case is twice this plus `write_byte_timeout_ns`:
-    /// 210 s by default. With the write-byte limit off, this one alone closes
-    /// it, up to twice this after the last stream's end.
+    /// connection then, and up to one idle limit later when nothing does (the
+    /// fallback wake in `Connection.nextDeadlineNs`, armed with the limit an
+    /// idle wait starting at that park would get). So from the last stream's
+    /// end the worst case without pressure is twice this plus
+    /// `write_byte_timeout_ns`: 210 s by default. With the write-byte limit
+    /// off, this one alone closes it, up to twice this after the last
+    /// stream's end.
     /// HTTP/1.1 has no such state: a write returns only once the socket took
     /// it, and the wait for the next request starts after that. A handler
     /// does not count: one still running after its stream ended (it can be
@@ -500,9 +502,13 @@ pub const Limits = struct {
     /// 70 s from that start by default, the same rule as without pressure
     /// (`connection_idle_timeout_ns`). The start can come late: when nothing
     /// wakes the connection after its last stream ended, its next check is
-    /// the fallback wake, armed `connection_idle_timeout_ns` (75 s) ahead,
-    /// not this limit. So from the last stream's end the worst case under
-    /// pressure is 75 + 10 + 60 = 145 s by default. HTTP/1.1 does
+    /// the fallback wake. That wake is armed with this limit when the
+    /// connection was under pressure at its last park, so from the last
+    /// stream's end the worst case is 10 + 10 + 60 = 80 s by default. If the
+    /// pressure began after that park, the wake was armed with
+    /// `connection_idle_timeout_ns`, and the worst case is 75 + 10 + 60 =
+    /// 145 s. The price: a connection with work under pressure wakes once
+    /// per this limit to look, not once per the normal limit. HTTP/1.1 does
     /// not use it: its wait for the next request is `field_block_timeout_ns`,
     /// 5 s, already shorter.
     connection_idle_timeout_under_pressure_ns: u64 = 10 * std.time.ns_per_s,

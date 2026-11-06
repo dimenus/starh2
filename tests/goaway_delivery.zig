@@ -1298,7 +1298,26 @@ const IdleCase = enum {
     /// work while that clock runs, so the idle limit waits and the write-byte
     /// timeout ends the connection. Its deadline is what wakes the actor.
     stream_ends_with_no_wake_write_byte,
+    /// `stream_ends_with_no_wake` under connection pressure: two filler
+    /// connections hold open SSE streams (so they are never idle and stay
+    /// counted), `max_connections` puts the mark at 2, and the no-wake
+    /// connection is the third. Its fallback wake (`nextDeadlineNs`) must
+    /// come after the pressure limit, not the normal one, so its idle wait
+    /// starts one pressure limit after its last park and ends one later.
+    /// The normal limit is long (`no_wake_pressure_normal_ms`), so a fallback
+    /// armed with it would hold the connection past the window.
+    stream_ends_with_no_wake_pressure,
 };
+
+/// `stream_ends_with_no_wake_pressure`: the normal idle limit (the pressure
+/// limit is `idle_limit_ms`), the server's connection limit (mark 2:
+/// `accounts.Share.of(8).mark`), and the filler connections that reach it.
+const no_wake_pressure_normal_ms = 5000;
+const no_wake_pressure_max_connections = 8;
+const no_wake_pressure_fillers = 2;
+comptime {
+    std.debug.assert(starh2.edge.accounts.Share.of(no_wake_pressure_max_connections).mark == no_wake_pressure_fillers);
+}
 
 const IdleRun = struct {
     err: ?anyerror = null,
@@ -1424,6 +1443,26 @@ fn idleMain(port: u16, gpa: std.mem.Allocator, transport: Transport, case: IdleC
 }
 
 fn idleClient(port: u16, gpa: std.mem.Allocator, transport: Transport, case: IdleCase, label: []const u8, run: *IdleRun) !void {
+    // The fillers of `stream_ends_with_no_wake_pressure`: each holds an open
+    // SSE stream, and is set up (its first event read) before the writer is
+    // held, since that hold is the whole process's.
+    var fillers: [no_wake_pressure_fillers]?*Wire = @splat(null);
+    defer for (fillers) |f| if (f) |w| w.close();
+    if (case == .stream_ends_with_no_wake_pressure) {
+        for (&fillers) |*slot| {
+            const fw = try Wire.open(gpa, transport, port, null);
+            slot.* = fw;
+            var fpre = try h2c.buildClientPrefaceAndSettings(gpa);
+            defer fpre.deinit(gpa);
+            try fw.send(fpre.items);
+            try idleSendRequest(gpa, fw, 1, "/sse", true);
+            const deadline = nowNs() + client_deadline_ns;
+            while (true) {
+                const fs = try fw.next(deadline) orelse return error.FillerClosed;
+                if (fs.ftype == 0 and fs.sid == 1) break;
+            }
+        }
+    }
     const wire = try Wire.open(gpa, transport, port, null);
     defer wire.close();
     var req = try h2c.buildClientPrefaceAndSettings(gpa);
@@ -1524,7 +1563,7 @@ fn idleClient(port: u16, gpa: std.mem.Allocator, transport: Transport, case: Idl
             try idleSendRequest(gpa, wire, 1, "/record", true);
             try idleExpectClose(wire, 1, true, null);
         },
-        .stream_ends_with_no_wake, .stream_ends_with_no_wake_write_byte => {
+        .stream_ends_with_no_wake, .stream_ends_with_no_wake_write_byte, .stream_ends_with_no_wake_pressure => {
             // Let the first writes finish, then hold the writer.
             sleepMs(100);
             wire_pump.test_hold_writes.store(true, .release);
@@ -1560,9 +1599,19 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     switch (case) {
         .stream_ends_with_no_wake => limits.write_byte_timeout_ns = 0,
         .stream_ends_with_no_wake_write_byte => limits.write_byte_timeout_ns = no_wake_write_byte_ms * std.time.ns_per_ms,
+        .stream_ends_with_no_wake_pressure => {
+            limits.write_byte_timeout_ns = 0;
+            limits.connection_idle_timeout_ns = no_wake_pressure_normal_ms * std.time.ns_per_ms;
+            limits.connection_idle_timeout_under_pressure_ns = idle_limit_ms * std.time.ns_per_ms;
+            limits.max_connections = no_wake_pressure_max_connections;
+        },
         else => {},
     }
-    const no_wake = case == .stream_ends_with_no_wake or case == .stream_ends_with_no_wake_write_byte;
+    const pressure = case == .stream_ends_with_no_wake_pressure;
+    const no_wake = case == .stream_ends_with_no_wake or case == .stream_ends_with_no_wake_write_byte or pressure;
+    // Connections that stay open through the no-wake measurement: the
+    // pressure case's fillers.
+    const base: usize = if (pressure) no_wake_pressure_fillers else 0;
     const expiries_before = starh2.edge.connection.response_wire_expiries.load(.acquire);
     defer wire_pump.test_hold_writes.store(false, .release);
     idle_cause_seen.store(false, .release);
@@ -1578,7 +1627,9 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     var endpoint: starh2.EndpointConfig = undefined;
     var tls_cfg: ?starh2.TlsConfig = null;
     switch (transport) {
-        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0) } },
+        // One loopback client drives the server's connection limit in the
+        // pressure case: no client identity, or its share refuses first.
+        .h2c => endpoint = .{ .h2c_prior_knowledge = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = if (pressure) .none else .peer } },
         .tls => {
             cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cert.pem", gpa, .limited(64 * 1024));
             key_pem = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/key.pem", gpa, .limited(64 * 1024));
@@ -1604,25 +1655,35 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     const t = try std.Thread.spawn(.{}, idleMain, .{ server.localAddress(0).getPort(), gpa, transport, case, label, &run });
     defer run.release.store(true, .release);
     var no_wake_gone_ms: u64 = 0;
+    // The pressure case: the server's connection count when the no-wake
+    // connection was admitted.
+    var no_wake_admitted_with: usize = 0;
     if (no_wake) {
         // Nothing reaches the client, so the connection count is the only answer:
         // the handler, two limits (`nextDeadlineNs`), the unanswered PING, the
-        // drain, the close deadline.
-        const t_start = nowNs();
-        while (server.active_connections.load(.acquire) == 0) {
-            if (nowNs() >= t_start + client_deadline_ns) {
+        // drain, the close deadline. In the pressure case, timed from the
+        // no-wake connection's admission (the fillers come first).
+        var t_start = nowNs();
+        const connect_deadline = t_start + client_deadline_ns;
+        while (server.active_connections.load(.acquire) <= base) {
+            if (nowNs() >= connect_deadline) {
                 run.release.store(true, .release);
-                t.join();
+                starh2.test_sleep.joinThread(t);
                 return error.ClientNeverConnected;
             }
             zio.sleep(.fromMilliseconds(1)) catch {};
         }
+        if (pressure) {
+            t_start = nowNs();
+            no_wake_admitted_with = server.active_connections.load(.acquire);
+        }
         const stop = t_start + (slow_handler_ms + 2 * idle_limit_ms + 1000 + 300 + 500 + 1000 + @as(u64, if (case == .stream_ends_with_no_wake_write_byte) no_wake_write_byte_ms else 0)) * std.time.ns_per_ms;
-        while (server.active_connections.load(.acquire) != 0) {
+        while (server.active_connections.load(.acquire) != base) {
             if (nowNs() >= stop) {
                 wire_pump.test_hold_writes.store(false, .release);
                 run.release.store(true, .release);
-                t.join();
+                starh2.test_sleep.joinThread(t);
+                std.debug.print("{s}: still open {d} ms after it was admitted\n", .{ label, (nowNs() - t_start) / std.time.ns_per_ms });
                 return error.HeldPastIdleTimeout;
             }
             zio.sleep(.fromMilliseconds(5)) catch {};
@@ -1666,7 +1727,19 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
         // The handler learns why: the write-byte timeout, not a plain close.
         try std.testing.expect(idle_cause_was_slow.load(.acquire));
     }
-    if (case == .cut_after_goaway or case == .stream_ends_with_no_wake) {
+    if (pressure) {
+        // Admitted under pressure: the fillers were at the mark.
+        std.debug.print("{s}: admitted with {d} connections in all (mark {d}); pressure limit {d} ms, normal {d} ms\n", .{ label, no_wake_admitted_with, no_wake_pressure_fillers, idle_limit_ms, no_wake_pressure_normal_ms });
+        try std.testing.expectEqual(@as(usize, no_wake_pressure_fillers + 1), no_wake_admitted_with);
+        // The client's wait, the handler, then the fallback wake and the idle
+        // wait, each one pressure limit, then the graceful path. A fallback
+        // armed with the normal limit would add 5 s.
+        const floor_ms = 150 + slow_handler_ms + idle_limit_ms + 1000 + 300 + 500;
+        try std.testing.expect(no_wake_gone_ms + 100 >= floor_ms);
+        try std.testing.expect(no_wake_gone_ms < floor_ms + idle_limit_ms + 600);
+        try std.testing.expectEqual(@as(u64, 0), expiries);
+    }
+    if (case == .cut_after_goaway or case == .stream_ends_with_no_wake or pressure) {
         // The handler stops on its own poll, just after the close.
         const seen_stop = nowNs() + 2 * std.time.ns_per_s;
         while (!idle_cause_seen.load(.acquire)) {
@@ -1748,6 +1821,9 @@ test "idle: tls a handler cut after the first GOAWAY does not hear the server is
 }
 test "idle: h2c a last stream that ends with nothing to wake the actor still ends the connection (t-3705)" {
     try runIdleCase(.h2c, .stream_ends_with_no_wake, "h2c idle no wake");
+}
+test "idle: h2c under pressure, a last stream that ends with nothing to wake the actor ends the connection within the pressure limits (t-3890)" {
+    try runIdleCase(.h2c, .stream_ends_with_no_wake_pressure, "h2c idle no wake pressure");
 }
 test "idle: h2c a last stream that ends with bytes held in the writer is ended by the write-byte timeout, not the idle limit (t-3890)" {
     try runIdleCase(.h2c, .stream_ends_with_no_wake_write_byte, "h2c idle no wake write-byte");

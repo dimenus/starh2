@@ -4206,12 +4206,17 @@ pub const Connection = struct {
             // last stream can end with nothing left to wake the actor: a task
             // handler's response drains after the check, and the peer is not
             // reading, so no write completes. It must not stay open for ever
-            // because of that.
+            // because of that. The limit is the one an idle wait starting now
+            // would get (`idleLimitNs`): under pressure the short one, so
+            // that wake does not add a whole normal limit before the idle
+            // wait even starts. The cost: a connection with work under
+            // pressure wakes once per pressure limit (10 s by default), not
+            // once per normal limit (75 s).
             // The idle close, held back by bytes in the writer at most one
             // write-byte period (`idleCloseAt`): never a past deadline while
             // it waits, so the actor does not spin, and always a wake for the
             // bound itself.
-            const deadline = if (self.idle_since_ns) |since| self.idleCloseAt(since) else nowNs(self.config.io) +| idle_limit_ns;
+            const deadline = if (self.idle_since_ns) |since| self.idleCloseAt(since) else nowNs(self.config.io) +| self.idleLimitNs();
             if (next == null or deadline < next.?) next = deadline;
         }
         const canary_tick: u64 = if (comptime test_observe) test_polling_canary_tick_ns.load(.acquire) else 0;
@@ -6233,7 +6238,10 @@ pub const Connection = struct {
     /// deadline, at most `connection_idle_timeout_ns` (75 s by default),
     /// and pressure only shortens the waits that start under it. That tail
     /// is accepted: it is bounded, and the connections that hold it are the
-    /// ones that were already there.
+    /// ones that were already there. The fallback wake of a connection that
+    /// has work (`nextDeadlineNs`) also reads it, at each park, so an idle
+    /// wait that starts at that wake starts within the pressure limit; that
+    /// is one atomic load per park, not a wake for pressure.
     fn idleLimitNs(self: *const Connection) u64 {
         const limits = self.config.limits;
         const conns = self.config.server_connections orelse return limits.connection_idle_timeout_ns;
