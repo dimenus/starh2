@@ -4177,7 +4177,12 @@ pub const Connection = struct {
             // reading, so no write completes. It must not stay open for ever
             // because of that.
             const deadline = if (self.idle_since_ns) |since| since +| self.idle_limit_ns else nowNs(self.config.io) +| idle_limit_ns;
-            if (next == null or deadline < next.?) next = deadline;
+            // An idle wait that ran out while the writer holds bytes waits for
+            // them (`idleCloseWaitsForWriter`): its deadline is past, so arming
+            // it would wake the actor on every turn. The write-byte deadline
+            // above and the write completion that empties the writer wake it.
+            const waits_for_writer = self.idle_since_ns != null and self.idleCloseWaitsForWriter();
+            if (!waits_for_writer and (next == null or deadline < next.?)) next = deadline;
         }
         const canary_tick: u64 = if (comptime test_observe) test_polling_canary_tick_ns.load(.acquire) else 0;
         if (canary_tick != 0) {
@@ -6171,8 +6176,23 @@ pub const Connection = struct {
             return;
         }
         if (now -% self.idle_since_ns.? < self.idle_limit_ns) return;
+        if (self.idleCloseWaitsForWriter()) return;
         self.noteServerClose("connection_idle", null);
         try self.beginGraceful();
+    }
+
+    /// An idle wait that has run out does not close the connection while bytes
+    /// still wait in the writer under the write-byte clock (`wireDeadlineNs`):
+    /// a stream ends when its last frame leaves the scheduler, not when the
+    /// socket takes it. That clock closes a peer that stops reading; one that
+    /// keeps reading gets the rest, and the idle close follows once the writer
+    /// is empty (the write completion wakes the actor). The wait itself keeps
+    /// running, so a PING's ACK passing through the writer does not restart
+    /// it. With the write-byte limit off nothing else bounds the wait, so the
+    /// idle limit closes the connection as before. HTTP/1.1 has the same rule:
+    /// its wait for the next request starts once the socket took the response.
+    fn idleCloseWaitsForWriter(self: *Connection) bool {
+        return self.wireDeadlineNs() != null;
     }
 
     /// The limit for an idle wait that starts now. Under connection pressure

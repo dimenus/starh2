@@ -1259,6 +1259,11 @@ test "goaway: h2c a cancel while the main loop drain is held back by the write p
 // ---------------------------------------------------------------------------
 
 const idle_limit_ms = 300;
+/// `stream_ends_with_no_wake_write_byte`'s write-byte limit: longer than
+/// the idle path takes there (about 2.4 s: one limit, the PING, the drain,
+/// the close deadline), so an idle close that does not wait for the writer
+/// comes first and fails the test.
+const no_wake_write_byte_ms = 3000;
 
 const IdleCase = enum {
     /// The peer connects and never asks for anything, and answers nothing.
@@ -1287,7 +1292,12 @@ const IdleCase = enum {
     /// receipt that never comes. It takes a task handler: an inline response ends
     /// its stream before the next check, which then sees the end. Not TLS: there
     /// the hold parks the actor itself, and that is not what a full socket does.
+    /// The write-byte limit is off, so the idle limit is what ends it.
     stream_ends_with_no_wake,
+    /// The same, with the write-byte limit on: bytes held in the writer are
+    /// work while that clock runs, so the idle limit waits and the write-byte
+    /// timeout ends the connection. Its deadline is what wakes the actor.
+    stream_ends_with_no_wake_write_byte,
 };
 
 const IdleRun = struct {
@@ -1300,6 +1310,7 @@ const IdleRun = struct {
 /// The cause `recordCause` read from its stream's terminal state; null until then.
 var idle_cause_seen: std.atomic.Value(bool) = .init(false);
 var idle_cause_was_closed: std.atomic.Value(bool) = .init(false);
+var idle_cause_was_slow: std.atomic.Value(bool) = .init(false);
 
 fn recordCause(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     var body = try resp.startSse(&.{});
@@ -1324,6 +1335,7 @@ fn sendThenRecordCause(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Re
     resp.send(200, &.{}, "ok") catch {};
     if (resp.slotTerminal()) |cause| {
         idle_cause_was_closed.store(cause == .connection_closed, .release);
+        idle_cause_was_slow.store(cause == .slow_consumer, .release);
         idle_cause_seen.store(true, .release);
     }
 }
@@ -1512,7 +1524,7 @@ fn idleClient(port: u16, gpa: std.mem.Allocator, transport: Transport, case: Idl
             try idleSendRequest(gpa, wire, 1, "/record", true);
             try idleExpectClose(wire, 1, true, null);
         },
-        .stream_ends_with_no_wake => {
+        .stream_ends_with_no_wake, .stream_ends_with_no_wake_write_byte => {
             // Let the first writes finish, then hold the writer.
             sleepMs(100);
             wire_pump.test_hold_writes.store(true, .release);
@@ -1545,9 +1557,17 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     var limits = starh2.Limits.defaults;
     limits.connection_idle_timeout_ns = if (case == .off) 0 else idle_limit_ms * std.time.ns_per_ms;
     limits.graceful_drain_timeout_ns = 300 * std.time.ns_per_ms;
+    switch (case) {
+        .stream_ends_with_no_wake => limits.write_byte_timeout_ns = 0,
+        .stream_ends_with_no_wake_write_byte => limits.write_byte_timeout_ns = no_wake_write_byte_ms * std.time.ns_per_ms,
+        else => {},
+    }
+    const no_wake = case == .stream_ends_with_no_wake or case == .stream_ends_with_no_wake_write_byte;
+    const expiries_before = starh2.edge.connection.response_wire_expiries.load(.acquire);
     defer wire_pump.test_hold_writes.store(false, .release);
     idle_cause_seen.store(false, .release);
     idle_cause_was_closed.store(false, .release);
+    idle_cause_was_slow.store(false, .release);
 
     var cert_pem: []u8 = &.{};
     var key_pem: []u8 = &.{};
@@ -1584,7 +1604,7 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     const t = try std.Thread.spawn(.{}, idleMain, .{ server.localAddress(0).getPort(), gpa, transport, case, label, &run });
     defer run.release.store(true, .release);
     var no_wake_gone_ms: u64 = 0;
-    if (case == .stream_ends_with_no_wake) {
+    if (no_wake) {
         // Nothing reaches the client, so the connection count is the only answer:
         // the handler, two limits (`nextDeadlineNs`), the unanswered PING, the
         // drain, the close deadline.
@@ -1597,7 +1617,7 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
             }
             zio.sleep(.fromMilliseconds(1)) catch {};
         }
-        const stop = t_start + (slow_handler_ms + 2 * idle_limit_ms + 1000 + 300 + 500 + 1000) * std.time.ns_per_ms;
+        const stop = t_start + (slow_handler_ms + 2 * idle_limit_ms + 1000 + 300 + 500 + 1000 + @as(u64, if (case == .stream_ends_with_no_wake_write_byte) no_wake_write_byte_ms else 0)) * std.time.ns_per_ms;
         while (server.active_connections.load(.acquire) != 0) {
             if (nowNs() >= stop) {
                 wire_pump.test_hold_writes.store(false, .release);
@@ -1622,11 +1642,29 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
         if (nowNs() >= stop) return error.ConnectionStillCounted;
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
+    const expiries = starh2.edge.connection.response_wire_expiries.load(.acquire) - expiries_before;
     if (case == .stream_ends_with_no_wake) {
         // Through the whole graceful path, not cut: the client's wait, the handler,
         // one limit, the PING, the drain, and the close deadline (the writer is
         // held, so the close never counts as flushed).
         try std.testing.expect(no_wake_gone_ms + 100 >= 150 + slow_handler_ms + idle_limit_ms + 1000 + 300 + 500);
+        try std.testing.expectEqual(@as(u64, 0), expiries);
+    }
+    if (case == .stream_ends_with_no_wake_write_byte) {
+        // The client's wait, the handler, then the write-byte limit from the
+        // handler's held response; the idle limit and the graceful path add
+        // nothing, and their close (about 2.4 s) does not come first.
+        std.debug.print("{s}: write-byte expiries {d}\n", .{ label, expiries });
+        try std.testing.expectEqual(@as(u64, 1), expiries);
+        try std.testing.expect(no_wake_gone_ms + 100 >= 150 + slow_handler_ms + no_wake_write_byte_ms);
+        try std.testing.expect(no_wake_gone_ms < 150 + slow_handler_ms + no_wake_write_byte_ms + 600);
+        const seen_stop = nowNs() + 2 * std.time.ns_per_s;
+        while (!idle_cause_seen.load(.acquire)) {
+            if (nowNs() >= seen_stop) return error.HandlerNeverSawCause;
+            zio.sleep(.fromMilliseconds(5)) catch {};
+        }
+        // The handler learns why: the write-byte timeout, not a plain close.
+        try std.testing.expect(idle_cause_was_slow.load(.acquire));
     }
     if (case == .cut_after_goaway or case == .stream_ends_with_no_wake) {
         // The handler stops on its own poll, just after the close.
@@ -1710,6 +1748,9 @@ test "idle: tls a handler cut after the first GOAWAY does not hear the server is
 }
 test "idle: h2c a last stream that ends with nothing to wake the actor still ends the connection (t-3705)" {
     try runIdleCase(.h2c, .stream_ends_with_no_wake, "h2c idle no wake");
+}
+test "idle: h2c a last stream that ends with bytes held in the writer is ended by the write-byte timeout, not the idle limit (t-3890)" {
+    try runIdleCase(.h2c, .stream_ends_with_no_wake_write_byte, "h2c idle no wake write-byte");
 }
 test "idle: h2c a peer that holds its window and stays silent loses its connection after the kill (t-3705)" {
     try runStalledCase(.h2c, .peer_holds_window, .idle_after_kill, "h2c idle after kill");

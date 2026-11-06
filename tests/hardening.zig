@@ -156,7 +156,32 @@ const routes = [_]starh2.Route{
     .{ .method = .GET, .path = "/exact-conn", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = exactConnWrite } } },
     .{ .method = .GET, .path = "/exact", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = exactWrite } } },
     .{ .method = .GET, .path = "/flood", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = flood } } },
+    .{ .method = .GET, .path = "/tail-task", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = tailTask } } },
+    .{ .method = .GET, .path = "/tail-complete", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = tailComplete } } },
 };
+
+/// The tail tests' responses (see "the last bytes of a response").
+const tail_task_bytes = 1024 * 1024;
+/// Under `outbound_bytes_per_stream` (64 KiB), as a complete body must be.
+const tail_complete_bytes = 60 * 1024;
+const tail_complete_streams = 16;
+
+fn tailTask(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
+    const chunk: [16 * 1024]u8 = @splat('t');
+    var body = try resp.start(200, &.{});
+    var left: usize = tail_task_bytes;
+    while (left > 0) {
+        const n = @min(left, chunk.len);
+        try body.writeAll(chunk[0..n]);
+        left -= n;
+    }
+    try body.finish();
+}
+
+fn tailComplete(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    const body: [tail_complete_bytes]u8 = @splat('c');
+    try resp.send(200, &.{}, &body);
+}
 
 /// Writes the whole initial CONNECTION window (65,535 bytes), flushes, then
 /// ends the stream with a bare END_STREAM.
@@ -1583,6 +1608,391 @@ test "hardening: h1c over TCP, a peer that stops reading loses its connection at
 
 test "hardening: HTTP/1.1 over TLS, a peer that stops reading loses its connection at the write-byte timeout; a slow reader keeps its" {
     try runWriteByteOn(.h1_tls_unix);
+}
+
+// ---------------------------------------------------------------------------
+// The last bytes of a response: its streams have ended (their last frames
+// left the scheduler), but bytes still wait in the writer. That connection
+// is not idle. A reader that keeps taking bytes gets all of them; one that
+// stops is closed by the write-byte timeout, not by the idle limit.
+//
+// The idle limit is short and the write-byte limit long, so the two closes
+// fall in separate windows. Unix sockets: their kernel buffer is fixed
+// (macOS TCP loopback grows it to MBs). The client measures that buffer
+// first (FIONREAD once it stops growing: on a unix socket every byte the
+// kernel holds waits in the reader's queue), then reads quickly until
+// `tail_outside` bytes are left outside the kernel, so the streams end while
+// the writer still holds bytes. Each run checks on the server that this
+// happened (`StreamsEnd`).
+//
+// What the writer holds once the streams end is small, and smaller on TLS:
+// on h2c the write queue less the `POP_PUSHES` chunks a pop needs free
+// (about 96 KiB by default); on TLS one staged record and the pending batch
+// (the drain pops no DATA while the pump has a batch pending), measured as
+// holding 48 KiB but not 64 KiB. Hence `tail_outside`.
+//
+// The kernel differs by OS, and so does how it frees room: measured, a
+// macOS unix socket held 8 KiB and took bytes as the reader read them; a
+// Linux one held about 210 to 240 KB and woke the writer only once much of
+// that was read (see `wbRead`). So the steady reader's rate is set from the
+// kernel it measured (`tailStepBytes`): on Linux its first room for the
+// writer comes about 4 s into the slow phase, after the idle close at
+// ad23c9b, and each step of progress comes inside the write-byte limit.
+
+const tail_idle_ms = 300;
+const tail_write_byte_ms = 6000;
+const tail_outside = 40 * 1024;
+/// The streams must have ended at least this long before the bytes stopped
+/// mattering (`StreamsEnd`): longer than the idle close at ad23c9b took
+/// (1.7 to 2.1 s from the streams' end, measured). Under the write-byte
+/// limit, so a stopped reader's close can meet it.
+const tail_streams_ended_ms = 2500;
+/// Bytes the steady reader takes each `tail_step_ms`: an eighth of the
+/// kernel's buffer per second (on Linux, half of it is read in about 4 s,
+/// under the write-byte limit), and at least 10 KiB per second (the tail
+/// then lasts more than 4 s on a small macOS buffer).
+fn tailStepBytes(kernel: usize) usize {
+    const per_s = @max(kernel / 8, 10 * 1024);
+    return per_s * tail_step_ms / 1000;
+}
+const tail_step_ms = 200;
+
+const TailShape = enum {
+    /// One stream, a task handler writing `tail_task_bytes`. The handler
+    /// waits for the receipt of its last write, so it is still running while
+    /// those bytes wait.
+    task,
+    /// `tail_complete_streams` streams, each a complete (inline) handler of
+    /// `tail_complete_bytes`: nothing is still running once the last frames
+    /// leave the scheduler.
+    complete,
+
+    fn total(s: TailShape) usize {
+        return switch (s) {
+            .task => tail_task_bytes,
+            .complete => tail_complete_streams * tail_complete_bytes,
+        };
+    }
+    fn streams(s: TailShape) u31 {
+        return switch (s) {
+            .task => 1,
+            .complete => tail_complete_streams,
+        };
+    }
+};
+
+const TailReader = enum { steady, stop };
+
+const TailResult = struct {
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    /// What the kernel held once the server's sends parked.
+    kernel: usize = 0,
+    data: usize = 0,
+    ended: u31 = 0,
+    goaway: bool = false,
+    /// The server closed before the last END_STREAM.
+    closed: bool = false,
+    /// `stop`: when the client stopped reading.
+    stop_ns: std.atomic.Value(u64) = .init(0),
+    /// `steady`: from the slow phase's start to the last END_STREAM or the close.
+    slow_ms: u64 = 0,
+    /// `steady`: when the slow phase ended (the last END_STREAM or the close).
+    end_ns: std.atomic.Value(u64) = .init(0),
+};
+
+/// When the server's streams ended (`Server.stats().active_streams` back to
+/// 0 after it was not): the Session closed them, which is when the idle time
+/// starts. The connection's own close releases them too, so a test reads
+/// this against the close, not alone.
+const StreamsEnd = struct {
+    seen: bool = false,
+    at_ns: u64 = 0,
+
+    fn poll(e: *StreamsEnd, server: *const starh2.Server) void {
+        const n = server.stats().active_streams;
+        if (n != 0) {
+            e.seen = true;
+        } else if (e.seen and e.at_ns == 0) {
+            e.at_ns = nowNs();
+        }
+    }
+};
+
+/// Read at most `cap` bytes off the socket into the client, without
+/// blocking. False on EOF.
+fn tailRecv(w: *Wire, cap: usize) !bool {
+    if (w.transport == .h2c) {
+        var buf: [64 * 1024]u8 = undefined;
+        const n = std.c.recv(w.fd, &buf, @min(cap, buf.len), std.c.MSG.DONTWAIT);
+        if (n == 0) return false;
+        if (n < 0) return switch (std.c.errno(n)) {
+            .AGAIN, .INTR => true,
+            else => false,
+        };
+        try w.plain.appendSlice(w.gpa, buf[0..@intCast(n)]);
+        return true;
+    }
+    const room = w.in.len - w.in_len;
+    if (room == 0) return true;
+    const n = std.c.recv(w.fd, w.in[w.in_len..].ptr, @min(cap, room), std.c.MSG.DONTWAIT);
+    if (n == 0) return false;
+    if (n < 0) return switch (std.c.errno(n)) {
+        .AGAIN, .INTR => true,
+        else => false,
+    };
+    w.in_len += @intCast(n);
+    return true;
+}
+
+/// Decrypt every complete record and take every complete frame, reading
+/// nothing more from the socket. False once the server closed (TLS
+/// close_notify).
+fn tailFrames(w: *Wire, r: *TailResult) !bool {
+    if (w.transport == .tls) {
+        while (Wire.recordLen(w.in[0..w.in_len]) != null) {
+            if (!try w.pump()) return false;
+        }
+    }
+    while (w.plain.items.len >= frame.FRAME_HEADER_LEN) {
+        const h = w.plain.items;
+        const len = (@as(usize, h[0]) << 16) | (@as(usize, h[1]) << 8) | h[2];
+        if (h.len < frame.FRAME_HEADER_LEN + len) break;
+        const s = (try w.next(nowNs() + std.time.ns_per_s)) orelse return false;
+        switch (s.ftype) {
+            0 => {
+                r.data += w.last_payload.items.len;
+                if (s.flags & 1 != 0) r.ended += 1;
+            },
+            1 => if (s.flags & 1 != 0) {
+                r.ended += 1;
+            },
+            6 => if (s.flags & 1 == 0) {
+                // A real client answers the graceful close's PING. Best
+                // effort: the server may have closed since it sent it.
+                var pbuf: [frame.FRAME_HEADER_LEN + 8]u8 = undefined;
+                const pn = try frame.Serializer.ping(&pbuf, true, w.last_payload.items[0..8]);
+                w.send(pbuf[0..pn]) catch {};
+            },
+            7 => r.goaway = true,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Bytes the server sent that this client has taken off the socket.
+fn tailTaken(w: *const Wire, r: *const TailResult) usize {
+    return r.data + w.plain.items.len + w.in_len;
+}
+
+fn tailClient(gpa: std.mem.Allocator, t: Transport, path: []const u8, shape: TailShape, reader: TailReader, r: *TailResult) void {
+    tailClientRun(gpa, t, path, shape, reader, r) catch |err| {
+        r.err = err;
+    };
+    r.done.store(true, .release);
+}
+
+fn tailClientRun(gpa: std.mem.Allocator, t: Transport, path: []const u8, shape: TailShape, reader: TailReader, r: *TailResult) !void {
+    const w = try Wire.connectUnix(gpa, t, path, wb_rcvbuf);
+    defer w.close();
+    try w.handshake();
+    var req = try h2c.buildClientPreface(gpa, .empty);
+    defer req.deinit(gpa);
+    var sbuf: [64]u8 = undefined;
+    const settings = [_]frame.Setting{ .{ .id = .max_concurrent_streams, .value = 256 }, .{ .id = .initial_window_size, .value = 1 << 30 } };
+    const sn = try frame.Serializer.settingsFrame(&sbuf, false, &settings);
+    try req.appendSlice(gpa, sbuf[0..sn]);
+    try h2c.appendWindowUpdate(gpa, &req, 0, 1 << 30);
+    for (0..shape.streams()) |i| try h2c.appendHeaders(gpa, &req, @intCast(1 + 2 * i), if (shape == .task) "/tail-task" else "/tail-complete", true);
+    try w.send(req.items);
+
+    // The kernel buffer, once full: no growth for 300 ms.
+    var last: usize = 0;
+    var still_ms: u32 = 0;
+    const fill_deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (still_ms < 300) {
+        if (nowNs() >= fill_deadline) return error.KernelNeverFilled;
+        threadSleepMs(20);
+        const k = w.unreadBytes();
+        if (k == last and k != 0) still_ms += 20 else still_ms = 0;
+        last = k;
+    }
+    r.kernel = last;
+    const total = shape.total();
+    if (total < r.kernel + tail_outside + 64 * 1024) return error.ResponseFitsTheKernel;
+
+    // Quickly, until `tail_outside` bytes are left outside the kernel.
+    while (tailTaken(w, r) + w.unreadBytes() + tail_outside < total) {
+        threadSleepMs(1);
+        if (!try tailRecv(w, 16 * 1024)) return error.ClosedEarly;
+        if (!try tailFrames(w, r)) return error.ClosedEarly;
+    }
+
+    const slow_start = nowNs();
+    switch (reader) {
+        .stop => {
+            r.stop_ns.store(slow_start, .release);
+            while (!r.release.load(.acquire)) threadSleepMs(5);
+        },
+        .steady => {
+            const step = tailStepBytes(r.kernel);
+            const deadline = slow_start + 60 * std.time.ns_per_s;
+            while (r.ended < shape.streams()) {
+                if (nowNs() >= deadline) return error.SteadyReaderTimedOut;
+                threadSleepMs(tail_step_ms);
+                if (!try tailRecv(w, step) or !try tailFrames(w, r)) {
+                    // Take what was already read, then report the close
+                    // if it came before the last END_STREAM.
+                    _ = tailFrames(w, r) catch {};
+                    r.closed = r.ended < shape.streams();
+                    break;
+                }
+            }
+            r.slow_ms = (nowNs() - slow_start) / ms;
+            r.end_ns.store(nowNs(), .release);
+        },
+    }
+}
+
+fn runTail(rt: *zio.Runtime, gpa: std.mem.Allocator, t: Transport, shape: TailShape, reader: TailReader) !void {
+    var limits = starh2.Limits.defaults;
+    limits.connection_idle_timeout_ns = tail_idle_ms * ms;
+    limits.write_byte_timeout_ns = tail_write_byte_ms * ms;
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/starh2-tail-{d}-{s}.sock", .{ std.c.getpid(), @tagName(t) });
+    var run: Running = undefined;
+    try startServerAt(rt, gpa, if (t == .tls) .tls else .h2c, limits, path, &run);
+    defer run.stop();
+    const expiries_before = conn_mod.response_wire_expiries.load(.acquire);
+
+    // Each close prints its site (`write_byte_timeout`, `connection_idle`):
+    // which rule ended the connection.
+    conn_mod.close_reason = true;
+    defer conn_mod.close_reason = false;
+    var r: TailResult = .{};
+    const th = try std.Thread.spawn(.{}, tailClient, .{ gpa, t, path, shape, reader, &r });
+    var joined = false;
+    defer if (!joined) {
+        r.release.store(true, .release);
+        starh2.test_sleep.joinThread(th);
+    };
+
+    var gone_ms: ?u64 = null;
+    var gone_ns: u64 = 0;
+    var ends: StreamsEnd = .{};
+    // What the server still held to write when the client stopped
+    // (`Server.stats().outbound_bytes`, scheduler and writer together).
+    var held_at_stop: ?usize = null;
+    switch (reader) {
+        .stop => {
+            while (r.stop_ns.load(.acquire) == 0 and !r.done.load(.acquire)) {
+                ends.poll(&run.server);
+                zio.sleep(.fromMilliseconds(2)) catch {};
+            }
+            const stop_ns = r.stop_ns.load(.acquire);
+            if (stop_ns != 0) {
+                held_at_stop = run.server.stats().outbound_bytes;
+                const deadline = stop_ns + (tail_write_byte_ms + 3000) * ms;
+                while (run.server.active_connections.load(.acquire) != 0 and nowNs() < deadline) {
+                    ends.poll(&run.server);
+                    zio.sleep(.fromMilliseconds(2)) catch {};
+                }
+                if (run.server.active_connections.load(.acquire) == 0) {
+                    gone_ns = nowNs();
+                    gone_ms = (gone_ns - stop_ns) / ms;
+                }
+            }
+            r.release.store(true, .release);
+        },
+        .steady => {},
+    }
+    while (!r.done.load(.acquire)) {
+        ends.poll(&run.server);
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    starh2.test_sleep.joinThread(th);
+    joined = true;
+    const expiries = conn_mod.response_wire_expiries.load(.acquire) - expiries_before;
+    // How long the streams had been ended when the bytes stopped mattering:
+    // the close (`stop`), or the client's last END_STREAM (`steady`).
+    const after_ns = if (reader == .stop) gone_ns else r.end_ns.load(.acquire);
+    const ended_before_ms: ?u64 = if (ends.at_ns != 0 and after_ns >= ends.at_ns) (after_ns - ends.at_ns) / ms else null;
+    std.debug.print("hardening tail {s} {s} {s}: kernel held {d} B; data {d} of {d} B; streams ended {d} of {d}; goaway={} closed={}; slow phase {d} ms; gone {?d} ms after the stop; server held {?d} B at the stop; server streams ended {?d} ms before the {s}; write-byte expiries {d}; err={?}\n", .{
+        @tagName(t), @tagName(shape), @tagName(reader), r.kernel, r.data, shape.total(), r.ended, shape.streams(), r.goaway, r.closed, r.slow_ms, gone_ms, held_at_stop, ended_before_ms, if (reader == .stop) "close" else "last END_STREAM", expiries, r.err,
+    });
+    if (r.err) |err| return err;
+    switch (reader) {
+        .steady => {
+            // Every byte, and the connection was not cut first.
+            try std.testing.expectEqual(shape.total(), r.data);
+            try std.testing.expectEqual(shape.streams(), r.ended);
+            try std.testing.expect(!r.closed);
+            try std.testing.expectEqual(@as(u64, 0), expiries);
+        },
+        .stop => {
+            // Closed by the write-byte timeout, timed from the last byte the
+            // socket took (at most the stop, plus the writer refilling the
+            // room the last read made); not by the idle limit, which is
+            // about 2 s with the graceful steps.
+            const g = gone_ms orelse return error.NeverClosed;
+            try std.testing.expectEqual(@as(u64, 1), expiries);
+            try std.testing.expect(g + 100 >= tail_write_byte_ms);
+            try std.testing.expect(g < tail_write_byte_ms + 1000);
+        },
+    }
+    // A pass counts only if the shape under test happened, checked on the
+    // server: its streams ended while bytes were still to be delivered, long
+    // enough before the end that an idle close that does not wait for the
+    // writer would have come first (at ad23c9b it came 1.7 to 2.1 s after
+    // the streams ended). Checked after the result, so a failure above
+    // still says what failed.
+    const ended_before = ended_before_ms orelse return error.StreamsNeverEndedFirst;
+    if (ended_before < tail_streams_ended_ms) return error.StreamsEndedTooLate;
+}
+
+/// The h2c task-handler shape is left out: its handler waits for the
+/// receipt of its last write, which h2c sends once the socket took it, so
+/// `live_handlers` holds the graceful close back and the idle rule never
+/// decides (at ad23c9b it was not cut either). TLS sends that receipt once
+/// the records are staged (`Pump.drivePending`), so there it is cut.
+fn runTailOn(t: Transport, shape: TailShape, reader: TailReader) !void {
+    if (builtin.os.tag != .macos) {
+        // A Linux unix socket frees room in large steps (the writer is woken
+        // once much of the kernel's 210 to 240 KB is read), and the writer's
+        // tail goes into the kernel in that same step, so whether the streams
+        // end while the writer holds bytes depends on where the step falls.
+        // Measured on nachos: an h2c stopping reader reached that shape in 1
+        // of 3 runs (the server held 0 B at the stop in the other 2), and a
+        // TLS one never (the TLS tail is one staged record and the pending
+        // batch, about 48 KiB). macOS takes bytes as they are read, and runs
+        // these. `stream_ends_with_no_wake_write_byte` in goaway_delivery.zig
+        // covers the rule on every OS, with the writer held by a test hook.
+        std.debug.print("hardening tail {s} {s} {s}: skipped, macOS only (a Linux unix socket frees room in steps larger than the writer's tail)\n", .{ @tagName(t), @tagName(shape), @tagName(reader) });
+        return error.SkipZigTest;
+    }
+    const gpa = std.testing.allocator;
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runTail, .{ rt, gpa, t, shape, reader });
+    try h.join();
+}
+
+test "hardening: tls tail, a steady reader gets the last bytes of a task handler's response" {
+    try runTailOn(.tls, .task, .steady);
+}
+test "hardening: h2c tail, a steady reader gets the last bytes of complete responses" {
+    try runTailOn(.h2c, .complete, .steady);
+}
+test "hardening: tls tail, a steady reader gets the last bytes of complete responses" {
+    try runTailOn(.tls, .complete, .steady);
+}
+test "hardening: h2c tail, a reader that stops after its streams ended is closed by the write-byte timeout, not the idle limit" {
+    try runTailOn(.h2c, .complete, .stop);
+}
+test "hardening: tls tail, a reader that stops after its streams ended is closed by the write-byte timeout, not the idle limit" {
+    try runTailOn(.tls, .complete, .stop);
 }
 
 // ---------------------------------------------------------------------------
