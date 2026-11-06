@@ -450,9 +450,15 @@ pub const Limits = struct {
     /// write-byte period more (`connection.idleCloseAtNs`): a slow reader gets
     /// the end of its response, one that stops reading is the write-byte
     /// timeout's, and one that takes a byte just inside every period is
-    /// closed at the bound. So a connection whose streams ended stays open at
-    /// most this plus `write_byte_timeout_ns` (135 s by default) before the
-    /// graceful close starts. With that limit off, this one alone closes it.
+    /// closed at the bound. So the graceful close starts at most this plus
+    /// `write_byte_timeout_ns` after the idle wait starts (135 s by default).
+    /// The wait starts at the first check after the last stream ended
+    /// (`Connection.idle_since_ns`): at once when something wakes the
+    /// connection then, and up to this limit later when nothing does (the
+    /// fallback wake in `Connection.nextDeadlineNs`). So from the last
+    /// stream's end the worst case is twice this plus `write_byte_timeout_ns`:
+    /// 210 s by default. With the write-byte limit off, this one alone closes
+    /// it, up to twice this after the last stream's end.
     /// HTTP/1.1 has no such state: a write returns only once the socket took
     /// it, and the wait for the next request starts after that. A handler
     /// does not count: one still running after its stream ended (it can be
@@ -488,10 +494,15 @@ pub const Limits = struct {
     /// The mark is low (a quarter of the server), so this is a moderate cut,
     /// not an emergency one: 10 s is the normal HTTP/2 idle timeout of some
     /// servers (h2o), so clients already live with it, and an idle
-    /// connection then holds its slot for 10 s instead of 75. One whose
-    /// writer still holds bytes when the 10 s run out holds it at most one
-    /// `write_byte_timeout_ns` more (70 s by default), the same bound as
-    /// without pressure (`connection_idle_timeout_ns`). HTTP/1.1 does
+    /// connection then holds its slot for 10 s instead of 75, counted from
+    /// the start of its idle wait. One whose writer still holds bytes when
+    /// the 10 s run out holds it at most one `write_byte_timeout_ns` more:
+    /// 70 s from that start by default, the same rule as without pressure
+    /// (`connection_idle_timeout_ns`). The start can come late: when nothing
+    /// wakes the connection after its last stream ended, its next check is
+    /// the fallback wake, armed `connection_idle_timeout_ns` (75 s) ahead,
+    /// not this limit. So from the last stream's end the worst case under
+    /// pressure is 75 + 10 + 60 = 145 s by default. HTTP/1.1 does
     /// not use it: its wait for the next request is `field_block_timeout_ns`,
     /// 5 s, already shorter.
     connection_idle_timeout_under_pressure_ns: u64 = 10 * std.time.ns_per_s,
