@@ -83,6 +83,18 @@
 //!   first.
 //!
 //! `std.Thread` (OS threads) is outside this ban.
+//!
+//! # Blocking sleeps (t-3885)
+//!
+//! Under `src/` and `tests/` only, a `blocking_sleep` finding is any
+//! `nanosleep`, `clock_nanosleep` or `usleep` identifier (a call, an alias, a
+//! `std.posix.system.nanosleep`), and any `Thread.sleep`. A blocking sleep on
+//! a zio executor thread stops that executor's event loop (t-3878: a test's
+//! `nanosleep` on a task held a timer-cancel completion for 10 s). The one
+//! file allowed them is `sleep_helper` (`src/test_sleep.zig`), whose sleeps
+//! panic on an executor thread; tasks wait with `zio.sleep` or `io.sleep`
+//! (the zio vtable), which are not banned. Not seen: a sleep built from
+//! another blocking call with a timeout (`poll`, `select`, a read timeout).
 const std = @import("std");
 
 /// Declarations of `std.Io` that are concurrency (Zig 0.17). Reaching one
@@ -125,7 +137,44 @@ pub const required_dirs = [_][]const u8{ "src", "tests", "examples", "tools" };
 /// type, not an unresolved receiver.
 pub const own_modules = [_][]const u8{ "starh2", "starh2_h2_client", "starh2_datastar", "h2_client", "h2_oracle" };
 
-pub const Rule = enum { io_decl, io_alias, unresolved, spawn_call, non_zio_call, field_access };
+pub const Rule = enum { io_decl, io_alias, unresolved, spawn_call, non_zio_call, field_access, blocking_sleep };
+
+/// Raw blocking sleeps, banned under `sleep_dirs` outside `sleep_helper`.
+pub const sleep_names = [_][]const u8{ "nanosleep", "clock_nanosleep", "usleep" };
+/// Where `blocking_sleep` applies: the server and its tests, whose code runs
+/// on zio executors. `examples/` and `tools/` hold benchmarks and harnesses
+/// with their own OS threads.
+pub const sleep_dirs = [_][]const u8{ "src", "tests" };
+/// The one file under `sleep_dirs` that may sleep: its sleeps check the thread.
+pub const sleep_helper = "src/test_sleep.zig";
+
+/// `blocking_sleep` findings in `source`, a file under `sleep_dirs`.
+pub fn scanSleeps(gpa: std.mem.Allocator, source: [:0]const u8, out: *std.ArrayList(Finding)) !void {
+    var tokenizer: std.zig.Tokenizer = .init(source);
+    // The last two significant tokens before this one, for `Thread . sleep`.
+    var prev: [2]?std.zig.Token = .{ null, null };
+    while (true) {
+        const t = tokenizer.next();
+        switch (t.tag) {
+            .eof => break,
+            .doc_comment, .container_doc_comment => continue,
+            else => {},
+        }
+        if (t.tag == .identifier) {
+            var name = source[t.loc.start..t.loc.end];
+            if (name.len >= 3 and name[0] == '@' and name[1] == '"') name = name[2 .. name.len - 1];
+            if (contains(&sleep_names, name)) {
+                try out.append(gpa, .{ .offset = t.loc.start, .rule = .blocking_sleep, .name = name });
+            } else if (std.mem.eql(u8, name, "sleep")) {
+                if (prev[1]) |dot| if (prev[0]) |thread| {
+                    if (dot.tag == .period and thread.tag == .identifier and std.mem.eql(u8, source[thread.loc.start..thread.loc.end], "Thread"))
+                        try out.append(gpa, .{ .offset = thread.loc.start, .rule = .blocking_sleep, .name = "Thread.sleep" });
+                };
+            }
+        }
+        prev = .{ prev[1], t };
+    }
+}
 
 pub const Finding = struct {
     /// Byte offset of the offending name in the source.
@@ -578,6 +627,8 @@ pub fn main(init: std.process.Init) !u8 {
     var per_dir: [required_dirs.len]usize = @splat(0);
     var lines: usize = 0;
     var total: usize = 0;
+    var sleep_scanned: usize = 0;
+    var sleep_helper_seen = false;
     for (files.items) |path| {
         const source = root.readFileAllocOptions(io, path, arena, .limited(64 << 20), .of(u8), 0) catch |err| {
             std.debug.print("std-io-gate FATAL: cannot read {s}: {t}\n", .{ path, err });
@@ -590,6 +641,13 @@ pub fn main(init: std.process.Init) !u8 {
         var found: std.ArrayList(Finding) = .empty;
         defer found.deinit(gpa);
         try scan(gpa, source, &found);
+        for (sleep_dirs) |d| {
+            if (std.mem.startsWith(u8, path, d) and path.len > d.len and path[d.len] == std.fs.path.sep and !std.mem.eql(u8, path, sleep_helper)) {
+                sleep_scanned += 1;
+                try scanSleeps(gpa, source, &found);
+            }
+        }
+        if (std.mem.eql(u8, path, sleep_helper)) sleep_helper_seen = true;
         for (found.items) |f| {
             var line: usize = 1;
             var line_start: usize = 0;
@@ -626,8 +684,15 @@ pub fn main(init: std.process.Init) !u8 {
             return 3;
         }
     }
+    std.debug.print("std-io-gate: blocking sleeps checked in {d} files under src/ and tests/, all but {s}\n", .{ sleep_scanned, sleep_helper });
+    // The exemption names a file; if it moved, the rule would exempt nothing
+    // and still pass, so a missing helper is a broken scan.
+    if (!sleep_helper_seen) {
+        std.debug.print("std-io-gate FATAL: the sleep helper {s} was not found\n", .{sleep_helper});
+        return 3;
+    }
     if (total != 0) {
-        std.debug.print("std-io-gate: {d} banned std.Io concurrency uses. Use zio, or ask Ryan.\n", .{total});
+        std.debug.print("std-io-gate: {d} banned uses: std.Io concurrency (use zio, or ask Ryan), or a blocking sleep outside {s} (a task uses zio.sleep; an OS thread uses starh2.test_sleep)\n", .{ total, sleep_helper });
         return 1;
     }
     std.debug.print("std-io-gate: 0 banned uses\n", .{});
@@ -782,4 +847,41 @@ test "@field on std.Io" {
         \\const U = @field(std, name);
         \\const ok = @field(self, "event");
     , &.{ .field_access, .field_access, .field_access });
+}
+
+fn expectSleeps(source: [:0]const u8, want: []const []const u8) !void {
+    var out: std.ArrayList(Finding) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try scanSleeps(std.testing.allocator, source, &out);
+    errdefer for (out.items) |f| std.debug.print("  got {s} at {d}\n", .{ f.name, f.offset });
+    try std.testing.expectEqual(want.len, out.items.len);
+    for (want, out.items) |w, f| {
+        try std.testing.expectEqual(Rule.blocking_sleep, f.rule);
+        try std.testing.expectEqualStrings(w, f.name);
+    }
+}
+
+test "blocking sleeps: every raw spelling, and Thread.sleep" {
+    try expectSleeps(
+        \\_ = std.c.nanosleep(&t, null);
+        \\_ = std.posix.system.nanosleep(&ts, null);
+        \\_ = std.c.clock_nanosleep(.MONOTONIC, .{}, &t, null);
+        \\_ = usleep(10);
+        \\std.Thread.sleep(5);
+        \\const ns = std.c.nanosleep;
+        \\_ = @"nanosleep"(&t, null);
+    , &.{ "nanosleep", "nanosleep", "clock_nanosleep", "usleep", "Thread.sleep", "nanosleep", "nanosleep" });
+}
+
+test "blocking sleeps: zio and std.Io sleeps, comments and strings are not findings" {
+    try expectSleeps(
+        \\zio.sleep(.fromMilliseconds(2)) catch {};
+        \\try io.sleep(.fromMilliseconds(1), .awake);
+        \\starh2.test_sleep.threadSleepMs(5);
+        \\// nanosleep here is a comment
+        \\/// so is std.Thread.sleep
+        \\const msg = "nanosleep in a string";
+        \\const sleep = 3;
+        \\_ = self.sleep;
+    , &.{});
 }
