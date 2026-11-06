@@ -27,6 +27,12 @@
 //! and the transport witness (`tests/dst_tls_lifecycle.zig`) drives the
 //! held case for HTTP/1.1 exactly. Each test runs `rounds` rounds on one
 //! server.
+//!
+//! A send in flight is likely at the decrypt error, not guaranteed: the
+//! stalled send can complete at the moment the bad record arrives, with
+//! nothing left to send (t-3871). So the HTTP/1.1 arm requires it in at least
+//! half the rounds, and prints the count. A run where the pump is never
+//! sending still fails; a single round that lost the race does not.
 const std = @import("std");
 const zio = @import("zio");
 const serve_deadline = @import("serve_deadline.zig");
@@ -291,7 +297,10 @@ fn runRounds(rt: *zio.Runtime, gpa: std.mem.Allocator, proto: Proto) !void {
     // nothing.
     switch (proto) {
         .h2 => try std.testing.expectEqual(@as(usize, rounds), holding_rounds),
-        .http11 => try std.testing.expectEqual(@as(usize, rounds), sending_rounds),
+        .http11 => if (sending_rounds < rounds / 2) {
+            std.debug.print("decrypt-error http11: a send in flight in only {d} of {d} rounds, want at least {d}\n", .{ sending_rounds, rounds, rounds / 2 });
+            return error.TooFewRoundsSending;
+        },
     }
 
     server.requestShutdown();
