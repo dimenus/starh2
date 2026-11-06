@@ -93,6 +93,8 @@ pub const http1 = @import("http1.zig");
 pub const Limits = core.limits.Limits;
 pub const ResourceUpperBound = core.limits.ResourceUpperBound;
 pub const physical_cpus = @import("physical_cpus.zig");
+/// The blocking sleeps test code may use: they panic on a zio executor thread.
+pub const test_sleep = @import("test_sleep.zig");
 pub const Server = edge.server.Server;
 pub const Balancer = edge.balancer.Balancer;
 pub const ServerConfig = edge.server.ServerConfig;

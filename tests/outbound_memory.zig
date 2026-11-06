@@ -267,8 +267,7 @@ fn floodRun(f: *Flood) !void {
 }
 
 fn sleepMs(ms: u32) void {
-    const t: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(ms);
 }
 
 fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void {

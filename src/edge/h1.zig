@@ -2263,8 +2263,7 @@ test "FIONREAD counts the bytes a TCP socket holds unread (the lingering close's
     // Loopback delivers before send returns on both OSes; allow a moment.
     var waited: usize = 0;
     while (queuedInput(server).? < bytes.len and waited < 1000) : (waited += 1) {
-        const t: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.c.nanosleep(&t, null);
+        @import("../test_sleep.zig").threadSleepMs(1);
     }
     try std.testing.expectEqual(@as(?usize, bytes.len), queuedInput(server));
     // A closed descriptor: the ioctl fails, and the caller is told so.

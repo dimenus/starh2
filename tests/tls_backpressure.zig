@@ -220,8 +220,7 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, shape: Shape, out: *ClientResult
     if (shape.request_delay_ns != 0) {
         try sendWire(&conn, client, wire.items);
         wire.clearRetainingCapacity();
-        const delay: std.c.timespec = .{ .sec = 0, .nsec = @intCast(shape.request_delay_ns) };
-        _ = std.c.nanosleep(&delay, null);
+        starh2.test_sleep.threadSleepNs(shape.request_delay_ns);
     }
     for (0..shape.streams) |i| try h2c.appendHeaders(gpa, &wire, @intCast(1 + 2 * i), shape.path, true);
     try sendWire(&conn, client, wire.items);
@@ -229,8 +228,7 @@ fn clientRun(port: u16, gpa: std.mem.Allocator, shape: Shape, out: *ClientResult
     // Stop reading while the server writes the body: its socket fills and a
     // send stays in flight.
     if (shape.read_pause_ns != 0) {
-        const pause: std.c.timespec = .{ .sec = 0, .nsec = @intCast(shape.read_pause_ns) };
-        _ = std.c.nanosleep(&pause, null);
+        starh2.test_sleep.threadSleepNs(shape.read_pause_ns);
     }
 
     // Read frames until every stream ends. A read timeout on the socket keeps

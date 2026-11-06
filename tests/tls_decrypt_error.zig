@@ -166,8 +166,7 @@ fn clientRun(c: *Client) !void {
 }
 
 fn sleepMs(ms: u32) void {
-    const t: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(ms);
 }
 
 /// A fresh HTTP/2 connection gets `/hello`: the server survived. On an OS

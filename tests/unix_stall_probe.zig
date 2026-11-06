@@ -136,8 +136,7 @@ fn clientRun(c: *Client) !void {
             try w.send(&ping);
             next_ping = nowNs() + 50 * std.time.ns_per_ms;
         }
-        const nap: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&nap, null);
+        starh2.test_sleep.threadSleepMs(5);
     }
     // Read until the server closes.
     var cancelled = false;

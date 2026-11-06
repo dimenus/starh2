@@ -757,8 +757,7 @@ const Stalled = struct {
 };
 
 fn sleepMs(ms: u32) void {
-    const t: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, ms) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(ms);
 }
 
 fn stalledMain(port: u16, gpa: std.mem.Allocator, transport: Transport, stall: Stall, st: *Stalled) void {
@@ -2029,8 +2028,7 @@ const H1OutliveClient = struct {
         // Closed (`peer_close`) or let go (`shutdown`) when the test says, so
         // the handler's first event has been acknowledged to it first.
         while (!c.release.load(.acquire)) {
-            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-            _ = std.c.nanosleep(&t, null);
+            starh2.test_sleep.threadSleepMs(5);
         }
     }
 };
@@ -2308,8 +2306,7 @@ const H1StalledClient = struct {
         try w.send("GET /flood HTTP/1.1\r\nHost: localhost\r\n\r\n");
         c.ready.store(true, .release);
         while (!c.release.load(.acquire)) {
-            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-            _ = std.c.nanosleep(&t, null);
+            starh2.test_sleep.threadSleepMs(5);
         }
     }
 };
@@ -2448,8 +2445,7 @@ const H1Exchange = struct {
         @memcpy(c.got[0..c.got_len], w.plain.items[0..c.got_len]);
         c.answered.store(true, .release);
         while (c.hold and !c.release.load(.acquire)) {
-            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-            _ = std.c.nanosleep(&t, null);
+            starh2.test_sleep.threadSleepMs(5);
         }
     }
 
@@ -2661,8 +2657,7 @@ const H1Drainer = struct {
             break Wire.openAlpn(tsan_allocator.pageAllocator(), .tls, c.port, null, "http/1.1") catch |err| switch (err) {
                 error.Connect => {
                     if (!c.connect_retry or nowNs() >= deadline) return err;
-                    const t: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-                    _ = std.c.nanosleep(&t, null);
+                    starh2.test_sleep.threadSleepMs(2);
                     continue;
                 },
                 else => return err,

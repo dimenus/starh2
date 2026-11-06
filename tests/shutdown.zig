@@ -103,8 +103,7 @@ const Client = struct {
                 }
                 continue;
             }
-            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * ms };
-            _ = std.c.nanosleep(&t, null);
+            starh2.test_sleep.threadSleepMs(5);
         }
     }
 };
@@ -191,8 +190,7 @@ fn openRetry(gpa: std.mem.Allocator, port: u16) !*Wire {
         return Wire.open(gpa, .h2c, port) catch |err| switch (err) {
             error.Connect => {
                 if (nowNs() >= deadline) return err;
-                const t: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-                _ = std.c.nanosleep(&t, null);
+                starh2.test_sleep.threadSleepMs(2);
                 continue;
             },
             else => return err,

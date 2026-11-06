@@ -50,8 +50,7 @@ pub fn connectRetry(port: u16, deadline_ns: u64) !c_int {
         if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) == 0) return fd;
         _ = std.c.close(fd);
         if (nowNs() >= deadline_ns) return error.Connect;
-        const t: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&t, null);
+        starh2.test_sleep.threadSleepMs(2);
     }
 }
 

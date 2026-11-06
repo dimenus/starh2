@@ -35,8 +35,9 @@ fn upload(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteRespo
 /// purpose, here and nowhere else: it is the only way to leave input in the
 /// socket with every buffer of the server empty (the FIONREAD case).
 fn busy(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
-    const t: std.c.timespec = .{ .sec = 0, .nsec = 150 * ms };
-    _ = std.c.nanosleep(&t, null);
+    // On purpose: the actor stays busy while the client's bytes sit in the
+    // socket (the `queued` linger reason).
+    starh2.test_sleep.holdExecutorMs(150);
     try resp.send(200, &.{}, "busy");
 }
 
@@ -152,8 +153,7 @@ fn expectWithin(comptime what: []const u8, got_ms: u64, lo: u64, hi: u64) !void 
 
 /// OS-thread sleep, for the client threads only (never on a zio task).
 fn osSleepMs(n: u64) void {
-    const t: std.c.timespec = .{ .sec = @intCast(n / 1000), .nsec = @intCast((n % 1000) * ms) };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(n);
 }
 
 // ---------------------------------------------------------------------------

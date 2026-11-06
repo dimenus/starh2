@@ -46,10 +46,6 @@ fn nowNs() u64 {
     return zio.Timestamp.now(.monotonic).toNanoseconds();
 }
 
-fn osSleepMs(n: u64) void {
-    const t: std.c.timespec = .{ .sec = @intCast(n / 1000), .nsec = @intCast((n % 1000) * ms) };
-    _ = std.c.nanosleep(&t, null);
-}
 
 // ---------------------------------------------------------------------------
 // Handlers.

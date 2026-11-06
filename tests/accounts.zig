@@ -554,8 +554,7 @@ const TlsProxyClient = struct {
         try w.sendUnchecked(req.items);
         self.ok.store(true, .release);
         while (!release.load(.acquire)) {
-            const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * ms };
-            _ = std.c.nanosleep(&t, null);
+            starh2.test_sleep.threadSleepMs(5);
         }
     }
 };
@@ -1348,8 +1347,7 @@ fn soakTlsOne(ctx: *SoakCtx, r: std.Random) !void {
         sid += 2;
     }
     try w.sendUnchecked(req.items);
-    const t: std.c.timespec = .{ .sec = 0, .nsec = @intCast(r.uintLessThan(u64, 80) * ms) };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(r.uintLessThan(u64, 80));
     if (r.boolean()) {
         const lg: std.c.linger = .{ .onoff = 1, .linger = 0 };
         _ = std.c.setsockopt(w.fd, std.c.SOL.SOCKET, std.c.SO.LINGER, std.mem.asBytes(&lg), @sizeOf(std.c.linger));

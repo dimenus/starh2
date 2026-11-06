@@ -79,8 +79,7 @@ fn clientMain(port: u16, release: *std.atomic.Value(bool)) void {
     h2c.appendHeaders(gpa, &req, 1, "/stuck", true) catch return;
     w.send(req.items) catch return;
     while (!release.load(.acquire)) {
-        const t: std.c.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
-        _ = std.c.nanosleep(&t, null);
+        starh2.test_sleep.threadSleepMs(5);
     }
 }
 

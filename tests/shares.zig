@@ -57,8 +57,7 @@ fn nowNs() u64 {
 
 /// Off a zio task (the clients run on blocking threads).
 fn osSleepMs(n: u64) void {
-    const t: std.c.timespec = .{ .sec = @intCast(n / 1000), .nsec = @intCast((n % 1000) * ms) };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(n);
 }
 
 // ---------------------------------------------------------------------------

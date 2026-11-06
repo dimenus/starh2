@@ -508,8 +508,7 @@ fn clientRun(c: *Client) !void {
                 }
             } else {
                 if (nowNs() >= deadline) return error.Deadline;
-                const nap: std.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-                _ = std.c.nanosleep(&nap, null);
+                starh2.test_sleep.threadSleepMs(2);
                 continue;
             }
         }

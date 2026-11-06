@@ -347,8 +347,7 @@ fn waitCount(comptime what: []const u8, value: *const std.atomic.Value(usize), w
 // Clients. Each runs on its own OS thread: `Wire` blocks.
 
 fn threadSleepMs(n: u32) void {
-    const t: std.c.timespec = .{ .sec = 0, .nsec = @as(isize, n) * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(n);
 }
 
 /// `Wire` sets a 1 s receive timeout, so `next` can block a full second past

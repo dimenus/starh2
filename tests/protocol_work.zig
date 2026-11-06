@@ -925,8 +925,7 @@ fn waitStarted(n: usize, timeout_ms: u64) bool {
 }
 
 fn osSleepMs(n: u64) void {
-    const t: std.c.timespec = .{ .sec = @intCast(n / 1000), .nsec = @intCast((n % 1000) * ms) };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(n);
 }
 
 /// What one connection saw, frame by frame.

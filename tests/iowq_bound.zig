@@ -154,8 +154,7 @@ fn readSmall(path: *[64]u8, buf: *[64]u8, tid: []const u8, file: []const u8) ?[]
 }
 
 fn osSleepMs(n: u64) void {
-    const t: std.c.timespec = .{ .sec = @intCast(n / 1000), .nsec = @intCast((n % 1000) * ms) };
-    _ = std.c.nanosleep(&t, null);
+    starh2.test_sleep.threadSleepMs(n);
 }
 
 /// The client side, on a blocking-pool thread (it sleeps and blocks; a zio
