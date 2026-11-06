@@ -421,6 +421,19 @@ pub const Limits = struct {
     /// After that grace, how often `Server.serve` reports the handlers it is
     /// still waiting for. Must be non-zero.
     shutdown_report_interval_ns: u64 = 10 * std.time.ns_per_s,
+    /// The executor watchdog (`edge/watchdog.zig`): an executor that is not
+    /// parked and makes no scheduler progress (no task switch, no park) for
+    /// at least this long is logged once, as a warning, with the route its
+    /// running handler serves. Reported, never stopped. One OS thread reads
+    /// every executor each half of this. 0 turns it off; otherwise at least
+    /// 1 ms, so the thread cannot spin.
+    ///
+    /// 1 s: zio aims to switch about every 100 us, so an executor held for
+    /// 1 s has stalled every connection on it ten thousand times longer
+    /// than that, which no correct handler does; and it is long enough that
+    /// heavy but finite work (a TLS handshake, a large compression in a
+    /// Debug build) is not reported.
+    executor_stall_report_ns: u64 = 1 * std.time.ns_per_s,
     /// How long an HTTP/2 connection may have nothing to do before the server
     /// ends it, with the same two GOAWAYs as a graceful shutdown. It has nothing
     /// to do when no stream is open and no header block is arriving, so a
@@ -782,6 +795,7 @@ pub const Limits = struct {
         // Zero would close before the GOAWAY is written, the defect this limit exists to remove.
         if (self.close_flush_timeout_ns == 0) return error.InvalidConfig;
         if (self.shutdown_report_interval_ns == 0) return error.InvalidConfig;
+        if (self.executor_stall_report_ns != 0 and self.executor_stall_report_ns < std.time.ns_per_ms) return error.InvalidConfig;
         if (self.concurrent_tls_handshakes == 0) return error.InvalidConfig;
         if (self.listen_backlog == 0) return error.InvalidConfig;
         try self.checkFramePool();
@@ -1126,6 +1140,17 @@ test "the idle limit under pressure: non-zero, the smaller of the two, at the sh
     // HTTP/1.1 does not use the pressure limit because, by default, its wait
     // for the next request is already no longer.
     try std.testing.expect(Limits.defaults.field_block_timeout_ns <= Limits.defaults.connection_idle_timeout_under_pressure_ns);
+}
+
+test "the executor watchdog's limit is off (0) or at least 1 ms (t-3760)" {
+    var l = Limits.defaults;
+    _ = try l.resourceUpperBound();
+    l.executor_stall_report_ns = 0;
+    _ = try l.resourceUpperBound();
+    l.executor_stall_report_ns = std.time.ns_per_ms - 1;
+    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    l.executor_stall_report_ns = std.time.ns_per_ms;
+    _ = try l.resourceUpperBound();
 }
 
 test "rejects a zero listen backlog" {

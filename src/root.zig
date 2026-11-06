@@ -72,6 +72,7 @@ pub const edge = struct {
     pub const gate = @import("edge/gate.zig");
     pub const accounts = @import("edge/accounts.zig");
     pub const proxy_protocol = @import("edge/proxy_protocol.zig");
+    pub const watchdog = @import("edge/watchdog.zig");
 };
 
 pub const http = struct {

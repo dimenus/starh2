@@ -1051,6 +1051,24 @@ pub fn build(b: *std.Build) void {
     const idle_pressure_step = b.step("test-idle-pressure", "Run the t-3759 step 8 gates (idle limit under connection pressure: h2c, TLS h2; HTTP/1.1's wait for the next request on h1c and TLS)");
     idle_pressure_step.dependOn(&run_idle_pressure_tests.step);
 
+    const watchdog_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/watchdog.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "starh2_h2_client", .module = h2_client_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    const run_watchdog_tests = b.addRunArtifact(watchdog_tests);
+    run_watchdog_tests.setCwd(b.path("."));
+    const watchdog_step = b.step("test-watchdog", "Run the t-3760 executor watchdog gate (a spinning handler is reported once with its route; a yielding handler and an idle server are not)");
+    watchdog_step.dependOn(&run_watchdog_tests.step);
+
     const protocol_work_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/protocol_work.zig"),
@@ -1320,6 +1338,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_accounts_tests.step);
     test_step.dependOn(&run_shares_tests.step);
     test_step.dependOn(&run_idle_pressure_tests.step);
+    test_step.dependOn(&run_watchdog_tests.step);
     test_step.dependOn(&run_routes_tests.step);
     test_step.dependOn(&run_protocol_work_tests.step);
     test_step.dependOn(&run_h1_linger_tests.step);
@@ -1841,6 +1860,9 @@ pub fn build(b: *std.Build) void {
             "placement",
             "h1_battery",
             "bug2_churn",
+            // The executor watchdog: an OS thread reading every executor's
+            // activity while handlers run.
+            "watchdog",
         };
         for (tsan_bins) |name| {
             const t = b.addTest(.{

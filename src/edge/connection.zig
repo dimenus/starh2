@@ -109,6 +109,7 @@
 //! home to choose, and zio refuses any placement but `.auto`.
 const std = @import("std");
 const test_hook = @import("test_hook.zig");
+const watchdog = @import("watchdog.zig");
 // Direct zio dependency: the actor parks in one `zio.select`; TLS adds
 // the CompletionQueue. The h2c pumps stay std.Io-pure.
 const zio = @import("zio");
@@ -8526,6 +8527,8 @@ pub const Connection = struct {
         if (link.core.terminal.getCause() != null) return;
         switch (link.matched) {
             .found => |f| {
+                // The route this task serves, for the executor watchdog.
+                zio.setTaskLabel(watchdog.routeLabel(f.route));
                 const run_res: anyerror!void = switch (f.handler) {
                     .task => |h| h.runFn(h.ptr, &link.req, &link.resp),
                     .complete => |h| blk: {
@@ -8533,6 +8536,7 @@ pub const Connection = struct {
                         break :blk h.runFn(h.ptr, &link.req, &complete_resp);
                     },
                 };
+                zio.setTaskLabel(0);
                 run_res catch {
                     if (link.core.terminal.getCause() != null) return;
                     if (!link.resp.committed) {

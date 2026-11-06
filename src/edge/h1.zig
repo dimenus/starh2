@@ -43,6 +43,7 @@ const tls_edge = @import("tls.zig");
 const request_pool = @import("request_pool.zig");
 const accounts = @import("accounts.zig");
 const test_hook = @import("test_hook.zig");
+const watchdog = @import("watchdog.zig");
 const wire_pump = @import("wire_pump.zig");
 const limits_mod = @import("../core/wire_const.zig");
 
@@ -100,6 +101,9 @@ pub const H1Link = struct {
     resp: response.Response,
     /// The task route's handler; unused for a complete handler.
     handler: router_mod.TaskHandler = undefined,
+    /// The task route's index in the router, for the executor watchdog's
+    /// label; unused for a complete handler.
+    route: u32 = undefined,
 
     fn fromCtx(ctx: *anyopaque) *H1Link {
         return @ptrCast(@alignCast(ctx));
@@ -1406,7 +1410,12 @@ fn dispatch(
         switch (matched) {
             .found => |f| {
                 var cr: response.CompleteResponse = .{ .inner = &link.resp };
-                f.handler.complete.runFn(f.handler.complete.ptr, &link.req, &cr) catch {
+                // On the actor: the actor's task carries the route while the
+                // handler runs, for the executor watchdog.
+                zio.setTaskLabel(watchdog.routeLabel(f.route));
+                const run_res = f.handler.complete.runFn(f.handler.complete.ptr, &link.req, &cr);
+                zio.setTaskLabel(0);
+                run_res catch {
                     // The same rule as a task handler (`runTaskBody`) and
                     // as HTTP/2: a handler that failed because its request's
                     // memory ran out says which cap, its own a 500, the
@@ -1429,6 +1438,7 @@ fn dispatch(
     }
 
     link.handler = matched.found.handler.task;
+    link.route = matched.found.route;
     // The handler's reference; the actor's is the one `newLink` began with.
     _ = link.core.refs.fetchAdd(1, .monotonic);
     link.core.task_counted = true;
@@ -1482,7 +1492,9 @@ fn runTaskBody(link: *H1Link) void {
     const t = &link.core.terminal;
     if (t.cancel_flag.load(.acquire)) return;
     if (t.getCause() != null) return;
+    zio.setTaskLabel(watchdog.routeLabel(link.route));
     const run_res: anyerror!void = link.handler.runFn(link.handler.ptr, &link.req, &link.resp);
+    zio.setTaskLabel(0);
     run_res catch {
         if (t.getCause() != null) return;
         if (!link.resp.committed) {

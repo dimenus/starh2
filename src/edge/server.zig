@@ -25,6 +25,7 @@
 //! may be parked in a select where a flag alone would never be observed.
 const std = @import("std");
 const test_hook = @import("test_hook.zig");
+const watchdog = @import("watchdog.zig");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const limits_mod = @import("../core/limits.zig");
@@ -299,6 +300,8 @@ pub const Server = struct {
     local_addrs: []EndpointAddress,
     tls_acceptor: ?tls_edge.Acceptor = null,
     shutdown_flag: std.atomic.Value(bool) = .init(false),
+    /// The executor watchdog's thread, while `serve` runs.
+    watchdog: watchdog.Watchdog = .{},
     shutdown_event: zio.Event = .init,
     active_connections: std.atomic.Value(usize) = .init(0),
     accounting: connection.GlobalAccounting,
@@ -583,6 +586,12 @@ pub const Server = struct {
             self.local_addrs[i] = self.listeners[i].socket.address;
             self.listeners_bound = i + 1;
         }
+
+        // Before any accept loop, so it watches every handler; joined when
+        // `serve` returns, after every wait below and before the route
+        // table or the runtime can be freed.
+        self.watchdog.start(self.gpa, self.limits.executor_stall_report_ns, self.router.routes) catch return error.TransportSetupFailed;
+        defer self.watchdog.stop(self.gpa);
 
         var accept_group: zio.Group = .init;
         var connection_group: zio.Group = .init;
