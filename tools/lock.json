@@ -1,10 +1,10 @@
 {
   "zig": "0.17.0",
   "zio": {
-    "tag": "none. dimenus/zio carmack/t-3760-watchdog eca8e32 (650144c + round 2), on sim/dst-m3 3d50bb6, on lalinsky/zio main cd0befa (2026-11-06).",
+    "tag": "none. dimenus/zio carmack/t-3896-rebase 16783b0: the fork's 11 commits rebased onto lalinsky/zio main c5716c4 (2026-11-06).",
     "repo": "https://github.com/dimenus/zio",
-    "commit": "eca8e3207391e8497d861756af78376ded2398bb",
-    "hash": "zio-0.19.0-xHbVVA9KMABETBoUzwYWqDlTCJ2PliA-P8LXhDfsa_C7",
+    "commit": "16783b085073ed6682fec350ef29dc84958513d0",
+    "hash": "zio-0.19.0-xHbVVDKfMAA8a7tr9IPfbM0S56_0Fj-D9nRYPOeMvS__",
     "scheduling": "-Dzio-scheduling, default work_stealing, passed to every zio dependency in build.zig",
     "fork_patches": "the io_uring send -EAGAIN bridge (lalinsky/zio PR #863, not merged); the DST simulator and the select/CompletionQueue invariant checks; two ThreadSanitizer race fixes (Waiter's tag, the work-stealing ring's slots); each executor's published activity and setTaskLabel, for the executor watchdog (t-3760)."
   },
