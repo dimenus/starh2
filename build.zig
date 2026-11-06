@@ -1051,17 +1051,41 @@ pub fn build(b: *std.Build) void {
     const idle_pressure_step = b.step("test-idle-pressure", "Run the t-3759 step 8 gates (idle limit under connection pressure: h2c, TLS h2; HTTP/1.1's wait for the next request on h1c and TLS)");
     idle_pressure_step.dependOn(&run_idle_pressure_tests.step);
 
+    // The watchdog gate reads the watchdog's own counters, which are test
+    // hooks: it gets a starh2 built with them on in every optimize mode (as
+    // `lib_test_mod`), and an h2 client module over that same starh2, so the
+    // binary holds one starh2. The test does not compile without the hooks,
+    // so it cannot skip.
+    const observe_starh2_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "tls", .module = tls_mod },
+            .{ .name = "zio", .module = zio_dep.module("zio") },
+        },
+    });
+    attachStarh2Options(b, observe_starh2_mod, true, wire_ring, zio_scheduling, .none);
+    linkBrotliEnc(observe_starh2_mod, brotli_dep, brotli_enc);
+    const observe_h2_client_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "starh2", .module = observe_starh2_mod }},
+    });
+    const observe_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "starh2", .module = observe_starh2_mod },
+        .{ .name = "starh2_h2_client", .module = observe_h2_client_mod },
+        .{ .name = "zio", .module = zio_dep.module("zio") },
+        .{ .name = "tls", .module = tls_mod },
+    };
     const watchdog_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/watchdog.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "starh2", .module = starh2_mod },
-                .{ .name = "starh2_h2_client", .module = h2_client_mod },
-                .{ .name = "zio", .module = zio_dep.module("zio") },
-                .{ .name = "tls", .module = tls_mod },
-            },
+            .imports = observe_imports,
         }),
     });
     const run_watchdog_tests = b.addRunArtifact(watchdog_tests);
@@ -1860,10 +1884,24 @@ pub fn build(b: *std.Build) void {
             "placement",
             "h1_battery",
             "bug2_churn",
-            // The executor watchdog: an OS thread reading every executor's
-            // activity while handlers run.
-            "watchdog",
         };
+        // The executor watchdog: an OS thread reading every executor's
+        // activity while handlers run. Its test needs the test hooks, so it
+        // takes the observe-on starh2 (see `test-watchdog`).
+        {
+            const t = b.addTest(.{
+                .name = "watchdog",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/watchdog.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .sanitize_thread = true,
+                    .imports = observe_imports,
+                }),
+            });
+            run.addArgs(&.{ "--bin", "watchdog" });
+            run.addArtifactArg(t);
+        }
         for (tsan_bins) |name| {
             const t = b.addTest(.{
                 .name = name,

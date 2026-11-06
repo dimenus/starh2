@@ -1079,6 +1079,9 @@ pub const ConnConfig = struct {
     shutdown_event: ?*zio.Event = null,
     /// Server-wide stream and task-handler admission (optional for unit tests).
     accounting: ?*GlobalAccounting = null,
+    /// The server's tag in its handlers' watchdog labels (`Server.watch_tag`;
+    /// 0 in unit tests with no server).
+    watch_tag: usize = 0,
     /// The server's live connections (`Server.active_connections`), this one
     /// included: the pressure reading of the connection share. An HTTP/2
     /// connection reads it once when an idle wait starts
@@ -1863,6 +1866,9 @@ const StreamLink = struct {
     req: request.Request,
     resp: response.Response,
     matched: router_mod.Match,
+    /// The handler's label for the executor watchdog (`watchdog.label`),
+    /// set at dispatch with `matched`.
+    watch_label: usize = 0,
     /// The connection's slot for this stream. Inside the gate only.
     slot: *HandlerSlot,
     hctx: HandlerCtx,
@@ -8371,7 +8377,10 @@ pub const Connection = struct {
         };
         link.matched = classified;
         switch (link.matched) {
-            .found => |f| link.req.path_remainder = f.path_remainder,
+            .found => |f| {
+                link.req.path_remainder = f.path_remainder;
+                link.watch_label = watchdog.label(self.config.watch_tag, f.route);
+            },
             else => {},
         }
 
@@ -8527,8 +8536,9 @@ pub const Connection = struct {
         if (link.core.terminal.getCause() != null) return;
         switch (link.matched) {
             .found => |f| {
-                // The route this task serves, for the executor watchdog.
-                zio.setTaskLabel(watchdog.routeLabel(f.route));
+                // The server and route this task serves, for the executor
+                // watchdog.
+                zio.setTaskLabel(link.watch_label);
                 const run_res: anyerror!void = switch (f.handler) {
                     .task => |h| h.runFn(h.ptr, &link.req, &link.resp),
                     .complete => |h| blk: {

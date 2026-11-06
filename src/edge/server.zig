@@ -302,6 +302,10 @@ pub const Server = struct {
     shutdown_flag: std.atomic.Value(bool) = .init(false),
     /// The executor watchdog's thread, while `serve` runs.
     watchdog: watchdog.Watchdog = .{},
+    /// This server's tag in a handler's watchdog label (`watchdog.label`),
+    /// so a stall in another server's handler is never reported as one of
+    /// this server's routes.
+    watch_tag: usize,
     shutdown_event: zio.Event = .init,
     active_connections: std.atomic.Value(usize) = .init(0),
     accounting: connection.GlobalAccounting,
@@ -528,6 +532,7 @@ pub const Server = struct {
         }
 
         var self: Server = .{
+            .watch_tag = watchdog.newServerTag(),
             .gpa = gpa,
             .io = io,
             .limits = config.limits,
@@ -590,7 +595,7 @@ pub const Server = struct {
         // Before any accept loop, so it watches every handler; joined when
         // `serve` returns, after every wait below and before the route
         // table or the runtime can be freed.
-        self.watchdog.start(self.gpa, self.limits.executor_stall_report_ns, self.router.routes) catch return error.TransportSetupFailed;
+        self.watchdog.start(self.gpa, self.limits.executor_stall_report_ns, self.watch_tag, self.router.routes) catch return error.TransportSetupFailed;
         defer self.watchdog.stop(self.gpa);
 
         var accept_group: zio.Group = .init;
@@ -1332,6 +1337,7 @@ pub const Server = struct {
                 .shutdown_event = &self.shutdown_event,
                 .accounting = &self.accounting,
                 .server_connections = &self.active_connections,
+                .watch_tag = self.watch_tag,
                 .charge = charge,
                 .peer = peer,
                 .slab_pool = &self.slabs,
