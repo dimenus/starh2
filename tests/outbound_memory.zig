@@ -323,7 +323,7 @@ fn runBackpressure(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpor
         if (nowNs() >= deadline) return error.Deadline;
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     joined = true;
     if (f.err) |err| return err;
 
@@ -486,7 +486,7 @@ fn runContinuation(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpor
         }
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (c.err) |err| return err;
     std.debug.print("{s} continuation: block {d} bytes in 1 HEADERS + {d} CONTINUATION frames; {d} of 3 wide headers decoded; {d} small responses beside it\n", .{
         @tagName(transport), c.block_len, c.continuation_frames, c.decoded_wide, c.small_done,
@@ -643,7 +643,7 @@ fn runBound(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !voi
         }
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (b.err) |err| return err;
 
     const lists = conn_mod.h2_work.response_header_lists.load(.monotonic) - lists_0;
@@ -952,7 +952,7 @@ fn runSmallestPools(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transpo
         }
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (c.err) |err| return err;
     try std.testing.expect(c.saw_settings);
     try std.testing.expect(c.saw_hello);
@@ -1071,7 +1071,7 @@ fn runMany(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void
         }
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (m.err) |err| return err;
     std.debug.print("{s} many headers: 33 -> {d} ({d} fields), 99 -> {d} ({d} fields), 100 -> {d} ({s})\n", .{
         @tagName(transport), m.status[0], m.fields[0], m.status[1], m.fields[1], m.status[2], m.body[2][0..m.body_len[2]],
@@ -1223,7 +1223,7 @@ fn runPack(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !void
         }
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (p.err) |err| return err;
 
     const chunks = om.chunks_to_pump.load(.monotonic) - chunks_0;

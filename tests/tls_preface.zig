@@ -318,7 +318,7 @@ fn runShape(rt: *zio.Runtime, gpa: std.mem.Allocator, shape: Shape) !void {
     const t = try std.Thread.spawn(.{}, clientMain, .{ server.localAddress(0).getPort(), gpa, shape, &result });
     // Wait inside zio so this executor keeps serving the connections.
     while (!result.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (result.err) |err| return err;
     try std.testing.expectEqual(@as(usize, connections_per_shape), result.ok_n);
     // Every connection's first wire handoff went through the first-frame check.

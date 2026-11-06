@@ -347,7 +347,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, outbound_bytes: usize, case
     // join holds this executor's thread, and the connection's actor and
     // pumps may be placed on it.
     while (!client.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    thread.join();
+    starh2.test_sleep.joinThread(thread);
 
     const want = client.body_total + client.flush_total;
     const waits: usize = if (comptime @hasDecl(conn_mod, "test_ack_room_waits")) conn_mod.test_ack_room_waits.load(.acquire) else 0;

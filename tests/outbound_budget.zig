@@ -308,7 +308,7 @@ fn joinClient(c: *Client, t: std.Thread) !void {
         }
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (c.err) |err| return err;
 }
 
@@ -948,7 +948,7 @@ fn runEmpties(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !v
         }
         zio.sleep(.fromMilliseconds(5)) catch {};
     }
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (e.err) |err| return err;
     try std.testing.expectEqual(@as(usize, empty_streams), e.ended);
     try std.testing.expectEqual(@as(usize, 0), e.resets);

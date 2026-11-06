@@ -403,7 +403,7 @@ fn serveGood(gpa: std.mem.Allocator, transport: Transport, port: u16) !void {
     var r: GoodResult = .{};
     const t = try std.Thread.spawn(.{}, goodGetMain, .{ gpa, transport, port, &r });
     while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (r.err) |err| return err;
 }
 
@@ -467,7 +467,7 @@ fn runSilent(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !vo
 
     var r: SilentResult = .{};
     const t = try std.Thread.spawn(.{}, silentMain, .{ gpa, transport, run.port(), &r });
-    defer t.join();
+    defer starh2.test_sleep.joinThread(t);
     // The attack holds its streams: every one took a server stream token.
     try waitCount("active_streams", &run.server.accounting.active_streams, silent_streams, 2 * std.time.ns_per_s);
     // A second client is served while they are held.
@@ -693,9 +693,9 @@ fn runBodyRate(rt: *zio.Runtime, gpa: std.mem.Allocator, ep: Endpoint) !void {
     var good: GoodResult = .{};
     const tg = try std.Thread.spawn(.{}, goodAnyMain, .{ gpa, ep, run.port(), &good });
     while (!dripped.done.load(.acquire) or !fair.done.load(.acquire) or !good.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    td.join();
-    tf.join();
-    tg.join();
+    starh2.test_sleep.joinThread(td);
+    starh2.test_sleep.joinThread(tf);
+    starh2.test_sleep.joinThread(tg);
     if (dripped.err) |err| return err;
     if (fair.err) |err| return err;
     if (good.err) |err| return err;
@@ -888,8 +888,8 @@ fn runResponseRateHeld(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Tran
     zio.sleep(.fromMilliseconds(200)) catch {};
     try serveGood(gpa, transport, run.port());
     while (!trickle.done.load(.acquire) or !sse.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    tt.join();
-    ts.join();
+    starh2.test_sleep.joinThread(tt);
+    starh2.test_sleep.joinThread(ts);
     if (trickle.err) |err| return err;
     if (sse.err) |err| return err;
     const handler_deadline = nowNs() + 2 * std.time.ns_per_s;
@@ -1005,7 +1005,7 @@ fn runQueuedStall(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport
     const t = try std.Thread.spawn(.{}, QueuedClient.main, .{&c});
     defer {
         c.release.store(true, .release);
-        t.join();
+        starh2.test_sleep.joinThread(t);
     }
     while (!c.ready.load(.acquire)) {
         if (c.done.load(.acquire)) return c.err orelse error.QueuedClientEnded;
@@ -1107,7 +1107,7 @@ fn runExact(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, whic
     var r: ExactResult = .{};
     const th = try std.Thread.spawn(.{}, exactClientMain, .{ gpa, if (ep == .tls) Transport.tls else Transport.h2c, run.port(), which, &r });
     while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    th.join();
+    starh2.test_sleep.joinThread(th);
     std.debug.print("hardening {s} exact {s} window: {d} body bytes, END_STREAM at {?d} ms, handler ended {s}, err={?}\n", .{
         @tagName(ep), @tagName(which), r.data_bytes, r.end_ms, @tagName(@as(BigEnd, @enumFromInt(exact_end.load(.acquire)))), r.err,
     });
@@ -1138,7 +1138,7 @@ fn runQueuedCredit(rt: *zio.Runtime, gpa: std.mem.Allocator, _: Transport) !void
     var r: CreditResult = .{};
     const th = try std.Thread.spawn(.{}, creditClientMain, .{ gpa, path, &r });
     while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    th.join();
+    starh2.test_sleep.joinThread(th);
     std.debug.print("hardening queued credit: body reset after {?d} ms (idle {d} ms); response bytes read meanwhile {d}; err={?}\n", .{ r.reset_ms, body_idle_ms, r.read, r.err });
     if (r.err) |err| return err;
     // The response kept moving the whole time.
@@ -1394,7 +1394,7 @@ fn wbOpenOffExecutor(gpa: std.mem.Allocator, t: WbTransport, run: *const Running
     var o: Open = .{};
     const th = try std.Thread.spawn(.{}, Open.main, .{ &o, gpa, t, run, path, attacker });
     while (!o.done.load(.acquire)) zio.sleep(.fromMilliseconds(2)) catch {};
-    th.join();
+    starh2.test_sleep.joinThread(th);
     if (o.err) |err| return err;
     return o.client;
 }
@@ -1457,7 +1457,7 @@ fn runWriteByteRead(rt: *zio.Runtime, gpa: std.mem.Allocator, t: WbTransport, rd
     const ts = try std.Thread.spawn(.{}, slowReader, .{ slow_client.fd, &slow, rd });
     defer {
         slow.release.store(true, .release);
-        ts.join();
+        starh2.test_sleep.joinThread(ts);
     }
 
     // The attacker asks for the flood and never reads. `t0` is before it
@@ -1507,7 +1507,7 @@ fn serveGoodWb(gpa: std.mem.Allocator, t: WbTransport, run: *const Running, path
         .tls_unix, .h1_tls_unix => try std.Thread.spawn(.{}, goodUnixMain, .{ gpa, Transport.tls, path, &r }),
     };
     while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    th.join();
+    starh2.test_sleep.joinThread(th);
     if (r.err) |err| return err;
 }
 
@@ -1827,7 +1827,7 @@ fn runAcceptError(rt: *zio.Runtime, gpa: std.mem.Allocator, _: Transport) !void 
     while (!r.go_restore.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
     r.restored.store(true, .release);
     while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (r.err) |err| {
         std.debug.print("hardening accept EMFILE: client failed with {s}\n", .{@errorName(err)});
         return err;

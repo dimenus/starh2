@@ -184,7 +184,7 @@ fn helloWorks(gpa: std.mem.Allocator, port: u16) !void {
     var done: std.atomic.Value(bool) = .init(false);
     const t = try std.Thread.spawn(.{}, helloThread, .{ gpa, port, &result, &done });
     while (!done.load(.acquire)) zio.sleep(.fromMilliseconds(2)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     return result;
 }
 
@@ -273,7 +273,7 @@ fn runRounds(rt: *zio.Runtime, gpa: std.mem.Allocator, proto: Proto) !void {
             if (nowNs() >= deadline) return error.Deadline;
             zio.sleep(.fromMilliseconds(2)) catch {};
         }
-        t.join();
+        starh2.test_sleep.joinThread(t);
         joined = true;
         if (c.err) |err| return err;
         try std.testing.expect(c.closed.load(.acquire));

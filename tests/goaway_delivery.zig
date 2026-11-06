@@ -476,7 +476,7 @@ fn runScenario(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, s
     }
     // Wait inside zio so this executor keeps serving the connection.
     while (!out.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (graceful) {
         serve_handle.join() catch {};
         serving = false;
@@ -1031,7 +1031,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     const t = try std.Thread.spawn(.{}, stalledMain, .{ server.localAddress(0).getPort(), gpa, transport, stall, &st });
     defer {
         st.release.store(true, .release);
-        t.join();
+        starh2.test_sleep.joinThread(t);
     }
 
     const give_up = nowNs() + client_deadline_ns;
@@ -1614,7 +1614,7 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     }
     // Wait inside zio so this executor keeps serving the connection.
     while (!run.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (run.err) |err| return err;
     // The client saw the close; the server's slot goes back just after it.
     const stop = nowNs() + 2 * std.time.ns_per_s;
@@ -1811,7 +1811,7 @@ fn runOutlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) !v
     var run: IdleRun = .{};
     const t = try std.Thread.spawn(.{}, outliveClient, .{ server.localAddress(0).getPort(), gpa, transport, &run });
     while (!run.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (run.err) |err| return err;
     try std.testing.expect(outlive_started.load(.acquire));
     const t_gone = nowNs();
@@ -2062,7 +2062,7 @@ fn h1ServedOk(port: u16, transport: H1Transport) !void {
     var c: H1OkClient = .{ .port = port, .transport = transport };
     const t = try std.Thread.spawn(.{}, H1OkClient.main, .{&c});
     while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (c.err) |err| return err;
 }
 
@@ -2097,7 +2097,7 @@ fn runH1Outlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: H1Transport
     defer {
         server.requestShutdown();
         client.release.store(true, .release);
-        if (client_thread) |t| t.join();
+        if (client_thread) |t| starh2.test_sleep.joinThread(t);
         serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
@@ -2341,7 +2341,7 @@ fn runH1BlockedWrite(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: H1Tran
     defer {
         server.requestShutdown();
         client.release.store(true, .release);
-        if (client_thread) |t| t.join();
+        if (client_thread) |t| starh2.test_sleep.joinThread(t);
         serve_deadline.join(&server, &serve_handle);
     }
     try server.waitUntilListening(5 * std.time.ns_per_s);
@@ -2525,7 +2525,7 @@ fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void
             defer {
                 h1r_hold.store(false, .release);
                 first.release.store(true, .release);
-                t1.join();
+                starh2.test_sleep.joinThread(t1);
             }
             const deadline = nowNs() + 5 * std.time.ns_per_s;
             while (h1r_running.load(.acquire) != 1) {
@@ -2535,7 +2535,7 @@ fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void
             var second: H1Exchange = .{ .port = port, .req = "GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n", .want = "connection: close\r\n\r\n" };
             const t2 = try std.Thread.spawn(.{}, H1Exchange.main, .{&second});
             while (!second.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-            t2.join();
+            starh2.test_sleep.joinThread(t2);
             if (second.err) |err| return err;
             std.debug.print("h1 refusal task_bound: {s}\n", .{second.text()});
             try std.testing.expect(std.mem.startsWith(u8, second.text(), "HTTP/1.1 503"));
@@ -2548,7 +2548,7 @@ fn runH1Refusal(rt: *zio.Runtime, gpa: std.mem.Allocator, kind: H1Refusal) !void
             var c: H1Exchange = .{ .port = port, .req = "GET /alloc HTTP/1.1\r\nHost: localhost\r\n\r\n", .want = "connection: close\r\n\r\n" };
             const t = try std.Thread.spawn(.{}, H1Exchange.main, .{&c});
             while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-            t.join();
+            starh2.test_sleep.joinThread(t);
             if (c.err) |err| return err;
             std.debug.print("h1 refusal {s}: {s}\n", .{ @tagName(kind), c.text() });
             try std.testing.expect(std.mem.startsWith(u8, c.text(), "HTTP/1.1 500"));
@@ -2733,7 +2733,7 @@ fn runH1MultiChunk(rt: *zio.Runtime, gpa: std.mem.Allocator, trigger: H1MultiTri
         server.requestShutdown();
         if (trigger == .canceled_serve) server_mod.test_accept_spawn_gate.store(true, .release);
         client.release.store(true, .release);
-        if (client_thread) |t| t.join();
+        if (client_thread) |t| starh2.test_sleep.joinThread(t);
         serve_deadline.join(&server, &serve_handle);
     }
     const t0 = nowNs();
@@ -2884,7 +2884,7 @@ fn runH1Reset(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     var c: H1Resetter = .{ .port = port };
     const t = try std.Thread.spawn(.{}, H1Resetter.main, .{&c});
     while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     if (c.err) |err| return err;
     // Every reset connection is gone, and the server still serves.
     const t0 = nowNs();

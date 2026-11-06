@@ -575,7 +575,7 @@ fn waitFor(comptime what: []const u8, ctx: anytype, comptime pred: fn (@TypeOf(c
 fn joinClient(c: *Client, t: std.Thread) void {
     const deadline = nowNs() + 4 * client_deadline_ns;
     while (!c.done.load(.acquire) and nowNs() < deadline) zio.sleep(.fromMilliseconds(5)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
 }
 
 // ---------------------------------------------------------------------------

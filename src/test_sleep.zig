@@ -53,6 +53,24 @@ pub fn holdExecutorMs(ms: u64) void {
     rawSleep(ms * std.time.ns_per_ms);
 }
 
+/// Join an OS thread (a test client) from test code. On a zio executor
+/// thread the join itself runs on zio's blocking pool and this task waits for
+/// it, so the executor keeps running its other tasks meanwhile: the joined
+/// thread may need one of them to finish (a client waiting for a response
+/// whose handler or connection is placed on this executor), and a plain join
+/// would then hold the executor until the client gives up (t-3899). Off an
+/// executor thread, a plain join. `t` is a `std.Thread` or a pointer to one.
+pub fn joinThread(t: anytype) void {
+    const thread: std.Thread = switch (@TypeOf(t)) {
+        std.Thread => t,
+        *std.Thread, *const std.Thread => t.*,
+        else => @compileError("test_sleep.joinThread takes a std.Thread"),
+    };
+    if (!onExecutorThread()) return thread.join();
+    var h = zio.spawnBlocking(std.Thread.join, .{thread}) catch |err| std.debug.panic("test_sleep.joinThread: the blocking pool refused the join: {t}", .{err});
+    h.join();
+}
+
 fn rawSleep(ns: u64) void {
     var t: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
     while (true) {

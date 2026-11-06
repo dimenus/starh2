@@ -337,7 +337,7 @@ const Started = struct {
     fn joinAll(self: *Started) void {
         for (self.list[0..self.n]) |c| {
             while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
-            c.thread.join();
+            starh2.test_sleep.joinThread(c.thread);
         }
         self.n = 0;
     }

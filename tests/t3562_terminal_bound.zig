@@ -583,7 +583,7 @@ fn reached(x: Count) bool {
 fn joinClient(c: *Client, t: std.Thread) void {
     const deadline = nowNs() + 45 * std.time.ns_per_s;
     while (!c.done.load(.acquire) and nowNs() < deadline) zio.sleep(.fromMilliseconds(5)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
 }
 
 fn hold(transport: Transport, on: bool) void {
@@ -1419,7 +1419,7 @@ fn runOwedAcks(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         }
     };
     try waitFor("the client to finish", &c, Done.f);
-    t.join();
+    starh2.test_sleep.joinThread(t);
     joined = true;
     std.debug.print("T3562 transport=h2c scenario=owed_acks settings_acks={d} ping_acked={} ended={d} rst_total={d} goaways={d} uploads_ok={d} conn_credit_after_go={d} client_err={s}\n", .{ c.settings_acks, c.ping_acked, c.ended, c.rst_total, c.goaways, uploads_ok.load(.acquire), c.conn_credit_after_go, if (c.err) |e| @errorName(e) else "-" });
     if (c.err) |e| return e;

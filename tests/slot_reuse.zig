@@ -246,7 +246,7 @@ fn runReuse(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, endi
     const t = try std.Thread.spawn(.{}, reuseClient, .{ server.localAddress(0).getPort(), gpa, transport, ending, &out });
     // Wait inside zio so this executor keeps serving the connections.
     while (!out.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     server.requestShutdown();
     serve_deadline.join(&server, &serve_handle);
     serving = false;
@@ -428,7 +428,7 @@ fn runCancel(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try h.join();
     }
     while (!out.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     joined = true;
 
     if (out.err) |err| return err;
@@ -611,7 +611,7 @@ fn runRoundOf(server: *starh2.Server, r: *Round) !void {
     defer gpa.free(threads);
     for (threads) |*t| t.* = try std.Thread.spawn(.{}, roundClient, .{r});
     while (r.done.load(.acquire) < n) zio.sleep(.fromMilliseconds(5)) catch {};
-    for (threads) |t| t.join();
+    for (threads) |t| starh2.test_sleep.joinThread(t);
     try std.testing.expectEqual(@as(usize, 0), r.failed.load(.acquire));
     try waitIdle(server);
 }
@@ -825,7 +825,7 @@ fn runExhausted(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport) 
     var r: Refused = .{ .port = server.localAddress(0).getPort(), .gpa = gpa, .transport = transport };
     const t = try std.Thread.spawn(.{}, refusedClient, .{&r});
     while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-    t.join();
+    starh2.test_sleep.joinThread(t);
     try std.testing.expect(r.closed);
     // The refusal gave back everything it took, handshake slot included.
     const give_up = nowNs() + client_deadline_ns;
@@ -907,7 +907,7 @@ fn runExhaustedProxy(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         var r: Refused = .{ .port = server.localAddress(1).getPort(), .gpa = gpa, .transport = .h2c };
         const t = try std.Thread.spawn(.{}, refusedClient, .{&r});
         while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(10)) catch {};
-        t.join();
+        starh2.test_sleep.joinThread(t);
         try std.testing.expect(r.closed);
     }
     const give_up = nowNs() + client_deadline_ns;
@@ -1003,7 +1003,7 @@ fn runShutdown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     serve_deadline.join(&server, &serve_handle);
     serving = false;
     while (h.done.load(.acquire) < 3) zio.sleep(.fromMilliseconds(5)) catch {};
-    for (threads) |t| t.join();
+    for (threads) |t| starh2.test_sleep.joinThread(t);
     try std.testing.expectEqual(@as(usize, 0), h.failed.load(.acquire));
 
     // Every slot is back. `Server.deinit` (deferred) frees each one once: it
