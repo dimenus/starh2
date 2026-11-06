@@ -151,6 +151,37 @@ pub const zio_scheduling = @import("build_options").zio_scheduling;
 /// comptime.
 pub const conn_placement: zio.Placement = if (zio_scheduling == .work_stealing) .auto else .local;
 
+/// When an HTTP/2 idle wait closes the connection (`Limits.connection_idle_timeout_ns`).
+///
+/// The wait starts at `since`, when the last stream ended, and runs out at
+/// `since + idle_limit`. A stream ends when its last frame leaves the
+/// scheduler, not when the socket takes it, so bytes can still wait in the
+/// writer then (`writer_waits`: under the write-byte clock). The close waits
+/// for them, so a slow reader gets the end of its response, but at most one
+/// write-byte period (`write_byte_timeout`, the clock's own limit): a peer
+/// that takes a byte just inside every period, or sends a PING whose ACK
+/// refills the writer, would otherwise hold the connection for ever, since
+/// each byte resets the write-byte clock. The wait itself never restarts.
+/// With the write-byte limit off there is no clock (`writer_waits` false),
+/// and the idle limit alone closes it, as it did before t-3890.
+pub fn idleCloseAtNs(since: u64, idle_limit: u64, writer_waits: bool, write_byte_timeout: u64) u64 {
+    const at = since +| idle_limit;
+    return if (writer_waits) at +| write_byte_timeout else at;
+}
+
+test "idleCloseAtNs: bytes in the writer hold the idle close back at most one write-byte period" {
+    const s = std.time.ns_per_s;
+    // Nothing waits: the idle limit alone.
+    try std.testing.expectEqual(100 * s + 75 * s, idleCloseAtNs(100 * s, 75 * s, false, 60 * s));
+    // Bytes wait: the limit plus one write-byte period, from the same start,
+    // so the close never moves later than that whatever the writer does.
+    try std.testing.expectEqual(100 * s + 75 * s + 60 * s, idleCloseAtNs(100 * s, 75 * s, true, 60 * s));
+    // Under pressure (10 s): 10 s plus one period.
+    try std.testing.expectEqual(100 * s + 10 * s + 60 * s, idleCloseAtNs(100 * s, 10 * s, true, 60 * s));
+    // Saturates instead of wrapping.
+    try std.testing.expectEqual(std.math.maxInt(u64), idleCloseAtNs(std.math.maxInt(u64) - s, 75 * s, true, 60 * s));
+}
+
 /// Bench and test override of `conn_placement`, so one pinned binary can run
 /// both arms of the placement A/B. Set it before the server starts.
 pub var placement_override: ?zio.Placement = null;
@@ -4176,13 +4207,12 @@ pub const Connection = struct {
             // handler's response drains after the check, and the peer is not
             // reading, so no write completes. It must not stay open for ever
             // because of that.
-            const deadline = if (self.idle_since_ns) |since| since +| self.idle_limit_ns else nowNs(self.config.io) +| idle_limit_ns;
-            // An idle wait that ran out while the writer holds bytes waits for
-            // them (`idleCloseWaitsForWriter`): its deadline is past, so arming
-            // it would wake the actor on every turn. The write-byte deadline
-            // above and the write completion that empties the writer wake it.
-            const waits_for_writer = self.idle_since_ns != null and self.idleCloseWaitsForWriter();
-            if (!waits_for_writer and (next == null or deadline < next.?)) next = deadline;
+            // The idle close, held back by bytes in the writer at most one
+            // write-byte period (`idleCloseAt`): never a past deadline while
+            // it waits, so the actor does not spin, and always a wake for the
+            // bound itself.
+            const deadline = if (self.idle_since_ns) |since| self.idleCloseAt(since) else nowNs(self.config.io) +| idle_limit_ns;
+            if (next == null or deadline < next.?) next = deadline;
         }
         const canary_tick: u64 = if (comptime test_observe) test_polling_canary_tick_ns.load(.acquire) else 0;
         if (canary_tick != 0) {
@@ -6175,24 +6205,20 @@ pub const Connection = struct {
             self.idle_limit_ns = self.idleLimitNs();
             return;
         }
-        if (now -% self.idle_since_ns.? < self.idle_limit_ns) return;
-        if (self.idleCloseWaitsForWriter()) return;
+        if (now < self.idleCloseAt(self.idle_since_ns.?)) return;
         self.noteServerClose("connection_idle", null);
         try self.beginGraceful();
     }
 
-    /// An idle wait that has run out does not close the connection while bytes
-    /// still wait in the writer under the write-byte clock (`wireDeadlineNs`):
-    /// a stream ends when its last frame leaves the scheduler, not when the
-    /// socket takes it. That clock closes a peer that stops reading; one that
-    /// keeps reading gets the rest, and the idle close follows once the writer
-    /// is empty (the write completion wakes the actor). The wait itself keeps
-    /// running, so a PING's ACK passing through the writer does not restart
-    /// it. With the write-byte limit off nothing else bounds the wait, so the
-    /// idle limit closes the connection as before. HTTP/1.1 has the same rule:
-    /// its wait for the next request starts once the socket took the response.
-    fn idleCloseWaitsForWriter(self: *Connection) bool {
-        return self.wireDeadlineNs() != null;
+    /// When the idle wait that started at `since` closes the connection
+    /// (`idleCloseAtNs`): while bytes still wait in the writer under the
+    /// write-byte clock (`wireDeadlineNs`), one write-byte period later than
+    /// the idle limit. Read on every turn, so the bound follows the writer:
+    /// once it is empty the plain deadline applies, and if that has passed
+    /// the close comes on the turn the write completion wakes. Actor only.
+    fn idleCloseAt(self: *Connection, since: u64) u64 {
+        const writer_waits = self.wireDeadlineNs() != null;
+        return idleCloseAtNs(since, self.idle_limit_ns, writer_waits, self.wire_timeout_ns.load(.acquire));
     }
 
     /// The limit for an idle wait that starts now. Under connection pressure

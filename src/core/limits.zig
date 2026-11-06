@@ -411,6 +411,12 @@ pub const Limits = struct {
     /// reader that takes less than one step per timeout looks stalled. On
     /// Linux defaults that is a reader slower than about 2 KB/s; it can lose
     /// its connection. Each run of the clock reads this when it starts.
+    ///
+    /// On HTTP/2 it is also how much longer an idle close waits for bytes
+    /// still in the writer once the idle limit has run out
+    /// (`connection_idle_timeout_ns`, `connection.idleCloseAtNs`): at most
+    /// one period, whatever the peer does, so a peer that takes a byte just
+    /// inside every period cannot hold a connection whose streams ended.
     write_byte_timeout_ns: u64 = 60 * std.time.ns_per_s,
     graceful_drain_timeout_ns: u64 = 30 * std.time.ns_per_s,
     /// After the drain deadline of a shutdown, when every handler has been
@@ -440,13 +446,18 @@ pub const Limits = struct {
     /// long-lived stream is never idle. A stream ends when its last frame
     /// leaves the scheduler, not when the socket takes it, so when the time
     /// runs out while bytes still wait in the writer under
-    /// `write_byte_timeout_ns`, the close waits for them: a slow reader gets
-    /// the end of its response, and one that stops reading is the write-byte
-    /// timeout's. With that limit off, this one closes it as before. HTTP/1.1
-    /// has the same rule: its wait for the next request starts once the
-    /// socket took the response. A handler does not count: one still running
-    /// after its stream ended (it can be waiting for a write that a peer who
-    /// stopped reading never lets finish) gets until the graceful drain ends.
+    /// `write_byte_timeout_ns`, the close waits for them, at most one
+    /// write-byte period more (`connection.idleCloseAtNs`): a slow reader gets
+    /// the end of its response, one that stops reading is the write-byte
+    /// timeout's, and one that takes a byte just inside every period is
+    /// closed at the bound. So a connection whose streams ended stays open at
+    /// most this plus `write_byte_timeout_ns` (135 s by default) before the
+    /// graceful close starts. With that limit off, this one alone closes it.
+    /// HTTP/1.1 has no such state: a write returns only once the socket took
+    /// it, and the wait for the next request starts after that. A handler
+    /// does not count: one still running after its stream ended (it can be
+    /// waiting for a write that a peer who stopped reading never lets
+    /// finish) gets until the graceful drain ends.
     /// A new stream restarts the time. The close can come up to twice this late
     /// when the last stream ended with nothing left to wake the connection.
     /// Frames that open no stream (PING, SETTINGS, WINDOW_UPDATE) do not restart
@@ -477,7 +488,10 @@ pub const Limits = struct {
     /// The mark is low (a quarter of the server), so this is a moderate cut,
     /// not an emergency one: 10 s is the normal HTTP/2 idle timeout of some
     /// servers (h2o), so clients already live with it, and an idle
-    /// connection then holds its slot for 10 s instead of 75. HTTP/1.1 does
+    /// connection then holds its slot for 10 s instead of 75. One whose
+    /// writer still holds bytes when the 10 s run out holds it at most one
+    /// `write_byte_timeout_ns` more (70 s by default), the same bound as
+    /// without pressure (`connection_idle_timeout_ns`). HTTP/1.1 does
     /// not use it: its wait for the next request is `field_block_timeout_ns`,
     /// 5 s, already shorter.
     connection_idle_timeout_under_pressure_ns: u64 = 10 * std.time.ns_per_s,

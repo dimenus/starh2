@@ -688,7 +688,7 @@ pub fn build(b: *std.Build) void {
 
     // A run of only some tests of the steps that take it (the 0.17 test
     // runner takes no filter at run time): `./zb build test-hardening
-    // -Dtest-filter=tail`. Steps without it ignore it.
+    // -Dtest-filter=tail`. `test` and `ci` refuse it (see `test_step`).
     const test_filter = b.option([]const u8, "test-filter", "test-hardening and test-goaway-delivery: only the tests whose name contains this");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
     const goaway_delivery_tests = b.addTest(.{
@@ -1360,6 +1360,10 @@ pub fn build(b: *std.Build) void {
     macos_sdk_step.dependOn(&run_macos_sdk_tests.step);
 
     const test_step = b.step("test", "Run unit and integration tests");
+    // `-Dtest-filter` narrows the hardening and GOAWAY binaries, and `test`
+    // (so `ci` too) runs those same binaries: a filtered `ci` would report
+    // green on a few tests. So the filter fails these steps, loudly.
+    if (test_filter != null) test_step.dependOn(&b.addFail("-Dtest-filter is only for test-hardening and test-goaway-delivery; test and ci always run every test").step);
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_protocol_tests.step);
     test_step.dependOn(&run_http1_tests.step);

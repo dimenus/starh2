@@ -1681,7 +1681,28 @@ const TailShape = enum {
     }
 };
 
-const TailReader = enum { steady, stop };
+const TailReader = enum {
+    /// Reads at `tailStepBytes` until every stream ended.
+    steady,
+    /// Stops reading once the streams can end with bytes in the writer.
+    stop,
+    /// Stops the same way, then takes what the kernel held (`kernel`) every
+    /// `tail_trickle_period_ms`, inside the write-byte limit: each read is
+    /// progress, so the write-byte timeout never fires, and the writer never
+    /// empties in the test's time. The idle close may wait for the writer
+    /// only one write-byte period (`connection.idleCloseAtNs`); without that
+    /// bound this peer would hold the connection until the writer drained,
+    /// and with one byte per period, for about 60 s a byte.
+    trickle,
+};
+/// The trickle period: well inside `tail_write_byte_ms`, and slow enough
+/// that the parked bytes (24 to 37 KB measured) take far longer than the
+/// bound to drain. Each read takes the kernel's whole 8 KiB: a macOS unix
+/// socket wakes the writer only once the reader's queue is below its
+/// receive buffer (4 KiB here), so a smaller read can show the server no
+/// progress at all (measured: after 4 KiB of 8 KiB read, the send stayed
+/// parked and the write-byte timeout fired; 6 and 8 KiB moved it).
+const tail_trickle_period_ms = 5000;
 
 const TailResult = struct {
     err: ?anyerror = null,
@@ -1698,6 +1719,8 @@ const TailResult = struct {
     stop_ns: std.atomic.Value(u64) = .init(0),
     /// `steady`: from the slow phase's start to the last END_STREAM or the close.
     slow_ms: u64 = 0,
+    /// `trickle`: bytes taken after the stop.
+    trickled: usize = 0,
     /// `steady`: when the slow phase ended (the last END_STREAM or the close).
     end_ns: std.atomic.Value(u64) = .init(0),
 };
@@ -1836,6 +1859,21 @@ fn tailClientRun(gpa: std.mem.Allocator, t: Transport, path: []const u8, shape: 
             r.stop_ns.store(slow_start, .release);
             while (!r.release.load(.acquire)) threadSleepMs(5);
         },
+        .trickle => {
+            r.stop_ns.store(slow_start, .release);
+            var next_ns = slow_start + tail_trickle_period_ms * ms;
+            while (!r.release.load(.acquire)) {
+                threadSleepMs(5);
+                if (nowNs() < next_ns) continue;
+                next_ns += tail_trickle_period_ms * ms;
+                const before = tailTaken(w, r);
+                // Frames too: TLS needs its records decrypted to make room,
+                // and a PING that arrives is answered.
+                const open = (try tailRecv(w, r.kernel)) and (try tailFrames(w, r));
+                r.trickled += tailTaken(w, r) - before;
+                if (!open) break;
+            }
+        },
         .steady => {
             const step = tailStepBytes(r.kernel);
             const deadline = slow_start + 60 * std.time.ns_per_s;
@@ -1886,7 +1924,7 @@ fn runTail(rt: *zio.Runtime, gpa: std.mem.Allocator, t: Transport, shape: TailSh
     // (`Server.stats().outbound_bytes`, scheduler and writer together).
     var held_at_stop: ?usize = null;
     switch (reader) {
-        .stop => {
+        .stop, .trickle => {
             while (r.stop_ns.load(.acquire) == 0 and !r.done.load(.acquire)) {
                 ends.poll(&run.server);
                 zio.sleep(.fromMilliseconds(2)) catch {};
@@ -1894,7 +1932,7 @@ fn runTail(rt: *zio.Runtime, gpa: std.mem.Allocator, t: Transport, shape: TailSh
             const stop_ns = r.stop_ns.load(.acquire);
             if (stop_ns != 0) {
                 held_at_stop = run.server.stats().outbound_bytes;
-                const deadline = stop_ns + (tail_write_byte_ms + 3000) * ms;
+                const deadline = stop_ns + (tail_idle_ms + tail_write_byte_ms + 4000) * ms;
                 while (run.server.active_connections.load(.acquire) != 0 and nowNs() < deadline) {
                     ends.poll(&run.server);
                     zio.sleep(.fromMilliseconds(2)) catch {};
@@ -1917,10 +1955,10 @@ fn runTail(rt: *zio.Runtime, gpa: std.mem.Allocator, t: Transport, shape: TailSh
     const expiries = conn_mod.response_wire_expiries.load(.acquire) - expiries_before;
     // How long the streams had been ended when the bytes stopped mattering:
     // the close (`stop`), or the client's last END_STREAM (`steady`).
-    const after_ns = if (reader == .stop) gone_ns else r.end_ns.load(.acquire);
+    const after_ns = if (reader == .steady) r.end_ns.load(.acquire) else gone_ns;
     const ended_before_ms: ?u64 = if (ends.at_ns != 0 and after_ns >= ends.at_ns) (after_ns - ends.at_ns) / ms else null;
-    std.debug.print("hardening tail {s} {s} {s}: kernel held {d} B; data {d} of {d} B; streams ended {d} of {d}; goaway={} closed={}; slow phase {d} ms; gone {?d} ms after the stop; server held {?d} B at the stop; server streams ended {?d} ms before the {s}; write-byte expiries {d}; err={?}\n", .{
-        @tagName(t), @tagName(shape), @tagName(reader), r.kernel, r.data, shape.total(), r.ended, shape.streams(), r.goaway, r.closed, r.slow_ms, gone_ms, held_at_stop, ended_before_ms, if (reader == .stop) "close" else "last END_STREAM", expiries, r.err,
+    std.debug.print("hardening tail {s} {s} {s}: kernel held {d} B; data {d} of {d} B; streams ended {d} of {d}; goaway={} closed={}; slow phase {d} ms; trickled {d} B; gone {?d} ms after the stop; server held {?d} B at the stop; server streams ended {?d} ms before the {s}; write-byte expiries {d}; err={?}\n", .{
+        @tagName(t), @tagName(shape), @tagName(reader), r.kernel, r.data, shape.total(), r.ended, shape.streams(), r.goaway, r.closed, r.slow_ms, r.trickled, gone_ms, held_at_stop, ended_before_ms, if (reader == .steady) "last END_STREAM" else "close", expiries, r.err,
     });
     if (r.err) |err| return err;
     switch (reader) {
@@ -1940,6 +1978,18 @@ fn runTail(rt: *zio.Runtime, gpa: std.mem.Allocator, t: Transport, shape: TailSh
             try std.testing.expectEqual(@as(u64, 1), expiries);
             try std.testing.expect(g + 100 >= tail_write_byte_ms);
             try std.testing.expect(g < tail_write_byte_ms + 1000);
+        },
+        .trickle => {
+            // The reader made progress, so the write-byte timeout never
+            // fired; the idle close came at its bound, one write-byte period
+            // after the idle limit, timed from the streams' end (the idle
+            // wait's start), plus the graceful steps (GOAWAY, the PING
+            // nobody reads in time, the close deadline: about 1.5 s).
+            if (r.trickled == 0) return error.TrickleTookNothing;
+            const e = ended_before_ms orelse return error.NeverClosedByTheBound;
+            try std.testing.expectEqual(@as(u64, 0), expiries);
+            try std.testing.expect(e + 100 >= tail_idle_ms + tail_write_byte_ms);
+            try std.testing.expect(e < tail_idle_ms + tail_write_byte_ms + 3000);
         },
     }
     // A pass counts only if the shape under test happened, checked on the
@@ -1967,8 +2017,16 @@ fn runTailOn(t: Transport, shape: TailShape, reader: TailReader) !void {
         // of 3 runs (the server held 0 B at the stop in the other 2), and a
         // TLS one never (the TLS tail is one staged record and the pending
         // batch, about 48 KiB). macOS takes bytes as they are read, and runs
-        // these. `stream_ends_with_no_wake_write_byte` in goaway_delivery.zig
-        // covers the rule on every OS, with the writer held by a test hook.
+        // these. What Linux runs instead: h2c only.
+        // `stream_ends_with_no_wake_write_byte` in goaway_delivery.zig holds
+        // an h2c writer with a test hook (the TLS hold parks the actor itself,
+        // so it does not model a full socket), and the arithmetic of the
+        // close-wait bound is a unit test (`connection.idleCloseAtNs`). The
+        // trickle's bound has no Linux socket test: the hook allows no
+        // progress, so write-byte fires before the bound there. TLS on Linux
+        // is not covered: the server's socket buffer has no setting to shrink
+        // it, and a client's small receive buffer does not bound it (2.68 MB
+        // of Send-Q measured on loopback with 4 KiB client buffers).
         std.debug.print("hardening tail {s} {s} {s}: skipped, macOS only (a Linux unix socket frees room in steps larger than the writer's tail)\n", .{ @tagName(t), @tagName(shape), @tagName(reader) });
         return error.SkipZigTest;
     }
@@ -1993,6 +2051,12 @@ test "hardening: h2c tail, a reader that stops after its streams ended is closed
 }
 test "hardening: tls tail, a reader that stops after its streams ended is closed by the write-byte timeout, not the idle limit" {
     try runTailOn(.tls, .complete, .stop);
+}
+test "hardening: h2c tail, a reader that takes a little every write-byte period is closed one period after the idle limit" {
+    try runTailOn(.h2c, .complete, .trickle);
+}
+test "hardening: tls tail, a reader that takes a little every write-byte period is closed one period after the idle limit" {
+    try runTailOn(.tls, .complete, .trickle);
 }
 
 // ---------------------------------------------------------------------------
