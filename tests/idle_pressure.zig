@@ -26,6 +26,14 @@
 //! HTTP/1.1 does not use the pressure limit: its wait for the next request
 //! is `field_block_timeout_ns` (5 s by default, below the 10 s default
 //! pressure limit). Its arm shows that wait, under pressure, on h1c and TLS.
+//!
+//! Two more HTTP/2 arms (t-3895):
+//! - The reverse transition: a wait that starts under pressure, then work,
+//!   then a new wait once pressure has ended gets the normal limit. The
+//!   pressure is ended by the test shutting its fillers' sockets.
+//! - The server's own teardown: after the idle GOAWAY the client keeps its
+//!   socket open, never closes its side, and the server still ends the
+//!   connection and gives the slot back (`Server.stats().connections`).
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -110,6 +118,18 @@ const Client = struct {
     /// From the start of its last idle wait to the server's close: the first
     /// GOAWAY (HTTP/2) or the end of the stream (HTTP/1.1).
     elapsed_ms: u64 = 0,
+    /// The socket, for a test that shuts it from its side (`closing`).
+    fd: std.atomic.Value(c_int) = .init(-1),
+    /// Set by the test before it shuts this client's socket: the end of the
+    /// connection is then expected, not an error.
+    closing: std.atomic.Value(bool) = .init(false),
+    /// HTTP/2: after the idle GOAWAY, keep the socket open and read until the
+    /// server closes (its EOF, or TLS close_notify), then hold the socket
+    /// open, sending nothing, until the test sets this.
+    hold: ?*std.atomic.Value(bool) = null,
+    goaway_seen: std.atomic.Value(bool) = .init(false),
+    /// `hold`: the server's end of the connection reached this client.
+    server_closed: std.atomic.Value(bool) = .init(false),
     err: ?anyerror = null,
     thread: std.Thread = undefined,
 
@@ -146,6 +166,7 @@ const Client = struct {
         const deadline = t0 + (normal_ms + 5000) * ms;
         const w = try self.open(if (self.tr == .tls) .tls else .h2c, "h2");
         defer w.close();
+        self.fd.store(w.fd, .release);
         var pre = try h2c.buildClientPrefaceAndSettings(self.gpa);
         defer pre.deinit(self.gpa);
         try w.send(pre.items);
@@ -177,7 +198,14 @@ const Client = struct {
             if (self.server_connections) |c| self.connections_after_response = c.load(.seq_cst);
         }
         while (true) {
-            const s = try w.next(deadline) orelse return error.ClosedWithoutGoaway;
+            const next = w.next(deadline) catch |err| {
+                if (self.closing.load(.acquire)) return;
+                return err;
+            };
+            const s = next orelse {
+                if (self.closing.load(.acquire)) return;
+                return error.ClosedWithoutGoaway;
+            };
             if (s.ftype == 7) {
                 self.elapsed_ms = (nowNs() - t0) / ms;
                 // The idle close is the graceful path's first GOAWAY
@@ -190,6 +218,16 @@ const Client = struct {
                 if (last != std.math.maxInt(u31) or code != 0) {
                     std.debug.print("idle-pressure client {s} ({t}): GOAWAY last stream {d} code {d}, not the idle close's (2147483647, NO_ERROR)\n", .{ self.name, self.tr, last, code });
                     return error.NotTheIdleGoaway;
+                }
+                self.goaway_seen.store(true, .release);
+                const release = self.hold orelse return;
+                // The rest of the graceful close (the second GOAWAY, the
+                // PING it never answers), then the server's end.
+                while (try w.next(deadline)) |_| {}
+                self.server_closed.store(true, .release);
+                while (!release.load(.acquire)) {
+                    if (nowNs() >= deadline) return error.NeverReleased;
+                    starh2.test_sleep.threadSleepMs(1);
                 }
                 return;
             }
@@ -425,6 +463,91 @@ fn h2Run(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP/2: the reverse transition (t-3895).
+
+fn h2Reverse(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, tr);
+    defer rig.stop();
+    var started: Started = .{};
+    defer started.joinAll();
+
+    // Four fillers from 127.0.0.1 hold the server at the mark; C (::1) is
+    // the first connection under pressure, so its first idle wait gets the
+    // short limit. Then the test ends the fillers and asks C for a request
+    // inside that short wait, and C's next idle wait starts with no
+    // pressure: it must get the normal limit, not keep the short one.
+    var go: std.atomic.Value(bool) = .init(false);
+    var fill: [mark]Client = undefined;
+    for (&fill, 0..) |*f, i| {
+        f.* = .{ .gpa = gpa, .name = "filler", .tr = tr, .v6 = false, .port = rig.port(0) };
+        _ = try rig.begin(&started, f, i + 1);
+    }
+    var c: Client = .{ .gpa = gpa, .name = "C (idle under pressure, then idle again after it)", .tr = tr, .v6 = true, .port = rig.port(1), .request_on = &go, .server_connections = &rig.server.active_connections };
+    const at = try rig.begin(&started, &c, mark + 1);
+    const t_end_fill = nowNs();
+    for (&fill) |*f| {
+        f.closing.store(true, .release);
+        _ = std.c.shutdown(f.fd.load(.acquire), std.c.SHUT.RDWR);
+    }
+    try rig.waitConnections(1);
+    const fill_gone_ms = (nowNs() - t_end_fill) / ms;
+    go.store(true, .release);
+    try started.finish();
+
+    std.debug.print("idle-pressure {t}: reverse: C began with {d} in all (mark {d} of the others); fillers gone {d} ms later; after its response {d} in all; its second idle wait closed after {d} ms (normal {d}, pressure {d})\n", .{ tr, at, mark, fill_gone_ms, c.connections_after_response, c.elapsed_ms, normal_ms, short_ms });
+    try expectPressure(tr, "C at its start", at, true);
+    try expectPressure(tr, "C after its response", c.connections_after_response, false);
+    try expectWindow(tr, &c, normal_ms, "a new idle wait after pressure ended gets the normal limit");
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2: the server's own teardown (t-3895).
+
+fn h2Teardown(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, tr, tr);
+    defer rig.stop();
+    var started: Started = .{};
+    defer started.joinAll();
+
+    var release: std.atomic.Value(bool) = .init(false);
+    // Released on every exit, so the client's thread can end.
+    defer release.store(true, .release);
+    var c: Client = .{ .gpa = gpa, .name = "holder (keeps its socket open)", .tr = tr, .v6 = false, .port = rig.port(0), .hold = &release };
+    _ = try rig.begin(&started, &c, 1);
+    const goaway_deadline = nowNs() + (normal_ms + late_ms + 2000) * ms;
+    while (!c.goaway_seen.load(.acquire)) {
+        if (c.done.load(.acquire)) return c.err orelse error.ClientEndedEarly;
+        if (nowNs() >= goaway_deadline) return error.NoIdleGoaway;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    const t_goaway = nowNs();
+    // The client holds its socket open and sends nothing: only the server
+    // can end the connection now. Its graceful close: the PING nobody
+    // answers (1 s), then the close deadline
+    // (`close_flush_timeout_ns`, 500 ms by default).
+    const drop_limit_ms = 1000 + 500 + late_ms;
+    while (rig.server.stats().connections != 0) {
+        if (c.done.load(.acquire)) return c.err orelse error.ClientEndedEarly;
+        if (nowNs() >= t_goaway + drop_limit_ms * ms) {
+            std.debug.print("idle-pressure {t}: teardown: the server still counts {d} connections {d} ms after the idle GOAWAY, with the client holding its socket\n", .{ tr, rig.server.stats().connections, drop_limit_ms });
+            return error.ServerNeverEndedTheConnection;
+        }
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    const drop_ms = (nowNs() - t_goaway) / ms;
+    // Still held: the client has not closed or released.
+    const holding = !c.done.load(.acquire);
+    release.store(true, .release);
+    try started.finish();
+    std.debug.print("idle-pressure {t}: teardown: idle GOAWAY after {d} ms; the server gave the slot back {d} ms later with the client still holding its socket ({}); the client saw the server's end: {}\n", .{ tr, c.elapsed_ms, drop_ms, holding, c.server_closed.load(.acquire) });
+    try std.testing.expect(holding);
+    try std.testing.expect(c.server_closed.load(.acquire));
+    try expectWindow(tr, &c, normal_ms, "alone: the normal limit");
+}
+
+// ---------------------------------------------------------------------------
 // HTTP/1.1: the wait for the next request, under pressure.
 
 fn h1Run(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
@@ -464,6 +587,22 @@ test "idle under pressure (h2c): a wait that starts under pressure gets the shor
 
 test "idle under pressure (TLS h2): a wait that starts under pressure gets the short limit; before pressure and without it, the normal one" {
     try runCase(h2Run, .tls);
+}
+
+test "idle under pressure (h2c): a new idle wait after pressure has ended gets the normal limit again (t-3895)" {
+    try runCase(h2Reverse, .h2c);
+}
+
+test "idle under pressure (TLS h2): a new idle wait after pressure has ended gets the normal limit again (t-3895)" {
+    try runCase(h2Reverse, .tls);
+}
+
+test "idle under pressure (h2c): the server ends an idle connection by itself and gives the slot back, while the client holds its socket (t-3895)" {
+    try runCase(h2Teardown, .h2c);
+}
+
+test "idle under pressure (TLS h2): the server ends an idle connection by itself and gives the slot back, while the client holds its socket (t-3895)" {
+    try runCase(h2Teardown, .tls);
 }
 
 test "idle under pressure (h1c): the wait for the next request is field_block_timeout_ns, under pressure too" {
