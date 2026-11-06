@@ -225,7 +225,7 @@ const Rig = struct {
         resetFlags();
         var c: Client = .{ .gpa = self.gpa, .proto = proto, .port = self.port(proto), .path = path, .release_on_report = release_on_report, .reports_before = reports() };
         const t = try std.Thread.spawn(.{}, Client.main, .{&c});
-        defer t.join();
+        defer starh2.test_sleep.joinThread(t);
         try waitClient(&c);
     }
 
@@ -234,7 +234,7 @@ const Rig = struct {
         resetFlags();
         var a: Client = .{ .gpa = self.gpa, .proto = .h2c, .port = self.port(.h2c), .path = "/nap-spin", .release_on_report = true, .reports_before = reports() };
         const ta = try std.Thread.spawn(.{}, Client.main, .{&a});
-        defer ta.join();
+        defer starh2.test_sleep.joinThread(ta);
         const until = nowNs() + report_deadline_ms * ms;
         while (!napping.load(.acquire)) {
             if (nowNs() >= until) {
@@ -245,7 +245,7 @@ const Rig = struct {
         }
         var b: Client = .{ .gpa = self.gpa, .proto = .h2c, .port = self.port(.h2c), .path = "/quick" };
         const tb = try std.Thread.spawn(.{}, Client.main, .{&b});
-        defer tb.join();
+        defer starh2.test_sleep.joinThread(tb);
         try waitClient(&b);
         try waitClient(&a);
     }
@@ -322,6 +322,8 @@ fn runAll(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "executor watchdog: a spinning handler is reported once with its route; a yielding handler and an idle server are not (t-3760)" {
+    // These stalls are on purpose: reported as warnings, not test errors.
+    watchdog.test_reports_fail.store(false, .release);
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
@@ -353,6 +355,8 @@ fn runTwo(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 }
 
 test "executor watchdog: two servers on one runtime have one watchdog, and a stall is reported once, as its own server's (t-3760)" {
+    // These stalls are on purpose: reported as warnings, not test errors.
+    watchdog.test_reports_fail.store(false, .release);
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();

@@ -45,6 +45,13 @@ pub var test_reports: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on
 pub var test_last_label: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
 /// Watchdogs that did not start because their runtime had one.
 pub var test_second_refused: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
+/// In a build with the test hooks (every Debug test), a report is logged as
+/// an error, and the test runner fails the test it happens in: a test that
+/// holds an executor for the watchdog's limit (a join, a blocking read or
+/// sleep on an executor thread, t-3899) fails, wherever it is, with no grep
+/// to keep up to date. A test that stalls an executor on purpose
+/// (`tests/watchdog.zig`) sets this false. Production builds log a warning.
+pub var test_reports_fail: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(true) else {};
 
 // ---------------------------------------------------------------------------
 // Labels: a server tag in the high half of the word, the route index plus
@@ -242,14 +249,14 @@ const Reporter = struct {
         const l = stall.label;
         const route = labelRoute(l);
         if (l == 0) {
-            log.warn("executor {d} made no scheduler progress for at least {d} ms; no label", .{ index, ms });
+            say("executor {d} made no scheduler progress for at least {d} ms; no label", .{ index, ms });
         } else if (labelTag(l) != self.server_tag) {
-            log.warn("executor {d} made no scheduler progress for at least {d} ms; a handler of server {d}, route index {?d}", .{ index, ms, labelTag(l), route });
+            say("executor {d} made no scheduler progress for at least {d} ms; a handler of server {d}, route index {?d}", .{ index, ms, labelTag(l), route });
         } else if (route != null and route.? < self.routes.len) {
             const r = self.routes[route.?];
-            log.warn("executor {d} made no scheduler progress for at least {d} ms; route {s} {s}", .{ index, ms, @tagName(r.method), r.path });
+            say("executor {d} made no scheduler progress for at least {d} ms; route {s} {s}", .{ index, ms, @tagName(r.method), r.path });
         } else {
-            log.warn("executor {d} made no scheduler progress for at least {d} ms; label {d}, not a route of this server", .{ index, ms, l });
+            say("executor {d} made no scheduler progress for at least {d} ms; label {d}, not a route of this server", .{ index, ms, l });
         }
         if (comptime test_hook.on) {
             test_last_label.store(l, .release);
@@ -257,6 +264,15 @@ const Reporter = struct {
         }
     }
 };
+
+/// A warning, or an error in a test build that has not opted out
+/// (`test_reports_fail`).
+fn say(comptime fmt: []const u8, args: anytype) void {
+    if (comptime test_hook.on) {
+        if (test_reports_fail.load(.acquire)) return log.err(fmt ++ " (an error in a test build: a test must not hold an executor)", args);
+    }
+    log.warn(fmt, args);
+}
 
 test "a slow pass cannot backdate a stall: each executor's time is read after its own read (t-3760)" {
     // Two executors. The first one's read takes 900 ms (the watchdog thread

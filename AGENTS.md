@@ -207,6 +207,12 @@ see `tools/README.md`.
   lock; the bench server shows it at `GET /stats`. A new counter an
   operator should see goes there and into `/stats`, not into a test hook.
   `./zb build test-stats` is the gate.
+- A test must not hold a zio executor: in a test build the executor
+  watchdog logs a stall of `executor_stall_report_ns` (1 s) as an error,
+  and the test it happens in fails. Join a client OS thread with
+  `test_sleep.joinThread`; sleep with `zio.sleep` on a task, or
+  `test_sleep.threadSleepMs` on an OS thread. A test that stalls an
+  executor on purpose sets `watchdog.test_reports_fail` false.
 
 ## TLS and allocation traps
 
