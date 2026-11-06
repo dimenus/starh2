@@ -978,10 +978,7 @@ fn runStalled(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, st
     // Above the 500 ms of no progress that says the server has stalled: the
     // handler must still be parked when the stall is seen.
     if (check_kind == .slow_consumer or check_kind == .idle_after_kill) limits.response_min_rate_grace_ns = 1500 * std.time.ns_per_ms;
-    if (check_kind == .idle_after_kill) {
-        limits.connection_idle_timeout_ns = 1000 * std.time.ns_per_ms;
-        limits.connection_idle_timeout_under_pressure_ns = limits.connection_idle_timeout_ns;
-    }
+    if (check_kind == .idle_after_kill) limits.connection_idle_timeout_ns = 1000 * std.time.ns_per_ms;
 
     // Read by the connection when its WritePump starts, so it must be set
     // before the client connects and cleared afterwards.
@@ -1547,7 +1544,6 @@ fn runIdle(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, case:
     };
     var limits = starh2.Limits.defaults;
     limits.connection_idle_timeout_ns = if (case == .off) 0 else idle_limit_ms * std.time.ns_per_ms;
-    if (case != .off) limits.connection_idle_timeout_under_pressure_ns = limits.connection_idle_timeout_ns;
     limits.graceful_drain_timeout_ns = 300 * std.time.ns_per_ms;
     defer wire_pump.test_hold_writes.store(false, .release);
     idle_cause_seen.store(false, .release);

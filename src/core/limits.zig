@@ -441,13 +441,18 @@ pub const Limits = struct {
     /// 503. 0 lets it wait until a slot frees.
     connection_idle_timeout_ns: u64 = 75 * std.time.ns_per_s,
     /// The HTTP/2 idle limit for a connection that starts to have nothing to
-    /// do while the server is under connection pressure: its connections at
-    /// or above the pressure mark of the connection share, L/4 of
-    /// `max_connections` (`accounts.Share`). The connection reads the count
-    /// once, when its idle wait starts, and keeps the limit it chose for that
-    /// whole wait (`Connection.checkConnectionIdle`). Must be non-zero, and
-    /// not above `connection_idle_timeout_ns` when that is on; with that off
-    /// (0), no connection is closed for being idle, under pressure or not.
+    /// do while the server is under connection pressure: the server's other
+    /// connections, not counting this one, at or above the connection
+    /// share's mark, L/4 of `max_connections` rounded up
+    /// (`accounts.underPressure`, the rule the client shares use at
+    /// admission). With `max_connections` of 4 or less the mark is 1, so a
+    /// connection is under pressure whenever any other connection is open.
+    /// The connection reads the count once, when its idle wait starts, and
+    /// keeps the limit it chose for that whole wait
+    /// (`Connection.checkConnectionIdle`). The wait gets the smaller of this
+    /// and `connection_idle_timeout_ns`, so pressure never lengthens one.
+    /// Must be non-zero. With `connection_idle_timeout_ns` off (0), no
+    /// connection is closed for being idle, under pressure or not.
     ///
     /// The mark is low (a quarter of the server), so this is a moderate cut,
     /// not an emergency one: 10 s is the normal HTTP/2 idle timeout of some
@@ -508,6 +513,18 @@ pub const Limits = struct {
     }
 
     /// The client table's rules: the shares and the two start buckets.
+    /// The HTTP/2 idle limit for a wait that starts with `others`
+    /// connections open besides this one: under connection pressure
+    /// (`accounts.underPressure`) the smaller of
+    /// `connection_idle_timeout_under_pressure_ns` and
+    /// `connection_idle_timeout_ns`, else `connection_idle_timeout_ns`.
+    pub fn idleLimitNs(self: Limits, others: usize) u64 {
+        if (accounts.underPressure(others, accounts.Share.of(self.max_connections).mark)) {
+            return @min(self.connection_idle_timeout_under_pressure_ns, self.connection_idle_timeout_ns);
+        }
+        return self.connection_idle_timeout_ns;
+    }
+
     pub fn accountRules(self: Limits) accounts.Rules {
         return .{
             .shares = self.shares(),
@@ -794,10 +811,10 @@ pub const Limits = struct {
         if (self.proxy_header_bytes < proxy_protocol.min_header_cap or self.proxy_header_bytes > proxy_protocol.fixed_bytes + std.math.maxInt(u16)) return error.InvalidConfig;
         if (self.proxy_header_waiters == 0) return error.InvalidConfig;
         if (self.proxy_header_timeout_ns == 0 or self.proxy_header_timeout_ns > self.preface_timeout_ns) return error.InvalidConfig;
-        // A pressure limit longer than the normal one would make pressure
-        // keep idle connections longer.
+        // Zero would close every idle connection at once under pressure. A
+        // value above `connection_idle_timeout_ns` is allowed: the wait gets
+        // the smaller (`Connection.idleLimitNs`).
         if (self.connection_idle_timeout_under_pressure_ns == 0) return error.InvalidConfig;
-        if (self.connection_idle_timeout_ns != 0 and self.connection_idle_timeout_under_pressure_ns > self.connection_idle_timeout_ns) return error.InvalidConfig;
         // A bucket's whole span (`burst` refills) must fit the clock's u64.
         for ([_]u32{ self.connection_start_burst, self.handshake_start_burst }, [_]u64{ self.connection_start_refill_ns, self.handshake_start_refill_ns }) |burst, refill| {
             if (burst == 0 or refill == 0) return error.InvalidConfig;
@@ -1079,20 +1096,33 @@ test "h1_body term moves allocator_bytes with request_body_bytes" {
     try std.testing.expect(bigger.allocator_bytes > base.allocator_bytes);
 }
 
-test "the idle limit under pressure is non-zero and not above the normal one (t-3759 step 8)" {
+test "the idle limit under pressure: non-zero, the smaller of the two, at the shares' mark (t-3759 step 8)" {
     _ = try Limits.defaults.resourceUpperBound();
     var l = Limits.defaults;
     l.connection_idle_timeout_under_pressure_ns = 0;
     try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
+    // Above the normal limit is accepted, and then unused: pressure never
+    // lengthens a wait.
     l = Limits.defaults;
-    l.connection_idle_timeout_under_pressure_ns = l.connection_idle_timeout_ns + 1;
-    try std.testing.expectError(error.InvalidConfig, l.resourceUpperBound());
-    l.connection_idle_timeout_under_pressure_ns = l.connection_idle_timeout_ns;
+    l.connection_idle_timeout_ns = 2 * std.time.ns_per_s;
     _ = try l.resourceUpperBound();
+    try std.testing.expectEqual(l.connection_idle_timeout_ns, l.idleLimitNs(1_000));
     // Idle closing off: the pressure limit is unused, any non-zero value.
     l.connection_idle_timeout_ns = 0;
     l.connection_idle_timeout_under_pressure_ns = 1;
     _ = try l.resourceUpperBound();
+    // The pressure line is the client shares' (`accounts.underPressure`):
+    // 1,024 connections, mark 256 of the others, so the 257th connection
+    // is the first under pressure.
+    l = Limits.defaults;
+    try std.testing.expectEqual(@as(usize, 256), accounts.Share.of(l.max_connections).mark);
+    try std.testing.expectEqual(l.connection_idle_timeout_ns, l.idleLimitNs(255));
+    try std.testing.expectEqual(l.connection_idle_timeout_under_pressure_ns, l.idleLimitNs(256));
+    // At most 4 connections: the mark is 1, so any other connection is
+    // pressure.
+    l.max_connections = 4;
+    try std.testing.expectEqual(l.connection_idle_timeout_ns, l.idleLimitNs(0));
+    try std.testing.expectEqual(l.connection_idle_timeout_under_pressure_ns, l.idleLimitNs(1));
     // HTTP/1.1 does not use the pressure limit because, by default, its wait
     // for the next request is already no longer.
     try std.testing.expect(Limits.defaults.field_block_timeout_ns <= Limits.defaults.connection_idle_timeout_under_pressure_ns);

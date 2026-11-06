@@ -261,6 +261,16 @@ pub const Share = struct {
 /// The share of every resource, from the server's limits (`Limits.shares`).
 pub const Shares = [resource_count]Share;
 
+/// The one definition of pressure on a resource: the server's use of it,
+/// counted BEFORE the charge or the connection in question, is at or above
+/// the resource's `mark`. The client shares (`Charge.add`), the route shares
+/// (`RouteRef.add`) and the HTTP/2 idle limit (`Connection.idleLimitNs`,
+/// which passes its own connection's count minus itself) all ask here, so
+/// they turn on at the same connection.
+pub fn underPressure(use_before: usize, mark: usize) bool {
+    return use_before >= mark;
+}
+
 /// Shares whose mark no use reaches: nothing is refused by share. For the
 /// unit tests and the child-process cases that build a table by hand.
 pub const unlimited: Shares = @splat(Share.of(std.math.maxInt(usize)));
@@ -390,7 +400,7 @@ pub const Charge = struct {
         if (self.len != 0) {
             const t = self.table.?;
             const share = t.shares[@intFromEnum(res)];
-            const pressure = server_use >= share.mark;
+            const pressure = underPressure(server_use, share.mark);
             for (self.refs[0..self.len], 0..) |r, i| {
                 const rec = t.record(r) orelse continue;
                 const bound: ?usize = if (!pressure) null else if (i == 0) share.client else share.aggregate;
@@ -516,7 +526,7 @@ pub const RouteRef = struct {
         const t = self.table;
         const r = self.rec();
         const c = &r.counts[@intFromEnum(rr)];
-        if (server_use < t.marks[@intFromEnum(rr)]) {
+        if (!underPressure(server_use, t.marks[@intFromEnum(rr)])) {
             _ = c.fetchAdd(n, .acq_rel);
             return true;
         }

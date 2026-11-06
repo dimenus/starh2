@@ -2,22 +2,26 @@
 //! sockets.
 //!
 //! An HTTP/2 connection reads the server's connection count once, when an
-//! idle wait starts: at or above the connection share's pressure mark (L/4 of
-//! `max_connections`, the client shares' mark) the wait gets
-//! `connection_idle_timeout_under_pressure_ns`, else
+//! idle wait starts. Under connection pressure (`accounts.underPressure`: the
+//! connections other than this one at or above the mark, L/4 of
+//! `max_connections`, the rule the client shares use at admission) the wait
+//! gets `connection_idle_timeout_under_pressure_ns`, else
 //! `connection_idle_timeout_ns`. A wait that started before pressure keeps
 //! its deadline. The test limits are short (normal 3 s, under pressure
-//! 600 ms) so a run takes seconds. The first GOAWAY is the idle close, timed
-//! from the moment the client could have been idle: after its preface, or
-//! after its stream's last frame. Each close must land in a window: not
-//! before its limit, and at most `late_ms` after it. The two windows do not
-//! overlap, so each arm tells the limits apart.
+//! 600 ms) so a run takes seconds.
+//!
+//! The close is the idle close's first GOAWAY (NO_ERROR, last stream
+//! 2^31-1: the graceful phase 1), timed from before the client connected,
+//! or from its stream's last frame. Each close must land in a window: at
+//! most `early_ms` before its limit (the server's wait can start before the
+//! client's clock does, and times are floored to ms) and at most `late_ms`
+//! after it. The windows do not overlap, so each arm tells the limits apart.
 //!
 //! Identities: 127.0.0.1 and ::1, on both machines (macOS answers only on
-//! 127.0.0.1 of 127/8 unless an alias is set). One identity reaches the
-//! mark by itself (its cap under pressure is L/4, the mark), so the table
-//! at the mark holds both: three idle connections from 127.0.0.1 and the
-//! first from ::1.
+//! 127.0.0.1 of 127/8 unless an alias is set). One identity fills the
+//! connections up to the mark by itself (its cap under pressure is L/4), so
+//! the table at the mark holds four idle connections from 127.0.0.1, and
+//! the connections from ::1 are the first under pressure.
 //!
 //! HTTP/1.1 does not use the pressure limit: its wait for the next request
 //! is `field_block_timeout_ns` (5 s by default, below the 10 s default
@@ -40,16 +44,27 @@ const max_connections = 16;
 const mark = accounts.Share.of(max_connections).mark;
 const normal_ms = 3000;
 const short_ms = 600;
-const field_block_ms = 1500;
+const field_block_ms = 2000;
 /// How late a close may come after its limit: the actor's wake, the
 /// GOAWAY's trip, a loaded ci host.
 const late_ms = 1000;
+/// How early: the server's wait can start before the client's clock
+/// (HTTP/1.1 and A3 time from the response they read), and ms are floored.
+const early_ms = 100;
 
 comptime {
     // The windows must not overlap, or an arm could not tell them apart.
-    std.debug.assert(short_ms + late_ms < normal_ms);
-    std.debug.assert(short_ms < field_block_ms);
+    std.debug.assert(short_ms + late_ms < normal_ms - early_ms);
+    std.debug.assert(short_ms + late_ms < field_block_ms - early_ms);
     std.debug.assert(mark == 4);
+}
+
+/// The rule under test, written out here rather than called
+/// (`accounts.underPressure`), so a defect there cannot move the test's own
+/// preconditions with it: `n` connections open in all, the one in question
+/// among them, and the others at or above the mark.
+fn pressured(n: usize) bool {
+    return n -| 1 >= mark;
 }
 
 fn hello(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
@@ -82,8 +97,13 @@ const Client = struct {
     v6: bool,
     port: u16,
     /// HTTP/2: once set, send one request and time the idle wait from its
-    /// end instead of from the preface.
+    /// end instead of from the connect.
     request_on: ?*std.atomic.Value(bool) = null,
+    /// The server's connection count, read right after that request's
+    /// response (`request_on`): the reading its second idle wait starts
+    /// with.
+    server_connections: ?*const std.atomic.Value(usize) = null,
+    connections_after_response: usize = 0,
     /// The client could be idle from now on (`nowNs`).
     ready: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
@@ -121,14 +141,24 @@ const Client = struct {
     }
 
     fn runH2(self: *Client) !void {
+        // Before the connect: the server's idle wait cannot start earlier.
+        var t0 = nowNs();
+        const deadline = t0 + (normal_ms + 5000) * ms;
         const w = try self.open(if (self.tr == .tls) .tls else .h2c, "h2");
         defer w.close();
         var pre = try h2c.buildClientPrefaceAndSettings(self.gpa);
         defer pre.deinit(self.gpa);
         try w.send(pre.items);
-        var t0 = nowNs();
+        // The server's SETTINGS leaves in the emit of an actor turn whose
+        // idle check (where the wait starts and reads pressure) runs before
+        // it (`Connection` turn: `checkConnectionIdle`, then
+        // `materializeAndDrain`).
+        while (true) {
+            const s = try w.next(deadline) orelse return error.ClosedBeforeSettings;
+            if (s.ftype == 7) return error.GoawayBeforeSettings;
+            if (s.ftype == 4 and s.flags & 1 == 0) break;
+        }
         self.ready.store(true, .release);
-        const deadline = t0 + (normal_ms + 5000) * ms;
         if (self.request_on) |on| {
             while (!on.load(.acquire)) {
                 if (nowNs() >= deadline) return error.NeverAskedToRequest;
@@ -144,11 +174,23 @@ const Client = struct {
                 if ((s.ftype == 0 or s.ftype == 1) and s.sid == 1 and s.flags & 1 != 0) break;
             }
             t0 = nowNs();
+            if (self.server_connections) |c| self.connections_after_response = c.load(.seq_cst);
         }
         while (true) {
             const s = try w.next(deadline) orelse return error.ClosedWithoutGoaway;
             if (s.ftype == 7) {
                 self.elapsed_ms = (nowNs() - t0) / ms;
+                // The idle close is the graceful path's first GOAWAY
+                // (`Session.beginGracefulPhase1`): NO_ERROR, last stream
+                // 2^31-1. Any other is some other close.
+                const p = w.last_payload.items;
+                if (p.len < 8) return error.ShortGoaway;
+                const last = std.mem.readInt(u32, p[0..4], .big) & 0x7fff_ffff;
+                const code = std.mem.readInt(u32, p[4..8], .big);
+                if (last != std.math.maxInt(u31) or code != 0) {
+                    std.debug.print("idle-pressure client {s} ({t}): GOAWAY last stream {d} code {d}, not the idle close's (2147483647, NO_ERROR)\n", .{ self.name, self.tr, last, code });
+                    return error.NotTheIdleGoaway;
+                }
                 return;
             }
         }
@@ -247,11 +289,12 @@ const Rig = struct {
         if (self.key.len != 0) self.gpa.free(self.key);
     }
 
-    /// Start `c` and wait until it could be idle and the server counts
-    /// `want` connections, then a little longer, so the server's first turn
-    /// on it (where its idle wait starts) is done. Returns the count then.
-    fn begin(self: *Rig, c: *Client, want: usize) !usize {
-        try c.start();
+    /// Start `c` (registered in `started` before any wait, so it is joined
+    /// on every exit) and wait until it could be idle and the server counts
+    /// `want` connections, then a little longer as margin. Returns the
+    /// count then.
+    fn begin(self: *Rig, started: *Started, c: *Client, want: usize) !usize {
+        try started.start(c);
         const deadline = nowNs() + 5 * std.time.ns_per_s;
         while (!c.ready.load(.acquire) or self.connections() < want) {
             if (c.done.load(.acquire)) return c.err orelse error.ClientEndedEarly;
@@ -277,23 +320,54 @@ const Rig = struct {
     }
 };
 
-/// Wait for every client and join it. The first error wins.
-fn finish(clients: []const *Client) !void {
-    const deadline = nowNs() + (normal_ms + 8000) * ms;
-    for (clients) |c| {
-        while (!c.done.load(.acquire)) {
-            if (nowNs() >= deadline) return error.ClientNeverEnded;
-            zio.sleep(.fromMilliseconds(5)) catch {};
-        }
-        c.thread.join();
+/// Every client thread a test started. `joinAll` runs on every exit
+/// (`defer`): a client's own deadlines bound how long it can run, so the
+/// wait ends, and no thread outlives the stack it points into.
+const Started = struct {
+    list: [8]*Client = undefined,
+    n: usize = 0,
+
+    fn start(self: *Started, c: *Client) !void {
+        std.debug.assert(self.n < self.list.len);
+        try c.start();
+        self.list[self.n] = c;
+        self.n += 1;
     }
-    for (clients) |c| if (c.err) |err| return err;
-}
+
+    fn joinAll(self: *Started) void {
+        for (self.list[0..self.n]) |c| {
+            while (!c.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
+            c.thread.join();
+        }
+        self.n = 0;
+    }
+
+    /// Every client ended, in time, without an error.
+    fn finish(self: *Started) !void {
+        const deadline = nowNs() + (normal_ms + 8000) * ms;
+        for (self.list[0..self.n]) |c| {
+            while (!c.done.load(.acquire)) {
+                if (nowNs() >= deadline) return error.ClientNeverEnded;
+                zio.sleep(.fromMilliseconds(5)) catch {};
+            }
+        }
+        const all = self.list[0..self.n];
+        self.joinAll();
+        for (all) |c| if (c.err) |err| return err;
+    }
+};
 
 fn expectWindow(tr: Tr, c: *const Client, limit_ms: u64, comptime why: []const u8) !void {
-    if (c.elapsed_ms < limit_ms or c.elapsed_ms > limit_ms + late_ms) {
-        std.debug.print("idle-pressure {t}: {s} closed after {d} ms, want {d} to {d} ms ({s})\n", .{ tr, c.name, c.elapsed_ms, limit_ms, limit_ms + late_ms, why });
+    if (c.elapsed_ms + early_ms < limit_ms or c.elapsed_ms > limit_ms + late_ms) {
+        std.debug.print("idle-pressure {t}: {s} closed after {d} ms, want {d} to {d} ms ({s})\n", .{ tr, c.name, c.elapsed_ms, limit_ms - early_ms, limit_ms + late_ms, why });
         return error.IdleCloseOutsideWindow;
+    }
+}
+
+fn expectPressure(tr: Tr, comptime what: []const u8, n: usize, want: bool) !void {
+    if (pressured(n) != want) {
+        std.debug.print("idle-pressure {t}: {s} with {d} connections in all (mark {d} of the others): want {s}\n", .{ tr, what, n, mark, if (want) "under pressure" else "no pressure" });
+        return error.PressureNotReached;
     }
 }
 
@@ -306,47 +380,45 @@ fn h2Run(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
     defer rig.stop();
     const p4 = rig.port(0);
     const p6 = rig.port(1);
+    var started: Started = .{};
+    defer started.joinAll();
 
     // Control: alone on the server, never under pressure.
     var ctl: Client = .{ .gpa = gpa, .name = "control", .tr = tr, .v6 = false, .port = p4 };
-    const at_ctl = try rig.begin(&ctl, 1);
-    try finish(&.{&ctl});
+    const at_ctl = try rig.begin(&started, &ctl, 1);
+    try started.finish();
+    std.debug.print("idle-pressure {t}: control {d} ms ({d} in all)\n", .{ tr, ctl.elapsed_ms, at_ctl });
+    try expectPressure(tr, "control", at_ctl, false);
+    try expectWindow(tr, &ctl, normal_ms, "no pressure: the normal limit");
     try rig.waitConnections(0);
 
-    // A1 and A2 go idle below the mark and stay idle: the accepted tail. A3
-    // goes idle below the mark too, then makes a request once the server is
-    // under pressure, so its next idle wait starts under it.
+    // A1, A2 and A4 go idle with fewer others than the mark and stay idle:
+    // the accepted tail. A3 goes idle the same way, then makes a request
+    // once the server is under pressure, so its next idle wait starts
+    // under it. B1 and B2 (::1) are the first connections under pressure.
     var go: std.atomic.Value(bool) = .init(false);
+    const conns = &rig.server.active_connections;
     var a1: Client = .{ .gpa = gpa, .name = "A1 (idle before pressure)", .tr = tr, .v6 = false, .port = p4 };
     var a2: Client = .{ .gpa = gpa, .name = "A2 (idle before pressure)", .tr = tr, .v6 = false, .port = p4 };
-    var a3: Client = .{ .gpa = gpa, .name = "A3 (idle again under pressure)", .tr = tr, .v6 = false, .port = p4, .request_on = &go };
+    var a3: Client = .{ .gpa = gpa, .name = "A3 (idle again under pressure)", .tr = tr, .v6 = false, .port = p4, .request_on = &go, .server_connections = conns };
+    var a4: Client = .{ .gpa = gpa, .name = "A4 (idle before pressure)", .tr = tr, .v6 = false, .port = p4 };
     var b1: Client = .{ .gpa = gpa, .name = "B1 (idle under pressure)", .tr = tr, .v6 = true, .port = p6 };
     var b2: Client = .{ .gpa = gpa, .name = "B2 (idle under pressure)", .tr = tr, .v6 = true, .port = p6 };
-    var started: [5]*Client = undefined;
-    var n: usize = 0;
-    // Every started client is joined, also when an arm fails.
-    defer finish(started[0..n]) catch {};
-    var at: [5]usize = undefined;
-    for ([_]*Client{ &a1, &a2, &a3, &b1, &b2 }, 0..) |c, i| {
-        at[i] = try rig.begin(c, i + 1);
-        started[n] = c;
-        n += 1;
-    }
+    var at: [6]usize = undefined;
+    for ([_]*Client{ &a1, &a2, &a3, &a4, &b1, &b2 }, 0..) |c, i| at[i] = try rig.begin(&started, c, i + 1);
     go.store(true, .release);
-    const all = started[0..n];
-    n = 0;
-    try finish(all);
+    try started.finish();
 
-    std.debug.print("idle-pressure {t}: mark {d} of {d}; control {d} ms (connections {d}); before pressure A1 {d} ms, A2 {d} ms (connections {d}, {d}); under pressure B1 {d} ms, B2 {d} ms (connections {d}, {d}); A3 {d} ms after its stream ended under pressure\n", .{ tr, mark, max_connections, ctl.elapsed_ms, at_ctl, a1.elapsed_ms, a2.elapsed_ms, at[0], at[1], b1.elapsed_ms, b2.elapsed_ms, at[3], at[4], a3.elapsed_ms });
-    // The precondition: below the mark for the first three, at or above it
-    // for the B's. A run that never reached pressure tested nothing.
-    if (at_ctl >= mark or at[0] >= mark or at[1] >= mark or at[2] >= mark or at[3] < mark or at[4] < mark) {
-        std.debug.print("idle-pressure {t}: pressure not where the arms need it\n", .{tr});
-        return error.PressureNotReached;
-    }
-    try expectWindow(tr, &ctl, normal_ms, "no pressure: the normal limit");
+    std.debug.print("idle-pressure {t}: mark {d} of {d} (others); before pressure A1 {d} ms, A2 {d} ms, A4 {d} ms ({d}, {d}, {d} in all); under pressure B1 {d} ms, B2 {d} ms ({d}, {d} in all); A3 {d} ms after its stream ended ({d} in all)\n", .{ tr, mark, max_connections, a1.elapsed_ms, a2.elapsed_ms, a4.elapsed_ms, at[0], at[1], at[3], b1.elapsed_ms, b2.elapsed_ms, at[4], at[5], a3.elapsed_ms, a3.connections_after_response });
+    // The preconditions: a run that never reached pressure, or reached it
+    // too early, tested nothing.
+    for ([_]usize{ 0, 1, 2, 3 }) |i| try expectPressure(tr, "an A connection at its start", at[i], false);
+    try expectPressure(tr, "B1", at[4], true);
+    try expectPressure(tr, "B2", at[5], true);
+    try expectPressure(tr, "A3 after its response", a3.connections_after_response, true);
     try expectWindow(tr, &a1, normal_ms, "idle before pressure keeps its deadline");
     try expectWindow(tr, &a2, normal_ms, "idle before pressure keeps its deadline");
+    try expectWindow(tr, &a4, normal_ms, "idle before pressure keeps its deadline");
     try expectWindow(tr, &b1, short_ms, "idle wait started under pressure");
     try expectWindow(tr, &b2, short_ms, "idle wait started under pressure");
     try expectWindow(tr, &a3, short_ms, "a new idle wait started under pressure");
@@ -357,29 +429,22 @@ fn h2Run(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
 
 fn h1Run(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Tr) !void {
     // HTTP/2 connections from 127.0.0.1 hold the server at the mark; the
-    // HTTP/1.1 client is ::1.
+    // HTTP/1.1 client is ::1, the first connection under pressure.
     var rig: Rig = undefined;
     try rig.start(rt, gpa, .h2c, tr);
     defer rig.stop();
+    var started: Started = .{};
+    defer started.joinAll();
     var fill: [mark]Client = undefined;
-    var started: [mark + 1]*Client = undefined;
-    var n: usize = 0;
-    defer finish(started[0..n]) catch {};
     for (&fill, 0..) |*f, i| {
         f.* = .{ .gpa = gpa, .name = "filler", .tr = .h2c, .v6 = false, .port = rig.port(0) };
-        _ = try rig.begin(f, i + 1);
-        started[n] = f;
-        n += 1;
+        _ = try rig.begin(&started, f, i + 1);
     }
     var c: Client = .{ .gpa = gpa, .name = "keep-alive", .tr = tr, .v6 = true, .port = rig.port(1) };
-    const at = try rig.begin(&c, mark + 1);
-    started[n] = &c;
-    n += 1;
-    const all = started[0..n];
-    n = 0;
-    try finish(all);
-    std.debug.print("idle-pressure {t}: the wait for the next request closed after {d} ms with {d} connections (mark {d}); field_block_timeout {d} ms, pressure limit {d} ms\n", .{ tr, c.elapsed_ms, at, mark, field_block_ms, short_ms });
-    if (at < mark) return error.PressureNotReached;
+    const at = try rig.begin(&started, &c, mark + 1);
+    try started.finish();
+    std.debug.print("idle-pressure {t}: the wait for the next request closed after {d} ms with {d} connections in all (mark {d} of the others); field_block_timeout {d} ms, pressure limit {d} ms\n", .{ tr, c.elapsed_ms, at, mark, field_block_ms, short_ms });
+    try expectPressure(tr, "the keep-alive connection", at, true);
     try expectWindow(tr, &c, field_block_ms, "HTTP/1.1 waits field_block_timeout_ns for its next request");
 }
 

@@ -195,13 +195,13 @@ see `tools/README.md`.
   among several gives its routes the whole server
   (`tests/route_share.zig`), or the route refuses first. `./zb build
   test-routes` is the gate.
-- An HTTP/2 idle wait that starts while the server's connections are at the
-  connection mark gets `connection_idle_timeout_under_pressure_ns`
-  (`Connection.idleLimitNs`). A test that holds many idle HTTP/2
+- An HTTP/2 idle wait that starts under connection pressure
+  (`accounts.underPressure`, the client shares' rule) gets
+  `connection_idle_timeout_under_pressure_ns`, or the normal limit if that
+  is smaller (`Limits.idleLimitNs`). A test that holds many idle HTTP/2
   connections sees the later ones close at that limit, not
-  `connection_idle_timeout_ns`. A test that sets `connection_idle_timeout_ns`
-  below 10 s sets the pressure limit too, or boot refuses it.
-  `./zb build test-idle-pressure` is the gate.
+  `connection_idle_timeout_ns`. `./zb build test-idle-pressure` is the
+  gate.
 
 ## TLS and allocation traps
 
