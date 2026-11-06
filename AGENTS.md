@@ -202,6 +202,11 @@ see `tools/README.md`.
   connections sees the later ones close at that limit, not
   `connection_idle_timeout_ns`. `./zb build test-idle-pressure` is the
   gate.
+- `Server.stats()` is the operator read path for the server's counters
+  (gauges and refusals by reason), a copy of independent atomics with no
+  lock; the bench server shows it at `GET /stats`. A new counter an
+  operator should see goes there and into `/stats`, not into a test hook.
+  `./zb build test-stats` is the gate.
 
 ## TLS and allocation traps
 

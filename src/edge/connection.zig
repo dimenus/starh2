@@ -1135,6 +1135,14 @@ pub const Admit = enum { ok, server_full, client_refused };
 pub const GlobalAccounting = struct {
     active_streams: std.atomic.Value(usize) = .init(0),
     max_streams: usize,
+    /// Streams refused because the server held `max_streams_per_server`
+    /// (`tryAdmitStream`): REFUSED_STREAM on HTTP/2, 503 on HTTP/1.1. Not
+    /// the client's share, which `accounts.Table` counts.
+    stream_bound_refusals: std.atomic.Value(u64) = .init(0),
+    /// Task handlers refused because the server held `max_task_handlers`
+    /// (`tryReserveTaskHandler`'s `.server_full`): REFUSED_STREAM on HTTP/2,
+    /// 503 on HTTP/1.1. Not a client's or a route's share.
+    task_bound_refusals: std.atomic.Value(u64) = .init(0),
     /// Task-handler tokens (`Limits.max_task_handlers`). A task handler,
     /// either protocol, holds one from dispatch until its link is freed,
     /// which can be after its connection ended (`LinkCore.task_token`), so
@@ -1228,6 +1236,7 @@ pub const GlobalAccounting = struct {
             const cur = self.active_streams.load(.acquire);
             if (cur >= self.max_streams) {
                 c.sub(.streams, 1);
+                _ = self.stream_bound_refusals.fetchAdd(1, .monotonic);
                 return false;
             }
             if (self.active_streams.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return true;
@@ -1255,6 +1264,7 @@ pub const GlobalAccounting = struct {
             const cur = self.task_handlers.load(.acquire);
             if (cur >= self.task_handler_capacity) {
                 c.sub(.task_handlers, 1);
+                _ = self.task_bound_refusals.fetchAdd(1, .monotonic);
                 return .server_full;
             }
             if (self.task_handlers.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) == null) return .ok;

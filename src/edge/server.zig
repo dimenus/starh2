@@ -308,6 +308,15 @@ pub const Server = struct {
     watch_tag: usize,
     shutdown_event: zio.Event = .init,
     active_connections: std.atomic.Value(usize) = .init(0),
+    /// Times an accept loop found the server at `max_connections` and began
+    /// to wait for room (`awaitAdmission`): once per wait, not per wake-up,
+    /// and per accept loop (one per endpoint). The loop checks for room
+    /// before it accepts, so a wait starts when the server becomes full,
+    /// whether or not a client is connecting; a client that connects
+    /// meanwhile waits in the kernel's listen queue, unseen. Nothing is
+    /// closed. So this counts how often the server was full, not clients
+    /// turned away.
+    connection_bound_waits: std.atomic.Value(u64) = .init(0),
     accounting: connection.GlobalAccounting,
     /// The client accounts (`accounts.zig`): one record per client identity,
     /// and per IPv6 aggregate, that holds anything.
@@ -983,6 +992,10 @@ pub const Server = struct {
             .client_refused => return false,
             .server_full => {},
         }
+        // Full for `max_connections`, not for a handshake or PROXY slot.
+        if (self.active_connections.load(.seq_cst) >= self.limits.max_connections) {
+            _ = self.connection_bound_waits.fetchAdd(1, .monotonic);
+        }
         const acct = &self.accounting;
         try acct.admission_mu.lock();
         defer acct.admission_mu.unlock();
@@ -1395,6 +1408,104 @@ pub const Server = struct {
         self.releaseConnection(a.charge);
         self.clients.release(a.charge);
         stream.close(self.io);
+    }
+
+    /// What `stats` returns. Each field is a copy of one counter the server
+    /// keeps anyway; nothing is counted for `stats` itself.
+    pub const Stats = struct {
+        // Use now (gauges).
+
+        /// Connections admitted and not yet ended, against `max_connections`.
+        connections: usize,
+        /// HTTP/2 streams and HTTP/1.1 requests open, against
+        /// `max_streams_per_server`.
+        active_streams: usize,
+        /// Task handlers running, orphans included, against
+        /// `max_task_handlers`.
+        task_handlers: usize,
+        /// Task handlers still running after their connection ended.
+        orphaned_handlers: usize,
+        /// Response bytes reserved and not yet written, against
+        /// `outbound_bytes_per_server`.
+        outbound_bytes: usize,
+        /// TLS handshakes in progress, against `concurrent_tls_handshakes`.
+        active_handshakes: usize,
+        /// Accept loops waiting now for room (`max_connections`, a handshake
+        /// slot or a PROXY header slot).
+        accept_loops_waiting: usize,
+        /// The request pool: bytes resident and held (now and their highs),
+        /// per block class, and its refusals by reason (`refused`, indexed
+        /// by `request_pool.Reason`: a request over its own cap, its
+        /// connection's, the server's).
+        request_pool: request_pool.Snapshot,
+
+        // Refused since the server started (counts only grow).
+
+        /// Charges refused because a client (or its IPv6 aggregate) was over
+        /// its share while the server was under pressure, by
+        /// `accounts.Resource`.
+        client_share_refusals: [accounts.resource_count]u64,
+        /// Connection and handshake starts refused by a client's start
+        /// bucket under pressure, by `accounts.BucketKind`.
+        client_rate_refusals: [2]u64,
+        /// Connections refused because the client table was full.
+        client_table_full: u64,
+        /// Charges refused because a task route was over its share under
+        /// pressure, summed over the routes, by `accounts.RouteResource`.
+        route_share_refusals: [accounts.RouteResource.count]u64,
+        /// Streams refused because the server held `max_streams_per_server`.
+        stream_bound_refusals: u64,
+        /// Task handlers refused because the server held
+        /// `max_task_handlers`.
+        task_bound_refusals: u64,
+        /// Times an accept loop found the server at `max_connections` and
+        /// began to wait for room: how often the server was full, per
+        /// accept loop. Not clients turned away: a client that connects
+        /// meanwhile waits in the kernel's listen queue, unseen by the
+        /// server.
+        connection_bound_waits: u64,
+        /// PROXY v2 headers from a source not in the endpoint's trusted
+        /// list.
+        proxy_untrusted: u64,
+        /// PROXY v2 headers that failed: timed out, closed, or malformed.
+        proxy_header_failures: u64,
+        /// `accept` calls that failed (for example, out of descriptors).
+        accept_errors: u64,
+    };
+
+    /// The server's counters, now. Each field is read from its own atomic,
+    /// one after another, with no lock: the struct is not one consistent
+    /// instant. Two fields can disagree by the work done while they were
+    /// read (a connection counted in one gauge and not yet in another). Safe
+    /// from any thread, also while `serve` runs; it takes no lock and
+    /// allocates nothing.
+    pub fn stats(self: *const Server) Stats {
+        var route_refusals: [accounts.RouteResource.count]u64 = @splat(0);
+        for (self.accounting.routes.records) |*r| {
+            for (&route_refusals, &r.refusals) |*sum, *c| sum.* += c.load(.monotonic);
+        }
+        var share: [accounts.resource_count]u64 = undefined;
+        for (&share, 0..) |*v, i| v.* = self.clients.share_refusals[i].load(.monotonic);
+        return .{
+            .connections = self.active_connections.load(.monotonic),
+            .active_streams = self.accounting.active_streams.load(.monotonic),
+            .task_handlers = self.accounting.task_handlers.load(.monotonic),
+            .orphaned_handlers = self.accounting.orphaned_handlers.load(.monotonic),
+            .outbound_bytes = self.accounting.outbound_bytes.load(.monotonic),
+            .active_handshakes = self.accounting.active_handshakes.load(.monotonic),
+            .accept_loops_waiting = self.accounting.admission_waiters.load(.monotonic),
+            .request_pool = self.requests.snapshot(),
+            .client_share_refusals = share,
+            .client_rate_refusals = .{ self.clients.rate_refusals[0].load(.monotonic), self.clients.rate_refusals[1].load(.monotonic) },
+            .client_table_full = self.clients.insert_failures.load(.monotonic),
+            .route_share_refusals = route_refusals,
+            .stream_bound_refusals = self.accounting.stream_bound_refusals.load(.monotonic),
+            .task_bound_refusals = self.accounting.task_bound_refusals.load(.monotonic),
+            .connection_bound_waits = self.connection_bound_waits.load(.monotonic),
+            .proxy_untrusted = self.proxy_untrusted.load(.monotonic),
+            .proxy_header_failures = self.proxy_header_failures.load(.monotonic),
+            .accept_errors = self.accept_errors.load(.monotonic),
+        };
     }
 
     pub fn requestShutdown(self: *Server) void {

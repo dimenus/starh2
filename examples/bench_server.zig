@@ -1134,6 +1134,36 @@ var g_counting: ?*CountingGpa = null;
 /// `null` and `touched_bytes_note` says it is not available; a `mincore`
 /// failure on Linux is `null` with `touched_bytes_error` naming it.
 var g_requests: ?*const starh2.edge.request_pool.RequestPool = null;
+/// For `/stats`: `Server.stats()`, read while the server runs.
+var g_server: ?*const starh2.Server = null;
+
+/// `GET /stats`: `Server.stats()` as one JSON object. The request pool's
+/// own detail is `/mem`'s; here only its refusals and bytes.
+fn statsHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
+    const server = g_server orelse return resp.send(500, &.{}, "no server\n");
+    const s = server.stats();
+    const buf = try req.arena.alloc(u8, 4 * 1024);
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("{{\"connections\":{d},\"active_streams\":{d},\"task_handlers\":{d},\"orphaned_handlers\":{d},\"outbound_bytes\":{d},\"active_handshakes\":{d},\"accept_loops_waiting\":{d}", .{ s.connections, s.active_streams, s.task_handlers, s.orphaned_handlers, s.outbound_bytes, s.active_handshakes, s.accept_loops_waiting });
+    try w.print(",\"request_pool\":{{\"resident\":{d},\"held\":{d},\"refused\":{{\"request_cap\":{d},\"connection_cap\":{d},\"server_cap\":{d}}}}}", .{
+        s.request_pool.resident_bytes,
+        s.request_pool.held_bytes,
+        s.request_pool.refused[@backingInt(starh2.edge.request_pool.Reason.request_cap)],
+        s.request_pool.refused[@backingInt(starh2.edge.request_pool.Reason.connection_cap)],
+        s.request_pool.refused[@backingInt(starh2.edge.request_pool.Reason.server_cap)],
+    });
+    try w.writeAll(",\"client_share_refusals\":{");
+    for (s.client_share_refusals, 0..) |v, i| {
+        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.accounts.Resource, @enumFromInt(i))), v });
+    }
+    try w.print("}},\"client_rate_refusals\":{{\"connection_start\":{d},\"handshake_start\":{d}}},\"client_table_full\":{d}", .{ s.client_rate_refusals[0], s.client_rate_refusals[1], s.client_table_full });
+    try w.writeAll(",\"route_share_refusals\":{");
+    for (s.route_share_refusals, 0..) |v, i| {
+        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.accounts.RouteResource, @enumFromInt(i))), v });
+    }
+    try w.print("}},\"stream_bound_refusals\":{d},\"task_bound_refusals\":{d},\"connection_bound_waits\":{d},\"proxy_untrusted\":{d},\"proxy_header_failures\":{d},\"accept_errors\":{d}}}\n", .{ s.stream_bound_refusals, s.task_bound_refusals, s.connection_bound_waits, s.proxy_untrusted, s.proxy_header_failures, s.accept_errors });
+    try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
+}
 
 fn memHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     const buf = try req.arena.alloc(u8, 32 * 1024);
@@ -1563,6 +1593,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
         .{ .method = .GET, .path = "/sse-cadence-reset", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = cadenceResetHandler } } },
         .{ .method = .GET, .path = "/stuck", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = stuckHandler } } },
         .{ .method = .GET, .path = "/mem", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = memHandler } } },
+        .{ .method = .GET, .path = "/stats", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = statsHandler } } },
         .{ .method = .GET, .path = "/fragment", .handler = .{ .complete = .{ .ptr = @constCast(&dummy), .runFn = fragmentHandler } } },
         .{ .method = .GET, .path = "/fragment-task", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = fragmentTaskHandler } } },
         .{ .method = .POST, .path = "/echo-len", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = echoLenHandler } } },
@@ -1601,6 +1632,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     });
     defer server.deinit(server_gpa);
     g_requests = &server.requests;
+    g_server = &server;
 
     var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, server_gpa });
     try server.waitUntilListening(5 * std.time.ns_per_s);

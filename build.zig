@@ -1051,6 +1051,22 @@ pub fn build(b: *std.Build) void {
     const idle_pressure_step = b.step("test-idle-pressure", "Run the t-3759 step 8 gates (idle limit under connection pressure: h2c, TLS h2; HTTP/1.1's wait for the next request on h1c and TLS)");
     idle_pressure_step.dependOn(&run_idle_pressure_tests.step);
 
+    const stats_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/stats.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "starh2", .module = starh2_mod },
+                .{ .name = "zio", .module = zio_dep.module("zio") },
+            },
+        }),
+    });
+    const run_stats_tests = b.addRunArtifact(stats_tests);
+    run_stats_tests.setCwd(b.path("."));
+    const stats_step = b.step("test-stats", "Run the t-3759 step 9b gate (Server.stats(): the stream, task-handler and connection bound counters, and the client and route share refusals)");
+    stats_step.dependOn(&run_stats_tests.step);
+
     // The watchdog gate reads the watchdog's own counters, which are test
     // hooks: it gets a starh2 built with them on in every optimize mode (as
     // `lib_test_mod`), and an h2 client module over that same starh2, so the
@@ -1363,6 +1379,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_shares_tests.step);
     test_step.dependOn(&run_idle_pressure_tests.step);
     test_step.dependOn(&run_watchdog_tests.step);
+    test_step.dependOn(&run_stats_tests.step);
     test_step.dependOn(&run_routes_tests.step);
     test_step.dependOn(&run_protocol_work_tests.step);
     test_step.dependOn(&run_h1_linger_tests.step);
