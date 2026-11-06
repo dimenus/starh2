@@ -4,7 +4,7 @@
     .fingerprint = 0x813a04b419058cf5,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // dimenus/zio 650144c (carmack/t-3760-watchdog, on sim/dst-m3):
+        // dimenus/zio eca8e32 (carmack/t-3760-watchdog, on sim/dst-m3):
         // lalinsky/zio main cd0befa plus four parts upstream does not carry:
         // - the io_uring send -EAGAIN bridge (wait for writability, then
         //   resend). Upstream will not merge it (PR #863). It stays until the
@@ -18,8 +18,8 @@
         //   running task's label) and `setTaskLabel`, which the executor
         //   watchdog reads (t-3760).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#650144c0a467704e25de86d1ef1d09b07de15eae",
-            .hash = "zio-0.19.0-xHbVVFtBMADB0E-YLBepI8Udrtji3rpuiE4KJ_ZZeQ4q",
+            .url = "git+https://github.com/dimenus/zio#eca8e3207391e8497d861756af78376ded2398bb",
+            .hash = "zio-0.19.0-xHbVVA9KMABETBoUzwYWqDlTCJ2PliA-P8LXhDfsa_C7",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.

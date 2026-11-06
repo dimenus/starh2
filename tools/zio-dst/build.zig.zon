@@ -5,11 +5,11 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // The same zio commit as starh2's own pin (../../build.zig.zon).
-        // The hash is of a prefix-less `git archive 650144c`; for d8ac2fd and
+        // The hash is of a prefix-less `git archive eca8e32`; for d8ac2fd and
         // 3d50bb6 that method gave the same hash as a GitHub fetch.
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#650144c0a467704e25de86d1ef1d09b07de15eae",
-            .hash = "zio-0.19.0-xHbVVFtBMADB0E-YLBepI8Udrtji3rpuiE4KJ_ZZeQ4q",
+            .url = "git+https://github.com/dimenus/zio#eca8e3207391e8497d861756af78376ded2398bb",
+            .hash = "zio-0.19.0-xHbVVA9KMABETBoUzwYWqDlTCJ2PliA-P8LXhDfsa_C7",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },
