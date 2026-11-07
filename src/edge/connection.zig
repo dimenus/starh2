@@ -1259,8 +1259,21 @@ pub fn closeReasonOfSite(comptime site: []const u8) CloseReason {
 
 pub fn closeReasonOfGoaway(code: frame.ErrorCode) CloseReason {
     return switch (code) {
+        .no_error => .h2_goaway_no_error,
+        .protocol_error => .h2_goaway_protocol_error,
+        .internal_error => .h2_goaway_internal_error,
+        .flow_control_error => .h2_goaway_flow_control_error,
+        .settings_timeout => .h2_goaway_settings_timeout,
+        .stream_closed => .h2_goaway_stream_closed,
+        .frame_size_error => .h2_goaway_frame_size_error,
+        .refused_stream => .h2_goaway_refused_stream,
+        .cancel => .h2_goaway_cancel,
+        .compression_error => .h2_goaway_compression_error,
+        .connect_error => .h2_goaway_connect_error,
+        .enhance_your_calm => .h2_goaway_enhance_your_calm,
+        .inadequate_security => .h2_goaway_inadequate_security,
+        .http_1_1_required => .h2_goaway_http_1_1_required,
         _ => .h2_goaway_unknown,
-        inline else => |c| @field(CloseReason, "h2_goaway_" ++ @tagName(c)),
     };
 }
 
