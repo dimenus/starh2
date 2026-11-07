@@ -53,10 +53,18 @@ const dummy: u8 = 0;
 
 var release: std.atomic.Value(bool) = .init(false);
 var started: std.atomic.Value(usize) = .init(0);
+/// The orphan tests: `hold` then ignores the cancel its connection's end
+/// asks for, so it outlives the connection (an orphan). Each canceled sleep
+/// is swallowed and the next one waits in full, so it does not spin.
+var ignore_cancel: std.atomic.Value(bool) = .init(false);
 
 fn hold(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror!void {
     _ = started.fetchAdd(1, .acq_rel);
-    while (!release.load(.acquire)) try zio.sleep(.fromMilliseconds(2));
+    while (!release.load(.acquire)) {
+        if (ignore_cancel.load(.acquire)) {
+            zio.sleep(.fromMilliseconds(2)) catch {};
+        } else try zio.sleep(.fromMilliseconds(2));
+    }
     try resp.send(200, &.{}, "held");
 }
 
@@ -767,6 +775,88 @@ fn expectStep(server: *starh2.Server, prev: starh2.Server.Stats, allowed: []cons
     return now;
 }
 
+// ---------------------------------------------------------------------------
+// Orphans (t-3900): per route, and the oldest one's age.
+
+fn waitOrphans(rig: *Rig, want: usize) !void {
+    const deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (rig.server.stats().orphaned_handlers != want) {
+        if (nowNs() >= deadline) {
+            std.debug.print("stats: orphans {d}, want {d}\n", .{ rig.server.stats().orphaned_handlers, want });
+            return error.OrphansNeverReached;
+        }
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+}
+
+/// A handler of `/hold`, then 300 ms later one of `/hold2`, each on its own
+/// connection; both connections close, so both handlers are orphans. Then:
+/// one orphan on each route, the server's oldest orphan at least 300 ms
+/// old, and `/hold`'s orphan about 300 ms older than `/hold2`'s. Once they
+/// return: no orphan anywhere, and every age 0.
+fn orphans(rt: *zio.Runtime, gpa: std.mem.Allocator, p: Proto) !void {
+    var limits = starh2.Limits.defaults;
+    limits.graceful_drain_timeout_ns = 200 * ms;
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, limits, if (p == .h1c) .h1c_none else .h2c, true);
+    defer rig.stop();
+    ignore_cancel.store(true, .release);
+    defer ignore_cancel.store(false, .release);
+    // On any exit: let the orphans return before the stop.
+    defer release.store(true, .release);
+    try std.testing.expectEqual(@as(usize, 2), rig.server.taskRouteCount());
+    try std.testing.expectEqualStrings("GET /hold", rig.server.routeStats(0).label);
+    try std.testing.expectEqualStrings("GET /hold2", rig.server.routeStats(1).label);
+    try std.testing.expectEqual(@as(u64, 0), rig.server.stats().oldest_orphan_age_ns);
+
+    const a = try rig.connect();
+    var a_open = true;
+    defer if (a_open) a.close();
+    try request(gpa, a, p, "/hold");
+    try waitStarted(1);
+    zio.sleep(.fromMilliseconds(300)) catch {};
+    const b = try rig.connect();
+    var b_open = true;
+    defer if (b_open) b.close();
+    try request(gpa, b, p, "/hold2");
+    try waitStarted(2);
+    a.close();
+    a_open = false;
+    b.close();
+    b_open = false;
+    try waitOrphans(&rig, 2);
+
+    const r0 = rig.server.routeStats(0);
+    const r1 = rig.server.routeStats(1);
+    const s = rig.server.stats();
+    std.debug.print("stats: orphans ({s}): server {d}, oldest {d} ms; {s} {d} (oldest {d} ms), {s} {d} (oldest {d} ms)\n", .{
+        @tagName(p),                       s.orphaned_handlers, s.oldest_orphan_age_ns / ms,
+        r0.label,                          r0.orphans,          r0.oldest_orphan_age_ns / ms,
+        r1.label,                          r1.orphans,          r1.oldest_orphan_age_ns / ms,
+    });
+    try std.testing.expectEqual(@as(usize, 1), r0.orphans);
+    try std.testing.expectEqual(@as(usize, 1), r1.orphans);
+    try std.testing.expectEqual(@as(usize, 1), r0.task_handlers);
+    try std.testing.expectEqual(@as(usize, 1), r1.task_handlers);
+    // Read in the order r0, r1, s: each later read is at least as old.
+    if (r0.oldest_orphan_age_ns < 300 * ms) return error.OldestOrphanTooYoung;
+    if (r1.oldest_orphan_age_ns == 0) return error.NoOrphanAge;
+    if (r0.oldest_orphan_age_ns < r1.oldest_orphan_age_ns + 250 * ms) return error.RouteAgesNotApart;
+    if (s.oldest_orphan_age_ns < r0.oldest_orphan_age_ns) return error.ServerOldestNotTheOldest;
+    // Not far past it either: the server's oldest is /hold's orphan.
+    if (s.oldest_orphan_age_ns > r0.oldest_orphan_age_ns + 250 * ms) return error.ServerOldestTooOld;
+
+    release.store(true, .release);
+    try waitOrphans(&rig, 0);
+    const after = rig.server.stats();
+    try std.testing.expectEqual(@as(u64, 0), after.oldest_orphan_age_ns);
+    for (0..2) |i| {
+        const r = rig.server.routeStats(i);
+        try std.testing.expectEqual(@as(usize, 0), r.orphans);
+        try std.testing.expectEqual(@as(u64, 0), r.oldest_orphan_age_ns);
+    }
+}
+
 fn runProto(comptime f: anytype, p: Proto) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -833,4 +923,12 @@ test "stats: an HTTP/1.1 request over request_body_bytes counts close_reasons.h1
 
 test "stats: six connections ended six ways, the peer's included, move close_reasons by six, one in each reason (t-3900 item 5, round 2)" {
     try runIn(mixedEnds);
+}
+
+test "stats: orphans per route and the oldest orphan's age, HTTP/1.1 (t-3900)" {
+    try runProto(orphans, .h1c);
+}
+
+test "stats: orphans per route and the oldest orphan's age, HTTP/2 (t-3900)" {
+    try runProto(orphans, .h2c);
 }

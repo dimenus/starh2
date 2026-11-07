@@ -1467,6 +1467,7 @@ fn dispatch(
 
     link.handler = matched.found.handler.task;
     link.watch_label = watchdog.label(self.config.watch_tag, matched.found.route);
+    link.core.start_ns = accounts.Orphans.now();
     // The handler's reference; the actor's is the one `newLink` began with.
     _ = link.core.refs.fetchAdd(1, .monotonic);
     link.core.task_counted = true;

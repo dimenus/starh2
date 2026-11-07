@@ -43,6 +43,10 @@
 //!   charging the record the index names in its own list.
 //! - `route-table-not-task`: the right list, but a complete route of it:
 //!   `ref` panics with its own message, in every build.
+//! - `orphan-line`: three handlers of `GET /orphan` that ignore their
+//!   cancel, on three connections closed 100 ms apart: the first orphan is
+//!   logged with its route and the counts, and the other two are held back
+//!   (the process exits with the server running).
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -468,6 +472,72 @@ fn runRouteUnderflow(_: *zio.Runtime) anyerror!void {
     std.debug.print("child: route underflow task_handlers={d} compression={d} underflows={d} clean={}\n", .{ r.table.records[0].count(.task_handlers), r.table.records[0].count(.compression), t.underflows.load(.acquire), t.checkEmpty() });
 }
 
+// ---------------------------------------------------------------------------
+// The orphan line (t-3900).
+
+fn connect4(port: u16) !zio.net.Stream {
+    const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
+    return peer.connect(.{});
+}
+
+fn monoMs() u64 {
+    return zio.Timestamp.now(.monotonic).toNanoseconds() / std.time.ns_per_ms;
+}
+
+var orphan_started: std.atomic.Value(usize) = .init(0);
+
+/// Ignores its cancel (each canceled sleep is swallowed and the next one
+/// waits in full), so it outlives its connection.
+fn orphanHandler(_: *anyopaque, _: *const starh2.Request, _: *starh2.Response) anyerror!void {
+    _ = orphan_started.fetchAdd(1, .acq_rel);
+    while (true) zio.sleep(.fromMilliseconds(20)) catch {};
+}
+
+const orphan_routes = [_]starh2.Route{
+    .{ .method = .GET, .path = "/orphan", .handler = .{ .task = .{ .ptr = @constCast(&dummy), .runFn = orphanHandler } } },
+};
+
+fn runOrphanLine(rt: *zio.Runtime) anyerror!void {
+    const gpa = std.heap.page_allocator;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } }},
+        .routes = &orphan_routes,
+        .tls = null,
+        .limits = .defaults,
+    });
+    _ = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+    var conns: [3]zio.net.Stream = undefined;
+    for (&conns) |*c| {
+        c.* = try connect4(port);
+        var off: usize = 0;
+        const req = "GET /orphan HTTP/1.1\r\nhost: localhost\r\n\r\n";
+        while (off < req.len) off += try c.write(req[off..], .none);
+    }
+    const t0 = monoMs();
+    while (orphan_started.load(.acquire) < 3) {
+        if (monoMs() - t0 > 5000) return error.HandlersNeverStarted;
+        try zio.sleep(.fromMilliseconds(5));
+    }
+    // One at a time, so the first line's counts are exact.
+    for (conns) |c| {
+        const before = server.stats().orphaned_handlers;
+        c.close();
+        const t1 = monoMs();
+        while (server.stats().orphaned_handlers == before) {
+            if (monoMs() - t1 > 5000) return error.NeverOrphaned;
+            try zio.sleep(.fromMilliseconds(2));
+        }
+        try zio.sleep(.fromMilliseconds(100));
+    }
+    try zio.sleep(.fromMilliseconds(3000));
+    const r = server.routeStats(0);
+    std.debug.print("child: orphan line orphans={d} {s}={d} oldest_ms>=3000={}\n", .{ server.stats().orphaned_handlers, r.label, r.orphans, r.oldest_orphan_age_ns >= 3000 * std.time.ns_per_ms });
+    // The kill: the orphans never end.
+    std.process.exit(0);
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.next();
@@ -507,6 +577,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runRouteTableMismatch, .{rt})
     else if (std.mem.eql(u8, case, "route-table-not-task"))
         try rt.spawn(runRouteTableNotTask, .{rt})
+    else if (std.mem.eql(u8, case, "orphan-line"))
+        try rt.spawn(runOrphanLine, .{rt})
     else
         return error.UnknownCase;
     try h.join();

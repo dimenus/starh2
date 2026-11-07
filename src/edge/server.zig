@@ -452,6 +452,8 @@ pub const Server = struct {
         // so a route index is always a slot of the table.
         var route_accounts = try accounts.RouteTable.init(gpa, routes, config.limits.routeLimits());
         errdefer route_accounts.deinit(gpa);
+        var orphans = try accounts.Orphans.init(gpa, config.limits.max_task_handlers);
+        errdefer orphans.deinit(gpa);
 
         const endpoints = try gpa.dupe(EndpointConfig, config.endpoints);
         for (endpoints) |*ep| switch (ep.*) {
@@ -556,6 +558,7 @@ pub const Server = struct {
                 .max_outbound_bytes = config.limits.outbound_bytes_per_server,
                 .max_handshakes = config.limits.concurrent_tls_handshakes,
                 .routes = route_accounts,
+                .orphans = orphans,
             },
             .clients = clients,
             .slabs = slabs,
@@ -1502,7 +1505,57 @@ pub const Server = struct {
         /// server's choices. `h2_unrecorded` / `h1_unrecorded` count ends
         /// no path recorded a reason for.
         close_reasons: std.EnumArray(connection.CloseReason, u64),
+
+        // Orphans (t-3900). Per route: `routeStats`.
+
+        /// How long the oldest orphan (a task handler still running after
+        /// its connection ended) has run since its dispatch, in ns; 0 with
+        /// no orphan.
+        oldest_orphan_age_ns: u64,
     };
+
+    /// One task route's share of `Stats`: `routeStats`.
+    pub const RouteStats = struct {
+        /// "GET /path" (a prefix route ends with `*`), as the log lines
+        /// name it. Valid while the server lives.
+        label: []const u8,
+        /// Its task handlers running, orphans included.
+        task_handlers: usize,
+        /// Its handlers still running after their connection ended.
+        orphans: usize,
+        /// How long its oldest orphan has run since dispatch, in ns; 0 with
+        /// no orphan.
+        oldest_orphan_age_ns: u64,
+        /// Its charges refused by its share under pressure, by
+        /// `accounts.RouteResource`.
+        share_refusals: [accounts.RouteResource.count]u64,
+    };
+
+    /// How many task routes `routeStats` takes (the route table's records,
+    /// in route order).
+    pub fn taskRouteCount(self: *const Server) usize {
+        return self.accounting.routes.records.len;
+    }
+
+    /// Task route `i` (0 up to `taskRouteCount`), now: as `stats`, plain
+    /// atomic loads with no lock, and a scan of the orphan registry
+    /// (`accounts.Orphans`).
+    pub fn routeStats(self: *const Server, i: usize) RouteStats {
+        const r = &self.accounting.routes.records[i];
+        var refusals: [accounts.RouteResource.count]u64 = undefined;
+        for (&refusals, &r.refusals) |*v, *c| v.* = c.load(.monotonic);
+        return .{
+            .label = r.label.text(),
+            .task_handlers = r.count(.task_handlers),
+            .orphans = r.orphans.load(.monotonic),
+            .oldest_orphan_age_ns = ageOf(self.accounting.orphans.oldestStart(@intCast(i))),
+            .share_refusals = refusals,
+        };
+    }
+
+    fn ageOf(start: u64) u64 {
+        return if (start == 0) 0 else accounts.Orphans.now() -| start;
+    }
 
     /// The server's counters, now. Each counter is read from its own
     /// atomic, one after another, with no lock: the struct is not one
@@ -1510,9 +1563,10 @@ pub const Server = struct {
     /// they were read (a connection counted in one gauge and not yet in
     /// another). Besides the atomics it reads plain fields that are fixed
     /// after `init`: the request pool's class sizes and count
-    /// (`RequestPool.snapshot`) and the route table's slice of records. Safe
-    /// from any thread, also while `serve` runs; it takes no lock and
-    /// allocates nothing.
+    /// (`RequestPool.snapshot`) and the route table's slice of records. The
+    /// oldest orphan's age scans the orphan registry, one load per
+    /// task-handler token (`accounts.Orphans`). Safe from any thread, also
+    /// while `serve` runs; it takes no lock and allocates nothing.
     pub fn stats(self: *const Server) Stats {
         var route_refusals: [accounts.RouteResource.count]u64 = @splat(0);
         for (self.accounting.routes.records) |*r| {
@@ -1542,6 +1596,7 @@ pub const Server = struct {
             .proxy_header_failures = self.proxy_header_failures.load(.monotonic),
             .accept_errors = self.accept_errors.load(.monotonic),
             .close_reasons = close_reasons,
+            .oldest_orphan_age_ns = ageOf(self.accounting.orphans.oldestStart(null)),
         };
     }
 
@@ -1604,6 +1659,7 @@ pub const Server = struct {
         live = checkZero("active_streams", self.accounting.active_streams.load(.acquire)) or live;
         live = checkZero("task handlers (task_handlers)", self.accounting.task_handlers.load(.acquire)) or live;
         live = checkZero("orphaned_handlers", self.accounting.orphaned_handlers.load(.acquire)) or live;
+        live = checkZero("orphan registry slots", self.accounting.orphans.inUse()) or live;
         live = checkZero("outbound_bytes", self.accounting.outbound_bytes.load(.acquire)) or live;
         live = checkZero("active_handshakes", self.accounting.active_handshakes.load(.acquire)) or live;
         if (self.compression_pool) |*pool| {
@@ -1638,6 +1694,7 @@ pub const Server = struct {
         self.slots.deinit();
         self.clients.deinit(gpa);
         self.accounting.routes.deinit(gpa);
+        self.accounting.orphans.deinit(gpa);
         if (self.tls_acceptor) |*auth| auth.deinit();
         self.* = undefined;
     }

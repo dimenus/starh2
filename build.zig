@@ -1347,6 +1347,16 @@ pub fn build(b: *std.Build) void {
     run_route_table_not_task.has_side_effects = true;
     shutdown_step.dependOn(&run_route_table_not_task.step);
     routes_step.dependOn(&run_route_table_not_task.step);
+    // The orphan line names its route and the counts (t-3900).
+    const run_orphan_line = b.addRunArtifact(shutdown_child);
+    run_orphan_line.addArg("orphan-line");
+    run_orphan_line.addCheck(.{ .expect_stderr_match = "handler of GET /orphan still running " });
+    run_orphan_line.addCheck(.{ .expect_stderr_match = " ms after dispatch when its connection ended; orphans now: 1 on this route, 1 on the server (0 more since the last report)" });
+    run_orphan_line.addCheck(.{ .expect_stderr_match = "child: orphan line orphans=3 GET /orphan=3 oldest_ms>=3000=true" });
+    run_orphan_line.expectExitCode(0);
+    run_orphan_line.has_side_effects = true;
+    shutdown_step.dependOn(&run_orphan_line.step);
+    stats_step.dependOn(&run_orphan_line.step);
 
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{

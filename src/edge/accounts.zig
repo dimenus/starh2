@@ -498,6 +498,10 @@ pub const RouteRecord = struct {
     refusals: [RouteResource.count]std.atomic.Value(u64) = @splat(.init(0)),
     /// "GET /path" (a prefix route ends with `*`), for the refusal line.
     label: Table.Label = .{},
+    /// This route's handlers still running after their connection ended:
+    /// up from `GlobalAccounting.addOrphan`, down when the orphan's link is
+    /// freed (`dropLink`). Its task handlers count includes them.
+    orphans: std.atomic.Value(usize) = .init(0),
 
     pub fn count(self: *const RouteRecord, res: RouteResource) usize {
         return self.counts[@intFromEnum(res)].load(.acquire);
@@ -509,7 +513,7 @@ pub const RouteRef = struct {
     table: *RouteTable,
     index: u32,
 
-    fn rec(self: RouteRef) *RouteRecord {
+    pub fn rec(self: RouteRef) *RouteRecord {
         return &self.table.records[self.index];
     }
 
@@ -744,6 +748,21 @@ pub const RouteTable = struct {
         if (!any) w.writeAll("none") catch {};
     }
 
+    /// One orphan of record `index` ended (`dropLink`). Below zero is
+    /// refused, counted in `underflows` and logged, like `RouteRef.sub`.
+    pub fn releaseOrphan(self: *RouteTable, index: u32) void {
+        const r = &self.records[index];
+        var cur = r.orphans.load(.acquire);
+        while (true) {
+            if (cur == 0) {
+                const total = self.underflows.fetchAdd(1, .monotonic) + 1;
+                log.err("route account underflow: an orphan of {s} ended with its orphan count at 0; refused ({d} refused so far)", .{ r.label.text(), total });
+                return;
+            }
+            cur = r.orphans.cmpxchgWeak(cur, cur - 1, .acq_rel, .acquire) orelse return;
+        }
+    }
+
     /// Every route count zero and no underflow over the server's life, or
     /// log what is not. `Server.deinit` calls it after `serve` returned, so
     /// every test that ends a server checks the route accounts too, orphans
@@ -757,6 +776,11 @@ pub const RouteTable = struct {
                 clean = false;
                 log.err("route account still charged at deinit: {s} {s} = {d}", .{ r.label.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), v });
             }
+            const o = r.orphans.load(.acquire);
+            if (o != 0) {
+                clean = false;
+                log.err("route account still charged at deinit: {s} orphans = {d}", .{ r.label.text(), o });
+            }
         }
         const u = self.underflows.load(.acquire);
         if (u != 0) {
@@ -764,6 +788,121 @@ pub const RouteTable = struct {
             log.err("route accounts: {d} refused releases over the server's life", .{u});
         }
         return clean;
+    }
+};
+
+/// The live orphans' dispatch times: the age of the oldest orphan,
+/// server-wide (`Server.stats`) and per task route (`Server.routeStats`).
+///
+/// An orphan is a task handler still running after its connection ended
+/// (`connection.LinkCore.orphan`). Its age is now minus its dispatch time
+/// (`LinkCore.start_ns`), so the oldest needs the smallest start among the
+/// orphans alive now. One "oldest start" kept per route cannot follow the
+/// orphans as they end: when the oldest ends, the next one is unknown
+/// without a list of them. So each orphan holds one slot here, from when it
+/// is orphaned until its link is freed, and a reader scans the slots.
+///
+/// - One slot per task-handler token (`Limits.max_task_handlers`). Every
+///   orphan holds a token until its link is freed and gives its slot back
+///   before its token (`dropLink`), so the slots in use are never more than
+///   the tokens held, and a new orphan, which holds a token, always finds a
+///   free one.
+/// - No lock. `add` claims a free slot with a compare-and-swap, writes the
+///   route, then publishes the start; `remove` stores 0. Only orphaning and
+///   the orphan's end touch this, and orphaning is rare (a connection ended
+///   under a running handler). Dispatch only writes its start into its own
+///   link.
+/// - A reader (`oldestStart`) loads every slot: `max_task_handlers` loads
+///   (4096 by default), only when asked.
+/// - A `GlobalAccounting` built by hand in a unit test has no slots
+///   (`capacity` 0): `add` then records nothing, and says so (null).
+pub const Orphans = struct {
+    /// The dispatch time (monotonic ns, never 0) of the orphan in the slot;
+    /// 0 for a free slot, `claimed` while `add` fills it.
+    starts: []std.atomic.Value(u64) = &.{},
+    /// The orphan's task route (`RouteRef.index`) + 1, or 0 for none (an
+    /// HTTP/2 404 or 405 runs as a task with no route account). Written
+    /// before the start is published.
+    routes: []std.atomic.Value(u32) = &.{},
+    /// One line at most a second when a handler is orphaned
+    /// (`GlobalAccounting.addOrphan`).
+    log: RateLimitedLine = .{},
+
+    const claimed = std.math.maxInt(u64);
+
+    pub fn init(gpa: std.mem.Allocator, capacity: usize) error{OutOfMemory}!Orphans {
+        const starts = try gpa.alloc(std.atomic.Value(u64), capacity);
+        errdefer gpa.free(starts);
+        const routes = try gpa.alloc(std.atomic.Value(u32), capacity);
+        @memset(starts, .init(0));
+        @memset(routes, .init(0));
+        return .{ .starts = starts, .routes = routes };
+    }
+
+    pub fn deinit(self: *Orphans, gpa: std.mem.Allocator) void {
+        gpa.free(self.starts);
+        gpa.free(self.routes);
+        self.* = undefined;
+    }
+
+    /// Take a slot for an orphan dispatched at `start_ns`, of route record
+    /// `route` (null for none). Its index, or null when this registry has no
+    /// slots (a hand-built test accounting). One pass can miss a slot that
+    /// was freed behind it while every slot ahead was taken, so it scans
+    /// again; a free slot exists at every instant (the type's doc).
+    pub fn add(self: *Orphans, start_ns: u64, route: ?u32) ?u32 {
+        if (self.starts.len == 0) return null;
+        const start = @min(@max(start_ns, 1), claimed - 1);
+        while (true) {
+            for (self.starts, 0..) |*slot, i| {
+                if (slot.load(.monotonic) != 0) continue;
+                if (slot.cmpxchgStrong(0, claimed, .acquire, .monotonic) != null) continue;
+                self.routes[i].store(if (route) |r| r + 1 else 0, .monotonic);
+                slot.store(start, .release);
+                return @intCast(i);
+            }
+        }
+    }
+
+    /// The orphan in slot `i` ended.
+    pub fn remove(self: *Orphans, i: u32) void {
+        std.debug.assert(self.starts[i].load(.monotonic) != 0);
+        self.starts[i].store(0, .release);
+    }
+
+    /// The smallest start among the live orphans of route record `route`, or
+    /// of every route when it is null; 0 when there is none. A slot being
+    /// filled or reused while it is read is skipped: that orphan is
+    /// arriving or gone.
+    pub fn oldestStart(self: *const Orphans, route: ?u32) u64 {
+        var oldest: u64 = 0;
+        for (self.starts, self.routes) |*slot, *r| {
+            const st = slot.load(.acquire);
+            if (st == 0 or st == claimed) continue;
+            if (route) |want| {
+                const got = r.load(.monotonic);
+                // The route belongs to this start only if the slot still
+                // holds it.
+                if (slot.load(.acquire) != st) continue;
+                if (got != want + 1) continue;
+            }
+            if (oldest == 0 or st < oldest) oldest = st;
+        }
+        return oldest;
+    }
+
+    /// Slots in use: 0 once every orphan ended (`Server.deinit` checks it).
+    pub fn inUse(self: *const Orphans) usize {
+        var n: usize = 0;
+        for (self.starts) |*slot| {
+            if (slot.load(.acquire) != 0) n += 1;
+        }
+        return n;
+    }
+
+    /// Now on the clock `LinkCore.start_ns` and `oldestStart` use.
+    pub fn now() u64 {
+        return nowNs();
     }
 };
 

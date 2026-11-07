@@ -1417,6 +1417,10 @@ pub const GlobalAccounting = struct {
     /// `Server.serve` waits for zero before it returns, because such a
     /// handler still reaches the request pool, this struct and the balancer.
     orphaned_handlers: std.atomic.Value(usize) = .init(0),
+    /// The live orphans' dispatch times (`accounts.Orphans`), one slot per
+    /// task-handler token: `Server.init` sizes it. Empty in a hand-built
+    /// test accounting, which then records no ages.
+    orphans: accounts.Orphans = .{},
     outbound_bytes: std.atomic.Value(usize) = .init(0),
     max_outbound_bytes: usize,
     active_handshakes: std.atomic.Value(usize) = .init(0),
@@ -1475,6 +1479,23 @@ pub const GlobalAccounting = struct {
 
     pub fn releaseOrphan(self: *GlobalAccounting) void {
         self.saturatingRelease(&self.orphaned_handlers, 1, "orphaned_handlers", .acq_rel);
+    }
+
+    /// `LinkCore.orphan`: count the orphan server-wide and on its route,
+    /// take its slot in the registry (for the oldest orphan's age), and log
+    /// it, at most a line a second. Rare: a connection ended under a running
+    /// handler.
+    pub fn addOrphan(self: *GlobalAccounting, core: *LinkCore) void {
+        const total = self.orphaned_handlers.fetchAdd(1, .acq_rel) + 1;
+        const route = core.charge.route;
+        const on_route: usize = if (route) |r| r.rec().orphans.fetchAdd(1, .acq_rel) + 1 else 0;
+        core.orphan_slot = self.orphans.add(core.start_ns, if (route) |r| r.index else null);
+        const ran_ms = (accounts.Orphans.now() -| core.start_ns) / std.time.ns_per_ms;
+        if (route) |r| {
+            self.orphans.log.note("handler of {s} still running {d} ms after dispatch when its connection ended; orphans now: {d} on this route, {d} on the server", .{ r.rec().label.text(), ran_ms, on_route, total });
+        } else {
+            self.orphans.log.note("handler with no task route (HTTP/2 404 or 405) still running {d} ms after dispatch when its connection ended; orphans now: {d} on the server", .{ ran_ms, total });
+        }
     }
 
     // Every charge below walks the holder's list (`accounts.Charge`: the
@@ -2032,6 +2053,13 @@ pub const LinkCore = struct {
     /// Written by the actor in `orphan` before it drops its reference; read
     /// by whoever frees the link. The reference count orders the two.
     orphaned: bool = false,
+    /// When a task handler was dispatched (`accounts.Orphans.now`, one clock
+    /// read): an orphan's age is counted from it. 0 for a complete handler,
+    /// which runs on the actor and is never orphaned.
+    start_ns: u64 = 0,
+    /// The orphan's registry slot (`accounts.Orphans`), set with `orphaned`;
+    /// null with no registry.
+    orphan_slot: ?u32 = null,
     /// The actor's thread at dispatch, for the placement probe only. A copy,
     /// because the handler may first run after its connection ended.
     actor_thread: std.Thread.Id = 0,
@@ -2062,7 +2090,7 @@ pub const LinkCore = struct {
         std.debug.assert(self.gate.isClosed());
         std.debug.assert(self.gate.inside() == 0);
         self.orphaned = true;
-        if (self.accounting) |a| _ = a.orphaned_handlers.fetchAdd(1, .acq_rel);
+        if (self.accounting) |a| a.addOrphan(self);
     }
 
     /// Take the link's own references on its client accounts. Called once,
@@ -2108,6 +2136,15 @@ pub fn dropLink(comptime L: type, link: *L) void {
     const token = core.task_token;
     const orphaned = core.orphaned;
     const charge = core.charge;
+    // The orphan's slot and route count go first, before its token: the
+    // registry's slots in use must never pass the tokens held
+    // (`accounts.Orphans`).
+    if (orphaned) {
+        if (accounting) |a| {
+            if (core.orphan_slot) |i| a.orphans.remove(i);
+            if (charge.route) |r| r.table.releaseOrphan(r.index);
+        }
+    }
     // Poison it in safe builds: a handler that still used the link would read
     // garbage and fail loudly instead of working on freed memory.
     link.* = undefined;
@@ -8625,6 +8662,7 @@ pub const Connection = struct {
                 .balancer = self.config.balancer,
                 .exec_index = self.config.exec_index,
                 .actor_thread = self.actor_thread,
+                .start_ns = if (complete_inline) 0 else accounts.Orphans.now(),
             },
             .conn = self,
             .stream_id = d.stream_id,
