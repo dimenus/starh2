@@ -1152,34 +1152,41 @@ pub const ConnConfig = struct {
 /// accept loop for everyone).
 pub const Admit = enum { ok, server_full, client_refused };
 
-/// Why the server ended a connection: the key of
-/// `GlobalAccounting.close_reasons`, read through `Server.stats()`. Each
-/// connection is counted once, at the first reason, where the protocol
-/// already records it:
+/// How a connection ended: the key of `GlobalAccounting.close_reasons`, read
+/// through `Server.stats()`. EVERY connection whose actor ran (HTTP/2) or
+/// whose `h1.serve` ran (HTTP/1.1) is counted exactly once, at its teardown,
+/// with the FIRST reason recorded for it (`EndReason`): a later failure (the
+/// write that fails after a GOAWAY) never adds a second count. A connection
+/// that ended with no reason recorded counts as `h2_unrecorded` or
+/// `h1_unrecorded`, so the table's total is the number of connections ended,
+/// and a path that records nothing is visible. Not counted: a connection
+/// that failed before its actor started (a TLS handshake, the accept-time
+/// refusals that `Stats` counts on their own).
 ///
-/// - HTTP/2, the edge's own closes: `Connection.noteServerClose`. Its site
-///   names (which `--close-reason` prints) map to a reason in
-///   `closeReasonOfSite`.
-/// - HTTP/2, the GOAWAY the session sent to end the connection: the
-///   `connection_error` intent, by error code (`closeReasonOfGoaway`). Every
-///   session protocol failure takes this path, the ENHANCE_YOUR_CALM
-///   floods included.
-/// - HTTP/1.1, an error response, which always ends the connection:
-///   `h1.writeError`, by status (`closeReasonOfStatus`).
+/// Where each reason is recorded:
+/// - HTTP/2, the edge's own ends: `Connection.noteServerClose`, whose site
+///   names (printed by `--close-reason`) map to a reason in
+///   `closeReasonOfSite`; the peer's end of stream (`onPeerEof`); the
+///   server's shutdown (`maybeBeginGraceful`).
+/// - HTTP/2, the GOAWAY the session sent for a protocol error: the
+///   `connection_error` intent, by code (`closeReasonOfGoaway`). The
+///   ENHANCE_YOUR_CALM floods take this path.
+/// - HTTP/1.1: `h1.writeError` (an error response, by status), the head
+///   wait (`readHead`), a failed write (`noteWriteFailed`), the keep-alive
+///   decision after a response (`serveOne`), and `runLoop`.
 ///
-/// A close this side did not choose (the peer's FIN or GOAWAY, a graceful
-/// shutdown) has no entry.
+/// Which side chose the end: `byPeer` is true for the peer's ends and for
+/// transport failures (the socket failed under us: usually the peer reset
+/// or vanished); every other reason is the server's choice.
 pub const CloseReason = enum {
+    // HTTP/2, the server's choice.
     /// No request for the connection idle timeout (`connection_idle`).
     h2_idle,
     /// The peer took no byte for the write-byte timeout
-    /// (`write_byte_timeout`).
+    /// (`write_byte_timeout`): the server gave up on a reader.
     h2_write_stalled,
-    /// A socket write failed (`ack_fail_all`). Most peer closes show up here
-    /// first: the next write after the peer hangs up fails.
-    h2_write_failed,
-    /// A socket read failed (`read_failed`).
-    h2_read_failed,
+    /// The server shut down: its graceful GOAWAY ended the connection.
+    h2_shutdown,
     /// The server failed the connection closed on its own error: an emit, a
     /// sink, a drain or a write-ack that cannot be completed, or a full
     /// ring or queue (`emit_fail1`-`5`, `data_sink_catch`/`2`,
@@ -1204,6 +1211,17 @@ pub const CloseReason = enum {
     h2_goaway_http_1_1_required,
     /// A GOAWAY code outside RFC 9113's list.
     h2_goaway_unknown,
+    // HTTP/2, the peer's end or the transport's.
+    /// The peer ended its side: a FIN or TLS close_notify (`onPeerEof`).
+    h2_peer_closed,
+    /// A socket read failed (`read_failed`): usually the peer reset.
+    h2_read_failed,
+    /// A socket write failed (`ack_fail_all`): usually the peer hung up
+    /// and the next write found it gone.
+    h2_write_failed,
+    /// No reason was recorded before teardown.
+    h2_unrecorded,
+    // HTTP/1.1, the server's choice: an error response, by status.
     h1_400,
     h1_408,
     h1_411,
@@ -1213,9 +1231,74 @@ pub const CloseReason = enum {
     h1_500,
     h1_501,
     h1_503,
-    /// Any other HTTP/1.1 error status.
+    /// Any other error status.
     h1_other,
+    // HTTP/1.1, the server's choice, with no error response.
+    /// No complete request head within `field_block_timeout_ns`, between
+    /// requests or inside one.
+    h1_idle,
+    /// The client took no byte for the write-byte timeout.
+    h1_write_stalled,
+    /// The server shut down.
+    h1_shutdown,
+    /// The server closed after a response because the exchange needed it
+    /// (HTTP/1.0 or a close-delimited body, a streamed body left unread, a
+    /// handler that ended the connection, an SSE stream that ended).
+    h1_server_closed,
+    // HTTP/1.1, the peer's end or the transport's.
+    /// The client's end of stream (or TLS close_notify): between requests
+    /// or inside a head. A read that fails ends the same way here.
+    h1_peer_closed,
+    /// The client asked to close (`Connection: close`) and got its response.
+    h1_close_requested,
+    /// A socket write failed under the server.
+    h1_write_failed,
+    /// No reason was recorded before teardown.
+    h1_unrecorded,
+
+    /// Whether the peer (or the transport) ended the connection, not the
+    /// server.
+    pub fn byPeer(r: CloseReason) bool {
+        return switch (r) {
+            .h2_peer_closed, .h2_read_failed, .h2_write_failed, .h1_peer_closed, .h1_close_requested, .h1_write_failed => true,
+            else => false,
+        };
+    }
 };
+
+/// A connection's first end reason. `note` records it once: the first
+/// caller wins, from any task, and later ones are dropped.
+pub const EndReason = struct {
+    /// 0 for none, else the reason's tag + 1.
+    v: std.atomic.Value(u8) = .init(0),
+
+    /// Records `r` if nothing was recorded yet; true when it did.
+    pub fn note(self: *EndReason, r: CloseReason) bool {
+        return self.v.cmpxchgStrong(0, @as(u8, @backingInt(r)) + 1, .acq_rel, .acquire) == null;
+    }
+
+    pub fn get(self: *const EndReason) ?CloseReason {
+        const x = self.v.load(.acquire);
+        return if (x == 0) null else @fromBackingInt(@intCast(x - 1));
+    }
+};
+
+/// Run-time-armed mutants of the close-reason recording, for
+/// `tests/stats.zig` only (observe builds).
+pub const CloseMutant = enum(u8) {
+    none,
+    /// The peer's end of stream is not recorded: the session's GOAWAY
+    /// NO_ERROR becomes its reason, as before t-3900 round 2.
+    peer_closed_as_goaway,
+    /// An HTTP/1.1 head timeout is not recorded.
+    h1_idle_unrecorded,
+};
+pub var test_close_mutant: test_hook.Hook(std.atomic.Value(CloseMutant)) = if (test_hook.on) .init(.none) else {};
+
+pub fn closeMutant(m: CloseMutant) bool {
+    if (comptime !test_hook.on) return false;
+    return test_close_mutant.load(.acquire) == m;
+}
 
 /// The reason of a `noteServerClose` site. A site missing here is a compile
 /// error, so a new site must be given a reason.
@@ -1305,7 +1388,8 @@ pub fn closeReasonOfStatus(status: u16) CloseReason {
 /// below zero is refused and counted (`saturatingRelease`).
 pub const GlobalAccounting = struct {
     active_streams: std.atomic.Value(usize) = .init(0),
-    /// Connections the server ended, by `CloseReason`. Only grow.
+    /// Connections ended, by `CloseReason`, each once at its teardown. Only
+    /// grow.
     close_reasons: std.EnumArray(CloseReason, std.atomic.Value(u64)) = .initFill(.init(0)),
     max_streams: usize,
     /// Streams refused because the server held `max_streams_per_server`
@@ -2478,10 +2562,10 @@ pub const Connection = struct {
     /// Set when a write completion reports failure; actor owns handler terminal transition.
     writer_failed: std.atomic.Value(bool) = .init(false),
     writer_fail_handled: bool = false,
-    /// Set by the first close reason (`noteClose`), so only the first one
-    /// is counted (`GlobalAccounting.close_reasons`) and, under
-    /// `--close-reason`, printed. Atomic so that exactly one caller wins.
-    close_reason_noted: std.atomic.Value(bool) = .init(false),
+    /// The first reason this connection ends (`noteClose`): counted at
+    /// teardown (`GlobalAccounting.close_reasons`) and, under
+    /// `--close-reason`, printed when it is recorded.
+    end_reason: EndReason = .{},
     /// Handler writes refused for lack of connection outbound budget
     /// (`enqueuePending`). Each refusal fails one stream. Under `session_mu`.
     stream_budget_refusals: u32 = 0,
@@ -3442,19 +3526,25 @@ pub const Connection = struct {
         self.noteClose(comptime closeReasonOfSite(site), site, if (err) |e| @errorName(e) else "-", "-");
     }
 
-    /// The first reason this connection ends: counted, and printed under
-    /// `--close-reason`. Later ones are neither.
+    /// Records the first reason this connection ends, and prints it under
+    /// `--close-reason`. Later ones are neither. It is counted at teardown.
     fn noteClose(self: *Connection, reason: CloseReason, comptime site: []const u8, err: []const u8, goaway: []const u8) void {
-        if (self.close_reason_noted.swap(true, .acq_rel)) return;
-        if (self.config.accounting) |a| a.countClose(reason);
+        if (!self.end_reason.note(reason)) return;
         if (!close_reason) return;
         // A failed socket write is how this side first sees most peer
         // closes: h2load hangs up after its last response, and the next
-        // write fails. So it is not counted as the server ending it.
-        const by = comptime if (std.mem.eql(u8, site, "ack_fail_all")) "write_failed" else "server";
-        diagRawPrint("CLOSE_REASON conn={x} mode={s} by=" ++ by ++ " site=" ++ site ++ " err={s} goaway={s} held={d} pending={d} wire={d} lim={d} high_water={d} budget_parks={d} stream_budget_refusals={d}\n", .{
+        // write fails. So it is not counted as the server ending it, nor
+        // a failed read, nor the peer's end of stream.
+        const by = switch (reason) {
+            .h2_write_failed => "write_failed",
+            .h2_read_failed => "read_failed",
+            .h2_peer_closed => "peer",
+            else => "server",
+        };
+        diagRawPrint("CLOSE_REASON conn={x} mode={s} by={s} site=" ++ site ++ " err={s} goaway={s} held={d} pending={d} wire={d} lim={d} high_water={d} budget_parks={d} stream_budget_refusals={d}\n", .{
             @intFromPtr(self) & 0xffffff,
             @tagName(self.config.mode),
+            by,
             err,
             goaway,
             self.outbound_held.load(.acquire),
@@ -5382,7 +5472,12 @@ pub const Connection = struct {
             // whose budget never filled proves nothing about the budget, so
             // the high-water (largest bytes held at once) is printed beside
             // the limit, with how many writes parked and how many were refused.
-            diagRawPrint("STREAM_BUDGET conn={x} mode={s} stream_budget_refusals={d} lim={d} high_water={d} budget_parks={d} server_ended={}\n", .{ @intFromPtr(self) & 0xffffff, @tagName(self.config.mode), self.stream_budget_refusals, self.config.limits.outbound_bytes_per_connection, self.outbound_high_water.load(.acquire), self.budget_parks.load(.acquire), self.close_reason_noted.load(.acquire) });
+            diagRawPrint("STREAM_BUDGET conn={x} mode={s} stream_budget_refusals={d} lim={d} high_water={d} budget_parks={d} server_ended={}\n", .{ @intFromPtr(self) & 0xffffff, @tagName(self.config.mode), self.stream_budget_refusals, self.config.limits.outbound_bytes_per_connection, self.outbound_high_water.load(.acquire), self.budget_parks.load(.acquire), if (self.end_reason.get()) |r| !r.byPeer() else false });
+        }
+        // The one count of this connection's end (`CloseReason`).
+        if (self.config.accounting) |a| {
+            const reason = self.end_reason.get() orelse if (self.serverShuttingDown()) CloseReason.h2_shutdown else CloseReason.h2_unrecorded;
+            a.countClose(reason);
         }
         if (close_probe) diagRawPrint("t1002 conn={x} loop_exit terminal={s} sched_pending={d} parked={d}\n", .{ @intFromPtr(self), @tagName(self.session.terminal), self.sched.pendingCount(), close_probe_parked.load(.acquire) });
         self.finishTerminalInline(self.teardown_inline_n);
@@ -5937,6 +6032,9 @@ pub const Connection = struct {
         defer self.unlockSession();
         if (self.closing_deadline_ns != null) return;
         if (self.session.terminal == .none) {
+            // Recorded before `peerClosed`, whose GOAWAY(NO_ERROR) is only
+            // the server's answer to the peer's end.
+            if (!closeMutant(.peer_closed_as_goaway)) self.noteClose(.h2_peer_closed, "peer_eof", "-", "-");
             self.session.peerClosed() catch |err| try self.sessionErrorExit(err, "peer_eof_error");
         }
         self.materializeIntents() catch self.failClosedOnIntentError();
@@ -6274,6 +6372,7 @@ pub const Connection = struct {
         if (!self.going_away) {
             const sf = self.config.shutdown_flag orelse return false;
             if (!sf.load(.acquire)) return false;
+            self.noteClose(.h2_shutdown, "server_shutdown", "-", "-");
             try self.beginGraceful();
             return false;
         }

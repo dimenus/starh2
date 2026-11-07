@@ -1139,6 +1139,8 @@ var g_server: ?*const starh2.Server = null;
 
 /// `GET /stats`: `Server.stats()` as one JSON object. The request pool's
 /// own detail is `/mem`'s; here only its refusals and bytes.
+/// `close_reasons` counts every connection that ended, once, by its first
+/// reason, the peer's ends included (`CloseReason.byPeer`).
 fn statsHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     const server = g_server orelse return resp.send(500, &.{}, "no server\n");
     const s = server.stats();

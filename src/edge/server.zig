@@ -1491,11 +1491,16 @@ pub const Server = struct {
         /// `accept` calls that failed (for example, out of descriptors).
         accept_errors: u64,
 
-        // Connections the server ended, since it started (counts only grow).
+        // Connections ended, since the server started (counts only grow).
 
-        /// By `CloseReason`, each connection once, at its first reason:
-        /// `close_reasons.get(.h2_idle)`. A close the peer chose has no
-        /// entry.
+        /// Every connection that ended, by `CloseReason`, each once at its
+        /// teardown with the first reason recorded for it:
+        /// `close_reasons.get(.h2_idle)`. The peer's ends are here too
+        /// (`h2_peer_closed`, `h1_peer_closed`, `h1_close_requested`), and
+        /// so are transport failures (`h2_read_failed`, `h2_write_failed`,
+        /// `h1_write_failed`); `CloseReason.byPeer` tells them from the
+        /// server's choices. `h2_unrecorded` / `h1_unrecorded` count ends
+        /// no path recorded a reason for.
         close_reasons: std.EnumArray(connection.CloseReason, u64),
     };
 

@@ -220,6 +220,9 @@ pub const H1Conn = struct {
     no_payload: bool = false,
     resp_status: u16 = 0,
     socket_closed: bool = false,
+    /// The first reason this connection ends (`connection.CloseReason`),
+    /// counted once by `countEnd` when `serve` returns.
+    end_reason: connection.EndReason = .{},
     dispatch_headers: []request.Header = &.{},
 
     /// The TLS transport (`H1Tls`): the pump and everything it borrows. The
@@ -298,6 +301,7 @@ pub fn serve(
         return;
     };
     defer conn.deinit();
+    defer countEnd(&conn);
     var marker: @TypeOf(actor_marker).Node = .unset;
     actor_marker.set(&marker, &conn);
     defer actor_marker.clear(&marker);
@@ -557,11 +561,25 @@ fn startTlsPump(self: *H1Conn) !void {
     try self.tls_t.arm();
 }
 
+/// The one count of this connection's end: its first recorded reason, or
+/// `h1_shutdown` / `h1_unrecorded` when none was recorded.
+fn countEnd(self: *H1Conn) void {
+    const a = self.config.accounting orelse return;
+    const reason = self.end_reason.get() orelse if (shutdownRequested(self)) connection.CloseReason.h1_shutdown else connection.CloseReason.h1_unrecorded;
+    a.countClose(reason);
+}
+
 fn runLoop(self: *H1Conn) !void {
     var keep = true;
     while (keep) {
-        if (shutdownRequested(self)) break;
+        if (shutdownRequested(self)) {
+            _ = self.end_reason.note(.h1_shutdown);
+            break;
+        }
         keep = try serveOne(self);
+        // The exchange ended the connection; a reason recorded on the way
+        // (an error status, a timeout, the client's EOF) stays first.
+        if (self.occupies or !keep) _ = self.end_reason.note(.h1_server_closed);
         if (self.occupies) break;
         if (!keep) break;
         self.acc.reset();
@@ -800,6 +818,7 @@ fn serveOne(self: *H1Conn) !bool {
 
             try dispatch(self, head, matched, body, headers, path, query, authority);
             if (test_channel_mutation == .m3_ignore_close) self.want_close = false;
+            if (close_after) _ = self.end_reason.note(.h1_close_requested);
             if (self.want_close or close_after) return false;
             return true;
         },
@@ -833,10 +852,13 @@ fn readHead(self: *H1Conn) !?HeadOutcome {
                 },
             }
         }
-        if (nowNs(self.io) >= deadline_ns) return null;
+        if (nowNs(self.io) >= deadline_ns) return headTimedOut(self);
         var tmp: [4096]u8 = undefined;
-        const n = try readSome(self, tmp[0..], deadline_ns) orelse return null;
-        if (n == 0) return null;
+        const n = try readSome(self, tmp[0..], deadline_ns) orelse return headTimedOut(self);
+        if (n == 0) {
+            _ = self.end_reason.note(.h1_peer_closed);
+            return null;
+        }
         const r = feedHead(self, tmp[0..n]);
         switch (r) {
             .need_more => {},
@@ -851,6 +873,12 @@ fn readHead(self: *H1Conn) !?HeadOutcome {
             },
         }
     }
+}
+
+/// No complete head within `field_block_timeout_ns`: the connection ends.
+fn headTimedOut(self: *H1Conn) ?HeadOutcome {
+    if (!connection.closeMutant(.h1_idle_unrecorded)) _ = self.end_reason.note(.h1_idle);
+    return null;
 }
 
 fn feedHead(self: *H1Conn, bytes: []const u8) parser.Accumulator.Feed {
@@ -2061,9 +2089,9 @@ fn writeCommonHeaders(
 }
 
 fn writeError(self: *H1Conn, status: u16) !void {
-    // An error response always ends the connection: counted as its close
-    // reason, also when the write below fails.
-    if (self.config.accounting) |a| a.countClose(connection.closeReasonOfStatus(status));
+    // An error response always ends the connection: its reason, also when
+    // the write below fails.
+    _ = self.end_reason.note(connection.closeReasonOfStatus(status));
     const phrase = parser.reasonPhrase(status);
     var buf: [256]u8 = undefined;
     const body = phrase;
@@ -2083,6 +2111,9 @@ fn writeError(self: *H1Conn, status: u16) !void {
 /// peer stopped reading: shut the socket, so the connection's own wait (for
 /// the handler, or for the next request) ends too and the connection goes.
 fn noteWriteFailed(self: *H1Conn) response.ResponseError {
+    // A socket the server's shutdown closed under the write is the
+    // shutdown's end, not a transport failure.
+    _ = self.end_reason.note(if (self.writer.timed_out) .h1_write_stalled else if (shutdownRequested(self)) .h1_shutdown else .h1_write_failed);
     if (self.writer.timed_out) {
         _ = write_byte_expiries.fetchAdd(1, .monotonic);
         self.stream.shutdown(self.io, .both) catch {};

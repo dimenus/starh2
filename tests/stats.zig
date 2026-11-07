@@ -25,15 +25,19 @@
 //! Clients are zio streams on the test's own tasks: a held request is a
 //! `/hold` whose handler waits for `release`.
 //!
-//! `close_reasons` (t-3900 item 5): one connection ended by each protocol's
-//! own path, and the one reason it should count, exactly once:
+//! `close_reasons` (t-3900 item 5): every connection that ends is counted
+//! once, at its teardown, with its first reason. One connection ended by
+//! each protocol's own path, and the one reason it should count:
 //! - an HTTP/2 connection idle past `connection_idle_timeout_ns` (the edge's
 //!   `noteServerClose`): `h2_idle`;
 //! - an HTTP/2 SETTINGS flood past the session's burst (the session's
 //!   GOAWAY): `h2_goaway_enhance_your_calm`;
 //! - an HTTP/1.1 request over `request_body_bytes` (`writeError`): `h1_413`.
 //! Each test also checks that no other reason moved: a connection counts
-//! once, at its first reason, whatever fails after it.
+//! once, at its first reason, whatever fails after it. A last test ends six
+//! connections on one server in six ways, the peer's included (round 2),
+//! and checks the table moved by six, one in each expected reason. It can
+//! run a mutant armed at run time (`STARH2_CLOSE_MUTANT`, see `mixedEnds`).
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -508,9 +512,20 @@ fn readUntilClosed(stream: zio.net.Stream, timeout_ms: u64) !void {
     }
 }
 
+/// Waits until the server holds no connection: a connection is counted at
+/// its teardown, which can come just after the client sees the close.
+fn waitNoConnections(server: *starh2.Server) !void {
+    const deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (server.stats().connections != 0) {
+        if (nowNs() >= deadline) return error.ConnectionsNotReleased;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+}
+
 /// `reason` moved by exactly one between `before` and now, and nothing else
 /// did: the connection was counted once.
 fn expectOneClose(rig: *Rig, before: starh2.Server.Stats, comptime reason: CloseReason) !void {
+    try waitNoConnections(&rig.server);
     const after = rig.server.stats();
     errdefer for (std.enums.values(CloseReason)) |r| {
         const d = after.close_reasons.get(r) - before.close_reasons.get(r);
@@ -625,6 +640,133 @@ fn bodyTooLarge(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     try expectOneClose(&rig, before, .h1_413);
 }
 
+/// Six connections on one server (an h1c and an h2c endpoint), each ended a
+/// different way, one after another. After each, the table must have moved
+/// by exactly one, in that end's reason; in all, by exactly six. A reset is
+/// seen by whichever socket call fails first, the read or a write, so it
+/// may count either transport reason.
+///
+/// `STARH2_CLOSE_MUTANT` arms a mutant of the recording at run time
+/// (`connection.CloseMutant`): `peer_closed_as_goaway` or
+/// `h1_idle_unrecorded`. Each must fail this test. Run the test binary
+/// directly to arm one: the variable is not part of the build's cache key.
+fn mixedEnds(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    if (std.c.getenv("STARH2_CLOSE_MUTANT")) |raw| {
+        const m = std.meta.stringToEnum(starh2.edge.connection.CloseMutant, std.mem.span(raw)) orelse return error.UnknownMutant;
+        starh2.edge.connection.test_close_mutant.store(m, .release);
+        std.debug.print("stats: close mutant armed: {s}\n", .{@tagName(m)});
+    }
+    defer starh2.edge.connection.test_close_mutant.store(.none, .release);
+
+    var limits = starh2.Limits.defaults;
+    limits.connection_idle_timeout_ns = 300 * ms;
+    limits.field_block_timeout_ns = 300 * ms;
+    limits.request_body_bytes = 1024;
+    var routes_copy = routes;
+    const a = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0);
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{
+            .{ .h1c = .{ .address = a, .client_identity = .none } },
+            .{ .h2c_prior_knowledge = .{ .address = a, .client_identity = .none } },
+        },
+        .routes = &routes_copy,
+        .tls = null,
+        .limits = limits,
+    });
+    var handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_deadline.join(&server, &handle);
+        server.deinit(gpa);
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const h1_peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
+    const h2_peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(1).getPort());
+    const before = server.stats();
+    var prev = before;
+    var bad = false;
+    var preface = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer preface.deinit(gpa);
+
+    // 1. HTTP/2, the server's idle close.
+    {
+        const c = try h2_peer.connect(.{});
+        defer c.close();
+        try writeAll(c, preface.items);
+        try readUntilClosed(c, 5000);
+    }
+    prev = try expectStep(&server, prev, &.{.h2_idle}, &bad);
+    // 2. HTTP/2, the peer's FIN.
+    {
+        const c = try h2_peer.connect(.{});
+        defer c.close();
+        try writeAll(c, preface.items);
+        try c.shutdown(.send);
+        try readUntilClosed(c, 5000);
+    }
+    prev = try expectStep(&server, prev, &.{.h2_peer_closed}, &bad);
+    // 3. HTTP/2, the peer's reset.
+    {
+        const c = try h2_peer.connect(.{});
+        try writeAll(c, preface.items);
+        const lg: std.c.linger = .{ .onoff = 1, .linger = 0 };
+        _ = std.c.setsockopt(c.socket.handle, std.c.SOL.SOCKET, std.c.SO.LINGER, std.mem.asBytes(&lg), @sizeOf(std.c.linger));
+        c.close();
+    }
+    prev = try expectStep(&server, prev, &.{ .h2_read_failed, .h2_write_failed }, &bad);
+    // 4. HTTP/1.1, a 413.
+    {
+        const c = try h1_peer.connect(.{});
+        defer c.close();
+        try writeAll(c, "POST /hello HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4096\r\n\r\n");
+        try std.testing.expectEqual(@as(?u16, 413), try readStatus(c, 5000));
+        try readUntilClosed(c, 5000);
+    }
+    prev = try expectStep(&server, prev, &.{.h1_413}, &bad);
+    // 5. HTTP/1.1, no request head within field_block_timeout_ns.
+    {
+        const c = try h1_peer.connect(.{});
+        defer c.close();
+        try readUntilClosed(c, 5000);
+    }
+    prev = try expectStep(&server, prev, &.{.h1_idle}, &bad);
+    // 6. HTTP/1.1, the client's EOF after one answered request.
+    {
+        const c = try h1_peer.connect(.{});
+        defer c.close();
+        try sendGet(c, "/hello");
+        try std.testing.expectEqual(@as(?u16, 200), try readStatus(c, 5000));
+        try c.shutdown(.send);
+        try readUntilClosed(c, 5000);
+    }
+    prev = try expectStep(&server, prev, &.{.h1_peer_closed}, &bad);
+
+    try expectDelta("close_reasons, all reasons (six connections)", closeTotal(before), closeTotal(prev), 6);
+    if (bad) return error.WrongCloseReasons;
+}
+
+/// After one connection's end: the table moved by exactly one, in one of
+/// `allowed`. Prints what moved otherwise and sets `bad`. Returns the new
+/// snapshot.
+fn expectStep(server: *starh2.Server, prev: starh2.Server.Stats, allowed: []const CloseReason, bad: *bool) !starh2.Server.Stats {
+    try waitNoConnections(server);
+    const now = server.stats();
+    var moved: u64 = 0;
+    var in_allowed: u64 = 0;
+    for (std.enums.values(CloseReason)) |r| {
+        const d = now.close_reasons.get(r) - prev.close_reasons.get(r);
+        if (d == 0) continue;
+        moved += d;
+        if (std.mem.indexOfScalar(CloseReason, allowed, r) != null) in_allowed += d;
+        std.debug.print("stats: mixed ends: close_reasons.{s} moved by {d}\n", .{ @tagName(r), d });
+    }
+    if (moved != 1 or in_allowed != 1) {
+        std.debug.print("stats: mixed ends: want one count in {any}, got {d} ({d} of them there)\n", .{ allowed, moved, in_allowed });
+        bad.* = true;
+    }
+    return now;
+}
+
 fn runProto(comptime f: anytype, p: Proto) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -687,4 +829,8 @@ test "stats: an HTTP/2 SETTINGS flood counts close_reasons.h2_goaway_enhance_you
 
 test "stats: an HTTP/1.1 request over request_body_bytes counts close_reasons.h1_413, once (t-3900 item 5)" {
     try runIn(bodyTooLarge);
+}
+
+test "stats: six connections ended six ways, the peer's included, move close_reasons by six, one in each reason (t-3900 item 5, round 2)" {
+    try runIn(mixedEnds);
 }
