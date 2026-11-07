@@ -278,9 +278,15 @@ test "T3: terminal during waitUntil returns exact error and frees the heap" {
                     var cap = try Capture.init(a);
                     defer cap.deinit();
                     var buf: [16 * 1024]u8 = undefined;
+                    // The RST must come while the handler is inside
+                    // `waitUntil`, the call under test. An admitted handler
+                    // (`test_observed_live_handlers`) may not have reached
+                    // it yet: an RST then fails its `startSse` with
+                    // PeerReset and it never waits (t-3900: 6 of 210 runs
+                    // on the Mac once the server had a once-a-second task).
                     var waited: u64 = 0;
                     while (waited < 2000) : (waited += 10) {
-                        if (starh2.edge.connection.test_observed_live_handlers.load(.acquire) >= 1) break;
+                        if (starh2.edge.connection.test_deadline_waits.load(.acquire) >= 1) break;
                         const n = stream.read(&buf, .{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
                             error.Timeout => 0,
                             else => return err,
@@ -288,6 +294,7 @@ test "T3: terminal during waitUntil returns exact error and frees the heap" {
                         if (n > 0) try cap.ingest(buf[0..n]);
                     }
                     try std.testing.expect(starh2.edge.connection.test_observed_live_handlers.load(.acquire) >= 1);
+                    try std.testing.expect(starh2.edge.connection.test_deadline_waits.load(.acquire) >= 1);
 
                     var rst: [13]u8 = undefined;
                     const rn = try frame.Serializer.rstStream(&rst, 1, .cancel);
