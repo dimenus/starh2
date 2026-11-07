@@ -1377,6 +1377,15 @@ pub fn build(b: *std.Build) void {
     run_orphan_line.has_side_effects = true;
     shutdown_step.dependOn(&run_orphan_line.step);
     stats_step.dependOn(&run_orphan_line.step);
+    // A full orphan registry: one pass, a counted miss, an error line.
+    const run_orphan_slot_miss = b.addRunArtifact(shutdown_child);
+    run_orphan_slot_miss.addArg("orphan-slot-miss");
+    run_orphan_slot_miss.addCheck(.{ .expect_stderr_match = "orphan registry: no free slot of 1 for an orphan of no task route (HTTP/2 404 or 405); its age is left out of the oldest orphan's age (1 misses so far)" });
+    run_orphan_slot_miss.addCheck(.{ .expect_stderr_match = "child: orphan slot miss first_slot=0 second_slot=null misses=1 orphaned=2 oldest_start=100" });
+    run_orphan_slot_miss.expectExitCode(0);
+    run_orphan_slot_miss.has_side_effects = true;
+    shutdown_step.dependOn(&run_orphan_slot_miss.step);
+    stats_step.dependOn(&run_orphan_slot_miss.step);
 
     const macos_sdk_tests = b.addTest(.{
         .root_module = b.createModule(.{

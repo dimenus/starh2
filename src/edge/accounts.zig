@@ -805,8 +805,14 @@ pub const RouteTable = struct {
 /// - One slot per task-handler token (`Limits.max_task_handlers`). Every
 ///   orphan holds a token until its link is freed and gives its slot back
 ///   before its token (`dropLink`), so the slots in use are never more than
-///   the tokens held, and a new orphan, which holds a token, always finds a
-///   free one.
+///   the tokens held, and a new orphan, which holds a token, has a free one.
+/// - `add` makes one pass and never waits. A pass that finds no free slot
+///   is a miss: counted (`misses`, `Server.Stats.orphan_slot_misses`) and
+///   logged at error level, at most a line a second
+///   (`GlobalAccounting.addOrphan`). The orphan is still counted everywhere
+///   else; only its age is left out of the oldest orphan's age. A miss
+///   means the invariant above broke, or, at full capacity, the pass raced
+///   with frees behind it.
 /// - No lock. `add` claims a free slot with a compare-and-swap, writes the
 ///   route, then publishes the start; `remove` stores 0. Only orphaning and
 ///   the orphan's end touch this, and orphaning is rare (a connection ended
@@ -827,6 +833,11 @@ pub const Orphans = struct {
     /// One line at most a second when a handler is orphaned
     /// (`GlobalAccounting.addOrphan`).
     log: RateLimitedLine = .{},
+    /// Orphans that found no free slot (`add`): their age is not in
+    /// `oldestStart`. Only grows.
+    misses: std.atomic.Value(u64) = .init(0),
+    /// The miss line, at error level: a miss is a broken invariant.
+    miss_log: RateLimitedLine = .{ .level = .err },
 
     const claimed = std.math.maxInt(u64);
 
@@ -846,22 +857,21 @@ pub const Orphans = struct {
     }
 
     /// Take a slot for an orphan dispatched at `start_ns`, of route record
-    /// `route` (null for none). Its index, or null when this registry has no
-    /// slots (a hand-built test accounting). One pass can miss a slot that
-    /// was freed behind it while every slot ahead was taken, so it scans
-    /// again; a free slot exists at every instant (the type's doc).
+    /// `route` (null for none): its index. Null when this registry has no
+    /// slots (a hand-built test accounting), or when one pass found none
+    /// free: then the miss is counted in `misses` (the caller logs it).
     pub fn add(self: *Orphans, start_ns: u64, route: ?u32) ?u32 {
         if (self.starts.len == 0) return null;
         const start = @min(@max(start_ns, 1), claimed - 1);
-        while (true) {
-            for (self.starts, 0..) |*slot, i| {
-                if (slot.load(.monotonic) != 0) continue;
-                if (slot.cmpxchgStrong(0, claimed, .acquire, .monotonic) != null) continue;
-                self.routes[i].store(if (route) |r| r + 1 else 0, .monotonic);
-                slot.store(start, .release);
-                return @intCast(i);
-            }
+        for (self.starts, 0..) |*slot, i| {
+            if (slot.load(.monotonic) != 0) continue;
+            if (slot.cmpxchgStrong(0, claimed, .acquire, .monotonic) != null) continue;
+            self.routes[i].store(if (route) |r| r + 1 else 0, .monotonic);
+            slot.store(start, .release);
+            return @intCast(i);
         }
+        _ = self.misses.fetchAdd(1, .monotonic);
+        return null;
     }
 
     /// The orphan in slot `i` ended.
@@ -1667,6 +1677,17 @@ pub const RateLimitedLine = struct {
     last_ns: std.atomic.Value(u64) = .init(0),
     held: std.atomic.Value(u64) = .init(0),
     interval_ns: u64 = std.time.ns_per_s,
+    /// `err` for a line that reports a broken invariant.
+    level: Level = .warn,
+
+    pub const Level = enum { warn, err };
+
+    fn emit(self: *const RateLimitedLine, comptime fmt: []const u8, args: anytype) void {
+        switch (self.level) {
+            .warn => log.warn(fmt, args),
+            .err => log.err(fmt, args),
+        }
+    }
 
     pub fn note(self: *RateLimitedLine, comptime fmt: []const u8, args: anytype) void {
         const now = zio.Timestamp.now(.monotonic).toNanoseconds();
@@ -1680,7 +1701,7 @@ pub const RateLimitedLine = struct {
             return;
         }
         const held = self.held.swap(0, .monotonic);
-        log.warn(fmt ++ " ({d} more since the last report)", args ++ .{held});
+        self.emit(fmt ++ " ({d} more since the last report)", args ++ .{held});
     }
 
     /// Print the held count, if any, once the interval since the last line
@@ -1697,7 +1718,7 @@ pub const RateLimitedLine = struct {
         if (self.last_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) return;
         const held = self.held.swap(0, .monotonic);
         if (held == 0) return;
-        log.warn(what ++ ": {d} more since the last report", .{held});
+        self.emit(what ++ ": {d} more since the last report", .{held});
     }
 };
 
@@ -2169,4 +2190,30 @@ test "RouteTable: ref takes only the list the table was built from, not another 
     try std.testing.expectEqual(@as(u32, 1), t.ref(la, 1).index);
     // (`ref` with `lb`, or with a complete route of `la`, panics:
     // `shutdown_child route-table-mismatch`.)
+}
+
+test "Orphans.add: a full registry is one pass and a counted miss, and the missed orphan is left out of the age (t-3900)" {
+    const gpa = std.testing.allocator;
+    var o = try Orphans.init(gpa, 3);
+    defer o.deinit(gpa);
+    try std.testing.expectEqual(@as(?u32, 0), o.add(100, 0));
+    try std.testing.expectEqual(@as(?u32, 1), o.add(200, 1));
+    try std.testing.expectEqual(@as(?u32, 2), o.add(300, null));
+    // Full. The new orphan is older than all three, so had it been counted
+    // it would be the oldest.
+    try std.testing.expectEqual(@as(?u32, null), o.add(50, 0));
+    try std.testing.expectEqual(@as(u64, 1), o.misses.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 100), o.oldestStart(null));
+    try std.testing.expectEqual(@as(u64, 100), o.oldestStart(0));
+    try std.testing.expectEqual(@as(u64, 200), o.oldestStart(1));
+    try std.testing.expectEqual(@as(usize, 3), o.inUse());
+    // A freed slot is found again, and a miss is not repeated.
+    o.remove(0);
+    try std.testing.expectEqual(@as(?u32, 0), o.add(60, 0));
+    try std.testing.expectEqual(@as(u64, 60), o.oldestStart(null));
+    try std.testing.expectEqual(@as(u64, 1), o.misses.load(.monotonic));
+    // No slots at all (a hand-built test accounting): null, and no miss.
+    var none: Orphans = .{};
+    try std.testing.expectEqual(@as(?u32, null), none.add(10, null));
+    try std.testing.expectEqual(@as(u64, 0), none.misses.load(.monotonic));
 }

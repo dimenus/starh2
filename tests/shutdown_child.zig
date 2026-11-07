@@ -58,6 +58,11 @@
 //!   logged with its route and the counts, the other two are held back, and
 //!   the once-a-second flush prints them (the process exits with the
 //!   server running).
+//! - `orphan-slot-miss`: an orphan registry of one slot, and two orphans
+//!   (`GlobalAccounting.addOrphan` on hand-built links). The second finds no
+//!   slot: it is counted, logged at error level with the registry's size,
+//!   and still counted as an orphan. It logs an error, so a test process
+//!   cannot check it.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -603,6 +608,17 @@ fn runOrphanLine(rt: *zio.Runtime) anyerror!void {
     std.process.exit(0);
 }
 
+fn runOrphanSlotMiss(_: *zio.Runtime) anyerror!void {
+    const gpa = std.heap.page_allocator;
+    const connection = starh2.edge.connection;
+    var a: connection.GlobalAccounting = .{ .max_streams = 1, .task_handler_capacity = 1, .max_outbound_bytes = 1, .max_handshakes = 1, .routes = .empty, .orphans = try starh2.edge.accounts.Orphans.init(gpa, 1) };
+    var first: connection.LinkCore = .{ .arena = undefined, .charge = .none, .start_ns = 100 };
+    var second: connection.LinkCore = .{ .arena = undefined, .charge = .none, .start_ns = 50 };
+    a.addOrphan(&first);
+    a.addOrphan(&second);
+    std.debug.print("child: orphan slot miss first_slot={?d} second_slot={?d} misses={d} orphaned={d} oldest_start={d}\n", .{ first.orphan_slot, second.orphan_slot, a.orphans.misses.load(.acquire), a.orphaned_handlers.load(.acquire), a.orphans.oldestStart(null) });
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.next();
@@ -648,6 +664,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runRefusalTailShutdown, .{rt})
     else if (std.mem.eql(u8, case, "orphan-line"))
         try rt.spawn(runOrphanLine, .{rt})
+    else if (std.mem.eql(u8, case, "orphan-slot-miss"))
+        try rt.spawn(runOrphanSlotMiss, .{rt})
     else
         return error.UnknownCase;
     try h.join();

@@ -686,6 +686,7 @@ pub const Server = struct {
         self.clients.refusal_log.flush("refused clients (share or start rate)", force);
         self.accounting.routes.refusal_log.flush("refused task routes (share)", force);
         self.accounting.orphans.log.flush("handlers orphaned", force);
+        self.accounting.orphans.miss_log.flush("orphan registry: orphans with no free slot", force);
         self.proxy_log.flush("PROXY failures", force);
     }
 
@@ -1543,6 +1544,11 @@ pub const Server = struct {
         /// its connection ended) has run since its dispatch, in ns; 0 with
         /// no orphan.
         oldest_orphan_age_ns: u64,
+        /// Orphans that found no free slot in the orphan registry
+        /// (`accounts.Orphans`), so their age is left out of
+        /// `oldest_orphan_age_ns`. Each is a broken invariant and is logged
+        /// at error level; 0 is the only healthy value.
+        orphan_slot_misses: u64,
     };
 
     /// One task route's share of `Stats`: `routeStats`.
@@ -1628,6 +1634,7 @@ pub const Server = struct {
             .accept_errors = self.accept_errors.load(.monotonic),
             .close_reasons = close_reasons,
             .oldest_orphan_age_ns = ageOf(self.accounting.orphans.oldestStart(null)),
+            .orphan_slot_misses = self.accounting.orphans.misses.load(.monotonic),
         };
     }
 

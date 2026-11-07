@@ -1491,6 +1491,10 @@ pub const GlobalAccounting = struct {
         const on_route: usize = if (route) |r| r.rec().orphans.fetchAdd(1, .acq_rel) + 1 else 0;
         core.orphan_slot = self.orphans.add(core.start_ns, if (route) |r| r.index else null);
         const ran_ms = (accounts.Orphans.now() -| core.start_ns) / std.time.ns_per_ms;
+        if (core.orphan_slot == null and self.orphans.starts.len != 0) {
+            const label = if (route) |r| r.rec().label.text() else "no task route (HTTP/2 404 or 405)";
+            self.orphans.miss_log.note("orphan registry: no free slot of {d} for an orphan of {s}; its age is left out of the oldest orphan's age ({d} misses so far). Every orphan holds a task-handler token and frees its slot first, so this is a broken invariant, or a scan that raced with frees at full capacity", .{ self.orphans.starts.len, label, self.orphans.misses.load(.monotonic) });
+        }
         if (route) |r| {
             self.orphans.log.note("handler of {s} still running {d} ms after dispatch when its connection ended; orphans now: {d} on this route, {d} on the server", .{ r.rec().label.text(), ran_ms, on_route, total });
         } else {
