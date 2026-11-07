@@ -58,6 +58,13 @@
 //!   logged with its route and the counts, the other two are held back, and
 //!   the once-a-second flush prints them (the process exits with the
 //!   server running).
+//! - `orphan-drain`: three HTTP/1.1 handlers of `GET /orphan` that ignore
+//!   their cancel, then a shutdown: each connection cancels its handler at
+//!   once and orphans it, so the three orphans come during the drain, and
+//!   `serve` keeps waiting for them. The first is logged, two are held
+//!   back, and the held count must print while `serve` still waits: the
+//!   process exits 3 s later with `serve` not returned, so only a flush
+//!   ticker that lives through the drain can have printed it.
 //! - `orphan-slot-miss`: an orphan registry of one slot, and two orphans
 //!   (`GlobalAccounting.addOrphan` on hand-built links). The second finds no
 //!   slot: it is counted, logged at error level with the registry's size,
@@ -608,6 +615,42 @@ fn runOrphanLine(rt: *zio.Runtime) anyerror!void {
     std.process.exit(0);
 }
 
+fn runOrphanDrain(rt: *zio.Runtime) anyerror!void {
+    const gpa = std.heap.page_allocator;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } }},
+        .routes = &orphan_routes,
+        .tls = null,
+        .limits = .defaults,
+    });
+    var handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+    var conns: [3]zio.net.Stream = undefined;
+    for (&conns) |*c| {
+        c.* = try connect4(port);
+        var off: usize = 0;
+        const req = "GET /orphan HTTP/1.1\r\nhost: localhost\r\n\r\n";
+        while (off < req.len) off += try c.write(req[off..], .none);
+    }
+    const t0 = monoMs();
+    while (orphan_started.load(.acquire) < 3) {
+        if (monoMs() - t0 > 5000) return error.HandlersNeverStarted;
+        try zio.sleep(.fromMilliseconds(5));
+    }
+    server.requestShutdown();
+    const t1 = monoMs();
+    while (server.stats().orphaned_handlers < 3) {
+        if (monoMs() - t1 > 5000) return error.NeverOrphaned;
+        try zio.sleep(.fromMilliseconds(2));
+    }
+    const orphaned_ms = monoMs() - t1;
+    try zio.sleep(.fromMilliseconds(3000));
+    std.debug.print("child: orphan drain orphans={d} orphaned {d} ms after the shutdown; serve returned={}\n", .{ server.stats().orphaned_handlers, orphaned_ms, handle.hasResult() });
+    // The kill: `serve` still waits for the orphans, which never end.
+    std.process.exit(0);
+}
+
 fn runOrphanSlotMiss(_: *zio.Runtime) anyerror!void {
     const gpa = std.heap.page_allocator;
     const connection = starh2.edge.connection;
@@ -664,6 +707,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runRefusalTailShutdown, .{rt})
     else if (std.mem.eql(u8, case, "orphan-line"))
         try rt.spawn(runOrphanLine, .{rt})
+    else if (std.mem.eql(u8, case, "orphan-drain"))
+        try rt.spawn(runOrphanDrain, .{rt})
     else if (std.mem.eql(u8, case, "orphan-slot-miss"))
         try rt.spawn(runOrphanSlotMiss, .{rt})
     else

@@ -818,6 +818,18 @@ pub const RouteTable = struct {
 ///   the orphan's end touch this, and orphaning is rare (a connection ended
 ///   under a running handler). Dispatch only writes its start into its own
 ///   link.
+/// - Every access that pairs a start with its route is `.seq_cst`: the
+///   route store and the start store in `add`, the store in `remove`, and
+///   the reader's start load, route load and start re-load. A per-route
+///   reader takes the route as the start's only if the slot still holds
+///   the same start after it read the route. With acquire loads that check
+///   does not hold: an acquire load keeps later accesses after it, but not
+///   an earlier relaxed one, so the route load could move after the
+///   re-load (on ARM it can) and pair an old start with the next
+///   occupant's route. In one total order the route load sits between the
+///   two start loads, so the pair is the slot's at one instant. Only a slot
+///   reused with the very same start in between could fool it, and two
+///   dispatch times equal to the nanosecond are not a case worth a lock.
 /// - A reader (`oldestStart`) loads every slot: `max_task_handlers` loads
 ///   (4096 by default), only when asked.
 /// - A `GlobalAccounting` built by hand in a unit test has no slots
@@ -862,12 +874,19 @@ pub const Orphans = struct {
     /// free: then the miss is counted in `misses` (the caller logs it).
     pub fn add(self: *Orphans, start_ns: u64, route: ?u32) ?u32 {
         if (self.starts.len == 0) return null;
-        const start = @min(@max(start_ns, 1), claimed - 1);
+        // Every orphan's link has a dispatch time (`LinkCore.start_ns`, set
+        // at task dispatch); a 0 here is a dispatch path that forgot it, and
+        // would report an age equal to the uptime.
+        std.debug.assert(start_ns != 0);
+        // The one clamp left: `claimed` (the largest u64) marks a slot being
+        // filled, so a start may not equal it. A monotonic clock reaches it
+        // after 584 years.
+        const start = @min(start_ns, claimed - 1);
         for (self.starts, 0..) |*slot, i| {
             if (slot.load(.monotonic) != 0) continue;
             if (slot.cmpxchgStrong(0, claimed, .acquire, .monotonic) != null) continue;
-            self.routes[i].store(if (route) |r| r + 1 else 0, .monotonic);
-            slot.store(start, .release);
+            self.routes[i].store(if (route) |r| r + 1 else 0, .seq_cst);
+            slot.store(start, .seq_cst);
             return @intCast(i);
         }
         _ = self.misses.fetchAdd(1, .monotonic);
@@ -877,7 +896,7 @@ pub const Orphans = struct {
     /// The orphan in slot `i` ended.
     pub fn remove(self: *Orphans, i: u32) void {
         std.debug.assert(self.starts[i].load(.monotonic) != 0);
-        self.starts[i].store(0, .release);
+        self.starts[i].store(0, .seq_cst);
     }
 
     /// The smallest start among the live orphans of route record `route`, or
@@ -887,13 +906,13 @@ pub const Orphans = struct {
     pub fn oldestStart(self: *const Orphans, route: ?u32) u64 {
         var oldest: u64 = 0;
         for (self.starts, self.routes) |*slot, *r| {
-            const st = slot.load(.acquire);
+            const st = slot.load(.seq_cst);
             if (st == 0 or st == claimed) continue;
             if (route) |want| {
-                const got = r.load(.monotonic);
+                const got = r.load(.seq_cst);
                 // The route belongs to this start only if the slot still
-                // holds it.
-                if (slot.load(.acquire) != st) continue;
+                // holds it (the type's doc: why `.seq_cst`).
+                if (slot.load(.seq_cst) != st) continue;
                 if (got != want + 1) continue;
             }
             if (oldest == 0 or st < oldest) oldest = st;

@@ -629,8 +629,11 @@ pub const Server = struct {
             if (failed) return self.failStart(&accept_group, &connection_group, &cancel, &canceller);
         }
         // The rate-limited lines' held counts reach output within about a
-        // second even when no later line comes (`flushTicker`).
-        accept_group.spawn(flushTicker, .{self}) catch return self.failStart(&accept_group, &connection_group, &cancel, &canceller);
+        // second even when no later line comes (`flushTicker`). Not in the
+        // accept group: that is cancelled when the drain begins, and the
+        // drain is when orphans come. It is cancelled after the last
+        // handler is done.
+        var ticker = zio.spawn(flushTicker, .{self}) catch return self.failStart(&accept_group, &connection_group, &cancel, &canceller);
 
         self.bind_state.store(.listening, .release);
         self.bind_event.set();
@@ -650,8 +653,9 @@ pub const Server = struct {
         zio.beginShield();
         defer zio.endShield();
         self.waitForHandlers(&connection_group, canceled, &cancel, &canceller);
-        // The ticker ended with the accept group: what the drain held back
-        // is printed now.
+        // Every handler is done: the ticker ends (a cancel waits for it),
+        // and what it had not printed yet is printed now.
+        ticker.cancel();
         self.flushLines(true);
         if (canceled) return error.RuntimeShutdown;
     }
@@ -670,8 +674,10 @@ pub const Server = struct {
     }
 
     /// Once a second, the held counts of the server's rate-limited lines
-    /// (`flushLines`). It runs in the accept group, so the shutdown's cancel
-    /// of that group ends it, and `serve` flushes once more at its end.
+    /// (`flushLines`). Its own task, from startup until every handler is
+    /// done (`serve` cancels it after `waitForHandlers`), so the lines held
+    /// during a drain print while the drain runs; then `serve` flushes once
+    /// more. It only sleeps (`zio.sleep`, cooperative) and logs.
     fn flushTicker(self: *Server) void {
         while (true) {
             zio.sleep(.fromNanoseconds(std.time.ns_per_s)) catch return;
