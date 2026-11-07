@@ -24,6 +24,16 @@
 //!
 //! Clients are zio streams on the test's own tasks: a held request is a
 //! `/hold` whose handler waits for `release`.
+//!
+//! `close_reasons` (t-3900 item 5): one connection ended by each protocol's
+//! own path, and the one reason it should count, exactly once:
+//! - an HTTP/2 connection idle past `connection_idle_timeout_ns` (the edge's
+//!   `noteServerClose`): `h2_idle`;
+//! - an HTTP/2 SETTINGS flood past the session's burst (the session's
+//!   GOAWAY): `h2_goaway_enhance_your_calm`;
+//! - an HTTP/1.1 request over `request_body_bytes` (`writeError`): `h1_413`.
+//! Each test also checks that no other reason moved: a connection counts
+//! once, at its first reason, whatever fails after it.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -472,6 +482,149 @@ fn handshakeWait(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     std.debug.print("stats: handshake wait at max_connections: admission_waiters {d}, connection_bound_waits {d} -> {d}\n", .{ after.admission_waiters, before.connection_bound_waits, after.connection_bound_waits });
 }
 
+// ---------------------------------------------------------------------------
+// Close reasons (t-3900 item 5).
+
+const CloseReason = starh2.edge.connection.CloseReason;
+
+fn closeTotal(st: starh2.Server.Stats) u64 {
+    var sum: u64 = 0;
+    for (std.enums.values(CloseReason)) |r| sum += st.close_reasons.get(r);
+    return sum;
+}
+
+/// Reads and drops what the server sends until it closes `stream`.
+fn readUntilClosed(stream: zio.net.Stream, timeout_ms: u64) !void {
+    var buf: [16 * 1024]u8 = undefined;
+    const deadline = nowNs() + timeout_ms * ms;
+    while (true) {
+        if (nowNs() >= deadline) return error.ServerDidNotClose;
+        const got = stream.read(&buf, .{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
+            error.Timeout => continue,
+            error.ConnectionResetByPeer => return,
+            else => return err,
+        };
+        if (got == 0) return;
+    }
+}
+
+/// `reason` moved by exactly one between `before` and now, and nothing else
+/// did: the connection was counted once.
+fn expectOneClose(rig: *Rig, before: starh2.Server.Stats, comptime reason: CloseReason) !void {
+    const after = rig.server.stats();
+    errdefer for (std.enums.values(CloseReason)) |r| {
+        const d = after.close_reasons.get(r) - before.close_reasons.get(r);
+        if (d != 0) std.debug.print("stats: close_reasons.{s} moved by {d}\n", .{ @tagName(r), d });
+    };
+    try expectDelta("close_reasons." ++ @tagName(reason), before.close_reasons.get(reason), after.close_reasons.get(reason), 1);
+    try expectDelta("close_reasons, all reasons", closeTotal(before), closeTotal(after), 1);
+}
+
+fn idleClose(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var limits = starh2.Limits.defaults;
+    limits.connection_idle_timeout_ns = 200 * ms;
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, limits, .h2c, false);
+    defer rig.stop();
+    const before = rig.server.stats();
+
+    const c = try rig.connect();
+    defer c.close();
+    var preface = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer preface.deinit(gpa);
+    try writeAll(c, preface.items);
+    // No request: the server ends it at the idle limit.
+    try readUntilClosed(c, 5000);
+    try expectOneClose(&rig, before, .h2_idle);
+}
+
+/// Reads frames until a GOAWAY arrives.
+fn readUntilGoaway(stream: zio.net.Stream, timeout_ms: u64) !void {
+    var buf: [16 * 1024]u8 = undefined;
+    var n: usize = 0;
+    const deadline = nowNs() + timeout_ms * ms;
+    while (true) {
+        while (n >= 9) {
+            const len = (@as(usize, buf[0]) << 16) | (@as(usize, buf[1]) << 8) | buf[2];
+            if (n < 9 + len) break;
+            if (buf[3] == 0x7) return;
+            std.mem.copyForwards(u8, buf[0 .. n - 9 - len], buf[9 + len .. n]);
+            n -= 9 + len;
+        }
+        if (nowNs() >= deadline) return error.NoGoaway;
+        const got = stream.read(buf[n..], .{ .duration = .fromMilliseconds(10) }) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        if (got == 0) return error.ClosedBeforeGoaway;
+        n += got;
+    }
+}
+
+/// The idle close starts a graceful close, which still reads: a reset from
+/// the client then fails the server's read. That second ending must not be
+/// counted: the connection was already counted as idle.
+fn idleThenReset(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var limits = starh2.Limits.defaults;
+    limits.connection_idle_timeout_ns = 200 * ms;
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, limits, .h2c, false);
+    defer rig.stop();
+    const before = rig.server.stats();
+
+    const c = try rig.connect();
+    var preface = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer preface.deinit(gpa);
+    try writeAll(c, preface.items);
+    try readUntilGoaway(c, 5000);
+    const lg: std.c.linger = .{ .onoff = 1, .linger = 0 };
+    _ = std.c.setsockopt(c.socket.handle, std.c.SOL.SOCKET, std.c.SO.LINGER, std.mem.asBytes(&lg), @sizeOf(std.c.linger));
+    c.close();
+    const deadline = nowNs() + 5 * std.time.ns_per_s;
+    while (rig.server.stats().connections != 0) {
+        if (nowNs() >= deadline) return error.ConnectionNotReleased;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    try expectOneClose(&rig, before, .h2_idle);
+}
+
+fn settingsFlood(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, starh2.Limits.defaults, .h2c, false);
+    defer rig.stop();
+    const before = rig.server.stats();
+
+    const c = try rig.connect();
+    defer c.close();
+    var wire = try h2c.buildClientPrefaceAndSettings(gpa);
+    defer wire.deinit(gpa);
+    // Past the SETTINGS burst at once, faster than its refill.
+    for (0..2 * starh2.core.rates.SETTINGS_BURST) |_| {
+        var sbuf: [9]u8 = undefined;
+        const n = try starh2.core.frame.Serializer.settingsFrame(&sbuf, false, &.{});
+        try wire.appendSlice(gpa, sbuf[0..n]);
+    }
+    try writeAll(c, wire.items);
+    try readUntilClosed(c, 5000);
+    try expectOneClose(&rig, before, .h2_goaway_enhance_your_calm);
+}
+
+fn bodyTooLarge(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var limits = starh2.Limits.defaults;
+    limits.request_body_bytes = 1024;
+    var rig: Rig = undefined;
+    try rig.start(rt, gpa, limits, .h1c_none, false);
+    defer rig.stop();
+    const before = rig.server.stats();
+
+    const c = try rig.connect();
+    defer c.close();
+    try writeAll(c, "POST /hello HTTP/1.1\r\nhost: localhost\r\ncontent-length: 4096\r\n\r\n");
+    try std.testing.expectEqual(@as(?u16, 413), try readStatus(c, 5000));
+    try readUntilClosed(c, 5000);
+    try expectOneClose(&rig, before, .h1_413);
+}
+
 fn runProto(comptime f: anytype, p: Proto) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -518,4 +671,20 @@ test "stats: a client-share refusal shows in client_share_refusals (t-3759 step 
 
 test "stats: a route-share refusal shows in route_share_refusals (t-3759 step 9b)" {
     try runIn(routeShare);
+}
+
+test "stats: an HTTP/2 connection idle past its limit counts close_reasons.h2_idle, once (t-3900 item 5)" {
+    try runIn(idleClose);
+}
+
+test "stats: an HTTP/2 idle close followed by a client reset counts close_reasons.h2_idle only (t-3900 item 5)" {
+    try runIn(idleThenReset);
+}
+
+test "stats: an HTTP/2 SETTINGS flood counts close_reasons.h2_goaway_enhance_your_calm, once (t-3900 item 5)" {
+    try runIn(settingsFlood);
+}
+
+test "stats: an HTTP/1.1 request over request_body_bytes counts close_reasons.h1_413, once (t-3900 item 5)" {
+    try runIn(bodyTooLarge);
 }

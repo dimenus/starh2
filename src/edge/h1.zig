@@ -2061,6 +2061,9 @@ fn writeCommonHeaders(
 }
 
 fn writeError(self: *H1Conn, status: u16) !void {
+    // An error response always ends the connection: counted as its close
+    // reason, also when the write below fails.
+    if (self.config.accounting) |a| a.countClose(connection.closeReasonOfStatus(status));
     const phrase = parser.reasonPhrase(status);
     var buf: [256]u8 = undefined;
     const body = phrase;

@@ -1142,7 +1142,7 @@ var g_server: ?*const starh2.Server = null;
 fn statsHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     const server = g_server orelse return resp.send(500, &.{}, "no server\n");
     const s = server.stats();
-    const buf = try req.arena.alloc(u8, 4 * 1024);
+    const buf = try req.arena.alloc(u8, 8 * 1024);
     var w: std.Io.Writer = .fixed(buf);
     try w.print("{{\"connections\":{d},\"active_streams\":{d},\"task_handlers\":{d},\"orphaned_handlers\":{d},\"outbound_bytes\":{d},\"active_handshakes\":{d},\"admission_waiters\":{d}", .{ s.connections, s.active_streams, s.task_handlers, s.orphaned_handlers, s.outbound_bytes, s.active_handshakes, s.admission_waiters });
     try w.print(",\"request_pool\":{{\"resident\":{d},\"held\":{d},\"refused\":{{", .{ s.request_pool.resident_bytes, s.request_pool.held_bytes });
@@ -1160,7 +1160,13 @@ fn statsHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Complet
     for (s.route_share_refusals, 0..) |v, i| {
         try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(@as(starh2.edge.accounts.RouteResource, @fromBackingInt(@intCast(i)))), v });
     }
-    try w.print("}},\"stream_bound_refusals\":{d},\"task_bound_refusals\":{d},\"connection_bound_waits\":{d},\"proxy_untrusted\":{d},\"proxy_header_failures\":{d},\"accept_errors\":{d}}}\n", .{ s.stream_bound_refusals, s.task_bound_refusals, s.connection_bound_waits, s.proxy_untrusted, s.proxy_header_failures, s.accept_errors });
+    try w.print("}},\"stream_bound_refusals\":{d},\"task_bound_refusals\":{d},\"connection_bound_waits\":{d},\"proxy_untrusted\":{d},\"proxy_header_failures\":{d},\"accept_errors\":{d}", .{ s.stream_bound_refusals, s.task_bound_refusals, s.connection_bound_waits, s.proxy_untrusted, s.proxy_header_failures, s.accept_errors });
+    // Every close reason, by name, so a new one shows up here by itself.
+    try w.writeAll(",\"close_reasons\":{");
+    for (std.enums.values(starh2.edge.connection.CloseReason), 0..) |r, i| {
+        try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(r), s.close_reasons.get(r) });
+    }
+    try w.writeAll("}}\n");
     try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
 }
 

@@ -1490,6 +1490,13 @@ pub const Server = struct {
         proxy_header_failures: u64,
         /// `accept` calls that failed (for example, out of descriptors).
         accept_errors: u64,
+
+        // Connections the server ended, since it started (counts only grow).
+
+        /// By `CloseReason`, each connection once, at its first reason:
+        /// `close_reasons.get(.h2_idle)`. A close the peer chose has no
+        /// entry.
+        close_reasons: std.EnumArray(connection.CloseReason, u64),
     };
 
     /// The server's counters, now. Each counter is read from its own
@@ -1508,6 +1515,8 @@ pub const Server = struct {
         }
         var share: [accounts.resource_count]u64 = undefined;
         for (&share, 0..) |*v, i| v.* = self.clients.share_refusals[i].load(.monotonic);
+        var close_reasons: std.EnumArray(connection.CloseReason, u64) = .initFill(0);
+        for (std.enums.values(connection.CloseReason)) |r| close_reasons.set(r, self.accounting.close_reasons.getPtrConst(r).load(.monotonic));
         return .{
             .connections = self.active_connections.load(.monotonic),
             .active_streams = self.accounting.active_streams.load(.monotonic),
@@ -1527,6 +1536,7 @@ pub const Server = struct {
             .proxy_untrusted = self.proxy_untrusted.load(.monotonic),
             .proxy_header_failures = self.proxy_header_failures.load(.monotonic),
             .accept_errors = self.accept_errors.load(.monotonic),
+            .close_reasons = close_reasons,
         };
     }
 
