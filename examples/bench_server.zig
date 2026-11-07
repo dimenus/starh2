@@ -1134,17 +1134,37 @@ var g_counting: ?*CountingGpa = null;
 /// `null` and `touched_bytes_note` says it is not available; a `mincore`
 /// failure on Linux is `null` with `touched_bytes_error` naming it.
 var g_requests: ?*const starh2.edge.request_pool.RequestPool = null;
-/// For `/stats`: `Server.stats()`, read while the server runs.
-var g_server: ?*const starh2.Server = null;
+/// For `/stats`: `Server.stats()`, read while the server runs. Not const:
+/// `?top=` reads the client table under its lock.
+var g_server: ?*starh2.Server = null;
 
 /// `GET /stats`: `Server.stats()` as one JSON object. The request pool's
 /// own detail is `/mem`'s; here only its refusals and bytes.
 /// `close_reasons` counts every connection that ended, once, by its first
-/// reason, the peer's ends included (`CloseReason.byPeer`).
+/// reason, the peer's ends included (`CloseReason.byPeer`). `routes` lists
+/// each task route (`Server.routeStats`): its task handlers, its orphans,
+/// and its oldest orphan's age.
+///
+/// `?top=N&by=RESOURCE` adds `top`: the N clients that hold the most of
+/// RESOURCE (an `accounts.Resource` name, `connections` by default), from
+/// a scan of the client table (`Table.snapshot`, under the table's lock),
+/// sorted here. N is at most 100. The sort is the bench's, not starh2's:
+/// what to rank by, and how many, is an operator's choice.
 fn statsHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
     const server = g_server orelse return resp.send(500, &.{}, "no server\n");
     const s = server.stats();
-    const buf = try req.arena.alloc(u8, 8 * 1024);
+    var top: usize = 0;
+    var by: starh2.edge.accounts.Resource = .connections;
+    var it = std.mem.splitScalar(u8, req.query, '&');
+    while (it.next()) |kv| {
+        if (std.mem.startsWith(u8, kv, "top=")) {
+            top = std.fmt.parseInt(usize, kv[4..], 10) catch return resp.send(400, &.{}, "top: not a number\n");
+            if (top > 100) return resp.send(400, &.{}, "top: at most 100\n");
+        } else if (std.mem.startsWith(u8, kv, "by=")) {
+            by = std.meta.stringToEnum(starh2.edge.accounts.Resource, kv[3..]) orelse return resp.send(400, &.{}, "by: not a resource name\n");
+        }
+    }
+    const buf = try req.arena.alloc(u8, 64 * 1024);
     var w: std.Io.Writer = .fixed(buf);
     try w.print("{{\"connections\":{d},\"active_streams\":{d},\"task_handlers\":{d},\"orphaned_handlers\":{d},\"outbound_bytes\":{d},\"active_handshakes\":{d},\"admission_waiters\":{d}", .{ s.connections, s.active_streams, s.task_handlers, s.orphaned_handlers, s.outbound_bytes, s.active_handshakes, s.admission_waiters });
     try w.print(",\"request_pool\":{{\"resident\":{d},\"held\":{d},\"refused\":{{", .{ s.request_pool.resident_bytes, s.request_pool.held_bytes });
@@ -1168,8 +1188,40 @@ fn statsHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Complet
     for (std.enums.values(starh2.edge.connection.CloseReason), 0..) |r, i| {
         try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", @tagName(r), s.close_reasons.get(r) });
     }
-    try w.writeAll("}}\n");
+    try w.writeAll("}");
+    try w.print(",\"oldest_orphan_age_ms\":{d},\"routes\":[", .{s.oldest_orphan_age_ns / std.time.ns_per_ms});
+    for (0..server.taskRouteCount()) |i| {
+        const r = server.routeStats(i);
+        try w.print("{s}{{\"route\":\"{s}\",\"task_handlers\":{d},\"orphans\":{d},\"oldest_orphan_age_ms\":{d}}}", .{ if (i == 0) "" else ",", r.label, r.task_handlers, r.orphans, r.oldest_orphan_age_ns / std.time.ns_per_ms });
+    }
+    try w.writeAll("]");
+    if (top != 0) try writeTopHolders(&w, &server.clients, top, by);
+    try w.writeAll("}\n");
     try resp.send(200, &.{.{ .name = "content-type", .value = "application/json" }}, w.buffered());
+}
+
+/// `"top":{"by":...,"clients":[...]}`: the `n` clients holding the most of
+/// `by`, most first; each with its holders and every count.
+fn writeTopHolders(w: *std.Io.Writer, table: *starh2.edge.accounts.Table, n: usize, by: starh2.edge.accounts.Resource) !void {
+    const Entry = starh2.edge.accounts.Table.Entry;
+    // The whole slab can be live: one entry per record.
+    const all = try std.heap.page_allocator.alloc(Entry, table.records.len);
+    defer std.heap.page_allocator.free(all);
+    const live = table.snapshot(all);
+    std.mem.sort(Entry, live, by, struct {
+        fn more(res: starh2.edge.accounts.Resource, a: Entry, b: Entry) bool {
+            return a.count(res) > b.count(res);
+        }
+    }.more);
+    try w.print(",\"top\":{{\"by\":\"{s}\",\"live_clients\":{d},\"clients\":[", .{ @tagName(by), live.len });
+    for (live[0..@min(n, live.len)], 0..) |e, i| {
+        try w.print("{s}{{\"client\":\"{f}\",\"holders\":{d}", .{ if (i == 0) "" else ",", starh2.edge.accounts.fmtKey(e.key), e.holders });
+        for (e.counts, 0..) |v, ri| {
+            try w.print(",\"{s}\":{d}", .{ @tagName(@as(starh2.edge.accounts.Resource, @enumFromInt(ri))), v });
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
 }
 
 fn memHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.CompleteResponse) anyerror!void {
