@@ -347,7 +347,9 @@ pub const Server = struct {
     /// PROXY headers that were malformed, over `Limits.proxy_header_bytes`,
     /// or not complete by the preface deadline; each connection was closed.
     proxy_header_failures: std.atomic.Value(u64) = .init(0),
-    proxy_log: RateLimitedLog = .{},
+    /// One line a minute at most: the PROXY failures a client can cause
+    /// must not become a flood of lines.
+    proxy_log: accounts.RateLimitedLine = .{ .interval_ns = 60 * std.time.ns_per_s },
     router: router_mod.Router = undefined,
     /// Server-wide outbound DATA slabs. Shared so an idle connection holds
     /// none, and capped so the ceiling stays computable.
@@ -624,18 +626,11 @@ pub const Server = struct {
                 accept_group.spawn(acceptLoop, .{ self, i, endpoint.mode(), &connection_group }) catch break :blk true;
                 break :blk false;
             };
-            if (failed) {
-                // An earlier endpoint may have taken connections, and their
-                // handlers may run: this exit waits for them like every
-                // other (`waitForHandlers`), so `serve` never returns under
-                // a running handler.
-                accept_group.cancel();
-                zio.beginShield();
-                defer zio.endShield();
-                self.waitForHandlers(&connection_group, true, &cancel, &canceller);
-                return error.TransportSetupFailed;
-            }
+            if (failed) return self.failStart(&accept_group, &connection_group, &cancel, &canceller);
         }
+        // The rate-limited lines' held counts reach output within about a
+        // second even when no later line comes (`flushTicker`).
+        accept_group.spawn(flushTicker, .{self}) catch return self.failStart(&accept_group, &connection_group, &cancel, &canceller);
 
         self.bind_state.store(.listening, .release);
         self.bind_event.set();
@@ -655,7 +650,43 @@ pub const Server = struct {
         zio.beginShield();
         defer zio.endShield();
         self.waitForHandlers(&connection_group, canceled, &cancel, &canceller);
+        // The ticker ended with the accept group: what the drain held back
+        // is printed now.
+        self.flushLines(true);
         if (canceled) return error.RuntimeShutdown;
+    }
+
+    /// A spawn at startup failed. An earlier endpoint may have taken
+    /// connections, and their handlers may run: this exit waits for them
+    /// like every other (`waitForHandlers`), so `serve` never returns under
+    /// a running handler.
+    fn failStart(self: *Server, accept_group: *zio.Group, connection_group: *zio.Group, cancel: *CancelSignal, canceller: *zio.JoinHandle(void)) ServeError {
+        accept_group.cancel();
+        zio.beginShield();
+        defer zio.endShield();
+        self.waitForHandlers(connection_group, true, cancel, canceller);
+        self.flushLines(true);
+        return error.TransportSetupFailed;
+    }
+
+    /// Once a second, the held counts of the server's rate-limited lines
+    /// (`flushLines`). It runs in the accept group, so the shutdown's cancel
+    /// of that group ends it, and `serve` flushes once more at its end.
+    fn flushTicker(self: *Server) void {
+        while (true) {
+            zio.sleep(.fromNanoseconds(std.time.ns_per_s)) catch return;
+            self.flushLines(false);
+        }
+    }
+
+    /// Every rate-limited line of this server: a held count is printed once
+    /// the line's interval has passed, or at once with `force`
+    /// (`accounts.RateLimitedLine.flush`).
+    fn flushLines(self: *Server, force: bool) void {
+        self.clients.refusal_log.flush("refused clients (share or start rate)", force);
+        self.accounting.routes.refusal_log.flush("refused task routes (share)", force);
+        self.accounting.orphans.log.flush("handlers orphaned", force);
+        self.proxy_log.flush("PROXY failures", force);
     }
 
     /// The shutdown contract: `serve` never returns while a handler still
@@ -1891,30 +1922,6 @@ fn readExact(stream: std.Io.net.Stream, buf: []u8, timeout: zio.Timeout) HeaderE
         got += n;
     }
 }
-
-/// One warn line at most a minute, with the count of the ones held back:
-/// the PROXY failures a client can cause must not become a flood of lines.
-const RateLimitedLog = struct {
-    last_ns: std.atomic.Value(u64) = .init(0),
-    held: std.atomic.Value(u64) = .init(0),
-
-    const interval_ns = 60 * std.time.ns_per_s;
-
-    fn note(self: *RateLimitedLog, comptime fmt: []const u8, args: anytype) void {
-        const now = monoNs();
-        const last = self.last_ns.load(.monotonic);
-        if (last != 0 and now -% last < interval_ns) {
-            _ = self.held.fetchAdd(1, .monotonic);
-            return;
-        }
-        if (self.last_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) {
-            _ = self.held.fetchAdd(1, .monotonic);
-            return;
-        }
-        const held = self.held.swap(0, .monotonic);
-        log.warn(fmt ++ " ({d} more since the last report)", args ++ .{held});
-    }
-};
 
 fn fmtPeer(p: request.Peer) std.fmt.Alt(request.Peer, formatPeer) {
     return .{ .data = p };

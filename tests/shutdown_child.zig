@@ -43,10 +43,21 @@
 //!   charging the record the index names in its own list.
 //! - `route-table-not-task`: the right list, but a complete route of it:
 //!   `ref` panics with its own message, in every build.
+//! - `refusal-tail`: the client-share refusal line's last burst (t-3900).
+//!   Four connections from 127.0.0.1, 200 ms apart, at a mark of 2 and a
+//!   share of 1: two are held, the third is refused and logged, the fourth
+//!   is refused inside the line's second and held back. The process then
+//!   waits 3 s and exits with the server running, so only the server's
+//!   once-a-second flush can print the held count. Before t-3900 nothing
+//!   printed it (measured on a ReleaseFast bench server in t-3759 step 9b).
+//! - `refusal-tail-shutdown`: the same burst, then a shutdown at once,
+//!   inside the line's second and before the flush's next chance: only
+//!   `serve`'s last flush can print it.
 //! - `orphan-line`: three handlers of `GET /orphan` that ignore their
 //!   cancel, on three connections closed 100 ms apart: the first orphan is
-//!   logged with its route and the counts, and the other two are held back
-//!   (the process exits with the server running).
+//!   logged with its route and the counts, the other two are held back, and
+//!   the once-a-second flush prints them (the process exits with the
+//!   server running).
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -473,7 +484,7 @@ fn runRouteUnderflow(_: *zio.Runtime) anyerror!void {
 }
 
 // ---------------------------------------------------------------------------
-// The orphan line (t-3900).
+// The rate-limited lines' held counts, and the orphan line (t-3900).
 
 fn connect4(port: u16) !zio.net.Stream {
     const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -482,6 +493,60 @@ fn connect4(port: u16) !zio.net.Stream {
 
 fn monoMs() u64 {
     return zio.Timestamp.now(.monotonic).toNanoseconds() / std.time.ns_per_ms;
+}
+
+fn clientRefusals(server: *const starh2.Server) u64 {
+    const s = server.stats();
+    var n: u64 = s.client_rate_refusals[0] + s.client_rate_refusals[1];
+    for (s.client_share_refusals) |v| n += v;
+    return n;
+}
+
+fn runRefusalTail(rt: *zio.Runtime, at_shutdown: bool) anyerror!void {
+    const gpa = std.heap.page_allocator;
+    var limits = starh2.Limits.defaults;
+    // Mark 2, a client's share 1: 127.0.0.1 holds two, the rest is refused.
+    limits.max_connections = 8;
+    limits.graceful_drain_timeout_ns = 200 * std.time.ns_per_ms;
+    var server = try starh2.Server.init(gpa, rt.io(), .{
+        .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .peer } }},
+        .routes = &ok_routes,
+        .tls = null,
+        .limits = limits,
+    });
+    var handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+    const port = server.localAddress(0).getPort();
+    var conns: [4]zio.net.Stream = undefined;
+    for (&conns, 0..) |*c, i| {
+        if (i != 0) try zio.sleep(.fromMilliseconds(200));
+        c.* = try connect4(port);
+    }
+    const t0 = monoMs();
+    while (clientRefusals(&server) < 2) {
+        if (monoMs() - t0 > 2000) break;
+        try zio.sleep(.fromMilliseconds(5));
+    }
+    const refused = clientRefusals(&server);
+    if (at_shutdown) {
+        for (conns) |c| c.close();
+        server.requestShutdown();
+        handle.join() catch {};
+        std.debug.print("child: refusal tail at shutdown refusals={d}, serve returned {d} ms after the fourth connection\n", .{ refused, monoMs() - t0 });
+        server.deinit(gpa);
+        std.process.exit(0);
+    }
+    try zio.sleep(.fromMilliseconds(3000));
+    std.debug.print("child: refusal tail refusals={d}, server still running\n", .{refused});
+    std.process.exit(0);
+}
+
+fn runRefusalTailTick(rt: *zio.Runtime) anyerror!void {
+    return runRefusalTail(rt, false);
+}
+
+fn runRefusalTailShutdown(rt: *zio.Runtime) anyerror!void {
+    return runRefusalTail(rt, true);
 }
 
 var orphan_started: std.atomic.Value(usize) = .init(0);
@@ -577,6 +642,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runRouteTableMismatch, .{rt})
     else if (std.mem.eql(u8, case, "route-table-not-task"))
         try rt.spawn(runRouteTableNotTask, .{rt})
+    else if (std.mem.eql(u8, case, "refusal-tail"))
+        try rt.spawn(runRefusalTailTick, .{rt})
+    else if (std.mem.eql(u8, case, "refusal-tail-shutdown"))
+        try rt.spawn(runRefusalTailShutdown, .{rt})
     else if (std.mem.eql(u8, case, "orphan-line"))
         try rt.spawn(runOrphanLine, .{rt})
     else

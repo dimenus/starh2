@@ -1655,18 +1655,23 @@ fn nowNs() u64 {
     return zio.Timestamp.now(.monotonic).toNanoseconds();
 }
 
-/// One warn line at most a second, with the count of the ones held back: a
-/// client that is refused under an attack must not become a flood of lines.
+/// One warn line at most per `interval_ns` (a second by default), with the
+/// count of the ones held back: a client that is refused under an attack
+/// must not become a flood of lines.
+///
+/// The held count is printed by the next line, or by `flush` when no line
+/// comes: `Server.serve` flushes every such line of the server once a second
+/// and once when it ends (`Server.flushLines`). Without the flush, the last
+/// burst inside an interval reached no output at all.
 pub const RateLimitedLine = struct {
     last_ns: std.atomic.Value(u64) = .init(0),
     held: std.atomic.Value(u64) = .init(0),
-
-    const interval_ns = std.time.ns_per_s;
+    interval_ns: u64 = std.time.ns_per_s,
 
     pub fn note(self: *RateLimitedLine, comptime fmt: []const u8, args: anytype) void {
         const now = zio.Timestamp.now(.monotonic).toNanoseconds();
         const last = self.last_ns.load(.monotonic);
-        if (last != 0 and now -% last < interval_ns) {
+        if (last != 0 and now -% last < self.interval_ns) {
             _ = self.held.fetchAdd(1, .monotonic);
             return;
         }
@@ -1676,6 +1681,23 @@ pub const RateLimitedLine = struct {
         }
         const held = self.held.swap(0, .monotonic);
         log.warn(fmt ++ " ({d} more since the last report)", args ++ .{held});
+    }
+
+    /// Print the held count, if any, once the interval since the last line
+    /// passed, or at once with `force` (the server's last flush). The line
+    /// has only `what` and the count: the held lines' own details were not
+    /// kept. It takes the interval like a line of its own, so one line per
+    /// interval stays the bound.
+    pub fn flush(self: *RateLimitedLine, comptime what: []const u8, force: bool) void {
+        if (self.held.load(.monotonic) == 0) return;
+        const now = zio.Timestamp.now(.monotonic).toNanoseconds();
+        const last = self.last_ns.load(.monotonic);
+        if (!force and now -% last < self.interval_ns) return;
+        // A line printed meanwhile carries the held count itself.
+        if (self.last_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) return;
+        const held = self.held.swap(0, .monotonic);
+        if (held == 0) return;
+        log.warn(what ++ ": {d} more since the last report", .{held});
     }
 };
 

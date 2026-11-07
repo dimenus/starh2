@@ -1347,11 +1347,31 @@ pub fn build(b: *std.Build) void {
     run_route_table_not_task.has_side_effects = true;
     shutdown_step.dependOn(&run_route_table_not_task.step);
     routes_step.dependOn(&run_route_table_not_task.step);
-    // The orphan line names its route and the counts (t-3900).
+    // The rate-limited lines' last burst reaches output (t-3900): from the
+    // once-a-second flush while the server runs, and from `serve`'s last
+    // flush at shutdown. The orphan line names its route and the counts.
+    const run_refusal_tail = b.addRunArtifact(shutdown_child);
+    run_refusal_tail.addArg("refusal-tail");
+    run_refusal_tail.addCheck(.{ .expect_stderr_match = "over its share under pressure), endpoint 0 (h1c) client_identity=.peer (0 more since the last report)" });
+    run_refusal_tail.addCheck(.{ .expect_stderr_match = "refused clients (share or start rate): 1 more since the last report" });
+    run_refusal_tail.addCheck(.{ .expect_stderr_match = "child: refusal tail refusals=2, server still running" });
+    run_refusal_tail.expectExitCode(0);
+    run_refusal_tail.has_side_effects = true;
+    shutdown_step.dependOn(&run_refusal_tail.step);
+    stats_step.dependOn(&run_refusal_tail.step);
+    const run_refusal_tail_shutdown = b.addRunArtifact(shutdown_child);
+    run_refusal_tail_shutdown.addArg("refusal-tail-shutdown");
+    run_refusal_tail_shutdown.addCheck(.{ .expect_stderr_match = "refused clients (share or start rate): 1 more since the last report" });
+    run_refusal_tail_shutdown.addCheck(.{ .expect_stderr_match = "child: refusal tail at shutdown refusals=2" });
+    run_refusal_tail_shutdown.expectExitCode(0);
+    run_refusal_tail_shutdown.has_side_effects = true;
+    shutdown_step.dependOn(&run_refusal_tail_shutdown.step);
+    stats_step.dependOn(&run_refusal_tail_shutdown.step);
     const run_orphan_line = b.addRunArtifact(shutdown_child);
     run_orphan_line.addArg("orphan-line");
     run_orphan_line.addCheck(.{ .expect_stderr_match = "handler of GET /orphan still running " });
     run_orphan_line.addCheck(.{ .expect_stderr_match = " ms after dispatch when its connection ended; orphans now: 1 on this route, 1 on the server (0 more since the last report)" });
+    run_orphan_line.addCheck(.{ .expect_stderr_match = "handlers orphaned: 2 more since the last report" });
     run_orphan_line.addCheck(.{ .expect_stderr_match = "child: orphan line orphans=3 GET /orphan=3 oldest_ms>=3000=true" });
     run_orphan_line.expectExitCode(0);
     run_orphan_line.has_side_effects = true;
