@@ -1,6 +1,7 @@
 //! The only blocking sleeps test code may use (t-3885). `tools/std-io-gate`
-//! fails the build on any other `nanosleep`, `clock_nanosleep`, `usleep` or
-//! `Thread.sleep` under `src/` and `tests/`.
+//! fails the build on any other `nanosleep` or `clock_nanosleep` under `src/`
+//! and `tests/`, also when the name is spelled as a string (`@field`,
+//! `@extern`); its `blocking_sleep` doc has the full rule.
 //!
 //! A blocking sleep on a zio executor thread stops that executor's event loop
 //! for its whole length: every task placed there waits, and so does any I/O

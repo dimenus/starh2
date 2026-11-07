@@ -84,17 +84,36 @@
 //!
 //! `std.Thread` (OS threads) is outside this ban.
 //!
-//! # Blocking sleeps (t-3885)
+//! # Blocking sleeps (t-3885, t-3892)
 //!
-//! Under `src/` and `tests/` only, a `blocking_sleep` finding is any
-//! `nanosleep`, `clock_nanosleep` or `usleep` identifier (a call, an alias, a
-//! `std.posix.system.nanosleep`), and any `Thread.sleep`. A blocking sleep on
-//! a zio executor thread stops that executor's event loop (t-3878: a test's
-//! `nanosleep` on a task held a timer-cancel completion for 10 s). The one
-//! file allowed them is `sleep_helper` (`src/test_sleep.zig`), whose sleeps
-//! panic on an executor thread; tasks wait with `zio.sleep` or `io.sleep`
-//! (the zio vtable), which are not banned. Not seen: a sleep built from
-//! another blocking call with a timeout (`poll`, `select`, a read timeout).
+//! A blocking sleep on a zio executor thread stops that executor's event loop
+//! (t-3878: a test's `nanosleep` on a task held a timer-cancel completion for
+//! 10 s). Zig 0.17's std has exactly two: `nanosleep` and `clock_nanosleep`
+//! (`std.c`, `std.posix.system`, `std.os.linux`; netbsd's `__nanosleep50`).
+//! `std.Thread` has no `sleep`, and every `std.Io` sleep goes through the
+//! vtable, which is zio's. Under `src/` and `tests/` only, a `blocking_sleep`
+//! finding is:
+//!
+//! - any `nanosleep`, `clock_nanosleep` or `usleep` identifier: a call, an
+//!   alias, `std.posix.system.nanosleep`, a `.nanosleep` syscall tag;
+//! - a string literal shaped like a symbol name (`[A-Za-z0-9_$@]` only) that
+//!   contains `sleep` in any case: the name in `@field(std.c, "nanosleep")`,
+//!   `@extern(..., .{ .name = "nanosleep" })`, `"__nanosleep50"`, Windows'
+//!   `"Sleep"`. A string with a space or a `.` (prose, an import path) is not
+//!   one;
+//! - `@extern` whose `.name` is not a string literal, and `@field` with a
+//!   computed name on a receiver that resolves to any std namespace (through
+//!   aliases, as above): the name could be a sleep;
+//! - an `extern` function declared with `sleep` in its name (libc `sleep`,
+//!   Windows `Sleep`).
+//!
+//! These fail toward noise. The one file allowed them is `sleep_helper`
+//! (`src/test_sleep.zig`), whose sleeps panic on an executor thread; tasks
+//! wait with `zio.sleep` or `io.sleep` (the zio vtable), which are not
+//! banned. Not seen: a sleep built from another blocking call with a timeout
+//! (`poll`, `select`, a read timeout), a `@cImport`ed `sleep` called as
+//! `c.sleep(`, and `@field` with a computed name on a receiver the scan cannot
+//! resolve to std.
 const std = @import("std");
 
 /// Declarations of `std.Io` that are concurrency (Zig 0.17). Reaching one
@@ -148,32 +167,101 @@ pub const sleep_dirs = [_][]const u8{ "src", "tests" };
 /// The one file under `sleep_dirs` that may sleep: its sleeps check the thread.
 pub const sleep_helper = "src/test_sleep.zig";
 
+/// A string that could name a sleep symbol: only symbol characters, and
+/// `sleep` in it in any case.
+fn sleepSymbolString(body: []const u8) bool {
+    if (body.len == 0) return false;
+    for (body) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_', '$', '@' => {},
+        else => return false,
+    };
+    return std.ascii.findIgnoreCase(body, "sleep") != null;
+}
+
 /// `blocking_sleep` findings in `source`, a file under `sleep_dirs`.
 pub fn scanSleeps(gpa: std.mem.Allocator, source: [:0]const u8, out: *std.ArrayList(Finding)) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var toks: std.ArrayList(Tok) = .empty;
     var tokenizer: std.zig.Tokenizer = .init(source);
-    // The last two significant tokens before this one, for `Thread . sleep`.
-    var prev: [2]?std.zig.Token = .{ null, null };
     while (true) {
         const t = tokenizer.next();
         switch (t.tag) {
             .eof => break,
             .doc_comment, .container_doc_comment => continue,
+            else => try toks.append(arena, .{ .tag = t.tag, .start = t.loc.start, .end = t.loc.end }),
+        }
+    }
+    // Aliases only, to resolve `@field`'s receiver; `scan` reports the rest.
+    var ignored: std.ArrayList(Finding) = .empty;
+    var s: Scanner = .{ .arena = arena, .src = source, .toks = toks.items, .out = &ignored, .out_gpa = arena };
+    try s.collectAliases();
+
+    // Set by `extern`, cleared at the end of the declaration.
+    var in_extern = false;
+    for (toks.items, 0..) |t, i| {
+        switch (t.tag) {
+            .identifier => {
+                const name = s.ident(i);
+                if (contains(&sleep_names, name)) {
+                    try out.append(gpa, .{ .offset = t.start, .rule = .blocking_sleep, .name = name });
+                } else if (in_extern and i > 0 and s.tag(i - 1) == .keyword_fn and std.ascii.findIgnoreCase(name, "sleep") != null) {
+                    try out.append(gpa, .{ .offset = t.start, .rule = .blocking_sleep, .name = name });
+                }
+            },
+            .string_literal => {
+                const body = s.stringBody(i);
+                if (sleepSymbolString(body)) try out.append(gpa, .{ .offset = t.start, .rule = .blocking_sleep, .name = body });
+            },
+            .multiline_string_literal_line => {
+                const body = std.mem.trimEnd(u8, source[t.start + 2 .. t.end], "\r\n");
+                if (sleepSymbolString(body)) try out.append(gpa, .{ .offset = t.start, .rule = .blocking_sleep, .name = body });
+            },
+            .keyword_extern => in_extern = true,
+            .semicolon, .l_brace => in_extern = false,
+            .builtin => {
+                if (s.isBuiltin(i, "@extern")) {
+                    if (externComputedName(&s, i)) |at|
+                        try out.append(gpa, .{ .offset = s.toks[at].start, .rule = .blocking_sleep, .name = "@extern <computed name>" });
+                } else if (s.isBuiltin(i, "@field") and s.tag(i + 1) == .l_paren) {
+                    const chain = (try s.quietChain(i + 2)) orelse continue;
+                    const paths, const after = chain;
+                    if (s.tag(after) != .comma or s.tag(after + 1) == .string_literal) continue;
+                    for (paths) |p| if (p.root == .std) {
+                        try out.append(gpa, .{ .offset = s.toks[after + 1].start, .rule = .blocking_sleep, .name = "@field(std, <computed name>)" });
+                        break;
+                    };
+                }
+            },
             else => {},
         }
-        if (t.tag == .identifier) {
-            var name = source[t.loc.start..t.loc.end];
-            if (name.len >= 3 and name[0] == '@' and name[1] == '"') name = name[2 .. name.len - 1];
-            if (contains(&sleep_names, name)) {
-                try out.append(gpa, .{ .offset = t.loc.start, .rule = .blocking_sleep, .name = name });
-            } else if (std.mem.eql(u8, name, "sleep")) {
-                if (prev[1]) |dot| if (prev[0]) |thread| {
-                    if (dot.tag == .period and thread.tag == .identifier and std.mem.eql(u8, source[thread.loc.start..thread.loc.end], "Thread"))
-                        try out.append(gpa, .{ .offset = thread.loc.start, .rule = .blocking_sleep, .name = "Thread.sleep" });
-                };
-            }
-        }
-        prev = .{ prev[1], t };
     }
+}
+
+/// For `@extern(` at `i`: the token index of a `.name = <x>` whose `x` is
+/// not a string literal, or of the `@extern` itself when its options are not
+/// a literal with a `.name` this scan can read. Null for a literal name.
+fn externComputedName(s: *const Scanner, i: usize) ?usize {
+    if (s.tag(i + 1) != .l_paren) return i;
+    var depth: usize = 0;
+    var k = i + 1;
+    while (k < s.toks.len) : (k += 1) {
+        switch (s.tag(k)) {
+            .l_paren, .l_brace, .l_bracket => depth += 1,
+            .r_paren, .r_brace, .r_bracket => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            .period => if (s.tag(k + 1) == .identifier and std.mem.eql(u8, s.ident(k + 1), "name") and s.tag(k + 2) == .equal) {
+                return if (s.tag(k + 3) == .string_literal) null else k + 3;
+            },
+            .eof => return i,
+            else => {},
+        }
+    }
+    return i;
 }
 
 pub const Finding = struct {
@@ -861,16 +949,41 @@ fn expectSleeps(source: [:0]const u8, want: []const []const u8) !void {
     }
 }
 
-test "blocking sleeps: every raw spelling, and Thread.sleep" {
+test "blocking sleeps: every raw spelling" {
     try expectSleeps(
         \\_ = std.c.nanosleep(&t, null);
         \\_ = std.posix.system.nanosleep(&ts, null);
         \\_ = std.c.clock_nanosleep(.MONOTONIC, .{}, &t, null);
         \\_ = usleep(10);
-        \\std.Thread.sleep(5);
         \\const ns = std.c.nanosleep;
         \\_ = @"nanosleep"(&t, null);
-    , &.{ "nanosleep", "nanosleep", "clock_nanosleep", "usleep", "Thread.sleep", "nanosleep", "nanosleep" });
+        \\_ = linux.syscall2(.nanosleep, a, b);
+    , &.{ "nanosleep", "nanosleep", "clock_nanosleep", "usleep", "nanosleep", "nanosleep", "nanosleep" });
+}
+
+test "blocking sleeps: the name as a string (t-3892)" {
+    try expectSleeps(
+        \\_ = @field(std.c, "nanosleep")(&t, null);
+        \\const f = @extern(*const fn (*const T, ?*T) callconv(.c) c_int, .{ .name = "nanosleep" });
+        \\const g = @extern(*const fn (u32) callconv(.winapi) void, .{ .library_name = "kernel32", .name = "Sleep" });
+        \\const h = @field(std.c, "__nanosleep50");
+        \\const m =
+        \\    \\clock_nanosleep
+        \\;
+    , &.{ "nanosleep", "nanosleep", "Sleep", "__nanosleep50", "clock_nanosleep" });
+}
+
+test "blocking sleeps: a name the scan cannot read, and extern declarations" {
+    try expectSleeps(
+        \\const std = @import("std");
+        \\const libc = std.c;
+        \\const a = @field(libc, name);
+        \\const b = @field(std.posix.system, sym);
+        \\const f = @extern(*const fn () void, .{ .name = sym });
+        \\const g = @extern(*const fn () void, opts);
+        \\extern "c" fn sleep(seconds: c_uint) c_uint;
+        \\pub extern "kernel32" fn SleepEx(ms: u32, alertable: i32) callconv(.winapi) u32;
+    , &.{ "@field(std, <computed name>)", "@field(std, <computed name>)", "@extern <computed name>", "@extern <computed name>", "sleep", "SleepEx" });
 }
 
 test "blocking sleeps: zio and std.Io sleeps, comments and strings are not findings" {
@@ -883,5 +996,12 @@ test "blocking sleeps: zio and std.Io sleeps, comments and strings are not findi
         \\const msg = "nanosleep in a string";
         \\const sleep = 3;
         \\_ = self.sleep;
+        \\const ts = @import("test_sleep.zig");
+        \\@field(lim, name) = v;
+        \\const x = @field(std.c, "write");
+        \\const f = @extern(*const fn () void, .{ .name = "write" });
+        \\extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
+        \\fn sleepFor(ms: u32) void {}
+        \\std.Thread.sleep(5);
     , &.{});
 }
