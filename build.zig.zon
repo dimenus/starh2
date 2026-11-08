@@ -4,15 +4,18 @@
     .fingerprint = 0x813a04b419058cf5,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // dimenus/zio 16783b0 (carmack/t-3896-rebase, 2026-11-06): the fork's
-        // 11 commits rebased onto lalinsky/zio main c5716c4. They carry four
+        // dimenus/zio 3417a77 (carmack/t-3939-preempt, 2026-11-08): 16783b0
+        // (carmack/t-3896-rebase, the fork's 11 commits rebased onto
+        // lalinsky/zio main c5716c4) plus the simulator's seeded preemption
+        // after a non-blocking channel operation (t-3939). They carry four
         // parts upstream does not:
         // - the io_uring send -EAGAIN bridge (wait for writability, then
         //   resend). Upstream will not merge it (PR #863). It stays until the
         //   kernel fix for -EAGAIN on an io_uring send ships on the machines
         //   we run, or upstream zio adds its own workaround.
-        // - the DST simulator and the select/CompletionQueue invariant
-        //   checks, which panic in every build.
+        // - the DST simulator (with `sim.Preempt`, which `dst-conn` turns on)
+        //   and the select/CompletionQueue invariant checks, which panic in
+        //   every build.
         // - two ThreadSanitizer race fixes (a Debug copy of a tagged union
         //   read across threads: Waiter's mode and the Linux backend's
         //   engine; the work-stealing ring's slots).
@@ -20,8 +23,8 @@
         //   running task's label) and `setTaskLabel`, which the executor
         //   watchdog reads (t-3760).
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#16783b085073ed6682fec350ef29dc84958513d0",
-            .hash = "zio-0.19.0-xHbVVDKfMAA8a7tr9IPfbM0S56_0Fj-D9nRYPOeMvS__",
+            .url = "git+https://github.com/dimenus/zio#3417a77ea40cde7b151ee0a85fd7bb88571ca126",
+            .hash = "zio-0.19.0-xHbVVGyqMACd6AE_rGzEsZP6xU4cRESorDIvmpDdE9Rc",
         },
         // Lazy: only `starh2_datastar` and the examples use the SDK, so a
         // consumer of the core HTTP/2 module never fetches or compiles it.

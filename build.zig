@@ -1895,7 +1895,10 @@ pub fn build(b: *std.Build) void {
             run.has_side_effects = true;
             run.stdio = .inherit;
             if (mutant == .none) {
-                run.addArgs(&.{ "--ci", "--seeds-file", "tools/dst-conn/regression-seeds.txt", "--commit", commit, "--budget-ms", "45000" });
+                // The second half of the budget preempts one non-blocking
+                // channel operation in two (`zio.sim.Preempt`): the rate
+                // that found the t-3931 teardown leak most often per seed.
+                run.addArgs(&.{ "--ci", "--seeds-file", "tools/dst-conn/regression-seeds.txt", "--commit", commit, "--budget-ms", "45000", "--preempt-one-in", "2" });
             } else {
                 run.addArgs(&.{"--expect-mutant"});
             }

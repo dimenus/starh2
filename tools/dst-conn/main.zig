@@ -37,6 +37,14 @@
 //!   zig-out/bin/dst-conn --seed N [--verbose]      one seed (replay)
 //!   zig-out/bin/dst-conn --ci --seeds-file F --commit HEX --budget-ms B
 //!   zig-out/bin/dst-conn-<mutant> --expect-mutant  validity
+//!   --preempt-one-in N: one non-blocking channel operation in N preempts
+//!   its task for a seeded 50 us .. 50 ms (`zio.sim.Preempt`); 0, the
+//!   default, is off. With --seed, --survey and --expect-mutant it applies to
+//!   every seed. With --ci the budget is split: the first half runs as
+//!   without it (preemption off: the regression seeds, which were recorded
+//!   off, the commit seeds and the range), the second half runs the range
+//!   again from seed 1 at one in N. A replay needs the same N, so every
+//!   replay line prints the N its run used.
 const std = @import("std");
 const zio = @import("zio");
 const starh2 = @import("starh2");
@@ -80,9 +88,21 @@ fn buildName() []const u8 {
     return if (comptime std.mem.eql(u8, harness_options.mutant, "none")) "dst-conn" else "dst-conn-" ++ harness_options.mutant;
 }
 
-var replay_buf: [192]u8 = undefined;
+var replay_buf: [224]u8 = undefined;
 fn replayCmd(seed: u64) []const u8 {
-    return std.fmt.bufPrint(&replay_buf, "./zb build dst-conn-install && zig-out/bin/{s} --seed {d} --verbose", .{ buildName(), seed }) catch "?";
+    return std.fmt.bufPrint(&replay_buf, "./zb build dst-conn-install && zig-out/bin/{s} --seed {d} --preempt-one-in {d} --verbose", .{ buildName(), seed, zio.sim.preemptSetting().one_in }) catch "?";
+}
+
+/// The preemption range (`zio.sim.Preempt`), log-uniform. Above 2 ms the
+/// window must stay open past the harness's 1 ms tick for a parked handler
+/// to wake and act in it (the t-3931 survey: 0 finds at 0 and 1 ms, finds
+/// from 2 ms); 50 us .. 50 ms puts about half the preemptions above 2 ms
+/// and keeps short ones, as an OS time slice does.
+const preempt_min_ns: u64 = 50 * std.time.ns_per_us;
+const preempt_max_ns: u64 = 50 * std.time.ns_per_ms;
+
+fn setPreempt(one_in: u32) void {
+    zio.sim.setPreempt(.{ .one_in = one_in, .min_ns = preempt_min_ns, .max_ns = preempt_max_ns });
 }
 
 // ---------------------------------------------------------------------------
@@ -958,7 +978,7 @@ fn printOutcome(out: *const Outcome, run: *const Run) void {
 // Modes.
 
 fn printScope() void {
-    std.debug.print("SCOPE simulated: one h2c Connection (real actor, read/write pumps, ticket table, complete and task handlers) on a zio sim pipe; peer as zio tasks (h2 oracle, HPACK); clock, task picks, I/O delays, timer order (zio sim); faults: peer RST_STREAM, half-close, close, requestShutdown, short writes, write error, flow-control windows 0/1/small/starved\n", .{});
+    std.debug.print("SCOPE simulated: one h2c Connection (real actor, read/write pumps, ticket table, complete and task handlers) on a zio sim pipe; peer as zio tasks (h2 oracle, HPACK); clock, task picks, I/O delays, timer order (zio sim); faults: peer RST_STREAM, half-close, close, requestShutdown, short writes, write error, flow-control windows 0/1/small/starved; with --preempt-one-in, a task preempted after a non-blocking channel operation\n", .{});
     std.debug.print("SCOPE unsimulated: real OS threads (one thread runs 2 logical executors; the connection's tasks share executor 0, placement .local), work stealing (sim cannot run work_stealing), TLS, HTTP/1.1, the accept loop and admission, getpeername (a real syscall that fails on a sim fd), more than one connection\n", .{});
 }
 
@@ -998,11 +1018,14 @@ fn wallNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.now(.awake, io).nanoseconds);
 }
 
-fn ciMode(gpa: std.mem.Allocator, io: std.Io, seeds_file: []const u8, commit: []const u8, budget_ms: u64) !void {
+fn ciMode(gpa: std.mem.Allocator, io: std.Io, seeds_file: []const u8, commit: []const u8, budget_ms: u64, preempt_one_in: u32) !void {
     printScope();
-    std.debug.print("dst-conn: build={s} commit={s} budget_ms={d}\n", .{ buildName(), commit, budget_ms });
+    std.debug.print("dst-conn: build={s} commit={s} budget_ms={d} preempt_one_in={d} (second half)\n", .{ buildName(), commit, budget_ms, preempt_one_in });
+    setPreempt(0);
     const start = wallNs(io);
     const budget_ns = budget_ms * std.time.ns_per_ms;
+    // With preemption the second half of the budget; without, all of it.
+    const off_ns = if (preempt_one_in == 0) budget_ns else budget_ns / 2;
     var sweep: Sweep = .{};
     var det_checked: u64 = 0;
 
@@ -1017,15 +1040,24 @@ fn ciMode(gpa: std.mem.Allocator, io: std.Io, seeds_file: []const u8, commit: []
     } else {
         const base = std.hash.Wyhash.hash(0xd5c0_33, commit);
         std.debug.print("dst-conn: commit seeds from {s}: base {d}\n", .{ commit, base });
-        while (commit_seeds < 64 and wallNs(io) - start < budget_ns / 4) : (commit_seeds += 1) {
+        while (commit_seeds < 64 and wallNs(io) - start < off_ns / 4) : (commit_seeds += 1) {
             try ciSeed(gpa, base +% commit_seeds, &sweep, &det_checked, false);
         }
     }
     var s: u64 = 1;
-    while (wallNs(io) - start < budget_ns) : (s += 1) try ciSeed(gpa, s, &sweep, &det_checked, false);
+    while (wallNs(io) - start < off_ns) : (s += 1) try ciSeed(gpa, s, &sweep, &det_checked, false);
+    const off_completed = sweep.completed;
+
+    // The second half: the same range, every seed preempted at one in N.
+    var p: u64 = 1;
+    if (preempt_one_in != 0) {
+        setPreempt(preempt_one_in);
+        while (wallNs(io) - start < budget_ns) : (p += 1) try ciSeed(gpa, p, &sweep, &det_checked, false);
+        setPreempt(0);
+    }
 
     const wall_ms = (wallNs(io) - start) / std.time.ns_per_ms;
-    std.debug.print("dst-conn: completed={d} (regression {d}, commit {d}, range 1..{d}) clean={d} determinism_checked={d} wall_ms={d}\n", .{ sweep.completed, regression.len, commit_seeds, s - 1, sweep.clean, det_checked, wall_ms });
+    std.debug.print("dst-conn: completed={d} (regression {d}, commit {d}, range 1..{d}; preempted at one in {d}: range 1..{d}, {d} seeds) clean={d} determinism_checked={d} wall_ms={d}\n", .{ sweep.completed, regression.len, commit_seeds, s - 1, preempt_one_in, p - 1, sweep.completed - off_completed, sweep.clean, det_checked, wall_ms });
     std.debug.print("dst-conn: marks {any}\n", .{sweep.marks});
     std.debug.print("dst-conn: runs with each fault {any}\n", .{sweep.fault_runs});
 
@@ -1072,7 +1104,7 @@ fn ciSeed(gpa: std.mem.Allocator, seed: u64, sweep: *Sweep, det_checked: *u64, a
 /// replay of that seed must fail the same way with the same trace.
 fn mutantMode(gpa: std.mem.Allocator, io: std.Io) !void {
     const want_per_stream = comptime std.mem.eql(u8, harness_options.mutant, "ticket_cause_first");
-    std.debug.print("== VALIDITY mutant {s} (needs a {s} failure)\n", .{ harness_options.mutant, if (want_per_stream) "per-stream rule" else "rule or oracle" });
+    std.debug.print("== VALIDITY mutant {s} (needs a {s} failure) preempt_one_in={d}\n", .{ harness_options.mutant, if (want_per_stream) "per-stream rule" else "rule or oracle", zio.sim.preemptSetting().one_in });
     const start = wallNs(io);
     var seed: u64 = 1;
     while (seed <= 20_000 and wallNs(io) - start < 45 * std.time.ns_per_s) : (seed += 1) {
@@ -1126,6 +1158,7 @@ pub fn main(init: std.process.Init) !void {
     var seeds_file: []const u8 = "tools/dst-conn/regression-seeds.txt";
     var commit: []const u8 = "none";
     var budget_ms: u64 = 45_000;
+    var preempt_one_in: u32 = 0;
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--seed")) {
             mode = .seed;
@@ -1145,18 +1178,21 @@ pub fn main(init: std.process.Init) !void {
             survey_n = try std.fmt.parseInt(u64, args.next() orelse return error.MissingCount, 10);
         } else if (std.mem.eql(u8, a, "--expect-mutant")) {
             mode = .mutant;
+        } else if (std.mem.eql(u8, a, "--preempt-one-in")) {
+            preempt_one_in = try std.fmt.parseInt(u32, args.next() orelse return error.MissingRate, 10);
         } else {
             std.debug.print("unknown arg {s}\n", .{a});
             std.process.exit(2);
         }
     }
+    setPreempt(preempt_one_in);
     switch (mode) {
         .seed => {
             printScope();
             const o = try runSeed(gpa, seed, verbose);
             if (o.failure != null) std.process.exit(1);
         },
-        .ci => try ciMode(gpa, io, seeds_file, commit, budget_ms),
+        .ci => try ciMode(gpa, io, seeds_file, commit, budget_ms, preempt_one_in),
         .mutant => try mutantMode(gpa, io),
         .survey => try surveyMode(gpa, survey_n),
         .none => {

@@ -7,11 +7,12 @@
         // The same zio commit as starh2's own pin (../../build.zig.zon). A
         // zon file cannot include another, so this is a copy: move both pins
         // together. `./zb build zio-pin-match` (in ci) fails when they differ.
-        // The hash is of a prefix-less `git archive 16783b0`; for d8ac2fd and
-        // 3d50bb6 that method gave the same hash as a GitHub fetch.
+        // The hash is of a prefix-less `git archive 3417a77`; for d8ac2fd and
+        // 3d50bb6 that method gave the same hash as a GitHub fetch, and it
+        // reproduces 16783b0's pinned hash.
         .zio = .{
-            .url = "git+https://github.com/dimenus/zio#16783b085073ed6682fec350ef29dc84958513d0",
-            .hash = "zio-0.19.0-xHbVVDKfMAA8a7tr9IPfbM0S56_0Fj-D9nRYPOeMvS__",
+            .url = "git+https://github.com/dimenus/zio#3417a77ea40cde7b151ee0a85fd7bb88571ca126",
+            .hash = "zio-0.19.0-xHbVVGyqMACd6AE_rGzEsZP6xU4cRESorDIvmpDdE9Rc",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "zb" },
