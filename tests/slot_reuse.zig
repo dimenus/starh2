@@ -773,6 +773,76 @@ test "slots: a slot left with a completion queued is kept out of reuse" {
     try runDirtyCase(.completion_queued, 1);
 }
 
+/// A handler that reports while teardown is under way is released after its
+/// link's gate closed. Its request bytes must still go back to the connection,
+/// or the slot fails the clean check and is never reused (t-3931). The
+/// completion drain is held, so the report sits in the channel until
+/// `shutdownHandlers` releases it after closing the gate: the same order a
+/// report gets when it lands between teardown's drain and its gate close.
+fn runReportedAtTeardown(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
+    var cert: []u8 = &.{};
+    var key: []u8 = &.{};
+    var limits = starh2.Limits.defaults;
+    // One slot: a quarantined one would refuse every later connection.
+    limits.max_connections = 1;
+    var server = try serverFor(rt, gpa, .h2c, limits, &cert, &key);
+    defer server.deinit(gpa);
+    var serve_handle = try rt.spawn(starh2.Server.serve, .{ &server, gpa });
+    defer {
+        server.requestShutdown();
+        serve_deadline.join(&server, &serve_handle);
+    }
+    try server.waitUntilListening(5 * std.time.ns_per_s);
+
+    const slots_base = conn_mod.test_observed_slots_in_use.load(.acquire);
+    const live_base = conn_mod.test_observed_live_handlers.load(.acquire);
+    conn_mod.test_hold_completion_drain.store(true, .release);
+    defer conn_mod.test_hold_completion_drain.store(false, .release);
+    {
+        const peer = try zio.net.IpAddress.parseIp4("127.0.0.1", server.localAddress(0).getPort());
+        const stream = try peer.connect(.{});
+        defer stream.close();
+        const wire = try h2c.buildClientHello(gpa, "/sse-short");
+        defer gpa.free(wire);
+        var off: usize = 0;
+        while (off < wire.len) off += try stream.write(wire[off..], .none);
+        // Dispatched (its slot in use) and reported (no live handler): the
+        // completion waits in the channel, behind the held drain.
+        const deadline = nowNs() + client_deadline_ns;
+        while (conn_mod.test_observed_slots_in_use.load(.acquire) != slots_base + 1 or
+            conn_mod.test_observed_live_handlers.load(.acquire) != live_base)
+        {
+            if (nowNs() >= deadline) return error.HandlerNeverReported;
+            zio.sleep(.fromMilliseconds(2)) catch {};
+        }
+    }
+    // The client closed: the connection ends with the report still held.
+    const deadline = nowNs() + client_deadline_ns;
+    while (server.active_connections.load(.acquire) != 0) {
+        if (nowNs() >= deadline) return error.ConnectionNeverEnded;
+        zio.sleep(.fromMilliseconds(2)) catch {};
+    }
+    conn_mod.test_hold_completion_drain.store(false, .release);
+    const after = server.slots.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), after.leaked);
+    try std.testing.expectEqual(@as(usize, 1), after.created);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+
+    // The one slot serves the next connection.
+    try runRound(&server, gpa, .h2c, 1);
+    const reused = server.slots.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), reused.created);
+    try std.testing.expectEqual(@as(usize, 0), reused.leaked);
+}
+
+test "slots: a handler that reports during teardown gives its request bytes back, and its slot is reused (t-3931)" {
+    const gpa = tsan_allocator.allocator();
+    const rt = try newRuntime(gpa);
+    defer rt.deinit();
+    var h = try rt.spawn(runReportedAtTeardown, .{ rt, gpa });
+    try h.join();
+}
+
 /// A connection that tries to be served and is closed instead.
 const Refused = struct {
     port: u16,

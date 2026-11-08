@@ -720,7 +720,7 @@ pub const Server = struct {
     ///    `shutdown_report_interval_ns`. There is no limit.
     ///
     /// Every wait polls the counters, from 1 ms doubling to 50 ms: a
-    /// handler's last act is its decrement (`dropLinkRef`), and a wake after
+    /// handler's last act is its decrement (`dropHandlerRef`), and a wake after
     /// it would touch this struct after `deinit` may have run. The polls run
     /// under the caller's shield, so a cancel of `serve` neither ends the wait
     /// nor makes it spin (a delivered error.Canceled would come back from

@@ -241,7 +241,7 @@ pub const H1Conn = struct {
         std.debug.assert(self.link == null);
         std.debug.assert(!self.stream_held);
         // Every request's connection charge came back: at the release of its
-        // link, or at teardown (`LinkCore.returnConnCharges`).
+        // link, or at teardown (`connection.dropActorRef`).
         if (self.request_budget.held.load(.acquire) != 0) {
             std.debug.panic("h1: {d} request bytes still charged to the connection at its end", .{self.request_budget.held.load(.acquire)});
         }
@@ -1332,7 +1332,7 @@ fn newLink(
     };
     if (!copied) {
         const status = (link.core.arena.refusal orelse request_pool.Reason.server_cap).status();
-        connection.dropLink(H1Link, link);
+        connection.dropActorRef(H1Link, link, &self.request_budget);
         return .{ .refused = status };
     }
     link.resp = .{
@@ -1514,7 +1514,7 @@ fn finishJob(link: *H1Link) void {
         };
     }
     link.core.noteHandlerEnd();
-    connection.dropLink(H1Link, link);
+    connection.dropHandlerRef(H1Link, link);
 }
 
 fn runTaskBody(link: *H1Link) void {
@@ -1763,7 +1763,7 @@ fn releaseRequest(self: *H1Conn) void {
         self.join = null;
     }
     self.link = null;
-    connection.dropLink(H1Link, link);
+    connection.dropActorRef(H1Link, link, &self.request_budget);
     releaseStream(self);
 }
 
@@ -1785,12 +1785,12 @@ fn endForShutdown(self: *H1Conn) void {
 ///    the join handle's awaitable, which never waits.
 /// 3. Wait for the calls already inside the gate. Bounded by starh2 code:
 ///    step 1 woke every wait a call can be in.
-/// 4. Give the connection its request bytes back
-///    (`LinkCore.returnConnCharges`). A handler whose report is in the
-///    channel is done with handler code: join it. One that did not report
-///    is orphaned (`LinkCore.orphan`): its join handle is detached, its link
-///    keeps the server-wide token and the orphan count, and `Server.serve`
-///    waits for it. Either way the actor drops its reference.
+/// 4. A handler whose report is in the channel is done with handler code:
+///    join it. One that did not report is orphaned (`LinkCore.orphan`): its
+///    join handle is detached, its link keeps the server-wide token and the
+///    orphan count, and `Server.serve` waits for it. Either way the actor
+///    drops its reference (`connection.dropActorRef`), which gives the
+///    connection its request bytes back, because the gate is closed.
 ///
 /// The connection must end after this: `dead` is set for good, the socket is
 /// shut, and the channels are closed. `want_close` says so to the loop.
@@ -1810,7 +1810,6 @@ fn endHandler(self: *H1Conn, cause: response.TerminalCause) void {
         if (h.awaitable) |aw| aw.cancel();
     }
     link.core.gate.waitDrained();
-    link.core.returnConnCharges(&self.request_budget);
     // A complete handler ran on this task and is done; a task handler is
     // done with handler code only if its report is in.
     const reported = if (self.join == null) true else blk: {
@@ -1825,7 +1824,7 @@ fn endHandler(self: *H1Conn, cause: response.TerminalCause) void {
     // After the drain: a call inside the gate may write it too.
     self.want_close = true;
     self.link = null;
-    connection.dropLink(H1Link, link);
+    connection.dropActorRef(H1Link, link, &self.request_budget);
     releaseStream(self);
 }
 

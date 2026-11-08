@@ -44,7 +44,9 @@
 //! `SlotPool.leaked` and reported, because something may still point into it
 //! and reusing it would hand that something a new connection's memory. The
 //! slot stays out of use for the life of the server and is freed by
-//! `SlotPool.deinit`, when no connection can be running.
+//! `SlotPool.deinit`, when no connection can be running. The report is a
+//! warning; in a test binary it is an error that fails the test, unless the
+//! test made the connection dirty on purpose (`Connection.dirtyOnPurpose`).
 //!
 //! Do not read this as a promise that real leaks end up here. `quiesce`
 //! panics or asserts on most of what the check looks for, before `recycle`
@@ -58,6 +60,7 @@ const zio = @import("zio");
 const boot_plan = @import("../core/boot_plan.zig");
 const connection = @import("connection.zig");
 const tls_edge = @import("tls.zig");
+const test_hook = @import("test_hook.zig");
 
 pub const ConnSlot = struct {
     buffer: []align(boot_plan.slot_align) u8,
@@ -81,7 +84,13 @@ pub const ConnSlot = struct {
     pub const Recycle = union(enum) {
         clean,
         /// The slot is dirty: the reason, and the slot is untouched.
-        dirty: []const u8,
+        dirty: Dirty,
+    };
+
+    pub const Dirty = struct {
+        why: []const u8,
+        /// A test left it dirty on purpose (`Connection.dirtyOnPurpose`).
+        asked: bool,
     };
 
     pub fn create(gpa: std.mem.Allocator, boot_bytes: usize) error{OutOfMemory}!*ConnSlot {
@@ -121,7 +130,7 @@ pub const ConnSlot = struct {
     /// and the caller must not reuse it.
     pub fn recycle(self: *ConnSlot) Recycle {
         if (std.debug.runtime_safety and self.state == .booted) {
-            if (self.conn.dirtiness()) |why| return .{ .dirty = why };
+            if (self.conn.dirtiness()) |why| return .{ .dirty = .{ .why = why, .asked = self.conn.dirty_on_purpose } };
         }
         if (builtin.mode == .debug) @memset(self.buffer, 0xdd);
         self.fba.reset();
@@ -266,7 +275,7 @@ pub const SlotPool = struct {
                 self.put(slot);
                 return .free;
             },
-            .dirty => |why| {
+            .dirty => |d| {
                 self.mu.lockUncancelable();
                 defer self.mu.unlock();
                 // Cannot fail: the quarantine holds slots in existence, `take`
@@ -274,7 +283,19 @@ pub const SlotPool = struct {
                 std.debug.assert(self.quarantine.items.len < self.quarantine.capacity);
                 self.quarantine.appendAssumeCapacity(slot);
                 self.leaked += 1;
-                std.log.warn("connection slot leaked, not reused: {s}", .{why});
+                // In a test binary (`builtin.is_test`) with the test hooks
+                // on, a dirty slot no test asked for is an error, and the
+                // test runner fails the test it happens in: a leak fails
+                // wherever it is, instead of passing with a warning in the
+                // log (t-3931). Everything else, a Debug application
+                // included, logs a warning.
+                if (comptime builtin.is_test and test_hook.on) {
+                    if (!d.asked) {
+                        std.log.err("connection slot leaked, not reused: {s} (an error in a test binary: no test asked for it)", .{d.why});
+                        return .quarantined;
+                    }
+                }
+                std.log.warn("connection slot leaked, not reused: {s}", .{d.why});
                 return .quarantined;
             },
         }

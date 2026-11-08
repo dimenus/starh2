@@ -668,7 +668,7 @@ pub const Arena = struct {
     gate: ?*Gate = null,
     /// Class bytes charged to `budget`, written only inside the gate. After
     /// the gate is closed and drained the actor gives exactly this back to
-    /// the connection (`Connection.orphanSlot`), because no later charge or
+    /// the connection (`connection.dropActorRef`), because no later charge or
     /// release reaches the budget.
     conn_charged: usize = 0,
     /// Class bytes of the blocks this request holds now.

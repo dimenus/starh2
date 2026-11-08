@@ -2020,9 +2020,11 @@ fn joinAcceptEncodingLines(a: std.mem.Allocator, headers: []const request.Header
 ///   server-wide token and is counted in `orphaned_handlers`, so
 ///   `Server.serve` waits for it.
 /// - Two references, counted in `refs`: the actor's, dropped when it frees
-///   the request (after the join), or when it orphans the handler; and the
-///   handler's, dropped as its job's last act. Whoever drops the last one
-///   frees the link and the arena with it (`dropLink`).
+///   the request (after the join), or when it orphans the handler
+///   (`dropActorRef`, which gives the connection its request bytes back if
+///   the gate is closed); and the handler's, dropped as its job's last act
+///   (`dropHandlerRef`). Whoever drops the last one frees the link and the
+///   arena with it (`dropLink`).
 pub const LinkCore = struct {
     gate: Gate = .{},
     refs: std.atomic.Value(u8) = .init(1),
@@ -2077,7 +2079,8 @@ pub const LinkCore = struct {
     /// connection exactly the request bytes it was charged
     /// (`request_pool.Arena.conn_charged`, which nothing changes once the
     /// gate is closed). A later release of the arena reaches no connection.
-    pub fn returnConnCharges(self: *LinkCore, budget: *request_pool.ConnBudget) void {
+    /// Called only by `dropActorRef`, so it happens once per link.
+    fn returnConnCharges(self: *LinkCore, budget: *request_pool.ConnBudget) void {
         std.debug.assert(self.gate.isClosed());
         std.debug.assert(self.gate.inside() == 0);
         const b = self.arena.budget orelse return;
@@ -2087,7 +2090,7 @@ pub const LinkCore = struct {
 
     /// Actor only, after the gate was closed and drained and the handler did
     /// not report: from here the handler runs on its link alone. The caller
-    /// detaches its join handle and then drops its reference (`dropLink`).
+    /// detaches its join handle and then drops its reference (`dropActorRef`).
     pub fn orphan(self: *LinkCore) void {
         std.debug.assert(self.gate.isClosed());
         std.debug.assert(self.gate.inside() == 0);
@@ -2109,17 +2112,37 @@ pub const LinkCore = struct {
     }
 };
 
-/// Drop one reference to a link (`L` embeds a `LinkCore` named `core`). The
-/// last one frees the link, the request's arena (the link lives in its first
-/// block), and the server-wide token.
+/// The actor drops its reference to a link (`L` embeds a `LinkCore` named
+/// `core`): once per link, with the connection alive, `budget` being the
+/// connection's request budget. If the gate is closed by then, the
+/// connection gets its request bytes back here, whatever ended the handler:
+/// orphaned, or reported and released after the gate closed (a report that
+/// lands between teardown's completion drain and its gate close). This is
+/// the one place that gives them back for a closed gate, so after it the
+/// arena may be freed from any task with no connection at all.
+pub fn dropActorRef(comptime L: type, link: *L, budget: *request_pool.ConnBudget) void {
+    if (link.core.gate.isClosed()) {
+        link.core.returnConnCharges(budget);
+    }
+    dropLink(L, link);
+}
+
+/// The handler's task drops its reference, its job's last act. It never
+/// touches the connection: it may run after the connection ended.
+pub fn dropHandlerRef(comptime L: type, link: *L) void {
+    dropLink(L, link);
+}
+
+/// Drop one reference to a link. The last one frees the link, the request's
+/// arena (the link lives in its first block), and the server-wide token.
+/// Only through `dropActorRef` or `dropHandlerRef`.
 ///
 /// Who may be last: on the ordinary path the actor, after the join, with the
 /// gate still open; the arena then gives its connection charges back as it
-/// releases. When the connection ended first, the gate is closed and the
-/// actor already gave the connection its charges back
-/// (`LinkCore.returnConnCharges`), so the arena releases with no connection
-/// at all, from whichever task is last.
-pub fn dropLink(comptime L: type, link: *L) void {
+/// releases. When the gate is closed, `dropActorRef` already gave the
+/// connection its charges back, so the arena releases with no connection at
+/// all, from whichever task is last.
+fn dropLink(comptime L: type, link: *L) void {
     const core = &link.core;
     const prev = core.refs.fetchSub(1, .acq_rel);
     std.debug.assert(prev != 0);
@@ -2203,10 +2226,6 @@ const StreamLink = struct {
         return self.core.closedError();
     }
 };
-
-fn dropLinkRef(link: *StreamLink) void {
-    dropLink(StreamLink, link);
-}
 
 /// Test-only: links freed, all connections.
 pub var test_links_freed: test_hook.Hook(std.atomic.Value(usize)) = if (test_hook.on) .init(0) else {};
@@ -2506,6 +2525,9 @@ pub const Connection = struct {
     trace_written_ns: std.atomic.Value(u64) = .init(0),
     /// Counted in `GlobalAccounting.shutdown_cancelled` (`noteShutdownCancel`).
     shutdown_cancel_counted: bool = false,
+    /// A test left this connection dirty on purpose (`dirtyOnPurpose`), so
+    /// its slot's quarantine is expected (`conn_slot.SlotPool.recycle`).
+    dirty_on_purpose: bool = false,
     live_handlers: std.atomic.Value(usize) = .init(0),
     /// Spawned task handlers only. Complete oneshots stay on `live_handlers`
     /// and must not trip the ReadPump donation.
@@ -3244,6 +3266,7 @@ pub const Connection = struct {
 
     /// Leave one condition `dirtiness` checks set, for a test.
     fn dirtyOnPurpose(self: *Connection, kind: DirtyKind) void {
+        self.dirty_on_purpose = true;
         switch (kind) {
             .write_chunk_rented => _ = self.write_pool.tryRentIndex(self.config.io),
             .request_bytes_reserved => _ = self.request_budget.held.fetchAdd(1, .acq_rel),
@@ -5776,7 +5799,7 @@ pub const Connection = struct {
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
         if (slot.link) |link| {
             slot.link = null;
-            dropLinkRef(link);
+            dropActorRef(StreamLink, link, &self.request_budget);
         }
         std.debug.assert(!slot.in_use);
         return true;
@@ -5788,11 +5811,12 @@ pub const Connection = struct {
     /// enter one, so nothing of this connection is reachable from it any more.
     ///
     /// What the handler would have done in its report is done here: the
-    /// finalize, the live counters, and the request's connection charges
-    /// (`request_pool.Arena.conn_charged`, which nothing changes once the gate
-    /// is closed). The task is not joined: its join handle is detached, and
-    /// the handler frees its link when it ends. Its server-wide token stays
-    /// with the link, so it still counts against the server's bound.
+    /// finalize and the live counters. The request's connection charges
+    /// (`request_pool.Arena.conn_charged`, which nothing changes once the
+    /// gate is closed) go back in `dropActorRef`. The task is not joined: its
+    /// join handle is detached, and the handler frees its link when it ends.
+    /// Its server-wide token stays with the link, so it still counts against
+    /// the server's bound.
     fn orphanSlot(self: *Connection, i: usize) void {
         const slot = &self.handlers.slice()[i];
         std.debug.assert(slot.in_use);
@@ -5803,7 +5827,6 @@ pub const Connection = struct {
         self.slots_orphaned += 1;
         _ = self.live_handlers.fetchSub(1, .acq_rel);
         if (link.core.task_counted) _ = self.live_task_handlers.fetchSub(1, .acq_rel);
-        link.core.returnConnCharges(&self.request_budget);
         if (self.handler_joins[i]) |*handle| handle.detach();
         self.handler_joins[i] = null;
         if (self.findLease(slot.stream_id)) |lease| self.releaseLease(lease);
@@ -5813,7 +5836,7 @@ pub const Connection = struct {
         if (comptime test_observe) _ = test_observed_slots_in_use.fetchSub(1, .acq_rel);
         slot.link = null;
         link.core.orphan();
-        dropLinkRef(link);
+        dropActorRef(StreamLink, link, &self.request_budget);
     }
 
     /// A slot goes back to the pool with its budget entry idle and out of the
@@ -8654,7 +8677,7 @@ pub const Connection = struct {
         // The link is the first thing this request allocates after its decode,
         // in its own arena; then the arena moves into it, and the lease goes
         // back without a block. From here the request's memory belongs to the
-        // link (`StreamLink`, `dropLinkRef`), not to the connection.
+        // link (`StreamLink`, `dropActorRef`), not to the connection.
         const link = lease.arena.allocator().create(StreamLink) catch return self.refuseDispatchForMemory(d, lease);
         link.* = .{
             .core = .{
@@ -8857,7 +8880,7 @@ pub const Connection = struct {
         }
         link.core.noteHandlerEnd();
         if (comptime test_observe) _ = test_observed_live_handlers.fetchSub(1, .acq_rel);
-        dropLinkRef(link);
+        dropHandlerRef(StreamLink, link);
     }
 
     fn runHandlerJob(link: *StreamLink) void {
