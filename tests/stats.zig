@@ -713,10 +713,23 @@ fn mixedEnds(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
         try readUntilClosed(c, 5000);
     }
     prev = try expectStep(&server, prev, &.{.h2_peer_closed}, &bad);
-    // 3. HTTP/2, the peer's reset.
+    // 3. HTTP/2, the peer's reset. The client waits for nothing from the
+    // server, so it must first see the server hold the connection: `connect`
+    // returns once the kernel has it in the listen backlog, and the server
+    // counts it only after `accept`. Reset before that, and `expectStep`
+    // sees no connection and nothing counted; the late accept then counts
+    // this end during the next step (t-3913).
     {
         const c = try h2_peer.connect(.{});
         try writeAll(c, preface.items);
+        const held_deadline = nowNs() + 5 * std.time.ns_per_s;
+        while (server.stats().connections != 1) {
+            if (nowNs() >= held_deadline) {
+                c.close();
+                return error.ResetConnectionNeverAccepted;
+            }
+            zio.sleep(.fromMilliseconds(2)) catch {};
+        }
         const lg: std.c.linger = .{ .onoff = 1, .linger = 0 };
         _ = std.c.setsockopt(c.socket.handle, std.c.SOL.SOCKET, std.c.SO.LINGER, std.mem.asBytes(&lg), @sizeOf(std.c.linger));
         c.close();
