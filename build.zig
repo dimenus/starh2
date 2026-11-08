@@ -1358,17 +1358,22 @@ pub fn build(b: *std.Build) void {
     shutdown_step.dependOn(&run_orphan_line.step);
     stats_step.dependOn(&run_orphan_line.step);
     // Orphans made during the drain: their held count prints while `serve`
-    // still waits, from the flush ticker that lives through the drain.
-    const run_orphan_drain = b.addRunArtifact(shutdown_child);
-    run_orphan_drain.addArg("orphan-drain");
-    run_orphan_drain.addCheck(.{ .expect_stderr_match = "handler of GET /orphan still running " });
-    run_orphan_drain.addCheck(.{ .expect_stderr_match = "handlers orphaned: 2 more since the last report" });
-    run_orphan_drain.addCheck(.{ .expect_stderr_match = "child: orphan drain orphans=3 orphaned " });
-    run_orphan_drain.addCheck(.{ .expect_stderr_match = "serve returned=false" });
-    run_orphan_drain.expectExitCode(0);
-    run_orphan_drain.has_side_effects = true;
-    shutdown_step.dependOn(&run_orphan_drain.step);
-    stats_step.dependOn(&run_orphan_drain.step);
+    // still waits, from the flush ticker that lives through the drain. The
+    // check is the total the child saw logged, not one split of it between
+    // lines, which timing can change (t-3933). The split case forces a
+    // second line and still totals three.
+    inline for (.{ "orphan-drain", "orphan-drain-split" }) |case| {
+        const run_orphan_drain = b.addRunArtifact(shutdown_child);
+        run_orphan_drain.addArg(case);
+        run_orphan_drain.addCheck(.{ .expect_stderr_match = "handler of GET /orphan still running " });
+        run_orphan_drain.addCheck(.{ .expect_stderr_match = "child: orphan drain orphans=3 orphaned " });
+        run_orphan_drain.addCheck(.{ .expect_stderr_match = "serve returned=false" });
+        run_orphan_drain.addCheck(.{ .expect_stderr_match = "child: orphan reports: 3 of 3 orphans reported; held counts printed by a flush while serve waited: true" });
+        run_orphan_drain.expectExitCode(0);
+        run_orphan_drain.has_side_effects = true;
+        shutdown_step.dependOn(&run_orphan_drain.step);
+        stats_step.dependOn(&run_orphan_drain.step);
+    }
     // A full orphan registry: one pass, a counted miss, an error line.
     const run_orphan_slot_miss = b.addRunArtifact(shutdown_child);
     run_orphan_slot_miss.addArg("orphan-slot-miss");

@@ -59,12 +59,20 @@
 //!   the once-a-second flush prints them (the process exits with the
 //!   server running).
 //! - `orphan-drain`: three HTTP/1.1 handlers of `GET /orphan` that ignore
-//!   their cancel, then a shutdown: each connection cancels its handler at
-//!   once and orphans it, so the three orphans come during the drain, and
-//!   `serve` keeps waiting for them. The first is logged, two are held
-//!   back, and the held count must print while `serve` still waits: the
-//!   process exits 3 s later with `serve` not returned, so only a flush
-//!   ticker that lives through the drain can have printed it.
+//!   their cancel. The first connection is closed before the shutdown, so
+//!   its orphan is logged alone, with nothing held. Then a shutdown: the
+//!   other two connections cancel their handlers at once and orphan them
+//!   during the drain, inside the line's one-second interval, so both are
+//!   held, and `serve` keeps waiting for all three. The held count must
+//!   print while `serve` still waits: the process exits 3 s later with
+//!   `serve` not returned, so only a flush ticker that lives through the
+//!   drain can have printed it. The child counts the orphan reports it
+//!   logged (`countingLog`) and prints the total, so the check does not
+//!   depend on how the count was split between lines.
+//! - `orphan-drain-split`: the same, with 1100 ms between the first orphan
+//!   and the shutdown. The second orphan is past the interval and prints a
+//!   line of its own; the third is held. The total is still three, and the
+//!   ticker still has a held count to print.
 //! - `orphan-slot-miss`: an orphan registry of one slot, and two orphans
 //!   (`GlobalAccounting.addOrphan` on hand-built links). The second finds no
 //!   slot: it is counted, logged at error level with the registry's size,
@@ -79,6 +87,35 @@ const wire_client = @import("wire_client.zig");
 
 const dummy: u8 = 0;
 var started: std.atomic.Value(bool) = .init(false);
+
+pub const std_options: std.Options = .{ .logFn = countingLog };
+
+/// Orphan reports this process logged: one per orphan line, plus each held
+/// count that a line or a flush carried. Two orphans noted at the same
+/// moment can split the count between lines in more than one way
+/// (`RateLimitedLine.note`: the loser of the race adds itself to `held`,
+/// and the winner's line may or may not carry it); the total cannot change.
+var orphans_reported: std.atomic.Value(u64) = .init(0);
+/// "handlers orphaned: N more" lines: a held count printed by a flush.
+var orphan_flushes: std.atomic.Value(u64) = .init(0);
+
+/// Logs as the default does, and counts the orphan reports, matched on the
+/// server's format strings at compile time (`Connection.dropLink` and
+/// `Server.flushLines`). If either string changes, nothing is counted, and
+/// the orphan-drain checks fail loudly.
+fn countingLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    std.log.defaultLog(level, scope, format, args);
+    if (scope != .starh2) return;
+    const n = args.len;
+    if (comptime std.mem.startsWith(u8, format, "handler of {s} still running ") and
+        std.mem.endsWith(u8, format, " ({d} more since the last report)"))
+    {
+        _ = orphans_reported.fetchAdd(1 + @as(u64, args[n - 1]), .acq_rel);
+    } else if (comptime std.mem.eql(u8, format, "handlers orphaned: {d} more since the last report")) {
+        _ = orphans_reported.fetchAdd(@as(u64, args[0]), .acq_rel);
+        _ = orphan_flushes.fetchAdd(1, .acq_rel);
+    }
+}
 
 /// Ignores cancel: each canceled sleep is swallowed and the next one waits
 /// in full, so it never ends and never spins.
@@ -616,6 +653,14 @@ fn runOrphanLine(rt: *zio.Runtime) anyerror!void {
 }
 
 fn runOrphanDrain(rt: *zio.Runtime) anyerror!void {
+    return orphanDrain(rt, 0);
+}
+
+fn runOrphanDrainSplit(rt: *zio.Runtime) anyerror!void {
+    return orphanDrain(rt, 1100);
+}
+
+fn orphanDrain(rt: *zio.Runtime, split_ms: u64) anyerror!void {
     const gpa = std.heap.page_allocator;
     var server = try starh2.Server.init(gpa, rt.io(), .{
         .endpoints = &.{.{ .h1c = .{ .address = try starh2.EndpointAddress.parseIp4("127.0.0.1", 0), .client_identity = .none } }},
@@ -638,6 +683,15 @@ fn runOrphanDrain(rt: *zio.Runtime) anyerror!void {
         if (monoMs() - t0 > 5000) return error.HandlersNeverStarted;
         try zio.sleep(.fromMilliseconds(5));
     }
+    // The first orphan alone, before the shutdown: its line prints with
+    // nothing held, and starts the line's interval.
+    conns[0].close();
+    const t_first = monoMs();
+    while (server.stats().orphaned_handlers < 1) {
+        if (monoMs() - t_first > 5000) return error.NeverOrphaned;
+        try zio.sleep(.fromMilliseconds(2));
+    }
+    if (split_ms != 0) try zio.sleep(.fromMilliseconds(split_ms));
     server.requestShutdown();
     const t1 = monoMs();
     while (server.stats().orphaned_handlers < 3) {
@@ -646,7 +700,11 @@ fn runOrphanDrain(rt: *zio.Runtime) anyerror!void {
     }
     const orphaned_ms = monoMs() - t1;
     try zio.sleep(.fromMilliseconds(3000));
-    std.debug.print("child: orphan drain orphans={d} orphaned {d} ms after the shutdown; serve returned={}\n", .{ server.stats().orphaned_handlers, orphaned_ms, handle.hasResult() });
+    const served = handle.hasResult();
+    std.debug.print("child: orphan drain orphans={d} orphaned {d} ms after the shutdown; serve returned={}\n", .{ server.stats().orphaned_handlers, orphaned_ms, served });
+    // Read after `served`: what the log shows was printed while `serve`
+    // still waited, so only the flush ticker can have printed a held count.
+    std.debug.print("child: orphan reports: {d} of {d} orphans reported; held counts printed by a flush while serve waited: {}\n", .{ orphans_reported.load(.acquire), server.stats().orphaned_handlers, orphan_flushes.load(.acquire) != 0 });
     // The kill: `serve` still waits for the orphans, which never end.
     std.process.exit(0);
 }
@@ -709,6 +767,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try rt.spawn(runOrphanLine, .{rt})
     else if (std.mem.eql(u8, case, "orphan-drain"))
         try rt.spawn(runOrphanDrain, .{rt})
+    else if (std.mem.eql(u8, case, "orphan-drain-split"))
+        try rt.spawn(runOrphanDrainSplit, .{rt})
     else if (std.mem.eql(u8, case, "orphan-slot-miss"))
         try rt.spawn(runOrphanSlotMiss, .{rt})
     else
