@@ -87,9 +87,6 @@ const Config = struct {
     /// dependency. Passed in rather than computed, so the build file that
     /// chooses `out` also states the answer.
     repo_rel: []const u8 = "../..",
-    /// Optional libc file forwarded to the nested `zig build`. Empty means
-    /// omit `--libc`. The generated consumer `build.zig` stays naive.
-    libc: []const u8 = "",
 };
 
 fn abort(comptime fmt: []const u8, args: anytype) noreturn {
@@ -116,8 +113,6 @@ fn parseArgs(gpa: std.mem.Allocator, process_args: std.process.Args) !Config {
             cfg.zig = try gpa.dupe(u8, val.next(&args, "--zig"));
         } else if (std.mem.eql(u8, a, "--repo-rel")) {
             cfg.repo_rel = try gpa.dupe(u8, val.next(&args, "--repo-rel"));
-        } else if (std.mem.eql(u8, a, "--libc")) {
-            cfg.libc = try gpa.dupe(u8, val.next(&args, "--libc"));
         } else {
             abort("unknown argument {s}", .{a});
         }
@@ -515,9 +510,6 @@ pub fn main(init: std.process.Init) !void {
         "--cache-dir",  ".zig-cache",
         "--prefix",     prefix,
     });
-    if (cfg.libc.len != 0) {
-        try argv.appendSlice(arena, &.{ "--libc", cfg.libc });
-    }
     var child = std.process.spawn(io, .{
         .argv = argv.items,
         .stdout = .inherit,
