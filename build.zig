@@ -1786,6 +1786,16 @@ pub fn build(b: *std.Build) void {
     const zio_pin_match_step = b.step("zio-pin-match", "Fail when a build.zig.zon pins a different zio url or hash from the root build.zig.zon; names both files and both values");
     zio_pin_match_step.dependOn(&zio_pin_match_run.step);
 
+    // The zb check: ./zb runs exactly the pinned zig whatever zig is first
+    // on PATH, and fails with the install command when mise lacks the pin.
+    // tools/zb-check.sh has the cases.
+    const zb_check_run = b.addSystemCommand(&.{ "bash", "tools/zb-check.sh" });
+    zb_check_run.setCwd(b.path("."));
+    zb_check_run.has_side_effects = true;
+    zb_check_run.stdio = .inherit;
+    const zb_check_step = b.step("zb-check", "Fail unless ./zb runs the pinned zig with another zig first on PATH, and refuses a missing or wrong-version zig");
+    zb_check_step.dependOn(&zb_check_run.step);
+
     // The zio DST gate. tools/zio-dst is its own package: it builds the sim
     // line of zio (`zio_options.sim` declared in its root) and runs D1-D5
     // over the fixtures, then one build per validity mutant, each of which
@@ -1984,11 +1994,12 @@ pub fn build(b: *std.Build) void {
         tsan_step.dependOn(&run.step);
     }
 
-    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + zig fmt gate + zio pin match gate + DST transport witness + every release target + zio DST gate (dst-zio) + connection DST gate (dst-conn) + every artifact a named step or the install step compiles");
+    const ci_step = b.step("ci", "Full suite + test-exact + fuzz smoke + TLS gate + README gate + std.Io gate + session mutex gate + zig fmt gate + zio pin match gate + zb check + DST transport witness + every release target + zio DST gate (dst-zio) + connection DST gate (dst-conn) + every artifact a named step or the install step compiles");
     ci_step.dependOn(std_io_gate_step);
     ci_step.dependOn(&session_mu_gate_run.step);
     ci_step.dependOn(&fmt_gate_run.step);
     ci_step.dependOn(&zio_pin_match_run.step);
+    ci_step.dependOn(&zb_check_run.step);
     ci_step.dependOn(&dst_transport_run.step);
     ci_step.dependOn(test_step);
     // Placement and balancer gates; each test says what it checks under the

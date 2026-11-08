@@ -1,0 +1,138 @@
+#!/bin/bash
+# Check that ./zb runs exactly the pinned zig, whatever zig is first on PATH.
+#
+#   tools/zb-check.sh [<zb>]     (default: the repo's ./zb)
+#
+# `./zb build zb-check` runs it, and `ci` depends on it. It needs mise and the
+# pinned zig installed through mise: the same things ./zb needs on the
+# machines that run ci. Without mise it exits 2; it does not skip.
+#
+# Each case copies <zb> into a temporary root with its own build.zig.zon, and
+# runs it with a PATH whose FIRST entry holds a fake `zig`. The fake prints
+# its own version for `zig version`, and appends a line to a marker file on
+# every run, so the check can see whether zb ran it.
+#
+#   1. mise, pin installed, and PATH shaped like a shell where mise is
+#      activated with another zig ahead of it: the fake, then the pin's
+#      install directory, then mise's shims directory. `zb version` must
+#      print the pin and never run the fake. (`mise exec zig@<pin> -- zig`
+#      runs the fake in this shape: it leaves directories already on PATH
+#      where they are. That was t-3912, with ~/.zvm/bin as the other zig.)
+#   2. mise, pin not installed: zb exits non-zero with the
+#      `mise install zig@<pin>` hint and never runs the fake.
+#   3. no mise, no ~/.zvm, the fake on PATH has another version: zb refuses
+#      it, naming both versions.
+#   4. no mise, no ~/.zvm, the fake on PATH has the pin's version: zb runs it.
+#   5. mise, pin installed, only the fake ahead of mise on PATH: as case 1.
+#
+# Exit 0: every case held. Exit 1: a case failed (each is printed). Exit 2:
+# setup failed (no mise, no build.zig.zon pin).
+set -euo pipefail
+
+repo=$(cd "$(dirname "$0")/.." && pwd)
+zb_src=${1:-$repo/zb}
+[ -f "$zb_src" ] || { echo "zb-check FATAL: no zb at $zb_src" >&2; exit 2; }
+pin=$(sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' "$repo/build.zig.zon")
+[ -n "$pin" ] || { echo "zb-check FATAL: no minimum_zig_version in $repo/build.zig.zon" >&2; exit 2; }
+mise_bin=$(type -P mise || true)
+[ -n "$mise_bin" ] || { echo "zb-check FATAL: no mise on PATH; this check tests zb's mise path and cannot run without it" >&2; exit 2; }
+"$mise_bin" where "zig@$pin" > /dev/null 2>&1 || { echo "zb-check FATAL: mise has no zig $pin installed (mise install zig@$pin)" >&2; exit 2; }
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/zb-check.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+# PATH is built from these, never from /usr/bin or /bin: on Linux mise can
+# live in /usr/bin, and a "no mise" case must not find it. zb itself needs
+# only sed and dirname.
+mkdir "$tmp/misebin" "$tmp/basebin" "$tmp/home"
+ln -s "$mise_bin" "$tmp/misebin/mise"
+for t in sed dirname; do
+  p=$(type -P "$t") || { echo "zb-check FATAL: no $t on PATH" >&2; exit 2; }
+  ln -s "$p" "$tmp/basebin/$t"
+done
+
+fake_version=0.0.0-zbcheck
+missing_pin=0.0.1-zbcheck-not-installed
+failed=0
+
+# A root holding a copy of zb, a build.zig.zon pinning $2, and a fake zig
+# that prints $3 for `zig version`.
+make_root() {
+  local dir=$tmp/$1 want=$2 says=$3
+  mkdir -p "$dir/fake"
+  cp "$zb_src" "$dir/zb"
+  chmod +x "$dir/zb"
+  printf '.{\n    .minimum_zig_version = "%s",\n}\n' "$want" > "$dir/build.zig.zon"
+  cat > "$dir/fake/zig" <<EOF
+#!/bin/sh
+echo "\$*" >> "$dir/fake-ran"
+if [ "\$1" = version ]; then echo "$says"; exit 0; fi
+echo "fake zig ran: \$*" >&2
+exit 97
+EOF
+  chmod +x "$dir/fake/zig"
+}
+
+# Run the root's zb with PATH=$2, HOME=$3; sets out, err, code.
+run_zb() {
+  local dir=$tmp/$1
+  set +e
+  out=$(cd "$dir" && env -u ZIG_LIB_DIR -u ZB_ZIG_LIB PATH="$2" HOME="$3" ./zb version 2> "$dir/stderr")
+  code=$?
+  set -e
+  err=$(cat "$dir/stderr")
+}
+
+ok() { echo "zb-check: case $1: ok ($2)"; }
+bad() { echo "zb-check: case $1: FAIL: $2"; failed=1; }
+fake_ran() { [ -s "$tmp/$1/fake-ran" ]; }
+
+# 1
+pin_dir=$("$mise_bin" where "zig@$pin")
+shims=$(cd "$pin_dir/../../.." && pwd)/shims
+[ -d "$shims" ] || { echo "zb-check FATAL: no mise shims directory at $shims (derived from $pin_dir)" >&2; exit 2; }
+make_root c1 "$pin" "$fake_version"
+run_zb c1 "$tmp/c1/fake:$pin_dir/bin:$shims:$tmp/misebin:$tmp/basebin" "$HOME"
+if [ "$code" -eq 0 ] && [ "$out" = "$pin" ] && ! fake_ran c1; then
+  ok 1 "mise activated, fake zig ahead of it: printed $out"
+else
+  bad 1 "mise activated, fake zig ahead of it: exit $code, printed '$out', fake ran: $(cat "$tmp/c1/fake-ran" 2>/dev/null | tr '\n' ' ')stderr: $err"
+fi
+
+# 2
+make_root c2 "$missing_pin" "$fake_version"
+run_zb c2 "$tmp/c2/fake:$tmp/misebin:$tmp/basebin" "$HOME"
+if [ "$code" -ne 0 ] && grep -qF "mise install zig@$missing_pin" "$tmp/c2/stderr" && ! fake_ran c2; then
+  ok 2 "mise, pin not installed: exit $code with the install hint"
+else
+  bad 2 "mise, pin not installed: exit $code, printed '$out', fake ran: $(cat "$tmp/c2/fake-ran" 2>/dev/null | tr '\n' ' ')stderr: $err"
+fi
+
+# 3
+make_root c3 "$pin" "$fake_version"
+run_zb c3 "$tmp/c3/fake:$tmp/basebin" "$tmp/home"
+if [ "$code" -ne 0 ] && grep -qF "is $fake_version, build.zig.zon pins $pin" "$tmp/c3/stderr"; then
+  ok 3 "no mise, wrong zig on PATH: refused"
+else
+  bad 3 "no mise, wrong zig on PATH: exit $code, printed '$out', stderr: $err"
+fi
+
+# 4
+make_root c4 "$pin" "$pin"
+run_zb c4 "$tmp/c4/fake:$tmp/basebin" "$tmp/home"
+if [ "$code" -eq 0 ] && [ "$out" = "$pin" ] && [ "$(grep -c '^version$' "$tmp/c4/fake-ran")" -eq 2 ]; then
+  ok 4 "no mise, pinned zig on PATH: checked, then ran"
+else
+  bad 4 "no mise, pinned zig on PATH: exit $code, printed '$out', fake ran: $(cat "$tmp/c4/fake-ran" 2>/dev/null | tr '\n' ' ')stderr: $err"
+fi
+
+# 5
+make_root c5 "$pin" "$fake_version"
+run_zb c5 "$tmp/c5/fake:$tmp/misebin:$tmp/basebin" "$HOME"
+if [ "$code" -eq 0 ] && [ "$out" = "$pin" ] && ! fake_ran c5; then
+  ok 5 "mise, fake zig first on PATH: printed $out"
+else
+  bad 5 "mise, fake zig first on PATH: exit $code, printed '$out', fake ran: $(cat "$tmp/c5/fake-ran" 2>/dev/null | tr '\n' ' ')stderr: $err"
+fi
+
+[ "$failed" -eq 0 ] || exit 1
+echo "zb-check: PASS (zb $zb_src, pin $pin, mise $mise_bin)"

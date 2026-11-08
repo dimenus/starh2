@@ -1,9 +1,18 @@
 #!/bin/sh
 # Run the zig this tree targets: build.zig.zon's minimum_zig_version, through
 # mise, so worktrees on different Zig releases share one machine without
-# touching the global default. Without mise, fall back to ~/.zvm, then PATH,
-# and refuse a zig whose version differs from the pin: a wrong compiler
-# fails with std API errors that look like real porting work.
+# touching the global default. Without mise, fall back to ~/.zvm, then PATH.
+# On every path zb runs the binary by its absolute path and refuses it unless
+# `zig version` prints the pin: a wrong compiler fails with std API errors
+# that look like real porting work.
+#
+# With mise, the binary is `$(mise where zig@<pin>)/bin/zig`. zb does not use
+# `mise exec zig@<pin> -- zig`: when the caller's PATH already holds mise's
+# shims directory and the pin's install directory (a shell where mise is
+# activated), mise exec leaves them where they are, so a zig earlier on PATH
+# (~/.zvm/bin, say) runs instead (t-3912; tools/zb-check.sh reproduces it).
+# If mise has no install of the pin, zb fails with the install command; it
+# does not fall back to another zig.
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 want=$(sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' "$root/build.zig.zon")
 if [ -z "$want" ]; then
@@ -31,10 +40,19 @@ elif [ -n "${ZIG_LIB_DIR:-}" ]; then
   exit 2
 fi
 if command -v mise >/dev/null 2>&1; then
-  exec mise exec "zig@$want" -- zig "$@"
+  if ! where=$(mise where "zig@$want" 2>/dev/null) || [ -z "$where" ]; then
+    echo "zb: mise has no zig $want, which build.zig.zon pins (install it with: mise install zig@$want)" >&2
+    exit 1
+  fi
+  zig="$where/bin/zig"
+  if [ ! -x "$zig" ]; then
+    echo "zb: no zig binary at $zig (mise where zig@$want printed $where)" >&2
+    exit 1
+  fi
+else
+  zig="$HOME/.zvm/bin/zig"
+  [ -x "$zig" ] || zig=zig
 fi
-zig="$HOME/.zvm/bin/zig"
-[ -x "$zig" ] || zig=zig
 have=$("$zig" version)
 if [ "$have" != "$want" ]; then
   echo "zb: $zig is $have, build.zig.zon pins $want (install it with mise)" >&2
