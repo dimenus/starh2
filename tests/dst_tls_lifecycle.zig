@@ -900,12 +900,11 @@ fn isCommit(s: []const u8) bool {
     return true;
 }
 
-/// The commit the seeds derive from. A `git archive` export substitutes
-/// it into `dst_commit.txt` (`.gitattributes` `export-subst`); a checkout
-/// gets it from `git rev-parse` at configure time (`build.zig`).
+/// The commit the seeds derive from. `dst_options` is written when the build
+/// runs by tools/dst/identity.sh, the one place that decides it: a `git
+/// archive` export's substituted `dst_commit.txt`, else the checkout's HEAD
+/// (with `-dirty`), else nothing.
 fn commitIdentity() ?[]const u8 {
-    const embedded = std.mem.trim(u8, @embedFile("dst_commit.txt"), " \r\n\t");
-    if (isCommit(embedded)) return embedded;
     if (isCommit(dst_options.git_commit)) return dst_options.git_commit;
     return null;
 }

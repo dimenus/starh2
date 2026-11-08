@@ -177,22 +177,6 @@ fn linkBrotliDec(mod: *std.Build.Module, brotli: *std.Build.Dependency, lib: *st
     mod.linkLibrary(lib);
 }
 
-/// The commit this build is from, for the transport witness's seeds and
-/// build identity, or "" when there is none to read: not a git checkout
-/// (a `git archive` export carries it in `tests/dst_commit.txt` instead),
-/// or a tree nested inside some other repository, whose HEAD is not ours.
-/// "-dirty" is appended when tracked files differ from HEAD.
-fn gitCommit(b: *std.Build) []const u8 {
-    const root = b.root.toString(b.graph.arena) catch @panic("OOM");
-    var code: u8 = 0;
-    const cdup = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "--show-cdup" }, &code, .ignore) catch return "";
-    if (std.mem.trim(u8, cdup, " \r\n\t").len != 0) return "";
-    const head = b.runAllowFail(&.{ "git", "-C", root, "rev-parse", "HEAD" }, &code, .ignore) catch return "";
-    const sha = std.mem.trim(u8, head, " \r\n\t");
-    _ = b.runAllowFail(&.{ "git", "-C", root, "diff", "--quiet", "HEAD", "--" }, &code, .ignore) catch return b.fmt("{s}-dirty", .{sha});
-    return sha;
-}
-
 fn attachStarh2Options(b: *std.Build, mod: *std.Build.Module, observe: bool, wire_ring: bool, zio_scheduling: ZioScheduling, dst_mutant: DstMutant) void {
     const opts = b.addOptions();
     opts.addOption(bool, "observe", observe);
@@ -815,8 +799,15 @@ pub fn build(b: *std.Build) void {
     }).module("zio");
     const dst_tls = b.dependency("tls", .{ .target = target, .optimize = dst_optimize }).module("tls");
     const dst_brotli_enc = brotliEncLib(b, brotli_dep, target, dst_optimize, "brotli_enc_dst");
-    const dst_opts = b.addOptions();
-    dst_opts.addOption([]const u8, "git_commit", gitCommit(b));
+    // The commit the witness's seeds and BUILD line name. It is read when the
+    // build runs, not here: Zig caches this configure step, and git's answer
+    // is not an input to that cache. tools/dst/identity.sh has the rules.
+    const dst_identity_run = b.addSystemCommand(&.{ "sh", "tools/dst/identity.sh" });
+    dst_identity_run.setCwd(b.path("."));
+    dst_identity_run.has_side_effects = true;
+    const dst_options_mod = b.createModule(.{
+        .root_source_file = dst_identity_run.captureStdOut(.{ .basename = "dst_options.zig" }),
+    });
     var dst_bins: [2]*std.Build.Step.Compile = undefined;
     for ([_]DstMutant{ .none, .no_h1_ack_sink }, 0..) |mutant, i| {
         const dst_starh2 = b.createModule(.{
@@ -840,7 +831,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "starh2", .module = dst_starh2 },
                     .{ .name = "zio", .module = dst_zio },
-                    .{ .name = "dst_options", .module = dst_opts.createModule() },
+                    .{ .name = "dst_options", .module = dst_options_mod },
                 },
             }),
         });
