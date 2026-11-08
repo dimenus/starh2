@@ -45,8 +45,11 @@
 //! and reusing it would hand that something a new connection's memory. The
 //! slot stays out of use for the life of the server and is freed by
 //! `SlotPool.deinit`, when no connection can be running. The report is a
-//! warning; in a test binary it is an error that fails the test, unless the
-//! test made the connection dirty on purpose (`Connection.dirtyOnPurpose`).
+//! warning; in a test binary it is a logged error, unless the reason is the
+//! condition the test planted on purpose (`Connection.plantedDirt`). A
+//! logged error fails the run, not the test: under `zig build` the test's
+//! Run step fails and names the test ("'<test>' logged N errors"); a test
+//! binary run directly prints "N errors were logged." and exits 1.
 //!
 //! Do not read this as a promise that real leaks end up here. `quiesce`
 //! panics or asserts on most of what the check looks for, before `recycle`
@@ -89,7 +92,8 @@ pub const ConnSlot = struct {
 
     pub const Dirty = struct {
         why: []const u8,
-        /// A test left it dirty on purpose (`Connection.dirtyOnPurpose`).
+        /// `why` is the condition a test planted on purpose
+        /// (`Connection.plantedDirt`), not some other leak.
         asked: bool,
     };
 
@@ -130,7 +134,7 @@ pub const ConnSlot = struct {
     /// and the caller must not reuse it.
     pub fn recycle(self: *ConnSlot) Recycle {
         if (std.debug.runtime_safety and self.state == .booted) {
-            if (self.conn.dirtiness()) |why| return .{ .dirty = .{ .why = why, .asked = self.conn.dirty_on_purpose } };
+            if (self.conn.dirtiness()) |why| return .{ .dirty = .{ .why = why, .asked = self.conn.plantedDirt(why) } };
         }
         if (builtin.mode == .debug) @memset(self.buffer, 0xdd);
         self.fba.reset();
@@ -284,11 +288,13 @@ pub const SlotPool = struct {
                 self.quarantine.appendAssumeCapacity(slot);
                 self.leaked += 1;
                 // In a test binary (`builtin.is_test`) with the test hooks
-                // on, a dirty slot no test asked for is an error, and the
-                // test runner fails the test it happens in: a leak fails
-                // wherever it is, instead of passing with a warning in the
-                // log (t-3931). Everything else, a Debug application
-                // included, logs a warning.
+                // on, a dirty slot whose reason no test planted is a logged
+                // error, so a leak fails the run wherever it is, instead of
+                // passing with a warning in the log (t-3931). Zig's test
+                // runner does not mark the test itself failed: under
+                // `zig build` the Run step fails and names the test; a
+                // binary run directly exits 1. Everything else, a Debug
+                // application included, logs a warning.
                 if (comptime builtin.is_test and test_hook.on) {
                     if (!d.asked) {
                         std.log.err("connection slot leaked, not reused: {s} (an error in a test binary: no test asked for it)", .{d.why});

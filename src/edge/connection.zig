@@ -2310,6 +2310,18 @@ pub const DirtyKind = enum {
     stream_still_admitted,
     handler_join_held,
     completion_queued,
+
+    /// The reason `dirtiness` gives for this condition. `dirtiness` returns
+    /// these same strings, so the two cannot drift apart.
+    pub fn reason(self: DirtyKind) []const u8 {
+        return switch (self) {
+            .write_chunk_rented => "write pool chunk still rented",
+            .request_bytes_reserved => "request bytes still reserved",
+            .stream_still_admitted => "streams still admitted",
+            .handler_join_held => "handler join still held",
+            .completion_queued => "completion channel not empty",
+        };
+    }
 };
 
 /// Test-only: how many of the next connections to end in a slot are dirtied,
@@ -2525,9 +2537,10 @@ pub const Connection = struct {
     trace_written_ns: std.atomic.Value(u64) = .init(0),
     /// Counted in `GlobalAccounting.shutdown_cancelled` (`noteShutdownCancel`).
     shutdown_cancel_counted: bool = false,
-    /// A test left this connection dirty on purpose (`dirtyOnPurpose`), so
-    /// its slot's quarantine is expected (`conn_slot.SlotPool.recycle`).
-    dirty_on_purpose: bool = false,
+    /// The condition a test left set on purpose (`dirtyOnPurpose`). Only a
+    /// slot whose reported reason is this one is expected to be quarantined
+    /// (`plantedDirt`); any other reason is a real leak.
+    dirty_planted: ?DirtyKind = null,
     live_handlers: std.atomic.Value(usize) = .init(0),
     /// Spawned task handlers only. Complete oneshots stay on `live_handlers`
     /// and must not trip the ReadPump donation.
@@ -3266,7 +3279,7 @@ pub const Connection = struct {
 
     /// Leave one condition `dirtiness` checks set, for a test.
     fn dirtyOnPurpose(self: *Connection, kind: DirtyKind) void {
-        self.dirty_on_purpose = true;
+        self.dirty_planted = kind;
         switch (kind) {
             .write_chunk_rented => _ = self.write_pool.tryRentIndex(self.config.io),
             .request_bytes_reserved => _ = self.request_budget.held.fetchAdd(1, .acq_rel),
@@ -3275,6 +3288,15 @@ pub const Connection = struct {
             .handler_join_held => self.handler_joins[0] = @as(zio.JoinHandle(void), undefined),
             .completion_queued => self.completion_ch.trySend(1) catch unreachable,
         }
+    }
+
+    /// True when `why` (from `dirtiness`) is the condition a test planted
+    /// on purpose. `dirtiness` reports only the first condition it finds,
+    /// so a real leak beside a planted one is reported under its own reason
+    /// and is not mistaken for the planted one.
+    pub fn plantedDirt(self: *const Connection, why: []const u8) bool {
+        const kind = self.dirty_planted orelse return false;
+        return std.mem.eql(u8, why, kind.reason());
     }
 
     /// Why this connection, after `quiesce`, still must not have its slot
@@ -3308,9 +3330,9 @@ pub const Connection = struct {
             if (h.in_use) return "handler slot still in use";
         }
         for (self.handlers.slice(), 0..) |_, i| {
-            if (self.handler_joins[i] != null) return "handler join still held";
+            if (self.handler_joins[i] != null) return DirtyKind.handler_join_held.reason();
         }
-        if (self.write_pool.rentedCount() != 0) return "write pool chunk still rented";
+        if (self.write_pool.rentedCount() != 0) return DirtyKind.write_chunk_rented.reason();
         if (self.frame_pool.rentedCount() != 0) return "frame pool slab still rented";
         if (self.terminal_store.rentedCount() != 0) return "terminal frame store slot still rented";
         if (self.sched.terminal_len != 0 or self.sched.ordinary_len != 0 or self.sched.framed_len != 0) {
@@ -3327,8 +3349,8 @@ pub const Connection = struct {
             self.pending_outbound_held.load(.acquire) != 0 or
             self.wire_outbound_held.load(.acquire) != 0) return "outbound bytes still reserved";
         if (self.budget_waiters.load(.acquire) != 0 or self.budget_head != budget_none) return "budget waiter still queued";
-        if (self.request_budget.held.load(.acquire) != 0) return "request bytes still reserved";
-        if (self.session.active_streams != 0) return "streams still admitted";
+        if (self.request_budget.held.load(.acquire) != 0) return DirtyKind.request_bytes_reserved.reason();
+        if (self.session.active_streams != 0) return DirtyKind.stream_still_admitted.reason();
         if (self.handshake_held) return "handshake slot still held";
         if (!self.socket_closed.load(.acquire)) return "socket still open";
         if (io_queue.chanLen(wire_pump.WireChunk, &self.read_ch) != 0) return "read channel not empty";
@@ -3336,7 +3358,7 @@ pub const Connection = struct {
         if (self.tls_write_buf.len != 0 and io_queue.chanLen(wire_pump.WireChunk, &self.tls_write_ch) != 0) {
             return "tls write channel not empty";
         }
-        if (io_queue.chanLen(u31, &self.completion_ch) != 0) return "completion channel not empty";
+        if (io_queue.chanLen(u31, &self.completion_ch) != 0) return DirtyKind.completion_queued.reason();
         if (io_queue.chanLen(wire_pump.WriteCompletion, &self.write_ack_ch) != 0) return "write ack channel not empty";
         return null;
     }
