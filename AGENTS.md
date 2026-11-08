@@ -91,6 +91,7 @@ steps remain available (`test`, `test-exact`, `fuzz-*`, `tls-smoke`, example nam
 ./zb build std-io-gate  # fails on any std.Io concurrency use in any .zig file outside zig-pkg and build caches; prints files and lines scanned; runs in ci
 ./zb build session-mu-gate  # fails on session_mu used outside lockSession/unlockSession, or a doorbell send outside ring; runs in ci
 ./zb build fmt-gate  # fails on any .zig/.zon file of ours not in zig fmt form, and names each (the set, in a checkout and in an export: tools/fmt-gate/gate.sh); fix with ./zb fmt <file>; runs in ci
+./zb build zio-pin-match  # fails when a build.zig.zon pins a different zio url or hash from the root build.zig.zon (tools/zio-dst repeats the pin), naming both files and values; runs in ci
 ./zb build dst-transport  # HTTP/1.1 TLS transport witness: control passes, the no-h1AckSink mutant must fail UnconsumedTlsAck and replay identically; runs in ci
 tools/dst/identity-check.sh [<rev>]  # the witness's BUILD=commit= follows a new commit, a dirty tree and a git archive export with build.zig unchanged; exits 1 if stale; about a minute; NOT in ci (needs a git checkout); run it after touching tools/dst/identity.sh or its build.zig step
 ```

@@ -4,8 +4,9 @@
     .fingerprint = 0x813a04b419058cf5,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // dimenus/zio 16783b0 (carmack/t-3896-rebase): lalinsky/zio main
-        // c5716c4 plus four parts upstream does not carry:
+        // dimenus/zio 16783b0 (carmack/t-3896-rebase, 2026-11-06): the fork's
+        // 11 commits rebased onto lalinsky/zio main c5716c4. They carry four
+        // parts upstream does not:
         // - the io_uring send -EAGAIN bridge (wait for writability, then
         //   resend). Upstream will not merge it (PR #863). It stays until the
         //   kernel fix for -EAGAIN on an io_uring send ships on the machines
@@ -13,7 +14,8 @@
         // - the DST simulator and the select/CompletionQueue invariant
         //   checks, which panic in every build.
         // - two ThreadSanitizer race fixes (a Debug copy of a tagged union
-        //   read across threads; the work-stealing ring's slots).
+        //   read across threads: Waiter's mode and the Linux backend's
+        //   engine; the work-stealing ring's slots).
         // - each executor's published activity (generation, parked bit,
         //   running task's label) and `setTaskLabel`, which the executor
         //   watchdog reads (t-3760).

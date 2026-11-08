@@ -1,6 +1,6 @@
 # Grader / interop commands (local)
 
-Pins live in `tools/lock.json`. Held-out seeds stay outside this repo (`tools/held-out/README.md`).
+Dependency pins live in `build.zig.zon`, with a comment above each pin that says what it is. `tools/zio-dst/build.zig.zon` repeats the zio pin; `./zb build zio-pin-match` (in `ci`) fails when the two differ. Held-out seeds stay outside this repo (`tools/held-out/README.md`).
 
 ## Build / unit
 

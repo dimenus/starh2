@@ -4,7 +4,9 @@
     .fingerprint = 0x6e270d0db05b332f,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // The same zio commit as starh2's own pin (../../build.zig.zon).
+        // The same zio commit as starh2's own pin (../../build.zig.zon). A
+        // zon file cannot include another, so this is a copy: move both pins
+        // together. `./zb build zio-pin-match` (in ci) fails when they differ.
         // The hash is of a prefix-less `git archive 16783b0`; for d8ac2fd and
         // 3d50bb6 that method gave the same hash as a GitHub fetch.
         .zio = .{
