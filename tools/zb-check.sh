@@ -12,6 +12,10 @@
 # its own version for `zig version`, and appends a line to a marker file on
 # every run, so the check can see whether zb ran it.
 #
+# Every case runs under `env -i`: nothing of the caller's environment, mise
+# config or mise state reaches it, only the installs (see run_zb). So a case
+# gives the same answer from any shell, a mise-activated one included.
+#
 #   1. mise, pin installed, and PATH shaped like a shell where mise is
 #      activated with another zig ahead of it: the fake, then the pin's
 #      install directory, then mise's shims directory. `zb version` must
@@ -43,7 +47,7 @@ trap 'rm -rf "$tmp"' EXIT
 # PATH is built from these, never from /usr/bin or /bin: on Linux mise can
 # live in /usr/bin, and a "no mise" case must not find it. zb itself needs
 # only sed and dirname.
-mkdir "$tmp/misebin" "$tmp/basebin" "$tmp/home"
+mkdir "$tmp/misebin" "$tmp/basebin"
 ln -s "$mise_bin" "$tmp/misebin/mise"
 for t in sed dirname; do
   p=$(type -P "$t") || { echo "zb-check FATAL: no $t on PATH" >&2; exit 2; }
@@ -72,11 +76,40 @@ EOF
   chmod +x "$dir/fake/zig"
 }
 
-# Run the root's zb with PATH=$2, HOME=$3; sets out, err, code.
+# Where the pinned zig is installed, and mise's data directory around it
+# (<data>/installs/zig/<pin>), whose shims directory case 1 needs.
+pin_dir=$("$mise_bin" where "zig@$pin")
+data=$(cd "$pin_dir/../../.." && pwd)
+shims=$data/shims
+[ -d "$shims" ] || { echo "zb-check FATAL: no mise shims directory at $shims (derived from $pin_dir)" >&2; exit 2; }
+
+# Run the root's zb as `zb version` with PATH=$2 and nothing else from the
+# caller: `env -i`. What mise does depends on more than PATH. It reads
+# MISE_* and __MISE_* variables (a shell where mise is activated exports
+# MISE_SHELL, __MISE_ORIG_PATH, __MISE_DIFF, __MISE_SESSION), its global and
+# system config, and config files in the directories above the working one.
+# A caller's activated mise once made case 1 pass for the old zb. So every
+# run gets an empty HOME of its own, and with $3 = mise, mise's config,
+# state and cache directories point at empty directories of the case's own,
+# the config search stops at the case's root, and only the data directory
+# (where the installs are) is the real one. Sets out, err, code.
 run_zb() {
-  local dir=$tmp/$1
+  local dir=$tmp/$1 mise_env=()
+  mkdir -p "$dir/home" "$dir/mise-config" "$dir/mise-system" "$dir/mise-state" "$dir/mise-cache"
+  if [ "$3" = mise ]; then
+    mise_env=(
+      MISE_DATA_DIR="$data"
+      MISE_CONFIG_DIR="$dir/mise-config"
+      MISE_GLOBAL_CONFIG_FILE="$dir/mise-config/config.toml"
+      MISE_SYSTEM_DIR="$dir/mise-system"
+      MISE_SYSTEM_CONFIG_DIR="$dir/mise-system"
+      MISE_STATE_DIR="$dir/mise-state"
+      MISE_CACHE_DIR="$dir/mise-cache"
+      MISE_CEILING_PATHS="$dir"
+    )
+  fi
   set +e
-  out=$(cd "$dir" && env -u ZIG_LIB_DIR -u ZB_ZIG_LIB PATH="$2" HOME="$3" ./zb version 2> "$dir/stderr")
+  out=$(cd "$dir" && env -i HOME="$dir/home" PATH="$2" ${mise_env[@]+"${mise_env[@]}"} ./zb version 2> "$dir/stderr")
   code=$?
   set -e
   err=$(cat "$dir/stderr")
@@ -87,11 +120,8 @@ bad() { echo "zb-check: case $1: FAIL: $2"; failed=1; }
 fake_ran() { [ -s "$tmp/$1/fake-ran" ]; }
 
 # 1
-pin_dir=$("$mise_bin" where "zig@$pin")
-shims=$(cd "$pin_dir/../../.." && pwd)/shims
-[ -d "$shims" ] || { echo "zb-check FATAL: no mise shims directory at $shims (derived from $pin_dir)" >&2; exit 2; }
 make_root c1 "$pin" "$fake_version"
-run_zb c1 "$tmp/c1/fake:$pin_dir/bin:$shims:$tmp/misebin:$tmp/basebin" "$HOME"
+run_zb c1 "$tmp/c1/fake:$pin_dir/bin:$shims:$tmp/misebin:$tmp/basebin" mise
 if [ "$code" -eq 0 ] && [ "$out" = "$pin" ] && ! fake_ran c1; then
   ok 1 "mise activated, fake zig ahead of it: printed $out"
 else
@@ -100,7 +130,7 @@ fi
 
 # 2
 make_root c2 "$missing_pin" "$fake_version"
-run_zb c2 "$tmp/c2/fake:$tmp/misebin:$tmp/basebin" "$HOME"
+run_zb c2 "$tmp/c2/fake:$tmp/misebin:$tmp/basebin" mise
 if [ "$code" -ne 0 ] && grep -qF "mise install zig@$missing_pin" "$tmp/c2/stderr" && ! fake_ran c2; then
   ok 2 "mise, pin not installed: exit $code with the install hint"
 else
@@ -109,7 +139,7 @@ fi
 
 # 3
 make_root c3 "$pin" "$fake_version"
-run_zb c3 "$tmp/c3/fake:$tmp/basebin" "$tmp/home"
+run_zb c3 "$tmp/c3/fake:$tmp/basebin" none
 if [ "$code" -ne 0 ] && grep -qF "is $fake_version, build.zig.zon pins $pin" "$tmp/c3/stderr"; then
   ok 3 "no mise, wrong zig on PATH: refused"
 else
@@ -118,7 +148,7 @@ fi
 
 # 4
 make_root c4 "$pin" "$pin"
-run_zb c4 "$tmp/c4/fake:$tmp/basebin" "$tmp/home"
+run_zb c4 "$tmp/c4/fake:$tmp/basebin" none
 if [ "$code" -eq 0 ] && [ "$out" = "$pin" ] && [ "$(grep -c '^version$' "$tmp/c4/fake-ran")" -eq 2 ]; then
   ok 4 "no mise, pinned zig on PATH: checked, then ran"
 else
@@ -127,7 +157,7 @@ fi
 
 # 5
 make_root c5 "$pin" "$fake_version"
-run_zb c5 "$tmp/c5/fake:$tmp/misebin:$tmp/basebin" "$HOME"
+run_zb c5 "$tmp/c5/fake:$tmp/misebin:$tmp/basebin" mise
 if [ "$code" -eq 0 ] && [ "$out" = "$pin" ] && ! fake_ran c5; then
   ok 5 "mise, fake zig first on PATH: printed $out"
 else
