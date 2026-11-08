@@ -225,7 +225,7 @@ fn clientRun(c: *Client) !void {
     var want = c.expect_end;
     const deadline = nowNs() + 3 * client_deadline_ns;
     while (want != 0 or (c.expect_inline and !c.inline_ended)) {
-        switch (@as(Cmd, @enumFromInt(c.cmd.swap(0, .acq_rel)))) {
+        switch (@as(Cmd, @fromBackingInt(@intCast(c.cmd.swap(0, .acq_rel))))) {
             .none => {},
             .send_inline => {
                 var one: std.ArrayList(u8) = .empty;
@@ -547,7 +547,7 @@ fn runExit(rt: *zio.Runtime, gpa: std.mem.Allocator, exit: Exit) !void {
         .peer_reset => {
             // The peer gives up on the parked stream. Its writer must leave
             // the queue and the handler return, with nothing reserved for it.
-            c.cmd.store(@intFromEnum(Cmd.reset_stream_2), .release);
+            c.cmd.store(@backingInt(Cmd.reset_stream_2), .release);
             try waitFor("the parked handler to return", {}, struct {
                 fn f(_: void) bool {
                     return finished[2].load(.acquire);
@@ -564,7 +564,7 @@ fn runExit(rt: *zio.Runtime, gpa: std.mem.Allocator, exit: Exit) !void {
         .hang_up => {
             // The connection ends while the writer waits. Every handler is
             // stopped, and the budget they held goes back with the connection.
-            c.cmd.store(@intFromEnum(Cmd.hang_up), .release);
+            c.cmd.store(@backingInt(Cmd.hang_up), .release);
             try joinClient(&c, t);
             const Ctx = struct { s: *const starh2.Server };
             try waitFor("the connection to end", Ctx{ .s = &server }, struct {
@@ -745,7 +745,7 @@ fn runInline(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 
     // The budget is full. A complete handler takes its place BEHIND the
     // waiting writer: the actor does not run it, and does not reset it.
-    c.cmd.store(@intFromEnum(Cmd.send_inline), .release);
+    c.cmd.store(@backingInt(Cmd.send_inline), .release);
     if (comptime conn_mod.test_observe) {
         const Ctx = struct { n: usize };
         try waitFor("the inline gate to hold the job back", Ctx{ .n = gated_0 }, struct {

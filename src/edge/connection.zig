@@ -253,7 +253,7 @@ pub fn probeNote(kind: ProbeKind) void {
         var cur = slot.load(.acquire);
         if (cur == 0) cur = slot.cmpxchgStrong(0, tid, .acq_rel, .acquire) orelse tid;
         if (cur == tid) {
-            _ = probe_counts[@intFromEnum(kind)][i].fetchAdd(1, .monotonic);
+            _ = probe_counts[@backingInt(kind)][i].fetchAdd(1, .monotonic);
             return;
         }
     }
@@ -541,8 +541,6 @@ pub var test_deadline_waits: test_hook.Hook(std.atomic.Value(usize)) = if (test_
 /// Test-only: Connection finished boot allocations (pools, sched slabs, session maps).
 pub var test_boot_ready: test_hook.Hook(std.atomic.Value(bool)) = if (test_hook.on) .init(false) else {};
 
-
-
 /// Per-task binding: the current task is inside `shutdownHandlers`.
 ///
 /// A connection-wide bool cannot answer that. A handler in
@@ -653,7 +651,7 @@ pub fn closeProbeSessionPrint(ev: session_mod.CloseProbeEvent) void {
     diagRawPrint("t1002 sess={x} {s} code={d} sid={d} parked={d}\n", .{
         ev.session,
         @tagName(ev.site),
-        @intFromEnum(ev.code),
+        @backingInt(ev.code),
         ev.stream_id,
         close_probe_parked.load(.acquire),
     });
@@ -1718,13 +1716,13 @@ pub const DiagActor = enum(u8) { running = 0, loop_lock, select, tls_turn, inlin
 
 fn diagActor(c: *Connection, w: DiagActor) void {
     if (!diag_stuck) return;
-    c.diag_actor_where.store(@intFromEnum(w), .monotonic);
+    c.diag_actor_where.store(@backingInt(w), .monotonic);
 }
 
 fn diagWait(hctx: *HandlerCtx, w: DiagWait) void {
     if (!diag_stuck) return;
     hctx.slot.diag_since_ns.store(if (w == .running) 0 else nowNs(hctx.conn.config.io), .monotonic);
-    hctx.slot.diag_wait.store(@intFromEnum(w), .monotonic);
+    hctx.slot.diag_wait.store(@backingInt(w), .monotonic);
 }
 
 /// Snapshot for a stuck-handler dump. `wait`/`waited_ms` come from atomics;
@@ -1770,7 +1768,7 @@ pub fn diagHandlerState(resp_ctx: *anyopaque) ?DiagHandlerState {
     return .{
         .stream_id = hctx.stream_id,
         .conn_addr = @intFromPtr(c),
-        .wait = @enumFromInt(hctx.slot.diag_wait.load(.monotonic)),
+        .wait = @fromBackingInt(@intCast(hctx.slot.diag_wait.load(.monotonic))),
         .waited_ms = if (since == 0 or now < since) 0 else (now - since) / std.time.ns_per_ms,
         .sched_terminal_len = c.sched.terminal_len,
         .sched_ordinary_len = c.sched.ordinary_len,
@@ -1782,7 +1780,7 @@ pub fn diagHandlerState(resp_ctx: *anyopaque) ?DiagHandlerState {
         .live_task_handlers = c.live_task_handlers.load(.monotonic),
         .conn_send_available = c.session.connectionSendAvailable(),
         .actor_turns = c.diag_actor_turns.load(.monotonic),
-        .actor_where = @enumFromInt(c.diag_actor_where.load(.monotonic)),
+        .actor_where = @fromBackingInt(@intCast(c.diag_actor_where.load(.monotonic))),
         .tls_carried = if (c.tls_driver) |pump| pump.carried != null else false,
         .tls_write_ch_len = if (c.tls_driver) |pump| io_queue.chanLen(wire_pump.WireChunk, pump.write_ch) else 0,
         .tls_send_armed = if (c.tls_driver) |pump| pump.send_armed else false,
@@ -4561,7 +4559,7 @@ pub const Connection = struct {
                 missing += 1;
                 if (self.session.tombstoneCode(s.stream_id)) |c| {
                     if (c == .no_error) tomb_noerr += 1 else tomb_rst += 1;
-                    if (rst0 == 0 and c != .no_error) rst0 = @intFromEnum(c);
+                    if (rst0 == 0 and c != .no_error) rst0 = @backingInt(c);
                 }
             } else if (sw <= 0) {
                 zero_win += 1;
@@ -4678,7 +4676,7 @@ pub const Connection = struct {
         self.diag_no_park_run += 1;
         if (self.diag_no_park_run == 100_000 or self.diag_no_park_run == 10_000_000) {
             diagRawPrint("NOPARK conn={x} run={d} why={d} pending_n={d} carried={} write_ch_empty={} send_armed={} recv_armed={} stash_full={} sched_pending={d}\n", .{
-                @intFromPtr(self) & 0xffff, self.diag_no_park_run, why, pump.pending_n, pump.carried != null,
+                @intFromPtr(self) & 0xffff, self.diag_no_park_run, why,             pump.pending_n,   pump.carried != null,
                 pump.write_ch.isEmpty(),    pump.send_armed,       pump.recv_armed, pump.stashFull(), self.sched.pendingCount(),
             });
         }
@@ -7830,7 +7828,7 @@ pub const Connection = struct {
                 .stream_reset => |r| self.applyStreamResetIntent(r),
                 .connection_error => |ce| {
                     var code_buf: [12]u8 = undefined;
-                    const goaway = if (close_reason) std.fmt.bufPrint(&code_buf, "{d}", .{@intFromEnum(ce.code)}) catch "?" else "-";
+                    const goaway = if (close_reason) std.fmt.bufPrint(&code_buf, "{d}", .{@backingInt(ce.code)}) catch "?" else "-";
                     self.noteClose(closeReasonOfGoaway(ce.code), "session_goaway", "-", goaway);
                     if (close_probe) diagRawPrint("t1002 conn={x} intent_connection_error parked={d}\n", .{ @intFromPtr(self), close_probe_parked.load(.acquire) });
                     for (self.handlers.slice()) |*slot| {
@@ -8797,7 +8795,7 @@ pub const Connection = struct {
             error.OutOfMemory
         else
             zio.spawnInto(probeHandlerPlacement(), runHandlerJob, .{link});
-        diagActor(self, @enumFromInt(where_before));
+        diagActor(self, @fromBackingInt(@intCast(where_before)));
         if (handle) |_| _ = diag_task_spawned.fetchAdd(1, .monotonic) else |_| {}
         const h = handle catch {
             // Admission already incremented live_handlers and claimed a slot.
@@ -12296,7 +12294,7 @@ fn expectRouteRefusalReset(which: RouteRefusal, path: RefusalPath) !void {
     defer seen.deinit();
     try trapCollect(&trap, &seen);
     const res: accounts.RouteResource = if (which == .token) .task_handlers else .request_bytes;
-    try std.testing.expectEqual(@as(u64, 1), rec.refusals[@intFromEnum(res)].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), rec.refusals[@backingInt(res)].load(.acquire));
     try std.testing.expectEqual(@as(?usize, 1), seen.rst_per_sid.get(1));
     try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.internal_error)), seen.rst_code);
     try std.testing.expectEqual(@as(usize, 0), seen.goaways);
@@ -13269,7 +13267,7 @@ var hook_entries: [3]usize = @splat(0);
 /// handler's last counter lands AFTER this.
 fn actorTakesTokenAfterRing(conn: *Connection, point: ReleasePoint) void {
     if (conn != hook_target or point != .after_ring) return;
-    hook_entries[@intFromEnum(point)] += 1;
+    hook_entries[@backingInt(point)] += 1;
     std.debug.assert(io_queue.tryRecv(u8, &conn.doorbell) != null);
     conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
 }
@@ -13278,14 +13276,14 @@ fn actorTakesTokenAfterRing(conn: *Connection, point: ReleasePoint) void {
 /// ring.
 fn actorLooksBeforeRing(conn: *Connection, point: ReleasePoint) void {
     if (conn != hook_target or point != .before_ring) return;
-    hook_entries[@intFromEnum(point)] += 1;
+    hook_entries[@backingInt(point)] += 1;
     if (conn.lostWakeSince(conn.releases_at_turn_top)) hook_false_alarm = true;
 }
 
 /// Between the pre-park check and the select, a release starts and never rings.
 fn releaseWithoutRingAfterCheck(conn: *Connection, point: ReleasePoint) void {
     if (conn != hook_target or point != .park_after_check) return;
-    hook_entries[@intFromEnum(point)] += 1;
+    hook_entries[@backingInt(point)] += 1;
     conn.releaseRung(conn.releaseStarted());
 }
 
@@ -13295,7 +13293,7 @@ fn releaseWithoutRingAfterCheck(conn: *Connection, point: ReleasePoint) void {
 var overlap_caught = false;
 fn overlapHook(conn: *Connection, point: ReleasePoint) void {
     if (conn != hook_target or point != .after_ring) return;
-    hook_entries[@intFromEnum(point)] += 1;
+    hook_entries[@backingInt(point)] += 1;
     std.debug.assert(io_queue.tryRecv(u8, &conn.doorbell) != null);
     conn.releases_at_turn_top = conn.releases_started.load(.seq_cst);
     conn.releaseRung(conn.releaseStarted());
@@ -13324,7 +13322,7 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     test_release_hook = null;
     // The forced schedule ran: the hook was entered once, the actor took the
     // token (the doorbell is empty), and the release still counted.
-    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.after_ring)]);
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@backingInt(ReleasePoint.after_ring)]);
     try std.testing.expectEqual(@as(usize, 0), io_queue.chanLen(u8, &conn.doorbell));
     try std.testing.expectEqual(conn.releases_started.load(.seq_cst), conn.releases_rung_max.load(.seq_cst));
     try std.testing.expect(!conn.wakeAuditFailed());
@@ -13340,7 +13338,7 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     test_release_hook = null;
     // The hook ran once, between the start and the ring, and the ring then made
     // the token (the doorbell holds one).
-    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.before_ring)]);
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@backingInt(ReleasePoint.before_ring)]);
     try std.testing.expectEqual(@as(usize, 1), io_queue.chanLen(u8, &conn.doorbell));
     try std.testing.expect(!hook_false_alarm);
     try std.testing.expect(!conn.wakeAuditFailed());
@@ -13370,7 +13368,7 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     test_release_hook = releaseWithoutRingAfterCheck;
     const check_failed = conn.parkCheckFailed();
     test_release_hook = null;
-    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.park_after_check)]);
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@backingInt(ReleasePoint.park_after_check)]);
     try std.testing.expect(!check_failed);
     try std.testing.expect(conn.wakeAuditFailed());
 
@@ -13386,7 +13384,7 @@ fn interleaveScenario(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     conn.lockSessionUncancelable();
     conn.unlockSession();
     test_release_hook = null;
-    try std.testing.expectEqual(@as(usize, 1), hook_entries[@intFromEnum(ReleasePoint.after_ring)]);
+    try std.testing.expectEqual(@as(usize, 1), hook_entries[@backingInt(ReleasePoint.after_ring)]);
     try std.testing.expect(overlap_caught);
     try std.testing.expect(conn.wakeAuditFailed());
 }

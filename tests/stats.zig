@@ -843,9 +843,9 @@ fn orphans(rt: *zio.Runtime, gpa: std.mem.Allocator, p: Proto) !void {
     const r1 = rig.server.routeStats(1);
     const s = rig.server.stats();
     std.debug.print("stats: orphans ({s}): server {d}, oldest {d} ms; {s} {d} (oldest {d} ms), {s} {d} (oldest {d} ms)\n", .{
-        @tagName(p),                       s.orphaned_handlers, s.oldest_orphan_age_ns / ms,
-        r0.label,                          r0.orphans,          r0.oldest_orphan_age_ns / ms,
-        r1.label,                          r1.orphans,          r1.oldest_orphan_age_ns / ms,
+        @tagName(p), s.orphaned_handlers, s.oldest_orphan_age_ns / ms,
+        r0.label,    r0.orphans,          r0.oldest_orphan_age_ns / ms,
+        r1.label,    r1.orphans,          r1.oldest_orphan_age_ns / ms,
     });
     try std.testing.expectEqual(@as(usize, 1), r0.orphans);
     try std.testing.expectEqual(@as(usize, 1), r1.orphans);

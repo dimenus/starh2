@@ -350,8 +350,8 @@ fn bodylessFloods(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void
         try blocking(goodGet, .{ gpa, tr, rig.port(), &ok });
         std.debug.print("protocol work flood ({s}) {s}: ended {s} code {d} after {d} ms and {d} frames sent; a second client served 200: {}; err {?}\n", .{ @tagName(tr), @tagName(kind), @tagName(r.end), r.code, r.elapsed_ms, r.frames, ok, r.err });
         try std.testing.expect(r.err == null);
-        try expectExactly("the flood's end (goaway)", @intFromEnum(r.end), @intFromEnum(End.goaway));
-        try expectExactly("the GOAWAY code (ENHANCE_YOUR_CALM)", r.code, @intFromEnum(frame.ErrorCode.enhance_your_calm));
+        try expectExactly("the flood's end (goaway)", @backingInt(r.end), @backingInt(End.goaway));
+        try expectExactly("the GOAWAY code (ENHANCE_YOUR_CALM)", r.code, @backingInt(frame.ErrorCode.enhance_your_calm));
         // The burst is 10,000; what is past it was in flight when the GOAWAY
         // was written (the client writes 2,048 a batch).
         try std.testing.expect(r.frames >= 10_000);
@@ -385,7 +385,7 @@ fn oneByteFlood(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     const per_frame_ns = if (r.frames == 0) 0 else r.elapsed_ms * ms / r.frames;
     std.debug.print("protocol work 1-byte flood ({s}, one executor): ended {s} after {d} ms; {d} frames ({d} body bytes) sent before the end was read, about {d} ns a frame; the body cap is {d} bytes; err {?}\n", .{ @tagName(tr), @tagName(r.end), r.elapsed_ms, r.frames, r.body_bytes, per_frame_ns, limits.request_body_bytes, r.err });
     try std.testing.expect(r.err == null);
-    try expectExactly("the stream's end (answered: a 413)", @intFromEnum(r.end), @intFromEnum(End.answered));
+    try expectExactly("the stream's end (answered: a 413)", @backingInt(r.end), @backingInt(End.answered));
     try expectExactly("the answer's status", r.answered_status orelse 0, 413);
     try std.testing.expect(r.body_bytes > limits.request_body_bytes);
 }
@@ -415,11 +415,11 @@ fn floodAfterAnswer(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !vo
     try std.testing.expect(r.err == null);
     try std.testing.expect(r.answered_frames != 0);
     try expectExactly("the answer's status", r.answered_status orelse 0, 413);
-    try expectExactly("the stream's reset code (NO_ERROR)", r.rst_code orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the stream's reset code (NO_ERROR)", r.rst_code orelse 99, @backingInt(frame.ErrorCode.no_error));
     try expectExactly("the stream's RSTs", r.rst_n, 1);
     try std.testing.expect(r.rst_after_answer);
-    try expectExactly("the flood's end (goaway)", @intFromEnum(r.end), @intFromEnum(End.goaway));
-    try expectExactly("the GOAWAY code (ENHANCE_YOUR_CALM)", r.code, @intFromEnum(frame.ErrorCode.enhance_your_calm));
+    try expectExactly("the flood's end (goaway)", @backingInt(r.end), @backingInt(End.goaway));
+    try expectExactly("the GOAWAY code (ENHANCE_YOUR_CALM)", r.code, @backingInt(frame.ErrorCode.enhance_your_calm));
 }
 
 test "a 1-byte DATA flood that goes on after its 413 meets RST_STREAM NO_ERROR, then GOAWAY ENHANCE_YOUR_CALM (h2c)" {
@@ -484,7 +484,7 @@ fn refusedUpload(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void 
     try std.testing.expect(r.err == null);
     try expectExactly("the upload's status", r.seen.status[0] orelse 0, 413);
     try expectExactly("the upload's answers", r.seen.headers[0], 1);
-    try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @backingInt(frame.ErrorCode.no_error));
     try expectExactly("the upload's RSTs", r.seen.rst_n[0], 1);
     try std.testing.expect(r.seen.rst_after_headers[0]);
     try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);
@@ -584,7 +584,7 @@ fn heldRefusedUpload(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !v
         return error.HoldNotEngaged;
     }
     try expectExactly("the upload's status", r.seen.status[0] orelse 0, 413);
-    try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @backingInt(frame.ErrorCode.no_error));
     try expectExactly("the upload's RSTs", r.seen.rst_n[0], 1);
     try std.testing.expect(r.seen.rst_after_headers[0]);
     try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);
@@ -892,10 +892,10 @@ fn padding(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     try blocking(padClient, .{ gpa, tr, rig.port(), false, 3_000, &plain });
     std.debug.print("protocol work padding ({s}): 251 bytes of DATA payload every 100 ms, rate 240 B/s after a 1 s grace: padded (1 body byte each) ended {s} code {d} at {d} ms; unpadded (251 body bytes each) ended {s} at {d} ms; errs {?} {?}\n", .{ @tagName(tr), @tagName(pad.end), pad.code, pad.elapsed_ms, @tagName(plain.end), plain.elapsed_ms, pad.err, plain.err });
     try std.testing.expect(pad.err == null and plain.err == null);
-    try expectExactly("the padded body's end (reset)", @intFromEnum(pad.end), @intFromEnum(End.rst));
-    try expectExactly("the reset code (CANCEL)", pad.code, @intFromEnum(frame.ErrorCode.cancel));
+    try expectExactly("the padded body's end (reset)", @backingInt(pad.end), @backingInt(End.rst));
+    try expectExactly("the reset code (CANCEL)", pad.code, @backingInt(frame.ErrorCode.cancel));
     try std.testing.expect(pad.elapsed_ms < 2_500);
-    try expectExactly("the unpadded body's end (answered)", @intFromEnum(plain.end), @intFromEnum(End.answered));
+    try expectExactly("the unpadded body's end (answered)", @backingInt(plain.end), @backingInt(End.answered));
     try std.testing.expect(plain.elapsed_ms >= 3_000);
 }
 
@@ -913,7 +913,6 @@ fn parkedReleased() u64 {
     if (comptime !@hasDecl(conn_mod, "parked_released_on_rst")) return 0;
     return conn_mod.parked_released_on_rst.load(.acquire);
 }
-
 
 fn waitStarted(n: usize, timeout_ms: u64) bool {
     const deadline = nowNs() + timeout_ms * ms;
@@ -1121,11 +1120,10 @@ fn parkedLease(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     const d = nowNs() + 3 * std.time.ns_per_s;
     while (rig.server.accounting.task_handlers.load(.acquire) != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
     std.debug.print("protocol work parked lease ({s}): 3 running (2 of their streams reset) + 7 and 9 parked hold {d} KiB; 9 reset behind 7: {d} KiB {d} ms later, with {d} handlers ended (client {d} KiB, route {d} KiB); 11 parks: {d} KiB; 11 reset: {d} KiB; 13 parks: {d} KiB; released on RST {d}; answers 5:{?d} 7:{?d} 13:{?d} (9 and 11 never: {?d} {?d}, resets {?d} {?d}); err {?}\n", .{
-        @tagName(tr),             r.held_full / kib,       r.held_after_rst / kib, r.ms_to_release, r.ended_before_release,
-        r.client_after_rst / kib, r.route_after_rst / kib, r.held_11 / kib,        r.held_after_11 / kib,
-        r.held_13 / kib,          parkedReleased() - p0,   r.late.status[2],       r.late.status[3],
-        r.late.status[6],         r.late.status[4],        r.late.status[5],       r.late.rst[4],
-        r.late.rst[6],            r.err,
+        @tagName(tr),             r.held_full / kib,       r.held_after_rst / kib, r.ms_to_release,       r.ended_before_release,
+        r.client_after_rst / kib, r.route_after_rst / kib, r.held_11 / kib,        r.held_after_11 / kib, r.held_13 / kib,
+        parkedReleased() - p0,    r.late.status[2],        r.late.status[3],       r.late.status[6],      r.late.status[4],
+        r.late.status[5],         r.late.rst[4],           r.late.rst[6],          r.err,
     });
     try std.testing.expect(r.err == null);
     try expectExactly("request pool with 3 running and 2 parked", r.held_full, 5 * block);
@@ -1238,8 +1236,8 @@ fn parkedWait(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     const d = nowNs() + 3 * std.time.ns_per_s;
     while (rig.server.accounting.task_handlers.load(.acquire) != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
     std.debug.print("protocol work parked wait ({s}): 3 slots held by handlers that ignore cancel, every stream reset, 7 parked ({d} KiB held), wait limit {d} ms: 7 got status {?d} (HEADERS {d}, rst {?d}) {d} ms after it was sent; then {d} KiB held (client {d} KiB, route {d} KiB), {d} handlers ended; expired {d}, released on RST {d}; err {?}\n", .{
-        @tagName(tr),     r.held_parked / kib, wait_limit_ms,          r.seen.status[3],            r.seen.headers[3],
-        r.seen.rst[3],    r.ms_to_answer,      r.held_after / kib,     r.client_after / kib,        r.route_after / kib,
+        @tagName(tr),           r.held_parked / kib,  wait_limit_ms,         r.seen.status[3],     r.seen.headers[3],
+        r.seen.rst[3],          r.ms_to_answer,       r.held_after / kib,    r.client_after / kib, r.route_after / kib,
         r.ended_before_release, parkedExpired() - e0, parkedReleased() - p0, r.err,
     });
     try std.testing.expect(r.err == null);
@@ -1366,7 +1364,7 @@ fn crossRst(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: Cross)
     try expectExactly("the upload's status", r.seen.status[0] orelse 0, 413);
     try expectExactly("the upload's answers", r.seen.headers[0], 1);
     try expectExactly("the upload's RSTs", r.seen.rst_n[0], 1);
-    try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.no_error));
+    try expectExactly("the upload's reset code (NO_ERROR)", r.seen.rst[0] orelse 99, @backingInt(frame.ErrorCode.no_error));
     try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);
     try std.testing.expect(!r.seen.goaway and !r.seen.closed);
 }
@@ -1453,7 +1451,7 @@ fn peerClosedHeaders(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !v
         std.debug.print("protocol work HEADERS on a stream the peer closed ({s}, {s}): GOAWAY {} code {d}; err {?}\n", .{ @tagName(tr), @tagName(how), r.seen.goaway, r.seen.goaway_code, r.err });
         try std.testing.expect(r.err == null);
         try std.testing.expect(r.seen.goaway);
-        try expectExactly("the GOAWAY code (STREAM_CLOSED)", r.seen.goaway_code, @intFromEnum(frame.ErrorCode.stream_closed));
+        try expectExactly("the GOAWAY code (STREAM_CLOSED)", r.seen.goaway_code, @backingInt(frame.ErrorCode.stream_closed));
     }
 }
 
@@ -1522,12 +1520,13 @@ fn lateData(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: LateDa
     const d = nowNs() + 3 * std.time.ns_per_s;
     while (rig.server.accounting.task_handlers.load(.acquire) != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
     std.debug.print("protocol work late DATA ({s}, {s}): stream 1 rst {?d} x{d}, HEADERS {d}; handlers ended before release {d}, after {d}; next request status {?d}; GOAWAY {} code {d} closed {}; task handlers {d}, pool {d}; err {?}\n", .{
-        @tagName(tr),        @tagName(how),     r.seen.rst[0],                                         r.seen.rst_n[0],        r.seen.headers[0],
-        r.ended_before_release, ended.load(.acquire), r.seen.status[1], r.seen.goaway, r.seen.goaway_code, r.seen.closed, rig.server.accounting.task_handlers.load(.acquire), rig.server.requests.held_bytes.load(.acquire), r.err,
+        @tagName(tr),           @tagName(how),                                      r.seen.rst[0],                                 r.seen.rst_n[0], r.seen.headers[0],
+        r.ended_before_release, ended.load(.acquire),                               r.seen.status[1],                              r.seen.goaway,   r.seen.goaway_code,
+        r.seen.closed,          rig.server.accounting.task_handlers.load(.acquire), rig.server.requests.held_bytes.load(.acquire), r.err,
     });
     try std.testing.expect(r.err == null);
     try expectExactly("stream 1's RSTs", r.seen.rst_n[0], 1);
-    try expectExactly("stream 1's reset code (STREAM_CLOSED)", r.seen.rst[0] orelse 99, @intFromEnum(frame.ErrorCode.stream_closed));
+    try expectExactly("stream 1's reset code (STREAM_CLOSED)", r.seen.rst[0] orelse 99, @backingInt(frame.ErrorCode.stream_closed));
     try expectExactly("handlers ended before the release", r.ended_before_release, 0);
     try expectExactly("handlers ended after the release", ended.load(.acquire), 1);
     try expectExactly("the next request's status", r.seen.status[1] orelse 0, 200);

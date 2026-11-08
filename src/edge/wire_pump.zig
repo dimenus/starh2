@@ -607,8 +607,8 @@ pub const WritePump = struct {
                     lens[i] = chunk.len;
                 }
                 probePrint("t1002 pump={x} take n={d} t0={x} l0={d} t1={x} l1={d}\n", .{
-                    @intFromPtr(self),          count,
-                    types[0],                   lens[0],
+                    @intFromPtr(self),                 count,
+                    types[0],                          lens[0],
                     if (count > 1) types[1] else 0xee, if (count > 1) lens[1] else 0,
                 });
             }

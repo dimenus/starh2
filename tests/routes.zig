@@ -46,7 +46,6 @@ fn nowNs() u64 {
     return zio.Timestamp.now(.monotonic).toNanoseconds();
 }
 
-
 // ---------------------------------------------------------------------------
 // Handlers.
 
@@ -125,13 +124,11 @@ fn printTimeline(label: []const u8) void {
         const start_err = srv_start_err[i].load(.acquire);
         const flush_err = srv_flush_err[i].load(.acquire);
         std.debug.print("  id {d:>2} src {f}: sent {d} ms; client {s} status {d} errno {d} bytes {d} rst {?d} at {d} ms, route then {d}; server entered {d} ms, start {s}, flush {s}, ended {d} ms\n", .{
-            i,                                         fmtPeer(c.src),              traceMs(c.sent_ns),
-            @tagName(c.saw),                           c.status,                    c.errno,
-            c.bytes,                                   c.rst,                       traceMs(c.at_ns),
-            c.route_then,                              traceMs(srv_entered_ns[i].load(.acquire)),
-            if (start_err == 0) "ok" else @errorName(@errorFromInt(start_err)),
-            if (flush_err == 0) "ok" else @errorName(@errorFromInt(flush_err)),
-            traceMs(srv_ended_ns[i].load(.acquire)),
+            i,                                                                  fmtPeer(c.src),                            traceMs(c.sent_ns),
+            @tagName(c.saw),                                                    c.status,                                  c.errno,
+            c.bytes,                                                            c.rst,                                     traceMs(c.at_ns),
+            c.route_then,                                                       traceMs(srv_entered_ns[i].load(.acquire)), if (start_err == 0) "ok" else @errorName(@errorFromInt(start_err)),
+            if (flush_err == 0) "ok" else @errorName(@errorFromInt(flush_err)), traceMs(srv_ended_ns[i].load(.acquire)),
         });
     }
 }
@@ -349,19 +346,19 @@ const Rig = struct {
     fn routeCount(self: *Rig, route: u32, res: Res) usize {
         if (comptime !has_routes) return 0;
         const rec = self.server.accounting.routes.recordOf(route) orelse return 0;
-        return rec.count(@enumFromInt(@intFromEnum(res)));
+        return rec.count(@fromBackingInt(@intCast(@backingInt(res))));
     }
 
     fn routeRefusals(self: *Rig, route: u32, res: Res) u64 {
         if (comptime !has_routes) return 0;
         const rec = self.server.accounting.routes.recordOf(route) orelse return 0;
-        return rec.refusals[@intFromEnum(res)].load(.acquire);
+        return rec.refusals[@backingInt(res)].load(.acquire);
     }
 
     fn routeShare(self: *Rig, route: u32, res: Res) usize {
         if (comptime !has_routes) return 0;
         const rec = self.server.accounting.routes.recordOf(route) orelse return 0;
-        return rec.shares[@intFromEnum(res)];
+        return rec.shares[@backingInt(res)];
     }
 
     fn clientRefusals(self: *Rig, res: accounts.Resource) u64 {
@@ -589,7 +586,7 @@ fn rawAnswer(fd: std.c.fd_t, for_ms: u64) RawAnswer {
         if (r <= 0) continue;
         const n = std.c.recv(fd, got[len..].ptr, got.len - len, 0);
         if (n == 0) return .{ .saw = .eof, .bytes = len };
-        if (n < 0) return .{ .saw = .err, .errno = @intFromEnum(std.posix.errno(n)), .bytes = len };
+        if (n < 0) return .{ .saw = .err, .errno = @backingInt(std.posix.errno(n)), .bytes = len };
         len += @intCast(n);
     }
     if (!std.mem.startsWith(u8, got[0..len], "HTTP/1.1 ")) return .{ .saw = .status, .status = 0, .bytes = len };
@@ -1442,4 +1439,3 @@ fn bootShares(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
 test "route boot: the default share with 1, 2 and 8 task routes, an override, and no override on a complete route" {
     try runIn(bootShares);
 }
-

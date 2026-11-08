@@ -130,9 +130,7 @@ test "counting allocator: Server.init under published ceiling" {
     var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = counting.allocator();
     const rt = try zio.Runtime.init(std.testing.allocator, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         .executors = .exact(1),
     });
     defer rt.deinit();
@@ -191,9 +189,7 @@ test "fail-index iteration: Server.init fails closed" {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_i });
         const gpa = failing.allocator();
         const rt = zio.Runtime.init(gpa, .{
-            .stack_pool = .{
-                .maximum_size = 1024 * 1024,
-                .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 8, .prewarm = 8 },
+            .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 8, .prewarm = 8 },
             .executors = .exact(1),
         }) catch {
             saw_fail = true;
@@ -264,9 +260,7 @@ test "counting allocator peak under live hello stays under ceiling" {
     var counting = std.testing.FailingAllocator.init(std.heap.smp_allocator, .{});
     const gpa = counting.allocator();
     const rt = try zio.Runtime.init(std.testing.allocator, .{
-        .stack_pool = .{
-            .maximum_size = 1024 * 1024,
-            .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
+        .stack_pool = .{ .maximum_size = 1024 * 1024, .committed_size = 64 * 1024, .shrink_interval = .fromSeconds(5), .slab_slots = 16, .prewarm = 16 },
         // FailingAllocator is not thread-safe; serialize the counting path.
         .executors = .exact(1),
     });

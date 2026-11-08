@@ -93,7 +93,7 @@ pub const SlotTerminal = struct {
             .internal => internal,
         };
         const code: u32 = switch (cause) {
-            .peer_reset => |c| @intFromEnum(c),
+            .peer_reset => |c| @backingInt(c),
             else => 0,
         };
         _ = self.kind.cmpxchgStrong(none, kind, .acq_rel, .acquire);
@@ -105,7 +105,7 @@ pub const SlotTerminal = struct {
     pub fn getCause(self: *const SlotTerminal) ?TerminalCause {
         return switch (self.kind.load(.acquire)) {
             none => null,
-            peer_reset => .{ .peer_reset = @enumFromInt(self.code.load(.acquire)) },
+            peer_reset => .{ .peer_reset = @fromBackingInt(@intCast(self.code.load(.acquire))) },
             slow_consumer => .slow_consumer,
             connection_closed => .connection_closed,
             server_shutdown => .server_shutdown,

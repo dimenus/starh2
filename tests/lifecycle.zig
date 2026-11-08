@@ -1452,7 +1452,7 @@ fn peerResetWhileBlocked(_: *anyopaque, req: *const starh2.Request, resp: *starh
         recordHandlerErr(err);
         if (err == error.PeerReset) {
             if (resp.slotTerminal()) |c| switch (c) {
-                .peer_reset => |code| starh2.edge.connection.test_last_peer_reset_code.store(@intFromEnum(code), .release),
+                .peer_reset => |code| starh2.edge.connection.test_last_peer_reset_code.store(@backingInt(code), .release),
                 else => {},
             };
         }
@@ -1974,7 +1974,8 @@ test "regression: stream map drops closed streams (bounded history)" {
             }
         }
         if (respond_sid) |rsid| {
-            session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
+            session.applyCommand(.{ .respond_headers = .{
+                .ticket = .none,
                 .stream_id = rsid,
                 .status = 200,
                 .headers = &.{},
@@ -2261,7 +2262,7 @@ fn runLargeBodyWindowGate(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u
     const herr = starh2.edge.connection.test_last_handler_err.load(.acquire);
     try std.testing.expectEqual(@as(u8, 3), herr); // PeerReset only
     const frame = starh2.core.frame;
-    try std.testing.expectEqual(@as(u32, @intFromEnum(frame.ErrorCode.cancel)), starh2.edge.connection.test_last_peer_reset_code.load(.acquire));
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.cancel)), starh2.edge.connection.test_last_peer_reset_code.load(.acquire));
 }
 
 test "lifecycle: >64KiB body under small window + RST (stream 1)" {

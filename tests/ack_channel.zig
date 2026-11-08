@@ -203,7 +203,7 @@ fn clientBody(c: *Client) !void {
             const hdr = frame.FrameHeader.decode(in.items[off..][0..frame.FRAME_HEADER_LEN]);
             const len = frame.FRAME_HEADER_LEN + @as(usize, hdr.length);
             if (in.items.len - off < len) break;
-            const ftype = @intFromEnum(hdr.type);
+            const ftype = @backingInt(hdr.type);
             const flags = in.items[off + 4];
             switch (ftype) {
                 ftype_settings => if (flags & 0x1 == 0) {

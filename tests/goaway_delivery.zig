@@ -2028,7 +2028,7 @@ var h1o_late_cause: std.atomic.Value(u8) = .init(0);
 var h1o_request: std.atomic.Value(u8) = .init(0);
 
 fn h1CauseCode(c: starh2.TerminalCause) u8 {
-    return 1 + @as(u8, @intFromEnum(std.meta.activeTag(c)));
+    return 1 + @as(u8, @backingInt(std.meta.activeTag(c)));
 }
 
 fn h1RequestIntact(req: *const starh2.Request) bool {
@@ -2281,10 +2281,10 @@ fn runH1Outlive(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: H1Transport
             .shutdown => .server_shutdown,
         };
         std.debug.print("h1 outlive {s} {s} {s}: late write {s}, closed={}, cause={d} (want {d}), request intact={d}\n", .{
-            @tagName(transport),                                     @tagName(trigger),
-            @tagName(h1o_mode),                                      if (h1o_late.load(.acquire) == 2) "failed" else "did not fail",
-            h1o_late_closed.load(.acquire),                          h1o_late_cause.load(.acquire),
-            h1CauseCode(want_cause), h1o_request.load(.acquire),
+            @tagName(transport),            @tagName(trigger),
+            @tagName(h1o_mode),             if (h1o_late.load(.acquire) == 2) "failed" else "did not fail",
+            h1o_late_closed.load(.acquire), h1o_late_cause.load(.acquire),
+            h1CauseCode(want_cause),        h1o_request.load(.acquire),
         });
         try std.testing.expectEqual(@as(u8, 2), h1o_late.load(.acquire));
         try std.testing.expect(h1o_late_closed.load(.acquire));

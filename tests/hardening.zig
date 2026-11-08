@@ -101,14 +101,14 @@ fn big(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) anyerror
     const pattern: [big_bytes]u8 = @splat('b');
     var body = try resp.start(200, &.{});
     for (0..big_rounds) |_| body.writeAll(&pattern) catch |err| {
-        big_error.store(@intFromEnum(if (err == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
+        big_error.store(@backingInt(if (err == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
         return err;
     };
     body.finish() catch |err| {
-        big_error.store(@intFromEnum(if (err == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
+        big_error.store(@backingInt(if (err == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
         return err;
     };
-    big_error.store(@intFromEnum(BigEnd.ok), .release);
+    big_error.store(@backingInt(BigEnd.ok), .release);
 }
 
 /// Waits for `queued_gate`, writes 4 KiB, flushes, and stays open: its bytes
@@ -127,7 +127,7 @@ fn queuedWrite(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) 
         body.flush() catch |err| break :blk err;
         while (true) zio.sleep(.fromMilliseconds(20)) catch |err| break :blk err;
     };
-    queued_end.store(@intFromEnum(if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
+    queued_end.store(@backingInt(if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
     return res;
 }
 
@@ -201,7 +201,7 @@ fn exactConnWrite(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Respons
         body.finish() catch |err| break :blk err;
         break :blk error.Finished;
     };
-    exact_end.store(@intFromEnum(if (res == error.Finished) BigEnd.ok else if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
+    exact_end.store(@backingInt(if (res == error.Finished) BigEnd.ok else if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
     if (res != error.Finished) return res;
 }
 
@@ -228,7 +228,7 @@ fn exactWrite(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) a
         body.finish() catch |err| break :blk err;
         break :blk error.Finished;
     };
-    exact_end.store(@intFromEnum(if (res == error.Finished) BigEnd.ok else if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
+    exact_end.store(@backingInt(if (res == error.Finished) BigEnd.ok else if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
     if (res != error.Finished) return res;
 }
 
@@ -268,7 +268,7 @@ fn finishWrite(_: *anyopaque, _: *const starh2.Request, resp: *starh2.Response) 
         body.finish() catch |err| break :blk err;
         break :blk error.Finished;
     };
-    finish_end.store(@intFromEnum(if (res == error.Finished) BigEnd.ok else if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
+    finish_end.store(@backingInt(if (res == error.Finished) BigEnd.ok else if (res == error.SlowConsumer) BigEnd.slow_consumer else BigEnd.other), .release);
     if (res != error.Finished) return res;
 }
 
@@ -404,9 +404,9 @@ fn goodGet(gpa: std.mem.Allocator, transport: Transport, port: u16) !void {
     while (true) {
         const s = try w.next(deadline) orelse return error.GoodClientClosed;
         if (s.sid != 1) continue;
-        if (s.ftype == @intFromEnum(frame.FrameType.rst_stream)) return error.GoodClientReset;
-        if (s.ftype == @intFromEnum(frame.FrameType.data) and s.flags & 1 != 0) return;
-        if (s.ftype == @intFromEnum(frame.FrameType.headers) and s.flags & 1 != 0) return;
+        if (s.ftype == @backingInt(frame.FrameType.rst_stream)) return error.GoodClientReset;
+        if (s.ftype == @backingInt(frame.FrameType.data) and s.flags & 1 != 0) return;
+        if (s.ftype == @backingInt(frame.FrameType.headers) and s.flags & 1 != 0) return;
     }
 }
 
@@ -467,10 +467,10 @@ fn silentClient(gpa: std.mem.Allocator, transport: Transport, port: u16, r: *Sil
             error.Deadline => return,
             else => return err,
         } orelse return;
-        if (s.ftype == @intFromEnum(frame.FrameType.rst_stream)) {
+        if (s.ftype == @backingInt(frame.FrameType.rst_stream)) {
             r.resets += 1;
             r.last_reset_ns = nowNs();
-            if (rstCode(w) != @intFromEnum(frame.ErrorCode.cancel)) r.wrong_code += 1;
+            if (rstCode(w) != @backingInt(frame.ErrorCode.cancel)) r.wrong_code += 1;
         }
     }
 }
@@ -587,13 +587,13 @@ fn h2Upload(gpa: std.mem.Allocator, transport: Transport, port: u16, up: Upload,
                 return;
             };
             if (s.sid != 1) continue;
-            if (s.ftype == @intFromEnum(frame.FrameType.rst_stream)) {
+            if (s.ftype == @backingInt(frame.FrameType.rst_stream)) {
                 r.end = .reset;
                 r.status_or_code = rstCode(w);
                 r.elapsed_ms = (nowNs() - t0) / ms;
                 return;
             }
-            if ((s.ftype == @intFromEnum(frame.FrameType.data) or s.ftype == @intFromEnum(frame.FrameType.headers)) and s.flags & 1 != 0) {
+            if ((s.ftype == @backingInt(frame.FrameType.data) or s.ftype == @backingInt(frame.FrameType.headers)) and s.flags & 1 != 0) {
                 r.end = .answered;
                 r.elapsed_ms = (nowNs() - t0) / ms;
                 return;
@@ -726,13 +726,13 @@ fn runBodyRate(rt: *zio.Runtime, gpa: std.mem.Allocator, ep: Endpoint) !void {
     if (good.err) |err| return err;
     const fired = (counter(session_mod, "body_rate_expiries") - h2_rate_before) + (counter(h1_mod, "body_rate_expiries") - h1_rate_before);
     std.debug.print("hardening {s} body rate: drip ended {s} ({d}) after {d} ms with {d} of {d} bytes sent; honest upload ended {s} ({d}) after {d} ms with {d} bytes; body_rate_expiries +{d}\n", .{
-        @tagName(ep), @tagName(dripped.end), dripped.status_or_code, dripped.elapsed_ms, dripped.sent, drip.total,
-        @tagName(fair.end), fair.status_or_code, fair.elapsed_ms, fair.sent, fired,
+        @tagName(ep),       @tagName(dripped.end), dripped.status_or_code, dripped.elapsed_ms, dripped.sent, drip.total,
+        @tagName(fair.end), fair.status_or_code,   fair.elapsed_ms,        fair.sent,          fired,
     });
     switch (ep) {
         .h2c, .tls => {
             try std.testing.expectEqual(UploadEnd.reset, dripped.end);
-            try std.testing.expectEqual(@as(u32, @intFromEnum(frame.ErrorCode.cancel)), dripped.status_or_code);
+            try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.cancel)), dripped.status_or_code);
         },
         .h1c => {
             // Nothing final was sent before the expiry, so the client is told.
@@ -811,13 +811,13 @@ fn trickleClient(gpa: std.mem.Allocator, transport: Transport, port: u16, held: 
                 else => return err,
             } orelse return error.ClosedBeforeReset;
             if (s.sid != 1) continue;
-            if (s.ftype == @intFromEnum(frame.FrameType.rst_stream)) {
+            if (s.ftype == @backingInt(frame.FrameType.rst_stream)) {
                 r.reset = true;
                 r.code = rstCode(w);
                 r.elapsed_ms = (nowNs() - t0) / ms;
                 return;
             }
-            if (s.ftype == @intFromEnum(frame.FrameType.data)) {
+            if (s.ftype == @backingInt(frame.FrameType.data)) {
                 r.data_bytes += w.last_payload.items.len;
                 if (s.flags & 1 != 0) {
                     r.ended = true;
@@ -863,11 +863,11 @@ fn sseClient(gpa: std.mem.Allocator, transport: Transport, port: u16, r: *SseRes
     while (true) {
         const s = try w.next(deadline) orelse return error.SseClosed;
         if (s.sid != 1) continue;
-        if (s.ftype == @intFromEnum(frame.FrameType.rst_stream)) {
+        if (s.ftype == @backingInt(frame.FrameType.rst_stream)) {
             r.reset = true;
             return;
         }
-        if (s.ftype == @intFromEnum(frame.FrameType.data)) {
+        if (s.ftype == @backingInt(frame.FrameType.data)) {
             if (std.mem.indexOf(u8, w.last_payload.items, "tick") != null) r.events += 1;
             if (s.flags & 1 != 0) {
                 r.ended = true;
@@ -922,17 +922,17 @@ fn runResponseRateHeld(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Tran
     const fired = counter(conn_mod, "response_rate_resets") - resets_before;
     const rule_fired = counter(conn_mod, "response_rate_rule_resets") - rule_before;
     std.debug.print("hardening {s} response rate, {s} window: 1-byte window stream reset={} (code {d}) after {d} ms, {d} bytes taken over {d} updates; handler ended {s}; sparse SSE {d} events ended={} reset={}; response_rate_resets +{d} (rate rule +{d})\n", .{
-        @tagName(transport),                                      @tagName(held), trickle.reset, trickle.code, trickle.elapsed_ms, trickle.data_bytes, trickle.updates,
-        @tagName(@as(BigEnd, @enumFromInt(big_error.load(.acquire)))), sse.events, sse.ended, sse.reset, fired, rule_fired,
+        @tagName(transport),                                                        @tagName(held), trickle.reset, trickle.code, trickle.elapsed_ms, trickle.data_bytes, trickle.updates,
+        @tagName(@as(BigEnd, @fromBackingInt(@intCast(big_error.load(.acquire))))), sse.events,     sse.ended,     sse.reset,    fired,              rule_fired,
     });
     try std.testing.expect(trickle.reset);
     // Bytes kept moving, one at a time, so it was the rate that ended the
     // stream and not the grace without progress.
     try std.testing.expect(trickle.updates >= 2);
     try std.testing.expect(trickle.data_bytes >= @as(usize, if (held == .stream) 2 else 65_535 + 2));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(frame.ErrorCode.cancel)), trickle.code);
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.cancel)), trickle.code);
     try std.testing.expect(trickle.elapsed_ms + 50 >= response_grace_ms);
-    try std.testing.expectEqual(BigEnd.slow_consumer, @as(BigEnd, @enumFromInt(big_error.load(.acquire))));
+    try std.testing.expectEqual(BigEnd.slow_consumer, @as(BigEnd, @fromBackingInt(@intCast(big_error.load(.acquire)))));
     try std.testing.expect(sse.ended and !sse.reset);
     try std.testing.expectEqual(@as(usize, sse_events), sse.events);
     try std.testing.expectEqual(@as(u64, 1), fired);
@@ -994,7 +994,7 @@ const QueuedClient = struct {
         var seen: u8 = 0;
         while (seen != 3) {
             const s = try w.next(deadline) orelse return error.ClosedBeforeHeaders;
-            if (s.ftype != @intFromEnum(frame.FrameType.headers)) continue;
+            if (s.ftype != @backingInt(frame.FrameType.headers)) continue;
             if (s.sid == 1) seen |= 1;
             if (s.sid == 3) seen |= 2;
         }
@@ -1053,8 +1053,8 @@ fn runQueuedStall(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport
     const conns = run.server.active_connections.load(.acquire);
     wire_pump.test_hold_writes.store(false, .release);
     std.debug.print("hardening h2c bytes held in the writer: connection gone={} after {d} ms (write-byte timeout {d} ms); flush waiter ended {s}, finish waiter ended {s}\n", .{
-        conns == 0,                                                    ended_ms, write_byte_ms,
-        @tagName(@as(BigEnd, @enumFromInt(queued_end.load(.acquire)))), @tagName(@as(BigEnd, @enumFromInt(finish_end.load(.acquire)))),
+        conns == 0,                                                                  ended_ms,                                                                    write_byte_ms,
+        @tagName(@as(BigEnd, @fromBackingInt(@intCast(queued_end.load(.acquire))))), @tagName(@as(BigEnd, @fromBackingInt(@intCast(finish_end.load(.acquire))))),
     });
     try std.testing.expectEqual(@as(usize, 0), conns);
     try std.testing.expect(queued_end.load(.acquire) != 0);
@@ -1106,9 +1106,9 @@ fn exactClient(gpa: std.mem.Allocator, transport: Transport, port: u16, which: E
             else => return err,
         }) orelse return error.ServerClosed;
         if (f.sid != 1) continue;
-        if (f.ftype == @intFromEnum(frame.FrameType.rst_stream)) return error.StreamReset;
-        if (f.ftype == @intFromEnum(frame.FrameType.data)) r.data_bytes += w.last_payload.items.len;
-        if (f.flags & 1 != 0 and (f.ftype == @intFromEnum(frame.FrameType.data) or f.ftype == @intFromEnum(frame.FrameType.headers))) {
+        if (f.ftype == @backingInt(frame.FrameType.rst_stream)) return error.StreamReset;
+        if (f.ftype == @backingInt(frame.FrameType.data)) r.data_bytes += w.last_payload.items.len;
+        if (f.flags & 1 != 0 and (f.ftype == @backingInt(frame.FrameType.data) or f.ftype == @backingInt(frame.FrameType.headers))) {
             r.end_ms = (nowNs() - t0) / ms;
             return;
         }
@@ -1134,7 +1134,7 @@ fn runExact(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, whic
     while (!r.done.load(.acquire)) zio.sleep(.fromMilliseconds(5)) catch {};
     starh2.test_sleep.joinThread(th);
     std.debug.print("hardening {s} exact {s} window: {d} body bytes, END_STREAM at {?d} ms, handler ended {s}, err={?}\n", .{
-        @tagName(ep), @tagName(which), r.data_bytes, r.end_ms, @tagName(@as(BigEnd, @enumFromInt(exact_end.load(.acquire)))), r.err,
+        @tagName(ep), @tagName(which), r.data_bytes, r.end_ms, @tagName(@as(BigEnd, @fromBackingInt(@intCast(exact_end.load(.acquire))))), r.err,
     });
     if (r.err) |err| return err;
     try std.testing.expectEqual(@as(usize, if (which == .stream) exact_len else exact_conn_len), r.data_bytes);
@@ -1219,8 +1219,8 @@ fn creditClient(gpa: std.mem.Allocator, path: []const u8, r: *CreditResult) !voi
             error.Deadline, error.WouldBlock => continue,
             else => return err,
         }) orelse return error.ServerClosed;
-        if (f.ftype == @intFromEnum(frame.FrameType.data)) r.read += w.last_payload.items.len;
-        if (f.sid == 3 and f.ftype == @intFromEnum(frame.FrameType.rst_stream)) {
+        if (f.ftype == @backingInt(frame.FrameType.data)) r.read += w.last_payload.items.len;
+        if (f.sid == 3 and f.ftype == @backingInt(frame.FrameType.rst_stream)) {
             r.reset_ms = (nowNs() - t0) / ms;
             return;
         }
@@ -1555,8 +1555,8 @@ fn goodUnix(gpa: std.mem.Allocator, transport: Transport, path: []const u8) !voi
     while (true) {
         const s = try w.next(deadline) orelse return error.GoodClientClosed;
         if (s.sid != 1) continue;
-        if (s.ftype == @intFromEnum(frame.FrameType.rst_stream)) return error.GoodClientReset;
-        if ((s.ftype == @intFromEnum(frame.FrameType.data) or s.ftype == @intFromEnum(frame.FrameType.headers)) and s.flags & 1 != 0) return;
+        if (s.ftype == @backingInt(frame.FrameType.rst_stream)) return error.GoodClientReset;
+        if ((s.ftype == @backingInt(frame.FrameType.data) or s.ftype == @backingInt(frame.FrameType.headers)) and s.flags & 1 != 0) return;
     }
 }
 

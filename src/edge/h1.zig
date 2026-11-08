@@ -676,7 +676,7 @@ const fionread: c_int = switch (@import("builtin").os.tag) {
 /// must hold nothing unsent, or the half-close would cut the response.
 fn linger(self: *H1Conn, why: LingerReason) void {
     _ = linger_started.fetchAdd(1, .monotonic);
-    _ = linger_reasons[@intFromEnum(why)].fetchAdd(1, .monotonic);
+    _ = linger_reasons[@backingInt(why)].fetchAdd(1, .monotonic);
     if (self.tls != null) {
         if (self.tls_t.running()) |pump| std.debug.assert(pump.writesDrained());
     }

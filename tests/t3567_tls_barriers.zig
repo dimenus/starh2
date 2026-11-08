@@ -664,7 +664,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, hold:
     const held_waits = conn_mod.test_ack_room_waits.load(.monotonic) - waits_0;
     // Printed before the release too: a case can panic after it.
     std.debug.print("T3567-held transport={s} hold={s} n={d} overflow_while_held={d} flush_err_while_held={d} barrier_waits_while_held={d} ctrl_terminal_full={d}\n", .{
-        @tagName(transport),                                              @tagName(hold), n, held_overflow, held_err, held_waits,
+        @tagName(transport),                                             @tagName(hold), n, held_overflow, held_err, held_waits,
         conn_mod.test_ctrl_terminal_full.load(.monotonic) - term_full_0,
     });
 
@@ -690,12 +690,12 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, hold:
     std.debug.print(
         "T3567 transport={s} hold={s} n={d} overflow={d} overflow_while_held={d} flush_ok={d} flush_err={d} flush_err_while_held={d} first_err={s} barrier_waits_while_held={d} queue_refusals={d} ctrl_terminal_full={d} ended={d} rst={d} unresolved={d} goaway={} goaway_code={d} server_closed={} client_err={s}\n",
         .{
-            @tagName(transport),        @tagName(hold),             n,
-            overflow,                   held_overflow,              flush_ok.load(.acquire),
-            flush_err.load(.acquire),   held_err,                   err_name,
-            held_waits,                 refusals,                   term_full,
-            ended,                      reset,                      n - ended - reset,
-            c.goaway,                   c.goaway_code,              server_closed,
+            @tagName(transport),                   @tagName(hold), n,
+            overflow,                              held_overflow,  flush_ok.load(.acquire),
+            flush_err.load(.acquire),              held_err,       err_name,
+            held_waits,                            refusals,       term_full,
+            ended,                                 reset,          n - ended - reset,
+            c.goaway,                              c.goaway_code,  server_closed,
             if (c.err) |e| @errorName(e) else "-",
         },
     );
@@ -780,7 +780,7 @@ fn runSpinCase(rt: *zio.Runtime, gpa: std.mem.Allocator, n: usize, keepers: usiz
     }.f);
     flush_gate.store(true, .release);
     errdefer std.debug.print("T3567-spin timed out: {d} of {d} one-shot barriers done; barrier_waits={d} overflow={d}\n", .{
-        spin_done.load(.acquire),                                    n - keepers,
+        spin_done.load(.acquire),                                n - keepers,
         conn_mod.test_ack_room_waits.load(.monotonic) - waits_0, tls_edge.tls_write_overflow.load(.monotonic) - overflow_0,
     });
     try waitFor("every one-shot barrier to get through while the keepers flush", n - keepers, struct {

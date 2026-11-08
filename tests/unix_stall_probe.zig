@@ -280,9 +280,8 @@ fn runProbe(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, vari
     serving = false;
 
     std.debug.print("UNIX-STALL os={s} socket={s} transport={s} variant={s} plateau_unread={d} plateau_big={d} moved_samples={d} worst_unread={d} worst_big={d} ticked={d} recovered_bytes={d} tick_answered={} eof={} client_err={s}\n", .{
-        @tagName(@import("builtin").os.tag), @tagName(socket), @tagName(transport), @tagName(variant), plateau.unread, plateau.big, moved,
-        worst.unread,                         worst.big,           ticked,            recovered,      c.tick_answered, c.eof,
-        if (c.err) |e| @errorName(e) else "-",
+        @tagName(@import("builtin").os.tag), @tagName(socket), @tagName(transport), @tagName(variant), plateau.unread,  plateau.big, moved,
+        worst.unread,                        worst.big,        ticked,              recovered,         c.tick_answered, c.eof,       if (c.err) |e| @errorName(e) else "-",
     });
     if (c.err) |e| return e;
     if (socket == .tcp) return;

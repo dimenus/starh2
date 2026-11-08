@@ -420,4 +420,3 @@ pub const Wire = struct {
         }
     }
 };
-

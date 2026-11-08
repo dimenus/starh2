@@ -190,9 +190,10 @@ fn mainTask(init: std.process.Init, io: std.Io) !void {
         std.debug.print("h1-smoke: tls --http1.1 /hello 200\n", .{});
 
         const ka_tls = try curl(gpa, io, &.{
-            "curl", "-sk", "--http1.1",
-            "-o", "/dev/null", "-o", "/dev/null",
-            "-w", "n=%{num_connects} c=%{http_code}\n", url, url,
+            "curl",      "-sk",       "--http1.1",
+            "-o",        "/dev/null", "-o",
+            "/dev/null", "-w",        "n=%{num_connects} c=%{http_code}\n",
+            url,         url,
         });
         defer gpa.free(ka_tls.stdout);
         defer gpa.free(ka_tls.stderr);
@@ -203,12 +204,11 @@ fn mainTask(init: std.process.Init, io: std.Io) !void {
         var sig_url_buf: [128]u8 = undefined;
         const sig_url = std.fmt.bufPrint(&sig_url_buf, "https://127.0.0.1:{d}/signals", .{port}) catch abort("url", .{});
         const ka_post_tls = try curl(gpa, io, &.{
-            "curl", "-sk", "--http1.1",
-            "-o", "/dev/null", "-o", "/dev/null",
-            "-w", "n=%{num_connects} c=%{http_code}\n",
-            "-H", "Content-Type: application/json",
-            "--data-binary", "{\"nonce\":\"x\",\"sequence\":1}",
-            sig_url, sig_url,
+            "curl",                             "-sk",                            "--http1.1",
+            "-o",                               "/dev/null",                      "-o",
+            "/dev/null",                        "-w",                             "n=%{num_connects} c=%{http_code}\n",
+            "-H",                               "Content-Type: application/json", "--data-binary",
+            "{\"nonce\":\"x\",\"sequence\":1}", sig_url,                          sig_url,
         });
         defer gpa.free(ka_post_tls.stdout);
         defer gpa.free(ka_post_tls.stderr);
@@ -279,8 +279,10 @@ fn mainTask(init: std.process.Init, io: std.Io) !void {
         const url2 = std.fmt.bufPrint(&url2_buf, "http://127.0.0.1:{d}/hello", .{port}) catch abort("url", .{});
         const ka = try curl(gpa, io, &.{
             "curl", "-s",
-            "-o", "/dev/null", "-o", "/dev/null",
-            "-w", "n=%{num_connects} c=%{http_code}\n", url, url2,
+            "-o",   "/dev/null",
+            "-o",   "/dev/null",
+            "-w",   "n=%{num_connects} c=%{http_code}\n",
+            url,    url2,
         });
         defer gpa.free(ka.stdout);
         defer gpa.free(ka.stderr);
@@ -291,12 +293,13 @@ fn mainTask(init: std.process.Init, io: std.Io) !void {
         var sig_url_buf: [128]u8 = undefined;
         const sig_url = std.fmt.bufPrint(&sig_url_buf, "http://127.0.0.1:{d}/signals", .{port}) catch abort("url", .{});
         const ka_post = try curl(gpa, io, &.{
-            "curl", "-s",
-            "-o", "/dev/null", "-o", "/dev/null",
-            "-w", "n=%{num_connects} c=%{http_code}\n",
-            "-H", "Content-Type: application/json",
+            "curl",          "-s",
+            "-o",            "/dev/null",
+            "-o",            "/dev/null",
+            "-w",            "n=%{num_connects} c=%{http_code}\n",
+            "-H",            "Content-Type: application/json",
             "--data-binary", "{\"nonce\":\"x\",\"sequence\":1}",
-            sig_url, sig_url,
+            sig_url,         sig_url,
         });
         defer gpa.free(ka_post.stdout);
         defer gpa.free(ka_post.stderr);

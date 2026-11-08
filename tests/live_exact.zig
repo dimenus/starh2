@@ -202,7 +202,7 @@ fn rstBlockHandler(_: *anyopaque, req: *const starh2.Request, resp: *starh2.Resp
         var peer: u32 = 0;
         if (err == error.PeerReset) {
             if (resp.slotTerminal()) |c| switch (c) {
-                .peer_reset => |code| peer = @intFromEnum(code),
+                .peer_reset => |code| peer = @backingInt(code),
                 else => {},
             };
         }
@@ -568,7 +568,7 @@ fn runExactRstWhileCapWait(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: 
     const evt = try result_ch.waitOne(3000);
     try std.testing.expectEqual(@as(u8, 3), evt.code); // PeerReset while capacity-waiting
     const frame = starh2.core.frame;
-    try std.testing.expectEqual(@as(u32, @intFromEnum(frame.ErrorCode.cancel)), evt.peer_code);
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.cancel)), evt.peer_code);
     try waitAccountingZero(&server, 5_000);
 }
 
@@ -629,7 +629,7 @@ fn runExactRst(rt: *zio.Runtime, gpa: std.mem.Allocator, stream_id: u31) !void {
     stream.close();
     try std.testing.expectEqual(@as(u8, 3), evt.code); // PeerReset only
     const frame = starh2.core.frame;
-    try std.testing.expectEqual(@as(u32, @intFromEnum(frame.ErrorCode.cancel)), evt.peer_code);
+    try std.testing.expectEqual(@as(u32, @backingInt(frame.ErrorCode.cancel)), evt.peer_code);
     try waitAccountingZero(&server, 5_000);
 }
 

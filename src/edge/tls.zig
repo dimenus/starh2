@@ -645,7 +645,7 @@ pub const Conn = struct {
             // still at `in_head`.
             if (clientHelloOffersTls13(self.in_buf[self.in_head..self.in_fill]) == false) alert = .protocol_version;
         }
-        const payload = [2]u8{ alert_level_fatal, @intFromEnum(alert) };
+        const payload = [2]u8{ alert_level_fatal, @backingInt(alert) };
         // Record header: alert (21), legacy version 0x0303, length 2.
         const plain_record = [7]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, payload[0], payload[1] };
         const record: []const u8 = if (flight_sent)
@@ -870,7 +870,6 @@ pub const Conn = struct {
         self.in_fill += n;
     }
 };
-
 
 /// One task owns encrypt and decrypt. The cipher state is not thread-safe;
 /// this is the share-nothing owner.
@@ -1723,9 +1722,7 @@ pub const Pump = struct {
         self.cq.cancelAll(.keep);
         while (self.cq.next()) |_| {}
     }
-
 };
-
 
 fn nowNs(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);

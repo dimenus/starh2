@@ -21,7 +21,7 @@ pub fn expectDeath() void {
     // hands the dump to the helper, which records it; a process that is not
     // dumpable is not dumped at all.
     if (builtin.os.tag == .linux) {
-        const rc = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+        const rc = std.os.linux.prctl(@backingInt(std.os.linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
         if (std.os.linux.errno(rc) != .SUCCESS) std.debug.print("no_core: prctl(PR_SET_DUMPABLE, 0) failed; this death may write a core\n", .{});
     }
 }

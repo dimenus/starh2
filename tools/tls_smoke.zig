@@ -226,11 +226,9 @@ fn fetch(gpa: std.mem.Allocator, io: std.Io, port: u16, path: []const u8) !Fetch
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}{s}", .{ port, path });
     const res = try std.process.run(gpa, io, .{ .argv = &.{
-        "curl",     "-s",  "-k",  "--http2",
-        "--max-time", "30",
-        url,
-        "-o",       "/dev/null",
-        "-w",       "%{http_version} %{http_code} %{size_download}",
+        "curl",       "-s", "-k",                                            "--http2",
+        "--max-time", "30", url,                                             "-o",
+        "/dev/null",  "-w", "%{http_version} %{http_code} %{size_download}",
     } });
     defer gpa.free(res.stdout);
     defer gpa.free(res.stderr);
@@ -286,7 +284,7 @@ fn mainTask(init: std.process.Init, io: std.Io) !void {
     // machine cannot collide on a fixed port.
     var child = std.process.spawn(io, .{
         .argv = &.{
-            cfg.bin, "--mode", "tls", "--bind", "127.0.0.1:0",
+            cfg.bin,  "--mode", "tls",   "--bind", "127.0.0.1:0",
             "--cert", cfg.cert, "--key", cfg.key,
         },
         .stdout = .pipe,

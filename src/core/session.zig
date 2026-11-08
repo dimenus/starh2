@@ -1437,7 +1437,7 @@ pub const Session = struct {
                     try self.failConnection(if (hdr.length != 4) .frame_size_error else .protocol_error);
                     return;
                 }
-                const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
+                const code: frame.ErrorCode = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[0..4], .big)));
                 if (self.streams.getPtr(hdr.stream_id)) |s| {
                     // A final HEADERS still queued owes nothing now: the peer
                     // has reset the stream, whichever branch it takes here.
@@ -1764,7 +1764,7 @@ pub const Session = struct {
         }
         var i: usize = 0;
         while (i + 6 <= payload.len) : (i += 6) {
-            const id: frame.SettingId = @enumFromInt(std.mem.readInt(u16, payload[i..][0..2], .big));
+            const id: frame.SettingId = @fromBackingInt(@intCast(std.mem.readInt(u16, payload[i..][0..2], .big)));
             const value = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
             switch (id) {
                 .enable_push => if (value > 1) {
@@ -2766,16 +2766,18 @@ pub const Session = struct {
         // above, so a push cannot fail.
         for (bufs[0..n_frames], 0..) |out, k| {
             const flags = frame.FrameHeader.decode(out[0..frame.FRAME_HEADER_LEN]).flags;
-            self.pushIntent(.{ .outbound_frame = .{
-                .typ = if (k == 0) .headers else .continuation,
-                .payload = out,
-                .stream_id = stream_id,
-                .flags = flags,
-                .ticket = if (k == 0) ticket else .none,
-                // A final HEADERS owes an RST if the edge refuses it.
-                .owes_rst_if_refused = k == 0 and end_stream,
-                .refusal_code = refusal_code,
-            } }) catch unreachable;
+            self.pushIntent(.{
+                .outbound_frame = .{
+                    .typ = if (k == 0) .headers else .continuation,
+                    .payload = out,
+                    .stream_id = stream_id,
+                    .flags = flags,
+                    .ticket = if (k == 0) ticket else .none,
+                    // A final HEADERS owes an RST if the edge refuses it.
+                    .owes_rst_if_refused = k == 0 and end_stream,
+                    .refusal_code = refusal_code,
+                },
+            }) catch unreachable;
         }
         built = 0;
         if (self.streams.getPtr(stream_id)) |s| {
@@ -2971,7 +2973,8 @@ test "response header bound: a block of exactly response_header_bytes is queued,
     var session = try headerBoundSession(gpa, gpa, limits);
     defer session.deinit();
 
-    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
+    try std.testing.expectError(error.HeadersTooLarge, session.applyCommand(.{ .respond_headers = .{
+        .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &over,
@@ -3072,7 +3075,8 @@ test "respond_headers after RST is StreamClosed" {
         };
     }
     try std.testing.expect(session.streams.get(1) == null);
-    try std.testing.expectError(error.StreamClosed, session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
+    try std.testing.expectError(error.StreamClosed, session.applyCommand(.{ .respond_headers = .{
+        .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &.{},
@@ -3275,7 +3279,7 @@ test "the preface advertises the configured stream limit" {
             var off: usize = frame.FRAME_HEADER_LEN;
             while (off + 6 <= f.payload.len) : (off += 6) {
                 const id = std.mem.readInt(u16, f.payload[off..][0..2], .big);
-                if (id == @intFromEnum(frame.SettingId.max_concurrent_streams)) {
+                if (id == @backingInt(frame.SettingId.max_concurrent_streams)) {
                     advertised = std.mem.readInt(u32, f.payload[off + 2 ..][0..4], .big);
                 }
             }
@@ -3371,7 +3375,8 @@ test "SETTINGS_INITIAL_WINDOW_SIZE negative send window holds queued DATA (real 
             else => {},
         };
     }
-    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
+    try session.applyCommand(.{ .respond_headers = .{
+        .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &.{},
@@ -3619,7 +3624,8 @@ test "respond HEADERS allocates only the final frame" {
 
     const extra = [_]hpack_mod.HeaderField{.{ .name = "content-type", .value = "text/plain" }};
     const before = counting.allocations;
-    try session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
+    try session.applyCommand(.{ .respond_headers = .{
+        .ticket = .none,
         .stream_id = 1,
         .status = 200,
         .headers = &extra,

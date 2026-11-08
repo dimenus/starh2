@@ -443,13 +443,13 @@ const Cadence = struct {
 
     fn reset(self: *Cadence) void {
         inline for (.{
-            &self.loops,         &self.sleeps,         &self.skipped,
-            &self.writes,        &self.first_n,        &self.inter_n,
-            &self.late_n,        &self.late_ge1ms,     &self.sleep_req_ns,
-            &self.sleep_ns,      &self.late_ns,        &self.write_ns,
-            &self.yield_ns,      &self.skip_behind_ns, &self.first_ns,
-            &self.inter_ns,      &self.start_sse_n,    &self.start_sse_ns,
-            &self.start_sse_max, &self.entered_n,     &self.first_wait_in_n,
+            &self.loops,            &self.sleeps,         &self.skipped,
+            &self.writes,           &self.first_n,        &self.inter_n,
+            &self.late_n,           &self.late_ge1ms,     &self.sleep_req_ns,
+            &self.sleep_ns,         &self.late_ns,        &self.write_ns,
+            &self.yield_ns,         &self.skip_behind_ns, &self.first_ns,
+            &self.inter_ns,         &self.start_sse_n,    &self.start_sse_ns,
+            &self.start_sse_max,    &self.entered_n,      &self.first_wait_in_n,
             &self.first_wait_out_n,
         }) |f| f.store(0, .release);
     }
@@ -495,8 +495,8 @@ fn printTaskDiag(w: *std.Io.Writer, label: []const u8, h: usize) !void {
     const st = zio.debugTaskStateByte(h);
     const ex = zio.debugTaskExec(h);
     try w.print("{s} task=0x{x} tag={d} awaken={d} exec={d} is_current={d} ring={d} overflow={d} exec_pops={d} exec_current=0x{x}\n", .{
-        label,                     h,                     st & 7, (st >> 3) & 1, ex & 0xff, (ex >> 8) & 1,
-        (ex >> 16) & 0xffffffff,   ex >> 48,              zio.debugTaskExecPops(h), zio.debugTaskExecCurrent(h),
+        label,                   h,        st & 7,                   (st >> 3) & 1,               ex & 0xff, (ex >> 8) & 1,
+        (ex >> 16) & 0xffffffff, ex >> 48, zio.debugTaskExecPops(h), zio.debugTaskExecCurrent(h),
     });
 }
 
@@ -517,11 +517,11 @@ fn stuckHandler(_: *anyopaque, _: *const starh2.Request, resp: *starh2.CompleteR
         // handler ends.
         const st = conn_mod.diagHandlerState(@ptrFromInt(ctx)) orelse continue;
         w.print("stage={d} sid={d} conn=0x{x} wait={s} waited_ms={d} sched_term={d} sched_ord={d} sched_framed={d} sched_pending={d} sched_emits={d} stash_full={?} session_held={} live_task_handlers={d} conn_send_avail={d} actor_turns={d} actor_where={s} tls_carried={} tls_write_ch={d} tls_send_armed={} tls_recv_armed={} tls_pending_read={} tls_pending_cipher={}\n", .{
-            stage,                     st.stream_id,          st.conn_addr,        @tagName(st.wait),       st.waited_ms,
-            st.sched_terminal_len,     st.sched_ordinary_len, st.sched_framed_len, st.sched_active_pending, st.sched_emits_total,
-            st.tls_stash_full,         st.session_held,       st.live_task_handlers,
-            st.conn_send_available,    st.actor_turns,        @tagName(st.actor_where), st.tls_carried,      st.tls_write_ch_len,     st.tls_send_armed,
-            st.tls_recv_armed,         st.tls_pending_read,   st.tls_pending_cipher,
+            stage,                    st.stream_id,          st.conn_addr,          @tagName(st.wait),       st.waited_ms,
+            st.sched_terminal_len,    st.sched_ordinary_len, st.sched_framed_len,   st.sched_active_pending, st.sched_emits_total,
+            st.tls_stash_full,        st.session_held,       st.live_task_handlers, st.conn_send_available,  st.actor_turns,
+            @tagName(st.actor_where), st.tls_carried,        st.tls_write_ch_len,   st.tls_send_armed,       st.tls_recv_armed,
+            st.tls_pending_read,      st.tls_pending_cipher,
         }) catch break;
         printTaskDiag(&w, "  handler", e.task.load(.acquire)) catch break;
         printTaskDiag(&w, "  actor", st.actor_task) catch break;
@@ -1217,7 +1217,7 @@ fn writeTopHolders(w: *std.Io.Writer, table: *starh2.edge.accounts.Table, n: usi
     for (live[0..@min(n, live.len)], 0..) |e, i| {
         try w.print("{s}{{\"client\":\"{f}\",\"holders\":{d}", .{ if (i == 0) "" else ",", starh2.edge.accounts.fmtKey(e.key), e.holders });
         for (e.counts, 0..) |v, ri| {
-            try w.print(",\"{s}\":{d}", .{ @tagName(@as(starh2.edge.accounts.Resource, @enumFromInt(ri))), v });
+            try w.print(",\"{s}\":{d}", .{ @tagName(@as(starh2.edge.accounts.Resource, @fromBackingInt(@intCast(ri)))), v });
         }
         try w.writeAll("}");
     }
@@ -1351,7 +1351,7 @@ fn disableThp() !void {
         std.debug.print("--no-thp is Linux only\n", .{});
         return error.UnsupportedOs;
     }
-    const rc = std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_THP_DISABLE), 1, 0, 0, 0);
+    const rc = std.os.linux.prctl(@backingInt(std.os.linux.PR.SET_THP_DISABLE), 1, 0, 0, 0);
     if (std.os.linux.errno(rc) != .SUCCESS) {
         std.debug.print("prctl(PR_SET_THP_DISABLE) failed: {t}\n", .{std.os.linux.errno(rc)});
         return error.ThpDisableFailed;
@@ -1616,7 +1616,7 @@ fn serveMain(rt: *zio.Runtime, gpa: std.mem.Allocator, process_args: std.process
     if (args.allow_ptrace) {
         if (comptime @import("builtin").os.tag != .linux) return error.AllowPtraceIsLinuxOnly;
         const linux = std.os.linux;
-        const rc = linux.prctl(@intFromEnum(linux.PR.SET_PTRACER), linux.PR.SET_PTRACER_ANY, 0, 0, 0);
+        const rc = linux.prctl(@backingInt(linux.PR.SET_PTRACER), linux.PR.SET_PTRACER_ANY, 0, 0, 0);
         if (linux.errno(rc) != .SUCCESS) return error.PrctlSetPtracerFailed;
     }
     var balancer_storage: ?starh2.Balancer = if (args.conn_balance) try starh2.Balancer.init(gpa, rt) else null;

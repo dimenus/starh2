@@ -190,32 +190,32 @@ pub const Encoder = struct {
     }
 
     /// One-shot compress. Input is fed in ≤ `process_chunk` steps so encoder
-/// memory stays window-bounded and does not scale with body size.
-///
-/// Non-final chunks use FLUSH (not bare PROCESS): at quality ≥ 4 brotli
-/// accumulates commands until a full metablock (~1 MiB at w19), and
-/// `commands_` + `GetBrotliStorage(2*metablock)` alone exceed a 4 MiB
-/// context budget. Flushing each chunk keeps those buffers chunk-sized.
-/// A single multi-MiB CompressStream call also made GetBrotliStorage
-/// allocate input-proportional scratch and exit/OOM under the budget.
-pub const process_chunk: usize = 64 * 1024;
+    /// memory stays window-bounded and does not scale with body size.
+    ///
+    /// Non-final chunks use FLUSH (not bare PROCESS): at quality ≥ 4 brotli
+    /// accumulates commands until a full metablock (~1 MiB at w19), and
+    /// `commands_` + `GetBrotliStorage(2*metablock)` alone exceed a 4 MiB
+    /// context budget. Flushing each chunk keeps those buffers chunk-sized.
+    /// A single multi-MiB CompressStream call also made GetBrotliStorage
+    /// allocate input-proportional scratch and exit/OOM under the budget.
+    pub const process_chunk: usize = 64 * 1024;
 
-pub fn compressAll(self: *Encoder, input: []const u8, gpa: std.mem.Allocator) EncodeError![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var off: usize = 0;
-    while (off < input.len) {
-        const end = @min(off + process_chunk, input.len);
-        const last = end == input.len;
-        try self.compress(input[off..end], if (last) .finish else .flush, &out, gpa);
-        off = end;
+    pub fn compressAll(self: *Encoder, input: []const u8, gpa: std.mem.Allocator) EncodeError![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        var off: usize = 0;
+        while (off < input.len) {
+            const end = @min(off + process_chunk, input.len);
+            const last = end == input.len;
+            try self.compress(input[off..end], if (last) .finish else .flush, &out, gpa);
+            off = end;
+        }
+        if (input.len == 0) {
+            try self.compress(&.{}, .finish, &out, gpa);
+        }
+        return try out.toOwnedSlice(gpa);
     }
-    if (input.len == 0) {
-        try self.compress(&.{}, .finish, &out, gpa);
-    }
-    return try out.toOwnedSlice(gpa);
-}
-    };
+};
 
 pub const Decoder = struct {
     state: *c.BrotliDecoderState,

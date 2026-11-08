@@ -83,10 +83,7 @@ pub fn acceptDisposition(err: anyerror) AcceptDisposition {
     return switch (err) {
         error.Canceled => .cancel,
         error.ConnectionAborted => .retry,
-        error.WouldBlock,
-        error.ProcessFdQuotaExceeded,
-        error.SystemFdQuotaExceeded,
-        error.SystemResources => .backoff,
+        error.WouldBlock, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => .backoff,
         else => .fail,
     };
 }

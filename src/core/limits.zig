@@ -589,13 +589,13 @@ pub const Limits = struct {
     /// resident cap; its use is the bytes it holds.
     pub fn shares(self: Limits) accounts.Shares {
         var s: accounts.Shares = undefined;
-        s[@intFromEnum(accounts.Resource.connections)] = .of(self.max_connections);
-        s[@intFromEnum(accounts.Resource.handshakes)] = .of(self.concurrent_tls_handshakes);
-        s[@intFromEnum(accounts.Resource.streams)] = .of(self.max_streams_per_server);
-        s[@intFromEnum(accounts.Resource.task_handlers)] = .of(self.max_task_handlers);
-        s[@intFromEnum(accounts.Resource.request_bytes)] = .of(self.request_bytes_per_server);
-        s[@intFromEnum(accounts.Resource.outbound_bytes)] = .of(self.outbound_bytes_per_server);
-        s[@intFromEnum(accounts.Resource.compression)] = .of(self.compression_contexts_per_server);
+        s[@backingInt(accounts.Resource.connections)] = .of(self.max_connections);
+        s[@backingInt(accounts.Resource.handshakes)] = .of(self.concurrent_tls_handshakes);
+        s[@backingInt(accounts.Resource.streams)] = .of(self.max_streams_per_server);
+        s[@backingInt(accounts.Resource.task_handlers)] = .of(self.max_task_handlers);
+        s[@backingInt(accounts.Resource.request_bytes)] = .of(self.request_bytes_per_server);
+        s[@backingInt(accounts.Resource.outbound_bytes)] = .of(self.outbound_bytes_per_server);
+        s[@backingInt(accounts.Resource.compression)] = .of(self.compression_contexts_per_server);
         return s;
     }
 

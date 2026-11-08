@@ -132,7 +132,6 @@ pub const ControlPool = struct {
     pub fn shouldForceData(self: *const ControlPool) bool {
         return self.controls_since_data >= CONTROL_BEFORE_DATA;
     }
-
 };
 
 const test_terminal_entries: usize = 16;

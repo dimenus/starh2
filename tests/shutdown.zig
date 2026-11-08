@@ -95,7 +95,7 @@ const Client = struct {
                     error.Deadline, error.WouldBlock => continue,
                     else => return,
                 } orelse return;
-                if (s.ftype == @intFromEnum(starh2.core.frame.FrameType.ping) and s.flags & 1 == 0) {
+                if (s.ftype == @backingInt(starh2.core.frame.FrameType.ping) and s.flags & 1 == 0) {
                     var ping: [17]u8 = undefined;
                     (starh2.core.frame.FrameHeader{ .length = 8, .type = .ping, .flags = .{ .end_stream = true }, .stream_id = 0 }).encode(ping[0..9]);
                     @memcpy(ping[9..], w.last_payload.items[0..8]);

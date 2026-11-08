@@ -420,7 +420,7 @@ test "identity: 127.0.0.1 and ::1 are two clients; the IPv6 one is its /64 and i
 // ---------------------------------------------------------------------------
 // PROXY v2 on h2c and h1c.
 
-const trusted_loopback = [_]proxy.Cidr{ .{ .addr = .{ .ip4 = .{ 127, 0, 0, 1 } }, .prefix_bits = 32 } };
+const trusted_loopback = [_]proxy.Cidr{.{ .addr = .{ .ip4 = .{ 127, 0, 0, 1 } }, .prefix_bits = 32 }};
 
 /// A TCP endpoint behind a PROXY v2 proxy at one of `trusted`, keyed by the
 /// header's source.
@@ -1268,7 +1268,7 @@ fn soakPlain(ctx: *SoakCtx, transport: Transport) void {
 
 fn soakOne(ctx: *SoakCtx, transport: Transport, r: std.Random) !void {
     const gpa = ctx.gpa;
-    const port = ctx.ports[@intFromEnum(transport)];
+    const port = ctx.ports[@backingInt(transport)];
     const s = try connect(try zio.net.IpAddress.parseIp4("127.0.0.1", port));
     _ = ctx.stats.connections.fetchAdd(1, .monotonic);
     var closed = false;
@@ -1333,7 +1333,7 @@ fn soakTls(ctx: *SoakCtx) void {
 
 fn soakTlsOne(ctx: *SoakCtx, r: std.Random) !void {
     const gpa = ctx.gpa;
-    const w = try wire_client.Wire.connect(gpa, .tls, ctx.ports[@intFromEnum(Transport.tls)]);
+    const w = try wire_client.Wire.connect(gpa, .tls, ctx.ports[@backingInt(Transport.tls)]);
     defer w.close();
     _ = ctx.stats.connections.fetchAdd(1, .monotonic);
     try w.handshake();
@@ -1374,7 +1374,7 @@ fn soakRound(rt: *zio.Runtime, ctx: *SoakCtx, workers: usize) !void {
     for (0..workers) |i| {
         ctxs[i] = ctx.*;
         ctxs[i].seed = ctx.seed *% 31 +% i;
-        const t: Transport = @enumFromInt(i % 4);
+        const t: Transport = @fromBackingInt(@intCast(i % 4));
         if (t == .tls) {
             tlsh[nt] = try zio.spawnBlocking(soakTls, .{&ctxs[i]});
             nt += 1;
@@ -1435,10 +1435,10 @@ fn soak(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     last.join() catch {};
     const st = rig.server.clients.stats();
     std.debug.print("accounts soak: {d} connections, {d} resets, {d} closes, {d} GOAWAYs, {d} stream resets, {d} client errors; table: {d} inserts ({d} reuses), {d} removals, {d} live, {d} quarantined, {d} underflows, {d} stale, {d} insert failures\n", .{
-        stats.connections.load(.acquire), stats.resets.load(.acquire),        stats.closes.load(.acquire), stats.goaways.load(.acquire),
-        stats.stream_resets.load(.acquire), stats.errors.load(.acquire),     st.inserts,                  st.reuses,
-        st.removals,                       st.live,                           st.quarantined,              st.underflows,
-        st.stale,                          st.insert_failures,
+        stats.connections.load(.acquire),   stats.resets.load(.acquire), stats.closes.load(.acquire), stats.goaways.load(.acquire),
+        stats.stream_resets.load(.acquire), stats.errors.load(.acquire), st.inserts,                  st.reuses,
+        st.removals,                        st.live,                     st.quarantined,              st.underflows,
+        st.stale,                           st.insert_failures,
     });
     stats.printErrors();
     // The soak did the work.
@@ -1512,14 +1512,14 @@ fn soakRefusals(rt: *zio.Runtime, gpa: std.mem.Allocator) !void {
     const st = rig.server.clients.stats();
     const t = &rig.server.clients;
     std.debug.print("accounts refusal soak: {d} connections, {d} client errors; refused by share: {d} connections, {d} handshakes, {d} streams, {d} task handlers; by bucket: {d} connection starts, {d} handshake starts; table: {d} inserts, {d} removals, {d} rate-only, {d} evictions, {d} live, {d} quarantined, {d} underflows, {d} stale\n", .{
-        stats.connections.load(.acquire),  stats.errors.load(.acquire),
-        t.shareRefusals(.connections),     t.shareRefusals(.handshakes),
-        t.shareRefusals(.streams),         t.shareRefusals(.task_handlers),
-        st.rate_refusals[0],               st.rate_refusals[1],
-        st.inserts,                        st.removals,
-        st.rate_only,                      st.evictions,
-        st.live,                           st.quarantined,
-        st.underflows,                     st.stale,
+        stats.connections.load(.acquire), stats.errors.load(.acquire),
+        t.shareRefusals(.connections),    t.shareRefusals(.handshakes),
+        t.shareRefusals(.streams),        t.shareRefusals(.task_handlers),
+        st.rate_refusals[0],              st.rate_refusals[1],
+        st.inserts,                       st.removals,
+        st.rate_only,                     st.evictions,
+        st.live,                          st.quarantined,
+        st.underflows,                    st.stale,
     });
     stats.printErrors();
     // The instrument fired: every refusal kind this soak is built to drive.

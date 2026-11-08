@@ -237,7 +237,6 @@ test "admission: a TLS client queued behind a full handshake limit is served whe
     };
 }
 
-
 fn h1Limits() starh2.Limits {
     var limits = starh2.Limits.defaults;
     limits.max_connections = 1;

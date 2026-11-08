@@ -264,7 +264,7 @@ fn readAlertRecord(stream: zio.net.Stream) ![7]u8 {
 }
 
 fn alertRecord(alert: tls_edge.Alert) [7]u8 {
-    return .{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, @intFromEnum(alert) };
+    return .{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, @backingInt(alert) };
 }
 
 /// tls.zig's client offering only `alpn`, kept so the test can hand it the

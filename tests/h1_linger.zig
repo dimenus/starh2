@@ -130,7 +130,7 @@ const Lingers = struct {
     }
 
     fn of(self: Lingers, why: Reason) u64 {
-        return self.reasons[@intFromEnum(why)];
+        return self.reasons[@backingInt(why)];
     }
 };
 
@@ -318,8 +318,8 @@ fn rstCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport) !void {
     while (rig.connections() != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
     const l = Lingers.now().since(l0);
     std.debug.print("h1 linger RST case ({s}): body bytes sent {d} in 300 ms, send error {?}; SO_ERROR after {d}; read {d} bytes, status {d}, complete {}; then eof {} reset {} timed out {} after {d} ms; connections now {d}; err {?}\n", .{
-        @tagName(tr), r.sent,          r.send_err,       r.so_error,  r.read.bytes, r.read.status, r.read.complete,
-        r.read.eof,   r.read.reset,    r.read.timed_out, r.end_ms,    rig.connections(), r.err,
+        @tagName(tr), r.sent,       r.send_err,       r.so_error, r.read.bytes,      r.read.status, r.read.complete,
+        r.read.eof,   r.read.reset, r.read.timed_out, r.end_ms,   rig.connections(), r.err,
     });
     try std.testing.expect(r.err == null);
     try expectExactly("the status", r.read.status, 413);
@@ -552,7 +552,7 @@ fn otherCase(rt: *zio.Runtime, gpa: std.mem.Allocator, tr: Transport, how: Other
     while (rig.connections() != 0 and nowNs() < d) zio.sleep(.fromMilliseconds(2)) catch {};
     const l = Lingers.now().since(l0);
     std.debug.print("h1 linger {s} ({s}): status {d}, complete {}, bytes {d}; then eof {} reset {}; send error {?}; lingered {d} (request_unread {d}, unconsumed {d}, queued {d}, queued_unknown {d}); err {?}\n", .{
-        @tagName(how), @tagName(tr), r.read.status, r.read.complete, r.read.bytes, r.read.eof, r.read.reset, r.send_err, l.started,
+        @tagName(how),         @tagName(tr),      r.read.status, r.read.complete,       r.read.bytes, r.read.eof, r.read.reset, r.send_err, l.started,
         l.of(.request_unread), l.of(.unconsumed), l.of(.queued), l.of(.queued_unknown), r.err,
     });
     try std.testing.expect(r.err == null);

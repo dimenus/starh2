@@ -559,7 +559,8 @@ test "regression: >256 sequential streams reuse concurrency on same session" {
             }
         }
         if (respond_sid) |rsid| {
-            session.applyCommand(.{ .respond_headers = .{ .ticket = .none,
+            session.applyCommand(.{ .respond_headers = .{
+                .ticket = .none,
                 .stream_id = rsid,
                 .status = 200,
                 .headers = &.{},
@@ -588,7 +589,6 @@ test "hpack: a request allocation that fails while decoding is OutOfMemory, not 
         try std.testing.expectError(error.OutOfMemory, result);
     }
 }
-
 
 test "raised request_body_bytes: 413 on content-length and on cap+1" {
     const session_mod = starh2.core.session;

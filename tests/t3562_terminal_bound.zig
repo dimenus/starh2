@@ -809,7 +809,7 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
             abort_gate.store(true, .release);
             waitFor("every DATA handler to abort", atLeast(&aborted, writers), reached) catch |err| {
                 std.debug.print("T3562-abort-timeout aborted={d} of {d} terminal_full={d} ring_high={d}\n", .{
-                    aborted.load(.acquire),                                  writers,
+                    aborted.load(.acquire),                                     writers,
                     conn_mod.test_ctrl_terminal_full.load(.monotonic) - full_0, conn_mod.test_terminal_ring_high.load(.acquire),
                 });
                 return err;
@@ -911,10 +911,10 @@ fn runCase(rt: *zio.Runtime, gpa: std.mem.Allocator, transport: Transport, scena
 
     const full = conn_mod.test_ctrl_terminal_full.load(.monotonic) - full_0;
     std.debug.print("T3562 transport={s} scenario={s} m={d} t={d} ring_high={d} terminal_full={d} rst_paused={d} rst_total={d} goaways={d} goaway_code={d} eof={} close_ms={d} client_err={s} data_frames={d} headers_frames={d}\n", .{
-        @tagName(transport),                             @tagName(scenario), m,          t_frames,
-        conn_mod.test_terminal_ring_high.load(.acquire), full,               rst_paused, c.rst_total,
-        c.goaways,                                       c.goaway_code,      c.eof,      if (bound_ns != 0 and c.eof_ns > bound_ns) (c.eof_ns - bound_ns) / std.time.ns_per_ms else 0,
-        if (c.err) |e| @errorName(e) else "-",          c.frames[0],        c.frames[1],
+        @tagName(transport),                             @tagName(scenario), m,           t_frames,
+        conn_mod.test_terminal_ring_high.load(.acquire), full,               rst_paused,  c.rst_total,
+        c.goaways,                                       c.goaway_code,      c.eof,       if (bound_ns != 0 and c.eof_ns > bound_ns) (c.eof_ns - bound_ns) / std.time.ns_per_ms else 0,
+        if (c.err) |e| @errorName(e) else "-",           c.frames[0],        c.frames[1],
     });
 
     if (scenario == .flood_unread) {

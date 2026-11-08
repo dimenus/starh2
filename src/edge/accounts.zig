@@ -399,7 +399,7 @@ pub const Charge = struct {
         var took: [max_refs]bool = @splat(false);
         if (self.len != 0) {
             const t = self.table.?;
-            const share = t.shares[@intFromEnum(res)];
+            const share = t.shares[@backingInt(res)];
             const pressure = underPressure(server_use, share.mark);
             for (self.refs[0..self.len], 0..) |r, i| {
                 const rec = t.record(r) orelse continue;
@@ -504,7 +504,7 @@ pub const RouteRecord = struct {
     orphans: std.atomic.Value(usize) = .init(0),
 
     pub fn count(self: *const RouteRecord, res: RouteResource) usize {
-        return self.counts[@intFromEnum(res)].load(.acquire);
+        return self.counts[@backingInt(res)].load(.acquire);
     }
 };
 
@@ -529,12 +529,12 @@ pub const RouteRef = struct {
         if (n == 0) return true;
         const t = self.table;
         const r = self.rec();
-        const c = &r.counts[@intFromEnum(rr)];
-        if (!underPressure(server_use, t.marks[@intFromEnum(rr)])) {
+        const c = &r.counts[@backingInt(rr)];
+        if (!underPressure(server_use, t.marks[@backingInt(rr)])) {
             _ = c.fetchAdd(n, .acq_rel);
             return true;
         }
-        const share = r.shares[@intFromEnum(rr)];
+        const share = r.shares[@backingInt(rr)];
         var cur = c.load(.acquire);
         while (true) {
             if (cur > share or share - cur < n) {
@@ -550,7 +550,7 @@ pub const RouteRef = struct {
     pub fn sub(self: RouteRef, res: Resource, n: usize) void {
         const rr = RouteResource.of(res) orelse return;
         if (n == 0) return;
-        const c = &self.rec().counts[@intFromEnum(rr)];
+        const c = &self.rec().counts[@backingInt(rr)];
         var cur = c.load(.acquire);
         while (true) {
             if (cur < n) {
@@ -656,17 +656,17 @@ pub const RouteTable = struct {
                 // off under pressure, not a share; the default is never 0.
                 if (o) |v| {
                     if (v == 0) {
-                        log.err("route {s}: its {s} share is 0: the route would be refused everything under pressure", .{ l.text(), @tagName(@as(RouteResource, @enumFromInt(ri))) });
+                        log.err("route {s}: its {s} share is 0: the route would be refused everything under pressure", .{ l.text(), @tagName(@as(RouteResource, @fromBackingInt(@intCast(ri)))) });
                         return error.RouteShareZero;
                     }
                 }
                 const share = o orelse defaultShare(server_limit, task_routes);
                 if (share > server_limit) {
-                    log.err("route {s}: its {s} share {d} is above the server's limit {d}", .{ l.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), share, server_limit });
+                    log.err("route {s}: its {s} share {d} is above the server's limit {d}", .{ l.text(), @tagName(@as(RouteResource, @fromBackingInt(@intCast(ri)))), share, server_limit });
                     return error.RouteShareAboveServerLimit;
                 }
                 const client = Share.of(server_limit).client;
-                if (share < client) log.warn("route {s}: its {s} share {d} is below a client's share {d}: one client may hold more of it than this route", .{ l.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), share, client });
+                if (share < client) log.warn("route {s}: its {s} share {d} is below a client's share {d}: one client may hold more of it than this route", .{ l.text(), @tagName(@as(RouteResource, @fromBackingInt(@intCast(ri)))), share, client });
                 rec.shares[ri] = share;
             }
             next += 1;
@@ -718,19 +718,19 @@ pub const RouteTable = struct {
 
     fn noteRefused(self: *RouteTable, index: u32, res: RouteResource, server_use: usize) void {
         const r = &self.records[index];
-        _ = r.refusals[@intFromEnum(res)].fetchAdd(1, .monotonic);
+        _ = r.refusals[@backingInt(res)].fetchAdd(1, .monotonic);
         self.refusal_log.note("refused route {s}: {s} over its share under pressure; route holds task_handlers {d} of {d}, request_bytes {d} of {d}, compression {d} of {d}; the server's {s} {d} (mark {d})", .{
             r.label.text(),
             @tagName(res),
             r.count(.task_handlers),
-            r.shares[@intFromEnum(RouteResource.task_handlers)],
+            r.shares[@backingInt(RouteResource.task_handlers)],
             r.count(.request_bytes),
-            r.shares[@intFromEnum(RouteResource.request_bytes)],
+            r.shares[@backingInt(RouteResource.request_bytes)],
             r.count(.compression),
-            r.shares[@intFromEnum(RouteResource.compression)],
+            r.shares[@backingInt(RouteResource.compression)],
             @tagName(res),
             server_use,
-            self.marks[@intFromEnum(res)],
+            self.marks[@backingInt(res)],
         });
     }
 
@@ -774,7 +774,7 @@ pub const RouteTable = struct {
                 const v = c.load(.acquire);
                 if (v == 0) continue;
                 clean = false;
-                log.err("route account still charged at deinit: {s} {s} = {d}", .{ r.label.text(), @tagName(@as(RouteResource, @enumFromInt(ri))), v });
+                log.err("route account still charged at deinit: {s} {s} = {d}", .{ r.label.text(), @tagName(@as(RouteResource, @fromBackingInt(@intCast(ri)))), v });
             }
             const o = r.orphans.load(.acquire);
             if (o != 0) {
@@ -1117,14 +1117,14 @@ pub const Table = struct {
     /// holds as a part of the server's use, and the endpoint. Lock-free: the
     /// record is the refused holder's own, so its key does not change.
     pub fn noteRefused(self: *Table, res: Resource, rec: *const Record, held: usize, server_use: usize, endpoint: u16) void {
-        _ = self.share_refusals[@intFromEnum(res)].fetchAdd(1, .monotonic);
+        _ = self.share_refusals[@backingInt(res)].fetchAdd(1, .monotonic);
         const pct = if (server_use == 0) 0 else held * 100 / server_use;
         const label: []const u8 = if (endpoint < max_labels) self.labels[endpoint].text() else "endpoint ?";
         self.refusal_log.note("refused {f}: {d}% of {s} ({d} of the server's {d}, over its share under pressure), {s}", .{ fmtKey(rec.key), pct, @tagName(res), held, server_use, label });
     }
 
     pub fn shareRefusals(self: *const Table, res: Resource) u64 {
-        return self.share_refusals[@intFromEnum(res)].load(.acquire);
+        return self.share_refusals[@backingInt(res)].load(.acquire);
     }
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
@@ -1199,14 +1199,14 @@ pub const Table = struct {
                 };
                 if (used) |u| {
                     const res: Resource = if (kind == .connection_start) .connections else .handshakes;
-                    const t = self.rules.bucket(kind).take(rec.tat[@intFromEnum(kind)], st.now_ns);
-                    if (t == null and u >= self.shares[@intFromEnum(res)].mark) {
-                        _ = self.rate_refusals[@intFromEnum(kind)].fetchAdd(1, .monotonic);
+                    const t = self.rules.bucket(kind).take(rec.tat[@backingInt(kind)], st.now_ns);
+                    if (t == null and u >= self.shares[@backingInt(res)].mark) {
+                        _ = self.rate_refusals[@backingInt(kind)].fetchAdd(1, .monotonic);
                         self.noteRateRefused(kind, rec, u, endpoint);
                         self.dropAllLocked(&c);
                         return .rate_limited;
                     }
-                    next[ri][@intFromEnum(kind)] = t;
+                    next[ri][@backingInt(kind)] = t;
                 }
             }
         }
@@ -1231,7 +1231,7 @@ pub const Table = struct {
     fn noteRateRefused(self: *Table, kind: BucketKind, rec: *const Record, server_use: usize, endpoint: u16) void {
         const b = self.rules.bucket(kind);
         const res: Resource = if (kind == .connection_start) .connections else .handshakes;
-        const held = rec.counts[@intFromEnum(res)].load(.monotonic);
+        const held = rec.counts[@backingInt(res)].load(.monotonic);
         const pct = if (server_use == 0) 0 else held * 100 / server_use;
         const label: []const u8 = if (endpoint < max_labels) self.labels[endpoint].text() else "endpoint ?";
         self.refusal_log.note("refused {f}: {s}s over its rate (burst {d}, one every {d} ms) under pressure, {d}% of {s} ({d} of the server's {d}), {s}", .{ fmtKey(rec.key), @tagName(kind), b.burst, b.interval_ns / std.time.ns_per_ms, pct, @tagName(res), held, server_use, label });
@@ -1352,7 +1352,7 @@ pub const Table = struct {
             for (&rec.counts, 0..) |*count, ri| {
                 const v = count.load(.acquire);
                 if (v == 0) continue;
-                w.print("{s}{s} = {d}", .{ if (first) "" else ", ", @tagName(@as(Resource, @enumFromInt(ri))), v }) catch {};
+                w.print("{s}{s} = {d}", .{ if (first) "" else ", ", @tagName(@as(Resource, @fromBackingInt(@intCast(ri)))), v }) catch {};
                 first = false;
             }
             log.err("client account conservation: the last reference to {f} went with {s}; record quarantined", .{ fmtKey(rec.key), w.buffered() });
@@ -1420,7 +1420,7 @@ pub const Table = struct {
     /// found. A refusal is checked against the generation too, so a stale
     /// reference is never refused on another key's count.
     pub fn addAt(self: *Table, rec: *Record, r: Ref, res: Resource, n: usize, bound: ?usize) AddResult {
-        const c = &rec.counts[@intFromEnum(res)];
+        const c = &rec.counts[@backingInt(res)];
         if (bound) |b| {
             var cur = c.load(.seq_cst);
             while (true) {
@@ -1456,7 +1456,7 @@ pub const Table = struct {
     /// and counted (`stale`); an underflow is counted only when the record
     /// is still this reference's, so it is never charged to another key.
     pub fn subAt(self: *Table, rec: *Record, r: Ref, res: Resource, n: usize) void {
-        const c = &rec.counts[@intFromEnum(res)];
+        const c = &rec.counts[@backingInt(res)];
         var cur = c.load(.seq_cst);
         const took = while (true) {
             if (cur < n) break false;
@@ -1576,7 +1576,7 @@ pub const Table = struct {
             log.err("client account still {s} at deinit: record {d} {f}, {d} holders", .{ @tagName(rec.state), i, fmtKey(rec.key), rec.holders() });
             for (&rec.counts, 0..) |*count, ri| {
                 const v = count.load(.acquire);
-                if (v != 0) log.err("  {s} = {d}", .{ @tagName(@as(Resource, @enumFromInt(ri))), v });
+                if (v != 0) log.err("  {s} = {d}", .{ @tagName(@as(Resource, @fromBackingInt(@intCast(ri)))), v });
             }
         }
         for (self.index) |e| {
@@ -1622,7 +1622,7 @@ pub const Table = struct {
         counts: [resource_count]usize,
 
         pub fn count(self: Entry, res: Resource) usize {
-            return self.counts[@intFromEnum(res)];
+            return self.counts[@backingInt(res)];
         }
     };
 
@@ -1836,7 +1836,7 @@ test "Charge.add: shares apply only at the mark; an aggregate's refusal undoes t
     const gpa = std.testing.allocator;
     var shares: Shares = unlimited;
     // L = 16: client share 2, aggregate share 4, mark 4.
-    shares[@intFromEnum(Resource.streams)] = .of(16);
+    shares[@backingInt(Resource.streams)] = .of(16);
     var t = try Table.init(gpa, 8, 3, .{ .shares = shares, .connection_start = Rules.unlimited.connection_start, .handshake_start = Rules.unlimited.handshake_start });
     defer t.deinit(gpa);
     var o1: [max_refs]Key = undefined;
@@ -1870,8 +1870,8 @@ test "Charge.add: shares apply only at the mark; an aggregate's refusal undoes t
 fn bucketRules(burst: u64, interval_ns: u64) Rules {
     var r = Rules.unlimited;
     // L = 4: the connections' mark is 1.
-    r.shares[@intFromEnum(Resource.connections)] = .of(4);
-    r.shares[@intFromEnum(Resource.handshakes)] = .of(4);
+    r.shares[@backingInt(Resource.connections)] = .of(4);
+    r.shares[@backingInt(Resource.handshakes)] = .of(4);
     r.connection_start = .{ .burst = burst, .interval_ns = interval_ns };
     r.handshake_start = .{ .burst = burst, .interval_ns = interval_ns };
     return r;
@@ -1905,7 +1905,7 @@ test "start bucket: a serial reconnect keeps its bucket in a rate-only record an
     const tls = try t.acquire(k, 0, .{ .now_ns = now + std.time.ns_per_s + 7, .connections = 0, .handshakes = 1 });
     t.release(tls.charge);
     const s = t.stats();
-    try std.testing.expectEqual(@as(u64, 2), s.rate_refusals[@intFromEnum(BucketKind.connection_start)]);
+    try std.testing.expectEqual(@as(u64, 2), s.rate_refusals[@backingInt(BucketKind.connection_start)]);
     try std.testing.expectEqual(@as(u64, 1), s.inserts);
     try std.testing.expectEqual(@as(usize, 1), s.rate_only);
     try std.testing.expectEqual(@as(usize, 0), s.live);
@@ -2079,9 +2079,9 @@ test "RouteTable: the default share is the server's limit over the task routes, 
         try std.testing.expectEqual(@as(usize, n), t.records.len);
         for (0..n) |i| {
             const rec = t.recordOf(@intCast(i)).?;
-            try std.testing.expectEqual(@as(usize, 4096 / n), rec.shares[@intFromEnum(RouteResource.task_handlers)]);
-            try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024 / n), rec.shares[@intFromEnum(RouteResource.request_bytes)]);
-            try std.testing.expectEqual(@as(usize, 128 / n), rec.shares[@intFromEnum(RouteResource.compression)]);
+            try std.testing.expectEqual(@as(usize, 4096 / n), rec.shares[@backingInt(RouteResource.task_handlers)]);
+            try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024 / n), rec.shares[@backingInt(RouteResource.request_bytes)]);
+            try std.testing.expectEqual(@as(usize, 128 / n), rec.shares[@backingInt(RouteResource.compression)]);
         }
         // The complete route has no account.
         try std.testing.expect(t.recordOf(@intCast(n)) == null);
@@ -2091,8 +2091,8 @@ test "RouteTable: the default share is the server's limit over the task routes, 
     var buf3: [4]router.Route = undefined;
     var t3 = try RouteTable.init(gpa, testTaskRoutes(3, &buf3), limits);
     defer t3.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 43), t3.recordOf(0).?.shares[@intFromEnum(RouteResource.compression)]);
-    try std.testing.expectEqual(@as(usize, 1366), t3.recordOf(0).?.shares[@intFromEnum(RouteResource.task_handlers)]);
+    try std.testing.expectEqual(@as(usize, 43), t3.recordOf(0).?.shares[@backingInt(RouteResource.compression)]);
+    try std.testing.expectEqual(@as(usize, 1366), t3.recordOf(0).?.shares[@backingInt(RouteResource.task_handlers)]);
 }
 
 test "RouteTable: an override replaces the default for that resource only" {
@@ -2102,9 +2102,9 @@ test "RouteTable: an override replaces the default for that resource only" {
     buf[0].share = .{ .task_handlers = 4096 };
     var t = try RouteTable.init(gpa, routes, .{ 4096, 1024, 128 });
     defer t.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, 4096), t.recordOf(0).?.shares[@intFromEnum(RouteResource.task_handlers)]);
-    try std.testing.expectEqual(@as(usize, 512), t.recordOf(0).?.shares[@intFromEnum(RouteResource.request_bytes)]);
-    try std.testing.expectEqual(@as(usize, 2048), t.recordOf(1).?.shares[@intFromEnum(RouteResource.task_handlers)]);
+    try std.testing.expectEqual(@as(usize, 4096), t.recordOf(0).?.shares[@backingInt(RouteResource.task_handlers)]);
+    try std.testing.expectEqual(@as(usize, 512), t.recordOf(0).?.shares[@backingInt(RouteResource.request_bytes)]);
+    try std.testing.expectEqual(@as(usize, 2048), t.recordOf(1).?.shares[@backingInt(RouteResource.task_handlers)]);
     // An override on a complete route cannot mean anything.
     buf[2].share = .{ .compression = 1 };
     try std.testing.expectError(error.RouteShareOnCompleteRoute, RouteTable.init(gpa, routes, .{ 4096, 1024, 128 }));
@@ -2131,7 +2131,7 @@ test "Charge.add: a route over its share is refused only at the mark, and its re
     try std.testing.expectEqual(Charge.Outcome.route_refused, c.add(.task_handlers, 1, 4));
     try std.testing.expectEqual(@as(usize, 10), t.lookup(k[0]).?.count(.task_handlers));
     try std.testing.expectEqual(@as(usize, 10), rt.recordOf(0).?.count(.task_handlers));
-    try std.testing.expectEqual(@as(u64, 1), rt.recordOf(0).?.refusals[@intFromEnum(RouteResource.task_handlers)].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), rt.recordOf(0).?.refusals[@backingInt(RouteResource.task_handlers)].load(.acquire));
     // The other route has its whole share at the mark.
     const c1 = conn.withRoute(rt.ref(routes_list, 1));
     for (0..8) |_| try std.testing.expectEqual(Charge.Outcome.took, c1.add(.task_handlers, 1, 4));
@@ -2162,7 +2162,7 @@ test "Charge.add: a route refusal from an IPv6 client undoes both the /64 and th
     var rt = try RouteTable.init(gpa, routes, .{ 16, 1024, 16 });
     defer rt.deinit(gpa);
     var shares: Shares = unlimited;
-    shares[@intFromEnum(Resource.task_handlers)] = .of(16);
+    shares[@backingInt(Resource.task_handlers)] = .of(16);
     var t = try Table.init(gpa, 8, 9, .{ .shares = shares, .connection_start = Rules.unlimited.connection_start, .handshake_start = Rules.unlimited.handshake_start });
     defer t.deinit(gpa);
     const a: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 7, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };

@@ -90,7 +90,6 @@ pub const http = struct {
 /// Sibling of the h2 session — a different parser.
 pub const http1 = @import("http1.zig");
 
-
 pub const Limits = core.limits.Limits;
 pub const ResourceUpperBound = core.limits.ResourceUpperBound;
 pub const physical_cpus = @import("physical_cpus.zig");
